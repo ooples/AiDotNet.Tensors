@@ -86,6 +86,7 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.IstftNormalize",
                 "CudaBackend.MelFilterbankApply",
                 "CudaBackend.MfccLog1p",
+                "CudaBackend.NormalizeRowsFused",
                 "CudaBackend.PacPhaseBinMi",
                 "CudaBackend.PhaseVocoder",
                 "CudaBackend.PolarToComplex",
@@ -2425,6 +2426,57 @@ public class DirectPtxComplexMultiplyTests
             DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
         runtime.Synchronize();
         var actual = new float[seg * numBins];
+        oB.Download<float>(actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-3 * (1 + Math.Abs(expected[i])));
+    }
+
+    [Fact]
+    public void NormalizeRowsFusedEmitter_IsSharedTreeReduction()
+    {
+        string ptx = PtxNormalizeRowsFusedF32Kernel.EmitPtx(8, 6, 100, 3000);
+        Assert.Contains("op=normalize-rows-fused", ptx);
+        Assert.Contains(".shared .align 4 .b32 sdata[256]", ptx);
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));            // after phase 1 + inside reduction loop
+        Assert.Contains("mov.u32 %r8, 128", ptx);             // reduction start s = blockDim/2
+        Assert.Contains("rsqrt.approx.f32 %f5, %f4", ptx);
+        Assert.Contains("$NR_P1:", ptx);
+        Assert.Contains("$NR_RED:", ptx);
+        Assert.Contains("$NR_P2:", ptx);
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxNormalizeRowsFusedF32Kernel.IsSupportedShape(100, 3000));
+        Assert.False(PtxNormalizeRowsFusedF32Kernel.IsPromotedShape(100, 3000));
+    }
+
+    [SkippableFact]
+    public void DriverOnlyNormalizeRowsFused_MatchesDoubleOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        const int rows = 64, cols = 3000;   // cols > block exercises the grid-stride
+        using var kernel = new PtxNormalizeRowsFusedF32Kernel(runtime, rows, cols);
+        var input = new float[rows * cols];
+        var random = RandomHelper.CreateSeededRandom(20271101);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var expected = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            double sumSq = 0;
+            for (int c = 0; c < cols; c++) { double v = input[r * cols + c]; sumSq += v * v; }
+            double inv = sumSq > 0 ? 1.0 / Math.Sqrt(sumSq) : 0;
+            for (int c = 0; c < cols; c++) expected[r * cols + c] = (float)(input[r * cols + c] * inv);
+        }
+        using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        iB.Upload<float>(input);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
+        runtime.Synchronize();
+        var actual = new float[rows * cols];
         oB.Download<float>(actual);
         for (int i = 0; i < actual.Length; i++)
             Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-3 * (1 + Math.Abs(expected[i])));
