@@ -140,6 +140,15 @@ public static class PtxParityRegistry
             "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
             "Keep deferred until that three-way matrix and the competitive gates exist."),
 
+        new PtxParitySpec("PtxConv2DNchwK1RegBlockedKernel", PtxParityStatus.Deferred,
+            "register-blocked shared-memory 1x1 Conv2D+bias+ReLU GEMM, ResNet shapes (#841)",
+            "the register-blocked (TM x TN micro-tile) tiled-GEMM specialization: each thread computes a " +
+            "TM x TN output block in registers so every staged value is reused before leaving registers, " +
+            "raising arithmetic intensity to approach/beat cuDNN on the realistic ResNet 1x1 projections. " +
+            "Device correctness (<= 2e-4 vs the fp64 oracle), register/occupancy budget, block/micro-tile " +
+            "sweep, and the >=1.10x-vs-cuDNN gate are validated on-device. Keep deferred and unpromoted " +
+            "until the three-way matrix and competitive gates pass."),
+
         new PtxParitySpec("PtxConv2DNchwK1TiledKernel", PtxParityStatus.Deferred,
             "shared-memory tiled 1x1 Conv2D+bias+ReLU GEMM, realistic ResNet shapes (#841)",
             "the tiled-GEMM specialization staged ahead of the #841 GPU measurement window: it kills the " +

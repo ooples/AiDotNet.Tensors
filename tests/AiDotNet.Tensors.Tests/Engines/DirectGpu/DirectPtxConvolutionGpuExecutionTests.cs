@@ -94,6 +94,101 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         }
     }
 
+    [Fact]
+    public void RegBlocked_SmallCleanShape_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        // K=64 (BM64), C=64 (BK16), HW=64 (BN64), N=2. 256 threads, 4x4 micro-tile.
+        const int n = 2, k = 64, cch = 64, hw = 64;
+        var shape = new Conv2DRegBlockShape(n, k, cch, hw, blockM: 64, blockN: 64, blockK: 16, threadM: 4, threadN: 4);
+
+        var input = new float[n * cch * hw];
+        var weights = new float[k * cch];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+
+        float[] expected = ReferenceConv1x1(input, weights, bias, n, k, cch, hw);
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            float[] actual = LaunchRegBlocked(runtime, shape, input, weights, bias);
+            AssertClose(expected, actual);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
+    [Fact]
+    public void RegBlocked_ResNetC64_ExactShape_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        // The exact shape the >=1.10x-vs-cuDNN win is claimed on: N32/C64/56x56/K64.
+        const int n = 32, k = 64, cch = 64, hw = 3136;
+        var shape = new Conv2DRegBlockShape(n, k, cch, hw, 64, 64, 16, 4, 4);
+
+        var input = new float[n * cch * hw];
+        var weights = new float[k * cch];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+
+        float[] expected = ReferenceConv1x1(input, weights, bias, n, k, cch, hw);
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            float[] actual = LaunchRegBlocked(runtime, shape, input, weights, bias);
+            AssertClose(expected, actual);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
+    private static float[] LaunchRegBlocked(
+        DirectPtxRuntime runtime, Conv2DRegBlockShape shape,
+        float[] input, float[] weights, float[] bias)
+    {
+        using var kernel = new PtxConv2DNchwK1RegBlockedKernel(runtime, shape);
+        using var dInput = runtime.AllocateBytes((nuint)shape.InputBytes);
+        using var dWeights = runtime.AllocateBytes((nuint)shape.WeightBytes);
+        using var dBias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+        using var dOutput = runtime.AllocateBytes((nuint)shape.OutputBytes);
+        dInput.Upload<float>(input);
+        dWeights.Upload<float>(weights);
+        dBias.Upload<float>(bias);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(dInput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(dWeights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dBias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(dOutput, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actual = new float[shape.Batch * shape.OutputChannels * shape.Spatial];
+        dOutput.Download<float>(actual);
+        return actual;
+    }
+
     private static unsafe float[] LaunchV1(
         DirectPtxRuntime runtime, float[] input, float[] weights, float[] bias)
     {
