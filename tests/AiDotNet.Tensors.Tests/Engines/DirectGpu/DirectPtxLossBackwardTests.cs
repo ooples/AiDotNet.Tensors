@@ -27,20 +27,22 @@ public class DirectPtxLossBackwardTests
 
         // gradOutput[0] is a broadcast scalar, so it is read ONCE and doubled
         // once, outside the per-element work.
-        Assert.Equal(1, Count(ptx, "ld.global.nc.f32 %f12, [%rd0];"));
-        Assert.Equal(1, Count(ptx, "mul.rn.f32 %f12, %f12, 0f40000000;"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32 %f24, [%rd0];"));
+        Assert.Equal(1, Count(ptx, "mul.rn.f32 %f24, %f24, 0f40000000;"));
 
         // Per element: subtract, multiply by the hoisted (g*2), then by invN -
         // exactly ((g * 2) * d) * invN. Only the SOURCE of invN changed: it is a
         // launch parameter now, so one module serves every batch size.
-        Assert.Contains("ld.param.f32 %f13, [inv_n];", ptx);
+        Assert.Contains("ld.param.f32 %f25, [inv_n];", ptx);
         Assert.Equal(1, Count(ptx, "ld.param.f32"));
-        for (int i = 0; i < 4; i++)
+        // Eight elements per thread now: predictions %f0-7, targets %f8-15,
+        // diffs %f16-23, with the hoisted scalars above them.
+        for (int i = 0; i < 8; i++)
         {
-            int diff = 8 + i;
-            Assert.Contains($"sub.rn.f32 %f{diff}, %f{i}, %f{4 + i};", ptx);
-            Assert.Contains($"mul.rn.f32 %f{diff}, %f12, %f{diff};", ptx);
-            Assert.Contains($"mul.rn.f32 %f{diff}, %f{diff}, %f13;", ptx);
+            int diff = 16 + i;
+            Assert.Contains($"sub.rn.f32 %f{diff}, %f{i}, %f{8 + i};", ptx);
+            Assert.Contains($"mul.rn.f32 %f{diff}, %f24, %f{diff};", ptx);
+            Assert.Contains($"mul.rn.f32 %f{diff}, %f{diff}, %f25;", ptx);
         }
         // The scale is a multiply, so the kernel never divides.
         Assert.DoesNotContain("div.", ptx, StringComparison.Ordinal);
@@ -65,16 +67,12 @@ public class DirectPtxLossBackwardTests
         // Two predicates and two selects per element. Both predicates are false
         // for exact zero AND for NaN, so each yields +0 - matching
         // (d > 0) ? 1 : ((d < 0) ? -1 : 0).
-        Assert.Equal(4, Count(ptx, "setp.gt.f32 %p1,"));
-        Assert.Equal(4, Count(ptx, "setp.lt.f32 %p2,"));
+        Assert.Equal(8, Count(ptx, "setp.gt.f32 %p1,"));
+        Assert.Equal(8, Count(ptx, "setp.lt.f32 %p2,"));
         // Two selects per element: (+1 or 0), then (-1 or that).
-        Assert.Equal(8, Count(ptx, "selp.f32"));
-        Assert.Equal(4, Count(ptx, "selp.f32 %f8, 0f3F800000, 0f00000000, %p1;")
-                      + Count(ptx, "selp.f32 %f9, 0f3F800000, 0f00000000, %p1;")
-                      + Count(ptx, "selp.f32 %f10, 0f3F800000, 0f00000000, %p1;")
-                      + Count(ptx, "selp.f32 %f11, 0f3F800000, 0f00000000, %p1;"));
-        Assert.Equal(4, Count(ptx, "0f3F800000"));    // +1.0, once per element
-        Assert.Equal(4, Count(ptx, "0fBF800000"));    // -1.0, once per element
+        Assert.Equal(16, Count(ptx, "selp.f32"));
+        Assert.Equal(8, Count(ptx, "0f3F800000"));    // +1.0, once per element
+        Assert.Equal(8, Count(ptx, "0fBF800000"));    // -1.0, once per element
         // The sign gradient must not scale by anything.
         Assert.DoesNotContain("mul.rn.f32", ptx, StringComparison.Ordinal);
     }
@@ -101,8 +99,9 @@ public class DirectPtxLossBackwardTests
                  })
         {
             string ptx = PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, 262_144);
-            Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));  // predictions, targets
-            Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+            // Two vectors each of predictions and targets, two stored.
+            Assert.Equal(4, Count(ptx, "ld.global.nc.v4.f32"));
+            Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
             Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
         }
     }

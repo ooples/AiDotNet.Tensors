@@ -46,7 +46,16 @@ internal enum DirectPtxLossBackwardOp
 internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
 {
     internal const int DefaultBlockThreads = 256;
-    internal const int ElementsPerThread = 4;
+    /// <summary>
+    /// Independent vectors each thread moves. Two rather than one so both
+    /// prediction and target loads for the second vector are issued before the
+    /// first vector's arithmetic consumes it - these gradients are pure
+    /// streaming maps, limited by bytes in flight rather than by arithmetic.
+    /// </summary>
+    internal const int VectorsPerThread = 2;
+
+    internal const int ElementsPerVector = 4;
+    internal const int ElementsPerThread = VectorsPerThread * ElementsPerVector;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -180,7 +189,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
-            $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op={OpTag(op)}");
+            $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4x2 op={OpTag(op)}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {entryPoint}(");
         if (isMse)
@@ -201,7 +210,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<10>;");
         // p0..p3, t0..t3, d0..d3, plus the hoisted scalar for MSE.
-        ptx.AppendLine("    .reg .f32 %f<15>;");
+        ptx.AppendLine("    .reg .f32 %f<28>;");
 
         int paramCursor = 0;
         if (isMse)
@@ -220,9 +229,9 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             // ((g * 2) * d) * invN in the established kernel.
         // Streamed once and never revisited, so this goes through the
         // read-only data cache instead of displacing L1.
-            ptx.AppendLine("    ld.global.nc.f32 %f12, [%rd0];");
-            ptx.AppendLine("    mul.rn.f32 %f12, %f12, 0f40000000;");   // * 2.0
-            ptx.AppendLine("    ld.param.f32 %f13, [inv_n];");
+            ptx.AppendLine("    ld.global.nc.f32 %f24, [%rd0];");
+            ptx.AppendLine("    mul.rn.f32 %f24, %f24, 0f40000000;");   // * 2.0
+            ptx.AppendLine("    ld.param.f32 %f25, [inv_n];");
         }
 
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
@@ -232,19 +241,33 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         ptx.AppendLine($"    add.u64 %rd7, %rd{predParam}, %rd6;");
         ptx.AppendLine($"    add.u64 %rd8, %rd{targetParam}, %rd6;");
         ptx.AppendLine($"    add.u64 %rd9, %rd{gradInParam}, %rd6;");
-        ptx.AppendLine("    ld.global.nc.v4.f32 {%f0, %f1, %f2, %f3}, [%rd7];");
-        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4, %f5, %f6, %f7}, [%rd8];");
+        // Issue every load before consuming any of them so both vectors of
+        // predictions and targets are in flight together.
+        for (int v = 0; v < VectorsPerThread; v++)
+        {
+            int b = v * ElementsPerVector;
+            int offset = v * ElementsPerVector * sizeof(float);
+            ptx.AppendLine(
+                $"    ld.global.nc.v4.f32 {{%f{b}, %f{b + 1}, %f{b + 2}, %f{b + 3}}}, [%rd7+{offset}];");
+        }
+        for (int v = 0; v < VectorsPerThread; v++)
+        {
+            int b = ElementsPerThread + v * ElementsPerVector;
+            int offset = v * ElementsPerVector * sizeof(float);
+            ptx.AppendLine(
+                $"    ld.global.nc.v4.f32 {{%f{b}, %f{b + 1}, %f{b + 2}, %f{b + 3}}}, [%rd8+{offset}];");
+        }
 
         for (int i = 0; i < ElementsPerThread; i++)
         {
-            int diff = 8 + i;
-            ptx.AppendLine($"    sub.rn.f32 %f{diff}, %f{i}, %f{4 + i};");
+            int diff = (2 * ElementsPerThread) + i;
+            ptx.AppendLine($"    sub.rn.f32 %f{diff}, %f{i}, %f{ElementsPerThread + i};");
             if (isMse)
             {
                 // ((g * 2) * d) * invN, association order unchanged - only the
                 // source of invN moved from a baked literal to a parameter.
-                ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f12, %f{diff};");
-                ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f{diff}, %f13;");
+                ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f24, %f{diff};");
+                ptx.AppendLine($"    mul.rn.f32 %f{diff}, %f{diff}, %f25;");
             }
             else
             {
@@ -257,7 +280,13 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             }
         }
 
-        ptx.AppendLine("    st.global.v4.f32 [%rd9], {%f8, %f9, %f10, %f11};");
+        for (int v = 0; v < VectorsPerThread; v++)
+        {
+            int b = (2 * ElementsPerThread) + v * ElementsPerVector;
+            int offset = v * ElementsPerVector * sizeof(float);
+            ptx.AppendLine(
+                $"    st.global.v4.f32 [%rd9+{offset}], {{%f{b}, %f{b + 1}, %f{b + 2}, %f{b + 3}}};");
+        }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -296,7 +325,11 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
             Variant: $"linear-vec4-b{blockThreads}-n{size}",
             Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
+                // Measured by the offline gate at sm86: 18 registers at four
+                // elements per thread. Eight elements hold twice the inputs and
+                // twice the diffs live, so the budget is widened ahead of the
+                // next measurement rather than left to fail at construction.
+                MaxRegistersPerThread: 40,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
