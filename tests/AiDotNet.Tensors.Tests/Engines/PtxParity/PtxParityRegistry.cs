@@ -118,6 +118,13 @@ public static class PtxParityRegistry
             "one module over the four exact element counts. The real lane is copied and the imaginary " +
             "lane is a neg.f32 sign-bit flip, so the spec is bit-exact and must include NaN payloads and " +
             "both signed zeros. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted."),
+
+        new PtxParitySpec("PtxComplexInterleaveF32Kernel", PtxParityStatus.Deferred,
+            "complex interleave and deinterleave layout bridges, fp32 (#850) - CudaBackend.InterleaveComplex, CudaBackend.DeinterleaveComplex",
+            "one module per direction over the four exact element counts. Both directions are pure data " +
+            "movement (a v2 transaction on the interleaved side, two scalar transactions on the split " +
+            "side), so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
+            "ThreeWayParity when the SM86 run lands; until then the shapes stay unpromoted and fail closed."),
     };
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =

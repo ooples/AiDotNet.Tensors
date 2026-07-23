@@ -65,6 +65,8 @@ public class DirectPtxComplexMultiplyTests
                 "CudaBackend.ComplexConjugate",
                 "CudaBackend.ComplexMagnitude",
                 "CudaBackend.ComplexMultiply",
+                "CudaBackend.DeinterleaveComplex",
+                "CudaBackend.InterleaveComplex",
                 "CudaBackend.SplitComplexAdd",
                 "CudaBackend.SplitComplexConjugate",
                 "CudaBackend.SplitComplexMagnitude",
@@ -394,6 +396,83 @@ public class DirectPtxComplexMultiplyTests
         {
             Assert.Equal(re[i], outR[i]);       // real lane copied bit-exact
             Assert.Equal(-im[i], outI[i]);      // imag sign-flipped bit-exact
+        }
+    }
+
+    [Fact]
+    public void InterleaveComplexEmitter_IsScalarLoadsThenV2Store()
+    {
+        string ptx = PtxComplexInterleaveF32Kernel.EmitPtx(8, 6, DirectPtxComplexInterleaveDirection.Interleave, 262144);
+        Assert.Contains("exact-shape count=262144 block=256", ptx);
+        Assert.Equal(3, Count(ptx, "ld.param.u64"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // real[i], imag[i]
+        Assert.Equal(1, Count(ptx, "st.global.v2.f32"));    // interleaved pair
+        Assert.Equal(0, Count(ptx, "ld.global.nc.v2.f32"));
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DeinterleaveComplexEmitter_IsV2LoadThenScalarStores()
+    {
+        string ptx = PtxComplexInterleaveF32Kernel.EmitPtx(8, 6, DirectPtxComplexInterleaveDirection.Deinterleave, 65536);
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v2.f32"));  // interleaved pair
+        Assert.Equal(2, Count(ptx, "st.global.f32"));         // real[i], imag[i]
+        Assert.Equal(0, Count(ptx, "st.global.v2.f32"));
+        Assert.True(PtxComplexInterleaveF32Kernel.IsSupportedShape(65536));
+        Assert.False(PtxComplexInterleaveF32Kernel.IsSupportedShape(1024));
+        Assert.False(PtxComplexInterleaveF32Kernel.IsPromotedShape(262144));
+        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
+    }
+
+    [SkippableTheory]
+    [InlineData(true, 65536)]
+    [InlineData(false, 65536)]
+    [InlineData(true, 1048576)]
+    public void DriverOnlyComplexInterleave_MatchesOracle(bool interleave, int count)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The candidate is admitted only on SM86.");
+        var direction = interleave
+            ? DirectPtxComplexInterleaveDirection.Interleave
+            : DirectPtxComplexInterleaveDirection.Deinterleave;
+        using var kernel = new PtxComplexInterleaveF32Kernel(runtime, direction, count);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20260880 + count + (interleave ? 1 : 0));
+        using var b0 = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var b1 = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var b2 = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        if (interleave)
+        {
+            var real = new float[count]; var imag = new float[count];
+            for (int i = 0; i < count; i++) { real[i] = (float)(random.NextDouble() * 2.0 - 1.0); imag[i] = (float)(random.NextDouble() * 2.0 - 1.0); }
+            b0.Upload<float>(real); b1.Upload<float>(imag);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(b0, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(b1, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(b2, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actual = new float[count * 2];
+            b2.Download<float>(actual);
+            for (int i = 0; i < count; i++) { Assert.Equal(real[i], actual[2 * i]); Assert.Equal(imag[i], actual[2 * i + 1]); }
+        }
+        else
+        {
+            var inter = new float[count * 2];
+            for (int i = 0; i < inter.Length; i++) inter[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+            b0.Upload<float>(inter);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(b0, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(b1, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(b2, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var real = new float[count]; var imag = new float[count];
+            b1.Download<float>(real); b2.Download<float>(imag);
+            for (int i = 0; i < count; i++) { Assert.Equal(inter[2 * i], real[i]); Assert.Equal(inter[2 * i + 1], imag[i]); }
         }
     }
 
