@@ -232,6 +232,8 @@ function Read-DenseLinearNcuProof([string]$Path) {
         'smsp__sass_inst_executed_op_local_st.sum',
         'l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum',
         'l1tex__t_requests_pipe_lsu_mem_local_op_st.sum',
+        'l1tex__data_bank_conflicts_pipe_lsu_cmd_read.sum',
+        'l1tex__data_bank_conflicts_pipe_lsu_cmd_write.sum',
         'launch__registers_per_thread',
         'launch__shared_mem_per_block_static',
         'launch__shared_mem_per_block_dynamic',
@@ -239,6 +241,7 @@ function Read-DenseLinearNcuProof([string]$Path) {
         'sm__warps_active.avg.pct_of_peak_sustained_active'
     )
     $zeroMetricNames = @($metricNames[0..7])
+    $metricSums = @{}
     $csvLines = @(Get-Content -LiteralPath $resolved)
     $headerIndex = -1
     for ($index = 0; $index -lt $csvLines.Count; $index++) {
@@ -258,6 +261,7 @@ function Read-DenseLinearNcuProof([string]$Path) {
         throw "Dense-linear Nsight proof expected 16 launch rows; found $($records.Count) in '$resolved'."
     }
     foreach ($metricName in $metricNames) {
+        $metricSum = 0.0
         if ($records[0].PSObject.Properties.Name -notcontains $metricName) {
             throw "Dense-linear Nsight proof is missing '$metricName' in '$resolved'."
         }
@@ -276,7 +280,9 @@ function Read-DenseLinearNcuProof([string]$Path) {
             if ($zeroMetricNames -contains $metricName -and $value -ne 0) {
                 throw "Dense-linear Nsight zero-spill proof failed: '$metricName'='$value' for '$($record.'Kernel Name')'."
             }
+            $metricSum += $value
         }
+        $metricSums[$metricName] = $metricSum
     }
     $hash = Get-FileHash -LiteralPath $resolved -Algorithm SHA256
     return [ordered]@{
@@ -285,6 +291,11 @@ function Read-DenseLinearNcuProof([string]$Path) {
         sha256 = $hash.Hash.ToLowerInvariant()
         exact_launch_rows = $records.Count
         zero_metric_groups = $zeroMetricNames.Count
+        shared_bank_metric_groups = 2
+        shared_bank_read_conflicts_total =
+            $metricSums['l1tex__data_bank_conflicts_pipe_lsu_cmd_read.sum']
+        shared_bank_write_conflicts_total =
+            $metricSums['l1tex__data_bank_conflicts_pipe_lsu_cmd_write.sum']
         requested_metric_groups = $metricNames.Count
     }
 }
@@ -328,6 +339,7 @@ function Write-DenseLinearMarkdown(
         $lines.Add('Nsight executed-spill proof: **HOLD** (no authenticated dense-linear CSV was supplied).')
     } else {
         $lines.Add("Nsight executed-spill proof: **PASS** - $($NcuProof.exact_launch_rows) exact launches, $($NcuProof.zero_metric_groups) zero local/spill metric groups, SHA-256 ``$($NcuProof.sha256)``.")
+        $lines.Add("Nsight shared-bank evidence: read-conflict total $($NcuProof.shared_bank_read_conflicts_total), write-conflict total $($NcuProof.shared_bank_write_conflicts_total) across the same exact launches.")
     }
     $lines.Add('')
     $lines.Add('| Operation | Eligible competitors evaluated | min device speedup | min E2E speedup | max P95 ratio | timing verdict |')

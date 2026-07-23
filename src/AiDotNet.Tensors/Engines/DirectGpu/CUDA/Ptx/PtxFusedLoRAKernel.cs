@@ -148,8 +148,10 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
         // Lanes are arranged as four K contributors for each eight-rank group.
         // All eight warps partition K in steps of 32, so loraA[K,R] is read in
         // contiguous eight-float segments instead of one strided rank column.
-        // A 64-float shared fold joins the eight warp partials; lanes 0..7 of
-        // warp zero publish the final rank group.
+        // A warp-major 8x8 shared fold joins the eight warp partials. The
+        // publishing lanes write consecutive banks, then warp zero reads the
+        // two 32-float halves as consecutive-bank transactions before lanes
+        // 0..7 publish the final rank group.
         ptx.AppendLine("    and.b32 %r5, %r0, 31;");
         ptx.AppendLine("    shr.u32 %r6, %r0, 5;");
         ptx.AppendLine("    and.b32 %r7, %r5, 7;");
@@ -188,7 +190,7 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
         }
         ptx.AppendLine("    setp.ne.u32 %p2, %r8, 0;");
         ptx.AppendLine("    @%p2 bra LORA_PARTIAL_STORED;");
-        ptx.AppendLine("    mad.lo.u32 %r11, %r7, 8, %r6;");
+        ptx.AppendLine("    mad.lo.u32 %r11, %r6, 8, %r7;");
         ptx.AppendLine("    mul.wide.u32 %rd8, %r11, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd14, %rd8;");
         ptx.AppendLine("    st.shared.f32 [%rd9], %f0;");
@@ -196,11 +198,11 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
         ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine("    setp.ne.u32 %p2, %r6, 0;");
         ptx.AppendLine("    @%p2 bra.uni LORA_PROJECTION_GROUP_DONE;");
-        ptx.AppendLine("    mad.lo.u32 %r11, %r7, 8, %r8;");
+        ptx.AppendLine("    mad.lo.u32 %r11, %r8, 8, %r7;");
         ptx.AppendLine("    mul.wide.u32 %rd8, %r11, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd14, %rd8;");
         ptx.AppendLine("    ld.shared.f32 %f0, [%rd9];");
-        ptx.AppendLine("    ld.shared.f32 %f1, [%rd9+16];");
+        ptx.AppendLine("    ld.shared.f32 %f1, [%rd9+128];");
         ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
         foreach (int offset in new[] { 8, 16 })
         {
@@ -299,7 +301,7 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
         var b = new DirectPtxExtent(rank, outputFeatures);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-lora-forward",
-            Version: 2,
+            Version: 3,
             Architecture: architecture,
             Variant: $"fp32-b{batch}-i{inputFeatures}-r{rank}-o{outputFeatures}-s{PtxCompat.SingleToInt32Bits(scaling):x8}",
             Tensors:
@@ -326,6 +328,7 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
                 ["scaling-bits"] = PtxCompat.SingleToInt32Bits(scaling).ToString("x8", CultureInfo.InvariantCulture),
                 ["intermediate"] = "warp-reduced-shared-projection-per-row",
                 ["projection"] = "eight-warp-coalesced-kxr-loads-two-stage-shuffle-reduction",
+                ["shared-layout"] = "warp-major-8x8-partials-conflict-free-publication-and-fold",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["shape-parameters"] = "none",

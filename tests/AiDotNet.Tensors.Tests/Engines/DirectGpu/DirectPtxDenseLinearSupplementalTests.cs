@@ -1071,6 +1071,11 @@ public partial class DirectPtxWmmaTests
             $".shared .align 16 .b8 projection[{rank * sizeof(float)}]",
             ptx, StringComparison.Ordinal);
         Assert.Contains(".shared .align 16 .b8 projection_partials[256]", ptx, StringComparison.Ordinal);
+        Assert.Contains("mad.lo.u32 %r11, %r6, 8, %r7", ptx, StringComparison.Ordinal);
+        Assert.Contains("mad.lo.u32 %r11, %r8, 8, %r7", ptx, StringComparison.Ordinal);
+        Assert.Contains("ld.shared.f32 %f1, [%rd9+128]", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("mad.lo.u32 %r11, %r7, 8, %r6", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.shared.f32 %f1, [%rd9+16]", ptx, StringComparison.Ordinal);
         Assert.Equal(4, Count(ptx, "shfl.sync.down.b32"));
         Assert.Contains("add.u32 %r2, %r2, 32", ptx, StringComparison.Ordinal);
         Assert.Equal(1, Count(ptx, "st.global.f32"));

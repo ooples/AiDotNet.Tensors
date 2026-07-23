@@ -269,7 +269,7 @@ internal static class DirectPtxDenseLinearArtifactTool
             Cell("fused-linear-bias-gelu-v5-Ampere-tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock32-k1024-n4096",
                 PtxFusedLinearGeluFp16M16Kernel.EmitPtx(
                     major, minor, 1_024, 4_096, outputsPerBlock: 32)),
-            Cell("fused-lora-forward-v2-Ampere-fp32-b8-i256-r8-o256-s3e000000",
+            Cell("fused-lora-forward-v3-Ampere-fp32-b8-i256-r8-o256-s3e000000",
                 PtxFusedLoRAKernel.EmitPtx(major, minor, 8, 256, 8, 256, 0.125f)),
             Cell("fused-linear-cross-entropy-index-v1-Ampere-fp32-b4-k16-v32",
                 PtxFusedLinearCrossEntropyKernel.EmitPtx(

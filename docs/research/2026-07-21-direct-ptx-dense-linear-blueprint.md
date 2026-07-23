@@ -162,7 +162,12 @@ each other and from saved forward tensors.
 
 One block owns one batch row. Eight warps partition K while lanes traverse
 contiguous eight-rank groups in `A[K,R]`; register shuffles and a fixed
-64-float shared fold produce the rank-sized shared projection. The same launch
+64-float shared fold produce the rank-sized shared projection. Warp partials
+are stored as `[warp, rank-lane]`: each publishing half-warp touches eight
+consecutive 32-bit banks, and warp zero reads the two 32-float halves with
+consecutive-bank lane addresses. The later projection reads are uniform
+broadcasts, so this shared topology introduces no distinct-address bank
+conflicts. The same launch
 reuses that projection for `@ B`, fuses scaling and the base residual in
 registers, and writes the final output once. Exact output aliasing with
 `baseOutput` is allowed; partial overlap is rejected.
@@ -321,7 +326,9 @@ a separate required gate: dedicated aggregate/local/shared register-spill
 instructions, aggregate local instructions, local-load/local-store
 instructions, and L1 local-load/local-store requests must all be present and
 zero for every launch. Static disassembly is not mislabeled as an executed
-counter capture.
+counter capture. The same profile records LSU shared-bank read- and write-
+conflict counters for every launch, so the analytical bank maps above are
+paired with hardware evidence instead of inferred from PTX alone.
 
 ## Current release evidence
 

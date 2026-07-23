@@ -61,6 +61,8 @@ $metricNames = @(
     'smsp__sass_inst_executed_op_local_st.sum',
     'l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum',
     'l1tex__t_requests_pipe_lsu_mem_local_op_st.sum',
+    'l1tex__data_bank_conflicts_pipe_lsu_cmd_read.sum',
+    'l1tex__data_bank_conflicts_pipe_lsu_cmd_write.sum',
     'launch__registers_per_thread',
     'launch__shared_mem_per_block_static',
     'launch__shared_mem_per_block_dynamic',
