@@ -173,6 +173,16 @@ internal static class DirectPtxConvolutionArtifactTool
             Conv3DBackward.KernelD, Conv3DBackward.KernelH, Conv3DBackward.KernelW, Conv3DBackward.Stride, Conv3DBackward.Padding))
             Export(c3dBwW.Audit, outputDirectory, exported, manifest);
 
+        using (var deform = new PtxDeformableConv2DKernel(
+            runtime, Deformable.Batch, Deformable.InputChannels, Deformable.OutputChannels,
+            Deformable.Height, Deformable.Width, Deformable.KernelH, Deformable.KernelW, Deformable.Stride, Deformable.Padding))
+            Export(deform.Audit, outputDirectory, exported, manifest);
+
+        using (var deformBwIn = new PtxDeformableConv2DBackwardInputKernel(
+            runtime, Deformable.Batch, Deformable.InputChannels, Deformable.OutputChannels,
+            Deformable.Height, Deformable.Width, Deformable.KernelH, Deformable.KernelW, Deformable.Stride, Deformable.Padding))
+            Export(deformBwIn.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -300,6 +310,7 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly ConvTranspose2DBackwardShape ConvTranspose2DBackward = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 0);
     private static readonly ConvTranspose3DBackwardShape ConvTranspose3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1, 0);
     private static readonly Conv3DBackwardShape Conv3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
+    private static readonly DeformableConv2DShape Deformable = new(2, 3, 4, 8, 8, 3, 3, 1, 1);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -459,6 +470,18 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxConv3DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv3DBackward).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(c3dBwWPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(c3dBwWPtx, 8, 6)));
+
+        string deformPtx = PtxDeformableConv2DKernel.EmitPtx(8, 6, Deformable);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Deformable).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(deformPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(deformPtx, 8, 6)));
+
+        string deformBwInPtx = PtxDeformableConv2DBackwardInputKernel.EmitPtx(8, 6, Deformable);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Deformable).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(deformBwInPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(deformBwInPtx, 8, 6)));
         return expected;
     }
 

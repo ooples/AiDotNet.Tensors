@@ -14,6 +14,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// zero-padded 4-corner bilinear interpolation. One thread per output element; consecutive
 /// threads own consecutive ow so the offset/mask reads (contiguous OH*OW) coalesce.
 /// </summary>
+/// <summary>Shared geometry for the DCNv2 (single deform-group) kernels (device-free re-emit).</summary>
+internal readonly record struct DeformableConv2DShape(
+    int Batch, int InputChannels, int OutputChannels, int Height, int Width,
+    int KernelH, int KernelW, int Stride, int Padding)
+{
+    internal int OutH => (Height + 2 * Padding - KernelH) / Stride + 1;
+    internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
+    internal int Taps => KernelH * KernelW;
+}
+
 internal sealed class PtxDeformableConv2DKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -44,8 +54,10 @@ internal sealed class PtxDeformableConv2DKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_deformable_conv2d_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}");
+    internal DeformableConv2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding);
+    internal static string EntryFor(DeformableConv2DShape s) => FormattableString.Invariant(
+        $"aidotnet_deformable_conv2d_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDeformableConv2DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -63,8 +75,9 @@ internal sealed class PtxDeformableConv2DKernel : IDisposable
         if ((long)batch * outputChannels * OutH * OutW % BlockThreads != 0)
             throw new ArgumentException($"N*K*OH*OW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        DeformableConv2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -73,8 +86,11 @@ internal sealed class PtxDeformableConv2DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, DeformableConv2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutH = shape.OutH, OutW = shape.OutW, Taps = shape.Taps;
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var weight = new DirectPtxExtent(OutputChannels, InputChannels, KernelH, KernelW);
         var offset = new DirectPtxExtent(Batch, 2 * Taps, OutH, OutW);
@@ -125,16 +141,17 @@ internal sealed class PtxDeformableConv2DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, DeformableConv2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 DeformableConv2D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int taps = kh * kw, hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow, ckk = c * taps;
         int offN = 2 * taps * ohow;   // offset per-batch stride
         int maskN = taps * ohow;      // mask per-batch stride
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(40960);
         s.AppendLine(".version 7.1");
