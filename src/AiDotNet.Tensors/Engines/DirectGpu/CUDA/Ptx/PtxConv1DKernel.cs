@@ -6,6 +6,18 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
+/// Shape identity for <see cref="PtxConv1DKernel"/> enabling device-free PTX/blueprint re-emit.
+/// </summary>
+internal readonly record struct Conv1DShape(
+    int Batch, int InputChannels, int OutputChannels, int Length, int KernelLength,
+    int Stride, int Padding, bool Relu)
+{
+    internal int OutLength => (Length + 2 * Padding - KernelLength) / Stride + 1;
+    internal string Entry => FormattableString.Invariant(
+        $"aidotnet_conv1d_n{Batch}_c{InputChannels}_k{OutputChannels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}{(Relu ? "_relu" : "")}");
+}
+
+/// <summary>
 /// Direct-PTX native Conv1D forward with per-output-channel bias and optional ReLU:
 /// out[n,k,ol] = relu(bias[k] + sum_{c,kl} W[k,c,kl] * in[n,c,ol*stride + kl - pad]).
 /// General kernel length, stride, and padding. One thread per output element; at
@@ -40,8 +52,8 @@ internal sealed class PtxConv1DKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutLength * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_conv1d_n{Batch}_c{InputChannels}_k{OutputChannels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}{(Relu ? "_relu" : "")}");
+    internal Conv1DShape Shape => new(Batch, InputChannels, OutputChannels, Length, KernelLength, Stride, Padding, Relu);
+    internal string EntryPoint => Shape.Entry;
 
     internal PtxConv1DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -60,8 +72,9 @@ internal sealed class PtxConv1DKernel : IDisposable
         if ((long)batch * outputChannels * OutLength % BlockThreads != 0)
             throw new ArgumentException($"N*K*OL must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Conv1DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -70,8 +83,12 @@ internal sealed class PtxConv1DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, Conv1DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Length = shape.Length, KernelLength = shape.KernelLength, Stride = shape.Stride, Padding = shape.Padding;
+        bool Relu = shape.Relu;
+        int OutLength = shape.OutLength;
         var input = new DirectPtxExtent(Batch, InputChannels, Length);
         var weight = new DirectPtxExtent(OutputChannels, InputChannels, KernelLength);
         var bias = new DirectPtxExtent(OutputChannels);
@@ -116,16 +133,18 @@ internal sealed class PtxConv1DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, Conv1DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 Conv1D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, kl = KernelLength, l = Length, ol = OutLength, kk = OutputChannels;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        bool Relu = shape.Relu;
+        int c = shape.InputChannels, kl = shape.KernelLength, l = shape.Length, ol = shape.OutLength, kk = shape.OutputChannels;
         int kol = kk * ol;                    // output batch stride
         int cl = c * l;                       // input batch stride
         int ckl = c * kl;                     // weight output-channel stride
-        string entry = EntryPoint;
+        string entry = shape.Entry;
 
         var s = new StringBuilder(12288);
         s.AppendLine(".version 7.1");

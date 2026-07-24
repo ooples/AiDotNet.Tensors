@@ -67,6 +67,22 @@ internal static class DirectPtxConvolutionArtifactTool
             FusedConvTranspose2D.Stride, FusedConvTranspose2D.Padding, FusedConvTranspose2D.OutputPadding))
             Export(fusedTranspose.Audit, outputDirectory, exported, manifest);
 
+        using (var conv1d = new PtxConv1DKernel(
+            runtime, Conv1D.Batch, Conv1D.InputChannels, Conv1D.OutputChannels, Conv1D.Length,
+            Conv1D.KernelLength, Conv1D.Stride, Conv1D.Padding, Conv1D.Relu))
+            Export(conv1d.Audit, outputDirectory, exported, manifest);
+
+        using (var conv3d = new PtxConv3DKernel(
+            runtime, Conv3D.Batch, Conv3D.InputChannels, Conv3D.OutputChannels, Conv3D.Depth, Conv3D.Height,
+            Conv3D.Width, Conv3D.KernelD, Conv3D.KernelH, Conv3D.KernelW, Conv3D.Stride, Conv3D.Padding, Conv3D.Relu))
+            Export(conv3d.Audit, outputDirectory, exported, manifest);
+
+        using (var convTranspose = new PtxConvTranspose2DKernel(
+            runtime, ConvTranspose2D.Batch, ConvTranspose2D.InputChannels, ConvTranspose2D.OutputChannels,
+            ConvTranspose2D.Height, ConvTranspose2D.Width, ConvTranspose2D.KernelH, ConvTranspose2D.KernelW,
+            ConvTranspose2D.Stride, ConvTranspose2D.Padding, ConvTranspose2D.OutputPadding, ConvTranspose2D.Relu))
+            Export(convTranspose.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -180,6 +196,9 @@ internal static class DirectPtxConvolutionArtifactTool
         new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
     private static readonly FusedConvTranspose2DShape FusedConvTranspose2D =
         new(2, 3, 4, 4, 4, 3, 3, 2, 1, 1);
+    private static readonly Conv1DShape Conv1D = new(2, 3, 4, 32, 3, 1, 1, true);
+    private static readonly Conv3DShape Conv3D = new(2, 2, 4, 8, 8, 8, 3, 3, 3, 1, 1, true);
+    private static readonly ConvTranspose2DShape ConvTranspose2D = new(2, 3, 4, 4, 4, 3, 3, 2, 1, 1, true);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -207,6 +226,24 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxFusedConvTranspose2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, FusedConvTranspose2D).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(fusedTransposePtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(fusedTransposePtx, 8, 6)));
+
+        string conv1dPtx = PtxConv1DKernel.EmitPtx(8, 6, Conv1D);
+        expected.Add(new ExpectedArtifact(
+            PtxConv1DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv1D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(conv1dPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(conv1dPtx, 8, 6)));
+
+        string conv3dPtx = PtxConv3DKernel.EmitPtx(8, 6, Conv3D);
+        expected.Add(new ExpectedArtifact(
+            PtxConv3DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv3D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(conv3dPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(conv3dPtx, 8, 6)));
+
+        string convTransposePtx = PtxConvTranspose2DKernel.EmitPtx(8, 6, ConvTranspose2D);
+        expected.Add(new ExpectedArtifact(
+            PtxConvTranspose2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose2D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(convTransposePtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(convTransposePtx, 8, 6)));
         return expected;
     }
 

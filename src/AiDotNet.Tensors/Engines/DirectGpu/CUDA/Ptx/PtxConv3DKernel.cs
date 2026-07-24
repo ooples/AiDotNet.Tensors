@@ -6,6 +6,20 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
+/// Shape identity for <see cref="PtxConv3DKernel"/> enabling device-free PTX/blueprint re-emit.
+/// </summary>
+internal readonly record struct Conv3DShape(
+    int Batch, int InputChannels, int OutputChannels, int Depth, int Height, int Width,
+    int KernelD, int KernelH, int KernelW, int Stride, int Padding, bool Relu)
+{
+    internal int OutD => (Depth + 2 * Padding - KernelD) / Stride + 1;
+    internal int OutH => (Height + 2 * Padding - KernelH) / Stride + 1;
+    internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
+    internal string Entry => FormattableString.Invariant(
+        $"aidotnet_conv3d_n{Batch}_c{InputChannels}_k{OutputChannels}_d{Depth}_h{Height}_w{Width}_kd{KernelD}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}{(Relu ? "_relu" : "")}");
+}
+
+/// <summary>
 /// Direct-PTX native Conv3D forward with per-output-channel bias and optional ReLU:
 /// out[n,k,od,oh,ow] = relu(bias[k] + sum_{c,kd,kh,kw} W[k,c,kd,kh,kw] *
 /// in[n,c,od*s+kd-pad, oh*s+kh-pad, ow*s+kw-pad]). General kernel extent / stride /
@@ -44,8 +58,8 @@ internal sealed class PtxConv3DKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutD * OutH * OutW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_conv3d_n{Batch}_c{InputChannels}_k{OutputChannels}_d{Depth}_h{Height}_w{Width}_kd{KernelD}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}{(Relu ? "_relu" : "")}");
+    internal Conv3DShape Shape => new(Batch, InputChannels, OutputChannels, Depth, Height, Width, KernelD, KernelH, KernelW, Stride, Padding, Relu);
+    internal string EntryPoint => Shape.Entry;
 
     internal PtxConv3DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -63,8 +77,9 @@ internal sealed class PtxConv3DKernel : IDisposable
         if ((long)batch * outputChannels * OutD * OutH * OutW % BlockThreads != 0)
             throw new ArgumentException($"N*K*OD*OH*OW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Conv3DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -73,8 +88,13 @@ internal sealed class PtxConv3DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, Conv3DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Depth = shape.Depth, Height = shape.Height, Width = shape.Width;
+        int KernelD = shape.KernelD, KernelH = shape.KernelH, KernelW = shape.KernelW, Stride = shape.Stride, Padding = shape.Padding;
+        bool Relu = shape.Relu;
+        int OutD = shape.OutD, OutH = shape.OutH, OutW = shape.OutW;
         // DirectPtxExtent is rank <= 4; collapse the leading dims (byte-length ABI only,
         // the emitter computes true 5D NCDHW offsets on the flat buffer).
         var input = new DirectPtxExtent(Batch, InputChannels * Depth, Height, Width);
@@ -120,14 +140,16 @@ internal sealed class PtxConv3DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, Conv3DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 Conv3D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, d = Depth, h = Height, w = Width;
-        int kd = KernelD, khh = KernelH, kw = KernelW;
-        int od = OutD, oh = OutH, ow = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        bool Relu = shape.Relu;
+        int c = shape.InputChannels, k = shape.OutputChannels, d = shape.Depth, h = shape.Height, w = shape.Width;
+        int kd = shape.KernelD, khh = shape.KernelH, kw = shape.KernelW;
+        int od = shape.OutD, oh = shape.OutH, ow = shape.OutW;
         int dhw = d * h * w, hw = h * w;
         int odohow = od * oh * ow, ohow = oh * ow;
         int cdhw = c * dhw;                              // input batch stride
@@ -135,7 +157,7 @@ internal sealed class PtxConv3DKernel : IDisposable
         int ckdkhkw = c * kd * khh * kw;                 // weight output-channel stride
         int kdkhkw = kd * khh * kw;
         int khkw = khh * kw;
-        string entry = EntryPoint;
+        string entry = shape.Entry;
 
         var s = new StringBuilder(24576);
         s.AppendLine(".version 7.1");

@@ -6,6 +6,19 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
+/// Shape identity for <see cref="PtxConvTranspose2DKernel"/> enabling device-free re-emit.
+/// </summary>
+internal readonly record struct ConvTranspose2DShape(
+    int Batch, int InputChannels, int OutputChannels, int Height, int Width,
+    int KernelH, int KernelW, int Stride, int Padding, int OutputPadding, bool Relu)
+{
+    internal int OutHeight => (Height - 1) * Stride - 2 * Padding + KernelH + OutputPadding;
+    internal int OutWidth => (Width - 1) * Stride - 2 * Padding + KernelW + OutputPadding;
+    internal string Entry => FormattableString.Invariant(
+        $"aidotnet_convtranspose2d_n{Batch}_ci{InputChannels}_co{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}{(Relu ? "_relu" : "")}");
+}
+
+/// <summary>
 /// Direct-PTX ConvTranspose2D (transposed convolution) forward with per-output-channel
 /// bias and optional ReLU. Weights are IOHW [Cin, Cout, KH, KW]; output is
 /// out[n,co,oh,ow] = relu(bias[co] + sum over (ci,kh,kw) with ih=(oh+pad-kh)/stride and
@@ -44,8 +57,8 @@ internal sealed class PtxConvTranspose2DKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutHeight * OutWidth * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_convtranspose2d_n{Batch}_ci{InputChannels}_co{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}{(Relu ? "_relu" : "")}");
+    internal ConvTranspose2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, OutputPadding, Relu);
+    internal string EntryPoint => Shape.Entry;
 
     internal PtxConvTranspose2DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -63,8 +76,9 @@ internal sealed class PtxConvTranspose2DKernel : IDisposable
         if ((long)batch * outputChannels * OutHeight * OutWidth % BlockThreads != 0)
             throw new ArgumentException($"N*Cout*OH*OW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        ConvTranspose2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -73,8 +87,13 @@ internal sealed class PtxConvTranspose2DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, ConvTranspose2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutputPadding = shape.OutputPadding;
+        bool Relu = shape.Relu;
+        int OutHeight = shape.OutHeight, OutWidth = shape.OutWidth;
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var weight = new DirectPtxExtent(InputChannels, OutputChannels, KernelH, KernelW);
         var bias = new DirectPtxExtent(OutputChannels);
@@ -89,7 +108,7 @@ internal sealed class PtxConvTranspose2DKernel : IDisposable
                 new("bias", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector, bias, bias, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Nchw, output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(MaxRegistersPerThread: 48, MaxStaticSharedBytes: 0, MaxLocalBytesPerThread: 0, MinBlocksPerMultiprocessor: 2),
+            ResourceBudget: new DirectPtxResourceBudget(MaxRegistersPerThread: 56, MaxStaticSharedBytes: 0, MaxLocalBytesPerThread: 0, MinBlocksPerMultiprocessor: 2),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["equation"] = "out[n,co,oh,ow] = " + (Relu ? "relu(" : "(") + "bias[co] + sum input[n,ci,(oh+pad-kh)/s,(ow+pad-kw)/s]*W[ci,co,kh,kw])",
@@ -118,15 +137,17 @@ internal sealed class PtxConvTranspose2DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, ConvTranspose2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 ConvTranspose2D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int ci = InputChannels, co = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW;
-        int oh = OutHeight, ow = OutWidth;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        bool Relu = shape.Relu;
+        int ci = shape.InputChannels, co = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW;
+        int oh = shape.OutHeight, ow = shape.OutWidth;
         int hw = h * w, cohw = co * oh * ow, cihw = ci * hw, cokk = co * kh * kw, khkw = kh * kw;
-        string entry = EntryPoint;
+        string entry = shape.Entry;
 
         var s = new StringBuilder(16384);
         s.AppendLine(".version 7.1");
