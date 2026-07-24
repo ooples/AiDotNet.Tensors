@@ -200,6 +200,24 @@ internal static class DirectPtxConvolutionArtifactTool
             DeformableSpatial.Stride, DeformableSpatial.Padding))
             Export(deformBwMask.Audit, outputDirectory, exported, manifest);
 
+        using (var gDeformFwd = new PtxDeformableConv2DGroupedForwardKernel(
+            runtime, GroupedDeform.Batch, GroupedDeform.InputChannels, GroupedDeform.OutputChannels,
+            GroupedDeform.Height, GroupedDeform.Width, GroupedDeform.KernelH, GroupedDeform.KernelW,
+            GroupedDeform.Stride, GroupedDeform.Padding, GroupedDeform.DeformGroups))
+            Export(gDeformFwd.Audit, outputDirectory, exported, manifest);
+
+        using (var gDeformBwIn = new PtxDeformableConv2DGroupedBackwardInputKernel(
+            runtime, GroupedDeform.Batch, GroupedDeform.InputChannels, GroupedDeform.OutputChannels,
+            GroupedDeform.Height, GroupedDeform.Width, GroupedDeform.KernelH, GroupedDeform.KernelW,
+            GroupedDeform.Stride, GroupedDeform.Padding, GroupedDeform.DeformGroups))
+            Export(gDeformBwIn.Audit, outputDirectory, exported, manifest);
+
+        using (var gDeformBwW = new PtxDeformableConv2DGroupedBackwardWeightKernel(
+            runtime, GroupedDeform.Batch, GroupedDeform.InputChannels, GroupedDeform.OutputChannels,
+            GroupedDeform.Height, GroupedDeform.Width, GroupedDeform.KernelH, GroupedDeform.KernelW,
+            GroupedDeform.Stride, GroupedDeform.Padding, GroupedDeform.DeformGroups))
+            Export(gDeformBwW.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -330,6 +348,8 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly DeformableConv2DShape Deformable = new(2, 3, 4, 8, 8, 3, 3, 1, 1);
     // offset/mask require N*Taps*OH*OW % 256 == 0 (Taps=9 coprime to 256 -> N*OH*OW % 256): OH=8,OW=16 -> 2*9*128=2304.
     private static readonly DeformableConv2DShape DeformableSpatial = new(2, 3, 4, 8, 16, 3, 3, 1, 1);
+    private static readonly GroupedDeformableConv2DShape GroupedDeform = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 2);
+    private static readonly GroupedDeformableConv2DShape GroupedDeformSpatial = new(2, 4, 4, 8, 16, 3, 3, 1, 1, 2);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -519,6 +539,24 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxDeformableConv2DBackwardMaskKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DeformableSpatial).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(deformBwMaskPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(deformBwMaskPtx, 8, 6)));
+
+        string gDeformFwdPtx = PtxDeformableConv2DGroupedForwardKernel.EmitPtx(8, 6, GroupedDeform);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DGroupedForwardKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeform).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformFwdPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformFwdPtx, 8, 6)));
+
+        string gDeformBwInPtx = PtxDeformableConv2DGroupedBackwardInputKernel.EmitPtx(8, 6, GroupedDeform);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DGroupedBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeform).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformBwInPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformBwInPtx, 8, 6)));
+
+        string gDeformBwWPtx = PtxDeformableConv2DGroupedBackwardWeightKernel.EmitPtx(8, 6, GroupedDeform);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DGroupedBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeform).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformBwWPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformBwWPtx, 8, 6)));
         return expected;
     }
 

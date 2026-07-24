@@ -14,6 +14,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// Zero-padded 4-corner bilinear. One thread per output element; consecutive ow -> coalesced
 /// offset/mask reads. Bounds-guarded ceil-div grid. dg=1 reproduces the single-group kernel.
 /// </summary>
+/// <summary>Shared geometry for the grouped DCNv2 (deform_groups) kernels (device-free re-emit).</summary>
+internal readonly record struct GroupedDeformableConv2DShape(
+    int Batch, int InputChannels, int OutputChannels, int Height, int Width,
+    int KernelH, int KernelW, int Stride, int Padding, int DeformGroups)
+{
+    internal int OutH => (Height + 2 * Padding - KernelH) / Stride + 1;
+    internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
+    internal int Taps => KernelH * KernelW;
+    internal int ChannelsPerGroup => InputChannels / DeformGroups;
+}
+
 internal sealed class PtxDeformableConv2DGroupedForwardKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -47,8 +58,10 @@ internal sealed class PtxDeformableConv2DGroupedForwardKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_deform_grouped_fwd_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_dg{DeformGroups}");
+    internal GroupedDeformableConv2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, DeformGroups);
+    internal static string EntryFor(GroupedDeformableConv2DShape s) => FormattableString.Invariant(
+        $"aidotnet_deform_grouped_fwd_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}_dg{s.DeformGroups}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDeformableConv2DGroupedForwardKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -64,8 +77,9 @@ internal sealed class PtxDeformableConv2DGroupedForwardKernel : IDisposable
         Height = height; Width = width; KernelH = kernelH; KernelW = kernelW; Stride = stride; Padding = padding; DeformGroups = deformGroups;
         if (OutH <= 0 || OutW <= 0) throw new ArgumentException("Non-positive output spatial.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        GroupedDeformableConv2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -74,8 +88,12 @@ internal sealed class PtxDeformableConv2DGroupedForwardKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, GroupedDeformableConv2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, DeformGroups = shape.DeformGroups;
+        int OutH = shape.OutH, OutW = shape.OutW, Taps = shape.Taps, ChannelsPerGroup = shape.ChannelsPerGroup;
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var weight = new DirectPtxExtent(OutputChannels, InputChannels, KernelH, KernelW);
         var offset = new DirectPtxExtent(Batch, DeformGroups * 2 * Taps, OutH, OutW);
@@ -126,16 +144,17 @@ internal sealed class PtxDeformableConv2DGroupedForwardKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, GroupedDeformableConv2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 grouped Deformable forward emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding, KernelH = shape.KernelH, DeformGroups = shape.DeformGroups;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int taps = KernelH * kw, hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow, ckk = c * taps;
         int offN = DeformGroups * 2 * taps * ohow, maskN = DeformGroups * taps * ohow;
-        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = ChannelsPerGroup, total = TotalThreads;
-        string entry = EntryPoint;
+        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = shape.ChannelsPerGroup, total = shape.Batch * k * ohow;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(45056);
         s.AppendLine(".version 7.1");
@@ -307,8 +326,10 @@ internal sealed class PtxDeformableConv2DGroupedBackwardInputKernel : IDisposabl
     internal long GradOutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
     internal long GradInputBytes => (long)Batch * InputChannels * Height * Width * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_deform_grouped_bwd_input_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_dg{DeformGroups}");
+    internal GroupedDeformableConv2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, DeformGroups);
+    internal static string EntryFor(GroupedDeformableConv2DShape s) => FormattableString.Invariant(
+        $"aidotnet_deform_grouped_bwd_input_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}_dg{s.DeformGroups}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDeformableConv2DGroupedBackwardInputKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -324,8 +345,9 @@ internal sealed class PtxDeformableConv2DGroupedBackwardInputKernel : IDisposabl
         Height = height; Width = width; KernelH = kernelH; KernelW = kernelW; Stride = stride; Padding = padding; DeformGroups = deformGroups;
         if (OutH <= 0 || OutW <= 0) throw new ArgumentException("Non-positive output spatial.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        GroupedDeformableConv2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -334,8 +356,12 @@ internal sealed class PtxDeformableConv2DGroupedBackwardInputKernel : IDisposabl
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, GroupedDeformableConv2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, DeformGroups = shape.DeformGroups;
+        int OutH = shape.OutH, OutW = shape.OutW, Taps = shape.Taps, ChannelsPerGroup = shape.ChannelsPerGroup;
         var weight = new DirectPtxExtent(OutputChannels, InputChannels, KernelH, KernelW);
         var offset = new DirectPtxExtent(Batch, DeformGroups * 2 * Taps, OutH, OutW);
         var mask = new DirectPtxExtent(Batch, DeformGroups * Taps, OutH, OutW);
@@ -382,16 +408,17 @@ internal sealed class PtxDeformableConv2DGroupedBackwardInputKernel : IDisposabl
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, GroupedDeformableConv2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 grouped Deformable backward-input emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding, KernelH = shape.KernelH, DeformGroups = shape.DeformGroups;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int taps = KernelH * kw, hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow, ckk = c * taps;
         int offN = DeformGroups * 2 * taps * ohow, maskN = DeformGroups * taps * ohow;
-        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = ChannelsPerGroup, total = TotalThreads;
-        string entry = EntryPoint;
+        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = shape.ChannelsPerGroup, total = shape.Batch * c * ohow;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(45056);
         s.AppendLine(".version 7.1");
@@ -560,8 +587,10 @@ internal sealed class PtxDeformableConv2DGroupedBackwardWeightKernel : IDisposab
     internal long GradOutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
     internal long GradWeightBytes => (long)TotalWeights * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_deform_grouped_bwd_weight_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_dg{DeformGroups}");
+    internal GroupedDeformableConv2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, DeformGroups);
+    internal static string EntryFor(GroupedDeformableConv2DShape s) => FormattableString.Invariant(
+        $"aidotnet_deform_grouped_bwd_weight_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}_dg{s.DeformGroups}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDeformableConv2DGroupedBackwardWeightKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -577,8 +606,9 @@ internal sealed class PtxDeformableConv2DGroupedBackwardWeightKernel : IDisposab
         Height = height; Width = width; KernelH = kernelH; KernelW = kernelW; Stride = stride; Padding = padding; DeformGroups = deformGroups;
         if (OutH <= 0 || OutW <= 0) throw new ArgumentException("Non-positive output spatial.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        GroupedDeformableConv2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -587,8 +617,12 @@ internal sealed class PtxDeformableConv2DGroupedBackwardWeightKernel : IDisposab
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, GroupedDeformableConv2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, DeformGroups = shape.DeformGroups;
+        int OutH = shape.OutH, OutW = shape.OutW, Taps = shape.Taps, ChannelsPerGroup = shape.ChannelsPerGroup;
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var offset = new DirectPtxExtent(Batch, DeformGroups * 2 * Taps, OutH, OutW);
         var mask = new DirectPtxExtent(Batch, DeformGroups * Taps, OutH, OutW);
@@ -635,16 +669,17 @@ internal sealed class PtxDeformableConv2DGroupedBackwardWeightKernel : IDisposab
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, GroupedDeformableConv2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 grouped Deformable backward-weight emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding, KernelH = shape.KernelH, DeformGroups = shape.DeformGroups, Batch = shape.Batch;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int taps = KernelH * kw, hw = h * w, ohow = ohh * oww;
         int offN = DeformGroups * 2 * taps * ohow, maskN = DeformGroups * taps * ohow;
-        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = ChannelsPerGroup, total = TotalWeights;
-        string entry = EntryPoint;
+        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = shape.ChannelsPerGroup, total = k * c * taps;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(36864);
         s.AppendLine(".version 7.1");
