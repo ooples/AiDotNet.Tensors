@@ -1710,6 +1710,115 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void Im2colKNFp16_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 4, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1;
+        int patchRows = c * kh * kw, cols = oh * ow;
+        var input = new float[n * c * h * w];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        var expected = new float[n * patchRows * cols];
+        for (int b = 0; b < n; b++)
+            for (int ic = 0; ic < c; ic++)
+                for (int r = 0; r < kh; r++)
+                    for (int t = 0; t < kw; t++)
+                        for (int y = 0; y < oh; y++)
+                            for (int x = 0; x < ow; x++)
+                            {
+                                int ih = y * stride + r - pad, iw = x * stride + t - pad;
+                                float v = 0;
+                                if (ih >= 0 && ih < h && iw >= 0 && iw < w) v = input[((b * c + ic) * h + ih) * w + iw];
+                                expected[(b * patchRows + (ic * kh * kw + r * kw + t)) * cols + (y * ow + x)] = (float)(Half)v;
+                            }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxUnfold2DFp16Kernel(runtime, n, c, h, w, kh, kw, stride, pad);
+            using var dInput = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dOut = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dInput.Upload<float>(input);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dInput, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dOut, kernel.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            var raw = new ushort[n * patchRows * cols];
+            dOut.Download<ushort>(raw);
+            var actual = new float[raw.Length];
+            for (int i = 0; i < raw.Length; i++) actual[i] = (float)BitConverter.UInt16BitsToHalf(raw[i]);
+            AssertClose(expected, actual, 1e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void Conv2dDirectFp16Hw_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 4, k = 8, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1;
+        var input = new float[n * c * h * w];
+        var wHalf = new ushort[k * c * kh * kw];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < wHalf.Length; i++) wHalf[i] = BitConverter.HalfToUInt16Bits((Half)DeterministicWeight(i));
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        var expected = new float[n * k * oh * ow];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int y = 0; y < oh; y++)
+                    for (int x = 0; x < ow; x++)
+                    {
+                        double acc = bias[oc];
+                        for (int ic = 0; ic < c; ic++)
+                            for (int r = 0; r < kh; r++)
+                                for (int t = 0; t < kw; t++)
+                                {
+                                    int ih = y * stride + r - pad, iw = x * stride + t - pad;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                    float iv = (float)(Half)input[((b * c + ic) * h + ih) * w + iw];
+                                    float wv = (float)BitConverter.UInt16BitsToHalf(wHalf[((oc * c + ic) * kh + r) * kw + t]);
+                                    acc += (double)iv * wv;
+                                }
+                        expected[((b * k + oc) * oh + y) * ow + x] = (float)Math.Max(acc, 0.0);
+                    }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxConv2DDirectFp16Kernel(runtime, n, c, k, h, w, kh, kw, stride, pad, relu: true);
+            using var dInput = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dBias = runtime.AllocateBytes((nuint)kernel.BiasBytes);
+            using var dOut = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dInput.Upload<float>(input); dW.Upload<ushort>(wHalf); dBias.Upload<float>(bias);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dInput, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dBias, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dOut, kernel.Blueprint.Tensors[3]));
+            runtime.Synchronize();
+            var actual = new float[n * k * oh * ow];
+            dOut.Download<float>(actual);
+            AssertClose(expected, actual, 3e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DumpWinogradPtxForSassAnalysis()
     {
         string dir = Environment.GetEnvironmentVariable("PTX_DUMP_DIR");
