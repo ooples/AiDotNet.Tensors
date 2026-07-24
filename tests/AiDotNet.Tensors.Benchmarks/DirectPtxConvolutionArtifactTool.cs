@@ -218,6 +218,18 @@ internal static class DirectPtxConvolutionArtifactTool
             GroupedDeform.Stride, GroupedDeform.Padding, GroupedDeform.DeformGroups))
             Export(gDeformBwW.Audit, outputDirectory, exported, manifest);
 
+        using (var gDeformBwOff = new PtxDeformableConv2DGroupedBackwardOffsetKernel(
+            runtime, GroupedDeformSpatial.Batch, GroupedDeformSpatial.InputChannels, GroupedDeformSpatial.OutputChannels,
+            GroupedDeformSpatial.Height, GroupedDeformSpatial.Width, GroupedDeformSpatial.KernelH, GroupedDeformSpatial.KernelW,
+            GroupedDeformSpatial.Stride, GroupedDeformSpatial.Padding, GroupedDeformSpatial.DeformGroups))
+            Export(gDeformBwOff.Audit, outputDirectory, exported, manifest);
+
+        using (var gDeformBwMask = new PtxDeformableConv2DGroupedBackwardMaskKernel(
+            runtime, GroupedDeformSpatial.Batch, GroupedDeformSpatial.InputChannels, GroupedDeformSpatial.OutputChannels,
+            GroupedDeformSpatial.Height, GroupedDeformSpatial.Width, GroupedDeformSpatial.KernelH, GroupedDeformSpatial.KernelW,
+            GroupedDeformSpatial.Stride, GroupedDeformSpatial.Padding, GroupedDeformSpatial.DeformGroups))
+            Export(gDeformBwMask.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -557,6 +569,18 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxDeformableConv2DGroupedBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeform).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformBwWPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformBwWPtx, 8, 6)));
+
+        string gDeformBwOffPtx = PtxDeformableConv2DGroupedBackwardOffsetKernel.EmitPtx(8, 6, GroupedDeformSpatial);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DGroupedBackwardOffsetKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeformSpatial).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformBwOffPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformBwOffPtx, 8, 6)));
+
+        string gDeformBwMaskPtx = PtxDeformableConv2DGroupedBackwardMaskKernel.EmitPtx(8, 6, GroupedDeformSpatial);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DGroupedBackwardMaskKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeformSpatial).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformBwMaskPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformBwMaskPtx, 8, 6)));
         return expected;
     }
 
