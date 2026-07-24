@@ -14,6 +14,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// index (ow-fast) so at stride 1 the input reads and the column stores coalesce
 /// (the contiguous NCHW / column axis) -- the coalescing lesson on a pure gather.
 /// </summary>
+/// <summary>Shape identity for <see cref="PtxUnfold2DKernel"/> for device-free re-emit.</summary>
+internal readonly record struct Unfold2DShape(
+    int Batch, int Channels, int Height, int Width, int KernelH, int KernelW, int Stride, int Padding)
+{
+    internal int OutH => (Height + 2 * Padding - KernelH) / Stride + 1;
+    internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
+    internal int PatchRows => Channels * KernelH * KernelW;
+    internal int Columns => OutH * OutW;
+    internal string Entry => FormattableString.Invariant(
+        $"aidotnet_unfold2d_n{Batch}_c{Channels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}");
+}
+
 internal sealed class PtxUnfold2DKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -40,8 +52,8 @@ internal sealed class PtxUnfold2DKernel : IDisposable
     internal long InputBytes => (long)Batch * Channels * Height * Width * sizeof(float);
     internal long OutputBytes => (long)Batch * PatchRows * Columns * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_unfold2d_n{Batch}_c{Channels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}");
+    internal Unfold2DShape Shape => new(Batch, Channels, Height, Width, KernelH, KernelW, Stride, Padding);
+    internal string EntryPoint => Shape.Entry;
 
     internal PtxUnfold2DKernel(
         DirectPtxRuntime runtime, int batch, int channels, int height, int width, int kernelH, int kernelW, int stride, int padding)
@@ -57,8 +69,9 @@ internal sealed class PtxUnfold2DKernel : IDisposable
         if ((long)batch * PatchRows * Columns % BlockThreads != 0)
             throw new ArgumentException($"N*(C*KH*KW)*(OH*OW) must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Unfold2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -67,8 +80,11 @@ internal sealed class PtxUnfold2DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, Unfold2DShape shape)
     {
+        int Batch = shape.Batch, Channels = shape.Channels, Height = shape.Height, Width = shape.Width;
+        int KernelH = shape.KernelH, KernelW = shape.KernelW, Stride = shape.Stride, Padding = shape.Padding;
+        int PatchRows = shape.PatchRows, Columns = shape.Columns;
         var input = new DirectPtxExtent(Batch, Channels, Height, Width);
         var output = new DirectPtxExtent(Batch, PatchRows, Columns);
         return new DirectPtxKernelBlueprint(
@@ -106,15 +122,16 @@ internal sealed class PtxUnfold2DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, Unfold2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 Unfold2D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = Channels, h = Height, w = Width, kh = KernelH, kw = KernelW, ohh = OutH, oww = OutW;
-        int patchRows = PatchRows, cols = Columns, khkw = kh * kw, hw = h * w, chw = c * hw;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        int c = shape.Channels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
+        int patchRows = shape.PatchRows, cols = shape.Columns, khkw = kh * kw, hw = h * w, chw = c * hw;
         int prc = patchRows * cols;                     // per-batch output stride
-        string entry = EntryPoint;
+        string entry = shape.Entry;
 
         var s = new StringBuilder(12288);
         s.AppendLine(".version 7.1");

@@ -83,6 +83,14 @@ internal static class DirectPtxConvolutionArtifactTool
             ConvTranspose2D.Stride, ConvTranspose2D.Padding, ConvTranspose2D.OutputPadding, ConvTranspose2D.Relu))
             Export(convTranspose.Audit, outputDirectory, exported, manifest);
 
+        using (var depthwise = new PtxDepthwiseConv2D3x3Kernel(runtime, DwN, DwC, DwH, DwW, DwRelu))
+            Export(depthwise.Audit, outputDirectory, exported, manifest);
+
+        using (var unfold = new PtxUnfold2DKernel(
+            runtime, Unfold2D.Batch, Unfold2D.Channels, Unfold2D.Height, Unfold2D.Width,
+            Unfold2D.KernelH, Unfold2D.KernelW, Unfold2D.Stride, Unfold2D.Padding))
+            Export(unfold.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -199,6 +207,9 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly Conv1DShape Conv1D = new(2, 3, 4, 32, 3, 1, 1, true);
     private static readonly Conv3DShape Conv3D = new(2, 2, 4, 8, 8, 8, 3, 3, 3, 1, 1, true);
     private static readonly ConvTranspose2DShape ConvTranspose2D = new(2, 3, 4, 4, 4, 3, 3, 2, 1, 1, true);
+    private const int DwN = 2, DwC = 8, DwH = 8, DwW = 8;
+    private const bool DwRelu = true;
+    private static readonly Unfold2DShape Unfold2D = new(2, 4, 8, 8, 3, 3, 1, 1);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -244,6 +255,18 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxConvTranspose2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose2D).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(convTransposePtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(convTransposePtx, 8, 6)));
+
+        string depthwisePtx = PtxDepthwiseConv2D3x3Kernel.EmitPtx(8, 6, DwN, DwC, DwH, DwW, DwRelu);
+        expected.Add(new ExpectedArtifact(
+            PtxDepthwiseConv2D3x3Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DwN, DwC, DwH, DwW, DwRelu).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(depthwisePtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(depthwisePtx, 8, 6)));
+
+        string unfoldPtx = PtxUnfold2DKernel.EmitPtx(8, 6, Unfold2D);
+        expected.Add(new ExpectedArtifact(
+            PtxUnfold2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Unfold2D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(unfoldPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(unfoldPtx, 8, 6)));
         return expected;
     }
 
