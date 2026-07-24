@@ -302,6 +302,20 @@ public static class PtxParityRegistry
             "slower than cuDNN. Keep deferred/unpromoted until the optimized layout (precomputed filter " +
             "transform + register-blocked batched 16-GEMM + input-transform reuse) clears the >=1.10x gate."),
 
+        new PtxParitySpec("PtxUnfold2DFp16Kernel", PtxParityStatus.Deferred,
+            "Fused im2col + FP16 conversion (Im2colKNFp16) direct-PTX (#841 FP16 family)",
+            "columns_fp16[n,c*KH*KW+kh*KW+kw,oh*OW+ow] = fp16(input[n,c,oh*s+kh-pad,ow*s+kw-pad]); prepares the " +
+            "KxN half operand for a Tensor-Core GEMM. Thread-per-output with consecutive spatial index -> coalesced " +
+            "input reads + fp16 column stores at stride 1. Verified on-device (<= 1e-3 vs fp16-rounded CPU reference). " +
+            "Deferred."),
+
+        new PtxParitySpec("PtxConv2DDirectFp16Kernel", PtxParityStatus.Deferred,
+            "Half-weight direct Conv2D (Conv2dDirectFp16Hw) direct-PTX (#841 FP16 family)",
+            "out[n,k,oh,ow] = relu(bias[k] + sum_{c,kh,kw} f16(W[k,c,kh,kw])*f16(in[n,c,oh*s+kh-pad,ow*s+kw-pad])) " +
+            "with FP32 accumulation; general kernel/stride/padding. FP16 OIHW weights, FP32 input rounded to FP16 " +
+            "before the multiply. Thread-per-output with consecutive ow -> coalesced in/out; fp16 weights broadcast. " +
+            "Verified on-device (<= 3e-3 vs fp16-rounded CPU reference). Deferred."),
+
         new PtxParitySpec("PtxUnfold2DKernel", PtxParityStatus.Deferred,
             "Unfold / im2col patch extraction direct-PTX (#841 unfold family)",
             "columns[n,c*KH*KW+kh*KW+kw,oh*OW+ow] = input[n,c,oh*s+kh-pad,ow*s+kw-pad] (0 outside padded input); " +
