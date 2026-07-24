@@ -1075,6 +1075,148 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void DepthwiseConv2D3x3_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 8, h = 8, w = 8;   // N*C*H*W = 1024
+        var input = new float[n * c * h * w];
+        var weights = new float[c * 9];
+        var bias = new float[c];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        var expected = new float[n * c * h * w];
+        for (int b = 0; b < n; b++)
+            for (int ch = 0; ch < c; ch++)
+                for (int oh = 0; oh < h; oh++)
+                    for (int ow = 0; ow < w; ow++)
+                    {
+                        double acc = bias[ch];
+                        for (int r = 0; r < 3; r++)
+                            for (int sK = 0; sK < 3; sK++)
+                            {
+                                int ih = oh + r - 1, iw = ow + sK - 1;
+                                if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                acc += (double)input[((b * c + ch) * h + ih) * w + iw] * weights[ch * 9 + r * 3 + sK];
+                            }
+                        expected[((b * c + ch) * h + oh) * w + ow] = (float)Math.Max(acc, 0.0);
+                    }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDepthwiseConv2D3x3Kernel(runtime, n, c, h, w, relu: true);
+            using var dInput = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dBias = runtime.AllocateBytes((nuint)kernel.BiasBytes);
+            using var dOut = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dInput.Upload<float>(input);
+            dW.Upload<float>(weights);
+            dBias.Upload<float>(bias);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dInput, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dBias, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dOut, kernel.Blueprint.Tensors[3]));
+            runtime.Synchronize();
+            var actual = new float[n * c * h * w];
+            dOut.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void DepthwiseConv2D3x3Backward_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 8, h = 8, w = 8;
+        var input = new float[n * c * h * w];
+        var grad = new float[n * c * h * w];
+        var weights = new float[c * 9];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicWeight(i) - 0.1f;
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicBias(i) + 0.3f;
+        // CPU oracles
+        var expDx = new float[n * c * h * w];
+        var expDw = new float[c * 9];
+        for (int b = 0; b < n; b++)
+            for (int ch = 0; ch < c; ch++)
+                for (int ih = 0; ih < h; ih++)
+                    for (int iw = 0; iw < w; iw++)
+                    {
+                        double acc = 0;
+                        for (int r = 0; r < 3; r++)
+                            for (int sK = 0; sK < 3; sK++)
+                            {
+                                int oh = ih - r + 1, ow = iw - sK + 1;
+                                if (oh < 0 || oh >= h || ow < 0 || ow >= w) continue;
+                                acc += (double)weights[ch * 9 + r * 3 + sK] * grad[((b * c + ch) * h + oh) * w + ow];
+                            }
+                        expDx[((b * c + ch) * h + ih) * w + iw] = (float)acc;
+                    }
+        for (int ch = 0; ch < c; ch++)
+            for (int r = 0; r < 3; r++)
+                for (int sK = 0; sK < 3; sK++)
+                {
+                    double acc = 0;
+                    for (int b = 0; b < n; b++)
+                        for (int oh = 0; oh < h; oh++)
+                            for (int ow = 0; ow < w; ow++)
+                            {
+                                int ih = oh + r - 1, iw = ow + sK - 1;
+                                if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                acc += (double)input[((b * c + ch) * h + ih) * w + iw] * grad[((b * c + ch) * h + oh) * w + ow];
+                            }
+                    expDw[ch * 9 + r * 3 + sK] = (float)acc;
+                }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var bin = new PtxDepthwiseConv2D3x3BackwardInputKernel(runtime, n, c, h, w);
+            using var dGrad = runtime.AllocateBytes((nuint)bin.GradOutputBytes);
+            using var dW = runtime.AllocateBytes((nuint)bin.WeightBytes);
+            using var dX = runtime.AllocateBytes((nuint)bin.GradInputBytes);
+            dGrad.Upload<float>(grad); dW.Upload<float>(weights);
+            bin.Launch(DirectPtxTensorView.CreateOwned(dGrad, bin.Blueprint.Tensors[0]),
+                       DirectPtxTensorView.CreateOwned(dW, bin.Blueprint.Tensors[1]),
+                       DirectPtxTensorView.CreateOwned(dX, bin.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actDx = new float[n * c * h * w];
+            dX.Download<float>(actDx);
+            AssertClose(expDx, actDx, 2e-3f);
+
+            using var bw = new PtxDepthwiseConv2D3x3BackwardWeightKernel(runtime, n, c, h, w);
+            using var dInput = runtime.AllocateBytes((nuint)bw.InputBytes);
+            using var dGrad2 = runtime.AllocateBytes((nuint)bw.GradOutputBytes);
+            using var dDw = runtime.AllocateBytes((nuint)bw.GradWeightBytes);
+            dInput.Upload<float>(input); dGrad2.Upload<float>(grad);
+            bw.Launch(DirectPtxTensorView.CreateOwned(dInput, bw.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dGrad2, bw.Blueprint.Tensors[1]),
+                      DirectPtxTensorView.CreateOwned(dDw, bw.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actDw = new float[c * 9];
+            dDw.Download<float>(actDw);
+            AssertClose(expDw, actDw, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DumpWinogradPtxForSassAnalysis()
     {
         string dir = Environment.GetEnvironmentVariable("PTX_DUMP_DIR");
