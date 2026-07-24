@@ -13,6 +13,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// output stores coalesce at stride 1 -- the native 1D depthwise layout instead of
 /// reshaping through Conv2D. Bounds-guarded ceil-div grid.
 /// </summary>
+/// <summary>Shared geometry for the depthwise Conv1D kernels (device-free re-emit).</summary>
+internal readonly record struct DepthwiseConv1DShape(
+    int Batch, int Channels, int Length, int KernelLength, int Stride, int Padding)
+{
+    internal int OutLength => (Length + 2 * Padding - KernelLength) / Stride + 1;
+}
+
 internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -36,8 +43,10 @@ internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
     internal long WeightBytes => (long)Channels * KernelLength * sizeof(float);
     internal long OutputBytes => (long)Batch * Channels * OutLength * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_dwconv1d_n{Batch}_c{Channels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}");
+    internal DepthwiseConv1DShape Shape => new(Batch, Channels, Length, KernelLength, Stride, Padding);
+    internal static string EntryFor(DepthwiseConv1DShape s) => FormattableString.Invariant(
+        $"aidotnet_dwconv1d_n{s.Batch}_c{s.Channels}_l{s.Length}_kl{s.KernelLength}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDepthwiseConv1DForwardKernel(
         DirectPtxRuntime runtime, int batch, int channels, int length, int kernelLength, int stride, int padding)
@@ -50,8 +59,9 @@ internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
         Batch = batch; Channels = channels; Length = length; KernelLength = kernelLength; Stride = stride; Padding = padding;
         if (OutLength <= 0) throw new ArgumentException("Non-positive output length.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        DepthwiseConv1DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -60,8 +70,10 @@ internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, DepthwiseConv1DShape shape)
     {
+        int Batch = shape.Batch, Channels = shape.Channels, Length = shape.Length, KernelLength = shape.KernelLength, Stride = shape.Stride, Padding = shape.Padding;
+        int OutLength = shape.OutLength;
         var input = new DirectPtxExtent(Batch, Channels, Length);
         var weight = new DirectPtxExtent(Channels, KernelLength);
         var output = new DirectPtxExtent(Batch, Channels, OutLength);
@@ -103,13 +115,14 @@ internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, DepthwiseConv1DShape shape)
     {
+        int Stride = shape.Stride, Padding = shape.Padding;
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 depthwise Conv1D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int cch = Channels, kl = KernelLength, l = Length, ol = OutLength, col = cch * ol, total = TotalThreads;
-        string entry = EntryPoint;
+        int cch = shape.Channels, kl = shape.KernelLength, l = shape.Length, ol = shape.OutLength, col = cch * ol, total = shape.Batch * shape.Channels * ol;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(8192);
         s.AppendLine(".version 7.1");
@@ -205,8 +218,10 @@ internal sealed class PtxDepthwiseConv1DBackwardInputKernel : IDisposable
     internal long WeightBytes => (long)Channels * KernelLength * sizeof(float);
     internal long GradInputBytes => (long)Batch * Channels * Length * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_dwconv1d_bwd_input_n{Batch}_c{Channels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}");
+    internal DepthwiseConv1DShape Shape => new(Batch, Channels, Length, KernelLength, Stride, Padding);
+    internal static string EntryFor(DepthwiseConv1DShape s) => FormattableString.Invariant(
+        $"aidotnet_dwconv1d_bwd_input_n{s.Batch}_c{s.Channels}_l{s.Length}_kl{s.KernelLength}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDepthwiseConv1DBackwardInputKernel(
         DirectPtxRuntime runtime, int batch, int channels, int length, int kernelLength, int stride, int padding)
@@ -219,8 +234,9 @@ internal sealed class PtxDepthwiseConv1DBackwardInputKernel : IDisposable
         Batch = batch; Channels = channels; Length = length; KernelLength = kernelLength; Stride = stride; Padding = padding;
         if (OutLength <= 0) throw new ArgumentException("Non-positive output length.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        DepthwiseConv1DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -229,8 +245,10 @@ internal sealed class PtxDepthwiseConv1DBackwardInputKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, DepthwiseConv1DShape shape)
     {
+        int Batch = shape.Batch, Channels = shape.Channels, Length = shape.Length, KernelLength = shape.KernelLength, Stride = shape.Stride, Padding = shape.Padding;
+        int OutLength = shape.OutLength;
         var grad = new DirectPtxExtent(Batch, Channels, OutLength);
         var weight = new DirectPtxExtent(Channels, KernelLength);
         var dx = new DirectPtxExtent(Batch, Channels, Length);
@@ -272,13 +290,14 @@ internal sealed class PtxDepthwiseConv1DBackwardInputKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, DepthwiseConv1DShape shape)
     {
+        int Stride = shape.Stride, Padding = shape.Padding;
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 depthwise Conv1D backward-input emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int cch = Channels, kl = KernelLength, l = Length, ol = OutLength, ccl = cch * l, total = TotalThreads;
-        string entry = EntryPoint;
+        int cch = shape.Channels, kl = shape.KernelLength, l = shape.Length, ol = shape.OutLength, ccl = cch * l, total = shape.Batch * shape.Channels * l;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(8192);
         s.AppendLine(".version 7.1");
@@ -377,8 +396,10 @@ internal sealed class PtxDepthwiseConv1DBackwardWeightKernel : IDisposable
     internal long InputBytes => (long)Batch * Channels * Length * sizeof(float);
     internal long GradWeightBytes => (long)Channels * KernelLength * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_dwconv1d_bwd_weight_n{Batch}_c{Channels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}");
+    internal DepthwiseConv1DShape Shape => new(Batch, Channels, Length, KernelLength, Stride, Padding);
+    internal static string EntryFor(DepthwiseConv1DShape s) => FormattableString.Invariant(
+        $"aidotnet_dwconv1d_bwd_weight_n{s.Batch}_c{s.Channels}_l{s.Length}_kl{s.KernelLength}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxDepthwiseConv1DBackwardWeightKernel(
         DirectPtxRuntime runtime, int batch, int channels, int length, int kernelLength, int stride, int padding)
@@ -391,8 +412,9 @@ internal sealed class PtxDepthwiseConv1DBackwardWeightKernel : IDisposable
         Batch = batch; Channels = channels; Length = length; KernelLength = kernelLength; Stride = stride; Padding = padding;
         if (OutLength <= 0) throw new ArgumentException("Non-positive output length.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        DepthwiseConv1DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -401,8 +423,10 @@ internal sealed class PtxDepthwiseConv1DBackwardWeightKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, DepthwiseConv1DShape shape)
     {
+        int Batch = shape.Batch, Channels = shape.Channels, Length = shape.Length, KernelLength = shape.KernelLength, Stride = shape.Stride, Padding = shape.Padding;
+        int OutLength = shape.OutLength;
         var grad = new DirectPtxExtent(Batch, Channels, OutLength);
         var input = new DirectPtxExtent(Batch, Channels, Length);
         var dw = new DirectPtxExtent(Channels, KernelLength);
@@ -444,13 +468,15 @@ internal sealed class PtxDepthwiseConv1DBackwardWeightKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, DepthwiseConv1DShape shape)
     {
+        int Stride = shape.Stride, Padding = shape.Padding;
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 depthwise Conv1D backward-weight emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int cch = Channels, kl = KernelLength, l = Length, ol = OutLength, total = TotalThreads;
-        string entry = EntryPoint;
+        int Batch = shape.Batch;
+        int cch = shape.Channels, kl = shape.KernelLength, l = shape.Length, ol = shape.OutLength, total = shape.Channels * shape.KernelLength;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(8192);
         s.AppendLine(".version 7.1");
