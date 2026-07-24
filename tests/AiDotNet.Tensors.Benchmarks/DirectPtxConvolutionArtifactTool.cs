@@ -135,6 +135,18 @@ internal static class DirectPtxConvolutionArtifactTool
             runtime, DwConv1D.Batch, DwConv1D.Channels, DwConv1D.Length, DwConv1D.KernelLength, DwConv1D.Stride, DwConv1D.Padding))
             Export(dwc1dBwW.Audit, outputDirectory, exported, manifest);
 
+        using (var ct2dBwIn = new PtxConvTranspose2DBackwardInputKernel(
+            runtime, ConvTranspose2DBackward.Batch, ConvTranspose2DBackward.InputChannels, ConvTranspose2DBackward.OutputChannels,
+            ConvTranspose2DBackward.Height, ConvTranspose2DBackward.Width, ConvTranspose2DBackward.KernelH, ConvTranspose2DBackward.KernelW,
+            ConvTranspose2DBackward.Stride, ConvTranspose2DBackward.Padding, ConvTranspose2DBackward.OutputPadding))
+            Export(ct2dBwIn.Audit, outputDirectory, exported, manifest);
+
+        using (var ct2dBwW = new PtxConvTranspose2DBackwardWeightKernel(
+            runtime, ConvTranspose2DBackward.Batch, ConvTranspose2DBackward.InputChannels, ConvTranspose2DBackward.OutputChannels,
+            ConvTranspose2DBackward.Height, ConvTranspose2DBackward.Width, ConvTranspose2DBackward.KernelH, ConvTranspose2DBackward.KernelW,
+            ConvTranspose2DBackward.Stride, ConvTranspose2DBackward.Padding, ConvTranspose2DBackward.OutputPadding))
+            Export(ct2dBwW.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -259,6 +271,7 @@ internal static class DirectPtxConvolutionArtifactTool
     private const int DwBwN = 2, DwBwC = 8, DwBwH = 8, DwBwW = 8;
     private static readonly Conv1DBackwardShape Conv1DBackward = new(2, 4, 4, 32, 3, 1, 1);
     private static readonly DepthwiseConv1DShape DwConv1D = new(2, 4, 32, 3, 1, 1);
+    private static readonly ConvTranspose2DBackwardShape ConvTranspose2DBackward = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 0);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -382,6 +395,18 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxDepthwiseConv1DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DwConv1D).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(dwc1dBwWPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(dwc1dBwWPtx, 8, 6)));
+
+        string ct2dBwInPtx = PtxConvTranspose2DBackwardInputKernel.EmitPtx(8, 6, ConvTranspose2DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConvTranspose2DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose2DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(ct2dBwInPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(ct2dBwInPtx, 8, 6)));
+
+        string ct2dBwWPtx = PtxConvTranspose2DBackwardWeightKernel.EmitPtx(8, 6, ConvTranspose2DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConvTranspose2DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose2DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(ct2dBwWPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(ct2dBwWPtx, 8, 6)));
         return expected;
     }
 

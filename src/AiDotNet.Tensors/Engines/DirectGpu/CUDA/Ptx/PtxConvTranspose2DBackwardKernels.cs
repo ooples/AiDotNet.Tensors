@@ -13,6 +13,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// consecutive threads own consecutive iw so gradOut reads and dInput stores coalesce at
 /// stride 1 and the weights broadcast across the warp.
 /// </summary>
+/// <summary>Shared geometry for the ConvTranspose2D backward kernels (device-free re-emit).</summary>
+internal readonly record struct ConvTranspose2DBackwardShape(
+    int Batch, int InputChannels, int OutputChannels, int Height, int Width,
+    int KernelH, int KernelW, int Stride, int Padding, int OutputPadding)
+{
+    internal int OutHeight => (Height - 1) * Stride - 2 * Padding + KernelH + OutputPadding;
+    internal int OutWidth => (Width - 1) * Stride - 2 * Padding + KernelW + OutputPadding;
+}
+
 internal sealed class PtxConvTranspose2DBackwardInputKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -40,8 +49,10 @@ internal sealed class PtxConvTranspose2DBackwardInputKernel : IDisposable
     internal long WeightBytes => (long)InputChannels * OutputChannels * KernelH * KernelW * sizeof(float);
     internal long GradInputBytes => (long)Batch * InputChannels * Height * Width * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_convtranspose2d_bwd_input_n{Batch}_ci{InputChannels}_co{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}");
+    internal ConvTranspose2DBackwardShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, OutputPadding);
+    internal static string EntryFor(ConvTranspose2DBackwardShape s) => FormattableString.Invariant(
+        $"aidotnet_convtranspose2d_bwd_input_n{s.Batch}_ci{s.InputChannels}_co{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}_op{s.OutputPadding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxConvTranspose2DBackwardInputKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -59,8 +70,9 @@ internal sealed class PtxConvTranspose2DBackwardInputKernel : IDisposable
         if ((long)batch * inputChannels * height * width % BlockThreads != 0)
             throw new ArgumentException($"N*Ci*H*W must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        ConvTranspose2DBackwardShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -69,8 +81,12 @@ internal sealed class PtxConvTranspose2DBackwardInputKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, ConvTranspose2DBackwardShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutputPadding = shape.OutputPadding;
+        int OutHeight = shape.OutHeight, OutWidth = shape.OutWidth;
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutHeight, OutWidth);
         var weight = new DirectPtxExtent(InputChannels, OutputChannels, KernelH, KernelW);
         var dx = new DirectPtxExtent(Batch, InputChannels, Height, Width);
@@ -111,15 +127,16 @@ internal sealed class PtxConvTranspose2DBackwardInputKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, ConvTranspose2DBackwardShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 ConvTranspose2D backward-input emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int ci = InputChannels, co = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutputPadding = shape.OutputPadding, Batch = shape.Batch, OutHeight = shape.OutHeight, OutWidth = shape.OutWidth;
+        int ci = shape.InputChannels, co = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW;
         int oh = OutHeight, ow = OutWidth;
         int hw = h * w, cihw = ci * hw, cohw = co * oh * ow, ohw = oh * ow, cokk = co * kh * kw, khkw = kh * kw;
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(16384);
         s.AppendLine(".version 7.1");
@@ -241,8 +258,10 @@ internal sealed class PtxConvTranspose2DBackwardWeightKernel : IDisposable
     internal long GradOutputBytes => (long)Batch * OutputChannels * OutHeight * OutWidth * sizeof(float);
     internal long GradWeightBytes => (long)InputChannels * OutputChannels * KernelH * KernelW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_convtranspose2d_bwd_weight_n{Batch}_ci{InputChannels}_co{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}");
+    internal ConvTranspose2DBackwardShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, OutputPadding);
+    internal static string EntryFor(ConvTranspose2DBackwardShape s) => FormattableString.Invariant(
+        $"aidotnet_convtranspose2d_bwd_weight_n{s.Batch}_ci{s.InputChannels}_co{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}_op{s.OutputPadding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxConvTranspose2DBackwardWeightKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -259,8 +278,9 @@ internal sealed class PtxConvTranspose2DBackwardWeightKernel : IDisposable
         Height = height; Width = width; KernelH = kernelH; KernelW = kernelW; Stride = stride; Padding = padding; OutputPadding = outputPadding;
         if (OutHeight <= 0 || OutWidth <= 0) throw new ArgumentException("Non-positive output spatial.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        ConvTranspose2DBackwardShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -269,8 +289,12 @@ internal sealed class PtxConvTranspose2DBackwardWeightKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, ConvTranspose2DBackwardShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutputPadding = shape.OutputPadding;
+        int OutHeight = shape.OutHeight, OutWidth = shape.OutWidth;
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutHeight, OutWidth);
         var dw = new DirectPtxExtent(InputChannels, OutputChannels, KernelH, KernelW);
@@ -310,15 +334,16 @@ internal sealed class PtxConvTranspose2DBackwardWeightKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, ConvTranspose2DBackwardShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 ConvTranspose2D backward-weight emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int ci = InputChannels, co = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutputPadding = shape.OutputPadding, Batch = shape.Batch, OutHeight = shape.OutHeight, OutWidth = shape.OutWidth;
+        int ci = shape.InputChannels, co = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW;
         int oh = OutHeight, ow = OutWidth, taps = kh * kw;
         int hw = h * w, nhw = Batch * hw, cihw = ci * hw, cohw = co * oh * ow, ohw = oh * ow;
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(24576);
         s.AppendLine(".version 7.1");
