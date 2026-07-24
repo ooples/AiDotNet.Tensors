@@ -311,6 +311,14 @@ public static class PtxParityRegistry
             "DirectGpuTensorEngine.Conv2DBackwardBiasGpu. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
             "reduction, non-power-of-2 spatial). Deferred (experimental-pending-gpu-evidence)."),
 
+        new PtxParitySpec("PtxConvTranspose2DKernel", PtxParityStatus.Deferred,
+            "ConvTranspose2D forward + bias + ReLU direct-PTX (#841 transposed family)",
+            "out[n,co,oh,ow] = relu(bias[co] + sum over (ci,kh,kw) valid of input[n,ci,(oh+pad-kh)/s,(ow+pad-kw)/s]" +
+            " * W[ci,co,kh,kw]); IOHW weights, general kernel/stride/padding/output-padding. The transpose-gather " +
+            "pattern (same shape as a regular conv's backward-input) run as a forward op; thread-per-output with " +
+            "consecutive ow -> coalesced input reads + output stores at stride 1, weights broadcast across the warp. " +
+            "Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxConv1DBackwardInputKernel", PtxParityStatus.Deferred,
             "Native Conv1D backward-input direct-PTX (#841 Conv1D family)",
             "dX[n,c,il] = sum_{k,kl} W[k,c,kl]*gradOut[n,k,(il+pad-kl)/stride] (valid divisible/in-range terms). " +
