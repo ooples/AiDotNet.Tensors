@@ -304,6 +304,20 @@ public static class PtxParityRegistry
             "One thread per output, consecutive ow -> coalesced. dg=1 reproduces the single-group kernel. Verified " +
             "correct on-device (<= 3e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxFusedConv3DKernel", PtxParityStatus.Deferred,
+            "Fused Conv3D inference epilogue (conv + bias + per-channel scale + ReLU) direct-PTX (#841 fused family)",
+            "out[n,k,od,oh,ow] = relu(scale[k]*(bias[k] + sum_{c,kd,kh,kw} W*in[...])); the bias, per-output-channel " +
+            "scale, and ReLU epilogue fold into the accumulator before the store with no intermediate materialization. " +
+            "One thread per output element, consecutive ow -> coalesced NCDHW reads/stores, bounds-guarded grid. " +
+            "Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxFusedConvTranspose2DKernel", PtxParityStatus.Deferred,
+            "Fused ConvTranspose2D inference epilogue (transposed conv + bias + per-channel scale + ReLU) direct-PTX (#841 fused family)",
+            "out[n,co,oh,ow] = relu(scale[co]*(bias[co] + sum input[n,ci,(oh+pad-kh)/s,(ow+pad-kw)/s]*W[ci,co,kh,kw])); " +
+            "IOHW weights, transpose-gather with valid-index checks, scale+ReLU epilogue folded before the store. One " +
+            "thread per output element, consecutive ow coalesced, bounds-guarded grid. Verified correct on-device " +
+            "(<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxDeformableConv2DGroupedBackwardOffsetKernel", PtxParityStatus.Deferred,
             "Grouped Deformable Conv2D backward-offset (deform_groups>1) direct-PTX (#841 grouped-deformable family)",
             "one thread per (n,g,pos,oh,ow) writes dOff_y/dOff_x = mask_g*sum_{c in group g, k} gradOut*W*bilinear-" +

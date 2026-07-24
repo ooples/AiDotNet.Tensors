@@ -2489,6 +2489,134 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
 
+    [Fact]
+    public void FusedConv3D_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 2, k = 4, d = 4, h = 4, w = 4, kd = 3, kh = 3, kw = 3, stride = 1, pad = 1;
+        int od = (d + 2 * pad - kd) / stride + 1, oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1;
+        var input = new float[n * c * d * h * w];
+        var weights = new float[k * c * kd * kh * kw];
+        var bias = new float[k];
+        var scale = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        for (int i = 0; i < scale.Length; i++) scale[i] = 0.5f + 0.5f * DeterministicWeight(i + 9);
+        var expected = new float[n * k * od * oh * ow];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int z = 0; z < od; z++)
+                    for (int y = 0; y < oh; y++)
+                        for (int x = 0; x < ow; x++)
+                        {
+                            double acc = bias[oc];
+                            for (int ic = 0; ic < c; ic++)
+                                for (int a = 0; a < kd; a++)
+                                    for (int rr = 0; rr < kh; rr++)
+                                        for (int t = 0; t < kw; t++)
+                                        {
+                                            int iz = z * stride + a - pad, iy = y * stride + rr - pad, ix = x * stride + t - pad;
+                                            if (iz >= 0 && iz < d && iy >= 0 && iy < h && ix >= 0 && ix < w)
+                                                acc += (double)input[(((b * c + ic) * d + iz) * h + iy) * w + ix]
+                                                     * weights[(((oc * c + ic) * kd + a) * kh + rr) * kw + t];
+                                        }
+                            double v = scale[oc] * acc;
+                            expected[(((b * k + oc) * od + z) * oh + y) * ow + x] = (float)Math.Max(v, 0);
+                        }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxFusedConv3DKernel(runtime, n, c, k, d, h, w, kd, kh, kw, stride, pad);
+            using var dI = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dB = runtime.AllocateBytes((nuint)kernel.BiasBytes);
+            using var dS = runtime.AllocateBytes((nuint)kernel.ScaleBytes);
+            using var dO = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dI.Upload<float>(input); dW.Upload<float>(weights); dB.Upload<float>(bias); dS.Upload<float>(scale);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dI, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dB, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dS, kernel.Blueprint.Tensors[3]),
+                          DirectPtxTensorView.CreateOwned(dO, kernel.Blueprint.Tensors[4]));
+            runtime.Synchronize();
+            var actual = new float[n * k * od * oh * ow];
+            dO.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void FusedConvTranspose2D_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, ci = 3, co = 4, h = 4, w = 4, kh = 3, kw = 3, stride = 2, pad = 1, outpad = 1;
+        int oh = (h - 1) * stride - 2 * pad + kh + outpad, ow = (w - 1) * stride - 2 * pad + kw + outpad;
+        var input = new float[n * ci * h * w];
+        var weights = new float[ci * co * kh * kw];
+        var bias = new float[co];
+        var scale = new float[co];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        for (int i = 0; i < scale.Length; i++) scale[i] = 0.5f + 0.5f * DeterministicWeight(i + 9);
+        var expected = new float[n * co * oh * ow];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < co; oc++)
+                for (int y = 0; y < oh; y++)
+                    for (int x = 0; x < ow; x++)
+                    {
+                        double acc = bias[oc];
+                        for (int c2 = 0; c2 < ci; c2++)
+                            for (int r = 0; r < kh; r++)
+                                for (int t = 0; t < kw; t++)
+                                {
+                                    int numH = y + pad - r, numW = x + pad - t;
+                                    if (numH >= 0 && numH % stride == 0 && numW >= 0 && numW % stride == 0)
+                                    {
+                                        int ih = numH / stride, iw = numW / stride;
+                                        if (ih < h && iw < w)
+                                            acc += (double)input[((b * ci + c2) * h + ih) * w + iw]
+                                                 * weights[((c2 * co + oc) * kh + r) * kw + t];
+                                    }
+                                }
+                        double v = scale[oc] * acc;
+                        expected[((b * co + oc) * oh + y) * ow + x] = (float)Math.Max(v, 0);
+                    }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxFusedConvTranspose2DKernel(runtime, n, ci, co, h, w, kh, kw, stride, pad, outpad);
+            using var dI = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dB = runtime.AllocateBytes((nuint)kernel.BiasBytes);
+            using var dS = runtime.AllocateBytes((nuint)kernel.ScaleBytes);
+            using var dO = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dI.Upload<float>(input); dW.Upload<float>(weights); dB.Upload<float>(bias); dS.Upload<float>(scale);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dI, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dB, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dS, kernel.Blueprint.Tensors[3]),
+                          DirectPtxTensorView.CreateOwned(dO, kernel.Blueprint.Tensors[4]));
+            runtime.Synchronize();
+            var actual = new float[n * co * oh * ow];
+            dO.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
     private static double GroupedBilinear(float[] input, int inBase, double py, double px, int h, int w)
     {
         int y0 = (int)Math.Floor(py), x0 = (int)Math.Floor(px);
