@@ -344,6 +344,18 @@ public static class PtxParityRegistry
             "N x OL contraction into KL taps with coalesced spatial reads (gradOut reused across taps) and a shared " +
             "tree reduce per tap. KL <= 11. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxConv3DBackwardInputKernel", PtxParityStatus.Deferred,
+            "Native Conv3D backward-input direct-PTX (#841 Conv3D family)",
+            "dInput[n,c,id,ih,iw] = sum over (k,kd,kh,kw) valid of W[k,c,kd,kh,kw]*gradOut[n,k,(id+pad-kd)/s," +
+            "(ih+pad-kh)/s,(iw+pad-kw)/s]. Thread-per-output, consecutive iw -> coalesced gradOut reads + dInput " +
+            "stores, weights broadcast. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxConv3DBackwardWeightKernel", PtxParityStatus.Deferred,
+            "Native Conv3D backward-weight direct-PTX coalesced reduction (#841 Conv3D family)",
+            "dW[k,c,kd,kh,kw] = sum_{n,od,oh,ow} input[n,c,od*s+kd-pad,oh*s+kh-pad,ow*s+kw-pad]*gradOut[n,k,od,oh,ow]. " +
+            "One block per (k,c) reduces N x OD x OH x OW into the KD*KH*KW taps with coalesced gradOut reads (reused " +
+            "across taps) and a shared tree reduce per tap (KD*KH*KW<=27). Verified correct on-device (<= 3e-3). Deferred."),
+
         new PtxParitySpec("PtxConv3DKernel", PtxParityStatus.Deferred,
             "Native Conv3D forward + bias + ReLU direct-PTX (#841 Conv3D family)",
             "out[n,k,od,oh,ow] = relu(bias[k] + sum_{c,kd,kh,kw} W[k,c,kd,kh,kw]*in[n,c,od*s+kd-pad,oh*s+kh-pad," +
