@@ -344,6 +344,13 @@ public static class PtxParityRegistry
             "N x OL contraction into KL taps with coalesced spatial reads (gradOut reused across taps) and a shared " +
             "tree reduce per tap. KL <= 11. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxConv3DKernel", PtxParityStatus.Deferred,
+            "Native Conv3D forward + bias + ReLU direct-PTX (#841 Conv3D family)",
+            "out[n,k,od,oh,ow] = relu(bias[k] + sum_{c,kd,kh,kw} W[k,c,kd,kh,kw]*in[n,c,od*s+kd-pad,oh*s+kh-pad," +
+            "ow*s+kw-pad]); general kernel extent/stride/padding. Thread-per-output with consecutive ow -> " +
+            "coalesced innermost input reads and output stores at stride 1 (contiguous NCDHW axis); weights broadcast. " +
+            "Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxConv1DKernel", PtxParityStatus.Deferred,
             "Native Conv1D forward + bias + ReLU direct-PTX (#841 Conv1D family)",
             "out[n,k,ol] = relu(bias[k] + sum_{c,kl} W[k,c,kl]*in[n,c,ol*stride+kl-pad]); general kernel " +
