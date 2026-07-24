@@ -38,7 +38,12 @@ internal sealed class PtxDeformableConv2DGroupedBackwardOffsetKernel : IDisposab
     internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
     internal int Taps => KernelH * KernelW;
     internal int ChannelsPerGroup => InputChannels / DeformGroups;
-    internal int TotalThreads => Batch * DeformGroups * Taps * OutH * OutW;
+    // Single source of truth: the launch grid (TotalThreads) and the in-kernel bounds
+    // guard baked into PTX MUST come from the same expression, or threads silently retire
+    // early and the tail of the output is never written.
+    internal static int TotalThreadsFor(GroupedDeformableConv2DShape s) =>
+        s.Batch * s.DeformGroups * s.Taps * s.OutH * s.OutW;
+    internal int TotalThreads => TotalThreadsFor(Shape);
     internal long InputBytes => (long)Batch * InputChannels * Height * Width * sizeof(float);
     internal long WeightBytes => (long)OutputChannels * InputChannels * Taps * sizeof(float);
     internal long OffsetBytes => (long)Batch * DeformGroups * 2 * Taps * OutH * OutW * sizeof(float);
@@ -140,7 +145,7 @@ internal sealed class PtxDeformableConv2DGroupedBackwardOffsetKernel : IDisposab
         int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int taps = KernelH * kw, hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow, ckk = c * taps;
         int maskNg = DeformGroups * taps * ohow, offNg = DeformGroups * 2 * taps * ohow;
-        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = shape.ChannelsPerGroup, total = shape.Batch * taps * ohow;
+        int offGroup = 2 * taps * ohow, maskGroup = taps * ohow, cpg = shape.ChannelsPerGroup, total = TotalThreadsFor(shape);
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(45056);
@@ -320,7 +325,12 @@ internal sealed class PtxDeformableConv2DGroupedBackwardMaskKernel : IDisposable
     internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
     internal int Taps => KernelH * KernelW;
     internal int ChannelsPerGroup => InputChannels / DeformGroups;
-    internal int TotalThreads => Batch * DeformGroups * Taps * OutH * OutW;
+    // Single source of truth: the launch grid (TotalThreads) and the in-kernel bounds
+    // guard baked into PTX MUST come from the same expression, or threads silently retire
+    // early and the tail of the output is never written.
+    internal static int TotalThreadsFor(GroupedDeformableConv2DShape s) =>
+        s.Batch * s.DeformGroups * s.Taps * s.OutH * s.OutW;
+    internal int TotalThreads => TotalThreadsFor(Shape);
     internal long InputBytes => (long)Batch * InputChannels * Height * Width * sizeof(float);
     internal long WeightBytes => (long)OutputChannels * InputChannels * Taps * sizeof(float);
     internal long OffsetBytes => (long)Batch * DeformGroups * 2 * Taps * OutH * OutW * sizeof(float);
@@ -418,7 +428,7 @@ internal sealed class PtxDeformableConv2DGroupedBackwardMaskKernel : IDisposable
         int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int taps = KernelH * kw, hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow, ckk = c * taps;
         int maskNg = DeformGroups * taps * ohow, offNg = DeformGroups * 2 * taps * ohow;
-        int offGroup = 2 * taps * ohow, cpg = shape.ChannelsPerGroup, total = shape.Batch * taps * ohow;
+        int offGroup = 2 * taps * ohow, cpg = shape.ChannelsPerGroup, total = TotalThreadsFor(shape);
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(40960);
