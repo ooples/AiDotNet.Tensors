@@ -282,6 +282,13 @@ public static class PtxParityRegistry
             "(ow-fast) -> coalesced input reads + column stores at stride 1. Exact (<= 1e-5 vs CPU reference). " +
             "Deferred."),
 
+        new PtxParitySpec("PtxDeformableConv2DBackwardOffsetKernel", PtxParityStatus.Deferred,
+            "Deformable Conv2D backward-offset (DCNv2 offset gradient via bilinear derivative) direct-PTX (#841)",
+            "for each (n,pos,oh,ow) writes both dy/dx offset gradients: dOff_y = mask*sum gradOut*W*(wx0*(v10-v00)+" +
+            "wx1*(v11-v01)), dOff_x = mask*sum gradOut*W*(wy0*(v01-v00)+wy1*(v11-v10)) over the four zero-padded " +
+            "input corners. One thread per offset position, consecutive ow -> coalesced. Verified correct on-device " +
+            "(<= 3e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxDeformableConv2DBackwardWeightKernel", PtxParityStatus.Deferred,
             "Deformable Conv2D backward-weight (DCNv2 weight gradient) direct-PTX (#841 deformable family)",
             "dW[k,c,pos] = sum_{n,oh,ow} gradOut[n,k,oh,ow]*mask[n,pos,oh,ow]*bilinear(input[n,c]; py, px). One " +
