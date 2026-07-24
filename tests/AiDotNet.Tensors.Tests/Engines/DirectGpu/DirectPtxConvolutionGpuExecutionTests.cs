@@ -2490,6 +2490,151 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void DepthwiseConv1DForward_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 3, c = 5, l = 32, kl = 3, stride = 1, pad = 1;
+        int ol = (l + 2 * pad - kl) / stride + 1;
+        var input = new float[n * c * l];
+        var weights = new float[c * kl];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        var expected = new float[n * c * ol];
+        for (int b = 0; b < n; b++)
+            for (int ch = 0; ch < c; ch++)
+                for (int o = 0; o < ol; o++)
+                {
+                    double acc = 0;
+                    for (int t = 0; t < kl; t++)
+                    {
+                        int il = o * stride + t - pad;
+                        if (il >= 0 && il < l) acc += (double)input[(b * c + ch) * l + il] * weights[ch * kl + t];
+                    }
+                    expected[(b * c + ch) * ol + o] = (float)acc;
+                }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDepthwiseConv1DForwardKernel(runtime, n, c, l, kl, stride, pad);
+            using var dI = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dO = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dI.Upload<float>(input); dW.Upload<float>(weights);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dI, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dO, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actual = new float[n * c * ol];
+            dO.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void DepthwiseConv1DBackwardInput_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 3, c = 5, l = 32, kl = 3, stride = 1, pad = 1;
+        int ol = (l + 2 * pad - kl) / stride + 1;
+        var grad = new float[n * c * ol];
+        var weights = new float[c * kl];
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicWeight(i + 1);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        var expected = new float[n * c * l];
+        for (int b = 0; b < n; b++)
+            for (int ch = 0; ch < c; ch++)
+                for (int il = 0; il < l; il++)
+                {
+                    double acc = 0;
+                    for (int t = 0; t < kl; t++)
+                    {
+                        int num = il + pad - t;
+                        if (num >= 0 && num % stride == 0)
+                        {
+                            int o = num / stride;
+                            if (o < ol) acc += (double)grad[(b * c + ch) * ol + o] * weights[ch * kl + t];
+                        }
+                    }
+                    expected[(b * c + ch) * l + il] = (float)acc;
+                }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDepthwiseConv1DBackwardInputKernel(runtime, n, c, l, kl, stride, pad);
+            using var dG = runtime.AllocateBytes((nuint)kernel.GradOutputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dX = runtime.AllocateBytes((nuint)kernel.GradInputBytes);
+            dG.Upload<float>(grad); dW.Upload<float>(weights);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dG, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dX, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actual = new float[n * c * l];
+            dX.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void DepthwiseConv1DBackwardWeight_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 3, c = 5, l = 32, kl = 3, stride = 1, pad = 1;
+        int ol = (l + 2 * pad - kl) / stride + 1;
+        var grad = new float[n * c * ol];
+        var input = new float[n * c * l];
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicWeight(i + 1);
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        var expected = new float[c * kl];
+        for (int ch = 0; ch < c; ch++)
+            for (int t = 0; t < kl; t++)
+            {
+                double acc = 0;
+                for (int b = 0; b < n; b++)
+                    for (int o = 0; o < ol; o++)
+                    {
+                        int il = o * stride + t - pad;
+                        if (il >= 0 && il < l) acc += (double)grad[(b * c + ch) * ol + o] * input[(b * c + ch) * l + il];
+                    }
+                expected[ch * kl + t] = (float)acc;
+            }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDepthwiseConv1DBackwardWeightKernel(runtime, n, c, l, kl, stride, pad);
+            using var dG = runtime.AllocateBytes((nuint)kernel.GradOutputBytes);
+            using var dI = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.GradWeightBytes);
+            dG.Upload<float>(grad); dI.Upload<float>(input);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dG, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dI, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            var actual = new float[c * kl];
+            dW.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DeformableConv2DBackwardInput_MatchesCpuReference()
     {
         if (!DirectPtxRuntime.IsAvailable) return;

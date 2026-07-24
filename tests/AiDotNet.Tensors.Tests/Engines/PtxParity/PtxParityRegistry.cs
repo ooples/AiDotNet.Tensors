@@ -430,6 +430,25 @@ public static class PtxParityRegistry
             "and output stores at stride 1 (contiguous NCL axis). Native 1D instead of routing through Conv2D. " +
             "Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxDepthwiseConv1DForwardKernel", PtxParityStatus.Deferred,
+            "Native depthwise Conv1D forward (channel-multiplier 1) direct-PTX (#841 depthwise family)",
+            "out[n,c,ol] = sum_kl in[n,c,ol*stride+kl-pad]*W[c,kl]; each channel convolves with its own length-KL " +
+            "filter. One thread per output element, consecutive ol -> coalesced NCL reads/stores at stride 1. Native " +
+            "1D depthwise instead of reshaping through Conv2D. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
+            "reference). Deferred."),
+
+        new PtxParitySpec("PtxDepthwiseConv1DBackwardInputKernel", PtxParityStatus.Deferred,
+            "Native depthwise Conv1D backward-input direct-PTX (#841 depthwise family)",
+            "dInput[n,c,il] = sum_kl gradOut[n,c,(il+pad-kl)/stride]*W[c,kl] over taps where (il+pad-kl) is a " +
+            "non-negative in-range multiple of stride (transpose-gather of the forward correlation). One thread per " +
+            "input element, il-contiguous. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxDepthwiseConv1DBackwardWeightKernel", PtxParityStatus.Deferred,
+            "Native depthwise Conv1D backward-weight direct-PTX (#841 depthwise family)",
+            "dW[c,kl] = sum_{n,ol} gradOut[n,c,ol]*in[n,c,ol*stride+kl-pad]. One thread per weight element (C*KL is " +
+            "small) reduces over batch+output-spatial with a bounds-guarded ceil-div grid. Verified correct on-device " +
+            "(<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxDepthwiseConv2D3x3Kernel", PtxParityStatus.Deferred,
             "Depthwise Conv2D 3x3 forward + bias + ReLU direct-PTX (#841 depthwise family)",
             "channel-multiplier-1 depthwise forward: out[n,c,oh,ow] = relu(bias[c] + sum_{r,s} " +
