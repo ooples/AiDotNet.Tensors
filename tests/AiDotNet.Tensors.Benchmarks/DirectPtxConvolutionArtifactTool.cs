@@ -54,6 +54,13 @@ internal static class DirectPtxConvolutionArtifactTool
         using (var reg = new PtxConv2DNchwK1RegBlockedKernel(runtime, RegBlockedC64))
             Export(reg.Audit, outputDirectory, exported, manifest);
 
+        // #841 coverage specializations (correctness-verified; perf timing pending idle GPU).
+        using (var fusedConv3d = new PtxFusedConv3DKernel(
+            runtime, FusedConv3D.Batch, FusedConv3D.InputChannels, FusedConv3D.OutputChannels,
+            FusedConv3D.Depth, FusedConv3D.Height, FusedConv3D.Width,
+            FusedConv3D.KernelD, FusedConv3D.KernelH, FusedConv3D.KernelW, FusedConv3D.Stride, FusedConv3D.Padding))
+            Export(fusedConv3d.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -162,6 +169,10 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly Conv2DRegBlockShape RegBlockedC64 =
         new(32, 64, 64, 3136, 64, 64, 16, 4, 4);
 
+    // #841 coverage specialization shapes (match the on-device correctness tests).
+    private static readonly FusedConv3DShape FusedConv3D =
+        new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
+
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
         var expected = new List<ExpectedArtifact>();
@@ -176,6 +187,12 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxConv2DNchwK1RegBlockedKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, RegBlockedC64).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(regPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(regPtx, 8, 6)));
+
+        string fusedConv3dPtx = PtxFusedConv3DKernel.EmitPtx(8, 6, FusedConv3D);
+        expected.Add(new ExpectedArtifact(
+            PtxFusedConv3DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, FusedConv3D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(fusedConv3dPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(fusedConv3dPtx, 8, 6)));
         return expected;
     }
 
