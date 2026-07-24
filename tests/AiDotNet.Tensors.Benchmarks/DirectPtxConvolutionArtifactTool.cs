@@ -147,6 +147,32 @@ internal static class DirectPtxConvolutionArtifactTool
             ConvTranspose2DBackward.Stride, ConvTranspose2DBackward.Padding, ConvTranspose2DBackward.OutputPadding))
             Export(ct2dBwW.Audit, outputDirectory, exported, manifest);
 
+        using (var ct3dBwIn = new PtxConvTranspose3DBackwardInputKernel(
+            runtime, ConvTranspose3DBackward.Batch, ConvTranspose3DBackward.InputChannels, ConvTranspose3DBackward.OutputChannels,
+            ConvTranspose3DBackward.Depth, ConvTranspose3DBackward.Height, ConvTranspose3DBackward.Width,
+            ConvTranspose3DBackward.KernelD, ConvTranspose3DBackward.KernelH, ConvTranspose3DBackward.KernelW,
+            ConvTranspose3DBackward.Stride, ConvTranspose3DBackward.Padding, ConvTranspose3DBackward.OutputPadding))
+            Export(ct3dBwIn.Audit, outputDirectory, exported, manifest);
+
+        using (var ct3dBwW = new PtxConvTranspose3DBackwardWeightKernel(
+            runtime, ConvTranspose3DBackward.Batch, ConvTranspose3DBackward.InputChannels, ConvTranspose3DBackward.OutputChannels,
+            ConvTranspose3DBackward.Depth, ConvTranspose3DBackward.Height, ConvTranspose3DBackward.Width,
+            ConvTranspose3DBackward.KernelD, ConvTranspose3DBackward.KernelH, ConvTranspose3DBackward.KernelW,
+            ConvTranspose3DBackward.Stride, ConvTranspose3DBackward.Padding, ConvTranspose3DBackward.OutputPadding))
+            Export(ct3dBwW.Audit, outputDirectory, exported, manifest);
+
+        using (var c3dBwIn = new PtxConv3DBackwardInputKernel(
+            runtime, Conv3DBackward.Batch, Conv3DBackward.InputChannels, Conv3DBackward.OutputChannels,
+            Conv3DBackward.Depth, Conv3DBackward.Height, Conv3DBackward.Width,
+            Conv3DBackward.KernelD, Conv3DBackward.KernelH, Conv3DBackward.KernelW, Conv3DBackward.Stride, Conv3DBackward.Padding))
+            Export(c3dBwIn.Audit, outputDirectory, exported, manifest);
+
+        using (var c3dBwW = new PtxConv3DBackwardWeightKernel(
+            runtime, Conv3DBackward.Batch, Conv3DBackward.InputChannels, Conv3DBackward.OutputChannels,
+            Conv3DBackward.Depth, Conv3DBackward.Height, Conv3DBackward.Width,
+            Conv3DBackward.KernelD, Conv3DBackward.KernelH, Conv3DBackward.KernelW, Conv3DBackward.Stride, Conv3DBackward.Padding))
+            Export(c3dBwW.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -272,6 +298,8 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly Conv1DBackwardShape Conv1DBackward = new(2, 4, 4, 32, 3, 1, 1);
     private static readonly DepthwiseConv1DShape DwConv1D = new(2, 4, 32, 3, 1, 1);
     private static readonly ConvTranspose2DBackwardShape ConvTranspose2DBackward = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 0);
+    private static readonly ConvTranspose3DBackwardShape ConvTranspose3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1, 0);
+    private static readonly Conv3DBackwardShape Conv3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -407,6 +435,30 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxConvTranspose2DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose2DBackward).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(ct2dBwWPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(ct2dBwWPtx, 8, 6)));
+
+        string ct3dBwInPtx = PtxConvTranspose3DBackwardInputKernel.EmitPtx(8, 6, ConvTranspose3DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConvTranspose3DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose3DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(ct3dBwInPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(ct3dBwInPtx, 8, 6)));
+
+        string ct3dBwWPtx = PtxConvTranspose3DBackwardWeightKernel.EmitPtx(8, 6, ConvTranspose3DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConvTranspose3DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose3DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(ct3dBwWPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(ct3dBwWPtx, 8, 6)));
+
+        string c3dBwInPtx = PtxConv3DBackwardInputKernel.EmitPtx(8, 6, Conv3DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConv3DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv3DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(c3dBwInPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(c3dBwInPtx, 8, 6)));
+
+        string c3dBwWPtx = PtxConv3DBackwardWeightKernel.EmitPtx(8, 6, Conv3DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConv3DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv3DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(c3dBwWPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(c3dBwWPtx, 8, 6)));
         return expected;
     }
 
