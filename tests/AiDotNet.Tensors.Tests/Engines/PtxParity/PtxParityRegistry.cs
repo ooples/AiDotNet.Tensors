@@ -311,6 +311,24 @@ public static class PtxParityRegistry
             "DirectGpuTensorEngine.Conv2DBackwardBiasGpu. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
             "reduction, non-power-of-2 spatial). Deferred (experimental-pending-gpu-evidence)."),
 
+        new PtxParitySpec("PtxDepthwiseConv2D3x3Kernel", PtxParityStatus.Deferred,
+            "Depthwise Conv2D 3x3 forward + bias + ReLU direct-PTX (#841 depthwise family)",
+            "channel-multiplier-1 depthwise forward: out[n,c,oh,ow] = relu(bias[c] + sum_{r,s} " +
+            "W[c,r,s]*in[n,c,oh+r-1,ow+s-1]). No channel reduction (memory-bound), so one thread per output " +
+            "with consecutive threads owning consecutive ow (contiguous NCHW axis) coalesces the in/out accesses " +
+            "and broadcasts the 9 depthwise weights across the warp. Verified correct on-device (<= 2e-3). Deferred."),
+
+        new PtxParitySpec("PtxDepthwiseConv2D3x3BackwardInputKernel", PtxParityStatus.Deferred,
+            "Depthwise Conv2D 3x3 backward-input direct-PTX (#841 depthwise family)",
+            "dX[n,c,ih,iw] = sum_{r,s} W[c,r,s]*gradOut[n,c,ih-r+1,iw-s+1] (per channel). Thread-per-output, " +
+            "consecutive iw -> coalesced gradOut reads + dX stores. Verified correct on-device (<= 2e-3). Deferred."),
+
+        new PtxParitySpec("PtxDepthwiseConv2D3x3BackwardWeightKernel", PtxParityStatus.Deferred,
+            "Depthwise Conv2D 3x3 backward-weight direct-PTX coalesced reduction (#841 depthwise family)",
+            "dW[c,r,s] = sum_{n,oh,ow} input[n,c,oh+r-1,ow+s-1]*gradOut[n,c,oh,ow] (per channel). One block per " +
+            "channel reduces N x H x W into the 9 taps with coalesced spatial reads and a shared tree reduce. " +
+            "Verified correct on-device (<= 2e-3). Deferred."),
+
         new PtxParitySpec("PtxConv2DBackwardWeight3x3Kernel", PtxParityStatus.Deferred,
             "Conv2D backward-weight 3x3 direct-PTX coalesced reduction (#841 backward family)",
             "dW[k,c,r,s] = sum_{n,oh,ow} input[n,c,oh+r-1,ow+s-1] * gradOut[n,k,oh,ow]. One block per (k,c) " +
