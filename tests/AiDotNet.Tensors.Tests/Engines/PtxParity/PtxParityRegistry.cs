@@ -311,6 +311,18 @@ public static class PtxParityRegistry
             "DirectGpuTensorEngine.Conv2DBackwardBiasGpu. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
             "reduction, non-power-of-2 spatial). Deferred (experimental-pending-gpu-evidence)."),
 
+        new PtxParitySpec("PtxConv1DBackwardInputKernel", PtxParityStatus.Deferred,
+            "Native Conv1D backward-input direct-PTX (#841 Conv1D family)",
+            "dX[n,c,il] = sum_{k,kl} W[k,c,kl]*gradOut[n,k,(il+pad-kl)/stride] (valid divisible/in-range terms). " +
+            "Thread-per-output, consecutive il -> coalesced gradOut reads + dX stores; weights broadcast. General " +
+            "kernel length/stride/padding. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxConv1DBackwardWeightKernel", PtxParityStatus.Deferred,
+            "Native Conv1D backward-weight direct-PTX coalesced reduction (#841 Conv1D family)",
+            "dW[k,c,kl] = sum_{n,ol} input[n,c,ol*stride+kl-pad]*gradOut[n,k,ol]. One block per (k,c) reduces the " +
+            "N x OL contraction into KL taps with coalesced spatial reads (gradOut reused across taps) and a shared " +
+            "tree reduce per tap. KL <= 11. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxConv1DKernel", PtxParityStatus.Deferred,
             "Native Conv1D forward + bias + ReLU direct-PTX (#841 Conv1D family)",
             "out[n,k,ol] = relu(bias[k] + sum_{c,kl} W[k,c,kl]*in[n,c,ol*stride+kl-pad]); general kernel " +
