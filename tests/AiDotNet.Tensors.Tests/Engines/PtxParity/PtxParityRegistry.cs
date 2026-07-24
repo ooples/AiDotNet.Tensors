@@ -302,6 +302,13 @@ public static class PtxParityRegistry
             "slower than cuDNN. Keep deferred/unpromoted until the optimized layout (precomputed filter " +
             "transform + register-blocked batched 16-GEMM + input-transform reuse) clears the >=1.10x gate."),
 
+        new PtxParitySpec("PtxUnfold2DKernel", PtxParityStatus.Deferred,
+            "Unfold / im2col patch extraction direct-PTX (#841 unfold family)",
+            "columns[n,c*KH*KW+kh*KW+kw,oh*OW+ow] = input[n,c,oh*s+kh-pad,ow*s+kw-pad] (0 outside padded input); " +
+            "general kernel/stride/padding. One thread per output element with consecutive output-spatial index " +
+            "(ow-fast) -> coalesced input reads + column stores at stride 1. Exact (<= 1e-5 vs CPU reference). " +
+            "Deferred."),
+
         new PtxParitySpec("PtxConv2DBackwardBiasKernel", PtxParityStatus.Deferred,
             "Conv2D backward-bias direct-PTX coalesced reduction (#841 backward family)",
             "gradBias[k] = sum over batch+spatial of gradOutput[b,k,h,w]. One block per output channel " +
