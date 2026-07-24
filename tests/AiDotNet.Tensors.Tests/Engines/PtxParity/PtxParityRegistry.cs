@@ -330,6 +330,18 @@ public static class PtxParityRegistry
             "One block per (k,c) reduces N x OD x OH x OW into the KD*KH*KW taps with coalesced gradOut reads (reused " +
             "across taps) and a shared tree reduce per tap (KD*KH*KW<=27). Verified correct on-device (<= 3e-3). Deferred."),
 
+        new PtxParitySpec("PtxLocallyConnected2DBackwardInputKernel", PtxParityStatus.Deferred,
+            "LocallyConnected2D backward-input direct-PTX (#841 locally-connected family)",
+            "dInput[n,c,ih,iw] = sum over (k,kh,kw) valid of W[oh,ow,k,c,kh,kw]*gradOut[n,k,(ih+pad-kh)/s,(iw+pad-kw)/s] " +
+            "(per-position weights). Thread-per-output, consecutive iw -> coalesced gradOut reads + dInput stores. " +
+            "Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxLocallyConnected2DBackwardWeightKernel", PtxParityStatus.Deferred,
+            "LocallyConnected2D backward-weight direct-PTX (#841 locally-connected family)",
+            "each weight is used by one output position, so dW[oh,ow,k,c,kh,kw] = sum_n input[n,c,oh*s+kh-pad," +
+            "ow*s+kw-pad]*gradOut[n,k,oh,ow]. One thread per weight loops over N (no block reduction). Verified " +
+            "correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxLocallyConnected2DKernel", PtxParityStatus.Deferred,
             "LocallyConnected2D forward (unshared per-position weights) direct-PTX (#841 locally-connected family)",
             "out[n,k,oh,ow] = relu(bias[k,oh,ow] + sum_{c,kh,kw} W[oh,ow,k,c,kh,kw]*in[n,c,oh*s+kh-pad,ow*s+kw-pad]); " +
