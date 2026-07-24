@@ -1819,6 +1819,87 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void LocallyConnected2DForwardBias_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 3, k = 4, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1;
+        var input = new float[n * c * h * w];
+        var weights = new float[oh * ow * k * c * kh * kw];
+        var bias = new float[k * oh * ow];
+        var grad = new float[n * k * oh * ow];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicInput(i + 7) - 0.3f;
+        int Wi(int y, int x, int oc, int ic, int r, int t) => ((((y * ow + x) * k + oc) * c + ic) * kh + r) * kw + t;
+        var expOut = new float[n * k * oh * ow];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int y = 0; y < oh; y++)
+                    for (int x = 0; x < ow; x++)
+                    {
+                        double acc = bias[(oc * oh + y) * ow + x];
+                        for (int ic = 0; ic < c; ic++)
+                            for (int r = 0; r < kh; r++)
+                                for (int t = 0; t < kw; t++)
+                                {
+                                    int ih = y * stride + r - pad, iw = x * stride + t - pad;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                    acc += (double)input[((b * c + ic) * h + ih) * w + iw] * weights[Wi(y, x, oc, ic, r, t)];
+                                }
+                        expOut[((b * k + oc) * oh + y) * ow + x] = (float)Math.Max(acc, 0.0);
+                    }
+        var expBias = new float[k * oh * ow];
+        for (int oc = 0; oc < k; oc++)
+            for (int y = 0; y < oh; y++)
+                for (int x = 0; x < ow; x++)
+                {
+                    double acc = 0;
+                    for (int b = 0; b < n; b++) acc += grad[((b * k + oc) * oh + y) * ow + x];
+                    expBias[(oc * oh + y) * ow + x] = (float)acc;
+                }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var fwd = new PtxLocallyConnected2DKernel(runtime, n, c, k, h, w, kh, kw, stride, pad, relu: true);
+            using var dInput = runtime.AllocateBytes((nuint)fwd.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)fwd.WeightBytes);
+            using var dBias = runtime.AllocateBytes((nuint)fwd.BiasBytes);
+            using var dOut = runtime.AllocateBytes((nuint)fwd.OutputBytes);
+            dInput.Upload<float>(input); dW.Upload<float>(weights); dBias.Upload<float>(bias);
+            fwd.Launch(DirectPtxTensorView.CreateOwned(dInput, fwd.Blueprint.Tensors[0]),
+                       DirectPtxTensorView.CreateOwned(dW, fwd.Blueprint.Tensors[1]),
+                       DirectPtxTensorView.CreateOwned(dBias, fwd.Blueprint.Tensors[2]),
+                       DirectPtxTensorView.CreateOwned(dOut, fwd.Blueprint.Tensors[3]));
+            runtime.Synchronize();
+            var actOut = new float[n * k * oh * ow];
+            dOut.Download<float>(actOut);
+            AssertClose(expOut, actOut, 2e-3f);
+
+            using var bb = new PtxLocallyConnected2DBackwardBiasKernel(runtime, n, k, oh, ow);
+            using var dGrad = runtime.AllocateBytes((nuint)bb.GradOutputBytes);
+            using var dDbias = runtime.AllocateBytes((nuint)bb.GradBiasBytes);
+            dGrad.Upload<float>(grad);
+            bb.Launch(DirectPtxTensorView.CreateOwned(dGrad, bb.Blueprint.Tensors[0]),
+                      DirectPtxTensorView.CreateOwned(dDbias, bb.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            var actBias = new float[k * oh * ow];
+            dDbias.Download<float>(actBias);
+            AssertClose(expBias, actBias, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DumpWinogradPtxForSassAnalysis()
     {
         string dir = Environment.GetEnvironmentVariable("PTX_DUMP_DIR");

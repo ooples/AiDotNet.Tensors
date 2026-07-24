@@ -330,6 +330,18 @@ public static class PtxParityRegistry
             "One block per (k,c) reduces N x OD x OH x OW into the KD*KH*KW taps with coalesced gradOut reads (reused " +
             "across taps) and a shared tree reduce per tap (KD*KH*KW<=27). Verified correct on-device (<= 3e-3). Deferred."),
 
+        new PtxParitySpec("PtxLocallyConnected2DKernel", PtxParityStatus.Deferred,
+            "LocallyConnected2D forward (unshared per-position weights) direct-PTX (#841 locally-connected family)",
+            "out[n,k,oh,ow] = relu(bias[k,oh,ow] + sum_{c,kh,kw} W[oh,ow,k,c,kh,kw]*in[n,c,oh*s+kh-pad,ow*s+kw-pad]); " +
+            "each output position has its own filter (weights [OH,OW,K,C,KH,KW]). Thread-per-output with consecutive " +
+            "ow -> coalesced in/out. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxLocallyConnected2DBackwardBiasKernel", PtxParityStatus.Deferred,
+            "LocallyConnected2D backward-bias direct-PTX (#841 locally-connected family)",
+            "per-position bias so dBias[k,oh,ow] = sum_n gradOut[n,k,oh,ow]. One thread per output-bias element " +
+            "loops over N; consecutive threads (ow) coalesce the gradOut reads. Verified correct on-device (<= 2e-3). " +
+            "Deferred."),
+
         new PtxParitySpec("PtxConv3DKernel", PtxParityStatus.Deferred,
             "Native Conv3D forward + bias + ReLU direct-PTX (#841 Conv3D family)",
             "out[n,k,od,oh,ow] = relu(bias[k] + sum_{c,kd,kh,kw} W[k,c,kd,kh,kw]*in[n,c,od*s+kd-pad,oh*s+kh-pad," +
