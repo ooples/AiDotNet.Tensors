@@ -298,6 +298,19 @@ public static class PtxParityRegistry
             "per (ci,co) reduces N x H x W into the KH*KW taps with coalesced input reads (reused across taps) and a " +
             "shared tree reduce per tap (KH*KW<=25). Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxConvTranspose3DBackwardInputKernel", PtxParityStatus.Deferred,
+            "ConvTranspose3D backward-input direct-PTX (#841 transposed-3D family)",
+            "dInput[n,ci,id,ih,iw] = sum over (co,kd,kh,kw) valid of gradOut[n,co,id*s-pad+kd,ih*s-pad+kh," +
+            "iw*s-pad+kw]*W[ci,co,kd,kh,kw] (IODHW) -- 3D correlation of gradOut with the transposed weights. " +
+            "Thread-per-output, consecutive iw -> coalesced gradOut reads + dInput stores. Verified correct " +
+            "on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxConvTranspose3DBackwardWeightKernel", PtxParityStatus.Deferred,
+            "ConvTranspose3D backward-weight direct-PTX coalesced reduction (#841 transposed-3D family)",
+            "dW[ci,co,kd,kh,kw] = sum_{n,id,ih,iw} input[n,ci,id,ih,iw]*gradOut[n,co,id*s-pad+kd,ih*s-pad+kh," +
+            "iw*s-pad+kw]. One block per (ci,co) reduces N x D x H x W into the KD*KH*KW taps with coalesced input " +
+            "reads (reused across taps) + shared tree reduce (<=27 taps). Verified correct on-device (<= 3e-3). Deferred."),
+
         new PtxParitySpec("PtxConvTranspose3DKernel", PtxParityStatus.Deferred,
             "ConvTranspose3D forward + bias + ReLU direct-PTX (#841 transposed-3D family)",
             "out[n,co,od,oh,ow] = relu(bias[co] + sum over (ci,kd,kh,kw) valid of input[n,ci,(od+pad-kd)/s," +
