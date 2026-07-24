@@ -107,6 +107,22 @@ internal static class DirectPtxConvolutionArtifactTool
             ConvTranspose3D.OutputPadding, ConvTranspose3D.Relu))
             Export(convTranspose3d.Audit, outputDirectory, exported, manifest);
 
+        using (var dwBwInput = new PtxDepthwiseConv2D3x3BackwardInputKernel(runtime, DwBwN, DwBwC, DwBwH, DwBwW))
+            Export(dwBwInput.Audit, outputDirectory, exported, manifest);
+
+        using (var dwBwWeight = new PtxDepthwiseConv2D3x3BackwardWeightKernel(runtime, DwBwN, DwBwC, DwBwH, DwBwW))
+            Export(dwBwWeight.Audit, outputDirectory, exported, manifest);
+
+        using (var c1dBwInput = new PtxConv1DBackwardInputKernel(
+            runtime, Conv1DBackward.Batch, Conv1DBackward.InputChannels, Conv1DBackward.OutputChannels,
+            Conv1DBackward.Length, Conv1DBackward.KernelLength, Conv1DBackward.Stride, Conv1DBackward.Padding))
+            Export(c1dBwInput.Audit, outputDirectory, exported, manifest);
+
+        using (var c1dBwWeight = new PtxConv1DBackwardWeightKernel(
+            runtime, Conv1DBackward.Batch, Conv1DBackward.InputChannels, Conv1DBackward.OutputChannels,
+            Conv1DBackward.Length, Conv1DBackward.KernelLength, Conv1DBackward.Stride, Conv1DBackward.Padding))
+            Export(c1dBwWeight.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -228,6 +244,8 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly Unfold2DShape Unfold2D = new(2, 4, 8, 8, 3, 3, 1, 1);
     private const int Bw2dN = 2, Bw2dK = 8, Bw2dC = 4, Bw2dH = 8, Bw2dW = 8;
     private static readonly ConvTranspose3DShape ConvTranspose3D = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 2, 1, 1, true);
+    private const int DwBwN = 2, DwBwC = 8, DwBwH = 8, DwBwW = 8;
+    private static readonly Conv1DBackwardShape Conv1DBackward = new(2, 4, 4, 32, 3, 1, 1);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -309,6 +327,30 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxConvTranspose3DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose3D).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(convTranspose3dPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(convTranspose3dPtx, 8, 6)));
+
+        string dwBwInputPtx = PtxDepthwiseConv2D3x3BackwardInputKernel.EmitPtx(8, 6, DwBwN, DwBwC, DwBwH, DwBwW);
+        expected.Add(new ExpectedArtifact(
+            PtxDepthwiseConv2D3x3BackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DwBwN, DwBwC, DwBwH, DwBwW).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(dwBwInputPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(dwBwInputPtx, 8, 6)));
+
+        string dwBwWeightPtx = PtxDepthwiseConv2D3x3BackwardWeightKernel.EmitPtx(8, 6, DwBwN, DwBwC, DwBwH, DwBwW);
+        expected.Add(new ExpectedArtifact(
+            PtxDepthwiseConv2D3x3BackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DwBwN, DwBwC, DwBwH, DwBwW).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(dwBwWeightPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(dwBwWeightPtx, 8, 6)));
+
+        string c1dBwInputPtx = PtxConv1DBackwardInputKernel.EmitPtx(8, 6, Conv1DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConv1DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv1DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(c1dBwInputPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(c1dBwInputPtx, 8, 6)));
+
+        string c1dBwWeightPtx = PtxConv1DBackwardWeightKernel.EmitPtx(8, 6, Conv1DBackward);
+        expected.Add(new ExpectedArtifact(
+            PtxConv1DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Conv1DBackward).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(c1dBwWeightPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(c1dBwWeightPtx, 8, 6)));
         return expected;
     }
 

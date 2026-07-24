@@ -12,6 +12,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// per input-gradient element; consecutive threads own consecutive il so gradOut
 /// reads (at stride 1) and dX stores coalesce and the weights broadcast across the warp.
 /// </summary>
+/// <summary>Shared geometry for the Conv1D backward kernels (device-free re-emit).</summary>
+internal readonly record struct Conv1DBackwardShape(
+    int Batch, int InputChannels, int OutputChannels, int Length, int KernelLength, int Stride, int Padding)
+{
+    internal int OutLength => (Length + 2 * Padding - KernelLength) / Stride + 1;
+}
+
 internal sealed class PtxConv1DBackwardInputKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -35,8 +42,10 @@ internal sealed class PtxConv1DBackwardInputKernel : IDisposable
     internal long WeightBytes => (long)OutputChannels * InputChannels * KernelLength * sizeof(float);
     internal long GradInputBytes => (long)Batch * InputChannels * Length * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_conv1d_bwd_input_n{Batch}_c{InputChannels}_k{OutputChannels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}");
+    internal Conv1DBackwardShape Shape => new(Batch, InputChannels, OutputChannels, Length, KernelLength, Stride, Padding);
+    internal static string EntryFor(Conv1DBackwardShape s) => FormattableString.Invariant(
+        $"aidotnet_conv1d_bwd_input_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_l{s.Length}_kl{s.KernelLength}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxConv1DBackwardInputKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -54,8 +63,9 @@ internal sealed class PtxConv1DBackwardInputKernel : IDisposable
         if ((long)batch * inputChannels * length % BlockThreads != 0)
             throw new ArgumentException($"N*C*L must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Conv1DBackwardShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -64,8 +74,11 @@ internal sealed class PtxConv1DBackwardInputKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, Conv1DBackwardShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Length = shape.Length, KernelLength = shape.KernelLength, Stride = shape.Stride, Padding = shape.Padding;
+        int OutLength = shape.OutLength;
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutLength);
         var weight = new DirectPtxExtent(OutputChannels, InputChannels, KernelLength);
         var dx = new DirectPtxExtent(Batch, InputChannels, Length);
@@ -106,14 +119,15 @@ internal sealed class PtxConv1DBackwardInputKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, Conv1DBackwardShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 Conv1D backward-input emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, kl = KernelLength, l = Length, ol = OutLength, kk = OutputChannels;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        int c = shape.InputChannels, kl = shape.KernelLength, l = shape.Length, ol = shape.OutLength, kk = shape.OutputChannels;
         int cl = c * l, kol = kk * ol, ckl = c * kl;
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(12288);
         s.AppendLine(".version 7.1");
@@ -224,8 +238,10 @@ internal sealed class PtxConv1DBackwardWeightKernel : IDisposable
     internal long GradOutputBytes => (long)Batch * OutputChannels * OutLength * sizeof(float);
     internal long GradWeightBytes => (long)OutputChannels * InputChannels * KernelLength * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_conv1d_bwd_weight_n{Batch}_c{InputChannels}_k{OutputChannels}_l{Length}_kl{KernelLength}_s{Stride}_p{Padding}");
+    internal Conv1DBackwardShape Shape => new(Batch, InputChannels, OutputChannels, Length, KernelLength, Stride, Padding);
+    internal static string EntryFor(Conv1DBackwardShape s) => FormattableString.Invariant(
+        $"aidotnet_conv1d_bwd_weight_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_l{s.Length}_kl{s.KernelLength}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxConv1DBackwardWeightKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -242,8 +258,9 @@ internal sealed class PtxConv1DBackwardWeightKernel : IDisposable
         Length = length; KernelLength = kernelLength; Stride = stride; Padding = padding;
         if (OutLength <= 0) throw new ArgumentException("Non-positive output length.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Conv1DBackwardShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -252,8 +269,11 @@ internal sealed class PtxConv1DBackwardWeightKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, Conv1DBackwardShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Length = shape.Length, KernelLength = shape.KernelLength, Stride = shape.Stride, Padding = shape.Padding;
+        int OutLength = shape.OutLength;
         var input = new DirectPtxExtent(Batch, InputChannels, Length);
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutLength);
         var dw = new DirectPtxExtent(OutputChannels, InputChannels, KernelLength);
@@ -293,14 +313,15 @@ internal sealed class PtxConv1DBackwardWeightKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, Conv1DBackwardShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 Conv1D backward-weight emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, kl = KernelLength, l = Length, ol = OutLength, kk = OutputChannels;
-        int nol = Batch * ol, cl = c * l, kol = kk * ol;
-        string entry = EntryPoint;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        int c = shape.InputChannels, kl = shape.KernelLength, l = shape.Length, ol = shape.OutLength, kk = shape.OutputChannels;
+        int nol = shape.Batch * ol, cl = c * l, kol = kk * ol;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(16384);
         s.AppendLine(".version 7.1");
