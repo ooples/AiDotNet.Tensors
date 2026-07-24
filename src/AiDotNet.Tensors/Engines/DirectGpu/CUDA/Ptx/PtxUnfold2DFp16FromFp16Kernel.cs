@@ -39,8 +39,10 @@ internal sealed class PtxUnfold2DFp16FromFp16Kernel : IDisposable
     internal long InputBytes => (long)Batch * Channels * Height * Width * sizeof(ushort);
     internal long OutputBytes => (long)Batch * PatchRows * Columns * sizeof(ushort);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_unfold_kn_fp16_from_fp16_n{Batch}_c{Channels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}");
+    internal Unfold2DShape Shape => new(Batch, Channels, Height, Width, KernelH, KernelW, Stride, Padding);
+    internal static string EntryFor(Unfold2DShape s) => FormattableString.Invariant(
+        $"aidotnet_unfold_kn_fp16_from_fp16_n{s.Batch}_c{s.Channels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxUnfold2DFp16FromFp16Kernel(
         DirectPtxRuntime runtime, int batch, int channels, int height, int width, int kernelH, int kernelW, int stride, int padding)
@@ -56,8 +58,9 @@ internal sealed class PtxUnfold2DFp16FromFp16Kernel : IDisposable
         if ((long)batch * PatchRows * Columns % BlockThreads != 0)
             throw new ArgumentException($"N*(C*KH*KW)*(OH*OW) must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Unfold2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -66,8 +69,11 @@ internal sealed class PtxUnfold2DFp16FromFp16Kernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, Unfold2DShape shape)
     {
+        int Batch = shape.Batch, Channels = shape.Channels, Height = shape.Height, Width = shape.Width;
+        int KernelH = shape.KernelH, KernelW = shape.KernelW, Stride = shape.Stride, Padding = shape.Padding;
+        int PatchRows = shape.PatchRows, Columns = shape.Columns;
         var input = new DirectPtxExtent(Batch, Channels, Height, Width);
         var output = new DirectPtxExtent(Batch, PatchRows, Columns);
         return new DirectPtxKernelBlueprint(
@@ -105,14 +111,15 @@ internal sealed class PtxUnfold2DFp16FromFp16Kernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, Unfold2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 UnfoldKNFp16FromFp16 emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = Channels, h = Height, w = Width, kw = KernelW, oww = OutW;
-        int khkw = KernelH * kw, hw = h * w, cols = Columns, prc = PatchRows * cols;
-        string entry = EntryPoint;
+        int Stride = shape.Stride, Padding = shape.Padding, KernelH = shape.KernelH;
+        int c = shape.Channels, h = shape.Height, w = shape.Width, kw = shape.KernelW, oww = shape.OutW;
+        int khkw = KernelH * kw, hw = h * w, cols = shape.Columns, prc = shape.PatchRows * cols;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(12288);
         s.AppendLine(".version 7.1");

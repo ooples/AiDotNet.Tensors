@@ -248,6 +248,21 @@ internal static class DirectPtxConvolutionArtifactTool
             LcBwd.KernelH, LcBwd.KernelW, LcBwd.Stride, LcBwd.Padding))
             Export(lcBwW.Audit, outputDirectory, exported, manifest);
 
+        using (var unfoldFp16 = new PtxUnfold2DFp16Kernel(
+            runtime, Unfold2D.Batch, Unfold2D.Channels, Unfold2D.Height, Unfold2D.Width,
+            Unfold2D.KernelH, Unfold2D.KernelW, Unfold2D.Stride, Unfold2D.Padding))
+            Export(unfoldFp16.Audit, outputDirectory, exported, manifest);
+
+        using (var unfoldFp16FromFp16 = new PtxUnfold2DFp16FromFp16Kernel(
+            runtime, Unfold2D.Batch, Unfold2D.Channels, Unfold2D.Height, Unfold2D.Width,
+            Unfold2D.KernelH, Unfold2D.KernelW, Unfold2D.Stride, Unfold2D.Padding))
+            Export(unfoldFp16FromFp16.Audit, outputDirectory, exported, manifest);
+
+        using (var conv2dDirectFp16 = new PtxConv2DDirectFp16Kernel(
+            runtime, LcFwd.Batch, LcFwd.InputChannels, LcFwd.OutputChannels, LcFwd.Height, LcFwd.Width,
+            LcFwd.KernelH, LcFwd.KernelW, LcFwd.Stride, LcFwd.Padding, LcFwd.Relu))
+            Export(conv2dDirectFp16.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -626,6 +641,24 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxLocallyConnected2DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, LcBwd).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(lcBwWPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(lcBwWPtx, 8, 6)));
+
+        string unfoldFp16Ptx = PtxUnfold2DFp16Kernel.EmitPtx(8, 6, Unfold2D);
+        expected.Add(new ExpectedArtifact(
+            PtxUnfold2DFp16Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Unfold2D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(unfoldFp16Ptx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(unfoldFp16Ptx, 8, 6)));
+
+        string unfoldFp16FromFp16Ptx = PtxUnfold2DFp16FromFp16Kernel.EmitPtx(8, 6, Unfold2D);
+        expected.Add(new ExpectedArtifact(
+            PtxUnfold2DFp16FromFp16Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Unfold2D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(unfoldFp16FromFp16Ptx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(unfoldFp16FromFp16Ptx, 8, 6)));
+
+        string conv2dDirectFp16Ptx = PtxConv2DDirectFp16Kernel.EmitPtx(8, 6, LcFwd);
+        expected.Add(new ExpectedArtifact(
+            PtxConv2DDirectFp16Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, LcFwd).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(conv2dDirectFp16Ptx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(conv2dDirectFp16Ptx, 8, 6)));
         return expected;
     }
 
