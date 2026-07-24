@@ -91,6 +91,22 @@ internal static class DirectPtxConvolutionArtifactTool
             Unfold2D.KernelH, Unfold2D.KernelW, Unfold2D.Stride, Unfold2D.Padding))
             Export(unfold.Audit, outputDirectory, exported, manifest);
 
+        using (var bwBias = new PtxConv2DBackwardBiasKernel(runtime, Bw2dN, Bw2dK, Bw2dH, Bw2dW))
+            Export(bwBias.Audit, outputDirectory, exported, manifest);
+
+        using (var bwWeight = new PtxConv2DBackwardWeight3x3Kernel(runtime, Bw2dN, Bw2dK, Bw2dC, Bw2dH, Bw2dW))
+            Export(bwWeight.Audit, outputDirectory, exported, manifest);
+
+        using (var bwInput = new PtxConv2DBackwardInput3x3Kernel(runtime, Bw2dN, Bw2dK, Bw2dC, Bw2dH, Bw2dW))
+            Export(bwInput.Audit, outputDirectory, exported, manifest);
+
+        using (var convTranspose3d = new PtxConvTranspose3DKernel(
+            runtime, ConvTranspose3D.Batch, ConvTranspose3D.InputChannels, ConvTranspose3D.OutputChannels,
+            ConvTranspose3D.Depth, ConvTranspose3D.Height, ConvTranspose3D.Width, ConvTranspose3D.KernelD,
+            ConvTranspose3D.KernelH, ConvTranspose3D.KernelW, ConvTranspose3D.Stride, ConvTranspose3D.Padding,
+            ConvTranspose3D.OutputPadding, ConvTranspose3D.Relu))
+            Export(convTranspose3d.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -210,6 +226,8 @@ internal static class DirectPtxConvolutionArtifactTool
     private const int DwN = 2, DwC = 8, DwH = 8, DwW = 8;
     private const bool DwRelu = true;
     private static readonly Unfold2DShape Unfold2D = new(2, 4, 8, 8, 3, 3, 1, 1);
+    private const int Bw2dN = 2, Bw2dK = 8, Bw2dC = 4, Bw2dH = 8, Bw2dW = 8;
+    private static readonly ConvTranspose3DShape ConvTranspose3D = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 2, 1, 1, true);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -267,6 +285,30 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxUnfold2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Unfold2D).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(unfoldPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(unfoldPtx, 8, 6)));
+
+        string bwBiasPtx = PtxConv2DBackwardBiasKernel.EmitPtx(8, 6, Bw2dN, Bw2dK, Bw2dH, Bw2dW);
+        expected.Add(new ExpectedArtifact(
+            PtxConv2DBackwardBiasKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Bw2dN, Bw2dK, Bw2dH, Bw2dW).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(bwBiasPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(bwBiasPtx, 8, 6)));
+
+        string bwWeightPtx = PtxConv2DBackwardWeight3x3Kernel.EmitPtx(8, 6, Bw2dN, Bw2dK, Bw2dC, Bw2dH, Bw2dW);
+        expected.Add(new ExpectedArtifact(
+            PtxConv2DBackwardWeight3x3Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Bw2dN, Bw2dK, Bw2dC, Bw2dH, Bw2dW).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(bwWeightPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(bwWeightPtx, 8, 6)));
+
+        string bwInputPtx = PtxConv2DBackwardInput3x3Kernel.EmitPtx(8, 6, Bw2dN, Bw2dK, Bw2dC, Bw2dH, Bw2dW);
+        expected.Add(new ExpectedArtifact(
+            PtxConv2DBackwardInput3x3Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Bw2dN, Bw2dK, Bw2dC, Bw2dH, Bw2dW).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(bwInputPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(bwInputPtx, 8, 6)));
+
+        string convTranspose3dPtx = PtxConvTranspose3DKernel.EmitPtx(8, 6, ConvTranspose3D);
+        expected.Add(new ExpectedArtifact(
+            PtxConvTranspose3DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, ConvTranspose3D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(convTranspose3dPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(convTranspose3dPtx, 8, 6)));
         return expected;
     }
 

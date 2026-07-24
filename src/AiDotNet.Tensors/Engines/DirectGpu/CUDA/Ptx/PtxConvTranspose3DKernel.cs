@@ -13,6 +13,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// a forward op. One thread per output element; consecutive threads own consecutive ow so
 /// at stride 1 the input reads and output stores coalesce (the contiguous NCDHW axis).
 /// </summary>
+/// <summary>Shape identity for <see cref="PtxConvTranspose3DKernel"/> for device-free re-emit.</summary>
+internal readonly record struct ConvTranspose3DShape(
+    int Batch, int InputChannels, int OutputChannels, int Depth, int Height, int Width,
+    int KernelD, int KernelH, int KernelW, int Stride, int Padding, int OutputPadding, bool Relu)
+{
+    internal int OutD => (Depth - 1) * Stride - 2 * Padding + KernelD + OutputPadding;
+    internal int OutH => (Height - 1) * Stride - 2 * Padding + KernelH + OutputPadding;
+    internal int OutW => (Width - 1) * Stride - 2 * Padding + KernelW + OutputPadding;
+    internal string Entry => FormattableString.Invariant(
+        $"aidotnet_convtranspose3d_n{Batch}_ci{InputChannels}_co{OutputChannels}_d{Depth}_h{Height}_w{Width}_kd{KernelD}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}{(Relu ? "_relu" : "")}");
+}
+
 internal sealed class PtxConvTranspose3DKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -45,8 +57,8 @@ internal sealed class PtxConvTranspose3DKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutD * OutH * OutW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_convtranspose3d_n{Batch}_ci{InputChannels}_co{OutputChannels}_d{Depth}_h{Height}_w{Width}_kd{KernelD}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}{(Relu ? "_relu" : "")}");
+    internal ConvTranspose3DShape Shape => new(Batch, InputChannels, OutputChannels, Depth, Height, Width, KernelD, KernelH, KernelW, Stride, Padding, OutputPadding, Relu);
+    internal string EntryPoint => Shape.Entry;
 
     internal PtxConvTranspose3DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -64,8 +76,9 @@ internal sealed class PtxConvTranspose3DKernel : IDisposable
         if ((long)batch * outputChannels * OutD * OutH * OutW % BlockThreads != 0)
             throw new ArgumentException($"N*Cout*OD*OH*OW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        ConvTranspose3DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -74,8 +87,14 @@ internal sealed class PtxConvTranspose3DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, ConvTranspose3DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Depth = shape.Depth, Height = shape.Height, Width = shape.Width;
+        int KernelD = shape.KernelD, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutputPadding = shape.OutputPadding;
+        bool Relu = shape.Relu;
+        int OutD = shape.OutD, OutH = shape.OutH, OutW = shape.OutW;
         var input = new DirectPtxExtent(Batch, InputChannels * Depth, Height, Width);
         var weight = new DirectPtxExtent(InputChannels, OutputChannels * KernelD, KernelH, KernelW);
         var bias = new DirectPtxExtent(OutputChannels);
@@ -119,17 +138,19 @@ internal sealed class PtxConvTranspose3DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, ConvTranspose3DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 ConvTranspose3D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int ci = InputChannels, co = OutputChannels, d = Depth, h = Height, w = Width;
-        int kd = KernelD, khh = KernelH, kw = KernelW, od = OutD, oh = OutH, ow = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        bool Relu = shape.Relu;
+        int ci = shape.InputChannels, co = shape.OutputChannels, d = shape.Depth, h = shape.Height, w = shape.Width;
+        int kd = shape.KernelD, khh = shape.KernelH, kw = shape.KernelW, od = shape.OutD, oh = shape.OutH, ow = shape.OutW;
         int dhw = d * h * w, hw = h * w, cidhw = ci * dhw;
         int odohow = od * oh * ow, ohow = oh * ow, coodohow = co * odohow;
         int cokdkhkw = co * kd * khh * kw, kdkhkw = kd * khh * kw, khkw = khh * kw;
-        string entry = EntryPoint;
+        string entry = shape.Entry;
 
         var s = new StringBuilder(32768);
         s.AppendLine(".version 7.1");
