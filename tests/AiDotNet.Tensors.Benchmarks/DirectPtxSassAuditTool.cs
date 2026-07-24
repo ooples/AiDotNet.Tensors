@@ -141,6 +141,14 @@ internal static class DirectPtxSassAuditTool
             }
             if (!line.StartsWith("/*", StringComparison.Ordinal))
                 continue;
+            // --print-instruction-encoding emits TWO lines per instruction: the
+            // disassembly line, prefixed with a 4-hex-digit address (/*0a30*/), and
+            // an encoding line (/* 0x... */). Both start with "/*", so counting every
+            // such line double-counts -- which silently inflated every reported
+            // instruction count by exactly 2x. Only the address-prefixed form is an
+            // instruction.
+            if (!IsInstructionAddressPrefix(line))
+                continue;
             instructions++;
             if (HasMnemonic(line, "LDL")) ldl++;
             if (HasMnemonic(line, "STL")) stl++;
@@ -154,6 +162,26 @@ internal static class DirectPtxSassAuditTool
         if (entry == null || registers < 0 || instructions == 0)
             throw new InvalidDataException("No auditable AiDotNet direct entry point was found in " + source);
         return new SassMetrics(entry, registers, instructions, ldg, stg, lds, sts, async, tensor, ldl, stl);
+    }
+
+    /// <summary>
+    /// True when a trimmed SASS line is an instruction line, i.e. it opens with a
+    /// 4-hex-digit address comment such as <c>/*0a30*/</c>. Encoding lines emitted by
+    /// --print-instruction-encoding look like <c>/* 0x00000a00... */</c> and are not
+    /// instructions.
+    /// </summary>
+    private static bool IsInstructionAddressPrefix(string line)
+    {
+        // "/*" + 4 hex + "*/" == 8 characters minimum.
+        if (line.Length < 8) return false;
+        if (line[0] != '/' || line[1] != '*') return false;
+        for (int i = 2; i < 6; i++)
+        {
+            char c = line[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return line[6] == '*' && line[7] == '/';
     }
 
     private static bool HasMnemonic(string instruction, string mnemonic)
