@@ -311,6 +311,21 @@ public static class PtxParityRegistry
             "DirectGpuTensorEngine.Conv2DBackwardBiasGpu. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
             "reduction, non-power-of-2 spatial). Deferred (experimental-pending-gpu-evidence)."),
 
+        new PtxParitySpec("PtxConv2DBackwardWeight3x3Kernel", PtxParityStatus.Deferred,
+            "Conv2D backward-weight 3x3 direct-PTX coalesced reduction (#841 backward family)",
+            "dW[k,c,r,s] = sum_{n,oh,ow} input[n,c,oh+r-1,ow+s-1] * gradOut[n,k,oh,ow]. One block per (k,c) " +
+            "pair reduces the N x H x W contraction into the 9 filter taps: consecutive threads walk the " +
+            "flattened (n,oh,ow) index so the gradOut reads coalesce, the gradOut value is read once and reused " +
+            "across all 9 overlapping (cached) input taps, and a shared tree reduction combines the taps. " +
+            "Verified correct on-device (<= 2e-3 vs fp64 CPU reference, non-power-of-2 spatial). Deferred."),
+
+        new PtxParitySpec("PtxConv2DBackwardInput3x3Kernel", PtxParityStatus.Deferred,
+            "Conv2D backward-input 3x3 direct-PTX transpose-gather (#841 backward family)",
+            "dX[n,c,ih,iw] = sum_{k,r,s} W[k,c,r,s] * gradOut[n,k,ih-r+1,iw-s+1] (flip/transpose of the forward " +
+            "correlation). One thread per input-gradient element with consecutive threads owning consecutive iw " +
+            "(contiguous NCHW axis) so gradOut reads (ow=iw-s+1) and dX stores coalesce and the weight reads " +
+            "broadcast across the warp. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxConv2DNchwK1RegBlockedKernel", PtxParityStatus.Deferred,
             "register-blocked shared-memory 1x1 Conv2D+bias+ReLU GEMM, ResNet shapes (#841)",
             "the register-blocked (TM x TN micro-tile) tiled-GEMM specialization: each thread computes a " +
