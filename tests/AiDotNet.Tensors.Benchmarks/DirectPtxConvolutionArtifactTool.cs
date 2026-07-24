@@ -183,6 +183,23 @@ internal static class DirectPtxConvolutionArtifactTool
             Deformable.Height, Deformable.Width, Deformable.KernelH, Deformable.KernelW, Deformable.Stride, Deformable.Padding))
             Export(deformBwIn.Audit, outputDirectory, exported, manifest);
 
+        using (var deformBwW = new PtxDeformableConv2DBackwardWeightKernel(
+            runtime, Deformable.Batch, Deformable.InputChannels, Deformable.OutputChannels,
+            Deformable.Height, Deformable.Width, Deformable.KernelH, Deformable.KernelW, Deformable.Stride, Deformable.Padding))
+            Export(deformBwW.Audit, outputDirectory, exported, manifest);
+
+        using (var deformBwOff = new PtxDeformableConv2DBackwardOffsetKernel(
+            runtime, DeformableSpatial.Batch, DeformableSpatial.InputChannels, DeformableSpatial.OutputChannels,
+            DeformableSpatial.Height, DeformableSpatial.Width, DeformableSpatial.KernelH, DeformableSpatial.KernelW,
+            DeformableSpatial.Stride, DeformableSpatial.Padding))
+            Export(deformBwOff.Audit, outputDirectory, exported, manifest);
+
+        using (var deformBwMask = new PtxDeformableConv2DBackwardMaskKernel(
+            runtime, DeformableSpatial.Batch, DeformableSpatial.InputChannels, DeformableSpatial.OutputChannels,
+            DeformableSpatial.Height, DeformableSpatial.Width, DeformableSpatial.KernelH, DeformableSpatial.KernelW,
+            DeformableSpatial.Stride, DeformableSpatial.Padding))
+            Export(deformBwMask.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -311,6 +328,8 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly ConvTranspose3DBackwardShape ConvTranspose3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1, 0);
     private static readonly Conv3DBackwardShape Conv3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
     private static readonly DeformableConv2DShape Deformable = new(2, 3, 4, 8, 8, 3, 3, 1, 1);
+    // offset/mask require N*Taps*OH*OW % 256 == 0 (Taps=9 coprime to 256 -> N*OH*OW % 256): OH=8,OW=16 -> 2*9*128=2304.
+    private static readonly DeformableConv2DShape DeformableSpatial = new(2, 3, 4, 8, 16, 3, 3, 1, 1);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -482,6 +501,24 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxDeformableConv2DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Deformable).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(deformBwInPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(deformBwInPtx, 8, 6)));
+
+        string deformBwWPtx = PtxDeformableConv2DBackwardWeightKernel.EmitPtx(8, 6, Deformable);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, Deformable).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(deformBwWPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(deformBwWPtx, 8, 6)));
+
+        string deformBwOffPtx = PtxDeformableConv2DBackwardOffsetKernel.EmitPtx(8, 6, DeformableSpatial);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DBackwardOffsetKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DeformableSpatial).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(deformBwOffPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(deformBwOffPtx, 8, 6)));
+
+        string deformBwMaskPtx = PtxDeformableConv2DBackwardMaskKernel.EmitPtx(8, 6, DeformableSpatial);
+        expected.Add(new ExpectedArtifact(
+            PtxDeformableConv2DBackwardMaskKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, DeformableSpatial).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(deformBwMaskPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(deformBwMaskPtx, 8, 6)));
         return expected;
     }
 
