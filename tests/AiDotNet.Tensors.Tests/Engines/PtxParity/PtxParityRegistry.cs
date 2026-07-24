@@ -304,6 +304,20 @@ public static class PtxParityRegistry
             "One thread per output, consecutive ow -> coalesced. dg=1 reproduces the single-group kernel. Verified " +
             "correct on-device (<= 3e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxDeformableConv2DGroupedBackwardOffsetKernel", PtxParityStatus.Deferred,
+            "Grouped Deformable Conv2D backward-offset (deform_groups>1) direct-PTX (#841 grouped-deformable family)",
+            "one thread per (n,g,pos,oh,ow) writes dOff_y/dOff_x = mask_g*sum_{c in group g, k} gradOut*W*bilinear-" +
+            "derivative into dOff[n,g*2*taps+2*pos(+1),oh,ow]; the channel reduction runs only over the deformable " +
+            "group's channels c in [g*C/dg, (g+1)*C/dg). Bilinear derivatives over 4 zero-padded corners, bounds-" +
+            "guarded grid. Verified correct on-device (<= 3e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxDeformableConv2DGroupedBackwardMaskKernel", PtxParityStatus.Deferred,
+            "Grouped Deformable Conv2D backward-mask (deform_groups>1) direct-PTX (#841 grouped-deformable family)",
+            "dMask[n,g,pos,oh,ow] = sum_{c in group g, k} gradOut[n,k,oh,ow]*W[k,c,pos]*bilinear(input[n,c]; py_g, " +
+            "px_g); the channel reduction is restricted to the deformable group. One thread per grouped mask element, " +
+            "consecutive ow -> coalesced, zero-padded 4-corner bilinear, bounds-guarded grid. Verified correct " +
+            "on-device (<= 3e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxDeformableConv2DGroupedBackwardInputKernel", PtxParityStatus.Deferred,
             "Grouped Deformable Conv2D backward-input (deform_groups>1, atomic scatter) direct-PTX (#841 grouped-deformable family)",
             "dInput[n,c,yy,xx] += (sum_k gradOut*W)*mask_g*corner_weight scattered to the four bilinear corners via " +
