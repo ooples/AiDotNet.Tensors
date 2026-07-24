@@ -2489,6 +2489,219 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
 
+    private static double GroupedBilinear(float[] input, int inBase, double py, double px, int h, int w)
+    {
+        int y0 = (int)Math.Floor(py), x0 = (int)Math.Floor(px);
+        double wy1 = py - y0, wx1 = px - x0, wy0 = 1 - wy1, wx0 = 1 - wx1;
+        double v = 0;
+        void C(int yy, int xx, double cw) { if (yy >= 0 && yy < h && xx >= 0 && xx < w) v += cw * input[inBase + yy * w + xx]; }
+        C(y0, x0, wy0 * wx0); C(y0, x0 + 1, wy0 * wx1); C(y0 + 1, x0, wy1 * wx0); C(y0 + 1, x0 + 1, wy1 * wx1);
+        return v;
+    }
+
+    [Fact]
+    public void DeformableConv2DGroupedForward_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 4, k = 3, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1, dg = 2;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1, taps = kh * kw, cpg = c / dg;
+        var input = new float[n * c * h * w];
+        var weights = new float[k * c * taps];
+        var offset = new float[n * dg * 2 * taps * oh * ow];
+        var mask = new float[n * dg * taps * oh * ow];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < offset.Length; i++) offset[i] = DeterministicInput(i + 7) * 1.5f;
+        for (int i = 0; i < mask.Length; i++) mask[i] = 0.5f + 0.4f * DeterministicWeight(i + 3);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        var expected = new float[n * k * oh * ow];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int y = 0; y < oh; y++)
+                    for (int x = 0; x < ow; x++)
+                    {
+                        double acc = bias[oc];
+                        for (int ic = 0; ic < c; ic++)
+                        {
+                            int g = ic / cpg;
+                            for (int pos = 0; pos < taps; pos++)
+                            {
+                                int r = pos / kw, t = pos % kw;
+                                int offY = ((b * dg * 2 * taps + g * 2 * taps + 2 * pos) * oh + y) * ow + x;
+                                double oY = offset[offY], oX = offset[offY + oh * ow];
+                                double m = mask[((b * dg * taps + g * taps + pos) * oh + y) * ow + x];
+                                double py = y * stride + r - pad + oY, px = x * stride + t - pad + oX;
+                                double val = GroupedBilinear(input, (b * c + ic) * h * w, py, px, h, w);
+                                acc += weights[(oc * c + ic) * taps + pos] * m * val;
+                            }
+                        }
+                        expected[((b * k + oc) * oh + y) * ow + x] = (float)acc;
+                    }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDeformableConv2DGroupedForwardKernel(runtime, n, c, k, h, w, kh, kw, stride, pad, dg);
+            using var dI = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dOff = runtime.AllocateBytes((nuint)kernel.OffsetBytes);
+            using var dM = runtime.AllocateBytes((nuint)kernel.MaskBytes);
+            using var dB = runtime.AllocateBytes((nuint)kernel.BiasBytes);
+            using var dO = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dI.Upload<float>(input); dW.Upload<float>(weights); dOff.Upload<float>(offset); dM.Upload<float>(mask); dB.Upload<float>(bias);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dI, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dOff, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dM, kernel.Blueprint.Tensors[3]),
+                          DirectPtxTensorView.CreateOwned(dB, kernel.Blueprint.Tensors[4]),
+                          DirectPtxTensorView.CreateOwned(dO, kernel.Blueprint.Tensors[5]));
+            runtime.Synchronize();
+            var actual = new float[n * k * oh * ow];
+            dO.Download<float>(actual);
+            AssertClose(expected, actual, 3e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void DeformableConv2DGroupedBackwardInput_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 4, k = 3, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1, dg = 2;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1, taps = kh * kw, cpg = c / dg;
+        var weights = new float[k * c * taps];
+        var offset = new float[n * dg * 2 * taps * oh * ow];
+        var mask = new float[n * dg * taps * oh * ow];
+        var grad = new float[n * k * oh * ow];
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < offset.Length; i++) offset[i] = DeterministicInput(i + 7) * 1.5f;
+        for (int i = 0; i < mask.Length; i++) mask[i] = 0.5f + 0.4f * DeterministicWeight(i + 3);
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicWeight(i + 2) - 0.1f;
+        var expected = new double[n * c * h * w];
+        for (int b = 0; b < n; b++)
+            for (int ic = 0; ic < c; ic++)
+            {
+                int g = ic / cpg;
+                for (int y = 0; y < oh; y++)
+                    for (int x = 0; x < ow; x++)
+                        for (int pos = 0; pos < taps; pos++)
+                        {
+                            int r = pos / kw, t = pos % kw;
+                            int offY = ((b * dg * 2 * taps + g * 2 * taps + 2 * pos) * oh + y) * ow + x;
+                            double oY = offset[offY], oX = offset[offY + oh * ow];
+                            double m = mask[((b * dg * taps + g * taps + pos) * oh + y) * ow + x];
+                            double top = 0;
+                            for (int oc = 0; oc < k; oc++) top += grad[((b * k + oc) * oh + y) * ow + x] * weights[(oc * c + ic) * taps + pos];
+                            double contrib = top * m;
+                            double py = y * stride + r - pad + oY, px = x * stride + t - pad + oX;
+                            int y0 = (int)Math.Floor(py), x0 = (int)Math.Floor(px);
+                            double wy1 = py - y0, wx1 = px - x0, wy0 = 1 - wy1, wx0 = 1 - wx1;
+                            void Sc(int yy, int xx, double cw) { if (yy >= 0 && yy < h && xx >= 0 && xx < w) expected[((b * c + ic) * h + yy) * w + xx] += contrib * cw; }
+                            Sc(y0, x0, wy0 * wx0); Sc(y0, x0 + 1, wy0 * wx1); Sc(y0 + 1, x0, wy1 * wx0); Sc(y0 + 1, x0 + 1, wy1 * wx1);
+                        }
+            }
+        var expF = new float[n * c * h * w];
+        for (int i = 0; i < expF.Length; i++) expF[i] = (float)expected[i];
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDeformableConv2DGroupedBackwardInputKernel(runtime, n, c, k, h, w, kh, kw, stride, pad, dg);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dOff = runtime.AllocateBytes((nuint)kernel.OffsetBytes);
+            using var dM = runtime.AllocateBytes((nuint)kernel.MaskBytes);
+            using var dG = runtime.AllocateBytes((nuint)kernel.GradOutputBytes);
+            using var dX = runtime.AllocateBytes((nuint)kernel.GradInputBytes);
+            dW.Upload<float>(weights); dOff.Upload<float>(offset); dM.Upload<float>(mask); dG.Upload<float>(grad);
+            dX.Upload<float>(new float[n * c * h * w]);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dOff, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dM, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dG, kernel.Blueprint.Tensors[3]),
+                          DirectPtxTensorView.CreateOwned(dX, kernel.Blueprint.Tensors[4]));
+            runtime.Synchronize();
+            var actual = new float[n * c * h * w];
+            dX.Download<float>(actual);
+            AssertClose(expF, actual, 3e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
+    public void DeformableConv2DGroupedBackwardWeight_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 4, k = 3, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1, dg = 2;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1, taps = kh * kw, cpg = c / dg;
+        var input = new float[n * c * h * w];
+        var offset = new float[n * dg * 2 * taps * oh * ow];
+        var mask = new float[n * dg * taps * oh * ow];
+        var grad = new float[n * k * oh * ow];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < offset.Length; i++) offset[i] = DeterministicInput(i + 7) * 1.5f;
+        for (int i = 0; i < mask.Length; i++) mask[i] = 0.5f + 0.4f * DeterministicWeight(i + 3);
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicWeight(i + 2) - 0.1f;
+        var expected = new float[k * c * taps];
+        for (int oc = 0; oc < k; oc++)
+            for (int ic = 0; ic < c; ic++)
+            {
+                int g = ic / cpg;
+                for (int pos = 0; pos < taps; pos++)
+                {
+                    int r = pos / kw, t = pos % kw;
+                    double acc = 0;
+                    for (int b = 0; b < n; b++)
+                        for (int y = 0; y < oh; y++)
+                            for (int x = 0; x < ow; x++)
+                            {
+                                int offY = ((b * dg * 2 * taps + g * 2 * taps + 2 * pos) * oh + y) * ow + x;
+                                double oY = offset[offY], oX = offset[offY + oh * ow];
+                                double m = mask[((b * dg * taps + g * taps + pos) * oh + y) * ow + x];
+                                double gv = grad[((b * k + oc) * oh + y) * ow + x];
+                                double py = y * stride + r - pad + oY, px = x * stride + t - pad + oX;
+                                double val = GroupedBilinear(input, (b * c + ic) * h * w, py, px, h, w);
+                                acc += gv * m * val;
+                            }
+                    expected[(oc * c + ic) * taps + pos] = (float)acc;
+                }
+            }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDeformableConv2DGroupedBackwardWeightKernel(runtime, n, c, k, h, w, kh, kw, stride, pad, dg);
+            using var dI = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dOff = runtime.AllocateBytes((nuint)kernel.OffsetBytes);
+            using var dM = runtime.AllocateBytes((nuint)kernel.MaskBytes);
+            using var dG = runtime.AllocateBytes((nuint)kernel.GradOutputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.GradWeightBytes);
+            dI.Upload<float>(input); dOff.Upload<float>(offset); dM.Upload<float>(mask); dG.Upload<float>(grad);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dI, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dOff, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dM, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dG, kernel.Blueprint.Tensors[3]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[4]));
+            runtime.Synchronize();
+            var actual = new float[k * c * taps];
+            dW.Download<float>(actual);
+            AssertClose(expected, actual, 3e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
     [Fact]
     public void DepthwiseConv1DForward_MatchesCpuReference()
     {

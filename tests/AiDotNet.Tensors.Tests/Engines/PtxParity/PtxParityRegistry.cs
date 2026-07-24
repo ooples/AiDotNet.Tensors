@@ -296,6 +296,27 @@ public static class PtxParityRegistry
             "K*C*KH*KW is small), reusing the forward 4-corner bilinear. Verified correct on-device (<= 3e-3 vs " +
             "fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxDeformableConv2DGroupedForwardKernel", PtxParityStatus.Deferred,
+            "Grouped Deformable Conv2D forward (DCNv2 deform_groups>1) direct-PTX (#841 grouped-deformable family)",
+            "input channels partitioned into dg deformable groups, each with its own offset/mask field; for channel c " +
+            "the group g=c/(C/dg) selects offset[n,g*2*taps+2*pos(+1),oh,ow] and mask[n,g*taps+pos,oh,ow]. " +
+            "out[n,k,oh,ow] = bias[k] + sum W[k,c,pos]*mask_g*bilinear(input[n,c]; py_g, px_g), zero-padded 4-corner. " +
+            "One thread per output, consecutive ow -> coalesced. dg=1 reproduces the single-group kernel. Verified " +
+            "correct on-device (<= 3e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxDeformableConv2DGroupedBackwardInputKernel", PtxParityStatus.Deferred,
+            "Grouped Deformable Conv2D backward-input (deform_groups>1, atomic scatter) direct-PTX (#841 grouped-deformable family)",
+            "dInput[n,c,yy,xx] += (sum_k gradOut*W)*mask_g*corner_weight scattered to the four bilinear corners via " +
+            "red.global.add.f32, with group g=c/(C/dg) selecting the offset/mask field. gradInput zero-initialized, " +
+            "one thread per (n,c,oh,ow), bounds-guarded grid. Verified correct on-device (<= 3e-3 vs fp64 CPU " +
+            "reference). Deferred."),
+
+        new PtxParitySpec("PtxDeformableConv2DGroupedBackwardWeightKernel", PtxParityStatus.Deferred,
+            "Grouped Deformable Conv2D backward-weight (deform_groups>1) direct-PTX (#841 grouped-deformable family)",
+            "dW[k,c,pos] = sum_{n,oh,ow} gradOut[n,k,oh,ow]*mask_g*bilinear(input[n,c]; py_g, px_g), group g=c/(C/dg) " +
+            "selecting the offset/mask field. One thread per weight element reduces over batch+output-spatial with a " +
+            "bounds-guarded grid. Verified correct on-device (<= 3e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxDeformableConv2DBackwardInputKernel", PtxParityStatus.Deferred,
             "Deformable Conv2D backward-input (DCNv2 input gradient via atomic scatter) direct-PTX (#841 deformable family)",
             "dInput[n,c,yy,xx] += (sum_k gradOut[n,k,oh,ow]*W[k,c,pos])*mask[n,pos,oh,ow]*corner_weight(yy,xx). One " +
