@@ -12,6 +12,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// in[n,c,oh*s+kh-pad,ow*s+kw-pad]). One thread per output element; consecutive threads
 /// own consecutive ow so at stride 1 the input reads and output stores coalesce.
 /// </summary>
+/// <summary>Shared geometry for the locally-connected 2D fwd/backward kernels (device-free re-emit).</summary>
+internal readonly record struct LocallyConnected2DShape(
+    int Batch, int InputChannels, int OutputChannels, int Height, int Width,
+    int KernelH, int KernelW, int Stride, int Padding, bool Relu)
+{
+    internal int OutH => (Height + 2 * Padding - KernelH) / Stride + 1;
+    internal int OutW => (Width + 2 * Padding - KernelW) / Stride + 1;
+}
+
 internal sealed class PtxLocallyConnected2DKernel : IDisposable
 {
     internal const int BlockThreads = 256;
@@ -40,8 +49,10 @@ internal sealed class PtxLocallyConnected2DKernel : IDisposable
     internal long BiasBytes => (long)OutputChannels * OutH * OutW * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_locallyconnected2d_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}{(Relu ? "_relu" : "")}");
+    internal LocallyConnected2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, Relu);
+    internal static string EntryFor(LocallyConnected2DShape s) => FormattableString.Invariant(
+        $"aidotnet_locallyconnected2d_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}{(s.Relu ? "_relu" : "")}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxLocallyConnected2DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -59,8 +70,9 @@ internal sealed class PtxLocallyConnected2DKernel : IDisposable
         if ((long)batch * outputChannels * OutH * OutW % BlockThreads != 0)
             throw new ArgumentException($"N*K*OH*OW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        LocallyConnected2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -69,8 +81,12 @@ internal sealed class PtxLocallyConnected2DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, LocallyConnected2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutH = shape.OutH, OutW = shape.OutW;
+        bool Relu = shape.Relu;
         // Weights collapsed to rank-4 (OH*OW, K, C, KH*KW) for byte-length ABI.
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var weight = new DirectPtxExtent(OutH * OutW, OutputChannels, InputChannels, KernelH * KernelW);
@@ -115,15 +131,16 @@ internal sealed class PtxLocallyConnected2DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, LocallyConnected2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 LocallyConnected2D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding; bool Relu = shape.Relu;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow;
         int ckk = c * kh * kw, khkw = kh * kw, kckk = k * ckk;       // per-position weight block = K*C*KH*KW
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(16384);
         s.AppendLine(".version 7.1");
@@ -241,8 +258,9 @@ internal sealed class PtxLocallyConnected2DBackwardBiasKernel : IDisposable
     internal long GradOutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
     internal long GradBiasBytes => (long)OutputChannels * OutH * OutW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_lc2d_bwd_bias_n{Batch}_k{OutputChannels}_oh{OutH}_ow{OutW}");
+    internal static string EntryFor(int batch, int k, int oh, int ow) => FormattableString.Invariant(
+        $"aidotnet_lc2d_bwd_bias_n{batch}_k{k}_oh{oh}_ow{ow}");
+    internal string EntryPoint => EntryFor(Batch, OutputChannels, OutH, OutW);
 
     internal PtxLocallyConnected2DBackwardBiasKernel(DirectPtxRuntime runtime, int batch, int outputChannels, int outH, int outW)
     {
@@ -256,8 +274,8 @@ internal sealed class PtxLocallyConnected2DBackwardBiasKernel : IDisposable
         if ((long)outputChannels * outH * outW % BlockThreads != 0)
             throw new ArgumentException($"K*OH*OW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, Batch, OutputChannels, OutH, OutW);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, Batch, OutputChannels, OutH, OutW);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -266,7 +284,7 @@ internal sealed class PtxLocallyConnected2DBackwardBiasKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, int Batch, int OutputChannels, int OutH, int OutW)
     {
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutH, OutW);
         var bias = new DirectPtxExtent(OutputChannels, OutH, OutW);
@@ -305,13 +323,13 @@ internal sealed class PtxLocallyConnected2DBackwardBiasKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, int Batch, int OutputChannels, int OutH, int OutW)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 LC2D backward-bias emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
         int khow = OutputChannels * OutH * OutW;   // per-batch gradOut stride and output size
-        string entry = EntryPoint;
+        string entry = EntryFor(Batch, OutputChannels, OutH, OutW);
 
         var s = new StringBuilder(6144);
         s.AppendLine(".version 7.1");

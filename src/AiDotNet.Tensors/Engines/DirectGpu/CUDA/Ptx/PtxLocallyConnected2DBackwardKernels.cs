@@ -38,8 +38,10 @@ internal sealed class PtxLocallyConnected2DBackwardInputKernel : IDisposable
     internal long WeightBytes => (long)OutH * OutW * OutputChannels * InputChannels * KernelH * KernelW * sizeof(float);
     internal long GradInputBytes => (long)Batch * InputChannels * Height * Width * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_lc2d_bwd_input_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}");
+    internal LocallyConnected2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, false);
+    internal static string EntryFor(LocallyConnected2DShape s) => FormattableString.Invariant(
+        $"aidotnet_lc2d_bwd_input_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxLocallyConnected2DBackwardInputKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -57,8 +59,9 @@ internal sealed class PtxLocallyConnected2DBackwardInputKernel : IDisposable
         if ((long)batch * inputChannels * height * width % BlockThreads != 0)
             throw new ArgumentException($"N*C*H*W must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        LocallyConnected2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -67,8 +70,11 @@ internal sealed class PtxLocallyConnected2DBackwardInputKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, LocallyConnected2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutH = shape.OutH, OutW = shape.OutW;
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutH, OutW);
         var weight = new DirectPtxExtent(OutH * OutW, OutputChannels, InputChannels, KernelH * KernelW);
         var dx = new DirectPtxExtent(Batch, InputChannels, Height, Width);
@@ -109,15 +115,16 @@ internal sealed class PtxLocallyConnected2DBackwardInputKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, LocallyConnected2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 LC2D backward-input emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding, Batch = shape.Batch;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow;
         int ckk = c * kh * kw, khkw = kh * kw, kckk = k * ckk;
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(16384);
         s.AppendLine(".version 7.1");
@@ -244,8 +251,10 @@ internal sealed class PtxLocallyConnected2DBackwardWeightKernel : IDisposable
     internal long GradOutputBytes => (long)Batch * OutputChannels * OutH * OutW * sizeof(float);
     internal long GradWeightBytes => (long)OutH * OutW * OutputChannels * InputChannels * KernelH * KernelW * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_lc2d_bwd_weight_n{Batch}_c{InputChannels}_k{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}");
+    internal LocallyConnected2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, false);
+    internal static string EntryFor(LocallyConnected2DShape s) => FormattableString.Invariant(
+        $"aidotnet_lc2d_bwd_weight_n{s.Batch}_c{s.InputChannels}_k{s.OutputChannels}_h{s.Height}_w{s.Width}_kh{s.KernelH}_kw{s.KernelW}_s{s.Stride}_p{s.Padding}");
+    internal string EntryPoint => EntryFor(Shape);
 
     internal PtxLocallyConnected2DBackwardWeightKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -263,8 +272,9 @@ internal sealed class PtxLocallyConnected2DBackwardWeightKernel : IDisposable
         if ((long)OutH * OutW * outputChannels * inputChannels * kernelH * kernelW % BlockThreads != 0)
             throw new ArgumentException($"OH*OW*K*C*KH*KW must be a multiple of {BlockThreads}.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        LocallyConnected2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -273,8 +283,11 @@ internal sealed class PtxLocallyConnected2DBackwardWeightKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, LocallyConnected2DShape shape)
     {
+        int Batch = shape.Batch, InputChannels = shape.InputChannels, OutputChannels = shape.OutputChannels;
+        int Height = shape.Height, Width = shape.Width, KernelH = shape.KernelH, KernelW = shape.KernelW;
+        int Stride = shape.Stride, Padding = shape.Padding, OutH = shape.OutH, OutW = shape.OutW;
         var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
         var grad = new DirectPtxExtent(Batch, OutputChannels, OutH, OutW);
         var dw = new DirectPtxExtent(OutH * OutW, OutputChannels, InputChannels, KernelH * KernelW);
@@ -315,15 +328,16 @@ internal sealed class PtxLocallyConnected2DBackwardWeightKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, LocallyConnected2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 LC2D backward-weight emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int c = InputChannels, k = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW, ohh = OutH, oww = OutW;
+        int Stride = shape.Stride, Padding = shape.Padding, Batch = shape.Batch;
+        int c = shape.InputChannels, k = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW, ohh = shape.OutH, oww = shape.OutW;
         int hw = h * w, chw = c * hw, ohow = ohh * oww, kohow = k * ohow;
         int ckk = c * kh * kw, khkw = kh * kw, kckk = k * ckk;
-        string entry = EntryPoint;
+        string entry = EntryFor(shape);
 
         var s = new StringBuilder(12288);
         s.AppendLine(".version 7.1");

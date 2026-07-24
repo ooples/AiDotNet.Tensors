@@ -230,6 +230,24 @@ internal static class DirectPtxConvolutionArtifactTool
             GroupedDeformSpatial.Stride, GroupedDeformSpatial.Padding, GroupedDeformSpatial.DeformGroups))
             Export(gDeformBwMask.Audit, outputDirectory, exported, manifest);
 
+        using (var lcFwd = new PtxLocallyConnected2DKernel(
+            runtime, LcFwd.Batch, LcFwd.InputChannels, LcFwd.OutputChannels, LcFwd.Height, LcFwd.Width,
+            LcFwd.KernelH, LcFwd.KernelW, LcFwd.Stride, LcFwd.Padding, LcFwd.Relu))
+            Export(lcFwd.Audit, outputDirectory, exported, manifest);
+
+        using (var lcBias = new PtxLocallyConnected2DBackwardBiasKernel(runtime, LcBiasN, LcBiasK, LcBiasOH, LcBiasOW))
+            Export(lcBias.Audit, outputDirectory, exported, manifest);
+
+        using (var lcBwIn = new PtxLocallyConnected2DBackwardInputKernel(
+            runtime, LcBwd.Batch, LcBwd.InputChannels, LcBwd.OutputChannels, LcBwd.Height, LcBwd.Width,
+            LcBwd.KernelH, LcBwd.KernelW, LcBwd.Stride, LcBwd.Padding))
+            Export(lcBwIn.Audit, outputDirectory, exported, manifest);
+
+        using (var lcBwW = new PtxLocallyConnected2DBackwardWeightKernel(
+            runtime, LcBwd.Batch, LcBwd.InputChannels, LcBwd.OutputChannels, LcBwd.Height, LcBwd.Width,
+            LcBwd.KernelH, LcBwd.KernelW, LcBwd.Stride, LcBwd.Padding))
+            Export(lcBwW.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -362,6 +380,9 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly DeformableConv2DShape DeformableSpatial = new(2, 3, 4, 8, 16, 3, 3, 1, 1);
     private static readonly GroupedDeformableConv2DShape GroupedDeform = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 2);
     private static readonly GroupedDeformableConv2DShape GroupedDeformSpatial = new(2, 4, 4, 8, 16, 3, 3, 1, 1, 2);
+    private static readonly LocallyConnected2DShape LcFwd = new(2, 4, 4, 8, 8, 3, 3, 1, 1, true);
+    private static readonly LocallyConnected2DShape LcBwd = new(2, 4, 4, 8, 8, 3, 3, 1, 1, false);
+    private const int LcBiasN = 2, LcBiasK = 4, LcBiasOH = 8, LcBiasOW = 8;
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -581,6 +602,30 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxDeformableConv2DGroupedBackwardMaskKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, GroupedDeformSpatial).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(gDeformBwMaskPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(gDeformBwMaskPtx, 8, 6)));
+
+        string lcFwdPtx = PtxLocallyConnected2DKernel.EmitPtx(8, 6, LcFwd);
+        expected.Add(new ExpectedArtifact(
+            PtxLocallyConnected2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, LcFwd).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(lcFwdPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lcFwdPtx, 8, 6)));
+
+        string lcBiasPtx = PtxLocallyConnected2DBackwardBiasKernel.EmitPtx(8, 6, LcBiasN, LcBiasK, LcBiasOH, LcBiasOW);
+        expected.Add(new ExpectedArtifact(
+            PtxLocallyConnected2DBackwardBiasKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, LcBiasN, LcBiasK, LcBiasOH, LcBiasOW).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(lcBiasPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lcBiasPtx, 8, 6)));
+
+        string lcBwInPtx = PtxLocallyConnected2DBackwardInputKernel.EmitPtx(8, 6, LcBwd);
+        expected.Add(new ExpectedArtifact(
+            PtxLocallyConnected2DBackwardInputKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, LcBwd).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(lcBwInPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lcBwInPtx, 8, 6)));
+
+        string lcBwWPtx = PtxLocallyConnected2DBackwardWeightKernel.EmitPtx(8, 6, LcBwd);
+        expected.Add(new ExpectedArtifact(
+            PtxLocallyConnected2DBackwardWeightKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, LcBwd).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(lcBwWPtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(lcBwWPtx, 8, 6)));
         return expected;
     }
 
