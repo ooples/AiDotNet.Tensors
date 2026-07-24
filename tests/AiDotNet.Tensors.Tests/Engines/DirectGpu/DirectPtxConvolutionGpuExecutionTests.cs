@@ -2490,6 +2490,74 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void DeformableConv2DBackwardInput_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 3, k = 4, h = 8, w = 8, kh = 3, kw = 3, stride = 1, pad = 1;
+        int oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1, taps = kh * kw;
+        var weights = new float[k * c * taps];
+        var offset = new float[n * 2 * taps * oh * ow];
+        var mask = new float[n * taps * oh * ow];
+        var grad = new float[n * k * oh * ow];
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < offset.Length; i++) offset[i] = DeterministicInput(i + 3) * 1.5f;
+        for (int i = 0; i < mask.Length; i++) mask[i] = 0.5f + 0.4f * DeterministicWeight(i + 5);
+        for (int i = 0; i < grad.Length; i++) grad[i] = DeterministicWeight(i + 2) - 0.1f;
+        var expected = new double[n * c * h * w];
+        for (int b = 0; b < n; b++)
+            for (int ic = 0; ic < c; ic++)
+                for (int y = 0; y < oh; y++)
+                    for (int x = 0; x < ow; x++)
+                        for (int pos = 0; pos < taps; pos++)
+                        {
+                            int r = pos / kw, t = pos % kw;
+                            double offY = offset[((b * 2 * taps + 2 * pos) * oh + y) * ow + x];
+                            double offX = offset[((b * 2 * taps + 2 * pos + 1) * oh + y) * ow + x];
+                            double m = mask[((b * taps + pos) * oh + y) * ow + x];
+                            double top = 0;
+                            for (int oc = 0; oc < k; oc++) top += grad[((b * k + oc) * oh + y) * ow + x] * weights[(oc * c + ic) * taps + pos];
+                            double contrib = top * m;
+                            double py = y * stride + r - pad + offY, px = x * stride + t - pad + offX;
+                            int y0 = (int)Math.Floor(py), x0 = (int)Math.Floor(px);
+                            double wy1 = py - y0, wx1 = px - x0, wy0 = 1 - wy1, wx0 = 1 - wx1;
+                            void Sc(int yy, int xx, double cw) { if (yy >= 0 && yy < h && xx >= 0 && xx < w) expected[((b * c + ic) * h + yy) * w + xx] += contrib * cw; }
+                            Sc(y0, x0, wy0 * wx0); Sc(y0, x0 + 1, wy0 * wx1); Sc(y0 + 1, x0, wy1 * wx0); Sc(y0 + 1, x0 + 1, wy1 * wx1);
+                        }
+        var expF = new float[n * c * h * w];
+        for (int i = 0; i < expF.Length; i++) expF[i] = (float)expected[i];
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxDeformableConv2DBackwardInputKernel(runtime, n, c, k, h, w, kh, kw, stride, pad);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dOff = runtime.AllocateBytes((nuint)kernel.OffsetBytes);
+            using var dMask = runtime.AllocateBytes((nuint)kernel.MaskBytes);
+            using var dGrad = runtime.AllocateBytes((nuint)kernel.GradOutputBytes);
+            using var dX = runtime.AllocateBytes((nuint)kernel.GradInputBytes);
+            dW.Upload<float>(weights); dOff.Upload<float>(offset); dMask.Upload<float>(mask); dGrad.Upload<float>(grad);
+            dX.Upload<float>(new float[n * c * h * w]);   // zero-init for atomic accumulation
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dOff, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dMask, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dGrad, kernel.Blueprint.Tensors[3]),
+                          DirectPtxTensorView.CreateOwned(dX, kernel.Blueprint.Tensors[4]));
+            runtime.Synchronize();
+            var actual = new float[n * c * h * w];
+            dX.Download<float>(actual);
+            AssertClose(expF, actual, 3e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DumpWinogradPtxForSassAnalysis()
     {
         string dir = Environment.GetEnvironmentVariable("PTX_DUMP_DIR");

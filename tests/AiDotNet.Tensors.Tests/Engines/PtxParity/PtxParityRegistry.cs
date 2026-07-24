@@ -296,6 +296,14 @@ public static class PtxParityRegistry
             "K*C*KH*KW is small), reusing the forward 4-corner bilinear. Verified correct on-device (<= 3e-3 vs " +
             "fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxDeformableConv2DBackwardInputKernel", PtxParityStatus.Deferred,
+            "Deformable Conv2D backward-input (DCNv2 input gradient via atomic scatter) direct-PTX (#841 deformable family)",
+            "dInput[n,c,yy,xx] += (sum_k gradOut[n,k,oh,ow]*W[k,c,pos])*mask[n,pos,oh,ow]*corner_weight(yy,xx). One " +
+            "thread per (n,c,oh,ow) loops the taps and scatters each sample point's contribution to its four bilinear " +
+            "input corners via red.global.add.f32 (gradInput zero-initialized), since many (oh,ow,pos) alias onto the " +
+            "same input pixel. Bounds-guarded ceil-div grid. Verified correct on-device (<= 3e-3 vs fp64 CPU " +
+            "reference). Deferred."),
+
         new PtxParitySpec("PtxDeformableConv2DBackwardMaskKernel", PtxParityStatus.Deferred,
             "Deformable Conv2D backward-mask (DCNv2 modulation gradient) direct-PTX (#841 deformable family)",
             "dMask[n,pos,oh,ow] = sum_{c,k} gradOut[n,k,oh,ow]*W[k,c,pos]*bilinear(input[n,c]; py, px); reuses the " +
