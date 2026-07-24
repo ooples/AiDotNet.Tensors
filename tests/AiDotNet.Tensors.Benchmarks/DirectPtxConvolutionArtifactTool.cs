@@ -61,6 +61,12 @@ internal static class DirectPtxConvolutionArtifactTool
             FusedConv3D.KernelD, FusedConv3D.KernelH, FusedConv3D.KernelW, FusedConv3D.Stride, FusedConv3D.Padding))
             Export(fusedConv3d.Audit, outputDirectory, exported, manifest);
 
+        using (var fusedTranspose = new PtxFusedConvTranspose2DKernel(
+            runtime, FusedConvTranspose2D.Batch, FusedConvTranspose2D.InputChannels, FusedConvTranspose2D.OutputChannels,
+            FusedConvTranspose2D.Height, FusedConvTranspose2D.Width, FusedConvTranspose2D.KernelH, FusedConvTranspose2D.KernelW,
+            FusedConvTranspose2D.Stride, FusedConvTranspose2D.Padding, FusedConvTranspose2D.OutputPadding))
+            Export(fusedTranspose.Audit, outputDirectory, exported, manifest);
+
         // Prune only STALE convolution cubins. This directory is SHARED with
         // sibling operators (e.g. normalization), so never delete a cubin that is
         // referenced by another operator's manifest — only our own stale ones.
@@ -172,6 +178,8 @@ internal static class DirectPtxConvolutionArtifactTool
     // #841 coverage specialization shapes (match the on-device correctness tests).
     private static readonly FusedConv3DShape FusedConv3D =
         new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
+    private static readonly FusedConvTranspose2DShape FusedConvTranspose2D =
+        new(2, 3, 4, 4, 4, 3, 3, 2, 1, 1);
 
     private static IReadOnlyList<ExpectedArtifact> CreateExpectedArtifacts()
     {
@@ -193,6 +201,12 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxFusedConv3DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, FusedConv3D).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(fusedConv3dPtx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(fusedConv3dPtx, 8, 6)));
+
+        string fusedTransposePtx = PtxFusedConvTranspose2DKernel.EmitPtx(8, 6, FusedConvTranspose2D);
+        expected.Add(new ExpectedArtifact(
+            PtxFusedConvTranspose2DKernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere, FusedConvTranspose2D).Id,
+            DirectPtxCubinArtifactCache.ComputePtxSha256(fusedTransposePtx),
+            DirectPtxCubinArtifactCache.ComputeSourceKey(fusedTransposePtx, 8, 6)));
         return expected;
     }
 

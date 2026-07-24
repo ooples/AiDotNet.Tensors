@@ -270,6 +270,21 @@ internal sealed class PtxFusedConv3DKernel : IDisposable
 }
 
 /// <summary>
+/// Shape identity for <see cref="PtxFusedConvTranspose2DKernel"/> for device-free re-emit.
+/// </summary>
+internal readonly record struct FusedConvTranspose2DShape(
+    int Batch, int InputChannels, int OutputChannels, int Height, int Width,
+    int KernelH, int KernelW, int Stride, int Padding, int OutputPadding)
+{
+    internal int OutHeight => (Height - 1) * Stride - 2 * Padding + KernelH + OutputPadding;
+    internal int OutWidth => (Width - 1) * Stride - 2 * Padding + KernelW + OutputPadding;
+    internal int TotalThreads => Batch * OutputChannels * OutHeight * OutWidth;
+
+    internal string Entry => FormattableString.Invariant(
+        $"aidotnet_fused_convtranspose2d_n{Batch}_ci{InputChannels}_co{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}");
+}
+
+/// <summary>
 /// Direct-PTX fused ConvTranspose2D inference epilogue: transposed convolution +
 /// per-output-channel bias + per-output-channel scale + ReLU in one pass:
 /// out[n,co,oh,ow] = relu(scale[co] * (bias[co] + sum input[n,ci,(oh+pad-kh)/s,(ow+pad-kw)/s]*W[ci,co,kh,kw])).
@@ -307,8 +322,8 @@ internal sealed class PtxFusedConvTranspose2DKernel : IDisposable
     internal long ScaleBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * OutHeight * OutWidth * sizeof(float);
 
-    internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_fused_convtranspose2d_n{Batch}_ci{InputChannels}_co{OutputChannels}_h{Height}_w{Width}_kh{KernelH}_kw{KernelW}_s{Stride}_p{Padding}_op{OutputPadding}");
+    internal FusedConvTranspose2DShape Shape => new(Batch, InputChannels, OutputChannels, Height, Width, KernelH, KernelW, Stride, Padding, OutputPadding);
+    internal string EntryPoint => Shape.Entry;
 
     internal PtxFusedConvTranspose2DKernel(
         DirectPtxRuntime runtime, int batch, int inputChannels, int outputChannels,
@@ -323,8 +338,9 @@ internal sealed class PtxFusedConvTranspose2DKernel : IDisposable
         Height = height; Width = width; KernelH = kernelH; KernelW = kernelW; Stride = stride; Padding = padding; OutputPadding = outputPadding;
         if (OutHeight <= 0 || OutWidth <= 0) throw new ArgumentException("Non-positive output spatial.");
 
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        FusedConvTranspose2DShape shape = Shape;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, shape);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, shape);
         _module = runtime.LoadModule(Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
@@ -333,16 +349,20 @@ internal sealed class PtxFusedConvTranspose2DKernel : IDisposable
         Audit = DirectPtxKernelAudit.Create(Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo, BlockThreads, activeBlocks, _module);
     }
 
-    internal DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture)
+    internal static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, FusedConvTranspose2DShape shape)
     {
-        var input = new DirectPtxExtent(Batch, InputChannels, Height, Width);
-        var weight = new DirectPtxExtent(InputChannels, OutputChannels, KernelH, KernelW);
-        var bias = new DirectPtxExtent(OutputChannels);
-        var scale = new DirectPtxExtent(OutputChannels);
-        var output = new DirectPtxExtent(Batch, OutputChannels, OutHeight, OutWidth);
+        int batch = shape.Batch, inputChannels = shape.InputChannels, outputChannels = shape.OutputChannels;
+        int height = shape.Height, width = shape.Width, kernelH = shape.KernelH, kernelW = shape.KernelW;
+        int stride = shape.Stride, padding = shape.Padding, outputPadding = shape.OutputPadding;
+        int outHeight = shape.OutHeight, outWidth = shape.OutWidth;
+        var input = new DirectPtxExtent(batch, inputChannels, height, width);
+        var weight = new DirectPtxExtent(inputChannels, outputChannels, kernelH, kernelW);
+        var bias = new DirectPtxExtent(outputChannels);
+        var scale = new DirectPtxExtent(outputChannels);
+        var output = new DirectPtxExtent(batch, outputChannels, outHeight, outWidth);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-convtranspose2d-bias-scale-relu", Version: 1, Architecture: architecture,
-            Variant: FormattableString.Invariant($"n{Batch}-ci{InputChannels}-co{OutputChannels}-h{Height}-w{Width}-kh{KernelH}-kw{KernelW}-s{Stride}-p{Padding}-op{OutputPadding}-fp32"),
+            Variant: FormattableString.Invariant($"n{batch}-ci{inputChannels}-co{outputChannels}-h{height}-w{width}-kh{kernelH}-kw{kernelW}-s{stride}-p{padding}-op{outputPadding}-fp32"),
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Nchw, input, input, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
@@ -381,16 +401,17 @@ internal sealed class PtxFusedConvTranspose2DKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal string EmitPtx(int major, int minor)
+    internal static string EmitPtx(int major, int minor, FusedConvTranspose2DShape shape)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 fused ConvTranspose2D emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        int ci = InputChannels, co = OutputChannels, h = Height, w = Width, kh = KernelH, kw = KernelW;
-        int oh = OutHeight, ow = OutWidth;
+        int Stride = shape.Stride, Padding = shape.Padding;
+        int ci = shape.InputChannels, co = shape.OutputChannels, h = shape.Height, w = shape.Width, kh = shape.KernelH, kw = shape.KernelW;
+        int oh = shape.OutHeight, ow = shape.OutWidth;
         int hw = h * w, cohw = co * oh * ow, cihw = ci * hw, cokk = co * kh * kw, khkw = kh * kw;
-        int total = TotalThreads;
-        string entry = EntryPoint;
+        int total = shape.TotalThreads;
+        string entry = shape.Entry;
 
         var s = new StringBuilder(18432);
         s.AppendLine(".version 7.1");
