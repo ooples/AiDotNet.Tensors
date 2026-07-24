@@ -255,6 +255,12 @@ public static class PtxParityRegistry
             "slower than cuDNN. Keep deferred/unpromoted until the optimized layout (precomputed filter " +
             "transform + register-blocked batched 16-GEMM + input-transform reuse) clears the >=1.10x gate."),
 
+        new PtxParitySpec("PtxUnfold2DFp16FromFp16Kernel", PtxParityStatus.Deferred,
+            "FP16 im2col from FP16 input (UnfoldKNFp16FromFp16) direct-PTX (#841 FP16 family)",
+            "columns_fp16[n,c*KH*KW+kh*KW+kw,oh*OW+ow] = input_fp16[n,c,oh*s+kh-pad,ow*s+kw-pad] -- a pure " +
+            "half-to-half patch gather preparing the KxN operand for a Tensor-Core GEMM. Thread-per-output with " +
+            "consecutive spatial index -> coalesced fp16 reads + stores. Exact half copy on-device. Deferred."),
+
         new PtxParitySpec("PtxUnfold2DFp16Kernel", PtxParityStatus.Deferred,
             "Fused im2col + FP16 conversion (Im2colKNFp16) direct-PTX (#841 FP16 family)",
             "columns_fp16[n,c*KH*KW+kh*KW+kw,oh*OW+ow] = fp16(input[n,c,oh*s+kh-pad,ow*s+kw-pad]); prepares the " +
