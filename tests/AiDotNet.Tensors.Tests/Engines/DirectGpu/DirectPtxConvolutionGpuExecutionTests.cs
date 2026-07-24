@@ -1508,6 +1508,67 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     }
 
     [Fact]
+    public void Conv3D_MatchesCpuReference()
+    {
+        if (!DirectPtxRuntime.IsAvailable) return;
+
+        const int n = 2, c = 3, k = 4, d = 8, h = 8, w = 8, kd = 3, kh = 3, kw = 3, stride = 1, pad = 1;   // N*K*OD*OH*OW=4096
+        int od = (d + 2 * pad - kd) / stride + 1, oh = (h + 2 * pad - kh) / stride + 1, ow = (w + 2 * pad - kw) / stride + 1;
+        var input = new float[n * c * d * h * w];
+        var weights = new float[k * c * kd * kh * kw];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        var expected = new float[n * k * od * oh * ow];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int z = 0; z < od; z++)
+                    for (int y = 0; y < oh; y++)
+                        for (int x = 0; x < ow; x++)
+                        {
+                            double acc = bias[oc];
+                            for (int ic = 0; ic < c; ic++)
+                                for (int a = 0; a < kd; a++)
+                                    for (int rr = 0; rr < kh; rr++)
+                                        for (int t = 0; t < kw; t++)
+                                        {
+                                            int id = z * stride + a - pad, ih = y * stride + rr - pad, iw = x * stride + t - pad;
+                                            if (id < 0 || id >= d || ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                            acc += (double)input[(((b * c + ic) * d + id) * h + ih) * w + iw] *
+                                                   weights[(((oc * c + ic) * kd + a) * kh + rr) * kw + t];
+                                        }
+                            expected[(((b * k + oc) * od + z) * oh + y) * ow + x] = (float)Math.Max(acc, 0.0);
+                        }
+
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+            return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var kernel = new PtxConv3DKernel(runtime, n, c, k, d, h, w, kd, kh, kw, stride, pad, relu: true);
+            using var dInput = runtime.AllocateBytes((nuint)kernel.InputBytes);
+            using var dW = runtime.AllocateBytes((nuint)kernel.WeightBytes);
+            using var dBias = runtime.AllocateBytes((nuint)kernel.BiasBytes);
+            using var dOut = runtime.AllocateBytes((nuint)kernel.OutputBytes);
+            dInput.Upload<float>(input); dW.Upload<float>(weights); dBias.Upload<float>(bias);
+            kernel.Launch(DirectPtxTensorView.CreateOwned(dInput, kernel.Blueprint.Tensors[0]),
+                          DirectPtxTensorView.CreateOwned(dW, kernel.Blueprint.Tensors[1]),
+                          DirectPtxTensorView.CreateOwned(dBias, kernel.Blueprint.Tensors[2]),
+                          DirectPtxTensorView.CreateOwned(dOut, kernel.Blueprint.Tensors[3]));
+            runtime.Synchronize();
+            var actual = new float[n * k * od * oh * ow];
+            dOut.Download<float>(actual);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    [Fact]
     public void DumpWinogradPtxForSassAnalysis()
     {
         string dir = Environment.GetEnvironmentVariable("PTX_DUMP_DIR");
