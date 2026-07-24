@@ -311,6 +311,19 @@ public static class PtxParityRegistry
             "DirectGpuTensorEngine.Conv2DBackwardBiasGpu. Verified correct on-device (<= 2e-3 vs fp64 CPU " +
             "reduction, non-power-of-2 spatial). Deferred (experimental-pending-gpu-evidence)."),
 
+        new PtxParitySpec("PtxConvTranspose2DBackwardInputKernel", PtxParityStatus.Deferred,
+            "ConvTranspose2D backward-input direct-PTX (#841 transposed family)",
+            "dInput[n,ci,ih,iw] = sum over (co,kh,kw) valid of gradOut[n,co,ih*s-pad+kh,iw*s-pad+kw]*W[ci,co,kh,kw] " +
+            "(IOHW) -- a regular-conv-style correlation of gradOut with the transposed weights. Thread-per-output, " +
+            "consecutive iw -> coalesced gradOut reads + dInput stores, weights broadcast. Verified correct on-device " +
+            "(<= 2e-3 vs fp64 CPU reference). Deferred."),
+
+        new PtxParitySpec("PtxConvTranspose2DBackwardWeightKernel", PtxParityStatus.Deferred,
+            "ConvTranspose2D backward-weight direct-PTX coalesced reduction (#841 transposed family)",
+            "dW[ci,co,kh,kw] = sum_{n,ih,iw} input[n,ci,ih,iw]*gradOut[n,co,ih*s-pad+kh,iw*s-pad+kw] (IOHW). One block " +
+            "per (ci,co) reduces N x H x W into the KH*KW taps with coalesced input reads (reused across taps) and a " +
+            "shared tree reduce per tap (KH*KW<=25). Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxConvTranspose2DKernel", PtxParityStatus.Deferred,
             "ConvTranspose2D forward + bias + ReLU direct-PTX (#841 transposed family)",
             "out[n,co,oh,ow] = relu(bias[co] + sum over (ci,kh,kw) valid of input[n,ci,(oh+pad-kh)/s,(ow+pad-kw)/s]" +
