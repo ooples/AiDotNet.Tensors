@@ -298,6 +298,13 @@ public static class PtxParityRegistry
             "per (ci,co) reduces N x H x W into the KH*KW taps with coalesced input reads (reused across taps) and a " +
             "shared tree reduce per tap (KH*KW<=25). Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
 
+        new PtxParitySpec("PtxConvTranspose3DKernel", PtxParityStatus.Deferred,
+            "ConvTranspose3D forward + bias + ReLU direct-PTX (#841 transposed-3D family)",
+            "out[n,co,od,oh,ow] = relu(bias[co] + sum over (ci,kd,kh,kw) valid of input[n,ci,(od+pad-kd)/s," +
+            "(oh+pad-kh)/s,(ow+pad-kw)/s]*W[ci,co,kd,kh,kw]); IODHW weights, general kernel/stride/padding/output-" +
+            "padding. 3D transpose-gather run as a forward op; thread-per-output with consecutive ow -> coalesced " +
+            "in/out at stride 1. Verified correct on-device (<= 2e-3 vs fp64 CPU reference). Deferred."),
+
         new PtxParitySpec("PtxConvTranspose2DKernel", PtxParityStatus.Deferred,
             "ConvTranspose2D forward + bias + ReLU direct-PTX (#841 transposed family)",
             "out[n,co,oh,ow] = relu(bias[co] + sum over (ci,kh,kw) valid of input[n,ci,(oh+pad-kh)/s,(ow+pad-kw)/s]" +
