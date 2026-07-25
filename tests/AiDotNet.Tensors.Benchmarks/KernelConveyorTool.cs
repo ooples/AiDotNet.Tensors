@@ -42,6 +42,9 @@ internal static class KernelConveyorTool
     private const int LaunchesPerSample = 50;
     private const int Runs = 3;
 
+    /// <summary>Attempts allowed to obtain a measurement taken at a steady SM clock.</summary>
+    private const int ClockRetries = 4;
+
     internal static void Run(string stage, string[] args)
     {
         string selector = args.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? "all";
@@ -58,7 +61,7 @@ internal static class KernelConveyorTool
         {
             case "verify": Verify(entries); break;
             case "release": Release(entries, args); break;
-            case "bench": Bench(entries); break;
+            case "bench": Bench(entries, args); break;
             case "vector-ab": VectorAb(entries); break;
             case "dump": Dump(entries, args); break;
             case "coarsen-ab": CoarsenAb(entries); break;
@@ -359,7 +362,7 @@ internal static class KernelConveyorTool
 
     // ----------------------------------------------------------------- bench
 
-    private static void Bench(IReadOnlyList<CodegenCatalogEntry> entries)
+    private static void Bench(IReadOnlyList<CodegenCatalogEntry> entries, string[] args)
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("kernel-bench-start");
         using var runtime = OpenRuntime();
@@ -376,7 +379,7 @@ internal static class KernelConveyorTool
                               Runs + " runs");
             Console.WriteLine("harness noise floor measured at 1.05%; differences under ~3% are not claimable");
             Console.WriteLine();
-            Console.WriteLine("kernel                              blocks    us/launch    p95/med   run spread");
+            Console.WriteLine("kernel                              blocks    us/launch    p95/med   run spread   SM clock");
 
             foreach (var entry in entries)
             {
@@ -384,6 +387,7 @@ internal static class KernelConveyorTool
                 {
                     var spec = entry.Bench;
                     var emitter = new PtxAffineEmitter();
+                    if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
                     string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                     using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                     IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -408,21 +412,58 @@ internal static class KernelConveyorTool
                         pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
                         void Launch() => LaunchSpec(module, fn, pointers, blocks);
+                        int bestClockBefore = 0, bestClockAfter = 0;
 
+                        // RETRY ON CLOCK DRIFT. The SM clock was observed swinging
+                        // 2025 -> 1770 MHz (-12.6%) inside a single kernel's three runs,
+                        // and the rows whose clock held still had low spread while every
+                        // drifting row was elevated. That, not the kernel, is what
+                        // produced the intermittent 7.5% spreads. Locking clocks needs
+                        // administrator rights that are not available here, so instead
+                        // the measurement is repeated and the least-contaminated attempt
+                        // is the one reported.
                         var medians = new double[Runs];
                         double worstTail = 0;
-                        for (int run = 0; run < Runs; run++)
+                        int clockBefore = 0, clockAfter = 0;
+                        double bestDrift = double.MaxValue;
+                        var bestMedians = new double[Runs];
+                        double bestTail = 0;
+                        for (int attempt = 0; attempt < ClockRetries; attempt++)
                         {
-                            var d = Measure(runtime.Synchronize, Launch);
-                            medians[run] = d.Median;
-                            worstTail = Math.Max(worstTail, d.Median > 0 ? d.P95 / d.Median : double.NaN);
+                            clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                            worstTail = 0;
+                            for (int run = 0; run < Runs; run++)
+                            {
+                                var d = Measure(runtime.Synchronize, Launch);
+                                medians[run] = d.Median;
+                                worstTail = Math.Max(worstTail, d.Median > 0 ? d.P95 / d.Median : double.NaN);
+                            }
+                            clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
+
+                            double drift = clockBefore > 0
+                                ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
+                                : double.MaxValue;
+                            if (drift < bestDrift)
+                            {
+                                bestDrift = drift;
+                                Array.Copy(medians, bestMedians, Runs);
+                                bestTail = worstTail;
+                                bestClockBefore = clockBefore;
+                                bestClockAfter = clockAfter;
+                            }
+                            if (drift <= 0.02) break;   // clean enough; stop retrying
                         }
+                        Array.Copy(bestMedians, medians, Runs);
+                        worstTail = bestTail;
+                        clockBefore = bestClockBefore;
+                        clockAfter = bestClockAfter;
                         double lo = medians.Min(), hi = medians.Max();
                         Console.WriteLine(entry.Name.PadRight(36) +
                             blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
                             (lo * 1000.0).ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
                             worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
-                            ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%");
+                            ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
+                            GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
                     }
                     finally { foreach (var b in buffers) b.Dispose(); }
                 }
