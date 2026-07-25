@@ -112,7 +112,52 @@ public static class CodegenKernelCatalog
             "gradient wrt data of dense 3x3 (moved axis AND two inverted windows)",
             CodegenAdjoint.BackwardData(Conv2D3x3Linear(2, 8, 8, 8, 8), 0),
             CodegenAdjoint.BackwardData(Conv2D3x3Linear(8, 32, 64, 28, 28), 0)),
+
+        // ATTACKS A MEASURED STRUCTURAL WEAKNESS. Profiling showed cuDNN's "one
+        // convolution" is five kernels: an NCHW->NHWC transform, the implicit GEMM, the
+        // transform back, and a separate elementwise pass for bias -- 9.47 us of 41.06
+        // (23%) spent on work we do not do at all. PyTorch cannot fuse through a cuDNN
+        // call, so EVERY extra elementwise op costs it a full kernel launch plus a full
+        // round trip of the tensor through memory, while costing us one instruction
+        // inside a loop we are already running.
+        //
+        // This kernel exists to make that scaling visible: same convolution, deeper
+        // epilogue. Our cost should be flat; theirs should grow by a memory pass per op.
+        new("conv2d_1x1_deep_epilogue",
+            "dense 1x1 + bias + scale + ReLU in ONE kernel (cuDNN needs four)",
+            Conv2D1x1DeepEpilogue(2, 8, 8, 8, 8),
+            Conv2D1x1DeepEpilogue(16, 64, 64, 28, 28)),
     ];
+
+    /// <summary>Dense 1x1 with a three-stage epilogue: bias, then scale, then ReLU.</summary>
+    private static CodegenKernelSpec Conv2D1x1DeepEpilogue(int n, int c, int k, int h, int w)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("n", n), CodegenAxis.Parallel("k", k),
+            CodegenAxis.Parallel("oh", h), CodegenAxis.Parallel("ow", w),
+            CodegenAxis.Reduce("c", c));
+        const int N = 0, K = 1, OH = 2, OW = 3, C = 4;
+
+        var input = new CodegenTensorBinding(0, "input", [n, c, h, w],
+        [
+            CodegenAffineExpr.Axis(N), CodegenAffineExpr.Axis(C),
+            CodegenAffineExpr.Axis(OH), CodegenAffineExpr.Axis(OW)
+        ]);
+        var weights = new CodegenTensorBinding(1, "weights", [k, c],
+            [CodegenAffineExpr.Axis(K), CodegenAffineExpr.Axis(C)]);
+        var bias = new CodegenTensorBinding(2, "bias", [k], [CodegenAffineExpr.Axis(K)]);
+        var scale = new CodegenTensorBinding(3, "scale", [k], [CodegenAffineExpr.Axis(K)]);
+        var output = new CodegenTensorBinding(4, "output", [n, k, h, w],
+        [
+            CodegenAffineExpr.Axis(N), CodegenAffineExpr.Axis(K),
+            CodegenAffineExpr.Axis(OH), CodegenAffineExpr.Axis(OW)
+        ], isOutput: true);
+
+        return new CodegenKernelSpec("conv2d_1x1_deep_epilogue", space,
+            [input, weights, bias, scale], output,
+            [0, 1], CodegenReduceKind.Sum,
+            biasInput: 2, scaleInput: 3, activation: CodegenActivationKind.ReLU);
+    }
 
     /// <summary>Bias-free, activation-free 1x1: the linear operator an adjoint needs.</summary>
     private static CodegenKernelSpec Conv2D1x1Linear(int n, int c, int k, int h, int w)

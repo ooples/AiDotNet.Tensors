@@ -187,6 +187,16 @@ def main():
          lambda: torch.nn.functional.conv2d(x3, w3, b3, 1, 1),
          "unfused reference: conv+bias, no relu")
 
+    # ---- DEEP EPILOGUE, N16/C64->K64/28x28. The structural exploit: PyTorch cannot
+    # fuse through a cuDNN call, so each elementwise stage costs it a kernel launch and
+    # a full round trip of the tensor, while costing us one instruction in a loop we are
+    # already running. Measured marginal cost on this shape: bias +2.84 us, relu +8.14,
+    # scale +6.42 -- 17.40 us of epilogue against a 23.75 us convolution.
+    s1 = torch.randn(64, 1, 1, device=dev)
+    emit_both("conv2d_1x1_deep_epilogue",
+         lambda: torch.relu(torch.nn.functional.conv2d(x1, w1, b1) * s1),
+         "conv+bias then scale then relu: three kernels PyTorch cannot fuse")
+
     # ---- 2x2 max pool, N32/C64/112x112
     xp = torch.randn(32, 64, 112, 112, device=dev)
     emit_both("maxpool2d_2x2", lambda: torch.nn.functional.max_pool2d(xp, 2, 2))
