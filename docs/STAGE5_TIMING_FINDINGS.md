@@ -91,3 +91,54 @@ Before any sweep produces usable numbers, the released specialisations need
 This is a precondition for Stage 3 (the fusion pilot) as well: its gate is
 ">= 1.10x median vs a PyTorch composition", and at current shapes the noise floor
 is several times that threshold.
+
+## 6. Phase 0.5 — the harness is now calibrated (measured 2026-07-24)
+
+Sections 2-4 established that the harness could not resolve the 1.10x gate. Rather
+than assume a protocol fix works, `--bench-calibrate` measures the instrument against
+two known-truth comparisons on a device-filling shape (N32/C64/56x56 = 25,088 blocks,
+vs the 4 blocks of the released shapes):
+
+* **null test** — the same kernel against itself. True ratio is exactly 1.000x, so
+  any deviation is the harness's own noise floor.
+* **known-ratio test** — the same kernel at C=64 vs C=70. True work ratio is exactly
+  70/64 = 1.09375x, deliberately close to the 1.10x gate.
+
+Both variants use the *generated* kernel, so kernel differences cannot confound the
+measurement of the instrument.
+
+### What actually fixed it, in the order it was measured
+
+| protocol | null err | ratio err | worst P95/median | gates |
+|---|---|---|---|---|
+| device-filling shape + interleaved, 1 launch per timed region | 2.44% | 5.36% | **5.50** | 0/3 |
+| + 50 launches per timed region | 2.47% | 2.81% | 1.50 | 1/3 |
+| + counterbalanced slot order | **3.78%** | 2.75% | 1.60 | 2/3 |
+| + paired within-sample ratio estimator | **1.05%** | **2.43%** | 1.80 | **3/3 PASS** |
+
+Three findings worth keeping:
+
+1. **Batching launches per timed region was the single biggest win** (tail 5.50 ->
+   1.50). Timing one launch with a CPU stopwatch around a synchronize measures launch
+   API + sync latency + OS scheduler jitter; at 50 launches per region the sync cost
+   is amortised and kernel execution dominates.
+2. **Counterbalancing slot order made the null test worse, not better** (2.47% ->
+   3.78%). The hypothesis that slot-1-vs-slot-2 position bias drove the residual was
+   wrong; alternating merely mixed two slightly different distributions into each
+   array and destabilised their medians.
+3. **The estimator was the real defect.** `median(A)/median(B)` compares two
+   distributions gathered across the whole run, so clock drift during the run leaks
+   directly into the ratio. Taking the ratio *within* each sample pair -- two regions
+   microseconds apart -- cancels drift, and the median over pairs is outlier-robust.
+   This alone took the noise floor from 3.78% to 1.05%.
+
+### The number that matters
+
+**Noise floor 1.05%.** Differences below roughly 2-3% are not claimable on this rig;
+a 1.10x gate is ~10x the noise floor and is therefore resolvable. The known-ratio
+test lands at 1.067-1.076x against a true 1.09375x -- a consistent ~2% underestimate,
+inside the 3% gate but a reminder that the harness is slightly conservative, which is
+the safe direction for a performance claim.
+
+Phase 0.5 gate: **MET**. Downstream perf claims may now be made with this protocol,
+and only with this protocol.

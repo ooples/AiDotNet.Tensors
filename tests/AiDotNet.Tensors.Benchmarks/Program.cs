@@ -144,6 +144,12 @@ class Program
             DirectPtxW8A8LinearExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--bench-calibrate")
+        {
+            BenchmarkCalibrationExperiment.Run();
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--codegen-bakeoff")
         {
             CodegenBakeOffExperiment.Run();
