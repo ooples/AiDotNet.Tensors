@@ -119,7 +119,7 @@ internal static class KernelConveyorTool
                     if (ValueOf(args, "--max-lanes") is string mz)
                         emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
                 string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks);
+                using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks, (uint)emitter.LaunchBlockThreads);
                 stage.Launch();
                 runtime.Synchronize();
                 Console.WriteLine(entry.Name + ": one launch, " + emitter.LaunchBlocks + " blocks, lanes=" +
@@ -145,7 +145,7 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine("measured column recorded under protocol " + CodegenMeasurementProtocol.Tag);
         Console.WriteLine();
-        Console.WriteLine("kernel                          loads/MAC   predicted   limiter        measured   ratio");
+        Console.WriteLine("kernel                        tile            block  ld/MAC  staged");
 
         foreach (var entry in entries)
         {
@@ -164,11 +164,11 @@ internal static class KernelConveyorTool
                 ? (p.PredictedMicroseconds / measured).ToString("F2", CultureInfo.InvariantCulture) + "x"
                 : "-";
 
-            Console.WriteLine(entry.Name.PadRight(32) +
-                p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(9) +
-                p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
-                "   " + p.Limiter.ToString().PadRight(15) +
-                measuredText.PadLeft(8) + ratioText.PadLeft(8));
+            Console.WriteLine(entry.Name.PadRight(30) +
+                emitter.TileDescription.PadRight(16) +
+                emitter.LaunchBlockThreads.ToString(CultureInfo.InvariantCulture).PadLeft(5) +
+                p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(8) +
+                "  " + emitter.StagedOperands);
         }
 
         Console.WriteLine();
@@ -217,34 +217,43 @@ internal static class KernelConveyorTool
             Console.WriteLine("CONVEYOR STAGE 1 - verify against the fp64 interpretation of the same spec");
             Console.WriteLine("tolerance " + Tolerance.ToString("E0", CultureInfo.InvariantCulture));
             Console.WriteLine();
-            Console.WriteLine("kernel                              regs   lowering   guards   max abs dev   result");
+            Console.WriteLine("kernel                              regs  lowering/staged  guards  max abs dev   result");
 
             foreach (var entry in entries)
             {
                 string status;
                 try
                 {
-                    var (dev, regs, elided, lowering) = VerifyOne(runtime, entry.Verify);
+                    // VERIFY THE SHAPE WE RELEASE. Verifying a small proxy shape and
+                    // releasing a large one has now shipped two unexercised code paths:
+                    // the strip-mined loop, and then shared-memory staging, because both
+                    // are chosen from extents that differ between the shapes. Parity
+                    // gates caught each after the fact; using one shape removes the
+                    // class. The fp64 oracle at these sizes is 26-115M operations, a few
+                    // seconds, which is worth paying once per kernel.
+                    var (dev, regs, elided, lowering) = VerifyOne(runtime, entry.Bench);
 
                     // The verify shape must exercise the SAME lowering as the shape
                     // that gets released. Otherwise the strip-mined loop path can ship
                     // having only ever been checked in its fully-unrolled form -- the
                     // released-an-unverified-branch failure, one abstraction up.
-                    int releasedLowering = LoweringOf(runtime, entry.Bench);
-                    bool sameLowering = lowering == releasedLowering;
-                    bool ok = dev <= Tolerance && !double.IsNaN(dev) && sameLowering;
-                    status = ok ? "PASS" : sameLowering ? "FAIL" : "LOWERING";
+                    // One shape now, so there is no verify-vs-release divergence left to
+                    // gate: the row records the lowering and the staging it was verified
+                    // WITH, which is the fact that matters.
+                    var shipped = new PtxAffineEmitter();
+                    shipped.Emit(entry.Bench, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                    string staged = shipped.StagedOperands;
+
+                    bool ok = dev <= Tolerance && !double.IsNaN(dev);
+                    status = ok ? "PASS" : "FAIL";
                     if (ok) passed++; else failed++;
                     Console.WriteLine(entry.Name.PadRight(36) +
                         regs.ToString(CultureInfo.InvariantCulture).PadLeft(4) +
-                        Describe(lowering).PadLeft(11) +
+                        Describe(lowering).PadLeft(9) + ("/" + staged).PadRight(10) +
                         elided.ToString(CultureInfo.InvariantCulture).PadLeft(9) +
                         dev.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
                         status.PadLeft(9));
-                    if (!sameLowering)
-                        Console.WriteLine("    verify shape is " + Describe(lowering) +
-                            " but the released shape is " + Describe(releasedLowering) +
-                            "; the released path is unverified.");
+
                 }
                 catch (Exception ex)
                 {
@@ -310,7 +319,7 @@ internal static class KernelConveyorTool
             buffers.Add(outBuffer);
             pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-            LaunchSpec(module, fn, pointers, emitter.LaunchBlocks);
+            LaunchSpec(module, fn, pointers, emitter.LaunchBlocks, (uint)emitter.LaunchBlockThreads);
             runtime.Synchronize();
 
             var actual = new float[outCount];
@@ -588,7 +597,7 @@ internal static class KernelConveyorTool
                         buffers.Add(outBuffer);
                         pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-                        void Launch() => LaunchSpec(module, fn, pointers, blocks);
+                        void Launch() => LaunchSpec(module, fn, pointers, blocks, (uint)emitter.LaunchBlockThreads);
                         int bestClockBefore = 0, bestClockAfter = 0;
 
                         // RETRY ON CLOCK DRIFT. The SM clock was observed swinging
@@ -691,8 +700,8 @@ internal static class KernelConveyorTool
                 var scalarEmitter = new PtxAffineEmitter { EnableVectorLoads = false };
                 string scalarPtx = scalarEmitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
-                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx, vecEmitter.LaunchBlocks);
-                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx, scalarEmitter.LaunchBlocks);
+                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx, vecEmitter.LaunchBlocks, (uint)vecEmitter.LaunchBlockThreads);
+                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx, scalarEmitter.LaunchBlocks, (uint)scalarEmitter.LaunchBlockThreads);
 
                 var ratios = new double[Runs];
                 double scalarUs = double.MaxValue, vectorUs = double.MaxValue;
@@ -749,8 +758,8 @@ internal static class KernelConveyorTool
                     var thin = new PtxAffineEmitter { Coarsening = 1 };
                     string thinPtx = thin.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
-                    using var wideStage = LaunchableStage.Create(runtime, spec, widePtx, wide.LaunchBlocks);
-                    using var thinStage = LaunchableStage.Create(runtime, spec, thinPtx, thin.LaunchBlocks);
+                    using var wideStage = LaunchableStage.Create(runtime, spec, widePtx, wide.LaunchBlocks, (uint)wide.LaunchBlockThreads);
+                    using var thinStage = LaunchableStage.Create(runtime, spec, thinPtx, thin.LaunchBlocks, (uint)thin.LaunchBlockThreads);
 
                     var ratios = new double[Runs];
                     double thinUs = 0, wideUs = 0;
@@ -817,10 +826,13 @@ internal static class KernelConveyorTool
         private readonly uint _blocks;
         private readonly List<DirectPtxBuffer> _buffers;
 
-        private LaunchableStage(DirectPtxModule m, IntPtr fn, IntPtr[] p, uint blocks, List<DirectPtxBuffer> b)
-        { _module = m; _fn = fn; _pointers = p; _blocks = blocks; _buffers = b; }
+        private readonly uint _blockThreads;
 
-        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx, uint blocks)
+        private LaunchableStage(DirectPtxModule m, IntPtr fn, IntPtr[] p, uint blocks,
+                                uint blockThreads, List<DirectPtxBuffer> b)
+        { _module = m; _fn = fn; _pointers = p; _blocks = blocks; _blockThreads = blockThreads; _buffers = b; }
+
+        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx, uint blocks, uint blockThreads)
         {
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -839,10 +851,10 @@ internal static class KernelConveyorTool
             var outBuf = runtime.AllocateBytes((nuint)(Elements(spec.Output.Shape) * sizeof(float)));
             buffers.Add(outBuf);
             pointers[spec.Inputs.Count] = outBuf.Pointer;
-            return new LaunchableStage(module, fn, pointers, blocks, buffers);
+            return new LaunchableStage(module, fn, pointers, blocks, blockThreads, buffers);
         }
 
-        internal void Launch() => LaunchSpec(_module, _fn, _pointers, _blocks);
+        internal void Launch() => LaunchSpec(_module, _fn, _pointers, _blocks, _blockThreads);
 
         public void Dispose()
         {
@@ -905,13 +917,13 @@ internal static class KernelConveyorTool
         return null;
     }
 
-    private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks)
+    private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockThreads)
     {
         fixed (IntPtr* pinned = pointers)
         {
             void** argv = stackalloc void*[pointers.Length];
             for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, PtxAffineEmitter.BlockThreads, 1, 1, 0, argv);
+            module.Launch(fn, blocks, 1, 1, blockThreads, 1, 1, 0, argv);
         }
     }
 }

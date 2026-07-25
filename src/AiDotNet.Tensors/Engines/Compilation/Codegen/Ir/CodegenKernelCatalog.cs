@@ -67,32 +67,32 @@ public static class CodegenKernelCatalog
     [
         new("depthwise_conv2d_3x3_bias_relu",
             "depthwise 3x3 + bias + ReLU (the bake-off kernel)",
-            CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(2, 8, 8, 8),
+            CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(2, 8, 16, 16),
             CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(32, 64, 56, 56)),
 
         new("depthwise_conv2d_3x3",
             "depthwise 3x3, no epilogue (isolates the gather+reduce)",
-            Depthwise(2, 8, 8, 8, bias: false, relu: false),
+            Depthwise(2, 8, 16, 16, bias: false, relu: false),
             Depthwise(32, 64, 56, 56, bias: false, relu: false)),
 
         new("conv2d_1x1_bias_relu",
             "dense 1x1 + bias + ReLU (reduction over input channels)",
-            Conv2D1x1(2, 8, 8, 8, 8),
+            Conv2D1x1(2, 8, 8, 16, 16),
             Conv2D1x1(16, 64, 64, 28, 28)),
 
         new("conv2d_3x3_bias_relu",
             "dense 3x3 + bias + ReLU (reduction over C and both taps)",
-            Conv2D3x3(2, 8, 8, 8, 8),   // C=8 -> 72 trips: strip-mined, like the bench shape
+            Conv2D3x3(2, 8, 8, 16, 16),   // C=8 -> 72 trips: strip-mined, like the bench shape
             Conv2D3x3(8, 32, 64, 28, 28)),
 
         new("maxpool2d_2x2",
             "2x2/stride-2 max pool (max reduction, no weights)",
-            MaxPool2x2(2, 8, 16, 16),
+            MaxPool2x2(2, 8, 32, 32),
             MaxPool2x2(32, 64, 112, 112)),
 
         new("conv_transpose2d_3x3_stride2",
             "transposed 3x3 stride 2 (exact-division index map)",
-            ConvTranspose2D3x3Stride2(2, 8, 8, 8),
+            ConvTranspose2D3x3Stride2(2, 8, 16, 16),
             ConvTranspose2D3x3Stride2(16, 64, 28, 28)),
 
         // Backward kernels are DERIVED from the forward spec, never authored. Each of
@@ -100,17 +100,17 @@ public static class CodegenKernelCatalog
         // above it, so it cannot drift from the forward pass it differentiates.
         new("depthwise_conv2d_3x3_bwd_data",
             "gradient wrt data of depthwise 3x3 (derived adjoint)",
-            CodegenAdjoint.BackwardData(Depthwise(2, 8, 8, 8, bias: false, relu: false), 0),
+            CodegenAdjoint.BackwardData(Depthwise(2, 8, 16, 16, bias: false, relu: false), 0),
             CodegenAdjoint.BackwardData(Depthwise(32, 64, 56, 56, bias: false, relu: false), 0)),
 
         new("conv2d_1x1_bwd_data",
             "gradient wrt data of dense 1x1 (contracted axis moves into the reduction)",
-            CodegenAdjoint.BackwardData(Conv2D1x1Linear(2, 8, 8, 8, 8), 0),
+            CodegenAdjoint.BackwardData(Conv2D1x1Linear(2, 8, 8, 16, 16), 0),
             CodegenAdjoint.BackwardData(Conv2D1x1Linear(16, 64, 64, 28, 28), 0)),
 
         new("conv2d_3x3_bwd_data",
             "gradient wrt data of dense 3x3 (moved axis AND two inverted windows)",
-            CodegenAdjoint.BackwardData(Conv2D3x3Linear(2, 8, 8, 8, 8), 0),
+            CodegenAdjoint.BackwardData(Conv2D3x3Linear(2, 8, 8, 16, 16), 0),
             CodegenAdjoint.BackwardData(Conv2D3x3Linear(8, 32, 64, 28, 28), 0)),
 
         // ATTACKS A MEASURED STRUCTURAL WEAKNESS. Profiling showed cuDNN's "one
@@ -125,7 +125,7 @@ public static class CodegenKernelCatalog
         // epilogue. Our cost should be flat; theirs should grow by a memory pass per op.
         new("conv2d_1x1_deep_epilogue",
             "dense 1x1 + bias + scale + ReLU in ONE kernel (cuDNN needs four)",
-            Conv2D1x1DeepEpilogue(2, 8, 8, 8, 8),
+            Conv2D1x1DeepEpilogue(2, 8, 8, 16, 16),
             Conv2D1x1DeepEpilogue(16, 64, 64, 28, 28)),
     ];
 

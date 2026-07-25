@@ -20,15 +20,15 @@ public class CodegenPerformanceModelTests
     /// <summary>Measured microseconds, locked-clock true-fp32 bake-off.</summary>
     private static readonly Dictionary<string, double> Measured = new(StringComparer.Ordinal)
     {
-        ["depthwise_conv2d_3x3_bias_relu"] = 81.0,
-        ["depthwise_conv2d_3x3"] = 78.8,
-        ["depthwise_conv2d_3x3_bwd_data"] = 78.1,
-        ["conv2d_1x1_bias_relu"] = 38.6,
-        ["conv2d_1x1_bwd_data"] = 42.9,
-        ["conv2d_3x3_bias_relu"] = 75.0,
-        ["conv2d_3x3_bwd_data"] = 87.6,
-        ["maxpool2d_2x2"] = 171.6,
-        ["conv_transpose2d_3x3_stride2"] = 109.0,
+        ["depthwise_conv2d_3x3_bias_relu"] = 72.9,
+        ["depthwise_conv2d_3x3"] = 72.5,
+        ["depthwise_conv2d_3x3_bwd_data"] = 72.9,
+        ["conv2d_1x1_bias_relu"] = 29.2,
+        ["conv2d_1x1_bwd_data"] = 32.9,
+        ["conv2d_3x3_bias_relu"] = 62.3,
+        ["conv2d_3x3_bwd_data"] = 85.0,
+        ["maxpool2d_2x2"] = 157.6,
+        ["conv_transpose2d_3x3_stride2"] = 100.7,
     };
 
     /// <summary>
@@ -41,8 +41,6 @@ public class CodegenPerformanceModelTests
         "depthwise_conv2d_3x3",
         "depthwise_conv2d_3x3_bwd_data",
         "maxpool2d_2x2",
-        "conv2d_3x3_bias_relu",
-        "conv2d_3x3_bwd_data",
     };
 
     private static CodegenPerformancePrediction PredictFor(CodegenCatalogEntry entry)
@@ -105,7 +103,13 @@ public class CodegenPerformanceModelTests
     [Theory]
     [InlineData("conv2d_1x1_bias_relu")]        // ow=28 is not a warp multiple: warps straddle rows
     [InlineData("conv2d_1x1_bwd_data")]
-    [InlineData("conv_transpose2d_3x3_stride2")] // 76 registers, occupancy limited
+    [InlineData("conv_transpose2d_3x3_stride2")] // 77 registers, occupancy limited
+    // Shared-memory staging moved these two OUT of the regime the model describes: it
+    // credits the per-thread global loads that staging removes, but carries no term for
+    // the shared reads that replace them or for the two barriers per strip-mine step.
+    // Measured, staging took dense 3x3 from 68.1 us to 62.3; the model predicts 35.6.
+    [InlineData("conv2d_3x3_bias_relu")]
+    [InlineData("conv2d_3x3_bwd_data")]
     // The three that remain optimistic map EXACTLY onto the two limiters the model
     // does not carry, as measured by the limiter gate: both 1x1 kernels are L2-bound
     // (66% and 54%) and conv_transpose is SM-bound (82.5%). The model has LoadIssue,

@@ -342,11 +342,13 @@ internal static class ResidentProgramSpike
         private readonly IntPtr _fn;
         private readonly IntPtr[] _pointers;
         private readonly uint _blocks;
+        private readonly uint _blockThreads;
         private readonly List<DirectPtxBuffer> _buffers;
 
         private Stage(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks,
-                      List<DirectPtxBuffer> buffers)
-        { _module = module; _fn = fn; _pointers = pointers; _blocks = blocks; _buffers = buffers; }
+                      uint blockThreads, List<DirectPtxBuffer> buffers)
+        { _module = module; _fn = fn; _pointers = pointers; _blocks = blocks;
+          _blockThreads = blockThreads; _buffers = buffers; }
 
         internal static Stage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec)
         {
@@ -372,7 +374,7 @@ internal static class ResidentProgramSpike
             buffers.Add(outBuffer);
             pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-            return new Stage(module, fn, pointers, emitter.LaunchBlocks, buffers);
+            return new Stage(module, fn, pointers, emitter.LaunchBlocks, (uint)emitter.LaunchBlockThreads, buffers);
         }
 
         internal unsafe void Launch()
@@ -381,7 +383,7 @@ internal static class ResidentProgramSpike
             {
                 void** argv = stackalloc void*[_pointers.Length];
                 for (int i = 0; i < _pointers.Length; i++) argv[i] = pinned + i;
-                _module.Launch(_fn, _blocks, 1, 1, PtxAffineEmitter.BlockThreads, 1, 1, 0, argv);
+                _module.Launch(_fn, _blocks, 1, 1, _blockThreads, 1, 1, 0, argv);
             }
         }
 

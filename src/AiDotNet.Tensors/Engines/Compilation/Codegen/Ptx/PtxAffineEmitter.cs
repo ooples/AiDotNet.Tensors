@@ -145,6 +145,194 @@ public sealed class PtxAffineEmitter
     /// <summary>The tile the reuse analysis chose, e.g. <c>k x4, ow x4</c>.</summary>
     public string TileDescription { get; private set; } = "none";
 
+    /// <summary>Threads per block this kernel actually launches with.</summary>
+    /// <remarks>
+    /// Derived per kernel rather than fixed at 256, because shared-memory staging needs
+    /// a block to cover exactly one group of the axes the staged operand depends on. A
+    /// block that straddles two output-channel groups cannot stage weights: half its
+    /// threads would want a different slice.
+    /// </remarks>
+    public int LaunchBlockThreads { get; private set; } = BlockThreads;
+
+    /// <summary>Bytes of shared memory the launch must reserve.</summary>
+    public int SharedMemoryBytes { get; private set; }
+
+    /// <summary>Operand indices staged in shared memory, for reporting.</summary>
+    public string StagedOperands { get; private set; } = "none";
+
+    /// <summary>
+    /// Enables shared-memory staging. Off restores the fixed 256-thread block and no
+    /// staging, so the two lowerings can be compared inside one process.
+    /// </summary>
+    public bool EnableSharedStaging { get; set; } = true;
+
+    /// <summary>
+    /// Cooperatively loads a block-invariant operand into shared memory, once per
+    /// strip-mine iteration, and returns the register holding the shared base address.
+    /// </summary>
+    /// <remarks>
+    /// The block is sized so every thread in it agrees on the axes this operand is
+    /// indexed by, so all of them want the SAME slice. Measured, 196 threads were each
+    /// fetching the same weight, so the slice is fetched once by the first
+    /// <c>count</c> threads and read from shared memory thereafter.
+    ///
+    /// The staged element for (lane offset on the tiled axis, unrolled trip) sits at a
+    /// COMPILE-TIME index, so every consumer becomes a constant-offset
+    /// <c>ld.shared.f32</c> -- no address arithmetic at the point of use.
+    /// </remarks>
+    private void EmitStageLoad(
+        CodegenTensorBinding binding, string basePointer, string sharedBase,
+        string tid, int tiledSlot, string tileBaseReg, int tileFactor,
+        int[] innerReduction, IReadOnlyList<CodegenAxis> axes, string[] axisRegTemplate,
+        int count, int trips)
+    {
+        string skip = "STAGE_SKIP_" + I(_stageLabel++);
+
+        string active = NextP();
+        L($"setp.ge.u32 {active}, {tid}, {I(count)};");
+        L($"@{active} bra {skip};");
+
+        // Split the flat stage index into (lane offset on the tiled axis, trip).
+        var runtime = (string[])axisRegTemplate.Clone();
+        string laneOff = NextR(), trip = NextR();
+        L($"div.u32 {laneOff}, {tid}, {I(trips)};");
+        L($"rem.u32 {trip}, {tid}, {I(trips)};");
+
+        if (tiledSlot >= 0 && tileBaseReg != null)
+        {
+            string tiledValue = NextR();
+            L($"mad.lo.u32 {tiledValue}, {tileBaseReg}, {I(tileFactor)}, {laneOff};");
+            runtime[tiledSlot] = tiledValue;
+        }
+
+        // Unpack the trip into the unrolled reduction axes, last-declared fastest --
+        // the same order the unrolled body enumerates them in.
+        string rest = trip;
+        for (int i = innerReduction.Length - 1; i >= 0; i--)
+        {
+            int ax = innerReduction[i];
+            int extent = axes[ax].Extent;
+            string value = NextR();
+            if (i == 0)
+            {
+                L($"mov.u32 {value}, {rest};");
+            }
+            else
+            {
+                L($"rem.u32 {value}, {rest}, {I(extent)};");
+                string next = NextR();
+                L($"div.u32 {next}, {rest}, {I(extent)};");
+                rest = next;
+            }
+            runtime[ax] = value;
+        }
+
+        // Every axis is a register now, so nothing is folded: pass an empty reduction
+        // set and let the normal offset path build it symbolically.
+        string offset = EmitOffset(binding, runtime, new int[axes.Count],
+                                   Array.Empty<int>(), out string? pred);
+        string byteOffset = NextRd(), address = NextRd(), value2 = NextF();
+        L($"mul.wide.u32 {byteOffset}, {offset}, 4;");
+        L($"add.u64 {address}, {basePointer}, {byteOffset};");
+        L($"mov.f32 {value2}, 0f00000000;");
+        if (pred is null) L($"ld.global.nc.f32 {value2}, [{address}];");
+        else L($"@{pred} ld.global.nc.f32 {value2}, [{address}];");
+        EmittedLoads++;
+
+        string sharedByte = NextRd(), sharedAddr = NextRd();
+        L($"mul.wide.u32 {sharedByte}, {tid}, 4;");
+        L($"add.u64 {sharedAddr}, {sharedBase}, {sharedByte};");
+        L($"st.shared.f32 [{sharedAddr}], {value2};");
+
+        _body.Append(skip).Append(":\n");
+        L("bar.sync 0;");
+    }
+
+    private int _stageLabel;
+
+    /// <summary>Fallback when staging is disabled: fixed block, nothing invariant.</summary>
+    private static int PassThroughBlock(out HashSet<int> axesVaryingInBlock)
+    {
+        axesVaryingInBlock = new HashSet<int>();
+        return BlockThreads;
+    }
+
+    /// <summary>Largest block CUDA accepts.</summary>
+    private const int MaxBlockThreads = 1024;
+
+    /// <summary>Block size the derivation aims for; 256 matches the rest of the catalog.</summary>
+    private const int TargetBlockThreads = 256;
+
+    /// <summary>
+    /// Minimum share of a kernel's loads the staged operand must carry for staging to be
+    /// worth its two barriers per step. Measured: at 50% it turned 68.1 us into 61.9;
+    /// at 6% it turned 104 us into 131.4.
+    /// </summary>
+    private const double MinimumStagedShare = 0.25;
+
+    /// <summary>Shared memory a block may use without cutting occupancy hard on sm_86.</summary>
+    private const int MaxSharedBytes = 32 * 1024;
+
+    /// <summary>
+    /// Chooses a block size whose threads all agree on the slow axes, and reports which
+    /// axes vary inside a block.
+    /// </summary>
+    /// <remarks>
+    /// The decomposition assigns the last parallel axis fastest. If a block's thread
+    /// count is exactly the product of the fastest axes' extents, then every thread in
+    /// the block shares the same value of every slower axis -- which is precisely the
+    /// condition under which an operand indexed only by slower axes is constant across
+    /// the block and can be fetched once into shared memory instead of once per thread.
+    ///
+    /// For dense 3x3 this gives 28 x 7 = 196 threads covering all of oh and ow at one
+    /// output-channel group, and the measurement that motivates it is that those 196
+    /// threads currently fetch the same weight 196 times.
+    /// </remarks>
+    private static int ChooseBlockThreads(
+        IReadOnlyList<CodegenAxis> axes, int[] parallel, List<int> tileAxes, List<int> tileFactors,
+        out HashSet<int> axesVaryingInBlock)
+    {
+        axesVaryingInBlock = new HashSet<int>();
+        long threads = 1;
+
+        for (int p = parallel.Length - 1; p >= 0; p--)
+        {
+            int ax = parallel[p];
+            int slot = tileAxes.IndexOf(ax);
+            int extent = slot >= 0 ? axes[ax].Extent / tileFactors[slot] : axes[ax].Extent;
+
+            if (threads * extent <= TargetBlockThreads)
+            {
+                threads *= extent;
+                axesVaryingInBlock.Add(ax);
+                continue;
+            }
+
+            // This axis would overshoot. Taking PART of it is fine as long as the block
+            // still covers whole groups of every slower axis, which it does: a partial
+            // take only subdivides this axis. Only do it when the partial factor divides
+            // the extent, so the decomposition stays exact.
+            long room = TargetBlockThreads / threads;
+            for (long take = room; take >= 2; take--)
+            {
+                if (extent % take != 0) continue;
+                threads *= take;
+                axesVaryingInBlock.Add(ax);
+                break;
+            }
+            break;
+        }
+
+        // Too small to be a sensible block: fall back to the fixed size, in which case
+        // nothing is treated as block-invariant and no staging happens.
+        if (threads < 32)
+        {
+            axesVaryingInBlock.Clear();
+            return BlockThreads;
+        }
+        return (int)threads;
+    }
+
     /// <summary>Largest grid the CUDA launch API accepts in the X dimension.</summary>
     private const long MaxGridBlocksX = 2147483647L;
 
@@ -236,15 +424,38 @@ public sealed class PtxAffineEmitter
         // outweighs the load saving. That trade is exactly what the model expresses, so
         // the search finds the turning point instead of running away to a tile that
         // issues almost no loads and leaves the machine idle.
+        // PREDICATE-HEAVY OPERANDS COST MORE REGISTERS PER LANE. An exact-division index
+        // map (a transposed convolution's (ih + pad - kh)/stride) emits a remainder, a
+        // comparison and a predicate for every load, so registers grow much faster with
+        // the tile than for a plain gather. Measured: letting the search take 16 lanes
+        // for the transposed kernel produced 126 registers and 129.0 us against 40
+        // registers and ~104 us at 4 lanes -- better on the model's terms, worse on the
+        // machine, exactly like the 4x8 dense case.
+        //
+        // The cost model has no register term, so express the constraint where it is
+        // visible: in the index maps.
+        bool predicated = false;
+        foreach (int inputIndex in spec.ProductInputs)
+            foreach (var expr in spec.Inputs[inputIndex].Map)
+                if (expr.Divisor != 1) predicated = true;
+
+        int laneCeiling = predicated ? Math.Min(maxLanes, 4) : maxLanes;
         var factors = new[] { 1, 2, 4, 8, 16 };
 
         int bestPrimary = 1, bestSecondAxis = -1, bestSecondFactor = 1;
         double bestCost = double.MaxValue;
 
+        // Descending, so that on a TIE the larger contiguous factor wins. Ties are
+        // common -- an operand invariant in both candidate axes scores identically
+        // either way -- and the cost model cannot see that only the contiguous axis
+        // gives coalesced stores and lane-vectorised loads. Ascending order silently
+        // picked "ow x1, n x4" over "ow x4" for depthwise, which is equal on paper and
+        // worse on the machine.
+        Array.Reverse(factors);
         foreach (int tw in factors)
         {
             if (tw > 1 && axes[contiguous].Extent % tw != 0) continue;
-            if (tw > maxLanes) continue;
+            if (tw > laneCeiling) continue;
 
             // One-dimensional candidate: only the contiguous axis.
             double solo = PredictedRelativeTime(spec, axes, new[] { contiguous }, new[] { tw });
@@ -263,7 +474,7 @@ public sealed class PtxAffineEmitter
                 {
                     if (tk == 1) continue;
                     if (axes[candidate].Extent % tk != 0) continue;
-                    if (tw * tk > maxLanes) continue;
+                    if (tw * tk > laneCeiling) continue;
 
                     double cost = PredictedRelativeTime(spec, axes,
                         new[] { contiguous, candidate }, new[] { tw, tk });
@@ -502,14 +713,98 @@ public sealed class PtxAffineEmitter
             }
         }
 
+        // Block size derived so a block's threads all agree on the slow axes, which is
+        // the precondition for staging a block-invariant operand in shared memory.
+        int blockThreads = EnableSharedStaging
+            ? ChooseBlockThreads(axes, parallel, tileAxes, tileFactors, out var varyingAxes)
+            : PassThroughBlock(out varyingAxes);
+
+        // An operand indexed only by axes that are CONSTANT across the block is fetched
+        // identically by every thread in it. Dense 3x3's weights are the case that
+        // matters: 196 threads share one output-channel group, so the same weight is
+        // fetched 196 times.
+        var stageable = new List<int>();
+        if (EnableSharedStaging && varyingAxes.Count > 0)
+        {
+            foreach (int inputIdx in spec.ProductInputs)
+            {
+                bool varies = false;
+                foreach (int ax in varyingAxes)
+                    if (ReferencesAxis(spec.Inputs[inputIdx], ax)) varies = true;
+                if (!varies) stageable.Add(inputIdx);
+            }
+        }
+        // Staging pays only if the operand is fetched redundantly across the block, and
+        // only if its slice fits. Keep at most one: the shared budget is small and the
+        // weights are the measured 196x redundancy.
+        int stagedInput = -1;
+        int stageCount = 0;
+        int stagedTileSlot = -1;
+        if (stageable.Count > 0)
+        {
+            long innerTripsForStage = 1;
+            foreach (int ax in reduction) innerTripsForStage *= axes[ax].Extent;
+
+            foreach (int candidate in stageable)
+            {
+                // Distinct values the block needs per strip-mine step: one per
+                // (lane offset on a tiled axis this operand reads) x (unrolled trip).
+                int slot = -1;
+                for (int t = 0; t < tileAxes.Count; t++)
+                    if (ReferencesAxis(spec.Inputs[candidate], tileAxes[t])) slot = t;
+
+                long lanesForOperand = slot >= 0 ? tileFactors[slot] : 1;
+                long count = lanesForOperand * innerTripsForStage;
+
+                // The block must be able to fetch the whole slice in one pass, and it
+                // must fit the shared budget.
+                if (count > blockThreads) continue;
+                if (count * 4 > MaxSharedBytes) continue;
+
+                // STAGING IS NOT FREE: it adds two barriers per strip-mine step and the
+                // registers to build the cooperative address. It only pays if the operand
+                // is a large share of the loads. Measured both ways:
+                //
+                //   dense 3x3       weights are 50% of loads -> 68.1 us to 61.9 us
+                //   conv_transpose  weights are  6% of loads -> 104 us to 131.4 us
+                //
+                // So require the staged operand to carry a real share of the traffic.
+                double totalLoads = LoadsPerMac(spec, tileAxes.ToArray(), tileFactors.ToArray());
+                double operandLoads = lanesForOperand;
+                double lanesAll = 1;
+                foreach (int f in tileFactors) lanesAll *= f;
+                double share = totalLoads > 0 ? (operandLoads / lanesAll) / totalLoads : 0;
+                if (share < MinimumStagedShare) continue;
+
+                stagedInput = candidate;
+                stageCount = (int)count;
+                stagedTileSlot = slot;
+                break;
+            }
+        }
+        // The derived block size exists ONLY to make staging possible: it is chosen so a
+        // block covers whole groups of the staged operand's axes. If nothing ends up
+        // staged, that constraint buys nothing and the odd size costs occupancy -- the
+        // transposed kernel measured 114.3 us at the derived 196 against ~104 at 256.
+        // So fall back to the standard block whenever staging did not apply.
+        if (stagedInput < 0) blockThreads = BlockThreads;
+
+        SharedMemoryBytes = stageCount * 4;
+        LaunchBlockThreads = blockThreads;
+        StagedOperands = stagedInput < 0 ? "none" : spec.Inputs[stagedInput].Name;
+
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
         long threadCount = total / lanes;
-        long blocks = (threadCount + BlockThreads - 1) / BlockThreads;
+        long blocks = (threadCount + blockThreads - 1) / blockThreads;
         CheckLimits(spec, blocks, threadCount);
         LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
+        // Reset with the register counters: a label counter that survives between
+        // calls makes the SAME spec emit different text on a second Emit, and cubins
+        // are content-addressed on that text.
+        _stageLabel = 0;
 
         _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
@@ -542,7 +837,7 @@ public sealed class PtxAffineEmitter
         string ctaid = NextR(), tid = NextR(), gid = NextR();
         L($"mov.u32 {ctaid}, %ctaid.x;");
         L($"mov.u32 {tid}, %tid.x;");
-        L($"mad.lo.u32 {gid}, {ctaid}, {I(BlockThreads)}, {tid};");
+        L($"mad.lo.u32 {gid}, {ctaid}, {I(blockThreads)}, {tid};");
 
         // Bounds guard derived from the SAME TotalThreads the host launches with.
         string guard = NextP();
@@ -600,6 +895,12 @@ public sealed class PtxAffineEmitter
         }
 
         long loadsBeforeLoop = EmittedLoads;
+        string? sharedBase = null;
+        if (stagedInput >= 0)
+        {
+            sharedBase = NextRd();
+            L($"mov.u64 {sharedBase}, stageBuf;");
+        }
 
         // One accumulator per lane.
         var accs = new string[lanes];
@@ -633,6 +934,23 @@ public sealed class PtxAffineEmitter
             // so the backward branch re-zeroed the counter every iteration and the
             // kernel never terminated.
             _body.Append("LOOP").Append(I(i)).Append(":\n");
+        }
+
+        // Stage the block-invariant operand for THIS strip-mine step. Inside a loop this
+        // re-runs per iteration, which is required: the staged slice depends on the loop
+        // counter.
+        if (stagedInput >= 0 && sharedBase != null)
+        {
+            var b = spec.Inputs[stagedInput];
+            long innerTripsNow = 1;
+            foreach (int ax in reduction) innerTripsNow *= axes[ax].Extent;
+
+            EmitStageLoad(
+                b, basePtr[b.ParameterIndex], sharedBase, tid,
+                stagedTileSlot >= 0 ? tileAxes[stagedTileSlot] : -1,
+                stagedTileSlot >= 0 ? axisReg[tileAxes[stagedTileSlot]] : null!,
+                stagedTileSlot >= 0 ? tileFactors[stagedTileSlot] : 1,
+                reduction, axes, axisReg, stageCount, (int)innerTripsNow);
         }
 
         // Decide, before emitting anything, which product operands can be read with a
@@ -751,6 +1069,19 @@ public sealed class PtxAffineEmitter
                         }
                         value = rvec[reductionValues[innermost] % vectorGroup];
                     }
+                    else if (inputIdx == stagedInput && sharedBase != null)
+                    {
+                        // Resident in shared memory. Both coordinates are compile-time
+                        // constants here, so this is a constant-offset ld.shared with no
+                        // address arithmetic at the point of use.
+                        int laneOffset = stagedTileSlot >= 0 ? laneOffsets[l][stagedTileSlot] : 0;
+                        long slotIndex = laneOffset * trips + t;
+                        string sharedAddr = NextRd();
+                        string loaded = NextF();
+                        L($"add.u64 {sharedAddr}, {sharedBase}, {I(slotIndex * 4)};");
+                        L($"ld.shared.f32 {loaded}, [{sharedAddr}];");
+                        value = loaded;
+                    }
                     else
                     {
                         // Scalar path, cached on every referenced tiled axis. Two lanes
@@ -811,6 +1142,7 @@ public sealed class PtxAffineEmitter
             for (int l = 0; l < lanes; l++)
                 if (!string.Equals(accs[l], accsFixed[l], StringComparison.Ordinal))
                     L($"mov.f32 {accsFixed[l]}, {accs[l]};");
+            if (stagedInput >= 0) L("bar.sync 0;");
             for (int i = loopAxes.Length - 1; i >= 0; i--)
             {
                 string cont = NextP();
@@ -881,6 +1213,9 @@ public sealed class PtxAffineEmitter
         CheckEmittedSize(spec);
         _body.Append("END:\n    ret;\n}\n");
 
+        if (SharedMemoryBytes > 0)
+            _sb.Append("    .shared .align 4 .b8 stageBuf[")
+               .Append(I(SharedMemoryBytes)).Append("];\n");
         _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
            .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
            .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")

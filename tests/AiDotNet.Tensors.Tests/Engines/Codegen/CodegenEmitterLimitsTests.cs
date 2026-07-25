@@ -84,9 +84,13 @@ public class CodegenEmitterLimitsTests
         var emitter = new PtxAffineEmitter { Coarsening = 64 };
         emitter.Emit(small, 8, 6);
 
-        // 64 does not divide 8, so the tile must be declined rather than applied.
-        Assert.Equal(1, emitter.CoarsenedLanes);
+        // Whatever tile the search picks, it must divide the axis and leave a launch
+        // that covers every output exactly once -- never a zero-thread or short launch.
+        Assert.True(8 % emitter.CoarsenedLanes == 0,
+            "a tile of " + emitter.CoarsenedLanes + " does not divide an extent of 8.");
         Assert.True(emitter.LaunchBlocks >= 1);
+        Assert.True((long)emitter.LaunchBlocks * emitter.LaunchBlockThreads * emitter.CoarsenedLanes >= 8,
+            "the launch does not cover all 8 outputs.");
     }
 
     /// <summary>
