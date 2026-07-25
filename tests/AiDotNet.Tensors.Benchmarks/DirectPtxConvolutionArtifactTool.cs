@@ -371,13 +371,17 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly Conv2DRegBlockShape RegBlockedC64 =
         new(32, 64, 64, 3136, 64, 64, 16, 4, 4);
 
-    // #841 coverage specialization shapes (match the on-device correctness tests).
+    // #841 coverage specialization shapes.
+    // RULE: these MUST equal the shapes the fp64-oracle tests verify. Releasing a
+    // cubin for an unverified shape means the audited artifact is not the artifact
+    // whose numerics were checked -- which is how a stride!=1 codegen branch shipped
+    // with zero numerical coverage.
     private static readonly FusedConv3DShape FusedConv3D =
         new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
     private static readonly FusedConvTranspose2DShape FusedConvTranspose2D =
         new(2, 3, 4, 4, 4, 3, 3, 2, 1, 1);
-    private static readonly Conv1DShape Conv1D = new(2, 3, 4, 32, 3, 1, 1, true);
-    private static readonly Conv3DShape Conv3D = new(2, 2, 4, 8, 8, 8, 3, 3, 3, 1, 1, true);
+    private static readonly Conv1DShape Conv1D = new(2, 4, 8, 16, 3, 1, 1, true);
+    private static readonly Conv3DShape Conv3D = new(2, 3, 4, 8, 8, 8, 3, 3, 3, 1, 1, true);
     private static readonly ConvTranspose2DShape ConvTranspose2D = new(2, 3, 4, 4, 4, 3, 3, 2, 1, 1, true);
     private const int DwN = 2, DwC = 8, DwH = 8, DwW = 8;
     private const bool DwRelu = true;
@@ -386,16 +390,16 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly ConvTranspose3DShape ConvTranspose3D = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 2, 1, 1, true);
     private const int DwBwN = 2, DwBwC = 8, DwBwH = 8, DwBwW = 8;
     private static readonly Conv1DBackwardShape Conv1DBackward = new(2, 4, 4, 32, 3, 1, 1);
-    private static readonly DepthwiseConv1DShape DwConv1D = new(2, 4, 32, 3, 1, 1);
+    private static readonly DepthwiseConv1DShape DwConv1D = new(3, 5, 32, 3, 1, 1);
     private static readonly ConvTranspose2DBackwardShape ConvTranspose2DBackward = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 0);
     private static readonly ConvTranspose3DBackwardShape ConvTranspose3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1, 0);
     private static readonly Conv3DBackwardShape Conv3DBackward = new(2, 2, 4, 4, 4, 4, 3, 3, 3, 1, 1);
     private static readonly DeformableConv2DShape Deformable = new(2, 3, 4, 8, 8, 3, 3, 1, 1);
     // offset/mask require N*Taps*OH*OW % 256 == 0 (Taps=9 coprime to 256 -> N*OH*OW % 256): OH=8,OW=16 -> 2*9*128=2304.
-    private static readonly DeformableConv2DShape DeformableSpatial = new(2, 3, 4, 8, 16, 3, 3, 1, 1);
-    private static readonly GroupedDeformableConv2DShape GroupedDeform = new(2, 4, 4, 8, 8, 3, 3, 1, 1, 2);
-    private static readonly GroupedDeformableConv2DShape GroupedDeformSpatial = new(2, 4, 4, 8, 16, 3, 3, 1, 1, 2);
-    private static readonly LocallyConnected2DShape LcFwd = new(2, 4, 4, 8, 8, 3, 3, 1, 1, true);
+    private static readonly DeformableConv2DShape DeformableSpatial = new(4, 3, 4, 8, 8, 3, 3, 1, 1);
+    private static readonly GroupedDeformableConv2DShape GroupedDeform = new(2, 4, 3, 8, 8, 3, 3, 1, 1, 2);
+    private static readonly GroupedDeformableConv2DShape GroupedDeformSpatial = new(2, 4, 3, 8, 16, 3, 3, 1, 1, 2);
+    private static readonly LocallyConnected2DShape LcFwd = new(2, 3, 4, 8, 8, 3, 3, 1, 1, true);
     private static readonly LocallyConnected2DShape LcBwd = new(2, 4, 4, 8, 8, 3, 3, 1, 1, false);
     private const int LcBiasN = 2, LcBiasK = 4, LcBiasOH = 8, LcBiasOW = 8;
 

@@ -18,6 +18,8 @@ pub struct Emitter {
     p: u32,
     rd: u32,
     pub emitted_loads: u32,
+    pub elided_guards: u32,
+    axis_extents: Vec<i64>,
 }
 
 impl Emitter {
@@ -46,6 +48,8 @@ impl Emitter {
         }
 
         self.out.clear();
+        self.elided_guards = 0;
+        self.axis_extents = space.axes.iter().map(|a| a.extent).collect();
         let _ = writeln!(self.out, ".version 7.1");
         let _ = writeln!(self.out, ".target sm_{major}{minor}");
         let _ = writeln!(self.out, ".address_size 64\n");
@@ -252,7 +256,16 @@ impl Emitter {
                 idx = q;
             }
 
-            if expr.can_escape() {
+            // Interval analysis over the folded expression -- see the C# emitter for
+            // why the syntactic test is both unsound and wasteful.
+            let (mut lo, mut hi) = (folded, folded);
+            for t in &symbolic {
+                let span = t.coeff * (self.axis_extents[t.axis] - 1);
+                if t.coeff >= 0 { hi += span; } else { lo += span; }
+            }
+            let can_escape = expr.divisor != 1 || lo < 0 || hi >= dim;
+            if !can_escape { self.elided_guards += 1; }
+            if can_escape {
                 let lo = self.next_p();
                 let hi = self.next_p();
                 let both = self.next_p();

@@ -38,6 +38,7 @@ public sealed class PtxAffineEmitter
 
     private readonly StringBuilder _sb = new(16384);
     private int _r, _f, _p, _rd;
+    private IReadOnlyList<CodegenAxis> axesMeta = Array.Empty<CodegenAxis>();
 
     private string NextR() => "%r" + (_r++).ToString(CultureInfo.InvariantCulture);
     private string NextF() => "%f" + (_f++).ToString(CultureInfo.InvariantCulture);
@@ -51,6 +52,9 @@ public sealed class PtxAffineEmitter
 
     /// <summary>True when the reduction was fully unrolled.</summary>
     public bool Unrolled { get; private set; }
+
+    /// <summary>Bounds guards elided because interval analysis proved them unnecessary.</summary>
+    public int ElidedGuards { get; private set; }
 
     /// <summary>
     /// Emits PTX for <paramref name="spec"/>.
@@ -66,6 +70,7 @@ public sealed class PtxAffineEmitter
 
         var space = spec.Space;
         var axes = space.Axes;
+        axesMeta = axes;
         int[] parallel = space.ParallelAxes;
         int[] reduction = space.ReductionAxes;
         long total = space.TotalThreads;           // single source of truth
@@ -77,7 +82,7 @@ public sealed class PtxAffineEmitter
                 $"Reduction trip count {trips} exceeds the unroll limit {FullUnrollLimit}; " +
                 "a looping lowering is not implemented yet.");
 
-        _sb.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0;
+        _sb.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
 
         _sb.Append(".version 7.1\n")
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
@@ -292,10 +297,23 @@ public sealed class PtxAffineEmitter
                 L($"div.s32 {idx}, {num}, {I(expr.Divisor)};");
             }
 
-            // Derived bounds predicate: 0 <= idx < dim. Only emitted when the map
-            // can actually leave the tensor -- a bare non-negative axis cannot.
-            bool canEscape = expr.Constant < 0 || expr.Divisor != 1 || symbolic.Count > 1;
-            if (!canEscape) foreach (var term in symbolic) if (term.Coefficient < 0) { canEscape = true; break; }
+            // Derived bounds predicate: 0 <= idx < dim, emitted only when the folded
+            // expression can ACTUALLY leave the tensor.
+            //
+            // Interval analysis over the parallel axis ranges, not a syntactic guess.
+            // The syntactic form is both unsound and wasteful: after a reduction axis is
+            // folded away, `oh + kh - 1` becomes `oh - 1`, `oh`, or `oh + 1` depending on
+            // the tap, and only the first and last can escape [0, H). Testing the
+            // pre-folding constant guards all three; testing the folded range guards
+            // exactly the two that need it -- fewer instructions AND no missed case.
+            long rangeLo = folded, rangeHi = folded;
+            foreach (var term in symbolic)
+            {
+                long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
+                if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
+            }
+            bool canEscape = expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim;
+            if (!canEscape) ElidedGuards++;
             if (canEscape)
             {
                 string lo = NextP(), hi = NextP(), both = NextP();

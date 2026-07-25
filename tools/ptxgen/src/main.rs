@@ -82,6 +82,7 @@ fn main() {
             println!("threads (single source)    : {}", spec.space.total_threads());
             println!("grid blocks                : {}", Emitter::grid_blocks(&spec));
             println!("emitted loads              : {}", em.emitted_loads);
+            println!("guards elided (interval)   : {}", em.elided_guards);
             println!("ptx lines                  : {}", ptx.lines().count());
             println!("written                    : {path}");
         }
