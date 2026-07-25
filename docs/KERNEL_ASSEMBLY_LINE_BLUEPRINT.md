@@ -277,3 +277,110 @@ Ranked by how hard it is for them to replicate:
 3. **Phase 3 spike in parallel**: a two-op resident chain, hand-assembled from two
    specs, purely to measure whether the residency win is as large as predicted before
    committing the compiler work to it.
+
+---
+
+## 11. Critical review of this blueprint — gaps found on second pass
+
+Measured, then written. Ordered by leverage.
+
+### 11.1 Biggest miss: the backward kernel is derivable from the forward
+
+Roughly half of the ~800-kernel estate is backward kernels, and we were going to
+declare every one of them by hand.
+
+For an affine op the gradient index map is the **adjoint of the forward index map**:
+
+```
+forward   out[o]  = sum_k  in[f(o,k)] * w[k]
+backward  dIn[i]  = sum over (o,k) where f(o,k) = i  of  dOut[o] * w[k]
+```
+
+Inverting `f(o,k) = o*stride + k - pad` for `i` gives `o = (i + pad - k)/stride`,
+valid only on exact division — which is *literally* `CodegenAffineExpr.TransposedWindow`,
+already shipped. The hand-written backward-input kernels are exactly this transpose-gather,
+written out by hand 20+ times.
+
+**So: declare the forward spec, derive backward-input and backward-weight.** This is
+the single largest multiplier in the whole plan — it roughly halves the declaration
+work and guarantees the gradient can never disagree with the forward, which is a
+class of bug no framework currently prevents.
+
+Gate: derived backward must match the existing hand-written backward kernel against
+the same fp64 oracle, on every family where one exists.
+
+### 11.2 We use none of the hardware that makes modern kernels fast
+
+Measured across all 43 released cubins:
+
+| feature | our usage | why it matters |
+|---|---|---|
+| `cp.async` / LDGSTS | **0** | global→shared without staging through registers; the basis of software pipelining |
+| tensor core (HMMA/IMMA) | **0** | 8–16x math throughput; TF32 MMA applies to our fp32 conv on Ampere |
+| vectorised global loads | 34 vs **257 scalar** | `ld.global.v4.f32` is 1 instruction per 4 elements |
+
+Issue #863's own stated rule is that "cp.async and Tensor Core MMA are mandatory when
+a reusable tile or matrix multiply exists". **Our convolution kernels violate that rule
+today** — a convolution is a matrix multiply with a reusable tile.
+
+This reframes Phase 2. It is not "tune the scheduler"; it is "the scheduler must emit
+the instruction classes we currently never emit". Expected order of magnitude here is
+far larger than the 4.8% instruction win from interval analysis.
+
+### 11.3 Launch overhead is not only a measurement problem — it is the product problem
+
+Phase 0.5 treats the ~21 us launch+sync floor as an obstacle to measurement. It is
+also the strongest available argument for Layer 2: if a real workload issues many
+small kernels, that floor is a real cost on every one of them, and a resident program
+removes it. The measurement difficulty and the breakthrough are the same phenomenon
+observed from two sides. Phase 3's benchmark should therefore report **end-to-end
+chain time**, where the launch floor is part of the honest baseline, not just
+kernel-only time, where it is noise to be excluded.
+
+### 11.4 Missing: a cost model
+
+The plan says "search the schedule" without saying how. Brute-force autotuning over
+tile size x unroll x vector width x memory placement explodes, and it is why Triton's
+search is coarse. A simple analytic model — bytes moved, FLOPs, occupancy from
+register/SMEM budget, arithmetic intensity vs the roofline — prunes most of the space
+before anything is compiled, and it can be computed **from the spec alone, with no
+GPU**. That is the same "static gates run without the device" property that made the
+bake-off possible while the GPU was busy.
+
+### 11.5 Missing: a static-metric ratchet in CI
+
+We now measure registers, instruction count, LDG/STG/LDS/STS and spills for every
+released cubin, and nothing gates on them. Across 800 kernels, silent regressions are
+inevitable. The manifest should carry the accepted metrics per kernel and CI should
+fail on regression beyond a tolerance. Cheap to build, and it is what keeps "the same
+raw performance" true as the estate grows.
+
+### 11.6 Missing: determinism as a product property
+
+Our deformable backward-input scatters with `red.global.add.f32`, so results are
+run-to-run non-deterministic. Interval analysis proves bounds; nothing proves race
+freedom or reproducibility. A **bit-reproducible kernel library** is a genuine
+differentiator for training — competitors offer it partially and reluctantly — and
+the spec layer is where a deterministic-reduction ordering could be declared and then
+guaranteed.
+
+### 11.7 Missing: architecture parameterisation
+
+Everything here is sm_86. Hopper and Blackwell add TMA, `wgmma` and thread-block
+clusters, which change the *shape* of a good schedule, not just its constants. If the
+spec algebra is not arch-parameterised from the start, the whole thing gets rebuilt.
+The spec should declare intent ("stage this tile") and the backend should choose the
+mechanism (`cp.async` on Ampere, TMA on Hopper).
+
+### 11.8 Revised phase ordering
+
+Section 6 stands, with these amendments:
+
+* **Phase 1 gains backward derivation** (11.1) — it is cheap once index maps exist and
+  it halves the remaining work.
+* **Phase 2 is re-scoped** to "emit the instruction classes we currently never emit":
+  vectorised access, `cp.async` pipelining, tensor-core tiles (11.2). The cost model
+  (11.4) and the CI ratchet (11.5) land with it.
+* **Phase 3 measures end-to-end chain time**, not only kernel-only time (11.3).
+* **Determinism (11.6) and arch parameterisation (11.7)** are cross-cutting and must
+  be designed into the spec algebra now, not retrofitted.
