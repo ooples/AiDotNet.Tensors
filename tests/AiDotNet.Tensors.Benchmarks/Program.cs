@@ -150,6 +150,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-vector-ab")
+        {
+            KernelConveyorTool.Run("vector-ab", args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-verify")
         {
             KernelConveyorTool.Run("verify", args.Skip(1).ToArray());

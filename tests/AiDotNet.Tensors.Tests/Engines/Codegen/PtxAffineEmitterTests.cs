@@ -261,4 +261,43 @@ public class PtxAffineEmitterTests
         Assert.All(result, v => Assert.True(double.IsFinite(v)));
         Assert.Contains(result, v => v != 0.0);
     }
+
+    /// <summary>
+    /// A binding whose unit-stride dimension is indexed by the innermost reduction
+    /// axis must be read with ld.global.v4.f32, not four scalar loads.
+    /// </summary>
+    [Fact]
+    public void UnitStrideReductionOperand_UsesVectorLoads()
+    {
+        var entry = CodegenKernelCatalog.Find("conv2d_1x1_bias_relu");
+        Assert.NotNull(entry);
+
+        var vector = new PtxAffineEmitter();
+        string vectorPtx = vector.Emit(entry!.Bench, 8, 6);
+        Assert.True(vector.VectorisedLoads > 0, "conv2d_1x1 weights are unit-stride in the reduction axis.");
+        Assert.Contains("ld.global.v4.f32", vectorPtx, StringComparison.Ordinal);
+
+        var scalar = new PtxAffineEmitter { EnableVectorLoads = false };
+        string scalarPtx = scalar.Emit(entry.Bench, 8, 6);
+        Assert.Equal(0, scalar.VectorisedLoads);
+        Assert.DoesNotContain("ld.global.v4.f32", scalarPtx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Vectorising must never apply where it would be unsafe: a gathered window is not
+    /// guaranteed 16-byte aligned, so those bindings must stay on scalar loads.
+    /// </summary>
+    [Fact]
+    public void GatheredWindows_AreNotVectorised()
+    {
+        foreach (string name in new[] { "depthwise_conv2d_3x3", "conv2d_3x3_bias_relu",
+                                        "conv_transpose2d_3x3_stride2" })
+        {
+            var entry = CodegenKernelCatalog.Find(name);
+            Assert.NotNull(entry);
+            var emitter = new PtxAffineEmitter();
+            emitter.Emit(entry!.Bench, 8, 6);
+            Assert.Equal(0, emitter.VectorisedLoads);
+        }
+    }
 }

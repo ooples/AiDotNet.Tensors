@@ -59,6 +59,7 @@ internal static class KernelConveyorTool
             case "verify": Verify(entries); break;
             case "release": Release(entries, args); break;
             case "bench": Bench(entries); break;
+            case "vector-ab": VectorAb(entries); break;
             default: Console.WriteLine("Unknown conveyor stage '" + stage + "'."); break;
         }
     }
@@ -416,6 +417,136 @@ internal static class KernelConveyorTool
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
         GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-end");
+    }
+
+    /// <summary>
+    /// Paired A/B of the vector-load lowering against the scalar one, in ONE process.
+    /// Comparing numbers from separate runs is exactly what Phase 0.5 showed to be
+    /// untrustworthy, so the two variants are interleaved sample by sample and the
+    /// ratio is taken WITHIN each pair.
+    /// </summary>
+    private static void VectorAb(IReadOnlyList<CodegenCatalogEntry> entries)
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-vector-ab");
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            Console.WriteLine();
+            Console.WriteLine("VECTOR-LOAD A/B - ld.global.v4.f32 vs scalar, paired in-process");
+            Console.WriteLine("harness noise floor 1.05%; a ratio inside ~1.03x is not claimable");
+            Console.WriteLine();
+            Console.WriteLine("kernel                              v4 loads   scalar us   vector us    speedup");
+
+            foreach (var entry in entries)
+            {
+                var spec = entry.Bench;
+                var vecEmitter = new PtxAffineEmitter();
+                string vecPtx = vecEmitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                if (vecEmitter.VectorisedLoads == 0)
+                {
+                    Console.WriteLine(entry.Name.PadRight(36) + "         0           -           -   no unit-stride reduction axis");
+                    continue;
+                }
+
+                var scalarEmitter = new PtxAffineEmitter { EnableVectorLoads = false };
+                string scalarPtx = scalarEmitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+
+                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx);
+                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx);
+
+                var ratios = new double[Runs];
+                double scalarUs = 0, vectorUs = 0;
+                for (int run = 0; run < Runs; run++)
+                {
+                    (double a, double b, double ratio) = PairedRatio(runtime, scalarStage.Launch, vecStage.Launch);
+                    ratios[run] = ratio;
+                    scalarUs = a; vectorUs = b;
+                }
+                Array.Sort(ratios);
+
+                Console.WriteLine(entry.Name.PadRight(36) +
+                    vecEmitter.VectorisedLoads.ToString(CultureInfo.InvariantCulture).PadLeft(10) +
+                    scalarUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
+                    vectorUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
+                    ratios[Runs / 2].ToString("F3", CultureInfo.InvariantCulture).PadLeft(11) + "x");
+            }
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    /// <summary>Interleaves A and B and returns the median per-sample ratio A/B.</summary>
+    private static (double A, double B, double Ratio) PairedRatio(
+        DirectPtxRuntime runtime, Action a, Action b)
+    {
+        for (int i = 0; i < Warmup; i++) { a(); b(); }
+        runtime.Synchronize();
+
+        var sa = new double[Samples];
+        var sb = new double[Samples];
+        var ratio = new double[Samples];
+        for (int i = 0; i < Samples; i++)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            for (int k = 0; k < LaunchesPerSample; k++) a();
+            runtime.Synchronize();
+            sa[i] = Stopwatch.GetElapsedTime(t0).TotalMilliseconds / LaunchesPerSample * 1000.0;
+
+            long t1 = Stopwatch.GetTimestamp();
+            for (int k = 0; k < LaunchesPerSample; k++) b();
+            runtime.Synchronize();
+            sb[i] = Stopwatch.GetElapsedTime(t1).TotalMilliseconds / LaunchesPerSample * 1000.0;
+
+            ratio[i] = sa[i] / sb[i];
+        }
+        Array.Sort(sa); Array.Sort(sb); Array.Sort(ratio);
+        return (sa[Samples / 2], sb[Samples / 2], ratio[Samples / 2]);
+    }
+
+    /// <summary>A loaded module plus its buffers, launchable from supplied PTX.</summary>
+    private sealed class LaunchableStage : IDisposable
+    {
+        private readonly DirectPtxModule _module;
+        private readonly IntPtr _fn;
+        private readonly IntPtr[] _pointers;
+        private readonly uint _blocks;
+        private readonly List<DirectPtxBuffer> _buffers;
+
+        private LaunchableStage(DirectPtxModule m, IntPtr fn, IntPtr[] p, uint blocks, List<DirectPtxBuffer> b)
+        { _module = m; _fn = fn; _pointers = p; _blocks = blocks; _buffers = b; }
+
+        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx)
+        {
+            var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+            IntPtr fn = module.GetFunction(spec.Name, out _);
+            var buffers = new List<DirectPtxBuffer>();
+            var pointers = new IntPtr[spec.ParameterCount];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                long count = Elements(spec.Inputs[i].Shape);
+                var buf = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+                var host = new float[count];
+                for (long e = 0; e < count; e++) host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buf.Upload<float>(host);
+                buffers.Add(buf);
+                pointers[i] = buf.Pointer;
+            }
+            var outBuf = runtime.AllocateBytes((nuint)(Elements(spec.Output.Shape) * sizeof(float)));
+            buffers.Add(outBuf);
+            pointers[spec.Inputs.Count] = outBuf.Pointer;
+            return new LaunchableStage(module, fn, pointers, PtxAffineEmitter.GridBlocks(spec), buffers);
+        }
+
+        internal void Launch() => LaunchSpec(_module, _fn, _pointers, _blocks);
+
+        public void Dispose()
+        {
+            foreach (var b in _buffers) b.Dispose();
+            _module.Dispose();
+        }
     }
 
     private readonly record struct Dist(double Median, double P95);

@@ -67,6 +67,64 @@ public sealed class PtxAffineEmitter
     /// <summary>Number of reduction axes lowered to runtime loops rather than unrolled.</summary>
     public int LoopedAxes { get; private set; }
 
+    /// <summary>Elements per vector load. f32 x4 is the widest global load the ISA offers.</summary>
+    private const int VectorWidth = 4;
+
+    /// <summary>Number of <c>ld.global.v4.f32</c> instructions emitted.</summary>
+    public int VectorisedLoads { get; private set; }
+
+    /// <summary>
+    /// Enables vector loads. Off is not a production setting -- it exists so the two
+    /// lowerings can be measured against each other inside ONE process, which is the
+    /// only comparison Phase 0.5 showed to be trustworthy.
+    /// </summary>
+    public bool EnableVectorLoads { get; set; } = true;
+
+    /// <summary>
+    /// True when <paramref name="axis"/> indexes the binding's unit-stride dimension
+    /// directly and covers all of it -- the condition under which four consecutive
+    /// values of that axis are four consecutive, in-range, aligned floats.
+    /// </summary>
+    private static bool IsUnitStrideIn(
+        CodegenTensorBinding binding, int axis, IReadOnlyList<CodegenAxis> axes)
+    {
+        int last = binding.Map.Count - 1;
+        if (last < 0 || binding.Stride(last) != 1) return false;
+
+        var expr = binding.Map[last];
+        if (expr.Terms.Count != 1 || expr.Terms[0].Axis != axis ||
+            expr.Terms[0].Coefficient != 1 || expr.Constant != 0 || expr.Divisor != 1)
+            return false;
+
+        // The axis must span the dimension exactly; otherwise the group could run off
+        // the end and the load would need a guard it cannot have.
+        return axes[axis].Extent == binding.Shape[last];
+    }
+
+    /// <summary>
+    /// Emits one <c>ld.global.v4.f32</c> and returns the four component registers.
+    /// </summary>
+    private string[] EmitVectorLoad(
+        CodegenTensorBinding binding, string basePointer, string[] axisReg,
+        int[] reductionValues, int[] reductionAxes, int width)
+    {
+        string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out string? pred);
+        if (pred != null)
+            throw new InvalidOperationException(
+                "A vectorised binding must be provably in range; " + binding.Name + " produced a guard.");
+
+        string byteOffset = NextRd(), address = NextRd();
+        L($"mul.wide.u32 {byteOffset}, {offset}, 4;");
+        L($"add.u64 {address}, {basePointer}, {byteOffset};");
+
+        var regs = new string[width];
+        for (int i = 0; i < width; i++) regs[i] = NextF();
+        L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+        VectorisedLoads++;
+        EmittedLoads++;
+        return regs;
+    }
+
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
@@ -185,6 +243,26 @@ public sealed class PtxAffineEmitter
             _sb.Append("LOOP").Append(I(i)).Append(":\n");
         }
 
+        // Decide, before emitting anything, which product operands can be read with a
+        // vector load. The condition is exact rather than heuristic: the binding's
+        // FASTEST tensor dimension (stride 1) must be indexed by exactly the innermost
+        // reduction axis, with that axis covering the whole dimension so no bounds
+        // check is needed, and the extent must be a multiple of the vector width.
+        int innermost = reduction.Length > 0 ? reduction[reduction.Length - 1] : -1;
+        var vectorisable = new bool[spec.Inputs.Count];
+        var vectorRegs = new string[spec.Inputs.Count][];
+        int vectorGroup = 1;
+        if (EnableVectorLoads && innermost >= 0 && axes[innermost].Extent % VectorWidth == 0)
+        {
+            foreach (int inputIdx in spec.ProductInputs)
+                if (IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
+                {
+                    vectorisable[inputIdx] = true;
+                    vectorGroup = VectorWidth;
+                }
+        }
+        VectorisedLoads = 0;
+
         // Reduction over the axes that remain unrolled: every one of those takes a
         // compile-time value, so each index expression folds to (symbolic terms) +
         // constant. A peeled axis stays symbolic and is simply another term.
@@ -200,13 +278,49 @@ public sealed class PtxAffineEmitter
                 r /= extent;
             }
 
+            // VECTORISED LOADS. When a binding's fastest tensor dimension is exactly
+            // the innermost reduction axis, four consecutive trips read four
+            // consecutive floats from it, and one ld.global.v4.f32 replaces four
+            // ld.global.f32. The group start is a multiple of four and cudaMalloc
+            // aligns to 256 bytes, so the 16-byte alignment the instruction requires
+            // is guaranteed rather than hoped for.
+            //
+            // The vector is fetched on the FIRST trip of each group and the remaining
+            // three trips reuse the components already in registers.
+            if (vectorGroup > 1 && innermost >= 0)
+            {
+                int lane = reductionValues[innermost] % vectorGroup;
+                if (lane == 0)
+                {
+                    foreach (int inputIdx in spec.ProductInputs)
+                    {
+                        if (!vectorisable[inputIdx]) continue;
+                        var b = spec.Inputs[inputIdx];
+                        vectorRegs[inputIdx] = EmitVectorLoad(
+                            b, basePtr[b.ParameterIndex], axisReg, reductionValues, reduction, vectorGroup);
+                    }
+                }
+            }
+
             string? product = null;
             string? productPred = null;
             foreach (int inputIdx in spec.ProductInputs)
             {
                 var binding = spec.Inputs[inputIdx];
-                string value = EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg,
-                                        reductionValues, reduction, out string? pred);
+                string value;
+                string? pred;
+                if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
+                {
+                    // Already resident from this group's vector load; a vectorisable
+                    // binding is by construction in range, so it carries no predicate.
+                    value = vectorRegs[inputIdx]![reductionValues[innermost] % vectorGroup];
+                    pred = null;
+                }
+                else
+                {
+                    value = EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg,
+                                     reductionValues, reduction, out pred);
+                }
                 if (product is null) { product = value; productPred = pred; }
                 else
                 {
