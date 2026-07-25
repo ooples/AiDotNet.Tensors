@@ -116,8 +116,138 @@ public sealed class PtxAffineEmitter
     /// </summary>
     public int Coarsening { get; set; } = 4;
 
-    /// <summary>Lanes actually used: <see cref="Coarsening"/>, or 1 if it did not divide.</summary>
+    /// <summary>Lanes actually used: the product of the chosen tile factors.</summary>
     public int CoarsenedLanes { get; private set; } = 1;
+
+    /// <summary>Upper bound on accumulators per thread, to keep registers in budget.</summary>
+    public int MaxTileLanes { get; set; } = 16;
+
+    /// <summary>The tile the reuse analysis chose, e.g. <c>k x4, ow x4</c>.</summary>
+    public string TileDescription { get; private set; } = "none";
+
+    /// <summary>
+    /// Chooses which axes to tile and by how much, by minimising loads per MAC.
+    /// </summary>
+    /// <remarks>
+    /// For a tile with factors f over axes A, one trip issues, per operand, the product
+    /// of the factors on the axes that operand DEPENDS on -- an operand invariant in a
+    /// tiled axis costs nothing extra when that axis grows. MACs per trip is the product
+    /// of all factors. So loads/MAC is
+    /// <c>sum over operands of (product of dependent factors) / (product of all factors)</c>,
+    /// and the best tile is simply the one that minimises it.
+    /// </remarks>
+    private static void SelectTile(
+        CodegenKernelSpec spec, IReadOnlyList<CodegenAxis> axes, int[] parallel,
+        int factor, int maxLanes, List<int> tileAxes, List<int> tileFactors)
+    {
+        int contiguous = parallel[parallel.Length - 1];
+
+        // The contiguous axis is tiled whenever it divides: it is the only axis whose
+        // lanes stay adjacent in memory, which is what keeps stores coalesced and makes
+        // lane-vectorised loads legal.
+        int contiguousFactor = axes[contiguous].Extent % factor == 0 ? factor : 1;
+
+        // A SECOND TILED AXIS IS NOT FREE. It divides the thread count again, which
+        // costs occupancy and latency hiding, so it is only worth taking when the load
+        // saving is large enough to pay for that. Measured: adding one to the depthwise
+        // family -- already at 93% of the DRAM roofline, where fewer loads cannot help
+        // because the bytes are fixed -- moved it from 73 us to 100 us. Adding one to
+        // dense 3x3, which is load-issue bound, moved it from 126 us to 69 us.
+        //
+        // So the decision is made on predicted TIME, not on loads per MAC, and only a
+        // decisive win is taken. The 20% margin is deliberate slack for the two effects
+        // the model does not carry: sector efficiency and occupancy.
+        const double RequiredImprovement = 0.80;
+
+        double baseline = PredictedRelativeTime(
+            spec, axes, new[] { contiguous }, new[] { contiguousFactor });
+
+        int bestAxis = -1, bestFactor = 1;
+        double bestCost = baseline;
+
+        foreach (int candidate in parallel)
+        {
+            if (candidate == contiguous) continue;
+            if (axes[candidate].Extent % factor != 0) continue;
+            if (contiguousFactor * factor > maxLanes) continue;
+
+            double cost = PredictedRelativeTime(spec, axes,
+                new[] { contiguous, candidate }, new[] { contiguousFactor, factor });
+            if (cost < bestCost * RequiredImprovement)
+            {
+                bestCost = cost;
+                bestAxis = candidate;
+                bestFactor = factor;
+            }
+        }
+
+        if (contiguousFactor > 1)
+        {
+            tileAxes.Add(contiguous);
+            tileFactors.Add(contiguousFactor);
+        }
+        if (bestAxis >= 0)
+        {
+            tileAxes.Add(bestAxis);
+            tileFactors.Add(bestFactor);
+        }
+    }
+
+    /// <summary>
+    /// Relative runtime of a candidate tile: the slowest of its load-issue, DRAM and
+    /// compute constraints, in arbitrary but comparable units.
+    /// </summary>
+    /// <remarks>
+    /// The same three-constraint model <c>CodegenPerformanceModel</c> uses, evaluated
+    /// here on candidate tiles rather than on a finished kernel. Only the ratios between
+    /// candidates matter, so device constants appear as a single ratio: how many bytes of
+    /// DRAM traffic cost the same as one warp-level load instruction. On this class of
+    /// device that is about 22 bytes (760 GB/s against 35.3 G warp-loads/s).
+    /// </remarks>
+    private static double PredictedRelativeTime(
+        CodegenKernelSpec spec, IReadOnlyList<CodegenAxis> axes, int[] tileAxes, int[] factors)
+    {
+        const double BytesPerLoadInstruction = 22.0;
+        const int WarpWidth = 32;
+
+        long macs = spec.Output.ElementCount * Math.Max(1, spec.Space.ReductionTripCount);
+        double loadInstructions = LoadsPerMac(spec, tileAxes, factors) * macs / WarpWidth;
+
+        long bytes = spec.Output.ElementCount;
+        for (int i = 0; i < spec.Inputs.Count; i++) bytes += spec.Inputs[i].ElementCount;
+        double dramEquivalent = bytes * 4.0 / BytesPerLoadInstruction;
+
+        // Compute never binds for these kernels, so the two memory terms decide it.
+        return Math.Max(loadInstructions, dramEquivalent);
+    }
+
+    /// <summary>Loads per MAC for a candidate tile, from operand dependence alone.</summary>
+    private static double LoadsPerMac(CodegenKernelSpec spec, int[] tileAxes, int[] factors)
+    {
+        double macs = 1;
+        foreach (int f in factors) macs *= f;
+
+        double loads = 0;
+        foreach (int inputIndex in spec.ProductInputs)
+        {
+            double operand = 1;
+            for (int t = 0; t < tileAxes.Length; t++)
+                if (ReferencesAxis(spec.Inputs[inputIndex], tileAxes[t]))
+                    operand *= factors[t];
+            loads += operand;
+        }
+        return loads / macs;
+    }
+
+    private static string DescribeTile(
+        IReadOnlyList<CodegenAxis> axes, List<int> tileAxes, List<int> tileFactors)
+    {
+        if (tileAxes.Count == 0) return "none";
+        var parts = new List<string>();
+        for (int t = 0; t < tileAxes.Count; t++)
+            parts.Add(axes[tileAxes[t]].Name + " x" + tileFactors[t].ToString(CultureInfo.InvariantCulture));
+        return string.Join(", ", parts);
+    }
 
     /// <summary>
     /// Blocks the host must launch for the PTX just emitted. Read this rather than
@@ -214,27 +344,49 @@ public sealed class PtxAffineEmitter
         trips = innerTrips;
         reduction = innerAxes;
 
-        // COARSEN. One thread per output element means every operand that does not
-        // depend on the output position is re-loaded once per output. The bake-off
-        // measured dense convolution at 2% of peak bandwidth and 5% of peak FP32 while
-        // cuDNN reached 28%, and the cause was load COUNT, not load cost. Giving each
-        // thread several adjacent outputs along the contiguous axis lets one weight
-        // load feed several FMAs.
+        // TILE, CHOSEN BY REUSE ANALYSIS RATHER THAN HARDCODED.
         //
-        // The coarsened axis is the last-declared parallel axis, which is the one
-        // consecutive threads walk, so a lane group stays contiguous in memory.
-        int coarsenAxis = -1;
-        int lanes = 1;
+        // One thread per output element re-loads every operand once per output. Which
+        // axes can fix that is not a matter of taste -- it is written in the index maps:
+        // an operand that does not reference an axis can share ONE load across every
+        // position of it.
+        //
+        //   input  [n, c, oh+kh-1, ow+kw-1]   independent of k   -> tile K
+        //   weights[k, c, kh, kw]             independent of ow  -> tile the spatial axis
+        //
+        // Tiling only the contiguous axis leaves the input per-lane, so loads/MAC is
+        // (Tw+1)/Tw and can never beat 1.0 -- measured, and the reason spatial coarsening
+        // plateaued. Tiling BOTH gives (Tw+Tk)/(Tw*Tk), which breaks below 1.0. That is
+        // what turns the measured 64x input-load redundancy in dense convolution into
+        // reuse instead of traffic.
+        var tileAxes = new List<int>();
+        var tileFactors = new List<int>();
         if (Coarsening > 1 && parallel.Length > 0)
+            SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
+
+        int lanes = 1;
+        foreach (int f in tileFactors) lanes *= f;
+        CoarsenedLanes = lanes;
+        TileDescription = DescribeTile(axes, tileAxes, tileFactors);
+
+        // The contiguous axis, when tiled, is the one lane-vectorisation can use.
+        int coarsenAxis = tileAxes.Count > 0 && tileAxes[0] == parallel[parallel.Length - 1]
+            ? tileAxes[0]
+            : -1;
+        int contiguousFactor = coarsenAxis >= 0 ? tileFactors[0] : 1;
+
+        // Per-lane offsets on each tiled axis, last tile axis varying fastest.
+        var laneOffsets = new int[lanes][];
+        for (int l = 0; l < lanes; l++)
         {
-            int candidate = parallel[parallel.Length - 1];
-            if (axes[candidate].Extent % Coarsening == 0)
+            laneOffsets[l] = new int[tileAxes.Count];
+            int remaining = l;
+            for (int t = tileAxes.Count - 1; t >= 0; t--)
             {
-                coarsenAxis = candidate;
-                lanes = Coarsening;
+                laneOffsets[l][t] = remaining % tileFactors[t];
+                remaining /= tileFactors[t];
             }
         }
-        CoarsenedLanes = lanes;
 
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
@@ -290,7 +442,8 @@ public sealed class PtxAffineEmitter
         for (int p = parallel.Length - 1; p >= 0; p--)
         {
             int ax = parallel[p];
-            int extent = ax == coarsenAxis ? axes[ax].Extent / lanes : axes[ax].Extent;
+            int tileSlot = tileAxes.IndexOf(ax);
+            int extent = tileSlot >= 0 ? axes[ax].Extent / tileFactors[tileSlot] : axes[ax].Extent;
             axisReg[ax] = NextR();
             if (p == 0)
             {
@@ -306,17 +459,28 @@ public sealed class PtxAffineEmitter
             }
         }
 
-        // One axis-register view per lane. Only the coarsened axis differs between
-        // them: lane l covers position base*lanes + l.
+        // One axis-register view per lane. Only the tiled axes differ between them:
+        // on tiled axis t, lane l covers position base_t * factor_t + offset_t(l).
+        // Registers are shared between lanes that agree on an axis, so a 4x4 tile emits
+        // 8 index registers rather than 16.
         var laneAxisReg = new string[lanes][];
+        var tileAxisReg = new string[tileAxes.Count][];
+        for (int t = 0; t < tileAxes.Count; t++)
+        {
+            tileAxisReg[t] = new string[tileFactors[t]];
+            for (int off = 0; off < tileFactors[t]; off++)
+            {
+                string reg = NextR();
+                if (off == 0) L($"mul.lo.u32 {reg}, {axisReg[tileAxes[t]]}, {I(tileFactors[t])};   // {axes[tileAxes[t]].Name} tile");
+                else L($"mad.lo.u32 {reg}, {axisReg[tileAxes[t]]}, {I(tileFactors[t])}, {I(off)};");
+                tileAxisReg[t][off] = reg;
+            }
+        }
         for (int l = 0; l < lanes; l++)
         {
             laneAxisReg[l] = (string[])axisReg.Clone();
-            if (coarsenAxis < 0) continue;
-            string laneReg = NextR();
-            if (l == 0) L($"mul.lo.u32 {laneReg}, {axisReg[coarsenAxis]}, {I(lanes)};");
-            else L($"mad.lo.u32 {laneReg}, {axisReg[coarsenAxis]}, {I(lanes)}, {I(l)};");
-            laneAxisReg[l][coarsenAxis] = laneReg;
+            for (int t = 0; t < tileAxes.Count; t++)
+                laneAxisReg[l][tileAxes[t]] = tileAxisReg[t][laneOffsets[l][t]];
         }
 
         long loadsBeforeLoop = EmittedLoads;
@@ -379,6 +543,14 @@ public sealed class PtxAffineEmitter
         // compile-time value, so each index expression folds to (symbolic terms) +
         // constant. A peeled axis stays symbolic and is simply another term.
         var reductionValues = new int[axes.Count];
+
+        // TWO SCOPES, because the two vector forms have different lifetimes.
+        // A reduction-axis vector covers VectorWidth TRIPS, so it must outlive a trip.
+        // A lane vector's address depends on the reduction values, so it must NOT --
+        // sharing one cache let trip 1 reuse trip 0's vector and silently corrupted
+        // both 1x1 kernels while their neighbours stayed exact.
+        var reductionVectorCache = new Dictionary<string, string[]>(StringComparer.Ordinal);
+
         for (long t = 0; t < trips; t++)
         {
             long r = t;
@@ -399,64 +571,21 @@ public sealed class PtxAffineEmitter
             //
             // The vector is fetched on the FIRST trip of each group and the remaining
             // three trips reuse the components already in registers.
-            if (vectorGroup > 1 && innermost >= 0)
-            {
-                int lane = reductionValues[innermost] % vectorGroup;
-                if (lane == 0)
-                {
-                    foreach (int inputIdx in spec.ProductInputs)
-                    {
-                        if (!vectorisable[inputIdx]) continue;
-                        var b = spec.Inputs[inputIdx];
-                        vectorRegs[inputIdx] = EmitVectorLoad(
-                            b, basePtr[b.ParameterIndex], axisReg, reductionValues, reduction, vectorGroup);
-                    }
-                }
-            }
-
-            // HOIST WHAT DOES NOT VARY ACROSS LANES. This is where coarsening actually
-            // pays: a weight operand does not reference the coarsened axis, so ONE load
-            // feeds every lane's FMA instead of one load per output. In a dense 3x3 over
-            // 32 channels that is 288 weight loads serving `lanes` outputs rather than
-            // `lanes` x 288. The bake-off showed dense convolution losing to cuDNN by
-            // 4-6x on exactly this: too many loads, not loads that were too slow.
-            // VECTORISE THE ACTIVATION OPERAND ACROSS LANES. An operand that is
-            // unit-stride in the coarsened axis has its `lanes` values at consecutive
-            // addresses, and lane 0 starts at a multiple of `lanes`, so one
-            // ld.global.v4.f32 replaces four scalar loads. This is the operand that
-            // vectorising along the reduction axis could never reach: reducing thread
-            // count by 4 costs latency hiding, and without this the dense 1x1 measured
-            // 0.944x -- a regression -- from coarsening alone.
-            var laneVec = new string[spec.Inputs.Count][];
-            if (lanes == VectorWidth && EnableVectorLoads)
-            {
-                foreach (int inputIdx in spec.ProductInputs)
-                {
-                    var b = spec.Inputs[inputIdx];
-                    if (!IsUnitStrideIn(b, coarsenAxis, axes)) continue;
-                    laneVec[inputIdx] = EmitVectorLoad(
-                        b, basePtr[b.ParameterIndex], laneAxisReg[0],
-                        reductionValues, reduction, VectorWidth);
-                }
-            }
-
-            var shared = new string[spec.Inputs.Count];
-            foreach (int inputIdx in spec.ProductInputs)
-            {
-                if (lanes == 1 || ReferencesAxis(spec.Inputs[inputIdx], coarsenAxis)) continue;
-                if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
-                {
-                    shared[inputIdx] = vectorRegs[inputIdx]![reductionValues[innermost] % vectorGroup];
-                    continue;
-                }
-                shared[inputIdx] = EmitLoad(
-                    spec.Inputs[inputIdx], basePtr[spec.Inputs[inputIdx].ParameterIndex],
-                    laneAxisReg[0], reductionValues, reduction, out string? sharedPred);
-                if (sharedPred != null)
-                    throw new InvalidOperationException(
-                        "A lane-invariant operand must not need a lane-dependent guard: " +
-                        spec.Inputs[inputIdx].Name + ".");
-            }
+            // LOAD ONCE PER DISTINCT DEPENDENCE.
+            //
+            // This single rule replaces the two special cases it grew out of. An operand
+            // is loaded once for each distinct combination of the tile-axis offsets it
+            // ACTUALLY REFERENCES:
+            //
+            //   invariant in every tiled axis  -> 1 load for the whole tile
+            //   depends only on the spatial    -> Tw loads
+            //   depends only on the reuse axis -> Tk loads
+            //
+            // which is exactly (Tw + Tk)/(Tw*Tk) loads per MAC. An operand that is
+            // unit-stride in the contiguous axis has its Tw values at consecutive
+            // aligned addresses, so those collapse further into one ld.global.v4.f32.
+            var scalarCache = new Dictionary<string, (string Value, string? Pred)>(StringComparer.Ordinal);
+            var laneVectorCache = new Dictionary<string, string[]>(StringComparer.Ordinal);
 
             for (int l = 0; l < lanes; l++)
             {
@@ -467,24 +596,68 @@ public sealed class PtxAffineEmitter
                     var binding = spec.Inputs[inputIdx];
                     string value;
                     string? pred = null;
-                    if (laneVec[inputIdx] != null)
+
+                    bool laneVectorisable =
+                        EnableVectorLoads && coarsenAxis >= 0 &&
+                        contiguousFactor == VectorWidth &&
+                        IsUnitStrideIn(binding, coarsenAxis, axes);
+
+                    if (laneVectorisable)
                     {
-                        value = laneVec[inputIdx]![l];
-                    }
-                    else if (shared[inputIdx] != null)
-                    {
-                        value = shared[inputIdx];
+                        // Key on every referenced tiled axis EXCEPT the contiguous one,
+                        // whose Tw positions the vector itself covers.
+                        string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], coarsenAxis);
+                        if (!laneVectorCache.TryGetValue(key, out string[]? vec))
+                        {
+                            vec = EmitVectorLoad(binding, basePtr[binding.ParameterIndex],
+                                                 laneAxisReg[BaseLaneFor(l, tileAxes, laneOffsets, coarsenAxis)],
+                                                 reductionValues, reduction, VectorWidth);
+                            laneVectorCache[key] = vec;
+                        }
+                        int slot = tileAxes.IndexOf(coarsenAxis);
+                        value = vec[laneOffsets[l][slot]];
                     }
                     else if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
                     {
-                        // Already resident from this group's vector load; a vectorisable
-                        // binding is by construction in range, so it carries no predicate.
-                        value = vectorRegs[inputIdx]![reductionValues[innermost] % vectorGroup];
+                        // Vector load along the innermost REDUCTION axis. This was
+                        // emitted once from the untiled base registers, which made it
+                        // lane-unaware: weights[k, c] is unit-stride in c, so it took
+                        // this path, and once k was also tiled every lane received lane
+                        // zero's k. Keying it like every other load fixes that.
+                        int group = reductionValues[innermost] / vectorGroup;
+                        string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], -1) +
+                                     "#g" + group.ToString(CultureInfo.InvariantCulture);
+                        if (!reductionVectorCache.TryGetValue(key, out string[]? rvec))
+                        {
+                            rvec = EmitVectorLoad(binding, basePtr[binding.ParameterIndex],
+                                                  laneAxisReg[l], reductionValues, reduction, vectorGroup);
+                            reductionVectorCache[key] = rvec;
+                        }
+                        value = rvec[reductionValues[innermost] % vectorGroup];
                     }
                     else
                     {
-                        value = EmitLoad(binding, basePtr[binding.ParameterIndex], laneAxisReg[l],
-                                         reductionValues, reduction, out pred);
+                        // Scalar path, cached on every referenced tiled axis. Two lanes
+                        // that agree on the axes this operand reads share one load.
+                        string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], -1);
+                        if (scalarCache.TryGetValue(key, out var cached))
+                        {
+                            value = cached.Value;
+                            pred = cached.Pred;
+                        }
+                        else
+                        {
+                            value = EmitLoad(binding, basePtr[binding.ParameterIndex], laneAxisReg[l],
+                                             reductionValues, reduction, out pred);
+                            // GUARDED loads are cached too, together with their predicate.
+                            // Refusing to cache them defeated the entire point on the one
+                            // kernel that matters: dense convolution's input is a gathered
+                            // window and therefore always guarded, so it was re-loaded once
+                            // per lane and loads/MAC stayed at 1.167 instead of 0.5. The
+                            // predicate is derived from the index, and two lanes with the
+                            // same key have the same index, so they have the same predicate.
+                            scalarCache[key] = (value, pred);
+                        }
                     }
                     if (product is null) { product = value; productPred = pred; }
                     else
@@ -534,21 +707,12 @@ public sealed class PtxAffineEmitter
 
         // Epilogue and store, per lane. Bias and scale are hoisted when they do not
         // reference the coarsened axis, which for a channel-indexed bias is always.
-        string? sharedBias = null, sharedScale = null;
-        if (lanes > 1 && spec.BiasInput.HasValue &&
-            !ReferencesAxis(spec.Inputs[spec.BiasInput.Value], coarsenAxis))
-        {
-            var b = spec.Inputs[spec.BiasInput.Value];
-            sharedBias = EmitLoad(b, basePtr[b.ParameterIndex], laneAxisReg[0],
-                                  reductionValues, reduction, out _);
-        }
-        if (lanes > 1 && spec.ScaleInput.HasValue &&
-            !ReferencesAxis(spec.Inputs[spec.ScaleInput.Value], coarsenAxis))
-        {
-            var s = spec.Inputs[spec.ScaleInput.Value];
-            sharedScale = EmitLoad(s, basePtr[s.ParameterIndex], laneAxisReg[0],
-                                   reductionValues, reduction, out _);
-        }
+        // The epilogue caches on the SAME key as the body. Hoisting it to lane 0 whenever
+        // it did not reference the contiguous axis was correct while only that axis was
+        // tiled, and silently wrong the moment a second axis was: bias[k] does not
+        // reference `ow`, so every lane received lane 0's `k` and two kernels returned
+        // wrong values while their epilogue-free siblings stayed exact.
+        var epilogueCache = new Dictionary<string, string>(StringComparer.Ordinal);
 
         for (int l = 0; l < lanes; l++)
         {
@@ -556,8 +720,13 @@ public sealed class PtxAffineEmitter
             if (spec.BiasInput.HasValue)
             {
                 var b = spec.Inputs[spec.BiasInput.Value];
-                string v = sharedBias ?? EmitLoad(b, basePtr[b.ParameterIndex], laneAxisReg[l],
-                                                  reductionValues, reduction, out _);
+                string key = LoadKey(spec.BiasInput.Value, b, tileAxes, laneOffsets[l], -1);
+                if (!epilogueCache.TryGetValue(key, out string? v))
+                {
+                    v = EmitLoad(b, basePtr[b.ParameterIndex], laneAxisReg[l],
+                                 reductionValues, reduction, out _);
+                    epilogueCache[key] = v;
+                }
                 string na = NextF();
                 L($"add.rn.f32 {na}, {acc}, {v};");
                 acc = na;
@@ -565,8 +734,13 @@ public sealed class PtxAffineEmitter
             if (spec.ScaleInput.HasValue)
             {
                 var s = spec.Inputs[spec.ScaleInput.Value];
-                string v = sharedScale ?? EmitLoad(s, basePtr[s.ParameterIndex], laneAxisReg[l],
-                                                   reductionValues, reduction, out _);
+                string key = LoadKey(spec.ScaleInput.Value, s, tileAxes, laneOffsets[l], -1);
+                if (!epilogueCache.TryGetValue(key, out string? v))
+                {
+                    v = EmitLoad(s, basePtr[s.ParameterIndex], laneAxisReg[l],
+                                 reductionValues, reduction, out _);
+                    epilogueCache[key] = v;
+                }
                 string na = NextF();
                 L($"mul.rn.f32 {na}, {acc}, {v};");
                 acc = na;
@@ -596,6 +770,47 @@ public sealed class PtxAffineEmitter
            .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
            .Append(_body);
         return _sb.ToString();
+    }
+
+    /// <summary>
+    /// Identity of a load: the operand plus its offsets on the tiled axes it actually
+    /// reads. Two lanes producing the same key need the same value, so one load serves
+    /// both -- this is the mechanism that turns reuse analysis into fewer instructions.
+    /// </summary>
+    private static string LoadKey(
+        int inputIndex, CodegenTensorBinding binding, List<int> tileAxes,
+        int[] laneOffsets, int excludeAxis)
+    {
+        var sb = new StringBuilder();
+        sb.Append(inputIndex.ToString(CultureInfo.InvariantCulture));
+        for (int t = 0; t < tileAxes.Count; t++)
+        {
+            if (tileAxes[t] == excludeAxis) continue;
+            if (!ReferencesAxis(binding, tileAxes[t])) continue;
+            sb.Append(':').Append(t.ToString(CultureInfo.InvariantCulture))
+              .Append('=').Append(laneOffsets[t].ToString(CultureInfo.InvariantCulture));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The lane that shares <paramref name="lane"/>'s offsets on every tiled axis except
+    /// <paramref name="contiguousAxis"/>, where it sits at offset zero. A vector load is
+    /// emitted from there so its four components line up with offsets 0..3.
+    /// </summary>
+    private static int BaseLaneFor(
+        int lane, List<int> tileAxes, int[][] laneOffsets, int contiguousAxis)
+    {
+        int slot = tileAxes.IndexOf(contiguousAxis);
+        if (slot < 0) return lane;
+        for (int candidate = 0; candidate < laneOffsets.Length; candidate++)
+        {
+            bool match = laneOffsets[candidate][slot] == 0;
+            for (int t = 0; match && t < tileAxes.Count; t++)
+                if (t != slot && laneOffsets[candidate][t] != laneOffsets[lane][t]) match = false;
+            if (match) return candidate;
+        }
+        return lane;
     }
 
     /// <summary>True when a binding's index map reads <paramref name="axis"/>.</summary>

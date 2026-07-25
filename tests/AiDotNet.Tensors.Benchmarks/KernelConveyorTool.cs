@@ -185,15 +185,15 @@ internal static class KernelConveyorTool
     /// </summary>
     private static double MeasuredMicroseconds(string kernel) => kernel switch
     {
-        "depthwise_conv2d_3x3_bias_relu" => 73.0,
-        "depthwise_conv2d_3x3" => 72.6,
-        "depthwise_conv2d_3x3_bwd_data" => 72.3,
-        "conv2d_1x1_bias_relu" => 45.8,
-        "conv2d_1x1_bwd_data" => 47.5,
-        "conv2d_3x3_bias_relu" => 125.9,
-        "conv2d_3x3_bwd_data" => 127.9,
-        "maxpool2d_2x2" => 156.2,
-        "conv_transpose2d_3x3_stride2" => 99.2,
+        "depthwise_conv2d_3x3_bias_relu" => 81.0,
+        "depthwise_conv2d_3x3" => 78.8,
+        "depthwise_conv2d_3x3_bwd_data" => 78.1,
+        "conv2d_1x1_bias_relu" => 38.6,
+        "conv2d_1x1_bwd_data" => 42.9,
+        "conv2d_3x3_bias_relu" => 75.0,
+        "conv2d_3x3_bwd_data" => 87.6,
+        "maxpool2d_2x2" => 171.6,
+        "conv_transpose2d_3x3_stride2" => 109.0,
         _ => 0.0,
     };
 

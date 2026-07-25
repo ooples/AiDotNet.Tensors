@@ -20,15 +20,15 @@ public class CodegenPerformanceModelTests
     /// <summary>Measured microseconds, locked-clock true-fp32 bake-off.</summary>
     private static readonly Dictionary<string, double> Measured = new(StringComparer.Ordinal)
     {
-        ["depthwise_conv2d_3x3_bias_relu"] = 73.0,
-        ["depthwise_conv2d_3x3"] = 72.6,
-        ["depthwise_conv2d_3x3_bwd_data"] = 72.3,
-        ["conv2d_1x1_bias_relu"] = 45.8,
-        ["conv2d_1x1_bwd_data"] = 47.5,
-        ["conv2d_3x3_bias_relu"] = 125.9,
-        ["conv2d_3x3_bwd_data"] = 127.9,
-        ["maxpool2d_2x2"] = 156.2,
-        ["conv_transpose2d_3x3_stride2"] = 99.2,
+        ["depthwise_conv2d_3x3_bias_relu"] = 81.0,
+        ["depthwise_conv2d_3x3"] = 78.8,
+        ["depthwise_conv2d_3x3_bwd_data"] = 78.1,
+        ["conv2d_1x1_bias_relu"] = 38.6,
+        ["conv2d_1x1_bwd_data"] = 42.9,
+        ["conv2d_3x3_bias_relu"] = 75.0,
+        ["conv2d_3x3_bwd_data"] = 87.6,
+        ["maxpool2d_2x2"] = 171.6,
+        ["conv_transpose2d_3x3_stride2"] = 109.0,
     };
 
     /// <summary>
@@ -40,8 +40,6 @@ public class CodegenPerformanceModelTests
         "depthwise_conv2d_3x3_bias_relu",
         "depthwise_conv2d_3x3",
         "depthwise_conv2d_3x3_bwd_data",
-        "conv2d_3x3_bias_relu",
-        "conv2d_3x3_bwd_data",
         "maxpool2d_2x2",
     };
 
@@ -104,7 +102,14 @@ public class CodegenPerformanceModelTests
     [Theory]
     [InlineData("conv2d_1x1_bias_relu")]        // ow=28 is not a warp multiple: warps straddle rows
     [InlineData("conv2d_1x1_bwd_data")]
-    [InlineData("conv_transpose2d_3x3_stride2")] // 78 registers, occupancy limited
+    [InlineData("conv_transpose2d_3x3_stride2")] // 76 registers, occupancy limited
+    // Dense 3x3 USED to sit at 1.02x -- the model's best case. Reuse tiling then cut
+    // its loads/MAC from 1.251 to 0.501 and its time from 126 us to 75 us, which moved
+    // it out of the load-bound regime the model describes: at a 4x4 tile it runs 98
+    // blocks on 68 SMs, so occupancy now binds and the model, having no occupancy term,
+    // is optimistic. Fixing the predicted bottleneck moved the bottleneck.
+    [InlineData("conv2d_3x3_bias_relu")]
+    [InlineData("conv2d_3x3_bwd_data")]
     public void ModelIsOptimisticWhereItIgnoresCoalescingAndOccupancy(string kernel)
     {
         var entry = CodegenKernelCatalog.Find(kernel);
@@ -136,20 +141,40 @@ public class CodegenPerformanceModelTests
     }
 
     /// <summary>
-    /// Loads per MAC is the headline diagnostic. A kernel at or above 1.0 cannot be
-    /// compute-bound, and every dense-convolution loss sits there.
+    /// Loads per MAC is the headline diagnostic, and 1.0 is the wall that tiling only
+    /// the contiguous axis can never break: with a single tiled axis the ratio is
+    /// (Tw+1)/Tw. Dense convolution measured 1.251 and lost to cuDNN by 4.5x. Reuse
+    /// analysis added the output-channel axis, and it must stay below the wall.
     /// </summary>
     [Fact]
-    public void LoadsPerMac_FlagsTheKernelsThatCannotBeComputeBound()
+    public void ReuseTiling_BreaksTheOneLoadPerMacWall()
     {
-        var dense = PredictFor(CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!);
-        Assert.True(dense.LoadsPerMac > 1.0,
-            "dense 3x3 issues " + dense.LoadsPerMac.ToString("F3") + " loads/MAC; " +
-            "above 1.0 it cannot reach the compute roofline.");
+        foreach (string kernel in new[] { "conv2d_3x3_bias_relu", "conv2d_3x3_bwd_data" })
+        {
+            var p = PredictFor(CodegenKernelCatalog.Find(kernel)!);
+            Assert.True(p.LoadsPerMac < 0.6,
+                kernel + " issues " + p.LoadsPerMac.ToString("F3") + " loads/MAC. Above " +
+                "1.0 it cannot reach the compute roofline, and only a second tiled axis " +
+                "gets below it -- so this regressing means tile selection stopped " +
+                "finding the reuse axis.");
+        }
+    }
 
-        // And the model must agree that removing the load constraint is worth a lot.
-        Assert.True(dense.HeadroomIfLoadsWereFree > 3.0,
-            "dense 3x3 headroom if loads were free is only " +
-            dense.HeadroomIfLoadsWereFree.ToString("F2") + "x.");
+    /// <summary>
+    /// Tile selection must DERIVE the output-channel axis for dense convolution rather
+    /// than being told, and must decline it where it does not pay. The depthwise family
+    /// is at the DRAM roofline, where fewer loads cannot help because the bytes are
+    /// fixed: taking a second axis there measured 73 us -> 100 us.
+    /// </summary>
+    [Fact]
+    public void TileSelection_TakesTheReuseAxisOnlyWhereItPays()
+    {
+        var dense = new PtxAffineEmitter();
+        dense.Emit(CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench, 8, 6);
+        Assert.Contains("k x", dense.TileDescription, StringComparison.Ordinal);
+
+        var depthwise = new PtxAffineEmitter();
+        depthwise.Emit(CodegenKernelCatalog.Find("depthwise_conv2d_3x3")!.Bench, 8, 6);
+        Assert.Equal(4, depthwise.CoarsenedLanes);
     }
 }
