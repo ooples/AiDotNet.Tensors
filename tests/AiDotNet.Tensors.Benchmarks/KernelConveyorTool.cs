@@ -414,6 +414,68 @@ internal static class KernelConveyorTool
         Console.WriteLine("manifest " + manifest);
         Console.WriteLine("release: " + gated.ToString(CultureInfo.InvariantCulture) + " zero-spill, " +
                           spilled.ToString(CultureInfo.InvariantCulture) + " spilling");
+
+        ReportEvidenceGates(entries, outputDirectory);
+    }
+
+    /// <summary>
+    /// Blueprint #3 and #4 as release gates. Zero spills and a clean SASS audit say the
+    /// kernel is well-formed; they say nothing about whether it is worth shipping. A
+    /// kernel is only releasable when it also carries, at the CURRENT protocol:
+    ///
+    ///   a competitor ratio  -- otherwise every number about it is ours-vs-ours;
+    ///   a named limiter     -- otherwise nobody knows what its next lever is.
+    ///
+    /// Both files are produced by other stages, so this reports rather than recomputes,
+    /// and a missing or stale file is itself the finding.
+    /// </summary>
+    private static void ReportEvidenceGates(
+        IReadOnlyList<CodegenCatalogEntry> entries, string outputDirectory)
+    {
+        var ratios = ReadEvidence(Path.Combine("artifacts", "competitor-ratios.tsv"), 3);
+        var limiters = ReadEvidence(Path.Combine("artifacts", "limiter.tsv"), 1);
+
+        Console.WriteLine();
+        Console.WriteLine("EVIDENCE GATES (protocol " + CodegenMeasurementProtocol.Tag + ")");
+        Console.WriteLine("kernel                            competitor    limiter     releasable");
+
+        int releasable = 0;
+        foreach (var entry in entries)
+        {
+            bool hasRatio = ratios.TryGetValue(entry.Name, out string? ratio);
+            bool hasLimiter = limiters.TryGetValue(entry.Name, out string? limiter);
+            bool ok = hasRatio && hasLimiter;
+            if (ok) releasable++;
+
+            Console.WriteLine(entry.Name.PadRight(32) +
+                (hasRatio ? ratio + "x" : "MISSING").PadLeft(12) +
+                (hasLimiter ? limiter! : "MISSING").PadLeft(12) +
+                (ok ? "yes" : "NO").PadLeft(15));
+        }
+
+        Console.WriteLine();
+        Console.WriteLine(releasable.ToString(CultureInfo.InvariantCulture) + " of " +
+                          entries.Count.ToString(CultureInfo.InvariantCulture) +
+                          " carry both. Run --kernel-limiter and tools/bakeoff/run_bakeoff.py");
+        Console.WriteLine("to fill gaps; a kernel without both is well-formed but unproven.");
+    }
+
+    /// <summary>Reads kernel -> column from a protocol-stamped evidence file.</summary>
+    private static Dictionary<string, string> ReadEvidence(string path, int column)
+    {
+        var found = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!File.Exists(path)) return found;
+
+        foreach (string line in File.ReadAllLines(path))
+        {
+            if (line.StartsWith("#", StringComparison.Ordinal)) continue;
+            string[] cells = line.Split('	');
+            if (cells.Length <= column) continue;
+            if (!cells[cells.Length - 1].Equals(CodegenMeasurementProtocol.Tag, StringComparison.Ordinal))
+                continue;   // stale protocol is the same as absent
+            found[cells[0]] = cells[column];
+        }
+        return found;
     }
 
     private sealed record SassMetrics(int Instructions, int Ldg, int Stg, int SpillLoads, int SpillStores);

@@ -121,7 +121,22 @@ def main():
               % (name, our_us, our_spread, their_us, their_spread, ratio,
                  gbs / 1e9, pct_bw, tfs / 1e12, bound))
 
+    # Write the ratios where the release gate can find them. A kernel without a
+    # current-protocol competitor ratio is not releasable: every number before this
+    # existed was ours-vs-ours, which cannot tell you whether a kernel is good.
+    out = os.path.join("artifacts", "competitor-ratios.tsv")
+    os.makedirs("artifacts", exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write("# competitor: PyTorch/cuDNN, CUDA-graph lane, allow_tf32=False, locked clocks\n")
+        fh.write("kernel\tours_us\tcompetitor_us\tratio\tprotocol\n")
+        for name in sorted(ours):
+            if name not in theirs or "graph" not in theirs[name]:
+                continue
+            our_us, _ = ours[name]
+            their_us, _ = theirs[name]["graph"]
+            fh.write("%s\t%.3f\t%.3f\t%.4f\tp4\n" % (name, our_us, their_us, their_us / our_us))
     print()
+    print("  ratios written to " + out)
     print("  wins at >=1.10x: %d    losses at <=0.91x: %d" % (wins, losses))
     print("  Competitor is the CUDA-GRAPH lane -- the strongest form. Eager PyTorch")
     print("  allocates an output tensor per call and pays full launch overhead, which")
