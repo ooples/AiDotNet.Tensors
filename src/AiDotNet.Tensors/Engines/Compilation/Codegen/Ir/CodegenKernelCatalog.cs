@@ -94,7 +94,43 @@ public static class CodegenKernelCatalog
             "transposed 3x3 stride 2 (exact-division index map)",
             ConvTranspose2D3x3Stride2(2, 8, 8, 8),
             ConvTranspose2D3x3Stride2(16, 64, 28, 28)),
+
+        // Backward kernels are DERIVED from the forward spec, never authored. Each of
+        // these is CodegenAdjoint.BackwardData applied to the linear forward operator
+        // above it, so it cannot drift from the forward pass it differentiates.
+        new("depthwise_conv2d_3x3_bwd_data",
+            "gradient wrt data of depthwise 3x3 (derived adjoint)",
+            CodegenAdjoint.BackwardData(Depthwise(2, 8, 8, 8, bias: false, relu: false), 0),
+            CodegenAdjoint.BackwardData(Depthwise(32, 64, 56, 56, bias: false, relu: false), 0)),
+
+        new("conv2d_1x1_bwd_data",
+            "gradient wrt data of dense 1x1 (contracted axis moves into the reduction)",
+            CodegenAdjoint.BackwardData(Conv2D1x1Linear(2, 8, 8, 8, 8), 0),
+            CodegenAdjoint.BackwardData(Conv2D1x1Linear(16, 64, 64, 28, 28), 0)),
+
+        new("conv2d_3x3_bwd_data",
+            "gradient wrt data of dense 3x3 (moved axis AND two inverted windows)",
+            CodegenAdjoint.BackwardData(Conv2D3x3Linear(2, 8, 8, 8, 8), 0),
+            CodegenAdjoint.BackwardData(Conv2D3x3Linear(8, 32, 64, 28, 28), 0)),
     ];
+
+    /// <summary>Bias-free, activation-free 1x1: the linear operator an adjoint needs.</summary>
+    private static CodegenKernelSpec Conv2D1x1Linear(int n, int c, int k, int h, int w)
+    {
+        var full = Conv2D1x1(n, c, k, h, w);
+        return new CodegenKernelSpec("conv2d_1x1", full.Space,
+            new[] { full.Inputs[0], full.Inputs[1] }, full.Output,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+    }
+
+    /// <summary>Bias-free, activation-free 3x3: the linear operator an adjoint needs.</summary>
+    private static CodegenKernelSpec Conv2D3x3Linear(int n, int c, int k, int h, int w)
+    {
+        var full = Conv2D3x3(n, c, k, h, w);
+        return new CodegenKernelSpec("conv2d_3x3", full.Space,
+            new[] { full.Inputs[0], full.Inputs[1] }, full.Output,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+    }
 
     /// <summary>Depthwise 3x3 with optional bias and ReLU.</summary>
     private static CodegenKernelSpec Depthwise(int n, int c, int h, int w, bool bias, bool relu)
