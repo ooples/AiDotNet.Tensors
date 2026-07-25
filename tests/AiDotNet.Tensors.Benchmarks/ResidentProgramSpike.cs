@@ -350,7 +350,8 @@ internal static class ResidentProgramSpike
 
         internal static Stage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec)
         {
-            string ptx = new PtxAffineEmitter().Emit(
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(
                 spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -371,7 +372,7 @@ internal static class ResidentProgramSpike
             buffers.Add(outBuffer);
             pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-            return new Stage(module, fn, pointers, PtxAffineEmitter.GridBlocks(spec), buffers);
+            return new Stage(module, fn, pointers, emitter.LaunchBlocks, buffers);
         }
 
         internal unsafe void Launch()

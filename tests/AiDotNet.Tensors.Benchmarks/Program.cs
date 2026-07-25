@@ -156,6 +156,18 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-coarsen-ab")
+        {
+            KernelConveyorTool.Run("coarsen-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-dump")
+        {
+            KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-verify")
         {
             KernelConveyorTool.Run("verify", args.Skip(1).ToArray());

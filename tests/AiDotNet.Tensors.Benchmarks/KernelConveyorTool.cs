@@ -60,6 +60,8 @@ internal static class KernelConveyorTool
             case "release": Release(entries, args); break;
             case "bench": Bench(entries); break;
             case "vector-ab": VectorAb(entries); break;
+            case "dump": Dump(entries, args); break;
+            case "coarsen-ab": CoarsenAb(entries); break;
             default: Console.WriteLine("Unknown conveyor stage '" + stage + "'."); break;
         }
     }
@@ -70,6 +72,22 @@ internal static class KernelConveyorTool
             return CodegenKernelCatalog.All;
         var one = CodegenKernelCatalog.Find(selector);
         return one is null ? Array.Empty<CodegenCatalogEntry>() : new[] { one };
+    }
+
+    /// <summary>Writes each kernel's PTX to disk so ptxas can be run on it directly.</summary>
+    private static void Dump(IReadOnlyList<CodegenCatalogEntry> entries, string[] args)
+    {
+        string dir = ValueOf(args, "--out") ?? Path.Combine(Path.GetTempPath(), "codegen-ptx");
+        Directory.CreateDirectory(dir);
+        foreach (var entry in entries)
+        {
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(entry.Bench, 8, 6);
+            string path = Path.Combine(dir, entry.Name + ".ptx");
+            File.WriteAllText(path, ptx);
+            Console.WriteLine(path + "  lanes=" + emitter.CoarsenedLanes +
+                              " blocks=" + emitter.LaunchBlocks);
+        }
     }
 
     // ---------------------------------------------------------------- verify
@@ -181,7 +199,7 @@ internal static class KernelConveyorTool
             buffers.Add(outBuffer);
             pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-            LaunchSpec(module, fn, pointers, PtxAffineEmitter.GridBlocks(spec));
+            LaunchSpec(module, fn, pointers, emitter.LaunchBlocks);
             runtime.Synchronize();
 
             var actual = new float[outCount];
@@ -369,7 +387,7 @@ internal static class KernelConveyorTool
                     string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                     using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                     IntPtr fn = module.GetFunction(spec.Name, out _);
-                    uint blocks = PtxAffineEmitter.GridBlocks(spec);
+                    uint blocks = emitter.LaunchBlocks;
 
                     var buffers = new List<DirectPtxBuffer>();
                     try
@@ -455,8 +473,8 @@ internal static class KernelConveyorTool
                 var scalarEmitter = new PtxAffineEmitter { EnableVectorLoads = false };
                 string scalarPtx = scalarEmitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
-                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx);
-                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx);
+                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx, vecEmitter.LaunchBlocks);
+                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx, scalarEmitter.LaunchBlocks);
 
                 var ratios = new double[Runs];
                 double scalarUs = 0, vectorUs = 0;
@@ -473,6 +491,70 @@ internal static class KernelConveyorTool
                     scalarUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
                     vectorUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
                     ratios[Runs / 2].ToString("F3", CultureInfo.InvariantCulture).PadLeft(11) + "x");
+            }
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+    }
+
+    /// <summary>Paired A/B of the coarsened lowering against one-output-per-thread.</summary>
+    private static void CoarsenAb(IReadOnlyList<CodegenCatalogEntry> entries)
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-coarsen-ab");
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            Console.WriteLine();
+            Console.WriteLine("COARSENING A/B - N outputs per thread vs one, paired in-process");
+            Console.WriteLine("harness noise floor 1.05%; a ratio inside ~1.03x is not claimable");
+            Console.WriteLine();
+            Console.WriteLine("kernel                              lanes  loads/out   1-per-thread   coarsened   speedup");
+
+            foreach (var entry in entries)
+            {
+                try
+                {
+                    var spec = entry.Bench;
+                    var wide = new PtxAffineEmitter();
+                    string widePtx = wide.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                    if (wide.CoarsenedLanes == 1)
+                    {
+                        Console.WriteLine(entry.Name.PadRight(36) + "     1          -              -           -   axis not divisible");
+                        continue;
+                    }
+
+                    var thin = new PtxAffineEmitter { Coarsening = 1 };
+                    string thinPtx = thin.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+
+                    using var wideStage = LaunchableStage.Create(runtime, spec, widePtx, wide.LaunchBlocks);
+                    using var thinStage = LaunchableStage.Create(runtime, spec, thinPtx, thin.LaunchBlocks);
+
+                    var ratios = new double[Runs];
+                    double thinUs = 0, wideUs = 0;
+                    for (int run = 0; run < Runs; run++)
+                    {
+                        (double a, double b, double r) = PairedRatio(runtime, thinStage.Launch, wideStage.Launch);
+                        ratios[run] = r; thinUs = a; wideUs = b;
+                    }
+                    Array.Sort(ratios);
+
+                    // Loads per output: the quantity the bake-off identified as the
+                    // real problem, so report it beside the time.
+                    double loadsPerOutput = (double)wide.EmittedLoads / wide.CoarsenedLanes;
+                    Console.WriteLine(entry.Name.PadRight(36) +
+                        wide.CoarsenedLanes.ToString(CultureInfo.InvariantCulture).PadLeft(6) +
+                        loadsPerOutput.ToString("F1", CultureInfo.InvariantCulture).PadLeft(11) +
+                        thinUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(15) +
+                        wideUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
+                        ratios[Runs / 2].ToString("F3", CultureInfo.InvariantCulture).PadLeft(10) + "x");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(entry.Name.PadRight(36) + "  ERROR " + ex.Message.Split('\n')[0]);
+                }
             }
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
@@ -518,7 +600,7 @@ internal static class KernelConveyorTool
         private LaunchableStage(DirectPtxModule m, IntPtr fn, IntPtr[] p, uint blocks, List<DirectPtxBuffer> b)
         { _module = m; _fn = fn; _pointers = p; _blocks = blocks; _buffers = b; }
 
-        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx)
+        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx, uint blocks)
         {
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -537,7 +619,7 @@ internal static class KernelConveyorTool
             var outBuf = runtime.AllocateBytes((nuint)(Elements(spec.Output.Shape) * sizeof(float)));
             buffers.Add(outBuf);
             pointers[spec.Inputs.Count] = outBuf.Pointer;
-            return new LaunchableStage(module, fn, pointers, PtxAffineEmitter.GridBlocks(spec), buffers);
+            return new LaunchableStage(module, fn, pointers, blocks, buffers);
         }
 
         internal void Launch() => LaunchSpec(_module, _fn, _pointers, _blocks);

@@ -159,7 +159,8 @@ internal static class BenchmarkCalibrationExperiment
         internal static Variant Create(DirectPtxRuntime runtime, int channels)
         {
             var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(N, channels, H, W);
-            string ptx = new PtxAffineEmitter().Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out _);
 
@@ -180,7 +181,7 @@ internal static class BenchmarkCalibrationExperiment
             dB.Upload<float>(hb);
 
             return new Variant(module, fn, dIn, dW, dB, dOut, spec.Space.TotalThreads,
-                               PtxAffineEmitter.GridBlocks(spec));
+                               emitter.LaunchBlocks);
         }
 
         internal unsafe void Launch()

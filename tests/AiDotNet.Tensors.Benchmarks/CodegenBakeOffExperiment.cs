@@ -70,7 +70,7 @@ internal static class CodegenBakeOffExperiment
             string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
             using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out DirectPtxFunctionInfo info);
-            uint blocks = PtxAffineEmitter.GridBlocks(spec);
+            uint blocks = emitter.LaunchBlocks;
             void LaunchGen() => LaunchFour(module, fn, dIn.Pointer, dW.Pointer, dB.Pointer, dOutB.Pointer, blocks);
 
             // INTERLEAVED A/B. Measuring all of A then all of B lets clock/thermal

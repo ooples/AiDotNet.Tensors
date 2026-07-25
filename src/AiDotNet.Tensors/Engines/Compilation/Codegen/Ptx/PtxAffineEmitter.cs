@@ -37,6 +37,14 @@ public sealed class PtxAffineEmitter
     public const int FullUnrollLimit = 64;
 
     private readonly StringBuilder _sb = new(16384);
+
+    // The body is built separately from the header so the virtual-register
+    // declarations can be written from the ACTUAL counts. They used to be fixed at
+    // %f<512>/%r<1024>, which silently became a ceiling: coarsening pushed three
+    // kernels past it and ptxas rejected the module with InvalidPtx, because the body
+    // referenced registers the header never declared. A declaration derived from usage
+    // cannot be outgrown.
+    private readonly StringBuilder _body = new(16384);
     private int _r, _f, _p, _rd;
     private IReadOnlyList<CodegenAxis> axesMeta = Array.Empty<CodegenAxis>();
 
@@ -45,7 +53,7 @@ public sealed class PtxAffineEmitter
     private string NextP() => "%p" + (_p++).ToString(CultureInfo.InvariantCulture);
     private string NextRd() => "%rd" + (_rd++).ToString(CultureInfo.InvariantCulture);
     private static string I(long v) => v.ToString(CultureInfo.InvariantCulture);
-    private void L(string line) => _sb.Append("    ").Append(line).Append('\n');
+    private void L(string line) => _body.Append("    ").Append(line).Append('\n');
 
     /// <summary>Number of SASS-visible global loads the emitter produced (diagnostic).</summary>
     public int EmittedLoads { get; private set; }
@@ -93,6 +101,22 @@ public sealed class PtxAffineEmitter
 
     /// <summary>Number of <c>ld.global.v4.f32</c> instructions emitted.</summary>
     public int VectorisedLoads { get; private set; }
+
+    /// <summary>
+    /// Adjacent outputs computed per thread. 1 disables coarsening, which exists so
+    /// the two lowerings can be compared inside one process.
+    /// </summary>
+    public int Coarsening { get; set; } = 4;
+
+    /// <summary>Lanes actually used: <see cref="Coarsening"/>, or 1 if it did not divide.</summary>
+    public int CoarsenedLanes { get; private set; } = 1;
+
+    /// <summary>
+    /// Blocks the host must launch for the PTX just emitted. Read this rather than
+    /// <see cref="GridBlocks"/> when coarsening may be active: the guard inside the
+    /// kernel is derived from the same thread count, so the two cannot disagree.
+    /// </summary>
+    public uint LaunchBlocks { get; private set; }
 
     /// <summary>
     /// Enables vector loads. Off is not a production setting -- it exists so the two
@@ -182,7 +206,34 @@ public sealed class PtxAffineEmitter
         trips = innerTrips;
         reduction = innerAxes;
 
-        _sb.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
+        // COARSEN. One thread per output element means every operand that does not
+        // depend on the output position is re-loaded once per output. The bake-off
+        // measured dense convolution at 2% of peak bandwidth and 5% of peak FP32 while
+        // cuDNN reached 28%, and the cause was load COUNT, not load cost. Giving each
+        // thread several adjacent outputs along the contiguous axis lets one weight
+        // load feed several FMAs.
+        //
+        // The coarsened axis is the last-declared parallel axis, which is the one
+        // consecutive threads walk, so a lane group stays contiguous in memory.
+        int coarsenAxis = -1;
+        int lanes = 1;
+        if (Coarsening > 1 && parallel.Length > 0)
+        {
+            int candidate = parallel[parallel.Length - 1];
+            if (axes[candidate].Extent % Coarsening == 0)
+            {
+                coarsenAxis = candidate;
+                lanes = Coarsening;
+            }
+        }
+        CoarsenedLanes = lanes;
+
+        // Threads, grid and in-kernel guard all come from this one number, which is
+        // the invariant the whole IR exists to protect.
+        long threadCount = total / lanes;
+        LaunchBlocks = (uint)((threadCount + BlockThreads - 1) / BlockThreads);
+
+        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
 
         _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
@@ -196,11 +247,12 @@ public sealed class PtxAffineEmitter
             _sb.Append("    .param .u64 p").Append(I(i)).Append(i == paramCount - 1 ? "\n" : ",\n");
         _sb.Append(")\n{\n");
 
-        // Generous virtual-register declarations; ptxas performs the real allocation.
-        _sb.Append("    .reg .pred %p<").Append(I(256)).Append(">;\n")
-           .Append("    .reg .b32 %r<").Append(I(1024)).Append(">;\n")
-           .Append("    .reg .b64 %rd<").Append(I(512)).Append(">;\n")
-           .Append("    .reg .f32 %f<").Append(I(512)).Append(">;\n");
+        // Declarations are written AFTER the body, from the counts the body actually
+        // used. They were previously fixed at %p<256>/%f<512>, which was a silent
+        // ceiling rather than a generous bound: coarsening pushed the transposed
+        // convolution to %p256, one past the declared range, and ptxas reported it as
+        // "Arguments mismatch for instruction 'setp'" -- an undeclared register, not a
+        // malformed instruction. A bound derived from usage cannot be outgrown.
 
         // Base pointers.
         var basePtr = new string[paramCount];
@@ -218,17 +270,19 @@ public sealed class PtxAffineEmitter
 
         // Bounds guard derived from the SAME TotalThreads the host launches with.
         string guard = NextP();
-        L($"setp.ge.u32 {guard}, {gid}, {I(total)};");
+        L($"setp.ge.u32 {guard}, {gid}, {I(threadCount)};");
         L($"@{guard} bra END;");
 
         // Decompose the flat id across parallel axes, last-declared fastest, so
-        // consecutive threads walk the contiguous tensor axis.
+        // consecutive threads walk the contiguous tensor axis. When coarsening, the
+        // coarsened axis contributes extent/lanes to the decomposition, because one
+        // thread now covers `lanes` of its positions.
         var axisReg = new string[axes.Count];
         string rest = gid;
         for (int p = parallel.Length - 1; p >= 0; p--)
         {
             int ax = parallel[p];
-            int extent = axes[ax].Extent;
+            int extent = ax == coarsenAxis ? axes[ax].Extent / lanes : axes[ax].Extent;
             axisReg[ax] = NextR();
             if (p == 0)
             {
@@ -244,24 +298,51 @@ public sealed class PtxAffineEmitter
             }
         }
 
-        // Accumulator.
-        string acc = NextF();
-        L(spec.Reduce == CodegenReduceKind.Max
-            ? $"mov.f32 {acc}, 0fFF800000;   // -inf"
-            : $"mov.f32 {acc}, 0f00000000;");
+        // One axis-register view per lane. Only the coarsened axis differs between
+        // them: lane l covers position base*lanes + l.
+        var laneAxisReg = new string[lanes][];
+        for (int l = 0; l < lanes; l++)
+        {
+            laneAxisReg[l] = (string[])axisReg.Clone();
+            if (coarsenAxis < 0) continue;
+            string laneReg = NextR();
+            if (l == 0) L($"mul.lo.u32 {laneReg}, {axisReg[coarsenAxis]}, {I(lanes)};");
+            else L($"mad.lo.u32 {laneReg}, {axisReg[coarsenAxis]}, {I(lanes)}, {I(l)};");
+            laneAxisReg[l][coarsenAxis] = laneReg;
+        }
+
+        // One accumulator per lane.
+        var accs = new string[lanes];
+        for (int l = 0; l < lanes; l++)
+        {
+            accs[l] = NextF();
+            L(spec.Reduce == CodegenReduceKind.Max
+                ? $"mov.f32 {accs[l]}, 0fFF800000;   // -inf"
+                : $"mov.f32 {accs[l]}, 0f00000000;");
+        }
 
         // Open one runtime loop per peeled axis. Each level emits its counter reset
         // BEFORE its own label, so the reset for level i+1 lands inside level i's
         // body and re-runs on every outer trip.
-        string accFixed = acc;
+        var accsFixed = (string[])accs.Clone();
         var loopRegs = new string[loopAxes.Length];
         for (int i = 0; i < loopAxes.Length; i++)
         {
             string reg = NextR();
             loopRegs[i] = reg;
             axisReg[loopAxes[i]] = reg;   // symbolic from here on, not a folded constant
+
+            // The per-lane views were cloned BEFORE this point, so they must be told
+            // about the loop counter too. Without this a strip-mined kernel emitted an
+            // empty operand ("mad.lo.s32 %r16, , 9, %r15") for the peeled axis, which
+            // ptxas rejects -- the lane views had no register for it at all.
+            for (int l = 0; l < lanes; l++) laneAxisReg[l][loopAxes[i]] = reg;
             L($"mov.u32 {reg}, 0;   // {axes[loopAxes[i]].Name}");
-            _sb.Append("LOOP").Append(I(i)).Append(":\n");
+            // Must go to the BODY, not the header. Written to _sb it landed directly
+            // after the opening brace -- ahead of the counter's own initialisation --
+            // so the backward branch re-zeroed the counter every iteration and the
+            // kernel never terminated.
+            _body.Append("LOOP").Append(I(i)).Append(":\n");
         }
 
         // Decide, before emitting anything, which product operands can be read with a
@@ -323,46 +404,100 @@ public sealed class PtxAffineEmitter
                 }
             }
 
-            string? product = null;
-            string? productPred = null;
-            foreach (int inputIdx in spec.ProductInputs)
+            // HOIST WHAT DOES NOT VARY ACROSS LANES. This is where coarsening actually
+            // pays: a weight operand does not reference the coarsened axis, so ONE load
+            // feeds every lane's FMA instead of one load per output. In a dense 3x3 over
+            // 32 channels that is 288 weight loads serving `lanes` outputs rather than
+            // `lanes` x 288. The bake-off showed dense convolution losing to cuDNN by
+            // 4-6x on exactly this: too many loads, not loads that were too slow.
+            // VECTORISE THE ACTIVATION OPERAND ACROSS LANES. An operand that is
+            // unit-stride in the coarsened axis has its `lanes` values at consecutive
+            // addresses, and lane 0 starts at a multiple of `lanes`, so one
+            // ld.global.v4.f32 replaces four scalar loads. This is the operand that
+            // vectorising along the reduction axis could never reach: reducing thread
+            // count by 4 costs latency hiding, and without this the dense 1x1 measured
+            // 0.944x -- a regression -- from coarsening alone.
+            var laneVec = new string[spec.Inputs.Count][];
+            if (lanes == VectorWidth && EnableVectorLoads)
             {
-                var binding = spec.Inputs[inputIdx];
-                string value;
-                string? pred;
-                if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
+                foreach (int inputIdx in spec.ProductInputs)
                 {
-                    // Already resident from this group's vector load; a vectorisable
-                    // binding is by construction in range, so it carries no predicate.
-                    value = vectorRegs[inputIdx]![reductionValues[innermost] % vectorGroup];
-                    pred = null;
-                }
-                else
-                {
-                    value = EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg,
-                                     reductionValues, reduction, out pred);
-                }
-                if (product is null) { product = value; productPred = pred; }
-                else
-                {
-                    string mul = NextF();
-                    L($"mul.rn.f32 {mul}, {product!}, {value};");
-                    product = mul;
-                    productPred = AndPred(productPred, pred);
+                    var b = spec.Inputs[inputIdx];
+                    if (!IsUnitStrideIn(b, coarsenAxis, axes)) continue;
+                    laneVec[inputIdx] = EmitVectorLoad(
+                        b, basePtr[b.ParameterIndex], laneAxisReg[0],
+                        reductionValues, reduction, VectorWidth);
                 }
             }
 
-            // An out-of-range tap contributes the additive identity; the guarded
-            // load already produced 0, so no extra select is needed for Sum.
-            if (spec.Reduce == CodegenReduceKind.Max)
+            var shared = new string[spec.Inputs.Count];
+            foreach (int inputIdx in spec.ProductInputs)
             {
-                L($"max.f32 {acc}, {acc}, {product!};");
+                if (lanes == 1 || ReferencesAxis(spec.Inputs[inputIdx], coarsenAxis)) continue;
+                if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
+                {
+                    shared[inputIdx] = vectorRegs[inputIdx]![reductionValues[innermost] % vectorGroup];
+                    continue;
+                }
+                shared[inputIdx] = EmitLoad(
+                    spec.Inputs[inputIdx], basePtr[spec.Inputs[inputIdx].ParameterIndex],
+                    laneAxisReg[0], reductionValues, reduction, out string? sharedPred);
+                if (sharedPred != null)
+                    throw new InvalidOperationException(
+                        "A lane-invariant operand must not need a lane-dependent guard: " +
+                        spec.Inputs[inputIdx].Name + ".");
             }
-            else
+
+            for (int l = 0; l < lanes; l++)
             {
-                string na = NextF();
-                L($"add.rn.f32 {na}, {acc}, {product!};");
-                acc = na;
+                string? product = null;
+                string? productPred = null;
+                foreach (int inputIdx in spec.ProductInputs)
+                {
+                    var binding = spec.Inputs[inputIdx];
+                    string value;
+                    string? pred = null;
+                    if (laneVec[inputIdx] != null)
+                    {
+                        value = laneVec[inputIdx]![l];
+                    }
+                    else if (shared[inputIdx] != null)
+                    {
+                        value = shared[inputIdx];
+                    }
+                    else if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
+                    {
+                        // Already resident from this group's vector load; a vectorisable
+                        // binding is by construction in range, so it carries no predicate.
+                        value = vectorRegs[inputIdx]![reductionValues[innermost] % vectorGroup];
+                    }
+                    else
+                    {
+                        value = EmitLoad(binding, basePtr[binding.ParameterIndex], laneAxisReg[l],
+                                         reductionValues, reduction, out pred);
+                    }
+                    if (product is null) { product = value; productPred = pred; }
+                    else
+                    {
+                        string mul = NextF();
+                        L($"mul.rn.f32 {mul}, {product!}, {value};");
+                        product = mul;
+                        productPred = AndPred(productPred, pred);
+                    }
+                }
+
+                // An out-of-range tap contributes the additive identity; the guarded
+                // load already produced 0, so no extra select is needed for Sum.
+                if (spec.Reduce == CodegenReduceKind.Max)
+                {
+                    L($"max.f32 {accs[l]}, {accs[l]}, {product!};");
+                }
+                else
+                {
+                    string na = NextF();
+                    L($"add.rn.f32 {na}, {accs[l]}, {product!};");
+                    accs[l] = na;
+                }
             }
         }
 
@@ -370,8 +505,9 @@ public sealed class PtxAffineEmitter
         // register before the backward branch: SSA-style renaming cannot cross it.
         if (loopAxes.Length > 0)
         {
-            if (!string.Equals(acc, accFixed, StringComparison.Ordinal))
-                L($"mov.f32 {accFixed}, {acc};");
+            for (int l = 0; l < lanes; l++)
+                if (!string.Equals(accs[l], accsFixed[l], StringComparison.Ordinal))
+                    L($"mov.f32 {accsFixed[l]}, {accs[l]};");
             for (int i = loopAxes.Length - 1; i >= 0; i--)
             {
                 string cont = NextP();
@@ -379,39 +515,78 @@ public sealed class PtxAffineEmitter
                 L($"setp.lt.s32 {cont}, {loopRegs[i]}, {I(axes[loopAxes[i]].Extent)};");
                 L($"@{cont} bra LOOP{I(i)};");
             }
-            acc = accFixed;
+            accs = (string[])accsFixed.Clone();
         }
 
-        // Epilogue: bias, scale, activation -- fused, never a second kernel.
-        if (spec.BiasInput.HasValue)
+        // Epilogue and store, per lane. Bias and scale are hoisted when they do not
+        // reference the coarsened axis, which for a channel-indexed bias is always.
+        string? sharedBias = null, sharedScale = null;
+        if (lanes > 1 && spec.BiasInput.HasValue &&
+            !ReferencesAxis(spec.Inputs[spec.BiasInput.Value], coarsenAxis))
         {
             var b = spec.Inputs[spec.BiasInput.Value];
-            string v = EmitLoad(b, basePtr[b.ParameterIndex], axisReg, reductionValues, reduction, out _);
-            string na = NextF();
-            L($"add.rn.f32 {na}, {acc}, {v};");
-            acc = na;
+            sharedBias = EmitLoad(b, basePtr[b.ParameterIndex], laneAxisReg[0],
+                                  reductionValues, reduction, out _);
         }
-        if (spec.ScaleInput.HasValue)
+        if (lanes > 1 && spec.ScaleInput.HasValue &&
+            !ReferencesAxis(spec.Inputs[spec.ScaleInput.Value], coarsenAxis))
         {
             var s = spec.Inputs[spec.ScaleInput.Value];
-            string v = EmitLoad(s, basePtr[s.ParameterIndex], axisReg, reductionValues, reduction, out _);
-            string na = NextF();
-            L($"mul.rn.f32 {na}, {acc}, {v};");
-            acc = na;
+            sharedScale = EmitLoad(s, basePtr[s.ParameterIndex], laneAxisReg[0],
+                                   reductionValues, reduction, out _);
         }
-        if (spec.Activation == CodegenActivationKind.ReLU)
-            L($"max.f32 {acc}, {acc}, 0f00000000;");
 
-        // Store.
-        string outOff = EmitOffset(spec.Output, axisReg, reductionValues, reduction, out string? outPred);
-        string outAddr = NextRd(), outByte = NextRd();
-        L($"mul.wide.u32 {outByte}, {outOff}, 4;");
-        L($"add.u64 {outAddr}, {basePtr[spec.Output.ParameterIndex]}, {outByte};");
-        if (outPred is null) L($"st.global.f32 [{outAddr}], {acc};");
-        else L($"@{outPred} st.global.f32 [{outAddr}], {acc};");
+        for (int l = 0; l < lanes; l++)
+        {
+            string acc = accs[l];
+            if (spec.BiasInput.HasValue)
+            {
+                var b = spec.Inputs[spec.BiasInput.Value];
+                string v = sharedBias ?? EmitLoad(b, basePtr[b.ParameterIndex], laneAxisReg[l],
+                                                  reductionValues, reduction, out _);
+                string na = NextF();
+                L($"add.rn.f32 {na}, {acc}, {v};");
+                acc = na;
+            }
+            if (spec.ScaleInput.HasValue)
+            {
+                var s = spec.Inputs[spec.ScaleInput.Value];
+                string v = sharedScale ?? EmitLoad(s, basePtr[s.ParameterIndex], laneAxisReg[l],
+                                                   reductionValues, reduction, out _);
+                string na = NextF();
+                L($"mul.rn.f32 {na}, {acc}, {v};");
+                acc = na;
+            }
+            if (spec.Activation == CodegenActivationKind.ReLU)
+                L($"max.f32 {acc}, {acc}, 0f00000000;");
 
-        _sb.Append("END:\n    ret;\n}\n");
+            string laneOff = EmitOffset(spec.Output, laneAxisReg[l], reductionValues, reduction,
+                                       out string? lanePred);
+            string laneAddr = NextRd(), laneByte = NextRd();
+            L($"mul.wide.u32 {laneByte}, {laneOff}, 4;");
+            L($"add.u64 {laneAddr}, {basePtr[spec.Output.ParameterIndex]}, {laneByte};");
+            if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
+            else L($"@{lanePred} st.global.f32 [{laneAddr}], {acc};");
+        }
+
+        _body.Append("END:\n    ret;\n}\n");
+
+        _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
+           .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
+           .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")
+           .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
+           .Append(_body);
         return _sb.ToString();
+    }
+
+    /// <summary>True when a binding's index map reads <paramref name="axis"/>.</summary>
+    private static bool ReferencesAxis(CodegenTensorBinding binding, int axis)
+    {
+        if (axis < 0) return false;
+        for (int d = 0; d < binding.Map.Count; d++)
+            foreach (var term in binding.Map[d].Terms)
+                if (term.Axis == axis) return true;
+        return false;
     }
 
     /// <summary>

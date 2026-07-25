@@ -3,6 +3,7 @@
 // fp64 oracle the hand-written kernel is held to, and what does it cost?
 
 using System;
+using System.Globalization;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
@@ -299,5 +300,77 @@ public class PtxAffineEmitterTests
             emitter.Emit(entry!.Bench, 8, 6);
             Assert.Equal(0, emitter.VectorisedLoads);
         }
+    }
+
+    /// <summary>
+    /// Coarsening exists to cut loads PER OUTPUT, which is what the cuDNN bake-off
+    /// identified as the actual deficit: dense convolution sat at 2% of peak bandwidth
+    /// because every operand was re-read once per output.
+    /// </summary>
+    [Fact]
+    public void Coarsening_ReducesLoadsPerOutput()
+    {
+        foreach (var entry in CodegenKernelCatalog.All)
+        {
+            var wide = new PtxAffineEmitter();
+            wide.Emit(entry.Bench, 8, 6);
+            if (wide.CoarsenedLanes == 1) continue;
+
+            var thin = new PtxAffineEmitter { Coarsening = 1 };
+            thin.Emit(entry.Bench, 8, 6);
+
+            double wanted = (double)thin.EmittedLoads / thin.CoarsenedLanes;
+            double got = (double)wide.EmittedLoads / wide.CoarsenedLanes;
+            Assert.True(got <= wanted,
+                entry.Name + ": coarsened lowering issues " + got.ToString("F2") +
+                " loads per output but the uncoarsened one issues " + wanted.ToString("F2") +
+                "; coarsening must not increase load count per output.");
+        }
+    }
+
+    /// <summary>
+    /// The launch grid must cover exactly the coarsened thread count. This is the
+    /// invariant the whole IR exists to protect: the grid and the in-kernel guard read
+    /// the same number, so a coarsened kernel cannot be launched with an uncoarsened
+    /// grid (which would compute each output four times) or vice versa (which would
+    /// silently skip three quarters of the output).
+    /// </summary>
+    [Fact]
+    public void LaunchBlocks_CoverExactlyTheCoarsenedThreadCount()
+    {
+        foreach (var entry in CodegenKernelCatalog.All)
+        {
+            var emitter = new PtxAffineEmitter();
+            emitter.Emit(entry.Bench, 8, 6);
+
+            long threads = entry.Bench.Space.TotalThreads / emitter.CoarsenedLanes;
+            uint expected = (uint)((threads + PtxAffineEmitter.BlockThreads - 1) /
+                                  PtxAffineEmitter.BlockThreads);
+            Assert.Equal(expected, emitter.LaunchBlocks);
+
+            // And the guard inside the kernel must test that same count.
+            string ptx = emitter.Emit(entry.Bench, 8, 6);
+            Assert.Contains("setp.ge.u32 %p0, %r2, " + threads.ToString(CultureInfo.InvariantCulture) + ";",
+                            ptx, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// An operand that is unit-stride in the coarsened axis must be read with one
+    /// vector load across the lanes. Without this the dense 1x1 measured 0.944x from
+    /// coarsening -- a regression -- because it lost threads without gaining reuse.
+    /// </summary>
+    [Fact]
+    public void UnitStrideActivationOperand_VectorisesAcrossLanes()
+    {
+        var entry = CodegenKernelCatalog.Find("conv2d_1x1_bias_relu");
+        Assert.NotNull(entry);
+
+        var emitter = new PtxAffineEmitter();
+        emitter.Emit(entry!.Bench, 8, 6);
+        Assert.True(emitter.CoarsenedLanes > 1);
+        Assert.True(emitter.VectorisedLoads >= 64,
+            "the 1x1 input is unit-stride in the coarsened axis and must vectorise across lanes; " +
+            "got " + emitter.VectorisedLoads + " vector loads.");
     }
 }
