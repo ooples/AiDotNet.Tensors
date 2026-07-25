@@ -116,6 +116,8 @@ internal static class KernelConveyorTool
                 if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
                     if (ValueOf(args, "--coarsen") is string cz)
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
+                    if (ValueOf(args, "--max-lanes") is string mz)
+                        emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
                 string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks);
                 stage.Launch();
@@ -561,6 +563,8 @@ internal static class KernelConveyorTool
                     if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
                     if (ValueOf(args, "--coarsen") is string cz)
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
+                    if (ValueOf(args, "--max-lanes") is string mz)
+                        emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
                     string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                     using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                     IntPtr fn = module.GetFunction(spec.Name, out _);

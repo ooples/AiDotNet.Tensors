@@ -119,7 +119,27 @@ public sealed class PtxAffineEmitter
     /// <summary>Lanes actually used: the product of the chosen tile factors.</summary>
     public int CoarsenedLanes { get; private set; } = 1;
 
-    /// <summary>Upper bound on accumulators per thread, to keep registers in budget.</summary>
+    /// <summary>
+    /// Upper bound on accumulators per thread: a REGISTER budget, enforced because the
+    /// cost model cannot see register pressure.
+    /// </summary>
+    /// <remarks>
+    /// 16 is measured, not assumed. Raising it let the search pick a 4x8 tile for dense
+    /// 3x3, which is genuinely better on the model's terms -- loads/MAC 0.501 -> 0.376 --
+    /// and worse on the machine:
+    ///
+    ///   tile   loads/MAC   registers   blocks   time      run spread
+    ///   4x4      0.501         56         98    ~70 us       2-6%
+    ///   4x8      0.376        168         49    71.1 us    202.9%
+    ///
+    /// At 168 registers only about 1.5 blocks fit per SM out of the 65,536 registers an
+    /// SM has, so occupancy collapses no matter how many blocks the grid contains, and
+    /// the kernel becomes too unstable to measure. The model's occupancy term counts
+    /// BLOCKS and is blind to this; a register-pressure term is the next thing it needs.
+    ///
+    /// The lever that lowers loads/MAC further WITHOUT spending registers is shared
+    /// memory, which every kernel here still reports as completely unused (LDS 0/STS 0).
+    /// </remarks>
     public int MaxTileLanes { get; set; } = 16;
 
     /// <summary>The tile the reuse analysis chose, e.g. <c>k x4, ow x4</c>.</summary>
@@ -203,54 +223,76 @@ public sealed class PtxAffineEmitter
     {
         int contiguous = parallel[parallel.Length - 1];
 
-        // The contiguous axis is tiled whenever it divides: it is the only axis whose
-        // lanes stay adjacent in memory, which is what keeps stores coalesced and makes
-        // lane-vectorised loads legal.
-        int contiguousFactor = axes[contiguous].Extent % factor == 0 ? factor : 1;
-
-        // A SECOND TILED AXIS IS NOT FREE. It divides the thread count again, which
-        // costs occupancy and latency hiding, so it is only worth taking when the load
-        // saving is large enough to pay for that. Measured: adding one to the depthwise
-        // family -- already at 93% of the DRAM roofline, where fewer loads cannot help
-        // because the bytes are fixed -- moved it from 73 us to 100 us. Adding one to
-        // dense 3x3, which is load-issue bound, moved it from 126 us to 69 us.
+        // SEARCH THE TILE, DO NOT ASSUME IT.
         //
-        // So the decision is made on predicted TIME, not on loads per MAC, and only a
-        // decisive win is taken. The 20% margin is deliberate slack for the two effects
-        // the model does not carry: sector efficiency and occupancy.
-        const double RequiredImprovement = 0.80;
+        // This used to try exactly one factor per axis, so 4x4 was the only 2D tile it
+        // could construct and raising the lane budget changed nothing. Dense convolution
+        // sat at 0.501 loads/MAC while cuDNN reaches roughly 0.03, and the remaining
+        // factor of ~16 is available in the tile: (Tw+Tk)/(Tw*Tk) keeps falling as the
+        // tile grows. So enumerate factors on both axes and let the cost model choose.
+        //
+        // The model now carries an occupancy term, which is what makes the search safe:
+        // a bigger tile divides the thread count, and past a point the occupancy loss
+        // outweighs the load saving. That trade is exactly what the model expresses, so
+        // the search finds the turning point instead of running away to a tile that
+        // issues almost no loads and leaves the machine idle.
+        var factors = new[] { 1, 2, 4, 8, 16 };
 
-        double baseline = PredictedRelativeTime(
-            spec, axes, new[] { contiguous }, new[] { contiguousFactor });
+        int bestPrimary = 1, bestSecondAxis = -1, bestSecondFactor = 1;
+        double bestCost = double.MaxValue;
 
-        int bestAxis = -1, bestFactor = 1;
-        double bestCost = baseline;
-
-        foreach (int candidate in parallel)
+        foreach (int tw in factors)
         {
-            if (candidate == contiguous) continue;
-            if (axes[candidate].Extent % factor != 0) continue;
-            if (contiguousFactor * factor > maxLanes) continue;
+            if (tw > 1 && axes[contiguous].Extent % tw != 0) continue;
+            if (tw > maxLanes) continue;
 
-            double cost = PredictedRelativeTime(spec, axes,
-                new[] { contiguous, candidate }, new[] { contiguousFactor, factor });
-            if (cost < bestCost * RequiredImprovement)
+            // One-dimensional candidate: only the contiguous axis.
+            double solo = PredictedRelativeTime(spec, axes, new[] { contiguous }, new[] { tw });
+            if (solo < bestCost)
             {
-                bestCost = cost;
-                bestAxis = candidate;
-                bestFactor = factor;
+                bestCost = solo;
+                bestPrimary = tw;
+                bestSecondAxis = -1;
+                bestSecondFactor = 1;
+            }
+
+            foreach (int candidate in parallel)
+            {
+                if (candidate == contiguous) continue;
+                foreach (int tk in factors)
+                {
+                    if (tk == 1) continue;
+                    if (axes[candidate].Extent % tk != 0) continue;
+                    if (tw * tk > maxLanes) continue;
+
+                    double cost = PredictedRelativeTime(spec, axes,
+                        new[] { contiguous, candidate }, new[] { tw, tk });
+                    if (cost < bestCost)
+                    {
+                        bestCost = cost;
+                        bestPrimary = tw;
+                        bestSecondAxis = candidate;
+                        bestSecondFactor = tk;
+                    }
+                }
             }
         }
 
-        if (contiguousFactor > 1)
+        if (bestPrimary > 1)
         {
             tileAxes.Add(contiguous);
-            tileFactors.Add(contiguousFactor);
+            tileFactors.Add(bestPrimary);
         }
-        if (bestAxis >= 0)
+        if (bestSecondAxis >= 0)
         {
-            tileAxes.Add(bestAxis);
-            tileFactors.Add(bestFactor);
+            // The contiguous axis must lead so lane vectorisation can use it.
+            if (bestPrimary <= 1)
+            {
+                tileAxes.Add(contiguous);
+                tileFactors.Add(1);
+            }
+            tileAxes.Add(bestSecondAxis);
+            tileFactors.Add(bestSecondFactor);
         }
     }
 
@@ -270,6 +312,8 @@ public sealed class PtxAffineEmitter
     {
         const double BytesPerLoadInstruction = 22.0;
         const int WarpWidth = 32;
+        const int Multiprocessors = 68;
+        const double OccupancyCoefficient = 0.5;
 
         long macs = spec.Output.ElementCount * Math.Max(1, spec.Space.ReductionTripCount);
         double loadInstructions = LoadsPerMac(spec, tileAxes, factors) * macs / WarpWidth;
@@ -278,8 +322,17 @@ public sealed class PtxAffineEmitter
         for (int i = 0; i < spec.Inputs.Count; i++) bytes += spec.Inputs[i].ElementCount;
         double dramEquivalent = bytes * 4.0 / BytesPerLoadInstruction;
 
+        // OCCUPANCY, which is what stops the search running away. A larger tile always
+        // lowers loads per MAC, so without this term the best tile is always the biggest
+        // one -- and at 112 lanes dense 3x3 would run 14 blocks on 68 SMs and stall.
+        long lanes = 1;
+        foreach (int f in factors) lanes *= f;
+        long threads = spec.Output.ElementCount / Math.Max(1, lanes);
+        double blocks = Math.Max(1.0, (threads + BlockThreads - 1) / (double)BlockThreads);
+        double occupancy = 1.0 + OccupancyCoefficient / Math.Max(blocks / Multiprocessors, 0.05);
+
         // Compute never binds for these kernels, so the two memory terms decide it.
-        return Math.Max(loadInstructions, dramEquivalent);
+        return Math.Max(loadInstructions, dramEquivalent) * occupancy;
     }
 
     /// <summary>Loads per MAC for a candidate tile, from operand dependence alone.</summary>

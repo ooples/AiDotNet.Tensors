@@ -1,11 +1,11 @@
 kernel	ptx_lines	loads	vector_loads	elided_guards	looped_axes
-depthwise_conv2d_3x3_bias_relu	727	46	0	140	0
-depthwise_conv2d_3x3	713	45	0	139	0
+depthwise_conv2d_3x3_bias_relu	728	46	0	140	0
+depthwise_conv2d_3x3	714	45	0	139	0
 conv2d_1x1_bias_relu	3168	132	128	452	0
 conv2d_3x3_bias_relu	1349	76	0	308	1
-maxpool2d_2x2	250	16	0	80	0
-conv_transpose2d_3x3_stride2	1097	45	0	115	0
-depthwise_conv2d_3x3_bwd_data	713	45	0	139	0
+maxpool2d_2x2	90	4	0	20	0
+conv_transpose2d_3x3_stride2	4050	153	0	379	0
+depthwise_conv2d_3x3_bwd_data	714	45	0	139	0
 conv2d_1x1_bwd_data	4273	320	64	832	0
 conv2d_3x3_bwd_data	1302	72	0	304	1
 conv2d_1x1_deep_epilogue	3199	136	128	456	0
