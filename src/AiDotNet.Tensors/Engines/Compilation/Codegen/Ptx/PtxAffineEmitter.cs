@@ -125,6 +125,67 @@ public sealed class PtxAffineEmitter
     /// <summary>The tile the reuse analysis chose, e.g. <c>k x4, ow x4</c>.</summary>
     public string TileDescription { get; private set; } = "none";
 
+    /// <summary>Largest grid the CUDA launch API accepts in the X dimension.</summary>
+    private const long MaxGridBlocksX = 2147483647L;
+
+    /// <summary>Bytes of kernel parameter space PTX guarantees.</summary>
+    private const int MaxParameterBytes = 4096;
+
+    /// <summary>
+    /// Emitted global loads above which the kernel is refused rather than handed to
+    /// ptxas, which would spend minutes on it before failing.
+    /// </summary>
+    private const int MaxEmittedLoads = 200_000;
+
+    /// <summary>
+    /// Refuses specs this emitter cannot lower correctly, with a message that says which
+    /// bound was hit and what to change.
+    /// </summary>
+    /// <remarks>
+    /// Every one of these used to be an implicit ceiling. Register declarations were
+    /// fixed at <c>%p&lt;256&gt;</c>, written as a generous bound; coarsening reached
+    /// <c>%p256</c> and ptxas reported "Arguments mismatch for instruction 'setp'",
+    /// which describes an undeclared register in the language of a malformed
+    /// instruction. The PTX version was pinned at 7.1 while the target was
+    /// parameterised, so every sm_89 and sm_90 emission was invalid. The unroll limit
+    /// refused a 288-trip convolution outright.
+    ///
+    /// Those three are now derived from the input. What remains are genuine hardware
+    /// and format limits, and the rule for them is the same: assert loudly at the point
+    /// of violation rather than emit something that fails confusingly later.
+    /// </remarks>
+    private void CheckLimits(CodegenKernelSpec spec, long blocks, long threadCount)
+    {
+        if (blocks > MaxGridBlocksX)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' needs " + I(blocks) + " blocks, past the " +
+                I(MaxGridBlocksX) + " the launch API accepts in X. Raise Coarsening or " +
+                "BlockThreads, or give the spec a grid-stride loop.");
+
+        if (threadCount <= 0)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' resolved to " + I(threadCount) + " threads. " +
+                "A tile factor larger than an axis extent would do this.");
+
+        int parameterBytes = spec.ParameterCount * sizeof(long);
+        if (parameterBytes > MaxParameterBytes)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' declares " + I(spec.ParameterCount) +
+                " pointer parameters (" + I(parameterBytes) + " bytes), past the " +
+                I(MaxParameterBytes) + " bytes of PTX parameter space.");
+
+    }
+
+    /// <summary>Checked after emission, when the count actually exists.</summary>
+    private void CheckEmittedSize(CodegenKernelSpec spec)
+    {
+        if (EmittedLoads > MaxEmittedLoads)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' emitted " + I(EmittedLoads) + " global loads, " +
+                "past the " + I(MaxEmittedLoads) + " this emitter will hand to ptxas. " +
+                "Lower FullUnrollLimit or MaxTileLanes so more of the reduction loops.");
+    }
+
     /// <summary>
     /// Chooses which axes to tile and by how much, by minimising loads per MAC.
     /// </summary>
@@ -391,7 +452,9 @@ public sealed class PtxAffineEmitter
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
         long threadCount = total / lanes;
-        LaunchBlocks = (uint)((threadCount + BlockThreads - 1) / BlockThreads);
+        long blocks = (threadCount + BlockThreads - 1) / BlockThreads;
+        CheckLimits(spec, blocks, threadCount);
+        LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
 
@@ -762,6 +825,7 @@ public sealed class PtxAffineEmitter
         long loadsAfterLoop = EmittedLoads - loadsBeforeLoop - loadsInLoopBody;
         DynamicLoadsPerThread = loadsBeforeLoop + loadsInLoopBody * loopTrips + loadsAfterLoop;
 
+        CheckEmittedSize(spec);
         _body.Append("END:\n    ret;\n}\n");
 
         _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")

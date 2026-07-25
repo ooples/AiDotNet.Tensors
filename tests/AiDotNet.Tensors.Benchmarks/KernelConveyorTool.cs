@@ -141,6 +141,8 @@ internal static class KernelConveyorTool
                           " G warp-inst/s | dram " + (machine.DramBytesPerSecond / 1e9).ToString("F0", CultureInfo.InvariantCulture) +
                           " GB/s | compute " + (machine.MacsPerSecond * 2 / 1e12).ToString("F1", CultureInfo.InvariantCulture) + " TFLOP/s");
         Console.WriteLine();
+        Console.WriteLine("measured column recorded under protocol " + CodegenMeasurementProtocol.Tag);
+        Console.WriteLine();
         Console.WriteLine("kernel                          loads/MAC   predicted   limiter        measured   ratio");
 
         foreach (var entry in entries)
@@ -387,7 +389,8 @@ internal static class KernelConveyorTool
                     metrics?.Ldg.ToString(CultureInfo.InvariantCulture) ?? "",
                     metrics?.Stg.ToString(CultureInfo.InvariantCulture) ?? "",
                     metrics?.SpillLoads.ToString(CultureInfo.InvariantCulture) ?? "",
-                    metrics?.SpillStores.ToString(CultureInfo.InvariantCulture) ?? ""));
+                    metrics?.SpillStores.ToString(CultureInfo.InvariantCulture) ?? "",
+                    CodegenMeasurementProtocol.Tag));
               }
               catch (Exception ex)
               {
@@ -482,6 +485,8 @@ internal static class KernelConveyorTool
                               " launches per timed region, paired within-sample ratio, " +
                               Runs + " runs");
             Console.WriteLine("harness noise floor measured at 1.05%; differences under ~3% are not claimable");
+            Console.WriteLine("protocol " + CodegenMeasurementProtocol.Stamp(
+                "RTX 3080, clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
             Console.WriteLine();
             Console.WriteLine("kernel                              blocks    us/launch    p95/med   run spread   SM clock");
 
