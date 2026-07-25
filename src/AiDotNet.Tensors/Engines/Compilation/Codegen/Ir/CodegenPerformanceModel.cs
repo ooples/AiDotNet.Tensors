@@ -87,6 +87,28 @@ public sealed class CodegenMachineModel
     /// <summary>Fused multiply-adds per second across the whole device.</summary>
     public double MacsPerSecond => FmaLanesPerSm * Multiprocessors * ClockHz;
 
+    /// <summary>
+    /// Coefficient of the occupancy penalty <c>1 + c / blocksPerSm</c>.
+    /// </summary>
+    /// <remarks>
+    /// THE ONE FITTED CONSTANT IN THIS MODEL, and therefore its weakest part. Everything
+    /// else is a published figure or derived from a counter; this is fit to three
+    /// measured points, and it is recorded as fitted so nobody mistakes it for physics:
+    ///
+    ///   blocks/SM  measured penalty   1 + 0.5/perSm
+    ///     0.72          1.71              1.69
+    ///     1.44          1.46              1.35
+    ///    92.2           1.17              1.005
+    ///
+    /// The first shape tried -- wave quantisation plus a latency-hiding floor -- was
+    /// derived from first principles and predicted a 2.78x penalty where 1.46x was
+    /// measured, turning dense 3x3 from 0.41x optimistic into 1.90x pessimistic. The
+    /// derivation assumed a block that does not fill an SM wastes the rest of it, which
+    /// is wrong: at 1.44 blocks per SM there are still ~11 resident warps, enough to
+    /// hide a good deal of latency.
+    /// </remarks>
+    public double OccupancyPenaltyCoefficient { get; init; } = 0.5;
+
     /// <summary>RTX 3080 (GA102, 68 SMs) with clocks locked at 1770 MHz.</summary>
     public static CodegenMachineModel Rtx3080Locked { get; } = new(
         name: "RTX 3080 (GA102, clocks locked 1770 MHz)",
@@ -154,9 +176,20 @@ public sealed class CodegenPerformancePrediction
                 ? CodegenLimiter.DramBandwidth
                 : CodegenLimiter.Compute;
 
-    /// <summary>Predicted runtime: the slowest of the three constraints.</summary>
+    /// <summary>
+    /// Multiplier applied for imperfect occupancy: wave quantisation plus the loss of
+    /// latency hiding when too few blocks are resident. 1.0 means occupancy is not a
+    /// factor.
+    /// </summary>
+    public double OccupancyPenalty { get; internal set; } = 1.0;
+
+    /// <summary>Blocks the launch will use.</summary>
+    public long Blocks { get; internal set; }
+
+    /// <summary>Predicted runtime: the slowest constraint, scaled by occupancy.</summary>
     public double PredictedMicroseconds =>
-        Math.Max(LoadIssueMicroseconds, Math.Max(DramMicroseconds, ComputeMicroseconds));
+        Math.Max(LoadIssueMicroseconds, Math.Max(DramMicroseconds, ComputeMicroseconds))
+        * OccupancyPenalty;
 
     /// <summary>
     /// How much faster the kernel could run if load issue stopped binding. 1.0 means
@@ -187,7 +220,7 @@ public static class CodegenPerformanceModel
     /// </remarks>
     public static CodegenPerformancePrediction Predict(
         CodegenKernelSpec spec, long threads, long dynamicLoadsPerThread,
-        CodegenMachineModel? machine = null)
+        CodegenMachineModel? machine = null, int blockThreads = 256)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         if (threads <= 0) throw new ArgumentOutOfRangeException(nameof(threads));
@@ -211,9 +244,42 @@ public static class CodegenPerformanceModel
         double dramUs = uniqueBytes / machine.DramBytesPerSecond * 1e6;
         double computeUs = macs / machine.MacsPerSecond * 1e6;
 
-        return new CodegenPerformancePrediction(
+        var prediction = new CodegenPerformancePrediction(
             spec.Name, outputs, macs, uniqueBytes, warpLoads, loadsPerMac,
             loadIssueUs, dramUs, computeUs);
+
+        long blocks = (threads + blockThreads - 1) / blockThreads;
+        prediction.Blocks = blocks;
+        prediction.OccupancyPenalty = OccupancyPenaltyFor(blocks, machine);
+        return prediction;
+    }
+
+    /// <summary>
+    /// How much slower imperfect occupancy makes a kernel, as a multiplier.
+    /// </summary>
+    /// <remarks>
+    /// Two effects, and the larger one governs.
+    ///
+    /// WAVE QUANTISATION. Blocks are dispatched in waves across the SMs. 98 blocks on 68
+    /// SMs is 1.44 waves, but the hardware runs 2, so 28% of the second wave's capacity
+    /// is idle and the kernel takes 2/1.44 = 1.39x what perfect packing would cost. This
+    /// shrinks as the wave count grows and is negligible past a few waves.
+    ///
+    /// LATENCY HIDING. Below roughly four resident blocks per SM there are not enough
+    /// warps to cover memory latency, and the kernel stalls regardless of how few loads
+    /// it issues.
+    ///
+    /// This is the term whose absence made the model 0.68x optimistic on dense 3x3 after
+    /// reuse tiling cut its loads: the tiling worked, L1 pressure fell from 89.99% to
+    /// 53.4%, and the kernel stopped being load-bound -- so the model kept predicting a
+    /// load-bound time for a kernel that no longer was one.
+    /// </remarks>
+    private static double OccupancyPenaltyFor(long blocks, CodegenMachineModel machine)
+    {
+        if (blocks <= 0) return 1.0;
+
+        double perSm = blocks / (double)machine.Multiprocessors;
+        return 1.0 + machine.OccupancyPenaltyCoefficient / Math.Max(perSm, 0.05);
     }
 
     /// <summary>

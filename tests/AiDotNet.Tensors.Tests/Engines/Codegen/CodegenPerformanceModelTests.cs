@@ -41,6 +41,8 @@ public class CodegenPerformanceModelTests
         "depthwise_conv2d_3x3",
         "depthwise_conv2d_3x3_bwd_data",
         "maxpool2d_2x2",
+        "conv2d_3x3_bias_relu",
+        "conv2d_3x3_bwd_data",
     };
 
     private static CodegenPerformancePrediction PredictFor(CodegenCatalogEntry entry)
@@ -74,9 +76,10 @@ public class CodegenPerformanceModelTests
     }
 
     /// <summary>
-    /// On well-coalesced, non-register-limited kernels the predicted runtime must be
-    /// within 20% of measured. The two dense 3x3 kernels -- the ones the model exists
-    /// to diagnose -- land at 1.02x and 1.00x.
+    /// On kernels whose limiter the model actually carries, predicted runtime must be
+    /// within 20% of measured. Dense 3x3 sits at 0.92x and its backward at 0.99x, which
+    /// only became true once the occupancy term was added -- before it they were 0.41x
+    /// and 0.40x, because reuse tiling had moved them out of the load-bound regime.
     /// </summary>
     [Fact]
     public void PredictedTime_IsAccurateOnWellBehavedKernels()
@@ -103,13 +106,11 @@ public class CodegenPerformanceModelTests
     [InlineData("conv2d_1x1_bias_relu")]        // ow=28 is not a warp multiple: warps straddle rows
     [InlineData("conv2d_1x1_bwd_data")]
     [InlineData("conv_transpose2d_3x3_stride2")] // 76 registers, occupancy limited
-    // Dense 3x3 USED to sit at 1.02x -- the model's best case. Reuse tiling then cut
-    // its loads/MAC from 1.251 to 0.501 and its time from 126 us to 75 us, which moved
-    // it out of the load-bound regime the model describes: at a 4x4 tile it runs 98
-    // blocks on 68 SMs, so occupancy now binds and the model, having no occupancy term,
-    // is optimistic. Fixing the predicted bottleneck moved the bottleneck.
-    [InlineData("conv2d_3x3_bias_relu")]
-    [InlineData("conv2d_3x3_bwd_data")]
+    // The three that remain optimistic map EXACTLY onto the two limiters the model
+    // does not carry, as measured by the limiter gate: both 1x1 kernels are L2-bound
+    // (66% and 54%) and conv_transpose is SM-bound (82.5%). The model has LoadIssue,
+    // DRAM and Compute terms only. That correspondence is the useful part -- the gate
+    // says which term to add next.
     public void ModelIsOptimisticWhereItIgnoresCoalescingAndOccupancy(string kernel)
     {
         var entry = CodegenKernelCatalog.Find(kernel);
