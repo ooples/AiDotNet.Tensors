@@ -65,6 +65,7 @@ internal static class KernelConveyorTool
             case "vector-ab": VectorAb(entries); break;
             case "dump": Dump(entries, args); break;
             case "coarsen-ab": CoarsenAb(entries); break;
+            case "once": Once(entries, args); break;
             default: Console.WriteLine("Unknown conveyor stage '" + stage + "'."); break;
         }
     }
@@ -91,6 +92,38 @@ internal static class KernelConveyorTool
             Console.WriteLine(path + "  lanes=" + emitter.CoarsenedLanes +
                               " blocks=" + emitter.LaunchBlocks);
         }
+    }
+
+    /// <summary>
+    /// Launches each kernel at its BENCH shape exactly once. Nsight Compute replays
+    /// every launch it profiles, so the benchmark loop is unusable under a profiler;
+    /// this gives it a single launch of the shape we actually care about.
+    /// </summary>
+    private static void Once(IReadOnlyList<CodegenCatalogEntry> entries, string[] args)
+    {
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            foreach (var entry in entries)
+            {
+                var spec = entry.Bench;
+                var emitter = new PtxAffineEmitter();
+                if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
+                    if (ValueOf(args, "--coarsen") is string cz)
+                        emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
+                string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks);
+                stage.Launch();
+                runtime.Synchronize();
+                Console.WriteLine(entry.Name + ": one launch, " + emitter.LaunchBlocks + " blocks, lanes=" +
+                                  emitter.CoarsenedLanes + ", emitted loads=" + emitter.EmittedLoads);
+            }
+        }
+        finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
 
     // ---------------------------------------------------------------- verify
@@ -388,6 +421,8 @@ internal static class KernelConveyorTool
                     var spec = entry.Bench;
                     var emitter = new PtxAffineEmitter();
                     if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
+                    if (ValueOf(args, "--coarsen") is string cz)
+                        emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
                     string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                     using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                     IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -498,7 +533,7 @@ internal static class KernelConveyorTool
             Console.WriteLine("VECTOR-LOAD A/B - ld.global.v4.f32 vs scalar, paired in-process");
             Console.WriteLine("harness noise floor 1.05%; a ratio inside ~1.03x is not claimable");
             Console.WriteLine();
-            Console.WriteLine("kernel                              v4 loads   scalar us   vector us    speedup");
+            Console.WriteLine("kernel                              v4 loads   scalar us   vector us   best-of-3  paired-med");
 
             foreach (var entry in entries)
             {
@@ -518,12 +553,13 @@ internal static class KernelConveyorTool
                 using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx, scalarEmitter.LaunchBlocks);
 
                 var ratios = new double[Runs];
-                double scalarUs = 0, vectorUs = 0;
+                double scalarUs = double.MaxValue, vectorUs = double.MaxValue;
                 for (int run = 0; run < Runs; run++)
                 {
                     (double a, double b, double ratio) = PairedRatio(runtime, scalarStage.Launch, vecStage.Launch);
                     ratios[run] = ratio;
-                    scalarUs = a; vectorUs = b;
+                    scalarUs = Math.Min(scalarUs, a);   // best-of-N per side
+                    vectorUs = Math.Min(vectorUs, b);
                 }
                 Array.Sort(ratios);
 
@@ -531,7 +567,8 @@ internal static class KernelConveyorTool
                     vecEmitter.VectorisedLoads.ToString(CultureInfo.InvariantCulture).PadLeft(10) +
                     scalarUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
                     vectorUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
-                    ratios[Runs / 2].ToString("F3", CultureInfo.InvariantCulture).PadLeft(11) + "x");
+                    (scalarUs / vectorUs).ToString("F3", CultureInfo.InvariantCulture).PadLeft(11) + "x" +
+                    ratios[Runs / 2].ToString("F3", CultureInfo.InvariantCulture).PadLeft(10) + "x");
             }
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
