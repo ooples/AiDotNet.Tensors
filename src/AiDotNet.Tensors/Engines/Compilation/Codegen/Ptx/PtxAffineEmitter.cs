@@ -58,6 +58,14 @@ public sealed class PtxAffineEmitter
     /// <summary>Number of SASS-visible global loads the emitter produced (diagnostic).</summary>
     public int EmittedLoads { get; private set; }
 
+    /// <summary>
+    /// Global loads ONE THREAD executes, counting loads inside a strip-mined loop once
+    /// per trip. <see cref="EmittedLoads"/> counts instructions in the emitted text,
+    /// which undercounts a looping kernel by its trip count. Load count is exactly the
+    /// quantity the performance model needs, so it has to be the dynamic one.
+    /// </summary>
+    public long DynamicLoadsPerThread { get; private set; }
+
     /// <summary>True when the reduction was fully unrolled.</summary>
     public bool Unrolled { get; private set; }
 
@@ -311,6 +319,8 @@ public sealed class PtxAffineEmitter
             laneAxisReg[l][coarsenAxis] = laneReg;
         }
 
+        long loadsBeforeLoop = EmittedLoads;
+
         // One accumulator per lane.
         var accs = new string[lanes];
         for (int l = 0; l < lanes; l++)
@@ -501,6 +511,10 @@ public sealed class PtxAffineEmitter
             }
         }
 
+        long loadsInLoopBody = EmittedLoads - loadsBeforeLoop;
+        long loopTrips = 1;
+        for (int i = 0; i < loopAxes.Length; i++) loopTrips *= axes[loopAxes[i]].Extent;
+
         // Close the loops. The renamed accumulator must land back in the fixed
         // register before the backward branch: SSA-style renaming cannot cross it.
         if (loopAxes.Length > 0)
@@ -568,6 +582,11 @@ public sealed class PtxAffineEmitter
             if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
             else L($"@{lanePred} st.global.f32 [{laneAddr}], {acc};");
         }
+
+        // Loads before the loop run once, loads in its body run once per trip, loads
+        // after it (the epilogue) run once.
+        long loadsAfterLoop = EmittedLoads - loadsBeforeLoop - loadsInLoopBody;
+        DynamicLoadsPerThread = loadsBeforeLoop + loadsInLoopBody * loopTrips + loadsAfterLoop;
 
         _body.Append("END:\n    ret;\n}\n");
 

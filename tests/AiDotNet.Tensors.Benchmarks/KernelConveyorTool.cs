@@ -66,6 +66,7 @@ internal static class KernelConveyorTool
             case "dump": Dump(entries, args); break;
             case "coarsen-ab": CoarsenAb(entries); break;
             case "once": Once(entries, args); break;
+            case "predict": Predict(entries, args); break;
             default: Console.WriteLine("Unknown conveyor stage '" + stage + "'."); break;
         }
     }
@@ -125,6 +126,76 @@ internal static class KernelConveyorTool
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
+
+    /// <summary>
+    /// Device-free bottleneck prediction for every catalog kernel, printed beside the
+    /// measured time so the model can be falsified rather than believed.
+    /// </summary>
+    private static void Predict(IReadOnlyList<CodegenCatalogEntry> entries, string[] args)
+    {
+        var machine = CodegenMachineModel.Rtx3080Locked;
+        Console.WriteLine();
+        Console.WriteLine("STATIC BOTTLENECK PREDICTION - no GPU used");
+        Console.WriteLine("machine: " + machine.Name);
+        Console.WriteLine("  load issue " + (machine.LoadInstructionsPerSecond / 1e9).ToString("F1", CultureInfo.InvariantCulture) +
+                          " G warp-inst/s | dram " + (machine.DramBytesPerSecond / 1e9).ToString("F0", CultureInfo.InvariantCulture) +
+                          " GB/s | compute " + (machine.MacsPerSecond * 2 / 1e12).ToString("F1", CultureInfo.InvariantCulture) + " TFLOP/s");
+        Console.WriteLine();
+        Console.WriteLine("kernel                          loads/MAC   predicted   limiter        measured   ratio");
+
+        foreach (var entry in entries)
+        {
+            var spec = entry.Bench;
+            var emitter = new PtxAffineEmitter();
+            if (ValueOf(args, "--coarsen") is string cz)
+                emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
+            emitter.Emit(spec, 8, 6);
+
+            long threads = spec.Space.TotalThreads / Math.Max(1, emitter.CoarsenedLanes);
+            var p = CodegenPerformanceModel.Predict(spec, threads, emitter.DynamicLoadsPerThread, machine);
+
+            double measured = MeasuredMicroseconds(entry.Name);
+            string measuredText = measured > 0 ? measured.ToString("F1", CultureInfo.InvariantCulture) : "-";
+            string ratioText = measured > 0
+                ? (p.PredictedMicroseconds / measured).ToString("F2", CultureInfo.InvariantCulture) + "x"
+                : "-";
+
+            Console.WriteLine(entry.Name.PadRight(32) +
+                p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(9) +
+                p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
+                "   " + p.Limiter.ToString().PadRight(15) +
+                measuredText.PadLeft(8) + ratioText.PadLeft(8));
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("reuse axes (the axes worth tiling - an operand invariant in an axis");
+        Console.WriteLine("can share one load across every position of it):");
+        foreach (var entry in entries)
+        {
+            foreach (var pair in CodegenPerformanceModel.ReuseAxes(entry.Bench))
+                if (pair.Value.Count > 0)
+                    Console.WriteLine("  " + entry.Name.PadRight(32) + pair.Key.PadRight(10) +
+                                      "invariant in {" + string.Join(", ", pair.Value) + "}");
+        }
+    }
+
+    /// <summary>
+    /// Measured times from the locked-clock true-fp32 bake-off, so the prediction can
+    /// be checked against reality in the same table.
+    /// </summary>
+    private static double MeasuredMicroseconds(string kernel) => kernel switch
+    {
+        "depthwise_conv2d_3x3_bias_relu" => 73.0,
+        "depthwise_conv2d_3x3" => 72.6,
+        "depthwise_conv2d_3x3_bwd_data" => 72.3,
+        "conv2d_1x1_bias_relu" => 45.8,
+        "conv2d_1x1_bwd_data" => 47.5,
+        "conv2d_3x3_bias_relu" => 125.9,
+        "conv2d_3x3_bwd_data" => 127.9,
+        "maxpool2d_2x2" => 156.2,
+        "conv_transpose2d_3x3_stride2" => 99.2,
+        _ => 0.0,
+    };
 
     // ---------------------------------------------------------------- verify
 
