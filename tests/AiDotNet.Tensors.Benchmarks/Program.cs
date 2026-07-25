@@ -78,6 +78,78 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-residual-layernorm-gelu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxResidualLayerNormGeluExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-normalization")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            string scope = args.Length > 2 ? args[2] : "all";
+            DirectPtxNormalizationExperiment.Run(runs, scope);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-normalization-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            DirectPtxNormalizationArtifactTool.Run(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-normalization-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            DirectPtxNormalizationArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "normalization", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear-m16")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.RunM16(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-w8a8-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxW8A8LinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--codegen-bakeoff")
+        {
+            CodegenBakeOffExperiment.Run();
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-convolution")
         {
             bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
