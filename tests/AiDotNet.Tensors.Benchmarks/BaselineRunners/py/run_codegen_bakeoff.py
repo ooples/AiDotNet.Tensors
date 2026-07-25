@@ -131,6 +131,19 @@ def main():
         return 1
 
     torch.backends.cudnn.benchmark = True   # let cuDNN pick its best algorithm
+
+    # TRUE FP32, NOT TF32. PyTorch defaults allow_tf32=True, which routes dense
+    # convolution to tensor cores at 10-bit mantissa -- a DIFFERENT operation from the
+    # exact fp32 our kernels compute and verify to 0.000E+000 against an fp64 oracle.
+    # Profiling caught it: the default path runs
+    # cutlass_tensorop_s1688fprop_optimized_tf32_... on tensor cores.
+    #
+    # Measured on the dense 3x3 shape under CUDA graphs, TF32 is not even faster here
+    # (27.55 us vs 24.80 us true FP32) because it pays NCHW->NHWC layout transforms,
+    # while giving up 3.1e-04 relative accuracy. So disabling it costs the competitor
+    # nothing and makes the comparison honest in both directions.
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     dev = torch.device("cuda")
     torch.manual_seed(0)
 

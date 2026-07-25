@@ -7,10 +7,68 @@ It is not a measurement artefact. The losses are 3-6x against a harness noise fl
 1.05%, they reproduce across every run, and they hold with steady clocks and best-of-3
 reporting.
 
-Hardware counters were unavailable (`ncu` returns `ERR_NVGPUCTRPERM` without
-administrator rights), so the diagnosis rests on two things that need no profiler: exact
-arithmetic over the index maps, and controlled sweeps where the code generator varies one
-knob at a time.
+**Update: hardware counters are now available** (elevated session) and they confirm the
+diagnosis below and sharpen it. Section 0 has the measured evidence; the arithmetic in
+sections 1-4 predicted it correctly and still explains *why*.
+
+## 0. Measured with hardware counters (Nsight Compute, clocks locked at 1770 MHz)
+
+Dense 3x3, our kernel against cuDNN's, same shape:
+
+| counter | ours | cuDNN | |
+|---|---|---|---|
+| **l1tex throughput** | **89.99% of peak** | **11.67%** | we are pinned; cuDNN idles |
+| **global load instructions** | **4,017,216** | **25,480** | **158x more** |
+| DRAM throughput | 2.41% | — | not memory-starved |
+| L2 throughput | 10.17% | — | not L2-bound |
+| L1 hit rate | 98.08% | — | the loads HIT; there are just too many |
+| warps active | 67.62% | — | occupancy is fine |
+| registers/thread | 40 | — | no spills |
+| kernel time | 126.85 us | 31.58 us | |
+
+**The binding resource is L1/LSU request throughput, at 90% of peak.** Not DRAM, not L2,
+not occupancy, not precision. The loads almost all hit in L1 — the problem is issuing
+158x more of them than the competitor for identical arithmetic.
+
+The arithmetic in section 1 predicted roughly 30x; the measured figure is 158x, because
+cuDNN also stages through shared memory and uses an NHWC layout, on top of register
+tiling.
+
+### What cuDNN actually runs, and what it pays for
+
+Profiling shows cuDNN's "one convolution" is five kernels:
+
+| kernel | time |
+|---|---|
+| `nchwToNhwcKernel` (layout transform) | 3.20 us |
+| `sm86_xmma_fprop_implicit_gemm_...` (the convolution) | 31.58 us |
+| `elementwise_kernel` (the bias add) | 6.27 us |
+| **total** | **41.06 us** |
+
+So our fusion advantage is real and worth about 9.5 us of their 41 us — PyTorch cannot
+fuse through a cuDNN call, so it pays a layout transform and a separate bias pass. That
+is exactly why we beat it on depthwise. It is simply not enough to cover a 158x load gap
+on dense convolution.
+
+### The precision red herring, corrected
+
+The default cuDNN path selects
+`cutlass_tensorop_s1688fprop_optimized_tf32_128x64_32x3_nhwc_align4` — **tensor cores at
+TF32**, a 10-bit mantissa, which is not the exact FP32 our kernels verify to 0.000E+000.
+That looked like an unfair comparison.
+
+Measured under CUDA graphs on this shape, it is not:
+
+| | time | |
+|---|---|---|
+| cuDNN TF32 (torch default) | 27.55 us | gives up 3.1e-04 relative accuracy |
+| cuDNN true FP32 | **24.80 us** | **faster** |
+
+TF32 is *slower* here because it pays the NHWC layout transforms, so cuDNN gains nothing
+from lower precision at this shape. The bake-off now runs with `allow_tf32 = False` on
+both cudnn and matmul so the comparison is exact-FP32 against exact-FP32 — and that makes
+our dense-3x3 result slightly **worse** (5.11x behind rather than 4.60x), not better.
+The gap is entirely algorithmic.
 
 ## 1. The exact cause: input loads amplified 576x, of which 64x is pure waste
 
