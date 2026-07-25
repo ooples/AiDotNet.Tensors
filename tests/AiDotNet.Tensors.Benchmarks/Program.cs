@@ -144,6 +144,24 @@ class Program
             DirectPtxW8A8LinearExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--kernel-verify")
+        {
+            KernelConveyorTool.Run("verify", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-release")
+        {
+            KernelConveyorTool.Run("release", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-bench")
+        {
+            KernelConveyorTool.Run("bench", args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--bench-calibrate")
         {
             BenchmarkCalibrationExperiment.Run();

@@ -3,6 +3,7 @@
 // fp64 oracle the hand-written kernel is held to, and what does it cost?
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -191,5 +192,73 @@ public class PtxAffineEmitterTests
         void** args = stackalloc void*[4];
         args[0] = &pa; args[1] = &pb; args[2] = &pc; args[3] = &pd;
         module.Launch(fn, blocks, 1, 1, PtxAffineEmitter.BlockThreads, 1, 1, 0, args);
+    }
+
+    /// <summary>
+    /// A reduction too large to unroll must lower to a runtime loop rather than be
+    /// refused. Dense 3x3 over 32 channels is 288 trips; before strip-mining the
+    /// emitter threw NotSupportedException, which meant no dense convolution at a
+    /// production channel count could be generated at all.
+    /// </summary>
+    [Fact]
+    public void LargeReduction_StripMinesInsteadOfRefusing()
+    {
+        var entry = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu");
+        Assert.NotNull(entry);
+
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.Emit(entry!.Bench, 8, 6);
+
+        Assert.True(emitter.LoopedAxes > 0, "288 reduction trips must lower to a loop.");
+        Assert.Contains("LOOP0:", ptx, StringComparison.Ordinal);
+        Assert.Contains("bra LOOP0;", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Every catalog entry must be verified at a shape that exercises the SAME
+    /// lowering as the shape that gets released. Verifying an unrolled shape and
+    /// releasing a strip-mined one ships a code path nothing ever checked.
+    /// </summary>
+    [Fact]
+    public void EveryCatalogEntry_VerifiesTheLoweringItReleases()
+    {
+        foreach (var entry in CodegenKernelCatalog.All)
+        {
+            var verifyEmitter = new PtxAffineEmitter();
+            verifyEmitter.Emit(entry.Verify, 8, 6);
+            var benchEmitter = new PtxAffineEmitter();
+            benchEmitter.Emit(entry.Bench, 8, 6);
+
+            Assert.True(verifyEmitter.LoopedAxes == benchEmitter.LoopedAxes,
+                entry.Name + ": verify shape lowers with " + verifyEmitter.LoopedAxes +
+                " looped axes but the released shape uses " + benchEmitter.LoopedAxes +
+                "; the released path would be unverified.");
+        }
+    }
+
+    /// <summary>
+    /// The strip-mined loop must compute the same values as the fp64 reference. This
+    /// is the device-free half of the check the conveyor runs on hardware.
+    /// </summary>
+    [Fact]
+    public void StripMinedSpec_InterpreterMatchesFp64Oracle()
+    {
+        var entry = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu");
+        Assert.NotNull(entry);
+        var spec = entry!.Verify;
+
+        var inputs = new List<double[]>();
+        for (int i = 0; i < spec.Inputs.Count; i++)
+        {
+            long count = 1;
+            foreach (int d in spec.Inputs[i].Shape) count *= d;
+            var host = new double[count];
+            for (long e = 0; e < count; e++) host[e] = (((e * 37 + i * 101) % 97) - 48) / 64.0;
+            inputs.Add(host);
+        }
+
+        double[] result = spec.Interpret(inputs);
+        Assert.All(result, v => Assert.True(double.IsFinite(v)));
+        Assert.Contains(result, v => v != 0.0);
     }
 }

@@ -64,6 +64,9 @@ public sealed class PtxAffineEmitter
     /// indexing). Declining loudly is required -- silently mis-lowering an index
     /// map is exactly the failure this layer exists to prevent.
     /// </exception>
+    /// <summary>Number of reduction axes lowered to runtime loops rather than unrolled.</summary>
+    public int LoopedAxes { get; private set; }
+
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
@@ -75,12 +78,30 @@ public sealed class PtxAffineEmitter
         int[] reduction = space.ReductionAxes;
         long total = space.TotalThreads;           // single source of truth
         long trips = space.ReductionTripCount;
-        Unrolled = trips <= FullUnrollLimit;
 
-        if (!Unrolled)
-            throw new NotSupportedException(
-                $"Reduction trip count {trips} exceeds the unroll limit {FullUnrollLimit}; " +
-                "a looping lowering is not implemented yet.");
+        // STRIP-MINE. Full unroll is the fast path but it cannot be the only path:
+        // a dense 3x3 conv over 32 input channels is 288 reduction trips, and
+        // unrolling that produces a kernel ptxas cannot allocate. Peel outer
+        // reduction axes into runtime loops until the remaining suffix fits the
+        // unroll limit, so the inner taps stay unrolled (where the index folding
+        // and guard elision pay off) while the channel walk becomes a real loop.
+        int split = 0;
+        long innerTrips = trips;
+        while (innerTrips > FullUnrollLimit && split < reduction.Length)
+        {
+            innerTrips /= axes[reduction[split]].Extent;
+            split++;
+        }
+
+        var loopAxes = new int[split];
+        Array.Copy(reduction, 0, loopAxes, 0, split);
+        var innerAxes = new int[reduction.Length - split];
+        Array.Copy(reduction, split, innerAxes, 0, innerAxes.Length);
+
+        Unrolled = split == 0;
+        LoopedAxes = split;
+        trips = innerTrips;
+        reduction = innerAxes;
 
         _sb.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
 
@@ -150,8 +171,23 @@ public sealed class PtxAffineEmitter
             ? $"mov.f32 {acc}, 0fFF800000;   // -inf"
             : $"mov.f32 {acc}, 0f00000000;");
 
-        // Fully-unrolled reduction: every reduction axis takes a compile-time value,
-        // so each index expression folds to (parallel terms) + constant.
+        // Open one runtime loop per peeled axis. Each level emits its counter reset
+        // BEFORE its own label, so the reset for level i+1 lands inside level i's
+        // body and re-runs on every outer trip.
+        string accFixed = acc;
+        var loopRegs = new string[loopAxes.Length];
+        for (int i = 0; i < loopAxes.Length; i++)
+        {
+            string reg = NextR();
+            loopRegs[i] = reg;
+            axisReg[loopAxes[i]] = reg;   // symbolic from here on, not a folded constant
+            L($"mov.u32 {reg}, 0;   // {axes[loopAxes[i]].Name}");
+            _sb.Append("LOOP").Append(I(i)).Append(":\n");
+        }
+
+        // Reduction over the axes that remain unrolled: every one of those takes a
+        // compile-time value, so each index expression folds to (symbolic terms) +
+        // constant. A peeled axis stays symbolic and is simply another term.
         var reductionValues = new int[axes.Count];
         for (long t = 0; t < trips; t++)
         {
@@ -193,6 +229,22 @@ public sealed class PtxAffineEmitter
                 L($"add.rn.f32 {na}, {acc}, {product!};");
                 acc = na;
             }
+        }
+
+        // Close the loops. The renamed accumulator must land back in the fixed
+        // register before the backward branch: SSA-style renaming cannot cross it.
+        if (loopAxes.Length > 0)
+        {
+            if (!string.Equals(acc, accFixed, StringComparison.Ordinal))
+                L($"mov.f32 {accFixed}, {acc};");
+            for (int i = loopAxes.Length - 1; i >= 0; i--)
+            {
+                string cont = NextP();
+                L($"add.s32 {loopRegs[i]}, {loopRegs[i]}, 1;");
+                L($"setp.lt.s32 {cont}, {loopRegs[i]}, {I(axes[loopAxes[i]].Extent)};");
+                L($"@{cont} bra LOOP{I(i)};");
+            }
+            acc = accFixed;
         }
 
         // Epilogue: bias, scale, activation -- fused, never a second kernel.
