@@ -270,6 +270,24 @@ internal static class KernelConveyorTool
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
     }
 
+    /// <summary>
+    /// Applies a MEASURED lowering choice when the autotuner recorded one that beat the
+    /// modelled choice. Named the same as the autotuner's candidates, so the winner it
+    /// records is the configuration reproduced here.
+    /// </summary>
+    private static void ApplyTuned(PtxAffineEmitter emitter, string kernelName)
+    {
+        switch (CodegenAutotuneCache.WinnerFor(kernelName))
+        {
+            case "no-tile": emitter.Coarsening = 1; break;
+            case "tile2": emitter.Coarsening = 2; break;
+            case "lanes4": emitter.MaxTileLanes = 4; break;
+            case "no-staging": emitter.EnableSharedStaging = false; break;
+            case "no-vector": emitter.EnableVectorLoads = false; break;
+            default: break;   // untuned, or the modelled choice already won
+        }
+    }
+
     /// <summary>Number of reduction axes a spec lowers to runtime loops.</summary>
     private static int LoweringOf(DirectPtxRuntime runtime, CodegenKernelSpec spec)
     {
@@ -285,6 +303,7 @@ internal static class KernelConveyorTool
         DirectPtxRuntime runtime, CodegenKernelSpec spec)
     {
         var emitter = new PtxAffineEmitter();
+        ApplyTuned(emitter, spec.Name);
         string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
         IntPtr fn = module.GetFunction(spec.Name, out DirectPtxFunctionInfo info);
@@ -569,6 +588,7 @@ internal static class KernelConveyorTool
                 {
                     var spec = entry.Bench;
                     var emitter = new PtxAffineEmitter();
+                    ApplyTuned(emitter, spec.Name);
                     if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
                     if (ValueOf(args, "--coarsen") is string cz)
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
