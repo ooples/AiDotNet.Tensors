@@ -45,8 +45,20 @@ internal static class KernelConveyorTool
     /// <summary>Attempts allowed to obtain a measurement taken at a steady SM clock.</summary>
     private const int ClockRetries = 4;
 
+    /// <summary>
+    /// Forces per-dimension activation staging on, for the correctness gate and for
+    /// inspecting the staging decision.
+    /// </summary>
+    /// <remarks>
+    /// Staging must clear the fp64 oracle before any timing is believed: the first version
+    /// of it returned 5.277 and 1.112e1 instead of zero under a two-dimensional block. A
+    /// flag that runs the real verify with staging on is how that gets checked.
+    /// </remarks>
+    private static bool _forceInputStaging;
+
     internal static void Run(string stage, string[] args)
     {
+        _forceInputStaging = args.Contains("--input-staging", StringComparer.Ordinal);
         string selector = KernelToolArgs.Selector(args);
         var entries = Select(selector);
         if (entries.Count == 0)
@@ -184,6 +196,7 @@ internal static class KernelConveyorTool
             var emitter = new PtxAffineEmitter();
             if (ValueOf(args, "--coarsen") is string cz)
                 emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
+            if (_forceInputStaging) emitter.EnableInputStaging = true;
             emitter.Emit(spec, 8, 6);
 
             long threads = spec.Space.TotalThreads / Math.Max(1, emitter.CoarsenedLanes);
@@ -199,7 +212,9 @@ internal static class KernelConveyorTool
                 emitter.TileDescription.PadRight(16) +
                 emitter.LaunchBlockThreads.ToString(CultureInfo.InvariantCulture).PadLeft(5) +
                 p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(8) +
-                "  " + emitter.StagedOperands);
+                "  " + (emitter.UsedTwoDimensionalBlock
+                    ? "2D " + emitter.LaunchBlockX + "x" + emitter.LaunchBlockY + " "
+                    : "flat ") + emitter.StagedOperands);
         }
 
         Console.WriteLine();
@@ -417,6 +432,7 @@ internal static class KernelConveyorTool
 
         var single = new PtxAffineEmitter();
         ApplyTuned(single, catalogName);
+        if (_forceInputStaging) single.EnableInputStaging = true;
         string ptx = single.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         return new TunedProgram(
             spec,

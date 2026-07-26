@@ -56,6 +56,69 @@ instruction in a loop we already run.
 **So the path to wins on all thirteen is one lever applied five times, plus two
 special cases.**
 
+## FALSIFIED: lever 1 was wrong, and so was its replacement
+
+**The section below is kept as written, because it was the pre-registered prediction and it
+failed.** Implemented, verified correct, and measured:
+
+| | L1 | DRAM | SM | dense 3x3 time |
+|---|---|---|---|---|
+| baseline | 64.08% | 4.31% | 53.24% | 64.2 µs |
+| per-dimension staging | **77.45%** | 3.36% | 44.43% | slower than `tile2` |
+
+**L1 went UP.** Falsifier (a) fired. The cause invalidates the premise: on NVIDIA hardware
+shared memory *is* L1TEX, so `ld.shared` and `st.shared` are counted by the very metric the
+lever was meant to relieve. Staging moves traffic *within* the saturated unit instead of out
+of it. "L1-bound" never meant "too many global loads"; it means "too much L1TEX traffic of
+any kind", and DRAM at 3–4% says we were never close to memory-bound.
+
+The obvious replacement — more register reuse, which bypasses L1TEX entirely — is **also
+falsified**. L1 is insensitive to it:
+
+| coarsening | 2 | 4 | 8 |
+|---|---|---|---|
+| L1 % | 64.27 | 64.11 | 64.20 |
+| SM % | 53.20 | 53.84 | 53.18 |
+
+So L1% was not the binding constraint at all. The warp-stall breakdown says what is:
+
+| stall reason | % of warp-active cycles |
+|---|---|
+| **wait** — fixed-latency / FMA dependency | **17.12** |
+| long_scoreboard — global memory dependency | 10.35 |
+| short_scoreboard — shared / MIO dependency | 5.13 |
+| mio_throttle — load-pipe queue full | **3.03** |
+| no_instruction | 0.48 |
+
+`mio_throttle` at 3% is the decisive number: **the load pipe was never the bottleneck**, so
+no amount of load reduction could have helped, and the two dead levers were dead before they
+were written. Warps issue roughly 64% of the time with no unit above 64% — the kernel is
+*balanced*, not starved.
+
+### What that means for dense 3x3
+
+There is no single saturated unit to attack, and closing 62.4 µs → under cuDNN's 41.3 µs is a
+1.5× gap with no scheduling lever pointing at it. A 1.5× gap with a balanced profile is the
+signature of a **better algorithm**, not a better schedule: cuDNN is running an implicit-GEMM
+or Winograd formulation that does less arithmetic, and F(2,3) Winograd alone cuts multiplies
+by 2.25×.
+
+That is outside the index-map layer, and this branch already carries Winograd kernels. So the
+honest conclusion is that **dense 3x3 is not winnable by the code generator**, which is what
+`COMPETITOR_TARGETING_MAP.md` said before this attempt: do not pick that fight. Three losses
+in the dense-3x3 family (0.65×, 0.56×, 0.33×) should be recorded as *algorithmically* out of
+reach for this layer and routed to the Winograd path instead of retried here.
+
+### What survived
+
+Per-dimension staging is **correct** — 13/13 at `0.000E+000` with both operands staged,
+including the 2D block that previously returned 5.277 — and it wins marginally on
+`conv_transpose2d_3x3_stride2` (1.016×). It stays as a measured autotuner candidate, chosen
+where it wins and ignored where it does not. That is the mechanism working as intended: the
+lever was wrong about *why*, and the tuner caught it instead of a document asserting it.
+
+---
+
 ## Lever 1 — stage the activation operand (addresses all five losses)
 
 The reuse analysis already prints, per operand, which axes it does *not* reference — the

@@ -48,6 +48,13 @@ internal static class KernelAutotuneTool
         new("lanes4", e => { e.MaxTileLanes = 4; }),
         new("no-staging", e => e.EnableSharedStaging = false),
         new("no-vector", e => e.EnableVectorLoads = false),
+
+        // PER-DIMENSION STAGING, the lever docs/PATH_TO_WINS.md aims at all five
+        // competitor losses: each is L1-bound and none stages its activation operand.
+        // Measured as a candidate rather than switched on, because staging is not free --
+        // it adds two barriers per strip-mine step, and staging the wrong operand cost
+        // conv_transpose 104 -> 131.4 us.
+        new("input-staging", e => e.EnableInputStaging = true),
     };
 
     internal static void Run(string[] args)

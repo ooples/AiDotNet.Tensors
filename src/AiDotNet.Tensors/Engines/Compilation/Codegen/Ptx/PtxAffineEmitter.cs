@@ -254,25 +254,83 @@ public sealed class PtxAffineEmitter
     /// COMPILE-TIME index, so every consumer becomes a constant-offset
     /// <c>ld.shared.f32</c> -- no address arithmetic at the point of use.
     /// </remarks>
+    /// <summary>One operand resident in shared memory for the current strip-mine step.</summary>
+    /// <param name="Input">Index into the spec's inputs.</param>
+    /// <param name="TileSlot">Tile axis the operand varies on, or -1 when block-invariant.</param>
+    /// <param name="Dimension">
+    /// Block dimension that indexes the slice: 0 for x, 1 for y, or -1 when the slice is
+    /// block-invariant and every consumer reads a compile-time constant offset.
+    /// </param>
+    /// <param name="Count">Elements in the slice.</param>
+    /// <param name="ByteOffset">Where the slice starts inside the shared buffer.</param>
+    private sealed record StagedSlice(int Input, int TileSlot, int Dimension, int Count, int ByteOffset);
+
+    /// <summary>The slice holding an operand, or null when it is not staged.</summary>
+    private static StagedSlice? SliceFor(List<StagedSlice> slices, int input)
+    {
+        foreach (var slice in slices) if (slice.Input == input) return slice;
+        return null;
+    }
+
     private void EmitStageLoad(
         CodegenTensorBinding binding, string basePointer, string sharedBase,
         string tid, int tiledSlot, string tileBaseReg, int tileFactor,
         int[] innerReduction, IReadOnlyList<CodegenAxis> axes, string[] axisRegTemplate,
-        int count, int trips)
+        int count, int trips, bool coversAxisFromZero = false, int blockThreads = 0)
+    {
+        // A SLICE CAN BE LARGER THAN THE BLOCK. Requiring one pass per fetch rejected
+        // exactly the staging that matters: on dense 3x3 the activation slice is
+        // 28 positions x 9 trips = 252 elements against 112 threads, so the one-pass rule
+        // refused it and the 2D lowering ran with nothing staged -- which is worse than
+        // flat, because it also gives up the block-invariant weight staging (loads/MAC rose
+        // from 0.258 to 0.501).
+        //
+        // The passes are compile-time, so they unroll. Only the last needs a bounds guard.
+        if (blockThreads <= 0) blockThreads = count;
+        int passes = (count + blockThreads - 1) / blockThreads;
+        for (int pass = 0; pass < passes; pass++)
+            EmitStagePass(binding, basePointer, sharedBase, tid, tiledSlot, tileBaseReg,
+                tileFactor, innerReduction, axes, axisRegTemplate, count, trips,
+                coversAxisFromZero, pass * blockThreads);
+
+        L("bar.sync 0;");
+    }
+
+    private void EmitStagePass(
+        CodegenTensorBinding binding, string basePointer, string sharedBase,
+        string tid, int tiledSlot, string tileBaseReg, int tileFactor,
+        int[] innerReduction, IReadOnlyList<CodegenAxis> axes, string[] axisRegTemplate,
+        int count, int trips, bool coversAxisFromZero, int indexBase)
     {
         string skip = "STAGE_SKIP_" + I(_stageLabel++);
 
+        // The flat index into the slice for this pass.
+        string index = tid;
+        if (indexBase != 0)
+        {
+            index = NextR();
+            L($"add.u32 {index}, {tid}, {I(indexBase)};");
+        }
+
         string active = NextP();
-        L($"setp.ge.u32 {active}, {tid}, {I(count)};");
+        L($"setp.ge.u32 {active}, {index}, {I(count)};");
         L($"@{active} bra {skip};");
 
         // Split the flat stage index into (lane offset on the tiled axis, trip).
         var runtime = (string[])axisRegTemplate.Clone();
         string laneOff = NextR(), trip = NextR();
-        L($"div.u32 {laneOff}, {tid}, {I(trips)};");
-        L($"rem.u32 {trip}, {tid}, {I(trips)};");
+        L($"div.u32 {laneOff}, {index}, {I(trips)};");
+        L($"rem.u32 {trip}, {index}, {I(trips)};");
 
-        if (tiledSlot >= 0 && tileBaseReg != null)
+        if (tiledSlot >= 0 && coversAxisFromZero)
+        {
+            // PER-DIMENSION SLICE. The block covers this axis completely, so the slice
+            // spans the whole extent and the flat index IS the axis coordinate -- no block
+            // base to add. That full cover is exactly what CanStageInput requires, and it
+            // is what keeps this addressed from zero.
+            runtime[tiledSlot] = laneOff;
+        }
+        else if (tiledSlot >= 0 && tileBaseReg != null)
         {
             string tiledValue = NextR();
             L($"mad.lo.u32 {tiledValue}, {tileBaseReg}, {I(tileFactor)}, {laneOff};");
@@ -314,12 +372,11 @@ public sealed class PtxAffineEmitter
         EmittedLoads++;
 
         string sharedByte = NextRd(), sharedAddr = NextRd();
-        L($"mul.wide.u32 {sharedByte}, {tid}, 4;");
+        L($"mul.wide.u32 {sharedByte}, {index}, 4;");
         L($"add.u64 {sharedAddr}, {sharedBase}, {sharedByte};");
         L($"st.shared.f32 [{sharedAddr}], {value2};");
 
         _body.Append(skip).Append(":\n");
-        L("bar.sync 0;");
     }
 
     private int _stageLabel;
@@ -877,23 +934,78 @@ public sealed class PtxAffineEmitter
         }
         UsedTwoDimensionalBlock = twoDimensional;
 
-        // A two-dimensional block INVALIDATES the flat staging analysis. That analysis
-        // asks which operands are constant across the whole block; under a flat block
-        // the weights are, because every thread shares one reuse-axis group. Under a 2D
-        // block y varies over the reuse axis, so each row wants a different weight slice
-        // and the single staged copy is wrong for all but one row -- measured directly:
-        // the two dense kernels returned 5.277 and 1.112e1 instead of zero.
+        // PER-DIMENSION STAGING.
         //
-        // Under 2D each operand is invariant in exactly ONE dimension, not the block, so
-        // staging has to be indexed by the dimension the operand varies in. Until that is
-        // implemented, the 2D lowering runs without staging.
+        // A two-dimensional block invalidates the flat staging analysis. That analysis asks
+        // which operands are constant across the whole BLOCK; under a flat block the
+        // weights are, because every thread shares one reuse-axis group. Under 2D, y varies
+        // over that axis, so each row wants a different weight slice and one staged copy is
+        // wrong for every row but one -- measured directly, the two dense kernels returned
+        // 5.277 and 1.112e1 instead of zero.
+        //
+        // The fix is not to disable staging but to index it correctly: under 2D each operand
+        // is invariant in exactly one DIMENSION, so its slice is keyed by the dimension it
+        // varies in and shared along the other. The activation varies in x and is invariant
+        // in y, so one row serves the whole column; the weights are the mirror image. Both
+        // get staged, which is the point -- the activation half is where the traffic is, and
+        // staging weights alone only moved dense 3x3 from 68.1 us to 61.9 us against
+        // cuDNN's 41.3.
+        //
+        // The slice spans the whole axis because CanStageInput requires the block to cover
+        // both tiled axes completely, so it is addressed from zero.
+        var stagedSlices = new List<StagedSlice>();
         if (twoDimensional)
         {
             stagedInput = -1;
-            stageCount = 0;
             stagedTileSlot = -1;
-            SharedMemoryBytes = 0;
-            StagedOperands = "none";
+            stageCount = 0;
+
+            long tripsPerStep = 1;
+            foreach (int ax in reduction) tripsPerStep *= axes[ax].Extent;
+
+            int byteOffset = 0;
+            for (int slot = 0; slot < 2 && slot < tileAxes.Count; slot++)
+            {
+                int tileAxis = tileAxes[slot];
+                int other = tileAxes[slot == 0 ? 1 : 0];
+
+                foreach (int inputIdx in spec.ProductInputs)
+                {
+                    var binding = spec.Inputs[inputIdx];
+
+                    // Keyed by this dimension only if it varies here and is invariant in
+                    // the other -- that invariance is the reuse being exploited.
+                    if (!ReferencesAxis(binding, tileAxis)) continue;
+                    if (ReferencesAxis(binding, other)) continue;
+
+                    // Every OTHER axis this operand reads is either a reduction axis, which
+                    // the fetch unpacks from the trip, or an axis the grid covers, which is
+                    // constant across the block and so already correct in the thread's own
+                    // register. The two tiled axes are the only ones that vary within a 2D
+                    // block, and both have been accounted for above.
+                    //
+                    // Using the FLAT lowering's varying-axis set here rejected every
+                    // candidate: it counts n and oh as varying, when under 2D those are
+                    // grid axes and constant within the block.
+                    long count = axes[tileAxis].Extent * tripsPerStep;
+                    if ((byteOffset + count * 4) > MaxSharedBytes) continue;
+
+                    stagedSlices.Add(new StagedSlice(inputIdx, slot, slot, (int)count, byteOffset));
+                    byteOffset += (int)count * 4;
+                    break;   // one operand per dimension
+                }
+            }
+
+            SharedMemoryBytes = byteOffset;
+            StagedOperands = stagedSlices.Count == 0
+                ? "none"
+                : string.Join("+", stagedSlices.ConvertAll(s => spec.Inputs[s.Input].Name));
+        }
+        else if (stagedInput >= 0)
+        {
+            // Flat block: the operand is invariant across the WHOLE block, so every
+            // consumer reads a compile-time constant offset. Dimension -1 records that.
+            stagedSlices.Add(new StagedSlice(stagedInput, stagedTileSlot, -1, stageCount, 0));
         }
 
         // The derived block size exists ONLY to make staging possible: it is chosen so a
@@ -910,9 +1022,12 @@ public sealed class PtxAffineEmitter
         LaunchBlockX = blockX;
         LaunchBlockY = blockY;
 
-        SharedMemoryBytes = stageCount * 4;
+        if (!twoDimensional)
+        {
+            SharedMemoryBytes = stageCount * 4;
+            StagedOperands = stagedInput < 0 ? "none" : spec.Inputs[stagedInput].Name;
+        }
         LaunchBlockThreads = blockThreads;
-        StagedOperands = stagedInput < 0 ? "none" : spec.Inputs[stagedInput].Name;
 
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
@@ -1101,18 +1216,30 @@ public sealed class PtxAffineEmitter
         // Stage the block-invariant operand for THIS strip-mine step. Inside a loop this
         // re-runs per iteration, which is required: the staged slice depends on the loop
         // counter.
-        if (stagedInput >= 0 && sharedBase != null)
+        if (stagedSlices.Count > 0 && sharedBase != null)
         {
-            var b = spec.Inputs[stagedInput];
             long innerTripsNow = 1;
             foreach (int ax in reduction) innerTripsNow *= axes[ax].Extent;
 
-            EmitStageLoad(
-                b, basePtr[b.ParameterIndex], sharedBase, tid,
-                stagedTileSlot >= 0 ? tileAxes[stagedTileSlot] : -1,
-                stagedTileSlot >= 0 ? axisReg[tileAxes[stagedTileSlot]] : null!,
-                stagedTileSlot >= 0 ? tileFactors[stagedTileSlot] : 1,
-                reduction, axes, axisReg, stageCount, (int)innerTripsNow);
+            foreach (var slice in stagedSlices)
+            {
+                var b = spec.Inputs[slice.Input];
+                string sliceBase = sharedBase;
+                if (slice.ByteOffset != 0)
+                {
+                    sliceBase = NextRd();
+                    L($"add.u64 {sliceBase}, {sharedBase}, {I(slice.ByteOffset)};");
+                }
+
+                EmitStageLoad(
+                    b, basePtr[b.ParameterIndex], sliceBase, tid,
+                    slice.TileSlot >= 0 ? tileAxes[slice.TileSlot] : -1,
+                    slice.TileSlot >= 0 ? axisReg[tileAxes[slice.TileSlot]] : null!,
+                    slice.TileSlot >= 0 ? tileFactors[slice.TileSlot] : 1,
+                    reduction, axes, axisReg, slice.Count, (int)innerTripsNow,
+                    coversAxisFromZero: slice.Dimension >= 0,
+                    blockThreads: LaunchBlockThreads);
+            }
         }
 
         // Decide, before emitting anything, which product operands can be read with a
@@ -1146,6 +1273,29 @@ public sealed class PtxAffineEmitter
         // sharing one cache let trip 1 reuse trip 0's vector and silently corrupted
         // both 1x1 kernels while their neighbours stayed exact.
         var reductionVectorCache = new Dictionary<string, string[]>(StringComparer.Ordinal);
+
+        // Per-thread base for each dimension-keyed slice, hoisted once. The block
+        // coordinate is the only runtime term in a staged read, so lifting it here keeps
+        // every consumer at a constant offset.
+        var sliceBaseCache = new Dictionary<int, string>();
+        string SliceBase(StagedSlice slice, long tileTripsForBase)
+        {
+            if (sliceBaseCache.TryGetValue(slice.Input, out string? cached)) return cached;
+
+            int stride = (int)(tileFactors[slice.TileSlot] * tileTripsForBase * 4);
+            string scaled = NextRd();
+            L($"mul.wide.u32 {scaled}, {axisReg[tileAxes[slice.TileSlot]]}, {I(stride)};");
+            string result = NextRd();
+            L($"add.u64 {result}, {sharedBase}, {scaled};");
+            if (slice.ByteOffset != 0)
+            {
+                string shifted = NextRd();
+                L($"add.u64 {shifted}, {result}, {I(slice.ByteOffset)};");
+                result = shifted;
+            }
+            sliceBaseCache[slice.Input] = result;
+            return result;
+        }
 
         for (long t = 0; t < trips; t++)
         {
@@ -1231,16 +1381,33 @@ public sealed class PtxAffineEmitter
                         }
                         value = rvec[reductionValues[innermost] % vectorGroup];
                     }
-                    else if (inputIdx == stagedInput && sharedBase != null)
+                    else if (sharedBase != null && SliceFor(stagedSlices, inputIdx) is { } slice)
                     {
-                        // Resident in shared memory. Both coordinates are compile-time
-                        // constants here, so this is a constant-offset ld.shared with no
-                        // address arithmetic at the point of use.
-                        int laneOffset = stagedTileSlot >= 0 ? laneOffsets[l][stagedTileSlot] : 0;
-                        long slotIndex = laneOffset * trips + t;
-                        string sharedAddr = NextRd();
+                        // Resident in shared memory.
+                        int laneOffset = slice.TileSlot >= 0 ? laneOffsets[l][slice.TileSlot] : 0;
                         string loaded = NextF();
-                        L($"add.u64 {sharedAddr}, {sharedBase}, {I(slotIndex * 4)};");
+                        string sharedAddr = NextRd();
+
+                        if (slice.Dimension < 0)
+                        {
+                            // Block-invariant: both coordinates are compile-time constants,
+                            // so this is a constant-offset ld.shared with no address
+                            // arithmetic at the point of use.
+                            long slotIndex = laneOffset * trips + t;
+                            L($"add.u64 {sharedAddr}, {sharedBase}, {I(slice.ByteOffset + slotIndex * 4)};");
+                        }
+                        else
+                        {
+                            // Keyed by a block dimension. The slice spans the whole axis, so
+                            // the element is at (blockCoord * tileFactor + lane) * trips + t.
+                            // Only the blockCoord term is a runtime value, and it is hoisted
+                            // once per thread, so this stays a constant offset from a
+                            // per-thread base.
+                            string sliceBase = SliceBase(slice, tileTripsForBase: trips);
+                            long constant = (laneOffset * (long)trips + t) * 4;
+                            L($"add.u64 {sharedAddr}, {sliceBase}, {I(constant)};");
+                        }
+
                         L($"ld.shared.f32 {loaded}, [{sharedAddr}];");
                         value = loaded;
                     }
@@ -1304,7 +1471,7 @@ public sealed class PtxAffineEmitter
             for (int l = 0; l < lanes; l++)
                 if (!string.Equals(accs[l], accsFixed[l], StringComparison.Ordinal))
                     L($"mov.f32 {accsFixed[l]}, {accs[l]};");
-            if (stagedInput >= 0) L("bar.sync 0;");
+            if (stagedSlices.Count > 0) L("bar.sync 0;");
             for (int i = loopAxes.Length - 1; i >= 0; i--)
             {
                 string cont = NextP();
