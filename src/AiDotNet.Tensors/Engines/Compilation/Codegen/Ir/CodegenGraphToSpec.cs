@@ -137,6 +137,15 @@ public static class CodegenGraphToSpec
                 reduce = CodegenReduceKind.Sum;
                 break;
 
+            case CodegenOpKind.Conv2D:
+            case CodegenOpKind.DepthwiseConv2D:
+            case CodegenOpKind.ConvTranspose2D:
+                if (!TryBuildConv2D(graph, core, outShape, operands,
+                        out axes!, out operandMaps!, out outputMap!, out declineReason))
+                    return false;
+                reduce = CodegenReduceKind.Sum;
+                break;
+
             case CodegenOpKind.ReduceSum:
             case CodegenOpKind.ReduceMax:
                 if (!TryBuildReduce(graph, core, outShape, operands,
@@ -283,6 +292,146 @@ public static class CodegenGraphToSpec
         operands.Add(core.Inputs[1]);
         operandMaps = new[] { aMap.ToArray(), bMap.ToArray() };
         outputMap = oMap.ToArray();
+        return true;
+    }
+
+    // ---- Convolution.
+    //
+    // A convolution is a reduction whose operand maps are WINDOWED: the input is read at
+    // `oh*stride + kh - pad` rather than at `oh`. The index-map layer has expressed that
+    // since the catalog was written, and CodegenAdjoint derives the backward maps from
+    // it; what was missing was any way for a GRAPH to ask for one, which is why the
+    // measured convolution kernels were unreachable from the front end.
+    //
+    // Dense:      out[n,k,oh,ow] = sum_{c,kh,kw} in[n,c,W(oh,kh),W(ow,kw)] * w[k,c,kh,kw]
+    // Depthwise:  out[n,c,oh,ow] = sum_{kh,kw}   in[n,c,W(oh,kh),W(ow,kw)] * w[c,kh,kw]
+    // Transposed: the same with TransposedWindow, which is the adjoint window.
+    private static bool TryBuildConv2D(
+        CodegenGraph graph, CodegenNode core, int[] outShape, List<int> operands,
+        out CodegenAxis[]? axes, out CodegenAffineExpr[][]? operandMaps,
+        out CodegenAffineExpr[]? outputMap, out string reason)
+    {
+        axes = null; operandMaps = null; outputMap = null; reason = string.Empty;
+
+        if (core.Inputs.Length != 2)
+        {
+            reason = core.Op + " needs an input and a weight operand, got " + core.Inputs.Length;
+            return false;
+        }
+        if (core.Attribute is not CodegenConvAttributes conv)
+        {
+            reason = core.Op + " carries no CodegenConvAttributes, so its stride and " +
+                     "padding are unknown; guessing them would silently change the operator";
+            return false;
+        }
+        conv.Validate();
+
+        bool depthwise = core.Op == CodegenOpKind.DepthwiseConv2D;
+        bool transposed = core.Op == CodegenOpKind.ConvTranspose2D;
+
+        int[] inShape = graph[core.Inputs[0]].Shape;
+        int[] wShape = graph[core.Inputs[1]].Shape;
+        if (inShape.Length != 4 || outShape.Length != 4)
+        {
+            reason = core.Op + " expects NCHW operands; got input rank " + inShape.Length +
+                     " and output rank " + outShape.Length;
+            return false;
+        }
+        if (wShape.Length != (depthwise ? 3 : 4))
+        {
+            reason = core.Op + " expects a rank-" + (depthwise ? 3 : 4) +
+                     " weight tensor, got rank " + wShape.Length;
+            return false;
+        }
+
+        int n = inShape[0], inChannels = inShape[1], inH = inShape[2], inW = inShape[3];
+        int outChannels = outShape[1], outH = outShape[2], outW = outShape[3];
+        int tapH = depthwise ? wShape[1] : wShape[2];
+        int tapW = depthwise ? wShape[2] : wShape[3];
+
+        if (outShape[0] != n)
+        {
+            reason = "batch differs between input (" + n + ") and output (" + outShape[0] + ")";
+            return false;
+        }
+        if (depthwise && (inChannels != outChannels || wShape[0] != inChannels))
+        {
+            reason = "a depthwise convolution keeps one filter per channel, so input (" +
+                     inChannels + "), weights (" + wShape[0] + ") and output (" +
+                     outChannels + ") must agree on the channel count";
+            return false;
+        }
+        if (!depthwise && (wShape[0] != outChannels || wShape[1] != inChannels))
+        {
+            reason = "weights are [K,C,kh,kw] and must match the output channels (" +
+                     outChannels + " vs " + wShape[0] + ") and input channels (" +
+                     inChannels + " vs " + wShape[1] + ")";
+            return false;
+        }
+
+        // The declared output must be the one this geometry produces. Emitting against a
+        // mismatched extent would read a shifted window and still run.
+        int wantH = transposed
+            ? CodegenConvAttributes.TransposedExtent(inH, tapH, conv.StrideHeight, conv.PadHeight)
+            : CodegenConvAttributes.ForwardExtent(inH, tapH, conv.StrideHeight, conv.PadHeight);
+        int wantW = transposed
+            ? CodegenConvAttributes.TransposedExtent(inW, tapW, conv.StrideWidth, conv.PadWidth)
+            : CodegenConvAttributes.ForwardExtent(inW, tapW, conv.StrideWidth, conv.PadWidth);
+        if (wantH != outH || wantW != outW)
+        {
+            reason = "declared output " + outH + "x" + outW + " does not match the " +
+                     wantH + "x" + wantW + " this stride and padding produce";
+            return false;
+        }
+
+        // Axis numbering: n, kOut, oh, ow parallel; then kh, kw and (dense only) c reduce.
+        const int N = 0, KOUT = 1, OH = 2, OW = 3, KH = 4, KW = 5, C = 6;
+        var built = new List<CodegenAxis>
+        {
+            CodegenAxis.Parallel("n", n),
+            CodegenAxis.Parallel(depthwise ? "c" : "k", outChannels),
+            CodegenAxis.Parallel("oh", outH),
+            CodegenAxis.Parallel("ow", outW),
+            CodegenAxis.Reduce("kh", tapH),
+            CodegenAxis.Reduce("kw", tapW),
+        };
+        if (!depthwise) built.Add(CodegenAxis.Reduce("c", inChannels));
+
+        CodegenAffineExpr Row() => transposed
+            ? CodegenAffineExpr.TransposedWindow(OH, KH, conv.StrideHeight, conv.PadHeight)
+            : CodegenAffineExpr.Window(OH, KH, conv.StrideHeight, conv.PadHeight);
+        CodegenAffineExpr Col() => transposed
+            ? CodegenAffineExpr.TransposedWindow(OW, KW, conv.StrideWidth, conv.PadWidth)
+            : CodegenAffineExpr.Window(OW, KW, conv.StrideWidth, conv.PadWidth);
+
+        var inputMap = new[]
+        {
+            CodegenAffineExpr.Axis(N),
+            CodegenAffineExpr.Axis(depthwise ? KOUT : C),
+            Row(), Col(),
+        };
+
+        var weightMap = depthwise
+            ? new[]
+            {
+                CodegenAffineExpr.Axis(KOUT),
+                CodegenAffineExpr.Axis(KH), CodegenAffineExpr.Axis(KW),
+            }
+            : new[]
+            {
+                CodegenAffineExpr.Axis(KOUT), CodegenAffineExpr.Axis(C),
+                CodegenAffineExpr.Axis(KH), CodegenAffineExpr.Axis(KW),
+            };
+
+        operands.Add(core.Inputs[0]);
+        operands.Add(core.Inputs[1]);
+        axes = built.ToArray();
+        operandMaps = new[] { inputMap, weightMap };
+        outputMap = new[]
+        {
+            CodegenAffineExpr.Axis(N), CodegenAffineExpr.Axis(KOUT),
+            CodegenAffineExpr.Axis(OH), CodegenAffineExpr.Axis(OW),
+        };
         return true;
     }
 

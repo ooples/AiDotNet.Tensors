@@ -136,6 +136,29 @@ internal static class FrontEndCheckTool
         yield return ("linear: matmul+bias+relu 256x128x64", Linear(256, 128, 64));
         yield return ("reduce-sum [512,256] over axis 1", Reduce(CodegenOpKind.ReduceSum, 512, 256));
         yield return ("reduce-max [512,256] over axis 1", Reduce(CodegenOpKind.ReduceMax, 512, 256));
+
+        // Convolutions. Until CodegenOpKind gained these, the thirteen catalog kernels
+        // that carry every measured win on this branch were reachable only as
+        // hand-written specs -- no graph could ask for one.
+        yield return ("depthwise 3x3 + bias + relu (the bake-off kernel)",
+            CodegenLowering.LowerConv2D<float>(CodegenOpKind.DepthwiseConv2D,
+                new[] { 4, 32, 28, 28 }, new[] { 32, 3, 3 },
+                CodegenConvAttributes.Same3x3, withBias: true, withRelu: true));
+
+        yield return ("dense 1x1 + bias + relu",
+            CodegenLowering.LowerConv2D<float>(CodegenOpKind.Conv2D,
+                new[] { 4, 32, 28, 28 }, new[] { 32, 32, 1, 1 },
+                CodegenConvAttributes.Valid, withBias: true, withRelu: true));
+
+        yield return ("dense 3x3 + bias + relu",
+            CodegenLowering.LowerConv2D<float>(CodegenOpKind.Conv2D,
+                new[] { 2, 16, 28, 28 }, new[] { 16, 16, 3, 3 },
+                CodegenConvAttributes.Same3x3, withBias: true, withRelu: true));
+
+        yield return ("conv-transpose 3x3 stride 2",
+            CodegenLowering.LowerConv2D<float>(CodegenOpKind.ConvTranspose2D,
+                new[] { 2, 16, 16, 16 }, new[] { 16, 16, 3, 3 },
+                new CodegenConvAttributes(2, 2, 1, 1)));
     }
 
     private static int Load(CodegenGraph g, int[] shape) =>
