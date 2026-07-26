@@ -1,0 +1,111 @@
+# Reductions reach the front end
+
+## What was missing
+
+FE-1 connected `CodegenGraph` to `CodegenKernelSpec`, but the translator recognised only
+elementwise chains: `ReLU`, `Add`-as-bias, `Mul`-as-product, `LoadInput`. Every other op
+declined.
+
+That excluded every **reduction** — so every `MatMul`, so every linear layer. The PTX path
+was reachable end to end only for fusion chains, and it declined on the shape that carries
+most of the arithmetic in a real model.
+
+The exclusion was not a missing feature in the spec. `CodegenKernelSpec` already expresses
+
+```
+out = activation( reduce(product of operands) + bias ) * scale
+```
+
+and `C[m,n] = sum_k A[m,k] * B[k,n]` is exactly that: a product of two operands summed over
+one axis. What a matmul needs beyond a pointwise chain is only the **index maps** — which
+is the thing the spec was built to carry. The translator simply never derived them.
+
+## What now translates
+
+| graph form | spec form |
+|---|---|
+| `MatMul`, `MatMulTransposeA`, `MatMulTransposeB` | axes `m, n` parallel + `k` reduce, `Sum` |
+| `BatchMatMul` | axes `b, m, n` parallel + `k` reduce, `Sum` |
+| `ReduceSum` / `ReduceMax` over an axes attribute | reduced axes become `Reduce`, kept stay `Parallel` |
+| any of the above + `Add` bias + `ReLU` | one fused spec |
+
+A transpose variant changes one index map and nothing else — the point of expressing
+operands as maps rather than baking strides into the emitter.
+
+**Broadcast is derived, not guessed.** An operand right-aligned against the output reads
+the output's own axis where extents match and `Const(0)` where its extent is one. That is
+what lets a `[N]` bias fuse into an `[M,N]` matmul instead of declining. A dimension that
+is neither matching nor one is refused, because stretching it would be an invention.
+
+## What still declines, and why
+
+| form | reason |
+|---|---|
+| `ReduceMean` | the spec scales by a **tensor**, not by `1/n`; returning a sum would be silently wrong |
+| `ReduceMin` | `CodegenReduceKind` has `Sum` and `Max` only |
+| full reduction to a scalar | every axis reduced leaves no parallel axis at all |
+| operand shapes that do not contract | refused rather than emitted against a wrong `k` |
+| `Add` of two computed values | that is an elementwise add of two subgraphs, not a bias |
+
+Declining with a reason is the rule the emitter already follows for index maps: a
+translator that quietly mis-lowers is worse than one that refuses.
+
+## How it is checked
+
+A wrong translation is *easy to make and hard to see*: swap two axes in an index map and
+the kernel computes `A · Bᵀ`, at full speed, silently. Emitting PTX proves nothing about
+that. So there are two gates, and they check different things.
+
+**`CodegenGraphReductionTests`** — the translated spec's own fp64 interpretation against an
+independent hand-written triple loop, for every matmul variant, batched matmul, the fused
+linear layer, and both reduction kinds. This is what catches a swapped axis.
+
+**`--frontend-check`** — graph → PTX → device, compared against a reference. The `ref`
+column says which reference, and the distinction is load-bearing:
+
+```
+graph                                  elements       rel dev   ref   result
+relu (LowerUnaryPointwise)                16,384    0.000E+000  cpu     PASS
+mul (LowerBinaryPointwise)                16,384    0.000E+000  cpu     PASS
+mul+add+relu (hand-built chain)           16,384    0.000E+000  cpu     PASS
+matmul 128x96x64                           8,192    0.000E+000  fp64    PASS
+matmul A-transposed 128x96x64              8,192    0.000E+000  fp64    PASS
+matmul B-transposed 128x96x64              8,192    0.000E+000  fp64    PASS
+linear: matmul+bias+relu 256x128x64       16,384    0.000E+000  fp64    PASS
+reduce-sum [512,256] over axis 1             512    0.000E+000  fp64    PASS
+reduce-max [512,256] over axis 1             512    0.000E+000  fp64    PASS
+
+front end: 9 passed, 0 failed
+```
+
+- `cpu` — the CPU emitter on the *same graph*. It shares nothing with the PTX translator,
+  so it checks translation and emission together.
+- `fp64` — the translated spec's own interpretation. It checks the **emitter against the
+  spec**, and *not* the spec against the graph. A translator that swapped two axes would
+  pass this. The unit tests above are what cover that gap.
+
+The tool prints the reason the stronger reference was unavailable rather than falling back
+silently:
+
+```
+    no CPU reference from CpuAvx512: AVX-512F is not available on this CPU.
+    no CPU reference from CpuDotNetJit: Phase B CPU emitter does not yet handle Matmul ops (found MatMul).
+```
+
+Which surfaces something worth knowing: **no CPU emitter in this codebase handles matmul or
+reductions at all.** For these forms the PTX path is not the fast path, it is the only
+path — and there is consequently no independent same-graph reference to check it against
+on any machine, AVX-512 or not.
+
+## Still not done
+
+- **Convolution has no op kind in this IR.** `CodegenOpKind` has no `Conv2D`; convolutions
+  arrive as `Opaque` or not at all. So the 13 catalog kernels — which carry the measured
+  wins — remain hand-built specs that no graph can produce. Reaching them needs a
+  convolution op in the IR and `CodegenLowering` producing it, not another case in this
+  translator.
+- **Split plans are not launched.** `CodegenSplitReduction.TryPlan` returns the two
+  kernels and the temporary size, and nothing calls it from the execution path. Matmul and
+  reduction graphs are exactly the shapes that need it — see `SPLIT_K_REDUCTION.md`.
+- **`ReduceMean` and `ReduceMin`** need a scalar-scale epilogue and a `Min` reduce kind
+  respectively; both are small spec additions rather than translator work.

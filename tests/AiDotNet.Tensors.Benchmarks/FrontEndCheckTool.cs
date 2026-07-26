@@ -33,7 +33,7 @@ internal static class FrontEndCheckTool
         Console.WriteLine("FRONT-END CHECK - graph -> PTX -> device, against the CPU emitter");
         Console.WriteLine("protocol " + CodegenMeasurementProtocol.Tag);
         Console.WriteLine();
-        Console.WriteLine("graph                                  elements   max abs dev   result");
+        Console.WriteLine("graph                                  elements       rel dev   ref   result");
 
         int passed = 0, failed = 0;
         foreach (var (label, graph) in Graphs())
@@ -55,8 +55,16 @@ internal static class FrontEndCheckTool
         Console.WriteLine("front end: " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
         Console.WriteLine();
-        Console.WriteLine("A pass means a graph the engine's own lowering produces was executed by");
-        Console.WriteLine("our generated PTX and agreed with the CPU emitter on the same graph.");
+        Console.WriteLine("A pass means a graph the engine's own lowering produces was executed by our");
+        Console.WriteLine("generated PTX and agreed with a reference. The 'ref' column says which:");
+        Console.WriteLine();
+        Console.WriteLine("  cpu   the CPU emitter on the SAME graph. Shares nothing with the PTX");
+        Console.WriteLine("        translator, so it checks the translation and the emission together.");
+        Console.WriteLine("  fp64  the translated spec's own fp64 interpretation. Checks the EMITTER");
+        Console.WriteLine("        against the spec, and NOT the spec against the graph -- a translator");
+        Console.WriteLine("        that swapped two axes would pass this. The reduction forms are");
+        Console.WriteLine("        checked against independent hand-written contractions in");
+        Console.WriteLine("        CodegenGraphReductionTests instead; that is what covers the gap.");
     }
 
     private static IEnumerable<(string Label, CodegenGraph Graph)> Graphs()
@@ -68,6 +76,59 @@ internal static class FrontEndCheckTool
             CodegenLowering.LowerBinaryPointwise<float>(CodegenOpKind.Mul, new[] { 8, 2048 }));
 
         yield return ("mul+add+relu (hand-built chain)", MulAddRelu(16384));
+
+        // Reductions: these all DECLINED before the front end learned index maps, which
+        // meant no matmul -- and so no linear layer -- could reach the PTX path at all.
+        yield return ("matmul 128x96x64", MatMul(CodegenOpKind.MatMul, 128, 96, 64));
+        yield return ("matmul A-transposed 128x96x64", MatMul(CodegenOpKind.MatMulTransposeA, 128, 96, 64));
+        yield return ("matmul B-transposed 128x96x64", MatMul(CodegenOpKind.MatMulTransposeB, 128, 96, 64));
+        yield return ("linear: matmul+bias+relu 256x128x64", Linear(256, 128, 64));
+        yield return ("reduce-sum [512,256] over axis 1", Reduce(CodegenOpKind.ReduceSum, 512, 256));
+        yield return ("reduce-max [512,256] over axis 1", Reduce(CodegenOpKind.ReduceMax, 512, 256));
+    }
+
+    private static int Load(CodegenGraph g, int[] shape) =>
+        g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, shape));
+
+    private static CodegenGraph MatMul(CodegenOpKind op, int m, int k, int n)
+    {
+        var g = new CodegenGraph();
+        int a = Load(g, op == CodegenOpKind.MatMulTransposeA ? new[] { k, m } : new[] { m, k });
+        int b = Load(g, op == CodegenOpKind.MatMulTransposeB ? new[] { n, k } : new[] { k, n });
+        int mm = g.AddNode(new CodegenNode(op, new[] { a, b },
+            CodegenElementType.Float32, new[] { m, n }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { mm },
+            CodegenElementType.Float32, new[] { m, n }));
+        return g;
+    }
+
+    private static CodegenGraph Linear(int m, int k, int n)
+    {
+        var g = new CodegenGraph();
+        int a = Load(g, new[] { m, k });
+        int w = Load(g, new[] { k, n });
+        int bias = Load(g, new[] { n });
+        int mm = g.AddNode(new CodegenNode(CodegenOpKind.MatMul, new[] { a, w },
+            CodegenElementType.Float32, new[] { m, n }));
+        int add = g.AddNode(new CodegenNode(CodegenOpKind.Add, new[] { mm, bias },
+            CodegenElementType.Float32, new[] { m, n }));
+        int relu = g.AddNode(new CodegenNode(CodegenOpKind.ReLU, new[] { add },
+            CodegenElementType.Float32, new[] { m, n }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { relu },
+            CodegenElementType.Float32, new[] { m, n }));
+        return g;
+    }
+
+    private static CodegenGraph Reduce(CodegenOpKind op, int rows, int cols)
+    {
+        var g = new CodegenGraph();
+        int x = Load(g, new[] { rows, cols });
+        int r = g.AddNode(new CodegenNode(op, new[] { x },
+            CodegenElementType.Float32, new[] { rows }, new[] { 1 }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { r },
+            CodegenElementType.Float32, new[] { rows }));
+        return g;
     }
 
     private static CodegenGraph MulAddRelu(int n)
@@ -108,26 +169,46 @@ internal static class FrontEndCheckTool
         var spec = gpu.LastSpec!;
         long count = spec.Output.ElementCount;
 
-        // Deterministic inputs, so a failure is reproducible.
+        // Operands are sized from their OWN bindings, not from the output. They coincide
+        // only for pointwise kernels; a matmul's A, B and bias are three different sizes.
         int operands = spec.Inputs.Count;
         var host = new float[operands][];
+        var wide = new double[operands][];
         for (int i = 0; i < operands; i++)
         {
-            host[i] = new float[count];
-            for (long e = 0; e < count; e++)
-                host[i][e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+            long size = spec.Inputs[i].ElementCount;
+            host[i] = new float[size];
+            wide[i] = new double[size];
+            for (long e = 0; e < size; e++)
+            {
+                double v = (((e * 37 + i * 101) % 97) - 48) / 64.0;
+                host[i][e] = (float)v;
+                wide[i][e] = v;
+            }
         }
 
-        // --- CPU emitter, the existing reference for this graph.
-        var cpuKernel = CodegenDispatcher.TryEmitCpu(graph, CodegenElementType.Float32);
-        if (cpuKernel is null)
+        // --- The reference. The CPU emitter running the SAME graph is the stronger one,
+        // because it shares nothing with the translator; when it cannot take the graph,
+        // fall back to the spec's own fp64 interpretation and SAY SO, since that only
+        // checks the emitter against the spec, not the spec against the graph.
+        string reference;
+        double[] want;
+        var cpuKernel = CodegenDispatcher.TryEmitCpu(
+            graph, CodegenElementType.Float32, out var cpuDeclines);
+        if (cpuKernel is not null)
         {
-            Console.WriteLine(label.PadRight(38) + "        -             -   NO CPU REF");
-            return false;
+            var cpuOut = new float[1][];
+            cpuOut[0] = new float[count];
+            cpuKernel.Execute<float>(host, cpuOut);
+            want = new double[count];
+            for (long e = 0; e < count; e++) want[e] = cpuOut[0][e];
+            reference = "cpu";
         }
-        var cpuOut = new float[1][];
-        cpuOut[0] = new float[count];
-        cpuKernel.Execute<float>(host, cpuOut);
+        else
+        {
+            want = spec.Interpret(wide);
+            reference = "fp64";
+        }
 
         // --- our PTX, on the device.
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
@@ -141,7 +222,7 @@ internal static class FrontEndCheckTool
             var pointers = new IntPtr[spec.ParameterCount];
             for (int i = 0; i < operands; i++)
             {
-                var buffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+                var buffer = runtime.AllocateBytes((nuint)(host[i].Length * sizeof(float)));
                 buffer.Upload<float>(host[i]);
                 buffers.Add(buffer);
                 pointers[i] = buffer.Pointer;
@@ -156,15 +237,30 @@ internal static class FrontEndCheckTool
             var gpuOut = new float[count];
             outBuffer.Download<float>(gpuOut);
 
-            double worst = 0;
+            double worst = 0, scale = 0;
             for (long e = 0; e < count; e++)
-                worst = Math.Max(worst, Math.Abs(gpuOut[e] - cpuOut[0][e]));
+            {
+                worst = Math.Max(worst, Math.Abs(gpuOut[e] - want[e]));
+                scale = Math.Max(scale, Math.Abs(want[e]));
+            }
 
-            bool ok = worst <= 1e-6;
+            // A reduction accumulates, so the tolerance has to be relative to the result's
+            // own magnitude; an absolute 1e-6 would be a fp32 epsilon test, not a
+            // correctness test. Pointwise graphs still land on exact zero.
+            double deviation = scale > 0 ? worst / scale : worst;
+            bool ok = deviation <= 1e-6;
             Console.WriteLine(label.PadRight(38) +
                 count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
-                worst.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
-                (ok ? "PASS" : "FAIL").PadLeft(9));
+                deviation.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
+                "  " + reference.PadRight(5) +
+                (ok ? "PASS" : "FAIL").PadLeft(7));
+
+            // Say why the stronger reference was unavailable, rather than letting a
+            // weaker check pass as though it were the same one.
+            if (reference == "fp64")
+                foreach (var (target, why) in cpuDeclines)
+                    Console.WriteLine("    no CPU reference from " + target + ": " + why.Split('\n')[0]);
+
             return ok;
         }
         finally
