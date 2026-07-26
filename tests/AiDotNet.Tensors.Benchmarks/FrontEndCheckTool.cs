@@ -19,8 +19,31 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 internal static class FrontEndCheckTool
 {
+    /// <summary>
+    /// Whether timings may be reported. Correctness does not care what else is on the
+    /// GPU; a ratio does. Gating the whole check on an idle device would mean a busy box
+    /// could not verify anything, and reporting microseconds taken against a foreign
+    /// workload is worse than reporting none -- an earlier run of this tool produced a
+    /// 64 us ReLU and a 466 us 512-element reduction while another process held 84% of
+    /// the SMs, and those numbers meant nothing.
+    /// </summary>
+    private static bool _timingAllowed;
+
     internal static void Run()
     {
+        try
+        {
+            GpuBenchmarkEnvironment.RequireIdleGpu("frontend-check");
+            _timingAllowed = true;
+        }
+        catch (InvalidOperationException ex)
+        {
+            _timingAllowed = false;
+            Console.WriteLine();
+            Console.WriteLine("TIMINGS SUPPRESSED - " + ex.Message.Split('\n')[0]);
+            Console.WriteLine("Correctness still runs; contention changes speed, not answers.");
+        }
+
         using var runtime = new DirectPtxRuntime();
         if (!DirectPtxArchitecture.HasExperimentalConvolution(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
@@ -231,7 +254,10 @@ internal static class FrontEndCheckTool
             buffers.Add(outBuffer);
             pointers[operands] = outBuffer.Pointer;
 
-            Launch(module, fn, pointers, gpu.LastLaunchBlocks, gpu.LastLaunchBlockX, gpu.LastLaunchBlockY);
+            void LaunchSingle() => Launch(module, fn, pointers,
+                gpu.LastLaunchBlocks, gpu.LastLaunchBlockX, gpu.LastLaunchBlockY);
+
+            LaunchSingle();
             runtime.Synchronize();
 
             var gpuOut = new float[count];
@@ -249,17 +275,27 @@ internal static class FrontEndCheckTool
             // correctness test. Pointwise graphs still land on exact zero.
             double deviation = scale > 0 ? worst / scale : worst;
             bool ok = deviation <= 1e-6;
+            double singleUs = Measure(runtime.Synchronize, LaunchSingle);
             Console.WriteLine(label.PadRight(38) +
                 count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
                 deviation.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
                 "  " + reference.PadRight(5) +
-                (ok ? "PASS" : "FAIL").PadLeft(7));
+                (ok ? "PASS" : "FAIL").PadLeft(7) +
+                Us(singleUs) +
+                ("  " + gpu.LastLaunchBlocks + "blk x" +
+                 gpu.LastLaunchBlockX * gpu.LastLaunchBlockY).PadLeft(14));
 
             // Say why the stronger reference was unavailable, rather than letting a
             // weaker check pass as though it were the same one.
             if (reference == "fp64")
                 foreach (var (target, why) in cpuDeclines)
                     Console.WriteLine("    no CPU reference from " + target + ": " + why.Split('\n')[0]);
+
+            // The split route is an optimisation, so it is checked against the SAME
+            // reference rather than trusted. A two-kernel path through a temporary is
+            // exactly the shape that produces a fast wrong answer.
+            if (gpu.LastSplitProgram is { } split)
+                ok &= CheckSplit(runtime, label, split, spec, host, want);
 
             return ok;
         }
@@ -269,6 +305,145 @@ internal static class FrontEndCheckTool
             DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
         }
     }
+
+    /// <summary>
+    /// Runs the two-kernel split route and requires it to agree with the same reference
+    /// the single kernel was held to.
+    /// </summary>
+    private static bool CheckSplit(
+        DirectPtxRuntime runtime, string label, PtxSplitProgram split,
+        CodegenKernelSpec spec, float[][] host, double[] want)
+    {
+        var buffers = new List<DirectPtxBuffer>();
+        try
+        {
+            using var partialModule = runtime.LoadModule(split.PartialSource, allowExperimentalJitFallback: true);
+            using var combineModule = runtime.LoadModule(split.CombineSource, allowExperimentalJitFallback: true);
+            IntPtr partialFn = partialModule.GetFunction(split.PartialName, out _);
+            IntPtr combineFn = combineModule.GetFunction(split.CombineName, out _);
+
+            var plan = split.Plan;
+            long count = want.Length;
+
+            // The partial pass takes only the PRODUCT operands; the epilogue operands
+            // moved to the combine, so binding by position would feed it the bias.
+            var partialArgs = new IntPtr[plan.Partial.ParameterCount];
+            for (int i = 0; i < spec.ProductInputs.Count; i++)
+            {
+                int source = spec.ProductInputs[i];
+                var buffer = runtime.AllocateBytes((nuint)(host[source].Length * sizeof(float)));
+                buffer.Upload<float>(host[source]);
+                buffers.Add(buffer);
+                partialArgs[i] = buffer.Pointer;
+            }
+
+            var temp = runtime.AllocateBytes((nuint)(split.TempElements * sizeof(float)));
+            buffers.Add(temp);
+            partialArgs[partialArgs.Length - 1] = temp.Pointer;
+
+            var combineArgs = new IntPtr[plan.Combine.ParameterCount];
+            combineArgs[0] = temp.Pointer;
+            if (plan.Combine.BiasInput is { } bias)
+            {
+                int source = spec.BiasInput!.Value;
+                var buffer = runtime.AllocateBytes((nuint)(host[source].Length * sizeof(float)));
+                buffer.Upload<float>(host[source]);
+                buffers.Add(buffer);
+                combineArgs[bias] = buffer.Pointer;
+            }
+            if (plan.Combine.ScaleInput is { } scale)
+            {
+                int source = spec.ScaleInput!.Value;
+                var buffer = runtime.AllocateBytes((nuint)(host[source].Length * sizeof(float)));
+                buffer.Upload<float>(host[source]);
+                buffers.Add(buffer);
+                combineArgs[scale] = buffer.Pointer;
+            }
+
+            var outBuffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+            buffers.Add(outBuffer);
+            combineArgs[combineArgs.Length - 1] = outBuffer.Pointer;
+
+            void LaunchSplit()
+            {
+                Launch(partialModule, partialFn, partialArgs,
+                    split.PartialBlocks, split.PartialBlockX, split.PartialBlockY);
+                Launch(combineModule, combineFn, combineArgs,
+                    split.CombineBlocks, split.CombineBlockX, split.CombineBlockY);
+            }
+
+            LaunchSplit();
+            runtime.Synchronize();
+
+            var got = new float[count];
+            outBuffer.Download<float>(got);
+
+            double worst = 0, scale2 = 0;
+            for (long e = 0; e < count; e++)
+            {
+                worst = Math.Max(worst, Math.Abs(got[e] - want[e]));
+                scale2 = Math.Max(scale2, Math.Abs(want[e]));
+            }
+            double deviation = scale2 > 0 ? worst / scale2 : worst;
+            bool ok = deviation <= 1e-6;
+
+            // The emitter ADVERTISES this as the faster route, so the claim is measured
+            // rather than asserted. A split offered on a shape it does not help is a bug
+            // in the threshold, not a free option -- it costs a temporary and a launch.
+            double splitUs = Measure(runtime.Synchronize, LaunchSplit);
+
+            string axes = string.Join("+", plan.PromotedAxes);
+            Console.WriteLine(("  split on axis " + axes).PadRight(38) +
+                split.TempElements.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
+                deviation.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
+                "  split" + (ok ? "PASS" : "FAIL").PadLeft(7) +
+                Us(splitUs) +
+                ("  " + split.PartialBlocks + "+" + split.CombineBlocks + "blk").PadLeft(14));
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("  split                                      -             -   ERROR");
+            Console.WriteLine("    " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+            return false;
+        }
+        finally { foreach (var b in buffers) b.Dispose(); }
+    }
+
+    /// <summary>
+    /// Median of medians over three runs, the p4 shape at a smaller sample; NaN when a
+    /// foreign GPU workload makes the number meaningless.
+    /// </summary>
+    private static double Measure(Action synchronize, Action launch)
+    {
+        if (!_timingAllowed) return double.NaN;
+
+        const int Warmup = 20, Samples = 15, PerSample = 50;
+        double best = double.MaxValue;
+        for (int run = 0; run < 3; run++)
+        {
+            for (int i = 0; i < Warmup; i++) launch();
+            synchronize();
+
+            var samples = new double[Samples];
+            for (int i = 0; i < Samples; i++)
+            {
+                long start = System.Diagnostics.Stopwatch.GetTimestamp();
+                for (int k = 0; k < PerSample; k++) launch();
+                synchronize();
+                samples[i] = System.Diagnostics.Stopwatch.GetElapsedTime(start)
+                    .TotalMilliseconds / PerSample * 1000.0;
+            }
+            Array.Sort(samples);
+            best = Math.Min(best, samples[samples.Length / 2]);
+        }
+        return best;
+    }
+
+    /// <summary>Formats a timing, or blanks it when it was not measurable.</summary>
+    private static string Us(double value) => double.IsNaN(value)
+        ? "        -   "
+        : value.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) + " us";
 
     private static unsafe void Launch(
         DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)

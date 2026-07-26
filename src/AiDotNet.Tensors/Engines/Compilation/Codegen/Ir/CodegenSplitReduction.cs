@@ -120,9 +120,6 @@ public static class CodegenSplitReduction
 
         var chosen = new List<int>();
         if (spec.Reduce != CodegenReduceKind.Sum) return chosen;
-        if (spec.BiasInput.HasValue || spec.ScaleInput.HasValue ||
-            spec.Activation != CodegenActivationKind.None)
-            return chosen;
 
         // Four blocks per SM is the point past which latency is hidden; a kernel already
         // there does not need the extra launch or the temporary.
@@ -195,13 +192,6 @@ public static class CodegenSplitReduction
                 "Only a sum reduction splits: the combine pass has to be the same " +
                 "associative operation, and " + spec.Reduce + " is not summed partials.");
 
-        if (spec.BiasInput.HasValue || spec.ScaleInput.HasValue ||
-            spec.Activation != CodegenActivationKind.None)
-            throw new NotSupportedException(
-                "An epilogue cannot be split: bias, scale and activation apply once to " +
-                "the finished sum, and a partial pass would apply them to every partial. " +
-                "Split the epilogue-free operator and fuse the epilogue into the combine.");
-
         var axes = spec.Space.Axes;
         var promote = new List<int>();
         for (int i = 0; i < reductionAxes.Count; i++)
@@ -230,12 +220,18 @@ public static class CodegenSplitReduction
                 : axes[a];
         var partialSpace = new CodegenIterationSpace(partialAxes);
 
-        var partialInputs = new CodegenTensorBinding[spec.Inputs.Count];
-        for (int i = 0; i < spec.Inputs.Count; i++)
+        // Only the PRODUCT operands feed the partial pass. Bias, scale and activation
+        // apply once to the finished sum, so a partial pass that carried them would add
+        // the bias once per partial; they move to the combine instead. Binding only what
+        // the pass reads also keeps its parameter list free of unused pointers.
+        var partialInputs = new CodegenTensorBinding[spec.ProductInputs.Count];
+        var partialProduct = new int[spec.ProductInputs.Count];
+        for (int i = 0; i < spec.ProductInputs.Count; i++)
         {
-            var b = spec.Inputs[i];
+            var b = spec.Inputs[spec.ProductInputs[i]];
             partialInputs[i] = new CodegenTensorBinding(
-                b.ParameterIndex, b.Name, ToArray(b.Shape), ToArray(b.Map));
+                i, b.Name, ToArray(b.Shape), ToArray(b.Map));
+            partialProduct[i] = i;
         }
 
         int rank = spec.Output.Shape.Count;
@@ -253,14 +249,13 @@ public static class CodegenSplitReduction
         }
 
         var partialOutput = new CodegenTensorBinding(
-            spec.Output.ParameterIndex, "partial", partialShape, partialMap, isOutput: true);
+            partialInputs.Length, "partial", partialShape, partialMap, isOutput: true);
 
         // Promoting EVERY reduction axis is legitimate -- it materialises the product
         // and leaves all the summing to the combine pass -- but then the partial pass
         // has nothing left to reduce and must not claim it does.
         var partial = new CodegenKernelSpec(
-            spec.Name + "_partial", partialSpace, partialInputs, partialOutput,
-            ToArray(spec.ProductInputs),
+            spec.Name + "_partial", partialSpace, partialInputs, partialOutput, partialProduct,
             AnyReductionLeft(partialSpace) ? CodegenReduceKind.Sum : CodegenReduceKind.None);
 
         // ---- Pass 2: sum the partials over every promoted dimension.
@@ -274,19 +269,83 @@ public static class CodegenSplitReduction
         var combineInMap = new CodegenAffineExpr[rank + promote.Count];
         for (int d = 0; d < rank + promote.Count; d++) combineInMap[d] = CodegenAffineExpr.Axis(d);
 
-        var combineInput = new CodegenTensorBinding(
-            0, "partial", (int[])partialShape.Clone(), combineInMap);
+        var combineInputs = new List<CodegenTensorBinding>
+        {
+            new(0, "partial", (int[])partialShape.Clone(), combineInMap),
+        };
+
+        // The epilogue moves here. Its operands were indexed against the ORIGINAL axes,
+        // and the combine has its own, so their maps have to be rewritten rather than
+        // reused -- a bias that kept the original numbering would read a different axis
+        // and still emit.
+        var originalToCombine = new Dictionary<int, int>();
+        for (int d = 0; d < rank; d++)
+        {
+            var expr = spec.Output.Map[d];
+            if (expr.Terms.Count == 1 && expr.Terms[0].Coefficient == 1 &&
+                expr.Constant == 0 && expr.Divisor == 1)
+                originalToCombine[expr.Terms[0].Axis] = d;
+        }
+
+        int? combineBias = null, combineScale = null;
+        if (spec.BiasInput.HasValue)
+        {
+            combineBias = combineInputs.Count;
+            combineInputs.Add(Rebind(spec.Inputs[spec.BiasInput.Value],
+                combineInputs.Count, originalToCombine, "bias"));
+        }
+        if (spec.ScaleInput.HasValue)
+        {
+            combineScale = combineInputs.Count;
+            combineInputs.Add(Rebind(spec.Inputs[spec.ScaleInput.Value],
+                combineInputs.Count, originalToCombine, "scale"));
+        }
 
         var combineOutMap = new CodegenAffineExpr[rank];
         for (int d = 0; d < rank; d++) combineOutMap[d] = CodegenAffineExpr.Axis(d);
         var combineOutput = new CodegenTensorBinding(
-            1, spec.Output.Name, ToArray(spec.Output.Shape), combineOutMap, isOutput: true);
+            combineInputs.Count, spec.Output.Name, ToArray(spec.Output.Shape),
+            combineOutMap, isOutput: true);
 
         var combine = new CodegenKernelSpec(
-            spec.Name + "_combine", combineSpace, new[] { combineInput }, combineOutput,
-            new[] { 0 }, CodegenReduceKind.Sum);
+            spec.Name + "_combine", combineSpace, combineInputs.ToArray(), combineOutput,
+            new[] { 0 }, CodegenReduceKind.Sum,
+            biasInput: combineBias, scaleInput: combineScale, activation: spec.Activation);
 
         return (partial, combine);
+    }
+
+    /// <summary>
+    /// Rebinds an epilogue operand onto the combine pass's axes.
+    /// </summary>
+    /// <remarks>
+    /// Refuses anything it cannot translate exactly. An epilogue operand that referenced
+    /// a reduction axis of the original could not have been an epilogue in the first
+    /// place, and one whose map does not survive the renumbering would read the wrong
+    /// element at full speed.
+    /// </remarks>
+    private static CodegenTensorBinding Rebind(
+        CodegenTensorBinding binding, int parameterIndex,
+        Dictionary<int, int> originalToCombine, string role)
+    {
+        var map = new CodegenAffineExpr[binding.Map.Count];
+        for (int d = 0; d < binding.Map.Count; d++)
+        {
+            var expr = binding.Map[d];
+            var terms = new CodegenAffineTerm[expr.Terms.Count];
+            for (int t = 0; t < expr.Terms.Count; t++)
+            {
+                if (!originalToCombine.TryGetValue(expr.Terms[t].Axis, out int moved))
+                    throw new NotSupportedException(
+                        "The " + role + " reads axis " + expr.Terms[t].Axis + ", which the " +
+                        "combine pass does not carry, so the epilogue cannot move to it.");
+                terms[t] = new CodegenAffineTerm(moved, expr.Terms[t].Coefficient);
+            }
+            map[d] = new CodegenAffineExpr(
+                terms, expr.Constant, expr.Divisor, expr.RequiresExactDivision);
+        }
+        return new CodegenTensorBinding(
+            parameterIndex, binding.Name, ToArray(binding.Shape), map);
     }
 
     private static bool AnyReductionLeft(CodegenIterationSpace space)

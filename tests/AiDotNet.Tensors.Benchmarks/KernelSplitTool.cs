@@ -146,15 +146,22 @@ internal static class KernelSplitTool
             buffers.Add(directOut); buffers.Add(splitOut); buffers.Add(temp);
 
             var directArgs = new IntPtr[spec.ParameterCount];
-            var partialArgs = new IntPtr[partial.ParameterCount];
-            for (int i = 0; i < spec.Inputs.Count; i++)
-            {
-                directArgs[i] = inputPointers[i];
-                partialArgs[i] = inputPointers[i];
-            }
+            for (int i = 0; i < spec.Inputs.Count; i++) directArgs[i] = inputPointers[i];
             directArgs[spec.Inputs.Count] = directOut.Pointer;
-            partialArgs[partial.Inputs.Count] = temp.Pointer;
-            var combineArgs = new[] { temp.Pointer, splitOut.Pointer };
+
+            // The partial pass takes only the PRODUCT operands -- any epilogue moved to
+            // the combine -- so it is bound through ProductInputs, not by position.
+            var partialArgs = new IntPtr[partial.ParameterCount];
+            for (int i = 0; i < spec.ProductInputs.Count; i++)
+                partialArgs[i] = inputPointers[spec.ProductInputs[i]];
+            partialArgs[partialArgs.Length - 1] = temp.Pointer;
+
+            var combineArgs = new IntPtr[combine.ParameterCount];
+            combineArgs[0] = temp.Pointer;
+            if (combine.BiasInput is { } bias) combineArgs[bias] = inputPointers[spec.BiasInput!.Value];
+            if (combine.ScaleInput is { } scaleParam)
+                combineArgs[scaleParam] = inputPointers[spec.ScaleInput!.Value];
+            combineArgs[combineArgs.Length - 1] = splitOut.Pointer;
 
             void LaunchDirect() => Launch(directModule, directFn, directArgs,
                 direct.LaunchBlocks, (uint)direct.LaunchBlockX, (uint)direct.LaunchBlockY);

@@ -109,3 +109,50 @@ on any machine, AVX-512 or not.
   reduction graphs are exactly the shapes that need it — see `SPLIT_K_REDUCTION.md`.
 - **`ReduceMean` and `ReduceMin`** need a scalar-scale epilogue and a `Min` reduce kind
   respectively; both are small spec additions rather than translator work.
+
+## The split route is reachable from a graph
+
+`PtxGraphEmitter.LastSplitProgram` carries the two-kernel route when the single kernel
+would leave the device idle: both PTX texts, both launch configurations, and the size of
+the temporary between them. It is null when the single kernel already fills the device.
+
+Failure to build a split is silent and returns null. That is deliberate — the single
+kernel has already emitted and is correct, so a split that cannot be built costs
+performance, not correctness, and turning it into a decline would throw away a working
+kernel to report a missed optimisation.
+
+The epilogue moves to the combine pass. A partial pass carrying the bias would add it once
+per promoted position; refusing epilogues outright — which the first version did — would
+have excluded every linear layer, the most common reduction in a model. Bias and scale
+index maps are rewritten onto the combine's own axes, and anything that cannot be
+translated exactly is refused rather than reused under the wrong numbering.
+
+`--frontend-check` runs the split route on the device and holds it to the same reference
+as the single kernel, because a two-kernel path through a temporary is exactly the shape
+that produces a fast wrong answer. All routes agree at `0.000E+000`.
+
+## An open question: is the split faster at THESE sizes?
+
+It is not yet known, and the emitter should not be trusted on it.
+
+`ChooseAxes` offers a split whenever the kernel occupies fewer than four blocks per SM.
+That test says the device is **idle**; it does not say the kernel runs long enough for the
+extra launch and the temporary's round-trip to pay for themselves. The catalog kernels
+where the split won were 240–4063 µs unsplit. The front-end graphs here are far smaller,
+and for a kernel whose runtime is comparable to a launch, an extra launch is a guaranteed
+loss.
+
+A first attempt to measure this was **void**: another process held 84–98% of the SMs
+throughout, which produced a 64 µs 16K-element ReLU and a 466 µs 512-element reduction.
+Those numbers are discarded, not reported.
+
+The tool now separates the two concerns — correctness runs on a busy box, timings are
+suppressed with a printed reason:
+
+```
+TIMINGS SUPPRESSED - [frontend-check] Foreign GPU workload detected: pid=... sm=98%
+Correctness still runs; contention changes speed, not answers.
+```
+
+Re-measure on an idle GPU, and if the split does lose at these sizes, derive the size gate
+from the measured crossover rather than a guessed constant. Tracked as FE-6.

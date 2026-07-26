@@ -207,15 +207,44 @@ public class CodegenSplitReductionTests
     }
 
     /// <summary>
-    /// An epilogue cannot be split, and must be refused rather than applied once per
-    /// partial -- which would add the bias S times.
+    /// An epilogue must MOVE to the combine pass, not be applied once per partial -- which
+    /// would add the bias once for every promoted position -- and not be refused, since
+    /// refusing it would exclude every linear layer from the split.
     /// </summary>
     [Fact]
-    public void EpilogueOperator_IsRefused()
+    public void Epilogue_MovesToTheCombinePassAndKeepsTheAnswer()
     {
-        var withBias = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(2, 4, 8, 8);
-        Assert.Throws<NotSupportedException>(
-            () => CodegenSplitReduction.Split(withBias, withBias.Space.ReductionAxes[0]));
+        var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(2, 4, 8, 8);
+        var (partial, combine) = CodegenSplitReduction.Split(spec, spec.Space.ReductionAxes[0]);
+
+        // The partial pass computes the raw sum: no bias, no scale, no activation.
+        Assert.False(partial.BiasInput.HasValue);
+        Assert.False(partial.ScaleInput.HasValue);
+        Assert.Equal(CodegenActivationKind.None, partial.Activation);
+
+        // The combine carries them instead.
+        Assert.True(combine.BiasInput.HasValue);
+        Assert.Equal(spec.Activation, combine.Activation);
+
+        // And the two-pass answer still matches the one-pass answer.
+        var operands = new double[spec.Inputs.Count][];
+        for (int i = 0; i < spec.Inputs.Count; i++)
+            operands[i] = Fill(Elements(spec.Inputs[i].Shape), i + 1);
+
+        var partialOperands = new double[partial.Inputs.Count][];
+        for (int i = 0; i < partial.ProductInputs.Count; i++)
+            partialOperands[i] = operands[spec.ProductInputs[i]];
+
+        var combineOperands = new double[combine.Inputs.Count][];
+        combineOperands[0] = partial.Interpret(partialOperands);
+        combineOperands[combine.BiasInput!.Value] = operands[spec.BiasInput!.Value];
+
+        double[] direct = spec.Interpret(operands);
+        double[] staged = combine.Interpret(combineOperands);
+
+        Assert.Equal(direct.Length, staged.Length);
+        for (int i = 0; i < direct.Length; i++)
+            Assert.Equal(direct[i], staged[i], 9);
     }
 
     /// <summary>A max reduction has no summed-partial combine and must be refused.</summary>

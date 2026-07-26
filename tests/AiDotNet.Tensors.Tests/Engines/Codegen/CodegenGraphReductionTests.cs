@@ -275,6 +275,82 @@ public class CodegenGraphReductionTests
         Assert.Contains("ReduceMean", reason, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A reduction that cannot fill the device must reach the caller as a two-kernel
+    /// program, and a pointwise graph must not -- the split costs a temporary and a
+    /// launch, so offering it where it cannot help is not a free option.
+    /// </summary>
+    [Fact]
+    public void EmitterExposesTheSplitRouteOnlyWhereTheSingleKernelLeavesTheDeviceIdle()
+    {
+        var reduceGraph = new CodegenGraph();
+        int x = Load(reduceGraph, new[] { 512, 256 });
+        int r = reduceGraph.AddNode(new CodegenNode(CodegenOpKind.ReduceSum, new[] { x },
+            CodegenElementType.Float32, new[] { 512 }, new[] { 1 }));
+        Store(reduceGraph, r, new[] { 512 });
+
+        var reduceEmitter = new PtxGraphEmitter();
+        reduceEmitter.Emit(reduceGraph, CodegenElementType.Float32);
+
+        Assert.NotNull(reduceEmitter.LastSplitProgram);
+        var split = reduceEmitter.LastSplitProgram!;
+        Assert.Equal(512L * 256, split.TempElements);
+        Assert.Contains(".visible .entry", split.PartialSource, StringComparison.Ordinal);
+        Assert.Contains(".visible .entry", split.CombineSource, StringComparison.Ordinal);
+        Assert.NotEqual(split.PartialName, split.CombineName);
+        Assert.True(split.PartialBlocks > reduceEmitter.LastLaunchBlocks);
+
+        // A large pointwise graph already fills the device; splitting it is meaningless.
+        var pointwise = CodegenLowering.LowerUnaryPointwise<float>(
+            CodegenOpKind.ReLU, new[] { 64, 4096 });
+        var pointwiseEmitter = new PtxGraphEmitter();
+        pointwiseEmitter.Emit(pointwise, CodegenElementType.Float32);
+        Assert.Null(pointwiseEmitter.LastSplitProgram);
+    }
+
+    /// <summary>
+    /// A linear layer's epilogue must move to the combine pass. If it stayed on the
+    /// partial pass the bias would be added once per promoted position, and if it were
+    /// refused outright the most common reduction in a model could never split.
+    /// </summary>
+    [Fact]
+    public void SplitLinearLayer_MovesTheEpilogueToTheCombinePass()
+    {
+        const int M = 16, K = 64, N = 8;
+        var g = new CodegenGraph();
+        int a = Load(g, new[] { M, K });
+        int w = Load(g, new[] { K, N });
+        int bias = Load(g, new[] { N });
+        int mm = g.AddNode(new CodegenNode(CodegenOpKind.MatMul, new[] { a, w },
+            CodegenElementType.Float32, new[] { M, N }));
+        int add = g.AddNode(new CodegenNode(CodegenOpKind.Add, new[] { mm, bias },
+            CodegenElementType.Float32, new[] { M, N }));
+        int relu = g.AddNode(new CodegenNode(CodegenOpKind.ReLU, new[] { add },
+            CodegenElementType.Float32, new[] { M, N }));
+        Store(g, relu, new[] { M, N });
+
+        Assert.True(CodegenGraphToSpec.TryTranslate(g, "linear", out var spec, out string reason), reason);
+        var plan = CodegenSplitReduction.TryPlan(spec!);
+        Assert.NotNull(plan);
+
+        Assert.False(plan!.Partial.BiasInput.HasValue);
+        Assert.Equal(CodegenActivationKind.None, plan.Partial.Activation);
+        Assert.True(plan.Combine.BiasInput.HasValue);
+        Assert.Equal(CodegenActivationKind.ReLU, plan.Combine.Activation);
+
+        // And the two passes together still produce the one-pass answer.
+        double[] av = Fill((long)M * K, 11), wv = Fill((long)K * N, 12), bv = Fill(N, 13);
+        double[] partial = plan.Partial.Interpret(new[] { av, wv });
+
+        var combineOperands = new double[plan.Combine.Inputs.Count][];
+        combineOperands[0] = partial;
+        combineOperands[plan.Combine.BiasInput!.Value] = bv;
+
+        double[] want = spec!.Interpret(new[] { av, wv, bv });
+        double[] got = plan.Combine.Interpret(combineOperands);
+        for (int i = 0; i < want.Length; i++) Assert.Equal(want[i], got[i], 9);
+    }
+
     /// <summary>A translated reduction must emit, not merely translate.</summary>
     [Fact]
     public void TranslatedMatMulAndReduction_Emit()
