@@ -104,9 +104,9 @@ on any machine, AVX-512 or not.
   wins — remain hand-built specs that no graph can produce. Reaching them needs a
   convolution op in the IR and `CodegenLowering` producing it, not another case in this
   translator.
-- **Split plans are not launched.** `CodegenSplitReduction.TryPlan` returns the two
-  kernels and the temporary size, and nothing calls it from the execution path. Matmul and
-  reduction graphs are exactly the shapes that need it — see `SPLIT_K_REDUCTION.md`.
+- **The split's benefit at front-end sizes is unmeasured.** The route is built, emitted
+  and executed (see below), but whether it is *faster* on graphs this small is an open
+  question — the one attempt to measure it was contaminated. Tracked as FE-6.
 - **`ReduceMean` and `ReduceMin`** need a scalar-scale epilogue and a `Min` reduce kind
   respectively; both are small spec additions rather than translator work.
 
