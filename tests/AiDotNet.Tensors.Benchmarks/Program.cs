@@ -13,6 +13,82 @@ class Program
 
     static void Main(string[] args)
     {
+        // ---- The kernel conveyor and its gates.
+        //
+        // Three stages every generated kernel passes through, plus the tools that measure
+        // what a lowering is worth. See docs/KERNEL_CONVEYOR.md.
+        if (args.Length > 0 && args[0] == "--kernel-verify")
+        {
+            KernelConveyorTool.Run("verify", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-release")
+        {
+            KernelConveyorTool.Run("release", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-bench")
+        {
+            KernelConveyorTool.Run("bench", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-dump")
+        {
+            KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-once")
+        {
+            KernelConveyorTool.Run("once", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-predict")
+        {
+            KernelConveyorTool.Run("predict", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-vector-ab")
+        {
+            KernelConveyorTool.Run("vector-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-coarsen-ab")
+        {
+            KernelConveyorTool.Run("coarsen-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-autotune")
+        {
+            KernelAutotuneTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-splitk")
+        {
+            KernelSplitTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-limiter")
+        {
+            KernelLimiterTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--frontend-check")
+        {
+            FrontEndCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();

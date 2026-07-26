@@ -19,6 +19,7 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -34,12 +35,29 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+
+    /// <summary>
+    /// Benchmark-only access to generated convolution kernels, which have NOT passed
+    /// promotion.
+    /// </summary>
+    /// <remarks>
+    /// Defaults to false and is never set outside the kernel tools. The generated
+    /// convolution family is measured, not shipped: it wins on depthwise and loses to
+    /// cuDNN on dense 3x3 and on every weight gradient, so nothing dispatches to it. The
+    /// conveyor needs a way to load and run those kernels in order to produce that
+    /// evidence, and this is it.
+    /// </remarks>
+    internal static bool ConvolutionExperimentOverride { get; set; }
+
+    internal static bool IsConvolutionEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
 
     internal static bool IsEnabled => IsAttentionEnabled;
 

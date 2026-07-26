@@ -31,6 +31,19 @@ internal static class DirectPtxArchitecture
     };
 
     /// <summary>
+    /// The generated-kernel catalog is tuned for exactly one GA102/SM86 domain, so its
+    /// evidence claims nothing about any other SM.
+    /// </summary>
+    /// <remarks>
+    /// Every cost-model constant, register budget and tile choice in the index-map layer
+    /// was calibrated on this device. Admitting the wider Ampere family would run
+    /// lowerings that were never measured, which is how a launch geometry gets inherited
+    /// by a machine it does not suit.
+    /// </remarks>
+    internal static bool HasExperimentalConvolution(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The checked-in asynchronous attention implementation is an Ampere
     /// specialization. Other families must supply and benchmark their own
     /// implementation instead of silently inheriting Ampere's tuning.

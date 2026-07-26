@@ -1,0 +1,319 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// A complete, target-independent description of one conv-class kernel:
+// an iteration space, tensor bindings with index maps, and a reduce+epilogue body.
+//
+// This is the unit an emitter consumes. It carries a reference interpreter so a
+// spec's semantics can be validated on the CPU -- against the same fp64 oracle the
+// hand-written kernels are tested against -- BEFORE any backend exists and without
+// needing an idle GPU.
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+
+namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
+
+/// <summary>How the reduction axes are combined.</summary>
+public enum CodegenReduceKind
+{
+    /// <summary>No reduction axes; the body is a pure gather/copy.</summary>
+    None,
+
+    /// <summary>Sum of the operand product over the reduction axes.</summary>
+    Sum,
+
+    /// <summary>Maximum of the operand product over the reduction axes.</summary>
+    Max
+}
+
+/// <summary>Epilogue activation applied after bias and scale.</summary>
+public enum CodegenActivationKind
+{
+    /// <summary>No activation.</summary>
+    None,
+
+    /// <summary><c>max(x, 0)</c>.</summary>
+    ReLU
+}
+
+/// <summary>
+/// One kernel: iteration space + tensor bindings + a reduce-and-epilogue body.
+/// </summary>
+/// <remarks>
+/// <para>The body computes, for every point of the parallel iteration space:</para>
+/// <code>
+///   acc = REDUCE over reduction axes of ( product of ProductInputs )
+///   acc = acc + bias            (when BiasInput is set)
+///   acc = acc * scale           (when ScaleInput is set)
+///   out = activation(acc)
+/// </code>
+/// <para>
+/// That covers direct/depthwise/transposed convolution, im2col-style gathers
+/// (no reduction axes), and the fused bias/scale/ReLU epilogues -- i.e. the
+/// families where PyTorch must split the work because Inductor cannot fuse
+/// through cuDNN. It deliberately does NOT cover data-dependent indexing
+/// (deformable convolution's learned offsets); an emitter must reject those
+/// rather than mis-lower them.
+/// </para>
+/// </remarks>
+public sealed class CodegenKernelSpec
+{
+    private readonly CodegenTensorBinding[] _inputs;
+    private readonly int[] _productInputs;
+
+    /// <summary>Stable kernel name; becomes the emitted entry-point symbol.</summary>
+    public string Name { get; }
+
+    /// <summary>The axes this kernel iterates, and the authority on the launch grid.</summary>
+    public CodegenIterationSpace Space { get; }
+
+    /// <summary>Tensors the kernel reads.</summary>
+    public IReadOnlyList<CodegenTensorBinding> Inputs => _inputs;
+
+    /// <summary>The tensor the kernel writes.</summary>
+    public CodegenTensorBinding Output { get; }
+
+    /// <summary>Indices into <see cref="Inputs"/> whose loads are multiplied inside the reduction.</summary>
+    public IReadOnlyList<int> ProductInputs => _productInputs;
+
+    /// <summary>How the reduction axes combine.</summary>
+    public CodegenReduceKind Reduce { get; }
+
+    /// <summary>Optional index into <see cref="Inputs"/> added after the reduction.</summary>
+    public int? BiasInput { get; }
+
+    /// <summary>Optional index into <see cref="Inputs"/> multiplied after the bias.</summary>
+    public int? ScaleInput { get; }
+
+    /// <summary>Epilogue activation.</summary>
+    public CodegenActivationKind Activation { get; }
+
+    /// <summary>Creates a kernel spec and validates its internal consistency.</summary>
+    public CodegenKernelSpec(
+        string name,
+        CodegenIterationSpace space,
+        CodegenTensorBinding[] inputs,
+        CodegenTensorBinding output,
+        int[] productInputs,
+        CodegenReduceKind reduce,
+        int? biasInput = null,
+        int? scaleInput = null,
+        CodegenActivationKind activation = CodegenActivationKind.None)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
+        Name = name;
+        Space = space ?? throw new ArgumentNullException(nameof(space));
+        _inputs = inputs ?? throw new ArgumentNullException(nameof(inputs));
+        Output = output ?? throw new ArgumentNullException(nameof(output));
+        _productInputs = productInputs ?? throw new ArgumentNullException(nameof(productInputs));
+        Reduce = reduce;
+        BiasInput = biasInput;
+        ScaleInput = scaleInput;
+        Activation = activation;
+
+        if (_productInputs.Length == 0)
+            throw new ArgumentException("At least one operand must feed the body.", nameof(productInputs));
+        foreach (int i in _productInputs) Require(i, nameof(productInputs));
+        if (biasInput.HasValue) Require(biasInput.Value, nameof(biasInput));
+        if (scaleInput.HasValue) Require(scaleInput.Value, nameof(scaleInput));
+        if (!output.IsOutput)
+            throw new ArgumentException("Output binding must be marked IsOutput.", nameof(output));
+
+        bool hasReductionAxis = space.ReductionAxes.Length > 0;
+        if (hasReductionAxis && reduce == CodegenReduceKind.None)
+            throw new ArgumentException("Reduction axes declared but reduce kind is None.", nameof(reduce));
+        if (!hasReductionAxis && reduce != CodegenReduceKind.None)
+            throw new ArgumentException("Reduce kind declared but no reduction axis exists.", nameof(reduce));
+
+        // The output must be addressable from parallel axes only: a store that
+        // depended on a reduction axis would be written once per loop trip.
+        var reductionSet = new HashSet<int>(space.ReductionAxes);
+        for (int d = 0; d < output.Map.Count; d++)
+            foreach (var term in output.Map[d].Terms)
+                if (reductionSet.Contains(term.Axis))
+                    throw new ArgumentException(
+                        $"Output dimension {d} depends on reduction axis '{space.Axes[term.Axis].Name}'.", nameof(output));
+    }
+
+    private void Require(int inputIndex, string paramName)
+    {
+        if ((uint)inputIndex >= (uint)_inputs.Length)
+            throw new ArgumentOutOfRangeException(paramName, $"Input index {inputIndex} is outside [0, {_inputs.Length}).");
+    }
+
+    /// <summary>Number of kernel pointer parameters (inputs then output).</summary>
+    public int ParameterCount => _inputs.Length + 1;
+
+    /// <summary>
+    /// CPU reference execution of the spec, in fp64.
+    /// </summary>
+    /// <remarks>
+    /// This is the semantic definition of the spec. An emitter is correct when its
+    /// device output matches this within tolerance, and this can be checked with no
+    /// GPU at all -- which is what lets the C#-vs-Rust bake-off proceed while the
+    /// device is busy.
+    /// </remarks>
+    /// <param name="inputData">Buffers for each input binding, in binding order.</param>
+    /// <returns>The output buffer, row-major, of <c>Output.ElementCount</c> elements.</returns>
+    public double[] Interpret(IReadOnlyList<double[]> inputData)
+    {
+        if (inputData is null) throw new ArgumentNullException(nameof(inputData));
+        if (inputData.Count != _inputs.Length)
+            throw new ArgumentException($"Expected {_inputs.Length} input buffers, got {inputData.Count}.", nameof(inputData));
+
+        var axes = Space.Axes;
+        int axisCount = axes.Count;
+        int[] parallel = Space.ParallelAxes;
+        int[] reduction = Space.ReductionAxes;
+        var values = new int[axisCount];
+        var output = new double[Output.ElementCount];
+
+        long threads = Space.TotalThreads;
+        for (long tid = 0; tid < threads; tid++)
+        {
+            // Decompose the flat thread id across parallel axes, last-fastest --
+            // exactly the decomposition the emitter must generate.
+            long rest = tid;
+            for (int p = parallel.Length - 1; p >= 0; p--)
+            {
+                int extent = axes[parallel[p]].Extent;
+                values[parallel[p]] = (int)(rest % extent);
+                rest /= extent;
+            }
+            for (int r = 0; r < reduction.Length; r++) values[reduction[r]] = 0;
+
+            double acc = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
+            long trips = Space.ReductionTripCount;
+
+            for (long t = 0; t < trips; t++)
+            {
+                long rrest = t;
+                for (int r = reduction.Length - 1; r >= 0; r--)
+                {
+                    int extent = axes[reduction[r]].Extent;
+                    values[reduction[r]] = (int)(rrest % extent);
+                    rrest /= extent;
+                }
+
+                double product = 1.0;
+                bool anyOutOfBounds = false;
+                for (int k = 0; k < _productInputs.Length; k++)
+                {
+                    var binding = _inputs[_productInputs[k]];
+                    long off = binding.ResolveOffset(values, out bool ok);
+                    if (!ok) { anyOutOfBounds = true; break; }
+                    product *= inputData[_productInputs[k]][off];
+                }
+                // Zero padding: an out-of-range tap contributes the additive identity.
+                if (anyOutOfBounds) product = 0.0;
+
+                acc = Reduce switch
+                {
+                    CodegenReduceKind.Sum => acc + product,
+                    CodegenReduceKind.Max => Math.Max(acc, product),
+                    _ => product
+                };
+            }
+
+            if (BiasInput.HasValue)
+            {
+                var b = _inputs[BiasInput.Value];
+                long off = b.ResolveOffset(values, out bool ok);
+                if (ok) acc += inputData[BiasInput.Value][off];
+            }
+            if (ScaleInput.HasValue)
+            {
+                var s = _inputs[ScaleInput.Value];
+                long off = s.ResolveOffset(values, out bool ok);
+                if (ok) acc *= inputData[ScaleInput.Value][off];
+            }
+            if (Activation == CodegenActivationKind.ReLU && acc < 0.0) acc = 0.0;
+
+            long outOff = Output.ResolveOffset(values, out bool outOk);
+            if (outOk) output[outOff] = acc;
+        }
+
+        return output;
+    }
+
+    /// <summary>Human-readable dump of the whole spec.</summary>
+    public string Describe()
+    {
+        var sb = new StringBuilder();
+        sb.Append(Name).Append('\n');
+        sb.Append("  ").Append(Space.Describe()).Append('\n');
+        for (int i = 0; i < _inputs.Length; i++)
+            sb.Append("  in  ").Append(_inputs[i].Describe(Space.Axes))
+              .Append(_inputs[i].NeedsBoundsCheck ? "  [guarded]" : "").Append('\n');
+        sb.Append("  out ").Append(Output.Describe(Space.Axes)).Append('\n');
+        sb.Append("  body ").Append(Reduce.ToString().ToLowerInvariant()).Append('(');
+        for (int i = 0; i < _productInputs.Length; i++)
+        {
+            if (i > 0) sb.Append(" * ");
+            sb.Append(_inputs[_productInputs[i]].Name);
+        }
+        sb.Append(')');
+        if (BiasInput.HasValue) sb.Append(" + ").Append(_inputs[BiasInput.Value].Name);
+        if (ScaleInput.HasValue) sb.Append(" * ").Append(_inputs[ScaleInput.Value].Name);
+        if (Activation != CodegenActivationKind.None) sb.Append(" -> ").Append(Activation.ToString().ToLowerInvariant());
+        return sb.Append('\n').ToString();
+    }
+
+    /// <summary>
+    /// Builds the depthwise Conv2D 3x3 + bias + ReLU spec -- the bake-off target.
+    /// Chosen because it has affine gather indexing, a multi-tap reduction and an
+    /// epilogue: the exact shape of the conv+epilogue fusion PyTorch must split.
+    /// </summary>
+    public static CodegenKernelSpec DepthwiseConv2D3x3BiasRelu(int batch, int channels, int height, int width)
+    {
+        // Parallel axes are declared with the contiguous tensor axis LAST, so
+        // consecutive threads address consecutive elements.
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("n", batch),
+            CodegenAxis.Parallel("c", channels),
+            CodegenAxis.Parallel("oh", height),
+            CodegenAxis.Parallel("ow", width),
+            CodegenAxis.Reduce("kh", 3),
+            CodegenAxis.Reduce("kw", 3));
+        const int N = 0, C = 1, OH = 2, OW = 3, KH = 4, KW = 5;
+
+        var input = new CodegenTensorBinding(
+            0, "input", new[] { batch, channels, height, width },
+            new[]
+            {
+                CodegenAffineExpr.Axis(N),
+                CodegenAffineExpr.Axis(C),
+                CodegenAffineExpr.Window(OH, KH, stride: 1, padding: 1),
+                CodegenAffineExpr.Window(OW, KW, stride: 1, padding: 1)
+            });
+
+        var weights = new CodegenTensorBinding(
+            1, "weights", new[] { channels, 3, 3 },
+            new[] { CodegenAffineExpr.Axis(C), CodegenAffineExpr.Axis(KH), CodegenAffineExpr.Axis(KW) });
+
+        var bias = new CodegenTensorBinding(
+            2, "bias", new[] { channels }, new[] { CodegenAffineExpr.Axis(C) });
+
+        var output = new CodegenTensorBinding(
+            3, "output", new[] { batch, channels, height, width },
+            new[]
+            {
+                CodegenAffineExpr.Axis(N),
+                CodegenAffineExpr.Axis(C),
+                CodegenAffineExpr.Axis(OH),
+                CodegenAffineExpr.Axis(OW)
+            },
+            isOutput: true);
+
+        return new CodegenKernelSpec(
+            $"aidotnet_gen_dwconv2d3x3_n{batch}_c{channels}_h{height}_w{width}_relu",
+            space,
+            new[] { input, weights, bias },
+            output,
+            productInputs: new[] { 0, 1 },
+            reduce: CodegenReduceKind.Sum,
+            biasInput: 2,
+            activation: CodegenActivationKind.ReLU);
+    }
+}
