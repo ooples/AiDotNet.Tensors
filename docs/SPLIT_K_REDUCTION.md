@@ -96,10 +96,10 @@ kernel's own output; a row is only meaningful if that column is at or near zero.
 
 ## Not yet done
 
-The split is emitted and executed from a graph — see the chunking section below — but
-choosing it is still the caller's job, because it cannot be chosen statically. Folding it
-into the autotuner, so the catalog gets a measured answer per kernel the way tiles do, is
-the remaining work.
+The split is emitted, executed from a graph, and now chosen by the autotuner — see the
+sections below. What remains is that the conveyor's single-kernel stages cannot *launch* a
+split winner, so a kernel the tuner measured as 17× faster still verifies and benches under
+its single-kernel lowering. Teaching those stages the two-kernel program is the next step.
 
 Remaining order: per-dimension staging (predicted ~15 us on
 dense 3x3 against cuDNN's 41.0), then `cp.async` and tensor cores — the last two still
