@@ -231,25 +231,22 @@ internal static class KernelConveyorTool
                     // gates caught each after the fact; using one shape removes the
                     // class. The fp64 oracle at these sizes is 26-115M operations, a few
                     // seconds, which is worth paying once per kernel.
-                    var (dev, regs, elided, lowering) = VerifyOne(runtime, entry.Bench, entry.Name);
-
                     // The verify shape must exercise the SAME lowering as the shape
                     // that gets released. Otherwise the strip-mined loop path can ship
                     // having only ever been checked in its fully-unrolled form -- the
                     // released-an-unverified-branch failure, one abstraction up.
                     // One shape now, so there is no verify-vs-release divergence left to
                     // gate: the row records the lowering and the staging it was verified
-                    // WITH, which is the fact that matters.
-                    var shipped = new PtxAffineEmitter();
-                    shipped.Emit(entry.Bench, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                    string staged = shipped.StagedOperands;
+                    // WITH, which is the fact that matters -- including whether that
+                    // lowering was a two-kernel split.
+                    var (dev, regs, elided, lowering, staged) = VerifyOne(runtime, entry.Bench, entry.Name);
 
                     bool ok = dev <= Tolerance && !double.IsNaN(dev);
                     status = ok ? "PASS" : "FAIL";
                     if (ok) passed++; else failed++;
                     Console.WriteLine(entry.Name.PadRight(36) +
                         regs.ToString(CultureInfo.InvariantCulture).PadLeft(4) +
-                        Describe(lowering).PadLeft(9) + ("/" + staged).PadRight(10) +
+                        lowering.PadLeft(9) + ("/" + staged).PadRight(10) +
                         elided.ToString(CultureInfo.InvariantCulture).PadLeft(9) +
                         dev.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
                         status.PadLeft(9));
@@ -311,6 +308,208 @@ internal static class KernelConveyorTool
         }
     }
 
+    // ------------------------------------------------- the tuned program
+    //
+    // A tuned lowering is usually a set of knobs, but it can also be a different PROGRAM:
+    // the autotuner measures a two-kernel split against every single-kernel candidate and
+    // records "split:N" when it wins, which it does on all three weight gradients --
+    // 17.12x, 35.09x and 2.03x. The conveyor stages used to print a note and run the
+    // slower lowering, so the headline evidence for those kernels described a lowering the
+    // tuner had already rejected.
+    //
+    // This resolves the recorded winner into something all three stages can run, whether
+    // it is one kernel or two.
+
+    /// <summary>One kernel of a tuned program, with everything needed to launch it.</summary>
+    private sealed record ProgramKernel(
+        CodegenKernelSpec Spec, string Ptx, uint Blocks, uint BlockX, uint BlockY,
+        int LoopedAxes, int ElidedGuards, string StagedOperands);
+
+    /// <summary>What the tuner says to run for a catalog entry.</summary>
+    /// <param name="Spec">
+    /// The ORIGINAL spec. It stays the semantic contract and the verify oracle no matter
+    /// how many kernels the lowering takes: a split computing something else is not a
+    /// faster lowering of this operator.
+    /// </param>
+    /// <param name="Kernels">One kernel, or a partial pass followed by a combine pass.</param>
+    /// <param name="Split">The split plan when this is a two-kernel program.</param>
+    /// <param name="Winner">The recorded winner name, for reporting.</param>
+    private sealed record TunedProgram(
+        CodegenKernelSpec Spec, IReadOnlyList<ProgramKernel> Kernels,
+        CodegenSplitPlan? Split, string? Winner)
+    {
+        internal bool IsSplit => Split is not null;
+
+        /// <summary>How the stages label this lowering in their tables.</summary>
+        internal string Label() => IsSplit
+            ? "split x" + Kernels.Count.ToString(CultureInfo.InvariantCulture)
+            : Describe(Kernels[0].LoopedAxes);
+    }
+
+    /// <summary>Emits the program the tuner recorded for this entry.</summary>
+    private static TunedProgram ResolveTuned(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, string catalogName)
+    {
+        string? winner = CodegenAutotuneCache.WinnerFor(catalogName);
+
+        if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
+        {
+            CodegenSplitPlan? plan = null;
+            try { plan = CodegenSplitReduction.TryPlan(spec); }
+            catch (NotSupportedException) { }
+
+            if (plan is not null)
+            {
+                var halves = new List<ProgramKernel>(2);
+                bool emitted = true;
+                foreach (var half in new[] { plan.Partial, plan.Combine })
+                {
+                    var e = new PtxAffineEmitter();
+                    try
+                    {
+                        string text = e.Emit(half, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        halves.Add(new ProgramKernel(half, text, e.LaunchBlocks,
+                            (uint)e.LaunchBlockX, (uint)e.LaunchBlockY,
+                            e.LoopedAxes, e.ElidedGuards, e.StagedOperands));
+                    }
+                    catch (NotSupportedException) { emitted = false; break; }
+                }
+                if (emitted) return new TunedProgram(spec, halves, plan, winner);
+            }
+
+            // The recorded split could not be rebuilt. Falling back to one kernel is
+            // correct, but saying nothing would report the slower lowering as the tuned
+            // one, which is the confusion this resolution step exists to remove.
+            Console.WriteLine("    note: " + catalogName + " recorded " + winner +
+                              " but the split could not be rebuilt; using one kernel");
+        }
+
+        var single = new PtxAffineEmitter();
+        ApplyTuned(single, catalogName);
+        string ptx = single.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        return new TunedProgram(
+            spec,
+            new[]
+            {
+                new ProgramKernel(spec, ptx, single.LaunchBlocks, (uint)single.LaunchBlockX,
+                    (uint)single.LaunchBlockY, single.LoopedAxes, single.ElidedGuards,
+                    single.StagedOperands),
+            },
+            null, winner);
+    }
+
+    /// <summary>A loaded, bound tuned program: one launch call whatever its shape.</summary>
+    private sealed class TunedLaunchable : IDisposable
+    {
+        private readonly List<DirectPtxModule> _modules = new();
+        private readonly List<DirectPtxBuffer> _buffers = new();
+        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args, uint Blocks, uint X, uint Y)> _steps = new();
+        private DirectPtxBuffer _output = null!;
+
+        /// <summary>Highest register count across the program's kernels.</summary>
+        internal int RegistersPerThread { get; private set; }
+
+        /// <summary>The fp64 inputs the program was bound to, for the verify oracle.</summary>
+        internal List<double[]> HostInputs { get; } = new();
+
+        internal static TunedLaunchable Create(DirectPtxRuntime runtime, TunedProgram program)
+        {
+            var it = new TunedLaunchable();
+            try
+            {
+                var spec = program.Spec;
+
+                // One buffer per operand of the ORIGINAL spec, so both lowerings read
+                // byte-identical inputs and a deviation cannot come from the data.
+                var uploaded = new IntPtr[spec.Inputs.Count];
+                for (int i = 0; i < spec.Inputs.Count; i++)
+                {
+                    long count = Elements(spec.Inputs[i].Shape);
+                    var host = new double[count];
+                    var single = new float[count];
+                    for (long e = 0; e < count; e++)
+                    {
+                        float v = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                        single[e] = v;
+                        host[e] = v;
+                    }
+                    it.HostInputs.Add(host);
+                    var buffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+                    buffer.Upload<float>(single);
+                    it._buffers.Add(buffer);
+                    uploaded[i] = buffer.Pointer;
+                }
+
+                it._output = runtime.AllocateBytes(
+                    (nuint)(Elements(spec.Output.Shape) * sizeof(float)));
+                it._buffers.Add(it._output);
+
+                if (program.Split is { } plan)
+                {
+                    var temp = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
+                    it._buffers.Add(temp);
+
+                    // The partial pass reads only the product operands, because the
+                    // epilogue moved to the combine; binding by position would feed the
+                    // partial pass the bias.
+                    var partialArgs = new IntPtr[plan.Partial.ParameterCount];
+                    for (int i = 0; i < spec.ProductInputs.Count; i++)
+                        partialArgs[i] = uploaded[spec.ProductInputs[i]];
+                    partialArgs[partialArgs.Length - 1] = temp.Pointer;
+
+                    var combineArgs = new IntPtr[plan.Combine.ParameterCount];
+                    combineArgs[0] = temp.Pointer;
+                    if (plan.Combine.BiasInput is { } bias)
+                        combineArgs[bias] = uploaded[spec.BiasInput!.Value];
+                    if (plan.Combine.ScaleInput is { } scaleAt)
+                        combineArgs[scaleAt] = uploaded[spec.ScaleInput!.Value];
+                    combineArgs[combineArgs.Length - 1] = it._output.Pointer;
+
+                    it.Add(runtime, program.Kernels[0], partialArgs);
+                    it.Add(runtime, program.Kernels[1], combineArgs);
+                }
+                else
+                {
+                    var args = new IntPtr[spec.ParameterCount];
+                    for (int i = 0; i < spec.Inputs.Count; i++) args[i] = uploaded[i];
+                    args[spec.Inputs.Count] = it._output.Pointer;
+                    it.Add(runtime, program.Kernels[0], args);
+                }
+
+                return it;
+            }
+            catch
+            {
+                it.Dispose();
+                throw;
+            }
+        }
+
+        private void Add(DirectPtxRuntime runtime, ProgramKernel kernel, IntPtr[] args)
+        {
+            var module = runtime.LoadModule(kernel.Ptx, allowExperimentalJitFallback: true);
+            _modules.Add(module);
+            IntPtr fn = module.GetFunction(kernel.Spec.Name, out DirectPtxFunctionInfo info);
+            RegistersPerThread = Math.Max(RegistersPerThread, info.RegistersPerThread);
+            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY));
+        }
+
+        /// <summary>Runs the whole program in order; the combine depends on the partial.</summary>
+        internal void Launch()
+        {
+            foreach (var (module, fn, args, blocks, x, y) in _steps)
+                LaunchSpec(module, fn, args, blocks, x, y);
+        }
+
+        internal void DownloadOutput(float[] destination) => _output.Download<float>(destination);
+
+        public void Dispose()
+        {
+            foreach (var b in _buffers) b.Dispose();
+            foreach (var m in _modules) m.Dispose();
+        }
+    }
+
     /// <summary>Number of reduction axes a spec lowers to runtime loops.</summary>
     private static int LoweringOf(DirectPtxRuntime runtime, CodegenKernelSpec spec)
     {
@@ -322,62 +521,44 @@ internal static class KernelConveyorTool
     private static string Describe(int loopedAxes) =>
         loopedAxes == 0 ? "unroll" : "loop x" + loopedAxes.ToString(CultureInfo.InvariantCulture);
 
-    private static (double Deviation, int Registers, int Elided, int Lowering) VerifyOne(
+    /// <summary>
+    /// Runs the tuned program on the device and compares it against the fp64
+    /// interpretation of the ORIGINAL spec.
+    /// </summary>
+    /// <remarks>
+    /// The oracle is the original spec whether the lowering is one kernel or two. That is
+    /// the whole reason the split can be trusted: a two-kernel path through a temporary is
+    /// exactly the shape that produces a fast wrong answer, and it is held to the same
+    /// specification the single kernel was.
+    /// </remarks>
+    private static (double Deviation, int Registers, int Elided, string Lowering, string Staged) VerifyOne(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, string catalogName)
     {
-        var emitter = new PtxAffineEmitter();
-        ApplyTuned(emitter, catalogName);
-        string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
-        IntPtr fn = module.GetFunction(spec.Name, out DirectPtxFunctionInfo info);
+        var program = ResolveTuned(runtime, spec, catalogName);
 
         // Host data is a deterministic function of (input index, tensor index) so a
         // failure is reproducible and independent of run order.
-        var hostInputs = new List<double[]>(spec.Inputs.Count);
-        var buffers = new List<DirectPtxBuffer>();
-        try
+        using var launchable = TunedLaunchable.Create(runtime, program);
+        launchable.Launch();
+        runtime.Synchronize();
+
+        long outCount = Elements(spec.Output.Shape);
+        var actual = new float[outCount];
+        launchable.DownloadOutput(actual);
+        double[] expected = spec.Interpret(launchable.HostInputs);
+
+        double worst = 0;
+        for (long e = 0; e < outCount; e++)
         {
-            var pointers = new IntPtr[spec.ParameterCount];
-            for (int i = 0; i < spec.Inputs.Count; i++)
-            {
-                long count = Elements(spec.Inputs[i].Shape);
-                var host = new double[count];
-                var single = new float[count];
-                for (long e = 0; e < count; e++)
-                {
-                    float v = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
-                    single[e] = v;
-                    host[e] = v;
-                }
-                hostInputs.Add(host);
-                var buffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
-                buffer.Upload<float>(single);
-                buffers.Add(buffer);
-                pointers[i] = buffer.Pointer;
-            }
-
-            long outCount = Elements(spec.Output.Shape);
-            var outBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
-            buffers.Add(outBuffer);
-            pointers[spec.Inputs.Count] = outBuffer.Pointer;
-
-            LaunchSpec(module, fn, pointers, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
-            runtime.Synchronize();
-
-            var actual = new float[outCount];
-            outBuffer.Download<float>(actual);
-            double[] expected = spec.Interpret(hostInputs);
-
-            double worst = 0;
-            for (long e = 0; e < outCount; e++)
-            {
-                double diff = Math.Abs(actual[e] - expected[e]);
-                double scale = Math.Max(1.0, Math.Abs(expected[e]));
-                worst = Math.Max(worst, diff / scale);
-            }
-            return (worst, info.RegistersPerThread, emitter.ElidedGuards, emitter.LoopedAxes);
+            double diff = Math.Abs(actual[e] - expected[e]);
+            double scale = Math.Max(1.0, Math.Abs(expected[e]));
+            worst = Math.Max(worst, diff / scale);
         }
-        finally { foreach (var b in buffers) b.Dispose(); }
+
+        int elided = 0;
+        foreach (var kernel in program.Kernels) elided += kernel.ElidedGuards;
+        string staged = program.IsSplit ? "split" : program.Kernels[0].StagedOperands;
+        return (worst, launchable.RegistersPerThread, elided, program.Label(), staged);
     }
 
     // --------------------------------------------------------------- release
@@ -410,25 +591,38 @@ internal static class KernelConveyorTool
               try
               {
                 var spec = entry.Bench;
-                var emitter = new PtxAffineEmitter();
-                string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+
+                // Release the program the tuner chose. A split ships TWO cubins and both
+                // have to clear the zero-spill gate; releasing only the partial pass would
+                // leave half the shipped program unaudited.
+                var program = ResolveTuned(runtime, spec, entry.Name);
+                for (int k = 0; k < program.Kernels.Count; k++)
+                {
+                  var kernel = program.Kernels[k];
+                  string label = program.IsSplit
+                      ? entry.Name + (k == 0 ? " [partial]" : " [combine]")
+                      : entry.Name;
+                  string fileStem = program.IsSplit
+                      ? entry.Name + (k == 0 ? ".partial" : ".combine")
+                      : entry.Name;
+                  string ptx = kernel.Ptx;
 
                 int regs;
                 using (var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true))
                 {
-                    module.GetFunction(spec.Name, out DirectPtxFunctionInfo info);
+                    module.GetFunction(kernel.Spec.Name, out DirectPtxFunctionInfo info);
                     regs = info.RegistersPerThread;
                 }
 
                 var artifact = DirectPtxCubinArtifactCache.Resolve(runtime, ptx);
-                string cubinPath = Path.Combine(outputDirectory, entry.Name + ".cubin");
+                string cubinPath = Path.Combine(outputDirectory, fileStem + ".cubin");
                 File.WriteAllBytes(cubinPath, artifact.Image);
 
                 var metrics = nvdisasm is null ? null : ReadSass(nvdisasm, cubinPath);
                 bool ok = metrics is null || (metrics.SpillLoads == 0 && metrics.SpillStores == 0);
                 if (ok) gated++; else spilled++;
 
-                Console.WriteLine(entry.Name.PadRight(36) +
+                Console.WriteLine(label.PadRight(36) +
                     regs.ToString(CultureInfo.InvariantCulture).PadLeft(4) +
                     (metrics?.Instructions.ToString(CultureInfo.InvariantCulture) ?? "-").PadLeft(13) +
                     (metrics?.Ldg.ToString(CultureInfo.InvariantCulture) ?? "-").PadLeft(6) +
@@ -436,7 +630,7 @@ internal static class KernelConveyorTool
                     ((metrics is null ? "-" : metrics.SpillLoads + "/" + metrics.SpillStores)).PadLeft(14) +
                     (metrics is null ? "SKIP" : ok ? "PASS" : "FAIL").PadLeft(7));
 
-                rows.Add(string.Join("\t", entry.Name, spec.Name, artifact.CubinSha256, artifact.SourceKey,
+                rows.Add(string.Join("\t", label, kernel.Spec.Name, artifact.CubinSha256, artifact.SourceKey,
                     regs.ToString(CultureInfo.InvariantCulture),
                     metrics?.Instructions.ToString(CultureInfo.InvariantCulture) ?? "",
                     metrics?.Ldg.ToString(CultureInfo.InvariantCulture) ?? "",
@@ -444,6 +638,7 @@ internal static class KernelConveyorTool
                     metrics?.SpillLoads.ToString(CultureInfo.InvariantCulture) ?? "",
                     metrics?.SpillStores.ToString(CultureInfo.InvariantCulture) ?? "",
                     CodegenMeasurementProtocol.Tag));
+                }
               }
               catch (Exception ex)
               {
@@ -610,37 +805,50 @@ internal static class KernelConveyorTool
                 try
                 {
                     var spec = entry.Bench;
-                    var emitter = new PtxAffineEmitter();
-                    ApplyTuned(emitter, entry.Name);
-                    if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
-                    if (ValueOf(args, "--coarsen") is string cz)
-                        emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
-                    if (ValueOf(args, "--max-lanes") is string mz)
-                        emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
-                    string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                    using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
-                    IntPtr fn = module.GetFunction(spec.Name, out _);
-                    uint blocks = emitter.LaunchBlocks;
+
+                    // Bench the program the TUNER CHOSE, which for the weight gradients
+                    // is a two-kernel split measured at 17.12x, 35.09x and 2.03x. Timing
+                    // the single-kernel lowering here would publish a number for a
+                    // lowering the tuner had already rejected.
+                    bool overridden = args.Contains("--no-coarsen", StringComparer.Ordinal)
+                        || ValueOf(args, "--coarsen") is not null
+                        || ValueOf(args, "--max-lanes") is not null;
+
+                    TunedProgram program;
+                    if (overridden)
+                    {
+                        // An explicit knob on the command line is a request to bench THAT
+                        // lowering, so the recorded winner is set aside -- and said so,
+                        // because a hand-set knob silently overriding a measured split
+                        // would be the same confusion in the other direction.
+                        var emitter = new PtxAffineEmitter();
+                        if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
+                        if (ValueOf(args, "--coarsen") is string cz)
+                            emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
+                        if (ValueOf(args, "--max-lanes") is string mz)
+                            emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
+                        string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        program = new TunedProgram(spec,
+                            new[]
+                            {
+                                new ProgramKernel(spec, ptx, emitter.LaunchBlocks,
+                                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY,
+                                    emitter.LoopedAxes, emitter.ElidedGuards, emitter.StagedOperands),
+                            },
+                            null, "command-line");
+                    }
+                    else
+                    {
+                        program = ResolveTuned(runtime, spec, entry.Name);
+                    }
+
+                    uint blocks = program.Kernels[0].Blocks;
 
                     var buffers = new List<DirectPtxBuffer>();
                     try
                     {
-                        var pointers = new IntPtr[spec.ParameterCount];
-                        for (int i = 0; i < spec.Inputs.Count; i++)
-                        {
-                            long count = Elements(spec.Inputs[i].Shape);
-                            var b = runtime.AllocateBytes((nuint)(count * sizeof(float)));
-                            var single = new float[count];
-                            for (long e = 0; e < count; e++) single[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
-                            b.Upload<float>(single);
-                            buffers.Add(b);
-                            pointers[i] = b.Pointer;
-                        }
-                        var outBuffer = runtime.AllocateBytes((nuint)(Elements(spec.Output.Shape) * sizeof(float)));
-                        buffers.Add(outBuffer);
-                        pointers[spec.Inputs.Count] = outBuffer.Pointer;
-
-                        void Launch() => LaunchSpec(module, fn, pointers, blocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
+                        using var launchable = TunedLaunchable.Create(runtime, program);
+                        void Launch() => launchable.Launch();
                         int bestClockBefore = 0, bestClockAfter = 0;
 
                         // RETRY ON CLOCK DRIFT. The SM clock was observed swinging

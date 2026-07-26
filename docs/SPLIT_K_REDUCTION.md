@@ -231,3 +231,60 @@ Nothing — and it says so:
 A split winner is not a knob but a different *program*: two kernels and a temporary. The
 single-kernel verify path cannot launch it, and silently falling through would report a
 kernel as tuned while running the lowering the tuner measured as 17× slower.
+
+## The conveyor runs the split now
+
+All three stages resolve the recorded winner into a program and run *that*, whether it is
+one kernel or two. Previously they printed a note and ran the single-kernel lowering, so the
+headline evidence for the weight gradients described a lowering the tuner had already
+rejected.
+
+**Verify** holds the split to the same oracle as the single kernel — the fp64
+interpretation of the ORIGINAL spec — because a two-kernel path through a temporary is
+exactly the shape that produces a fast wrong answer:
+
+```
+depthwise_conv2d_3x3_bwd_weights      40 split x2/split          285    3.066E-007     PASS
+conv2d_1x1_bwd_weights                42 split x2/split          175    0.000E+000     PASS
+conv2d_3x3_bwd_weights                52 split x2/split          385    0.000E+000     PASS
+```
+
+The depthwise deviation *improved* from `5.589E-004` to `3.066E-007`. That was predicted
+and is worth stating plainly: the split sums 4 partials of 25,088 terms rather than one
+serial run of 100,352, so it accumulates in a shallower order and is **more** accurate than
+the kernel it replaces. The split was never a correctness compromise.
+
+**Bench** now reports the chosen program (clocks locked, drift +0.0% on every row):
+
+| kernel | before | after | blocks |
+|---|---|---|---|
+| `depthwise_conv2d_3x3_bwd_weights` | ~4060 | **245.9** | 126 |
+| `conv2d_1x1_bwd_weights` | ~2127 | **61.0** | 112 |
+| `conv2d_3x3_bwd_weights` | ~240 | **121.8** | 252 |
+
+The other ten are unchanged. `conv2d_1x1_bwd_weights` carries a 6.8% run spread, above the
+~3% claimable threshold — the 35× dominates it, but the row is noisier than the rest.
+
+**Release** ships both cubins and gates both:
+
+```
+conv2d_3x3_bwd_weights [partial]   ...   0/0   PASS
+conv2d_3x3_bwd_weights [combine]    34   112   0/0   PASS
+
+release: 16 zero-spill, 0 spilling
+```
+
+Sixteen rather than thirteen, because three kernels now ship two cubins each. Releasing only
+the partial pass would leave half the shipped program unaudited.
+
+An explicit `--coarsen` / `--max-lanes` / `--no-coarsen` on the command line still benches
+that lowering and sets the recorded winner aside, and says so — a hand-set knob silently
+overriding a measured split would be the same confusion in the other direction.
+
+### Still open
+
+The three weight gradients have no competitor ratio at all (`MISSING` in the evidence
+gates), so their split wins are measured against our own prior lowering and not against
+PyTorch or cuDNN. That is a real gap in the evidence, not a passing detail: a 17× over
+ourselves says nothing about where we stand. The bake-off lane covers forward operators
+only.
