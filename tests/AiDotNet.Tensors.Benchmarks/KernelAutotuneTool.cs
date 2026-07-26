@@ -61,10 +61,11 @@ internal static class KernelAutotuneTool
             return;
         }
 
-        string selector = args.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? "all";
+        string selector = KernelToolArgs.Selector(args);
         var entries = string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase)
             ? CodegenKernelCatalog.All
             : new[] { CodegenKernelCatalog.Find(selector)! }.Where(e => e != null).ToList();
+        KernelToolArgs.RequireNonEmptySelection(selector, entries.Count, "kernel-autotune");
 
         string outputPath = ValueOf(args, "--out") ??
             Path.Combine(Directory.GetCurrentDirectory(), "artifacts", "autotune.tsv");

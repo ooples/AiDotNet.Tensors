@@ -223,6 +223,27 @@ def main():
     emit_both("conv2d_3x3_bwd_data",
          lambda: conv2d_input(list(x3.shape), w3, g3, 1, 1))
 
+    # ---- gradient with respect to the WEIGHTS.
+    #
+    # These three had no competitor row at all, so the split-K wins on them (17.1x,
+    # 35.1x and 2.0x) were measured only against our own prior lowering. A 17x over
+    # ourselves says nothing about where we stand, and the release gate correctly
+    # refused to call them releasable while the competitor column read MISSING.
+    #
+    # Every tensor below is one the forward and data-gradient rows already use, so the
+    # comparison is on exactly the shapes the catalog benches -- the same discipline the
+    # rest of this file follows.
+    from torch.nn.grad import conv2d_weight
+
+    emit_both("depthwise_conv2d_3x3_bwd_weights",
+         lambda: conv2d_weight(x, list(dw.shape), gdw, 1, 1, 1, 64))
+
+    emit_both("conv2d_1x1_bwd_weights",
+         lambda: conv2d_weight(x1, list(w1.shape), g1))
+
+    emit_both("conv2d_3x3_bwd_weights",
+         lambda: conv2d_weight(x3, list(w3.shape), g3, 1, 1))
+
     return 0
 
 

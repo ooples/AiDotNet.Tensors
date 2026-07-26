@@ -43,6 +43,16 @@ WORK = {
     "maxpool2d_2x2":                   ((32 * 64 * 112 * 112 + 32 * 64 * 56 * 56) * 4, 0),
     "conv_transpose2d_3x3_stride2":    ((16 * 64 * 28 * 28 + 16 * 64 * 56 * 56) * 4,
                                         16 * 64 * 56 * 56 * 9 * 2),
+
+    # Weight gradients. Bytes are the two large operands read (activations and the
+    # incoming gradient); the OUTPUT is negligible -- 576 floats for the depthwise case --
+    # which is precisely the shape that left the device idle and made split-K necessary.
+    "depthwise_conv2d_3x3_bwd_weights": (2 * 32 * 64 * 56 * 56 * 4,
+                                         32 * 64 * 56 * 56 * 9 * 2),
+    "conv2d_1x1_bwd_weights":           ((16 * 64 * 28 * 28 + 16 * 64 * 28 * 28) * 4,
+                                         16 * 64 * 28 * 28 * 64 * 2),
+    "conv2d_3x3_bwd_weights":           ((8 * 32 * 28 * 28 + 8 * 64 * 28 * 28) * 4,
+                                         8 * 64 * 28 * 28 * 32 * 9 * 2),
 }
 
 

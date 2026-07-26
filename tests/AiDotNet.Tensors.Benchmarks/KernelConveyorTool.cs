@@ -47,7 +47,7 @@ internal static class KernelConveyorTool
 
     internal static void Run(string stage, string[] args)
     {
-        string selector = args.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? "all";
+        string selector = KernelToolArgs.Selector(args);
         var entries = Select(selector);
         if (entries.Count == 0)
         {
@@ -112,18 +112,49 @@ internal static class KernelConveyorTool
             foreach (var entry in entries)
             {
                 var spec = entry.Bench;
-                var emitter = new PtxAffineEmitter();
-                if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
+
+                // Launch the TUNED program. The limiter gate drives this stage, so
+                // launching the untuned lowering here made it profile a kernel we do not
+                // ship: the three weight gradients came back at 1-3% on every unit,
+                // because that is the unsplit 3-block kernel, not the split one the
+                // conveyor verifies, benches and releases.
+                bool overridden = args.Contains("--no-coarsen", StringComparer.Ordinal)
+                    || ValueOf(args, "--coarsen") is not null
+                    || ValueOf(args, "--max-lanes") is not null;
+
+                TunedProgram program;
+                if (overridden)
+                {
+                    var emitter = new PtxAffineEmitter();
+                    if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
                     if (ValueOf(args, "--coarsen") is string cz)
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
                     if (ValueOf(args, "--max-lanes") is string mz)
                         emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
-                string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
-                stage.Launch();
+                    string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                    program = new TunedProgram(spec,
+                        new[]
+                        {
+                            new ProgramKernel(spec, ptx, emitter.LaunchBlocks,
+                                (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY,
+                                emitter.LoopedAxes, emitter.ElidedGuards, emitter.StagedOperands),
+                        },
+                        null, "command-line");
+                }
+                else
+                {
+                    program = ResolveTuned(runtime, spec, entry.Name);
+                }
+
+                using var launchable = TunedLaunchable.Create(runtime, program);
+                launchable.Launch();
                 runtime.Synchronize();
-                Console.WriteLine(entry.Name + ": one launch, " + emitter.LaunchBlocks + " blocks, lanes=" +
-                                  emitter.CoarsenedLanes + ", emitted loads=" + emitter.EmittedLoads);
+
+                var blockCounts = new List<string>();
+                foreach (var kernel in program.Kernels)
+                    blockCounts.Add(kernel.Blocks.ToString(CultureInfo.InvariantCulture));
+                Console.WriteLine(entry.Name + ": " + program.Label() + ", " +
+                                  string.Join("+", blockCounts) + " blocks");
             }
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
