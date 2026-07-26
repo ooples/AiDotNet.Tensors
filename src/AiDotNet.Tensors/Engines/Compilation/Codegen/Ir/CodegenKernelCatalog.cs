@@ -113,6 +113,25 @@ public static class CodegenKernelCatalog
             CodegenAdjoint.BackwardData(Conv2D3x3Linear(2, 8, 8, 16, 16), 0),
             CodegenAdjoint.BackwardData(Conv2D3x3Linear(8, 32, 64, 28, 28), 0)),
 
+        // WEIGHT GRADIENTS, also derived. Without these the generated set could not
+        // train: only the data gradient existed. The same transform produces them --
+        // it differentiates with respect to whichever operand it is given -- but the
+        // reduction is over batch and spatial axes rather than channels and taps.
+        new("depthwise_conv2d_3x3_bwd_weights",
+            "gradient wrt weights of depthwise 3x3 (reduces over n, oh, ow)",
+            CodegenAdjoint.BackwardWeights(Depthwise(2, 8, 16, 16, bias: false, relu: false), 1),
+            CodegenAdjoint.BackwardWeights(Depthwise(32, 64, 56, 56, bias: false, relu: false), 1)),
+
+        new("conv2d_1x1_bwd_weights",
+            "gradient wrt weights of dense 1x1",
+            CodegenAdjoint.BackwardWeights(Conv2D1x1Linear(2, 8, 8, 16, 16), 1),
+            CodegenAdjoint.BackwardWeights(Conv2D1x1Linear(16, 64, 64, 28, 28), 1)),
+
+        new("conv2d_3x3_bwd_weights",
+            "gradient wrt weights of dense 3x3 (compound map survives renumbering)",
+            CodegenAdjoint.BackwardWeights(Conv2D3x3Linear(2, 8, 8, 16, 16), 1),
+            CodegenAdjoint.BackwardWeights(Conv2D3x3Linear(8, 32, 64, 28, 28), 1)),
+
         // ATTACKS A MEASURED STRUCTURAL WEAKNESS. Profiling showed cuDNN's "one
         // convolution" is five kernels: an NCHW->NHWC transform, the implicit GEMM, the
         // transform back, and a separate elementwise pass for bias -- 9.47 us of 41.06

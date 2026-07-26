@@ -56,6 +56,26 @@ public static class CodegenAdjoint
     /// a bias (which makes the operator affine rather than linear), or an index map
     /// that is not an axis or a single strided window.
     /// </exception>
+    /// <summary>
+    /// Gradient with respect to the WEIGHTS, without which these kernels cannot train.
+    /// </summary>
+    /// <remarks>
+    /// The transform is not data-specific -- it differentiates with respect to whichever
+    /// operand it is given -- so this is the same derivation with the roles swapped. For
+    /// a convolution it produces
+    ///
+    ///     dW[k, c, kh, kw] = sum over n, oh, ow of dOut[n,k,oh,ow] * in[n,c,oh+kh-1,ow+kw-1]
+    ///
+    /// whose reduction is over the batch and spatial axes rather than over channels and
+    /// taps. The weight's dimensions become the parallel axes and everything the weight
+    /// index does not pin down becomes a reduction axis, which falls out of the same
+    /// determined/free classification.
+    /// </remarks>
+    /// <param name="forward">The forward operator.</param>
+    /// <param name="weightInput">Index of the operand to differentiate with respect to.</param>
+    public static CodegenKernelSpec BackwardWeights(CodegenKernelSpec forward, int weightInput)
+        => BackwardData(forward, weightInput);
+
     public static CodegenKernelSpec BackwardData(CodegenKernelSpec forward, int dataInput)
     {
         if (forward is null) throw new ArgumentNullException(nameof(forward));
@@ -205,16 +225,45 @@ public static class CodegenAdjoint
                 result[d] = CodegenAffineExpr.Const(expr.Constant);
                 continue;
             }
-            if (expr.Terms.Count != 1 || expr.Terms[0].Coefficient != 1 ||
-                expr.Constant != 0 || expr.Divisor != 1)
-                throw new NotSupportedException(
-                    "Cannot substitute into a compound map: " + what + " dimension " + d + ".");
+            // Simple case: a plain axis reference maps straight to its image, which may
+            // itself be compound (a transposed window, for the data gradient).
+            if (expr.Terms.Count == 1 && expr.Terms[0].Coefficient == 1 &&
+                expr.Constant == 0 && expr.Divisor == 1)
+            {
+                var replacement = substitution[expr.Terms[0].Axis];
+                if (replacement is null)
+                    throw new NotSupportedException(
+                        what + " dimension " + d + " references an axis with no adjoint image.");
+                result[d] = replacement;
+                continue;
+            }
 
-            var replacement = substitution[expr.Terms[0].Axis];
-            if (replacement is null)
-                throw new NotSupportedException(
-                    what + " dimension " + d + " references an axis with no adjoint image.");
-            result[d] = replacement;
+            // COMPOUND MAP. Needed for the WEIGHT gradient: dW reduces over the batch and
+            // spatial axes, so the activation keeps its gather window
+            // `stride*oh + kh - pad` and that window has to be rewritten in the new axis
+            // numbering. Refusing this is what made the weight gradient underivable and
+            // left these kernels unable to train.
+            //
+            // Rewriting term-by-term is exact whenever every image is a plain axis, which
+            // is the case when the axes are being renumbered rather than transformed. If
+            // an image is itself compound the composition is no longer affine in one step,
+            // and that is refused rather than approximated.
+            var rewritten = new CodegenAffineTerm[expr.Terms.Count];
+            for (int t = 0; t < expr.Terms.Count; t++)
+            {
+                var image = substitution[expr.Terms[t].Axis];
+                if (image is null)
+                    throw new NotSupportedException(
+                        what + " dimension " + d + " references an axis with no adjoint image.");
+                if (image.Terms.Count != 1 || image.Terms[0].Coefficient != 1 ||
+                    image.Constant != 0 || image.Divisor != 1)
+                    throw new NotSupportedException(
+                        "Cannot substitute a compound image into a compound map: " +
+                        what + " dimension " + d + ".");
+                rewritten[t] = new CodegenAffineTerm(image.Terms[0].Axis, expr.Terms[t].Coefficient);
+            }
+            result[d] = new CodegenAffineExpr(
+                rewritten, expr.Constant, expr.Divisor, expr.RequiresExactDivision);
         }
         return result;
     }

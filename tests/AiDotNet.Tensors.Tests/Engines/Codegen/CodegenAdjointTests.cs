@@ -114,6 +114,66 @@ public class CodegenAdjointTests
         Assert.Throws<NotSupportedException>(() => CodegenAdjoint.BackwardData(withRelu, 0));
     }
 
+    /// <summary>
+    /// The WEIGHT gradient, tested by the same identity with the roles swapped. The
+    /// forward operator is bilinear in (data, weights), so
+    ///
+    ///     &lt;fwd(x, w), y&gt;  ==  &lt;w, dW(x, y)&gt;
+    ///
+    /// holds for the true weight gradient and for nothing else. Without this kernel the
+    /// generated set cannot train -- only the data gradient existed.
+    /// </summary>
+    [Theory]
+    [InlineData("depthwise")]
+    [InlineData("conv1x1")]
+    [InlineData("conv3x3")]
+    [InlineData("strided")]
+    public void WeightGradient_SatisfiesTheDotProductIdentity(string which)
+    {
+        CodegenKernelSpec forward = which switch
+        {
+            "depthwise" => Forward.Depthwise(2, 4, 8, 8),
+            "conv1x1" => Forward.Conv1x1(2, 6, 5, 8, 8),
+            "conv3x3" => Forward.Conv3x3(2, 3, 4, 8, 8),
+            _ => Forward.DepthwiseStrided(2, 4, 8, 8, 2),
+        };
+
+        // Operand 1 is the weights in every one of these specs.
+        var backward = CodegenAdjoint.BackwardWeights(forward, 1);
+
+        double[] x = Fill(Elements(forward.Inputs[0].Shape), 1);
+        double[] w = Fill(Elements(forward.Inputs[1].Shape), 2);
+        double[] y = Fill(Elements(forward.Output.Shape), 3);
+
+        double lhs = Dot(forward.Interpret(new[] { x, w }), y);
+
+        // The derived kernel takes (dOut, data) and produces dWeights.
+        double rhs = Dot(w, backward.Interpret(new[] { y, x }));
+
+        Assert.True(Math.Abs(lhs - rhs) <= 1e-9 * Math.Max(1.0, Math.Abs(lhs)),
+            which + ": inner product via forward is " + lhs.ToString("R") +
+            " but via the derived weight gradient is " + rhs.ToString("R") +
+            "; the derived map is not the adjoint in the weight argument.");
+        Assert.NotEqual(0.0, lhs);
+    }
+
+    /// <summary>Derived weight-gradient kernels must also be emittable.</summary>
+    [Fact]
+    public void WeightGradientKernels_Emit()
+    {
+        foreach (var forward in new[]
+                 {
+                     Forward.Depthwise(2, 4, 8, 8),
+                     Forward.Conv1x1(2, 6, 5, 8, 8),
+                     Forward.Conv3x3(2, 3, 4, 8, 8),
+                 })
+        {
+            var backward = CodegenAdjoint.BackwardWeights(forward, 1);
+            string ptx = new PtxAffineEmitter().Emit(backward, 8, 6);
+            Assert.Contains(".visible .entry", ptx, StringComparison.Ordinal);
+        }
+    }
+
     private static class Forward
     {
         internal static CodegenKernelSpec Depthwise(int n, int c, int h, int w) =>

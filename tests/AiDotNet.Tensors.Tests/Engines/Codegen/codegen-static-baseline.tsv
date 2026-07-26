@@ -8,4 +8,7 @@ conv_transpose2d_3x3_stride2	1097	45	0	115	0
 depthwise_conv2d_3x3_bwd_data	713	45	0	139	0
 conv2d_1x1_bwd_data	4273	320	64	832	0
 conv2d_3x3_bwd_data	1290	37	0	164	1
+depthwise_conv2d_3x3_bwd_weights	1072	70	14	225	2
+conv2d_1x1_bwd_weights	1511	56	56	256	2
+conv2d_3x3_bwd_weights	717	43	14	150	2
 conv2d_1x1_deep_epilogue	3199	136	128	456	0
