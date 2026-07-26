@@ -178,17 +178,12 @@ internal static class KernelAutotuneTool
                 outBuffer.Download<float>(got);
 
                 if (reference is null) reference = got;
-                else
+                else if (!Agrees(got, reference, out double deviation))
                 {
-                    double worst = 0;
-                    for (long e = 0; e < outCount; e++)
-                        worst = Math.Max(worst, Math.Abs(got[e] - reference[e]));
-                    if (worst > 2e-3)
-                    {
-                        Console.WriteLine("    candidate '" + candidate.Name + "' disagrees by " +
-                                          worst.ToString("E3", CultureInfo.InvariantCulture) + "; rejected");
-                        continue;
-                    }
+                    Console.WriteLine("    candidate '" + candidate.Name + "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                    continue;
                 }
 
                 double us = Measure(runtime.Synchronize, Launch);
@@ -199,7 +194,145 @@ internal static class KernelAutotuneTool
         }
 
         if (modelledUs <= 0) modelledUs = bestUs;
+
+        // The split is a candidate like any other lowering, and for the same reason:
+        // whether it wins cannot be predicted. Block count says the opposite of the truth
+        // (a 64-block kernel won 2.05x while a 16-block one lost 1.89x) and arithmetic
+        // volume does not separate the cases -- the reduction that won and the linear
+        // layer that lost do the SAME 131,072 multiply-accumulates per block. See
+        // docs/SPLIT_K_REDUCTION.md.
+        //
+        // Run LAST, deliberately: `reference` now holds a single-kernel result, so the
+        // split is checked against the established answer. Running it first would let a
+        // wrong split become the reference and reject the correct kernels.
+        if (reference is not null &&
+            TrySplitCandidate(runtime, spec, reference) is { } split && split.Us < bestUs)
+        {
+            bestUs = split.Us;
+            bestName = split.Name;
+        }
+
         return (bestName, bestUs, modelledUs);
+    }
+
+    /// <summary>
+    /// Times the two-kernel split route, or null when there is no split or it disagrees.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="reference"/> is an established single-kernel result, so the split
+    /// is held to exactly the same numerical bar as every other lowering. A two-kernel
+    /// path through a temporary is the shape that produces a fast wrong answer, and a
+    /// tuner that preferred it on speed alone would install one.
+    /// </remarks>
+    private static (string Name, double Us)? TrySplitCandidate(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, float[] reference)
+    {
+        CodegenSplitPlan? plan;
+        try { plan = CodegenSplitReduction.TryPlan(spec); }
+        catch (NotSupportedException) { return null; }
+        if (plan is null) return null;
+
+        var buffers = new List<DirectPtxBuffer>();
+        try
+        {
+            var partialEmitter = new PtxAffineEmitter();
+            var combineEmitter = new PtxAffineEmitter();
+            string partialPtx, combinePtx;
+            try
+            {
+                partialPtx = partialEmitter.Emit(plan.Partial,
+                    runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                combinePtx = combineEmitter.Emit(plan.Combine,
+                    runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            }
+            catch (NotSupportedException) { return null; }
+
+            using var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
+            using var combineModule = runtime.LoadModule(combinePtx, allowExperimentalJitFallback: true);
+            IntPtr partialFn = partialModule.GetFunction(plan.Partial.Name, out _);
+            IntPtr combineFn = combineModule.GetFunction(plan.Combine.Name, out _);
+
+            var uploaded = new IntPtr[spec.Inputs.Count];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                long count = Elements(spec.Inputs[i].Shape);
+                var b = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+                var host = new float[count];
+                for (long e = 0; e < count; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                b.Upload<float>(host);
+                buffers.Add(b);
+                uploaded[i] = b.Pointer;
+            }
+
+            var temp = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
+            buffers.Add(temp);
+            long outCount = Elements(spec.Output.Shape);
+            var outBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
+            buffers.Add(outBuffer);
+
+            // The partial pass reads only the product operands; the epilogue moved to the
+            // combine, so binding by position would hand it the bias.
+            var partialArgs = new IntPtr[plan.Partial.ParameterCount];
+            for (int i = 0; i < spec.ProductInputs.Count; i++)
+                partialArgs[i] = uploaded[spec.ProductInputs[i]];
+            partialArgs[partialArgs.Length - 1] = temp.Pointer;
+
+            var combineArgs = new IntPtr[plan.Combine.ParameterCount];
+            combineArgs[0] = temp.Pointer;
+            if (plan.Combine.BiasInput is { } bias) combineArgs[bias] = uploaded[spec.BiasInput!.Value];
+            if (plan.Combine.ScaleInput is { } scaleAt) combineArgs[scaleAt] = uploaded[spec.ScaleInput!.Value];
+            combineArgs[combineArgs.Length - 1] = outBuffer.Pointer;
+
+            void Launch()
+            {
+                LaunchOne(partialModule, partialFn, partialArgs, partialEmitter.LaunchBlocks,
+                    (uint)partialEmitter.LaunchBlockX, (uint)partialEmitter.LaunchBlockY);
+                LaunchOne(combineModule, combineFn, combineArgs, combineEmitter.LaunchBlocks,
+                    (uint)combineEmitter.LaunchBlockX, (uint)combineEmitter.LaunchBlockY);
+            }
+
+            Launch();
+            runtime.Synchronize();
+            var got = new float[outCount];
+            outBuffer.Download<float>(got);
+
+            if (!Agrees(got, reference, out double deviation))
+            {
+                Console.WriteLine("    candidate 'split' disagrees by " +
+                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                  " relative; rejected");
+                return null;
+            }
+
+            string axes = string.Join("+", plan.PromotedAxes);
+            return ("split:" + axes, Measure(runtime.Synchronize, Launch));
+        }
+        finally { foreach (var b in buffers) b.Dispose(); }
+    }
+
+    /// <summary>
+    /// Whether a candidate reproduces the reference, judged RELATIVE to the reference's
+    /// own magnitude.
+    /// </summary>
+    /// <remarks>
+    /// An absolute tolerance is a fp32-epsilon test, not an agreement test, and it
+    /// silently scales with the reduction length. The absolute form rejected a CORRECT
+    /// split of depthwise_conv2d_3x3_bwd_weights over a deviation of 8.575 -- which is
+    /// 5.6E-004 relative, the ordinary fp32 accumulation-order difference across 100,352
+    /// summed terms, and the same figure that kernel already shows on the conveyor. That
+    /// false negative cost a measured 17x.
+    /// </remarks>
+    private static bool Agrees(float[] candidate, float[] reference, out double deviation)
+    {
+        double worst = 0, scale = 0;
+        for (long e = 0; e < candidate.Length; e++)
+        {
+            worst = Math.Max(worst, Math.Abs(candidate[e] - reference[e]));
+            scale = Math.Max(scale, Math.Abs((double)reference[e]));
+        }
+        deviation = scale > 0 ? worst / scale : worst;
+        return deviation <= 2e-3;
     }
 
     private static double Measure(Action synchronize, Action launch)

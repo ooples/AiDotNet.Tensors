@@ -231,7 +231,7 @@ internal static class KernelConveyorTool
                     // gates caught each after the fact; using one shape removes the
                     // class. The fp64 oracle at these sizes is 26-115M operations, a few
                     // seconds, which is worth paying once per kernel.
-                    var (dev, regs, elided, lowering) = VerifyOne(runtime, entry.Bench);
+                    var (dev, regs, elided, lowering) = VerifyOne(runtime, entry.Bench, entry.Name);
 
                     // The verify shape must exercise the SAME lowering as the shape
                     // that gets released. Otherwise the strip-mined loop path can ship
@@ -275,15 +275,38 @@ internal static class KernelConveyorTool
     /// modelled choice. Named the same as the autotuner's candidates, so the winner it
     /// records is the configuration reproduced here.
     /// </summary>
+    /// <summary>
+    /// Applies the measured lowering for a kernel.
+    /// </summary>
+    /// <param name="emitter">Emitter to configure.</param>
+    /// <param name="kernelName">
+    /// The CATALOG ENTRY name, which is what the autotuner writes. It is not always the
+    /// spec's own name -- the depthwise entries are catalogued as
+    /// "depthwise_conv2d_3x3..." while their specs are named "dwconv2d_3x3..." -- and
+    /// looking up by the spec name silently found nothing, so those kernels ran the
+    /// modelled lowering while the cache said they had been tuned.
+    /// </param>
     private static void ApplyTuned(PtxAffineEmitter emitter, string kernelName)
     {
-        switch (CodegenAutotuneCache.WinnerFor(kernelName))
+        string? winner = CodegenAutotuneCache.WinnerFor(kernelName);
+        switch (winner)
         {
             case "no-tile": emitter.Coarsening = 1; break;
             case "tile2": emitter.Coarsening = 2; break;
             case "lanes4": emitter.MaxTileLanes = 4; break;
             case "no-staging": emitter.EnableSharedStaging = false; break;
             case "no-vector": emitter.EnableVectorLoads = false; break;
+
+            // A split winner is not a knob -- it is a different PROGRAM, two kernels and a
+            // temporary, which this single-kernel path cannot launch. Saying so is the
+            // point: silently falling through would report a kernel as tuned while running
+            // the lowering the tuner measured as 17x slower.
+            case not null when winner.StartsWith("split:", StringComparison.Ordinal):
+                Console.WriteLine("    note: " + kernelName + " measured fastest as " + winner +
+                                  ", a two-kernel split this stage cannot launch; " +
+                                  "running the single-kernel lowering instead");
+                break;
+
             default: break;   // untuned, or the modelled choice already won
         }
     }
@@ -300,10 +323,10 @@ internal static class KernelConveyorTool
         loopedAxes == 0 ? "unroll" : "loop x" + loopedAxes.ToString(CultureInfo.InvariantCulture);
 
     private static (double Deviation, int Registers, int Elided, int Lowering) VerifyOne(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec)
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, string catalogName)
     {
         var emitter = new PtxAffineEmitter();
-        ApplyTuned(emitter, spec.Name);
+        ApplyTuned(emitter, catalogName);
         string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
         IntPtr fn = module.GetFunction(spec.Name, out DirectPtxFunctionInfo info);
@@ -588,7 +611,7 @@ internal static class KernelConveyorTool
                 {
                     var spec = entry.Bench;
                     var emitter = new PtxAffineEmitter();
-                    ApplyTuned(emitter, spec.Name);
+                    ApplyTuned(emitter, entry.Name);
                     if (args.Contains("--no-coarsen", StringComparer.Ordinal)) emitter.Coarsening = 1;
                     if (ValueOf(args, "--coarsen") is string cz)
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);

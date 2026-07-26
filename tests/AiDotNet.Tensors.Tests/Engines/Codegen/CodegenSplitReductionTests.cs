@@ -335,6 +335,24 @@ public class CodegenSplitReductionTests
             Assert.Equal(direct[i], staged[i], 9);
     }
 
+    /// <summary>
+    /// Every kernel the autotuner can win on must be reachable through the split, and the
+    /// three weight gradients are exactly those -- measured at 17.12x, 35.09x and 2.03x.
+    /// </summary>
+    [Theory]
+    [InlineData("depthwise_conv2d_3x3_bwd_weights")]
+    [InlineData("conv2d_1x1_bwd_weights")]
+    [InlineData("conv2d_3x3_bwd_weights")]
+    public void WeightGradientCatalogKernels_AllPlanASplit(string kernelName)
+    {
+        var entry = CodegenKernelCatalog.Find(kernelName);
+        Assert.NotNull(entry);
+
+        var plan = CodegenSplitReduction.TryPlan(entry!.Bench);
+        Assert.NotNull(plan);
+        Assert.True(plan!.TempElements > entry.Bench.Output.ElementCount);
+    }
+
     /// <summary>A max reduction has no summed-partial combine and must be refused.</summary>
     [Fact]
     public void NonSumReduction_IsRefused()

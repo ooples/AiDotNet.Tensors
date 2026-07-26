@@ -181,3 +181,53 @@ reason printed. `--force-timing` overrides that for one specific case — a comp
 that has been externally *suspended*, so it holds a context and its memory but occupies no
 SMs — and prints what it overrode, so the caveat travels with the numbers. Every timing
 above was taken with the SM clock locked and verified unchanged across the run.
+
+## The autotuner decides it now
+
+Since the split cannot be chosen statically, it became a candidate in
+`--kernel-autotune` alongside `no-tile`, `tile2`, `lanes4`, `no-staging` and `no-vector`.
+It is timed last, against the reference an established single-kernel candidate produced —
+running it first would let a wrong split become the reference and reject the correct
+kernels — and it must agree numerically before it is timed at all.
+
+Measured across the catalog:
+
+| kernel | modelled | best | winner | gain |
+|---|---|---|---|---|
+| `depthwise_conv2d_3x3_bwd_weights` | 4059.9 | 237.1 | `split:4` | **17.12×** |
+| `conv2d_1x1_bwd_weights` | 2126.9 | 60.6 | `split:3` | **35.09×** |
+| `conv2d_3x3_bwd_weights` | 239.5 | 118.2 | `split:5` | **2.03×** |
+| the other ten | — | — | a tile knob or `modelled` | ≤ 1.013× |
+
+The split wins on exactly the three weight gradients and is rejected everywhere else, which
+is the FE-6 conclusion now enforced by measurement rather than asserted by a rule.
+
+### Two bugs this run exposed
+
+**An absolute tolerance rejected a correct split.** The agreement check compared candidates
+with an absolute `2e-3`, and rejected the depthwise split over a deviation of `8.575`. That
+is `5.6E-004` *relative* — the ordinary fp32 accumulation-order difference across 100,352
+summed terms, and the same figure that kernel already reports on the conveyor. An absolute
+tolerance is an fp32-epsilon test, not an agreement test, and it silently tightens as the
+reduction lengthens. The false negative cost a measured 17×. The check is now relative.
+
+**The autotune cache was keyed two different ways.** The autotuner *writes* rows under the
+catalog entry name (`depthwise_conv2d_3x3_bwd_weights`) while `ApplyTuned` *read* them by
+the spec's own name (`dwconv2d_3x3_bwd_weights`). Those differ for every depthwise entry, so
+the lookup silently found nothing and those kernels ran the modelled lowering while the
+cache reported them as tuned. Pre-existing, and invisible precisely because a miss is
+indistinguishable from "the modelled choice already won". Now keyed by the catalog name at
+both ends.
+
+### What the conveyor does with a split winner
+
+Nothing — and it says so:
+
+```
+    note: depthwise_conv2d_3x3_bwd_weights measured fastest as split:4, a two-kernel
+          split this stage cannot launch; running the single-kernel lowering instead
+```
+
+A split winner is not a knob but a different *program*: two kernels and a temporary. The
+single-kernel verify path cannot launch it, and silently falling through would report a
+kernel as tuned while running the lowering the tuner measured as 17× slower.
