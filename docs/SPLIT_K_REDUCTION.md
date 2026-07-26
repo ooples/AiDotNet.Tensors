@@ -96,10 +96,10 @@ kernel's own output; a row is only meaningful if that column is at or near zero.
 
 ## Not yet done
 
-The split is emitted, executed from a graph, and now chosen by the autotuner — see the
-sections below. What remains is that the conveyor's single-kernel stages cannot *launch* a
-split winner, so a kernel the tuner measured as 17× faster still verifies and benches under
-its single-kernel lowering. Teaching those stages the two-kernel program is the next step.
+The split is emitted, executed from a graph, chosen by the autotuner, and run by all three
+conveyor stages — see the sections below. What remains is that the three kernels it wins on
+have **no competitor ratio at all**, so those wins are measured against our own prior
+lowering rather than against PyTorch or cuDNN.
 
 Remaining order: per-dimension staging (predicted ~15 us on
 dense 3x3 against cuDNN's 41.0), then `cp.async` and tensor cores — the last two still
