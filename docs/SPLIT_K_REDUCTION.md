@@ -1,60 +1,106 @@
-# The gap the autotuner found: reductions with tiny outputs
+# Split-K: parallelism from the reduction
 
-FE-4 was planned as per-dimension staging and then tensor cores. Measurement re-aimed it.
+## The gap
 
-## The finding
+The emitter maps parallel axes to threads and reduction axes to loops, always. When the
+parallel axes are small and the reduction is enormous, the machine sits idle:
 
-`depthwise_conv2d_3x3_bwd_weights` runs at **4052.6 us against a 3.8 us compute
-roofline — 1081x off.** The autotuner tried every candidate lowering and none of them
-moved it.
-
-The reason is structural, not a tuning miss:
-
-| quantity | value |
+| | `depthwise_conv2d_3x3_bwd_weights` |
 |---|---|
-| output elements (dW is `[C,3,3]`) | **576** |
+| output elements (dW is `[C,3,3]`) | 576 |
 | reduction length (`n x oh x ow`) | 100,352 |
 | MACs | 57.8 M |
 | threads at one output per thread | 576 |
-| **blocks on a 68-SM device** | **3** |
-| fraction of one wave | **4%** |
+| blocks on a 68-SM device | **3** — 4% of one wave |
+| measured | **4063.5 us** |
+| compute roofline | 3.8 us |
+| ratio | **1081x** |
 
-The kernel is correct and it is idle. 96% of the GPU has nothing to do, because the
-emitter maps **parallel axes to threads and reduction axes to loops, always**. When the
-parallel axes are tiny and the reduction is enormous, there is no tile that helps — and
-the autotuner proved that empirically by failing to find one.
+The autotuner tried every candidate lowering — `no-tile`, `tile2`, `lanes4`,
+`no-staging`, `no-vector` — and none of them moved it. No tile *can*: tiling redistributes
+work among threads that exist, and the problem is that only 576 exist.
 
-## Why this outranks the dense-convolution gap
+This is not specific to depthwise. Every weight gradient has this shape, as does every
+norm, every loss, and every global pooling. It also outranks the dense-convolution gap,
+which is 1.5x in a battle the targeting map says not to pick.
 
-Dense 3x3 sits at 0.67x of cuDNN, a 1.5x tuning gap in a battle the targeting map says
-not to pick. This is a **1081x structural gap** in a kernel that is required for
-training. It is also not specific to depthwise: every weight gradient has a small output
-and a long reduction, and so does any norm, any loss, any global pooling.
+## The transform
 
-## What it needs: split the reduction
+Promote a reduction axis to a parallel axis. Its extent becomes threads instead of loop
+trips, and the kernel writes one partial result per position of it. A second kernel sums
+over the new dimension.
 
-Partition the reduction into `S` chunks and give each chunk to a different block, so
-parallelism comes from the reduction rather than from the output. Two ways to combine:
+Every index map is untouched — the axis keeps its index, only its *role* changes. The
+output gains the promoted axis as its last dimension, which is also the fastest-varying
+one in the thread decomposition, so the partial pass's stores stay coalesced.
 
-**Atomics.** Each block `atomicAdd`s its partial sum. Simple, one launch, no temporary.
-But fp32 atomic addition is order-nondeterministic, so the result varies run to run and
-the exact `0.000E+000` verify — which has caught four real bugs in this project — would
-have to be relaxed to a tolerance. That is a bad trade.
+`CodegenSplitReduction.TryPlan(spec)` returns the two kernels plus the size of the
+temporary between them, or `null` when the kernel already fills the device.
 
-**Two-pass.** Each block writes its partial to a temporary `[S, ...]` buffer; a second
-kernel sums over `S`. Deterministic, so the correctness bar is unchanged. Costs one
-temporary allocation and one extra launch, which the resident-program spike measured at
-about 4.3 us of marginal cost — negligible against 4052.
+## Two passes, not atomics
 
-**Two-pass is the right choice**, because the exact-agreement gate is the thing that has
-repeatedly caught defects the structural gates missed, and trading it for one launch is
-not worth it.
+An `atomicAdd` combine needs no temporary and no second launch. It was rejected: fp32
+atomic addition is order-nondeterministic, so the result changes run to run and the exact
+`0.000E+000` agreement gate would have to become a tolerance. That gate has caught four
+real defects in this project that the structural gates passed. The second launch was
+measured at about 10 us against a 4063 us kernel.
 
-## Order of work
+## What it bought (p4, locked clocks, best-of-3)
 
-1. **Split-K, two-pass** — the 1081x gap, and it unblocks training.
-2. Per-dimension staging — predicted ~15 us on dense 3x3 against cuDNN's 41.0.
-3. `cp.async`, then tensor cores.
+| kernel | promoted | unsplit | partial | combine | total | gain | max rel. dev |
+|---|---|---|---|---|---|---|---|
+| `depthwise_conv2d_3x3_bwd_weights` | `oh(56)` | 4063.5 | 232.4 | 10.5 | **236.4** | **17.19x** | 5.3E-004 |
+| `depthwise_conv2d_3x3_bwd_weights` | `oh(56)+ow(56)` | 4075.5 | 210.3 | 119.9 | 334.7 | 12.18x | 5.2E-004 |
+| `conv2d_1x1_bwd_weights` | `oh(28)` | 2133.7 | 54.5 | 12.2 | **58.2** | **36.67x** | 0.0E+000 |
+| `conv2d_3x3_bwd_weights` | `oh(28)` | 240.7 | 114.1 | 10.0 | **117.4** | **2.05x** | 0.0E+000 |
 
-The targeting map still applies to 2 and 3: aim them at depthwise, pooling and
-memory-bound fusion chains, not at dense convolution with large channel counts.
+Two of the three agree with the unsplit kernel to the last bit. The depthwise deviation is
+the pre-existing fp32 accumulation-order difference over 100,352 terms that this kernel
+already showed before the split (`5.589E-004` on the conveyor); it is within the 2E-003
+tolerance, and the split sums in a *shallower* order than the serial loop it replaces.
+
+Even at 17.19x, depthwise is still 62x off its roofline. Split-K removed the structural
+idleness; what remains is an ordinary tuning gap on a kernel that now has work to tune.
+
+## The model was wrong again, in the direction it always is
+
+One axis reached 126 blocks on 68 SMs — under two per SM — so the blocks-per-SM model said
+a second axis should help again. It did not:
+
+| | partial | combine | total |
+|---|---|---|---|
+| one axis | 235.9 | 11.0 | **240.8** |
+| two axes | 209.9 | 119.1 | 334.7 |
+
+The partial pass *did* get faster, exactly as predicted. The combine pass is **itself** a
+small-output long-reduction kernel — 576 threads, 3 blocks — and promoting a second axis
+grew its reduction from 56 to 3136, so it inherited the precise problem being fixed. The
+model had no term for that, because the model does not know the combine exists.
+
+Reproduced across two independent runs (240.8 / 334.7, then 236.4 / 334.7).
+
+So `ChooseAxes` returns a **candidate ranking, not a decision**; `TryPlan` defaults to the
+one axis that was measured to win; and `--kernel-splitk` measures every prefix and records
+what the hardware said. This is the fourth time on this project that a model-chosen
+lowering lost to a measured one — see `RELEASE_EVIDENCE_GATES.md`.
+
+## Reproducing
+
+```
+nvidia-smi -lgc 1770,1770
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -f net10.0 -- --kernel-splitk all
+```
+
+Writes `artifacts/splitk.tsv`. Every row carries the measured deviation from the unsplit
+kernel's own output; a row is only meaningful if that column is at or near zero.
+
+## Not yet done
+
+The dispatcher does not launch split plans — it allocates no temporary and issues one
+kernel. `TryPlan` gives a consumer everything it needs, and wiring it lands with the
+`CodegenLowering` work that makes reductions reachable from the front end at all.
+
+Remaining order: lowering reductions, then per-dimension staging (predicted ~15 us on
+dense 3x3 against cuDNN's 41.0), then `cp.async` and tensor cores — the last two still
+aimed by the targeting map at depthwise, pooling and memory-bound fusion chains, not at
+dense convolution with large channel counts.
