@@ -119,7 +119,7 @@ internal static class KernelConveyorTool
                     if (ValueOf(args, "--max-lanes") is string mz)
                         emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
                 string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks, (uint)emitter.LaunchBlockThreads);
+                using var stage = LaunchableStage.Create(runtime, spec, ptx, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
                 stage.Launch();
                 runtime.Synchronize();
                 Console.WriteLine(entry.Name + ": one launch, " + emitter.LaunchBlocks + " blocks, lanes=" +
@@ -319,7 +319,7 @@ internal static class KernelConveyorTool
             buffers.Add(outBuffer);
             pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-            LaunchSpec(module, fn, pointers, emitter.LaunchBlocks, (uint)emitter.LaunchBlockThreads);
+            LaunchSpec(module, fn, pointers, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
             runtime.Synchronize();
 
             var actual = new float[outCount];
@@ -597,7 +597,7 @@ internal static class KernelConveyorTool
                         buffers.Add(outBuffer);
                         pointers[spec.Inputs.Count] = outBuffer.Pointer;
 
-                        void Launch() => LaunchSpec(module, fn, pointers, blocks, (uint)emitter.LaunchBlockThreads);
+                        void Launch() => LaunchSpec(module, fn, pointers, blocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
                         int bestClockBefore = 0, bestClockAfter = 0;
 
                         // RETRY ON CLOCK DRIFT. The SM clock was observed swinging
@@ -700,8 +700,8 @@ internal static class KernelConveyorTool
                 var scalarEmitter = new PtxAffineEmitter { EnableVectorLoads = false };
                 string scalarPtx = scalarEmitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
-                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx, vecEmitter.LaunchBlocks, (uint)vecEmitter.LaunchBlockThreads);
-                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx, scalarEmitter.LaunchBlocks, (uint)scalarEmitter.LaunchBlockThreads);
+                using var vecStage = LaunchableStage.Create(runtime, spec, vecPtx, vecEmitter.LaunchBlocks, (uint)vecEmitter.LaunchBlockX, (uint)vecEmitter.LaunchBlockY);
+                using var scalarStage = LaunchableStage.Create(runtime, spec, scalarPtx, scalarEmitter.LaunchBlocks, (uint)scalarEmitter.LaunchBlockX, (uint)scalarEmitter.LaunchBlockY);
 
                 var ratios = new double[Runs];
                 double scalarUs = double.MaxValue, vectorUs = double.MaxValue;
@@ -758,8 +758,8 @@ internal static class KernelConveyorTool
                     var thin = new PtxAffineEmitter { Coarsening = 1 };
                     string thinPtx = thin.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
-                    using var wideStage = LaunchableStage.Create(runtime, spec, widePtx, wide.LaunchBlocks, (uint)wide.LaunchBlockThreads);
-                    using var thinStage = LaunchableStage.Create(runtime, spec, thinPtx, thin.LaunchBlocks, (uint)thin.LaunchBlockThreads);
+                    using var wideStage = LaunchableStage.Create(runtime, spec, widePtx, wide.LaunchBlocks, (uint)wide.LaunchBlockX, (uint)wide.LaunchBlockY);
+                    using var thinStage = LaunchableStage.Create(runtime, spec, thinPtx, thin.LaunchBlocks, (uint)thin.LaunchBlockX, (uint)thin.LaunchBlockY);
 
                     var ratios = new double[Runs];
                     double thinUs = 0, wideUs = 0;
@@ -826,13 +826,13 @@ internal static class KernelConveyorTool
         private readonly uint _blocks;
         private readonly List<DirectPtxBuffer> _buffers;
 
-        private readonly uint _blockThreads;
+        private readonly uint _blockX, _blockY;
 
         private LaunchableStage(DirectPtxModule m, IntPtr fn, IntPtr[] p, uint blocks,
-                                uint blockThreads, List<DirectPtxBuffer> b)
-        { _module = m; _fn = fn; _pointers = p; _blocks = blocks; _blockThreads = blockThreads; _buffers = b; }
+                                uint blockX, uint blockY, List<DirectPtxBuffer> b)
+        { _module = m; _fn = fn; _pointers = p; _blocks = blocks; _blockX = blockX; _blockY = blockY; _buffers = b; }
 
-        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx, uint blocks, uint blockThreads)
+        internal static LaunchableStage Create(DirectPtxRuntime runtime, CodegenKernelSpec spec, string ptx, uint blocks, uint blockX, uint blockY)
         {
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -851,10 +851,10 @@ internal static class KernelConveyorTool
             var outBuf = runtime.AllocateBytes((nuint)(Elements(spec.Output.Shape) * sizeof(float)));
             buffers.Add(outBuf);
             pointers[spec.Inputs.Count] = outBuf.Pointer;
-            return new LaunchableStage(module, fn, pointers, blocks, blockThreads, buffers);
+            return new LaunchableStage(module, fn, pointers, blocks, blockX, blockY, buffers);
         }
 
-        internal void Launch() => LaunchSpec(_module, _fn, _pointers, _blocks, _blockThreads);
+        internal void Launch() => LaunchSpec(_module, _fn, _pointers, _blocks, _blockX, _blockY);
 
         public void Dispose()
         {
@@ -917,13 +917,13 @@ internal static class KernelConveyorTool
         return null;
     }
 
-    private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockThreads)
+    private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)
     {
         fixed (IntPtr* pinned = pointers)
         {
             void** argv = stackalloc void*[pointers.Length];
             for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, blockThreads, 1, 1, 0, argv);
+            module.Launch(fn, blocks, 1, 1, blockX, blockY, 1, 0, argv);
         }
     }
 }

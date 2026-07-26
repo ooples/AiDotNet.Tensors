@@ -157,6 +157,80 @@ public sealed class PtxAffineEmitter
     /// <summary>Bytes of shared memory the launch must reserve.</summary>
     public int SharedMemoryBytes { get; private set; }
 
+    /// <summary>Block width, over the contiguous tile axis.</summary>
+    public int LaunchBlockX { get; private set; } = BlockThreads;
+
+    /// <summary>Block height, over the reuse tile axis. 1 for the flat lowering.</summary>
+    public int LaunchBlockY { get; private set; } = 1;
+
+    /// <summary>
+    /// Selects the two-dimensional lowering, the prerequisite for staging the ACTIVATION
+    /// operand. OFF by default: the lowering is correct but not yet profitable.
+    /// </summary>
+    /// <remarks>
+    /// Measured on dense 3x3: the flat lowering with staged weights runs 61.5 us; the
+    /// two-dimensional lowering runs 74.3 us. Two reasons, both addressable:
+    ///
+    /// 1. It gives up weight staging. Under a flat block every thread shares one
+    ///    reuse-axis group, so the weights are block-invariant. Under 2D, y varies over
+    ///    that axis, so each row needs its own slice -- each operand is invariant in one
+    ///    DIMENSION, not in the block, and staging must be indexed by the dimension the
+    ///    operand varies in. Staging the block-invariant way under 2D is not merely
+    ///    unprofitable, it is wrong: it returned 5.277 and 1.112e1 instead of zero.
+    ///
+    /// 2. The block is warp-ragged. 7 tiles of ow by 16 tiles of k is 112 threads, which
+    ///    is 3.5 warps, so every block wastes half a warp. Padding x to 8 with a guard
+    ///    would make it 128, exactly 4 warps.
+    ///
+    /// With per-dimension staging the arithmetic predicts 0.0078 loads/MAC -- below
+    /// cuDNN's measured ~0.03 -- and an LDS-bound ~15 us against cuDNN's 41.0. The
+    /// lowering here is the scaffolding for that; it is left off until it earns its way.
+    /// </remarks>
+    public bool EnableInputStaging { get; set; }
+
+    /// <summary>True when the emitted kernel used the two-dimensional lowering.</summary>
+    public bool UsedTwoDimensionalBlock { get; private set; }
+
+    /// <summary>
+    /// The activation operand is invariant in the reuse axis, so threads that differ
+    /// only in that axis want the SAME input. A flat block cannot exploit that: its
+    /// threads walk the spatial axes at one value of the reuse axis, which is the
+    /// opposite arrangement. A two-dimensional block fixes it -- x over the contiguous
+    /// axis so stores stay coalesced, y over the reuse axis so a staged input row is
+    /// shared by every thread in the column.
+    /// </summary>
+    private static bool CanStageInput(
+        CodegenKernelSpec spec, IReadOnlyList<CodegenAxis> axes,
+        List<int> tileAxes, List<int> tileFactors, int dataInput,
+        out int blockX, out int blockY)
+    {
+        blockX = 0;
+        blockY = 0;
+        if (tileAxes.Count < 2) return false;
+
+        int contiguousAxis = tileAxes[0];
+        int reuseAxis = tileAxes[1];
+
+        // The data operand must be invariant in the reuse axis -- that invariance IS
+        // the reuse -- and must vary along the contiguous one, or there is nothing to
+        // stage per column.
+        if (ReferencesAxis(spec.Inputs[dataInput], reuseAxis)) return false;
+        if (!ReferencesAxis(spec.Inputs[dataInput], contiguousAxis)) return false;
+
+        long x = axes[contiguousAxis].Extent / tileFactors[0];
+        long y = axes[reuseAxis].Extent / tileFactors[1];
+
+        // Require the block to cover BOTH tiled axes completely. A partial cover would
+        // need the staged tile to carry a base offset, and the halo maths to follow it;
+        // full cover keeps the staged row addressed from zero.
+        if (x * y > MaxBlockThreads || x * y < 32) return false;
+        if (x <= 0 || y <= 1) return false;
+
+        blockX = (int)x;
+        blockY = (int)y;
+        return true;
+    }
+
     /// <summary>Operand indices staged in shared memory, for reporting.</summary>
     public string StagedOperands { get; private set; } = "none";
 
@@ -782,12 +856,59 @@ public sealed class PtxAffineEmitter
                 break;
             }
         }
+        // TWO-DIMENSIONAL LOWERING, which is what makes the ACTIVATION operand stageable.
+        // It is invariant in the reuse axis, so threads differing only in that axis want
+        // the same input -- but a flat block walks the spatial axes at one value of the
+        // reuse axis, exactly the wrong arrangement. x over the contiguous axis keeps
+        // stores coalesced; y over the reuse axis makes a staged row serve the column.
+        int dataOperand = -1;
+        foreach (int inputIdx in spec.ProductInputs)
+            if (inputIdx != stagedInput && spec.Inputs[inputIdx].Map.Count > 2) dataOperand = inputIdx;
+
+        bool twoDimensional = false;
+        int blockX = blockThreads, blockY = 1;
+        if (EnableInputStaging && dataOperand >= 0 &&
+            CanStageInput(spec, axes, tileAxes, tileFactors, dataOperand, out int bx, out int by))
+        {
+            twoDimensional = true;
+            blockX = bx;
+            blockY = by;
+            blockThreads = bx * by;
+        }
+        UsedTwoDimensionalBlock = twoDimensional;
+
+        // A two-dimensional block INVALIDATES the flat staging analysis. That analysis
+        // asks which operands are constant across the whole block; under a flat block
+        // the weights are, because every thread shares one reuse-axis group. Under a 2D
+        // block y varies over the reuse axis, so each row wants a different weight slice
+        // and the single staged copy is wrong for all but one row -- measured directly:
+        // the two dense kernels returned 5.277 and 1.112e1 instead of zero.
+        //
+        // Under 2D each operand is invariant in exactly ONE dimension, not the block, so
+        // staging has to be indexed by the dimension the operand varies in. Until that is
+        // implemented, the 2D lowering runs without staging.
+        if (twoDimensional)
+        {
+            stagedInput = -1;
+            stageCount = 0;
+            stagedTileSlot = -1;
+            SharedMemoryBytes = 0;
+            StagedOperands = "none";
+        }
+
         // The derived block size exists ONLY to make staging possible: it is chosen so a
         // block covers whole groups of the staged operand's axes. If nothing ends up
         // staged, that constraint buys nothing and the odd size costs occupancy -- the
         // transposed kernel measured 114.3 us at the derived 196 against ~104 at 256.
         // So fall back to the standard block whenever staging did not apply.
-        if (stagedInput < 0) blockThreads = BlockThreads;
+        if (stagedInput < 0 && !twoDimensional)
+        {
+            blockThreads = BlockThreads;
+            blockX = BlockThreads;
+            blockY = 1;
+        }
+        LaunchBlockX = blockX;
+        LaunchBlockY = blockY;
 
         SharedMemoryBytes = stageCount * 4;
         LaunchBlockThreads = blockThreads;
@@ -796,7 +917,19 @@ public sealed class PtxAffineEmitter
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
         long threadCount = total / lanes;
-        long blocks = (threadCount + blockThreads - 1) / blockThreads;
+        long blocks;
+        if (twoDimensional)
+        {
+            // The block covers both tiled axes completely, so the grid is exactly the
+            // product of the axes it does NOT cover.
+            blocks = 1;
+            foreach (int ax in parallel)
+                if (!tileAxes.Contains(ax)) blocks *= axes[ax].Extent;
+        }
+        else
+        {
+            blocks = (threadCount + blockThreads - 1) / blockThreads;
+        }
         CheckLimits(spec, blocks, threadCount);
         LaunchBlocks = (uint)blocks;
 
@@ -833,30 +966,59 @@ public sealed class PtxAffineEmitter
             L($"ld.param.u64 {basePtr[i]}, [p{I(i)}];");
         }
 
-        // Flat thread id.
         string ctaid = NextR(), tid = NextR(), gid = NextR();
         L($"mov.u32 {ctaid}, %ctaid.x;");
-        L($"mov.u32 {tid}, %tid.x;");
-        L($"mad.lo.u32 {gid}, {ctaid}, {I(blockThreads)}, {tid};");
 
-        // Bounds guard derived from the SAME TotalThreads the host launches with.
-        string guard = NextP();
-        L($"setp.ge.u32 {guard}, {gid}, {I(threadCount)};");
-        L($"@{guard} bra END;");
+        if (twoDimensional)
+        {
+            // x indexes the contiguous tile, y the reuse tile, and the block covers both
+            // completely, so a thread's position in them is just its thread index and no
+            // guard is needed on those axes. The flat id is kept only so the staging
+            // helper has a linear identity for the cooperative fetch.
+            string tx = NextR(), ty = NextR();
+            L($"mov.u32 {tx}, %tid.x;");
+            L($"mov.u32 {ty}, %tid.y;");
+            L($"mad.lo.u32 {tid}, {ty}, {I(blockX)}, {tx};");
+            L($"mov.u32 {gid}, {tid};   // block-local; slow axes come from ctaid");
+        }
+        else
+        {
+            L($"mov.u32 {tid}, %tid.x;");
+            L($"mad.lo.u32 {gid}, {ctaid}, {I(blockThreads)}, {tid};");
+
+            // Bounds guard derived from the SAME TotalThreads the host launches with.
+            string guard = NextP();
+            L($"setp.ge.u32 {guard}, {gid}, {I(threadCount)};");
+            L($"@{guard} bra END;");
+        }
 
         // Decompose the flat id across parallel axes, last-declared fastest, so
         // consecutive threads walk the contiguous tensor axis. When coarsening, the
         // coarsened axis contributes extent/lanes to the decomposition, because one
         // thread now covers `lanes` of its positions.
         var axisReg = new string[axes.Count];
-        string rest = gid;
+        string rest = twoDimensional ? ctaid : gid;
         for (int p = parallel.Length - 1; p >= 0; p--)
         {
             int ax = parallel[p];
             int tileSlot = tileAxes.IndexOf(ax);
             int extent = tileSlot >= 0 ? axes[ax].Extent / tileFactors[tileSlot] : axes[ax].Extent;
+
+            // The two tiled axes are carried by the thread index in this lowering, so
+            // they are not part of the block-index decomposition.
+            if (twoDimensional && tileSlot >= 0)
+            {
+                string dim = NextR();
+                L($"mov.u32 {dim}, %tid.{(tileSlot == 0 ? "x" : "y")};   // {axes[ax].Name} tile");
+                axisReg[ax] = dim;
+                continue;
+            }
             axisReg[ax] = NextR();
-            if (p == 0)
+            bool outermost = true;
+            for (int q = 0; q < p; q++)
+                if (!(twoDimensional && tileAxes.Contains(parallel[q]))) outermost = false;
+
+            if (outermost)
             {
                 // Outermost axis takes whatever remains; no divide needed.
                 L($"mov.u32 {axisReg[ax]}, {rest};   // {axes[ax].Name}");
