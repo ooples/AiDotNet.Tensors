@@ -76,15 +76,34 @@ public sealed class PtxGraphEmitter : IKernelEmitter
     public CodegenKernelSpec? LastSpec { get; private set; }
 
     /// <summary>
-    /// A faster two-kernel route for the last emission, when the single kernel could not
-    /// fill the device; null when it could, or when the split did not emit.
+    /// A CANDIDATE two-kernel route for the last emission, when the single kernel could
+    /// not fill the device; null when it could, or when the split did not emit.
     /// </summary>
     /// <remarks>
-    /// This is an optimisation, never a requirement. A reduction whose output is small and
-    /// whose reduction is long runs at a few percent of one wave as a single kernel --
-    /// measured at 1081x off roofline on a weight gradient -- and no tile can fix it,
-    /// because tiling redistributes work among threads that exist. See
-    /// <c>docs/SPLIT_K_REDUCTION.md</c>.
+    /// <para>
+    /// A candidate, not a recommendation. It is always correct — the front-end check runs
+    /// it against the same reference as the single kernel — but whether it is FASTER has
+    /// to be measured per shape, and the answer is not predictable from anything cheap:
+    /// </para>
+    /// <code>
+    ///   graph                        single   split    outcome
+    ///   reduce-sum [512,256]          174.6    90.3    1.93x FASTER
+    ///   matmul 128x96x64               14.2    36.5    2.57x slower
+    ///   matmul A-transposed            14.9    29.1    1.95x slower
+    ///   matmul B-transposed            21.3    35.1    1.65x slower
+    ///   linear 256x128x64              16.1    30.5    1.89x slower
+    /// </code>
+    /// <para>
+    /// Block count does not separate those — a 64-block catalog kernel won 2.05x while a
+    /// 16-block linear layer lost. Nor does arithmetic volume: the reduce-sum that won and
+    /// the linear layer that lost have the SAME 131,072 multiply-accumulates per block.
+    /// What separates them is how long the unsplit kernel actually runs, and a second
+    /// launch cannot pay for itself on a kernel that finishes in about one launch's time.
+    /// </para>
+    /// <para>
+    /// So the caller measures. That is the same conclusion the tile search reached, for
+    /// the same reason. See <c>docs/SPLIT_K_REDUCTION.md</c>.
+    /// </para>
     /// </remarks>
     public PtxSplitProgram? LastSplitProgram { get; private set; }
 

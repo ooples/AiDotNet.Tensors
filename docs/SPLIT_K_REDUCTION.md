@@ -96,11 +96,88 @@ kernel's own output; a row is only meaningful if that column is at or near zero.
 
 ## Not yet done
 
-The dispatcher does not launch split plans — it allocates no temporary and issues one
-kernel. `TryPlan` gives a consumer everything it needs, and wiring it lands with the
-`CodegenLowering` work that makes reductions reachable from the front end at all.
+The split is emitted and executed from a graph — see the chunking section below — but
+choosing it is still the caller's job, because it cannot be chosen statically. Folding it
+into the autotuner, so the catalog gets a measured answer per kernel the way tiles do, is
+the remaining work.
 
-Remaining order: lowering reductions, then per-dimension staging (predicted ~15 us on
+Remaining order: per-dimension staging (predicted ~15 us on
 dense 3x3 against cuDNN's 41.0), then `cp.async` and tensor cores — the last two still
 aimed by the targeting map at depthwise, pooling and memory-bound fusion chains, not at
 dense convolution with large channel counts.
+
+## Chunking: promoting an axis whole is not always a split
+
+Measured on an idle device (SM clock 1770→1770 MHz, +0.0%), the first version LOST on
+every graph the front end could produce:
+
+| graph | single | split | launch config |
+|---|---|---|---|
+| matmul 128x96x64 | 11.5 | 29.9 | 32blk → 3072+32blk |
+| matmul A-transposed | 9.3 | 35.3 | 32blk → 3072+32blk |
+| matmul B-transposed | 18.3 | 28.1 | 32blk → 3072+32blk |
+| linear 256x128x64 | 14.4 | 49.7 | 16blk → 8192+64blk |
+| reduce-sum [512,256] | 175.1 | 186.6 | 1blk → 512+1blk |
+
+The launch-config column carries the diagnosis: **the combine pass's block count never
+improves on the original's.** Every one of those graphs has a single reduction axis, and
+promoting it whole leaves the partial pass reducing nothing while the combine performs the
+entire reduction with the original kernel's thread count. The combine *is* the original
+kernel, and the partial is a wasted copy. That is structural, not a tuning miss.
+
+`SplitChunked` fixes it: the axis is cut into `splitFactor` chunks, the chunk index becomes
+the parallel axis, and the work *within* a chunk stays a loop — so the partial keeps real
+reduction and the combine's reduction is genuinely shorter than the one it replaced. The
+chunk index folds into operand maps as an extra term rather than a substitution, which
+keeps compound maps (a convolution window is `oh*stride + kh - pad`) correct without
+unfolding them. A factor that does not divide the extent is refused, because a partial
+chunk would need a bounds guard on a reduction axis and that reads outside the operand.
+
+Re-measured with chunking:
+
+| graph | single | split | outcome |
+|---|---|---|---|
+| reduce-sum [512,256] | 174.6 | **90.3** | **1.93× faster** |
+| matmul 128x96x64 | 14.2 | 36.5 | 2.57× slower |
+| matmul A-transposed | 14.9 | 29.1 | 1.95× slower |
+| matmul B-transposed | 21.3 | 35.1 | 1.65× slower |
+| linear 256x128x64 | 16.1 | 30.5 | 1.89× slower |
+
+Chunking turned the reduction from 1.07× slower into **1.93× faster**. The matmuls still
+lose, and that is not a defect in the split — it is a size effect.
+
+## Why the split cannot be chosen statically
+
+The obvious gates do not separate the winners from the losers.
+
+**Not block count.** `conv2d_3x3_bwd_weights` won 2.05× at 64 blocks; the linear layer lost
+1.89× at 16 blocks. More blocks, bigger win — backwards.
+
+**Not arithmetic volume.** The reduce-sum that won and the linear layer that lost perform
+*the same* 131,072 multiply-accumulates per block. One wins by 1.93×, the other loses by
+1.89×.
+
+What actually separates them is how long the unsplit kernel runs:
+
+| | unsplit time |
+|---|---|
+| winners | 174.6, 240.7, 2133.7, 4063.5 µs |
+| losers | 14.2, 14.9, 16.1, 21.3 µs |
+
+A launch on this harness costs about 12 µs — the 16K-element ReLU, which is pure overhead,
+measures 12–15 µs. A second launch cannot pay for itself on a kernel that finishes in about
+one launch's time. The gap between the two groups is an order of magnitude, but landing on
+the right side of it needs the unsplit *runtime*, which needs either a model or a
+measurement — and the model has been wrong every time it was checked on this branch.
+
+**So `TryPlan` is advisory and `LastSplitProgram` is a candidate, not a recommendation.**
+It is always correct; whether it is faster is measured per shape. This is the same
+conclusion the tile search reached, for the same reason — see `RELEASE_EVIDENCE_GATES.md`.
+
+## Measurement hygiene
+
+`--frontend-check` reports timings only on an idle GPU and blanks them otherwise, with the
+reason printed. `--force-timing` overrides that for one specific case — a compute process
+that has been externally *suspended*, so it holds a context and its memory but occupies no
+SMs — and prints what it overrode, so the caveat travels with the numbers. Every timing
+above was taken with the SM clock locked and verified unchanged across the run.

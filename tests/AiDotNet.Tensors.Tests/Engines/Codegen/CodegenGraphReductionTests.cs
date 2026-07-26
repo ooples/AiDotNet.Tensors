@@ -294,7 +294,16 @@ public class CodegenGraphReductionTests
 
         Assert.NotNull(reduceEmitter.LastSplitProgram);
         var split = reduceEmitter.LastSplitProgram!;
-        Assert.Equal(512L * 256, split.TempElements);
+
+        // [512,256] reducing axis 1 has ONE reduction axis, so it must be chunked: the
+        // temporary is one partial per chunk, strictly fewer than one per reduced
+        // element. Promoting it whole would leave the combine reducing all 256 with the
+        // original 512 threads -- the original kernel plus a copy, measured 1.07x slower.
+        Assert.True(split.TempElements > 512 && split.TempElements < 512L * 256,
+            "expected a chunked temporary, got " + split.TempElements);
+        Assert.Equal(0, split.TempElements % 512);
+        Assert.Equal(CodegenReduceKind.Sum, split.Plan.Partial.Reduce);
+
         Assert.Contains(".visible .entry", split.PartialSource, StringComparison.Ordinal);
         Assert.Contains(".visible .entry", split.CombineSource, StringComparison.Ordinal);
         Assert.NotEqual(split.PartialName, split.CombineName);

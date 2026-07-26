@@ -67,10 +67,17 @@ public static class CodegenSplitReduction
     /// be left alone.
     /// </summary>
     /// <remarks>
-    /// Promotes ONE axis, which is what was measured to win. The blocks-per-SM model
-    /// preferred two and the hardware disagreed by 1.41x -- see <see cref="ChooseAxes"/>
-    /// for the numbers. A caller with a tuner should measure the prefixes of
-    /// <see cref="ChooseAxes"/> itself rather than take this default.
+    /// <para>
+    /// Splits ONE axis. The blocks-per-SM model preferred two and the hardware disagreed
+    /// by 1.41x — see <see cref="ChooseAxes"/> for the numbers.
+    /// </para>
+    /// <para>
+    /// The partial pass must keep real reduction work, so the axis is CHUNKED rather than
+    /// promoted whole unless other reduction axes remain. Promoting the only reduction
+    /// axis leaves the combine doing the entire reduction with the original kernel's
+    /// thread count — the combine IS the original kernel, plus a wasted copy — and that
+    /// lost on every graph it was measured on, by up to 3.80x.
+    /// </para>
     /// </remarks>
     public static CodegenSplitPlan? TryPlan(
         CodegenKernelSpec spec, int multiprocessors = 68, int blockThreads = 256)
@@ -78,9 +85,44 @@ public static class CodegenSplitReduction
         var ranked = ChooseAxes(spec, multiprocessors, blockThreads);
         if (ranked.Count == 0) return null;
 
-        var promoted = new[] { ranked[0] };
-        var (partial, combine) = Split(spec, promoted);
-        return new CodegenSplitPlan(partial, combine, partial.Output.ElementCount, promoted);
+        int axis = ranked[0];
+        int extent = spec.Space.Axes[axis].Extent;
+
+        // Reduction trips that survive if this axis is taken whole.
+        long remaining = 1;
+        foreach (int a in spec.Space.ReductionAxes)
+            if (a != axis) remaining *= spec.Space.Axes[a].Extent;
+
+        if (remaining > 1)
+        {
+            // Other axes still reduce, so taking this one whole leaves the partial with
+            // work and the combine with a genuinely shorter reduction.
+            var promoted = new[] { axis };
+            var (partial, combine) = Split(spec, promoted);
+            return new CodegenSplitPlan(partial, combine, partial.Output.ElementCount, promoted);
+        }
+
+        // This is the whole reduction, so it has to be chunked. Aim the chunk count at a
+        // full device and round DOWN to a divisor -- a chunk that does not divide exactly
+        // would need a bounds guard on a reduction axis, which would read outside the
+        // operand.
+        long target = (long)multiprocessors * 4L * blockThreads;
+        long want = (target + spec.Output.ElementCount - 1) / Math.Max(1L, spec.Output.ElementCount);
+        int factor = LargestDivisorAtMost(extent, (int)Math.Min(want, extent / 2L));
+        if (factor <= 1) return null;
+
+        var (chunkedPartial, chunkedCombine) = SplitChunked(spec, axis, factor);
+        return new CodegenSplitPlan(
+            chunkedPartial, chunkedCombine, chunkedPartial.Output.ElementCount, new[] { axis });
+    }
+
+    /// <summary>Largest divisor of <paramref name="extent"/> not above <paramref name="cap"/>.</summary>
+    private static int LargestDivisorAtMost(int extent, int cap)
+    {
+        if (cap < 2) return 1;
+        for (int d = Math.Min(cap, extent); d >= 2; d--)
+            if (extent % d == 0) return d;
+        return 1;
     }
 
     /// <summary>
@@ -171,6 +213,130 @@ public static class CodegenSplitReduction
         CodegenKernelSpec spec, int reductionAxis) => Split(spec, new[] { reductionAxis });
 
     /// <summary>
+    /// Splits a reduction axis into <paramref name="splitFactor"/> chunks, promoting the
+    /// chunk index to a parallel axis and leaving the work within a chunk as a loop.
+    /// </summary>
+    /// <param name="spec">Operator with a long reduction and a small output.</param>
+    /// <param name="reductionAxis">Reduction axis to chunk.</param>
+    /// <param name="splitFactor">Number of chunks. Must divide the axis's extent.</param>
+    /// <remarks>
+    /// <para>
+    /// Promoting an axis WHOLE only helps when other reduction axes remain, because the
+    /// combine pass keeps the original kernel's output — and therefore the original
+    /// kernel's thread count. If the promotion consumes the entire reduction, the partial
+    /// pass reduces nothing and the combine IS the original kernel, so the split is a
+    /// wasted copy. Measured on an idle device:
+    /// </para>
+    /// <code>
+    ///   graph                       single   split   launch config
+    ///   matmul 128x96x64             11.5    29.9    32blk -> 3072+32blk
+    ///   matmul A-transposed           9.3    35.3    32blk -> 3072+32blk
+    ///   linear 256x128x64            14.4    49.7    16blk -> 8192+64blk
+    ///   reduce-sum [512,256]        175.1   186.6     1blk ->   512+1blk
+    /// </code>
+    /// <para>
+    /// Every one of those has a single reduction axis, and the combine column shows the
+    /// tell: its block count never improves on the original. Chunking fixes it — the
+    /// partial keeps <c>extent/splitFactor</c> trips of real reduction, so the combine's
+    /// reduction is genuinely shorter than the one it replaced.
+    /// </para>
+    /// </remarks>
+    public static (CodegenKernelSpec Partial, CodegenKernelSpec Combine) SplitChunked(
+        CodegenKernelSpec spec, int reductionAxis, int splitFactor)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        if (spec.Reduce != CodegenReduceKind.Sum)
+            throw new NotSupportedException(
+                "Only a sum reduction splits: the combine pass has to be the same " +
+                "associative operation, and " + spec.Reduce + " is not summed partials.");
+
+        var axes = spec.Space.Axes;
+        bool isReduction = false;
+        foreach (int a in spec.Space.ReductionAxes) if (a == reductionAxis) isReduction = true;
+        if (!isReduction)
+            throw new ArgumentOutOfRangeException(nameof(reductionAxis),
+                "Axis " + reductionAxis + " is not a reduction axis of this operator.");
+
+        int extent = axes[reductionAxis].Extent;
+        if (splitFactor <= 1 || splitFactor > extent || extent % splitFactor != 0)
+            throw new ArgumentOutOfRangeException(nameof(splitFactor),
+                "Split factor " + splitFactor + " must be above one and divide the axis " +
+                "extent " + extent + " exactly; a partial chunk would need a bounds guard " +
+                "on a reduction axis, which would read outside the operand.");
+
+        int chunk = extent / splitFactor;
+
+        // The chunked axis KEEPS its index and shrinks to one chunk; the chunk index
+        // becomes a new parallel axis appended at the end. Splitting this way means no
+        // existing axis is renumbered, so every index map stays valid apart from the one
+        // extra term below.
+        int chunkAxis = axes.Count;
+        var partialAxes = new CodegenAxis[axes.Count + 1];
+        for (int a = 0; a < axes.Count; a++)
+            partialAxes[a] = a == reductionAxis
+                ? CodegenAxis.Reduce(axes[a].Name, chunk)
+                : axes[a];
+        partialAxes[chunkAxis] = CodegenAxis.Parallel(axes[reductionAxis].Name + "_chunk", splitFactor);
+        var partialSpace = new CodegenIterationSpace(partialAxes);
+
+        // Original index = chunkIndex * chunk + withinChunk. Anywhere a map read the axis
+        // with coefficient c, it now also reads the chunk index with coefficient c*chunk.
+        // Applied as an extra TERM rather than a substitution, so compound maps -- a
+        // convolution window is `oh*stride + kh - pad` -- stay correct without unfolding.
+        var partialInputs = new CodegenTensorBinding[spec.ProductInputs.Count];
+        var partialProduct = new int[spec.ProductInputs.Count];
+        for (int i = 0; i < spec.ProductInputs.Count; i++)
+        {
+            var b = spec.Inputs[spec.ProductInputs[i]];
+            partialInputs[i] = new CodegenTensorBinding(
+                i, b.Name, ToArray(b.Shape),
+                AddChunkTerm(b.Map, reductionAxis, chunkAxis, chunk));
+            partialProduct[i] = i;
+        }
+
+        int rank = spec.Output.Shape.Count;
+        var partialShape = new int[rank + 1];
+        var partialMap = new CodegenAffineExpr[rank + 1];
+        for (int d = 0; d < rank; d++)
+        {
+            partialShape[d] = spec.Output.Shape[d];
+            partialMap[d] = spec.Output.Map[d];
+        }
+        partialShape[rank] = splitFactor;
+        partialMap[rank] = CodegenAffineExpr.Axis(chunkAxis);
+
+        var partial = new CodegenKernelSpec(
+            spec.Name + "_partial", partialSpace, partialInputs,
+            new CodegenTensorBinding(partialInputs.Length, "partial", partialShape, partialMap, isOutput: true),
+            partialProduct,
+            AnyReductionLeft(partialSpace) ? CodegenReduceKind.Sum : CodegenReduceKind.None);
+
+        return (partial, BuildCombine(spec, partialShape, new[] { splitFactor }));
+    }
+
+    private static CodegenAffineExpr[] AddChunkTerm(
+        IReadOnlyList<CodegenAffineExpr> map, int reductionAxis, int chunkAxis, int chunk)
+    {
+        var rewritten = new CodegenAffineExpr[map.Count];
+        for (int d = 0; d < map.Count; d++)
+        {
+            var expr = map[d];
+            int coefficient = 0;
+            foreach (var term in expr.Terms)
+                if (term.Axis == reductionAxis) coefficient = term.Coefficient;
+
+            if (coefficient == 0) { rewritten[d] = expr; continue; }
+
+            var terms = new CodegenAffineTerm[expr.Terms.Count + 1];
+            for (int t = 0; t < expr.Terms.Count; t++) terms[t] = expr.Terms[t];
+            terms[expr.Terms.Count] = new CodegenAffineTerm(chunkAxis, coefficient * chunk);
+            rewritten[d] = new CodegenAffineExpr(
+                terms, expr.Constant, expr.Divisor, expr.RequiresExactDivision);
+        }
+        return rewritten;
+    }
+
+    /// <summary>
     /// Splits <paramref name="spec"/> by promoting several reduction axes at once.
     /// </summary>
     /// <param name="spec">Operator with a long reduction and a small output.</param>
@@ -258,16 +424,31 @@ public static class CodegenSplitReduction
             spec.Name + "_partial", partialSpace, partialInputs, partialOutput, partialProduct,
             AnyReductionLeft(partialSpace) ? CodegenReduceKind.Sum : CodegenReduceKind.None);
 
-        // ---- Pass 2: sum the partials over every promoted dimension.
-        var combineAxes = new CodegenAxis[rank + promote.Count];
+        var promotedExtents = new int[promote.Count];
+        for (int p = 0; p < promote.Count; p++) promotedExtents[p] = axes[promote[p]].Extent;
+        return (partial, BuildCombine(spec, partialShape, promotedExtents));
+    }
+
+    /// <summary>
+    /// Builds the pass that sums the partials back down and applies the epilogue.
+    /// </summary>
+    /// <param name="spec">The original operator, whose output and epilogue this restores.</param>
+    /// <param name="partialShape">Shape the partial pass wrote.</param>
+    /// <param name="splitExtents">Trailing dimensions of that shape, which are reduced away.</param>
+    private static CodegenKernelSpec BuildCombine(
+        CodegenKernelSpec spec, int[] partialShape, int[] splitExtents)
+    {
+        int rank = spec.Output.Shape.Count;
+
+        var combineAxes = new CodegenAxis[rank + splitExtents.Length];
         for (int d = 0; d < rank; d++)
             combineAxes[d] = CodegenAxis.Parallel("o" + I(d), spec.Output.Shape[d]);
-        for (int p = 0; p < promote.Count; p++)
-            combineAxes[rank + p] = CodegenAxis.Reduce("split" + I(p), axes[promote[p]].Extent);
+        for (int p = 0; p < splitExtents.Length; p++)
+            combineAxes[rank + p] = CodegenAxis.Reduce("split" + I(p), splitExtents[p]);
         var combineSpace = new CodegenIterationSpace(combineAxes);
 
-        var combineInMap = new CodegenAffineExpr[rank + promote.Count];
-        for (int d = 0; d < rank + promote.Count; d++) combineInMap[d] = CodegenAffineExpr.Axis(d);
+        var combineInMap = new CodegenAffineExpr[rank + splitExtents.Length];
+        for (int d = 0; d < rank + splitExtents.Length; d++) combineInMap[d] = CodegenAffineExpr.Axis(d);
 
         var combineInputs = new List<CodegenTensorBinding>
         {
@@ -307,12 +488,10 @@ public static class CodegenSplitReduction
             combineInputs.Count, spec.Output.Name, ToArray(spec.Output.Shape),
             combineOutMap, isOutput: true);
 
-        var combine = new CodegenKernelSpec(
+        return new CodegenKernelSpec(
             spec.Name + "_combine", combineSpace, combineInputs.ToArray(), combineOutput,
             new[] { 0 }, CodegenReduceKind.Sum,
             biasInput: combineBias, scaleInput: combineScale, activation: spec.Activation);
-
-        return (partial, combine);
     }
 
     /// <summary>

@@ -29,8 +29,21 @@ internal static class FrontEndCheckTool
     /// </summary>
     private static bool _timingAllowed;
 
-    internal static void Run()
+    /// <summary>SM clock when timing began, so drift across the run can be reported.</summary>
+    private static int _clockAtStart;
+
+    internal static void Run() => Run(Array.Empty<string>());
+
+    internal static void Run(string[] args)
     {
+        // --force-timing exists for ONE situation: a compute process that is holding a
+        // context and its memory but has been externally SUSPENDED, so it occupies no
+        // SMs. The guard keys on the process, not on whether it is running, and neither
+        // a frozen process's context nor its allocation affects how long our kernels
+        // take. It prints what it overrode, so the caveat travels with the numbers
+        // instead of being lost between a terminal and a document.
+        bool force = Array.IndexOf(args, "--force-timing") >= 0;
+
         try
         {
             GpuBenchmarkEnvironment.RequireIdleGpu("frontend-check");
@@ -38,10 +51,22 @@ internal static class FrontEndCheckTool
         }
         catch (InvalidOperationException ex)
         {
-            _timingAllowed = false;
+            _timingAllowed = force;
             Console.WriteLine();
-            Console.WriteLine("TIMINGS SUPPRESSED - " + ex.Message.Split('\n')[0]);
-            Console.WriteLine("Correctness still runs; contention changes speed, not answers.");
+            Console.WriteLine((force ? "GUARD OVERRIDDEN - " : "TIMINGS SUPPRESSED - ") +
+                              ex.Message.Split('\n')[0]);
+            Console.WriteLine(force
+                ? "Timings reported anyway on the caller's assertion that the above is idle."
+                : "Correctness still runs; contention changes speed, not answers.");
+        }
+
+        if (_timingAllowed)
+        {
+            // Whatever the guard said, a moving clock means the two halves of a ratio did
+            // not run on the same machine state.
+            _clockAtStart = GpuBenchmarkEnvironment.SampleSmClockMhz();
+            Console.WriteLine();
+            Console.WriteLine("SM clock at start: " + _clockAtStart + " MHz");
         }
 
         using var runtime = new DirectPtxRuntime();
@@ -77,6 +102,9 @@ internal static class FrontEndCheckTool
         Console.WriteLine();
         Console.WriteLine("front end: " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
+        if (_timingAllowed)
+            Console.WriteLine("SM clock across the run: " + GpuBenchmarkEnvironment.DescribeClockDrift(
+                _clockAtStart, GpuBenchmarkEnvironment.SampleSmClockMhz()));
         Console.WriteLine();
         Console.WriteLine("A pass means a graph the engine's own lowering produces was executed by our");
         Console.WriteLine("generated PTX and agreed with a reference. The 'ref' column says which:");

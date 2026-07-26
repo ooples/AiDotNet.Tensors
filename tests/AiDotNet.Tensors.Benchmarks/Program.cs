@@ -176,7 +176,7 @@ class Program
 
         if (args.Length > 0 && args[0] == "--frontend-check")
         {
-            FrontEndCheckTool.Run();
+            FrontEndCheckTool.Run(args.Skip(1).ToArray());
             return;
         }
 

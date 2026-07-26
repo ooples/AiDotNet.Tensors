@@ -179,6 +179,94 @@ public class CodegenSplitReductionTests
             CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(32, 64, 56, 56)));
     }
 
+    /// <summary>
+    /// Chunking a reduction axis must reproduce the unsplit result exactly. The chunk
+    /// index is folded into the operand maps as an extra term, so getting the stride
+    /// wrong reads a shifted slice and still emits.
+    /// </summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void SplitChunked_ReproducesTheUnsplitResult(int factor)
+    {
+        // A matmul has exactly one reduction axis, which is the case that must chunk.
+        const int M = 6, K = 16, N = 5;
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("m", M), CodegenAxis.Parallel("n", N), CodegenAxis.Reduce("k", K));
+        var a = new CodegenTensorBinding(0, "a", new[] { M, K },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) });
+        var b = new CodegenTensorBinding(1, "b", new[] { K, N },
+            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) });
+        var outBinding = new CodegenTensorBinding(2, "out", new[] { M, N },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
+        var spec = new CodegenKernelSpec("mm", space, new[] { a, b }, outBinding,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+
+        var (partial, combine) = CodegenSplitReduction.SplitChunked(spec, 2, factor);
+
+        // The partial must still REDUCE -- that is the whole point of chunking rather
+        // than promoting, and it is what the losing measurements lacked.
+        Assert.Equal(CodegenReduceKind.Sum, partial.Reduce);
+
+        double[] av = Fill((long)M * K, 1), bv = Fill((long)K * N, 2);
+        double[] direct = spec.Interpret(new[] { av, bv });
+        double[] staged = combine.Interpret(new[] { partial.Interpret(new[] { av, bv }) });
+
+        Assert.Equal(direct.Length, staged.Length);
+        for (int i = 0; i < direct.Length; i++) Assert.Equal(direct[i], staged[i], 9);
+    }
+
+    /// <summary>
+    /// A chunk count that does not divide the extent would need a bounds guard on a
+    /// reduction axis, which reads outside the operand, so it must be refused.
+    /// </summary>
+    [Fact]
+    public void SplitChunked_RefusesAFactorThatDoesNotDivide()
+    {
+        var spec = DepthwiseWeightGradient(2, 4, 8, 8);
+        int axis = CodegenSplitReduction.ChooseAxes(spec)[0];
+        int extent = spec.Space.Axes[axis].Extent;
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => CodegenSplitReduction.SplitChunked(spec, axis, extent - 1));
+    }
+
+    /// <summary>
+    /// When the chosen axis IS the whole reduction, the plan must chunk it rather than
+    /// promote it whole -- promoting leaves the combine doing the entire reduction with
+    /// the original thread count, which measured up to 3.80x SLOWER than not splitting.
+    /// </summary>
+    [Fact]
+    public void TryPlan_ChunksWhenTheAxisIsTheEntireReduction()
+    {
+        const int M = 64, K = 512, N = 8;
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("m", M), CodegenAxis.Parallel("n", N), CodegenAxis.Reduce("k", K));
+        var a = new CodegenTensorBinding(0, "a", new[] { M, K },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) });
+        var b = new CodegenTensorBinding(1, "b", new[] { K, N },
+            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) });
+        var outBinding = new CodegenTensorBinding(2, "out", new[] { M, N },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
+        var spec = new CodegenKernelSpec("mm", space, new[] { a, b }, outBinding,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+
+        var plan = CodegenSplitReduction.TryPlan(spec);
+        Assert.NotNull(plan);
+
+        // Chunked, not promoted: the partial still reduces, and the combine's reduction
+        // is strictly shorter than the original's.
+        Assert.Equal(CodegenReduceKind.Sum, plan!.Partial.Reduce);
+        int combineTrips = plan.Combine.Space.Axes[plan.Combine.Space.Axes.Count - 1].Extent;
+        Assert.True(combineTrips < K,
+            "the combine must reduce fewer than the original " + K + " terms, got " + combineTrips);
+
+        double[] av = Fill((long)M * K, 3), bv = Fill((long)K * N, 4);
+        double[] want = spec.Interpret(new[] { av, bv });
+        double[] got = plan.Combine.Interpret(new[] { plan.Partial.Interpret(new[] { av, bv }) });
+        for (int i = 0; i < want.Length; i++) Assert.Equal(want[i], got[i], 9);
+    }
+
     /// <summary>Both halves must be emittable, not merely expressible.</summary>
     [Fact]
     public void BothPasses_Emit()
