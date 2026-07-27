@@ -165,6 +165,19 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     public int? PreBiasInput { get; }
 
+    /// <summary>
+    /// Constant the pre-bias is multiplied by before being added. −1 makes it a SUBTRACT.
+    /// </summary>
+    /// <remarks>
+    /// The body multiplies its operands, so a difference of two tensors had no expression
+    /// at all: <c>(a - b)^2</c>, which is every squared-error loss, was inexpressible even
+    /// with the pre-reduction square. Rather than add a second combine mode to the product,
+    /// the pre-bias gains a sign -- <c>product + (-1) * b</c> -- which costs one constant
+    /// and reuses the slot that already exists for softmax's shift and LayerNorm's
+    /// centring.
+    /// </remarks>
+    public double PreBiasScale { get; }
+
     /// <summary>Creates a kernel spec and validates its internal consistency.</summary>
     public CodegenKernelSpec(
         string name,
@@ -178,7 +191,8 @@ public sealed class CodegenKernelSpec
         CodegenActivationKind activation = CodegenActivationKind.None,
         double reduceScale = 1.0,
         CodegenPreReduceOp preReduce = CodegenPreReduceOp.None,
-        int? preBiasInput = null)
+        int? preBiasInput = null,
+        double preBiasScale = 1.0)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
@@ -193,6 +207,11 @@ public sealed class CodegenKernelSpec
         ReduceScale = reduceScale;
         PreReduce = preReduce;
         PreBiasInput = preBiasInput;
+        PreBiasScale = preBiasScale;
+
+        if (double.IsNaN(preBiasScale) || double.IsInfinity(preBiasScale))
+            throw new ArgumentException(
+                "PreBiasScale must be finite; got " + preBiasScale + ".", nameof(preBiasScale));
 
         if (double.IsNaN(reduceScale) || double.IsInfinity(reduceScale))
             throw new ArgumentException(
@@ -335,7 +354,7 @@ public sealed class CodegenKernelSpec
                     {
                         var pb = _inputs[PreBiasInput.Value];
                         long pbOff = pb.ResolveOffset(values, out bool pbOk);
-                        if (pbOk) product += inputData[PreBiasInput.Value][pbOff];
+                        if (pbOk) product += PreBiasScale * inputData[PreBiasInput.Value][pbOff];
                     }
                     product = PreReduce switch
                     {

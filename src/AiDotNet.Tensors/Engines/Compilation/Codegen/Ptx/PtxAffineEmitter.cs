@@ -1625,7 +1625,15 @@ public sealed class PtxAffineEmitter
                     string pv = EmitLoad(pb, basePtr[pb.ParameterIndex], laneAxisReg[l],
                                          reductionValues, reduction, out _);
                     string shifted = NextF();
-                    L($"add.rn.f32 {shifted}, {product!}, {pv};");
+                    if (spec.PreBiasScale == 1.0)
+                    {
+                        L($"add.rn.f32 {shifted}, {product!}, {pv};");
+                    }
+                    else
+                    {
+                        // fma so the scaled add stays one instruction and one rounding.
+                        L($"fma.rn.f32 {shifted}, {pv}, {F32(spec.PreBiasScale)}, {product!};");
+                    }
                     product = shifted;
                 }
                 if (spec.PreReduce != CodegenPreReduceOp.None)

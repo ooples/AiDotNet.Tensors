@@ -164,6 +164,41 @@ public static class CodegenFusedStatistics
             "layernorm statistics " + rows + "x" + columns);
     }
 
+    /// <summary>
+    /// Per-sample mean squared error: <c>mse[n] = mean_j (a[n,j] - b[n,j])^2</c>.
+    /// </summary>
+    /// <param name="samples">Number of independent samples (rows).</param>
+    /// <param name="features">Length of the axis being averaged.</param>
+    /// <remarks>
+    /// One kernel, not a program. The body multiplies its operands, so a DIFFERENCE of two
+    /// tensors had no expression at all and this was the last thing in the audit still
+    /// blocked on the spec's shape. A signed pre-bias supplies it: the product is
+    /// <c>a</c>, the pre-bias is <c>b</c> scaled by −1, the pre-reduction op squares the
+    /// result, and the constant scale divides by the count.
+    /// </remarks>
+    public static CodegenKernelSpec MeanSquaredError(int samples, int features)
+    {
+        if (samples <= 0) throw new ArgumentOutOfRangeException(nameof(samples));
+        if (features <= 0) throw new ArgumentOutOfRangeException(nameof(features));
+
+        int[] matrix = { samples, features };
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("n", samples), CodegenAxis.Reduce("j", features));
+
+        return new CodegenKernelSpec(
+            "mse_per_sample", space,
+            new[]
+            {
+                Bind(0, "a", matrix, Axis(0), Axis(1)),
+                Bind(1, "b", matrix, Axis(0), Axis(1)),
+            },
+            Bind(2, "mse", new[] { samples }, isOutput: true, Axis(0)),
+            new[] { 0 }, CodegenReduceKind.Sum,
+            reduceScale: 1.0 / features,
+            preReduce: CodegenPreReduceOp.Square,
+            preBiasInput: 1, preBiasScale: -1.0);
+    }
+
     private static CodegenAffineExpr Axis(int axis) => CodegenAffineExpr.Axis(axis);
 
     private static CodegenTensorBinding Bind(

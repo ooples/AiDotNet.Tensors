@@ -209,4 +209,83 @@ public class CodegenFusedStatisticsTests
             Assert.Equal(-max, got[i], 9);
         }
     }
+
+    /// <summary>
+    /// MSE must equal a hand-written per-sample mean squared error. This was the last
+    /// operator in the gap audit still blocked on the spec's shape: the body MULTIPLIES
+    /// its operands, so a difference of two tensors had no expression at all.
+    /// </summary>
+    [Theory]
+    [InlineData(4, 10)]
+    [InlineData(7, 64)]
+    public void MeanSquaredError_MatchesAHandWrittenReference(int samples, int features)
+    {
+        var spec = CodegenFusedStatistics.MeanSquaredError(samples, features);
+
+        double[] a = Fill(samples, features, 2.0, 6);
+        double[] b = Fill(samples, features, 2.0, 7);
+        double[] got = spec.Interpret(new[] { a, b });
+
+        for (int n = 0; n < samples; n++)
+        {
+            double sum = 0;
+            for (int j = 0; j < features; j++)
+            {
+                double d = a[n * features + j] - b[n * features + j];
+                sum += d * d;
+            }
+            Assert.Equal(sum / features, got[n], 9);
+        }
+    }
+
+    /// <summary>Identical inputs give exactly zero error, and the error is never negative.</summary>
+    [Fact]
+    public void MeanSquaredError_IsZeroForIdenticalInputsAndNeverNegative()
+    {
+        var spec = CodegenFusedStatistics.MeanSquaredError(5, 32);
+        double[] a = Fill(5, 32, 3.0, 8);
+
+        foreach (double v in spec.Interpret(new[] { a, a })) Assert.Equal(0.0, v, 12);
+
+        double[] b = Fill(5, 32, 3.0, 9);
+        foreach (double v in spec.Interpret(new[] { a, b }))
+            Assert.True(v >= 0.0, "a mean of squares cannot be negative; got " + v);
+    }
+
+    /// <summary>
+    /// The subtraction must really be a subtraction. A pre-bias scale of +1 would compute
+    /// (a+b)^2, which is a different operator that still produces plausible numbers.
+    /// </summary>
+    [Fact]
+    public void MeanSquaredError_SubtractsRatherThanAdds()
+    {
+        var spec = CodegenFusedStatistics.MeanSquaredError(3, 8);
+        Assert.Equal(-1.0, spec.PreBiasScale, 12);
+        Assert.Equal(CodegenPreReduceOp.Square, spec.PreReduce);
+
+        // a = 2b would give 1*b^2 under subtraction and 9*b^2 under addition.
+        var b = new double[3 * 8];
+        for (int i = 0; i < b.Length; i++) b[i] = 1.0 + (i % 3);
+        var a = new double[b.Length];
+        for (int i = 0; i < b.Length; i++) a[i] = 2.0 * b[i];
+
+        double[] got = spec.Interpret(new[] { a, b });
+        for (int n = 0; n < 3; n++)
+        {
+            double want = 0;
+            for (int j = 0; j < 8; j++) want += b[n * 8 + j] * b[n * 8 + j];
+            Assert.Equal(want / 8.0, got[n], 9);
+        }
+    }
+
+    /// <summary>The emitted kernel must fold the signed pre-bias into a single fma.</summary>
+    [Fact]
+    public void MeanSquaredError_EmitsASignedFusedMultiplyAdd()
+    {
+        string ptx = new PtxAffineEmitter().Emit(
+            CodegenFusedStatistics.MeanSquaredError(16, 64), 8, 6);
+
+        Assert.Contains("fma.rn.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("0fBF800000", ptx, StringComparison.Ordinal);   // -1.0f
+    }
 }

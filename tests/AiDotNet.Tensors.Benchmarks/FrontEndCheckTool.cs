@@ -211,6 +211,9 @@ internal static class FrontEndCheckTool
         yield return ("softmax rows 512x256 (3 passes)", CodegenFusedStatistics.Softmax(512, 256));
         // Two lengths of the SAME operator. If the deviation tracks the reduction length
         // it is fp32 accumulation; if it does not, something is wrong with the maths.
+        yield return ("mse per-sample 512x256 (1 kernel)",
+            new CodegenProgram(new[] { CodegenFusedStatistics.MeanSquaredError(512, 256) },
+                new long[] { 512 }, "mse"));
         yield return ("layernorm stats 512x64 (2 passes)",
             CodegenFusedStatistics.LayerNormStatistics(512, 64));
         yield return ("layernorm stats 512x256 (2 passes)",
@@ -263,8 +266,37 @@ internal static class FrontEndCheckTool
                 var cpuOperands = new double[pass.Inputs.Count][];
                 for (int i = 0; i < pass.Inputs.Count; i++)
                 {
-                    args[i] = i == 0 ? source.Pointer : producedGpu[i - 1].Pointer;
-                    cpuOperands[i] = i == 0 ? wide : producedCpu[i - 1];
+                    // Parameter 0 is the source. A later parameter is an earlier pass's
+                    // output when one exists, and otherwise a SECOND source -- which is
+                    // what a two-operand kernel like MSE needs, since it consumes two
+                    // tensors and produces no intermediate at all.
+                    if (i == 0)
+                    {
+                        args[i] = source.Pointer;
+                        cpuOperands[i] = wide;
+                    }
+                    else if (i - 1 < producedGpu.Count)
+                    {
+                        args[i] = producedGpu[i - 1].Pointer;
+                        cpuOperands[i] = producedCpu[i - 1];
+                    }
+                    else
+                    {
+                        long extra = pass.Inputs[i].ElementCount;
+                        var extraHost = new float[extra];
+                        var extraWide = new double[extra];
+                        for (long e = 0; e < extra; e++)
+                        {
+                            double v = ((((e * 53 + 17) % 89) - 44) / 16.0);
+                            extraHost[e] = (float)v;
+                            extraWide[e] = v;
+                        }
+                        var extraBuffer = runtime.AllocateBytes((nuint)(extra * sizeof(float)));
+                        extraBuffer.Upload<float>(extraHost);
+                        buffers.Add(extraBuffer);
+                        args[i] = extraBuffer.Pointer;
+                        cpuOperands[i] = extraWide;
+                    }
                 }
 
                 long outCount = pass.Output.ElementCount;
