@@ -299,6 +299,24 @@ public sealed class CodegenKernelSpec
             throw new ArgumentException(
                 "Secondary output binding must be marked IsOutput.", nameof(secondaryOutput));
 
+        // EVERY INDIRECTION MUST POINT AT A REAL INDEX TENSOR. If it pointed at a float
+        // operand the emitter would reinterpret that operand's bit pattern as an integer and
+        // address with it -- which does not fault, does not look wrong in the PTX, and
+        // produces garbage that varies with the input data.
+        // AN INDEX TENSOR IS NEVER AN ARITHMETIC OPERAND. This is checked here, on the spec,
+        // rather than only at the load site: the emitter has several load paths -- scalar,
+        // vectorised, staged, coarsened -- and a guard on one of them is a guard on none.
+        // Reading an int32 buffer as fp32 does not fault and produces arithmetic out of a bit
+        // pattern, so it must be impossible to construct rather than merely unlikely.
+        for (int i = 0; i < _productInputs.Length; i++) RefuseIndexOperand(_productInputs[i], "a product operand");
+        if (biasInput.HasValue) RefuseIndexOperand(biasInput.Value, "the bias");
+        if (scaleInput.HasValue) RefuseIndexOperand(scaleInput.Value, "the scale");
+        if (preBiasInput.HasValue) RefuseIndexOperand(preBiasInput.Value, "the pre-bias");
+
+        ValidateIndirection(output, "output");
+        for (int i = 0; i < _inputs.Length; i++) ValidateIndirection(_inputs[i], "input " + i);
+        if (secondaryOutput is not null) ValidateIndirection(secondaryOutput, "secondary output");
+
         if (double.IsNaN(preBiasScale) || double.IsInfinity(preBiasScale))
             throw new ArgumentException(
                 "PreBiasScale must be finite; got " + preBiasScale + ".", nameof(preBiasScale));
@@ -375,6 +393,53 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     /// <param name="inputData">Buffers for each input binding, in binding order.</param>
     /// <returns>The output buffer, row-major, of <c>Output.ElementCount</c> elements.</returns>
+    /// <summary>Refuses an int32 index tensor used where a value operand is expected.</summary>
+    private void RefuseIndexOperand(int input, string role)
+    {
+        if (input < 0 || input >= _inputs.Length)
+            throw new ArgumentException(
+                $"Input {input} used as {role}, but the spec has {_inputs.Length} inputs.");
+
+        if (_inputs[input].IsIndexTensor)
+            throw new ArgumentException(
+                $"'{_inputs[input].Name}' is an int32 index tensor and cannot be {role}. " +
+                "Reading it as a value would compute with a bit pattern, which neither " +
+                "faults nor looks wrong in the generated PTX.");
+    }
+
+    /// <summary>
+    /// Checks that every data-dependent index on a binding refers to an int32 index tensor
+    /// that actually exists.
+    /// </summary>
+    private void ValidateIndirection(CodegenTensorBinding binding, string role)
+    {
+        if (!binding.HasIndirection) return;
+
+        for (int d = 0; d < binding.Indirect.Count; d++)
+        {
+            var indirect = binding.Indirect[d];
+            if (indirect is null) continue;
+
+            if (indirect.IndexInput >= _inputs.Length)
+                throw new ArgumentException(
+                    $"The {role} binding '{binding.Name}' takes dimension {d} from input " +
+                    $"{indirect.IndexInput}, but the spec has only {_inputs.Length} inputs.");
+
+            var source = _inputs[indirect.IndexInput];
+            if (!source.IsIndexTensor)
+                throw new ArgumentException(
+                    $"The {role} binding '{binding.Name}' takes dimension {d} from input " +
+                    $"'{source.Name}', which is {source.ElementType} rather than Int32. " +
+                    "Addressing with a float tensor would reinterpret its bit pattern as an " +
+                    "integer, which neither faults nor looks wrong in the generated PTX.");
+
+            if (_productInputs.Contains(indirect.IndexInput))
+                throw new ArgumentException(
+                    $"Input '{source.Name}' is used both as an index source and as an " +
+                    "arithmetic operand. It cannot be both.");
+        }
+    }
+
     public double[] Interpret(IReadOnlyList<double[]> inputData) => Interpret(inputData, out _);
 
     /// <summary>
@@ -435,7 +500,7 @@ public sealed class CodegenKernelSpec
                 for (int k = 0; k < _productInputs.Length; k++)
                 {
                     var binding = _inputs[_productInputs[k]];
-                    long off = binding.ResolveOffset(values, out bool ok);
+                    long off = binding.ResolveOffset(values, inputData, out bool ok);
                     if (!ok) { anyOutOfBounds = true; break; }
                     product *= inputData[_productInputs[k]][off];
                 }
@@ -507,12 +572,21 @@ public sealed class CodegenKernelSpec
 
             if (SecondaryOutput is not null)
             {
-                long secondaryOff = SecondaryOutput.ResolveOffset(values, out bool secondaryOk);
+                long secondaryOff = SecondaryOutput.ResolveOffset(values, inputData, out bool secondaryOk);
                 if (secondaryOk) secondaryData![secondaryOff] = argIndex;
             }
 
-            long outOff = Output.ResolveOffset(values, out bool outOk);
-            if (outOk) output[outOff] = acc;
+            long outOff = Output.ResolveOffset(values, inputData, out bool outOk);
+            if (outOk)
+            {
+                // SCATTER ACCUMULATES; a direct write ASSIGNS. Two iterations can reach the
+                // same destination through a run-time index -- repeated tokens in an
+                // embedding backward are the ordinary case, not the corner case -- and the
+                // emitter lowers that to red.global.add.f32. An oracle that assigned would
+                // disagree with a CORRECT kernel and look like a kernel bug.
+                if (Output.NeedsAtomicStore) output[outOff] += acc;
+                else output[outOff] = acc;
+            }
         }
 
         return output;

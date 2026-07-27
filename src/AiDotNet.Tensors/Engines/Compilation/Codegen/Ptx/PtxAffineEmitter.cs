@@ -48,6 +48,12 @@ public sealed class PtxAffineEmitter
     private int _r, _f, _p, _rd;
     private IReadOnlyList<CodegenAxis> axesMeta = Array.Empty<CodegenAxis>();
 
+    /// <summary>Base-pointer register per kernel parameter, for the current emission.</summary>
+    private string[]? _basePointers;
+
+    /// <summary>Input bindings of the spec being emitted, for the current emission.</summary>
+    private IReadOnlyList<CodegenTensorBinding>? _inputBindings;
+
     private string NextR() => "%r" + (_r++).ToString(CultureInfo.InvariantCulture);
     private string NextF() => "%f" + (_f++).ToString(CultureInfo.InvariantCulture);
     private string NextP() => "%p" + (_p++).ToString(CultureInfo.InvariantCulture);
@@ -71,6 +77,12 @@ public sealed class PtxAffineEmitter
 
     /// <summary>Bounds guards elided because interval analysis proved them unnecessary.</summary>
     public int ElidedGuards { get; private set; }
+
+    /// <summary>Index loads emitted for data-dependent (gather/scatter) dimensions.</summary>
+    public int IndirectIndexLoads { get; private set; }
+
+    /// <summary>Stores emitted as atomic accumulations because the destination may collide.</summary>
+    public int AtomicStores { get; private set; }
 
     /// <summary>
     /// Emits PTX for <paramref name="spec"/>.
@@ -1221,6 +1233,8 @@ public sealed class PtxAffineEmitter
         LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
+        IndirectIndexLoads = 0; AtomicStores = 0;
+        _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
         // calls makes the SAME spec emit different text on a second Emit, and cubins
         // are content-addressed on that text.
@@ -1264,6 +1278,7 @@ public sealed class PtxAffineEmitter
             basePtr[i] = NextRd();
             L($"ld.param.u64 {basePtr[i]}, [p{I(i)}];");
         }
+        _basePointers = basePtr;
 
         string ctaid = NextR(), tid = NextR(), gid = NextR();
         L($"mov.u32 {ctaid}, %ctaid.x;");
@@ -1792,7 +1807,28 @@ public sealed class PtxAffineEmitter
             string laneAddr = NextRd(), laneByte = NextRd();
             L($"mul.wide.u32 {laneByte}, {laneOff}, {I(spec.Output.ElementBytes)};");
             L($"add.u64 {laneAddr}, {basePtr[spec.Output.ParameterIndex]}, {laneByte};");
-            if (spec.Output.NeedsConversion)
+            if (spec.Output.NeedsAtomicStore)
+            {
+                // SCATTER. A destination reached through a run-time index cannot be proven
+                // unique, so two iterations may target the same element. A plain store would
+                // keep whichever warp finished last -- a race that yields a different wrong
+                // answer per run and reads as flakiness rather than as a bug. The atomic
+                // makes it an accumulation, which is what every scatter operator wants
+                // anyway: an embedding backward sums the gradients of repeated tokens.
+                //
+                // The destination must be zeroed by the caller before launch, since this
+                // adds to whatever is already there.
+                if (spec.Output.NeedsConversion)
+                    throw new NotSupportedException(
+                        "A scatter destination must be fp32: there is no atomic add for a " +
+                        "16-bit float here, and emulating one with a compare-and-swap loop " +
+                        "would silently change the operator's cost.");
+
+                if (lanePred is null) L($"red.global.add.f32 [{laneAddr}], {acc};");
+                else L($"@{lanePred} red.global.add.f32 [{laneAddr}], {acc};");
+                AtomicStores++;
+            }
+            else if (spec.Output.NeedsConversion)
             {
                 string narrowed = EmitNarrow(spec.Output.ElementType, acc);
                 if (lanePred is null) L($"st.global.u16 [{laneAddr}], {narrowed};");
@@ -1961,83 +1997,20 @@ public sealed class PtxAffineEmitter
 
         for (int d = 0; d < binding.Map.Count; d++)
         {
-            var expr = binding.Map[d];
             int dim = binding.Shape[d];
             long stride = binding.Stride(d);
+            string idx;
 
-            // Fold every reduction-axis term into the constant; keep parallel terms symbolic.
-            int folded = expr.Constant;
-            var symbolic = new List<CodegenAffineTerm>();
-            foreach (var term in expr.Terms)
+            var indirect = binding.Indirect[d];
+            if (indirect is not null)
             {
-                if (reductionSet.Contains(term.Axis)) folded += term.Coefficient * reductionValues[term.Axis];
-                else symbolic.Add(term);
-            }
-
-            // Build the numerator.
-            string? num;
-            if (symbolic.Count == 0)
-            {
-                num = NextR();
-                L($"mov.u32 {num}, {I(folded)};");
+                idx = EmitIndirectIndex(indirect, axisReg, reductionValues, reductionSet, ref predicate);
             }
             else
             {
-                num = null;
-                foreach (var term in symbolic)
-                {
-                    string contribution;
-                    if (term.Coefficient == 1) contribution = axisReg[term.Axis];
-                    else
-                    {
-                        contribution = NextR();
-                        L($"mul.lo.s32 {contribution}, {axisReg[term.Axis]}, {I(term.Coefficient)};");
-                    }
-                    if (num is null) num = contribution;
-                    else { string s = NextR(); L($"add.s32 {s}, {num}, {contribution};"); num = s; }
-                }
-                if (folded != 0) { string s = NextR(); L($"add.s32 {s}, {num}, {I(folded)};"); num = s; }
-            }
-
-            // Apply the divisor, deriving the exactness predicate when required.
-            string idx = num!;
-            if (expr.Divisor != 1)
-            {
-                if (expr.RequiresExactDivision)
-                {
-                    string rem = NextR(), pe = NextP();
-                    L($"rem.s32 {rem}, {num}, {I(expr.Divisor)};");
-                    L($"setp.eq.s32 {pe}, {rem}, 0;");
-                    predicate = AndPred(predicate, pe);
-                }
-                idx = NextR();
-                L($"div.s32 {idx}, {num}, {I(expr.Divisor)};");
-            }
-
-            // Derived bounds predicate: 0 <= idx < dim, emitted only when the folded
-            // expression can ACTUALLY leave the tensor.
-            //
-            // Interval analysis over the parallel axis ranges, not a syntactic guess.
-            // The syntactic form is both unsound and wasteful: after a reduction axis is
-            // folded away, `oh + kh - 1` becomes `oh - 1`, `oh`, or `oh + 1` depending on
-            // the tap, and only the first and last can escape [0, H). Testing the
-            // pre-folding constant guards all three; testing the folded range guards
-            // exactly the two that need it -- fewer instructions AND no missed case.
-            long rangeLo = folded, rangeHi = folded;
-            foreach (var term in symbolic)
-            {
-                long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
-                if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
-            }
-            bool canEscape = expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim;
-            if (!canEscape) ElidedGuards++;
-            if (canEscape)
-            {
-                string lo = NextP(), hi = NextP(), both = NextP();
-                L($"setp.ge.s32 {lo}, {idx}, 0;");
-                L($"setp.lt.s32 {hi}, {idx}, {I(dim)};");
-                L($"and.pred {both}, {lo}, {hi};");
-                predicate = AndPred(predicate, both);
+                var expr = binding.Map[d];
+                idx = EmitAffineIndex(
+                    expr, axisReg, reductionValues, reductionSet, dim, ref predicate);
             }
 
             // offset += idx * stride
@@ -2057,6 +2030,169 @@ public sealed class PtxAffineEmitter
         return offset!;
     }
 
+    /// <summary>
+    /// Computes one affine dimension's index, contributing its exactness and bounds terms to
+    /// <paramref name="predicate"/>.
+    /// </summary>
+    private string EmitAffineIndex(
+        CodegenAffineExpr expr,
+        string[] axisReg,
+        int[] reductionValues,
+        HashSet<int> reductionSet,
+        int dim,
+        ref string? predicate)
+    {
+        // Fold every reduction-axis term into the constant; keep parallel terms symbolic.
+        int folded = expr.Constant;
+        var symbolic = new List<CodegenAffineTerm>();
+        foreach (var term in expr.Terms)
+        {
+            if (reductionSet.Contains(term.Axis)) folded += term.Coefficient * reductionValues[term.Axis];
+            else symbolic.Add(term);
+        }
+
+        // Build the numerator.
+        string? num;
+        if (symbolic.Count == 0)
+        {
+            num = NextR();
+            L($"mov.u32 {num}, {I(folded)};");
+        }
+        else
+        {
+            num = null;
+            foreach (var term in symbolic)
+            {
+                string contribution;
+                if (term.Coefficient == 1) contribution = axisReg[term.Axis];
+                else
+                {
+                    contribution = NextR();
+                    L($"mul.lo.s32 {contribution}, {axisReg[term.Axis]}, {I(term.Coefficient)};");
+                }
+                if (num is null) num = contribution;
+                else { string s = NextR(); L($"add.s32 {s}, {num}, {contribution};"); num = s; }
+            }
+            if (folded != 0) { string s = NextR(); L($"add.s32 {s}, {num}, {I(folded)};"); num = s; }
+        }
+
+        // Apply the divisor, deriving the exactness predicate when required.
+        string idx = num!;
+        if (expr.Divisor != 1)
+        {
+            if (expr.RequiresExactDivision)
+            {
+                string rem = NextR(), pe = NextP();
+                L($"rem.s32 {rem}, {num}, {I(expr.Divisor)};");
+                L($"setp.eq.s32 {pe}, {rem}, 0;");
+                predicate = AndPred(predicate, pe);
+            }
+            idx = NextR();
+            L($"div.s32 {idx}, {num}, {I(expr.Divisor)};");
+        }
+
+        // Derived bounds predicate: 0 <= idx < dim, emitted only when the folded
+        // expression can ACTUALLY leave the tensor.
+        //
+        // Interval analysis over the parallel axis ranges, not a syntactic guess.
+        // The syntactic form is both unsound and wasteful: after a reduction axis is
+        // folded away, `oh + kh - 1` becomes `oh - 1`, `oh`, or `oh + 1` depending on
+        // the tap, and only the first and last can escape [0, H). Testing the
+        // pre-folding constant guards all three; testing the folded range guards
+        // exactly the two that need it -- fewer instructions AND no missed case.
+        long rangeLo = folded, rangeHi = folded;
+        foreach (var term in symbolic)
+        {
+            long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
+            if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
+        }
+        bool canEscape = expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim;
+        if (!canEscape) ElidedGuards++;
+        if (canEscape)
+        {
+            string lo = NextP(), hi = NextP(), both = NextP();
+            L($"setp.ge.s32 {lo}, {idx}, 0;");
+            L($"setp.lt.s32 {hi}, {idx}, {I(dim)};");
+            L($"and.pred {both}, {lo}, {hi};");
+            predicate = AndPred(predicate, both);
+        }
+
+        return idx;
+    }
+
+    /// <summary>
+    /// Loads a dimension's index from another tensor at run time -- the gather/scatter case.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two guards are emitted and they do different jobs, which is the whole subtlety here.
+    /// </para>
+    /// <para>
+    /// The value is ALWAYS clamped into <c>[0, bound)</c> before it reaches the address
+    /// arithmetic. That is not the caller's out-of-range policy -- it is what keeps a
+    /// malformed index tensor from forming an address outside the allocation. Predicating
+    /// the load alone would not do it: the address is computed whether or not the load
+    /// fires, and on a wild index that arithmetic can overflow into somebody else's memory.
+    /// </para>
+    /// <para>
+    /// The POLICY then decides whether the access counts. Under <c>Skip</c> the range test
+    /// joins the access predicate, so an out-of-range index contributes the reduction
+    /// identity on a gather and performs no write on a scatter -- which is what a padding row
+    /// or a -1 sentinel means. Under <c>Clamp</c> no predicate is added and the clamped edge
+    /// element is genuinely read or written.
+    /// </para>
+    /// </remarks>
+    private string EmitIndirectIndex(
+        CodegenIndirectIndex indirect,
+        string[] axisReg,
+        int[] reductionValues,
+        HashSet<int> reductionSet,
+        ref string? predicate)
+    {
+        var indexBinding = _inputBindings![indirect.IndexInput];
+
+        // Where to read the index from. This position is still affine, which is what keeps
+        // the whole mechanism tractable: the emitter knows exactly where the index lives, it
+        // just does not know its value until the load returns.
+        string? positionPredicate = null;
+        string position = EmitAffineIndex(
+            indirect.Position, axisReg, reductionValues, reductionSet,
+            (int)indexBinding.ElementCount, ref positionPredicate);
+
+        string posBytes = NextRd(), posAddr = NextRd(), raw = NextR();
+        L($"mul.wide.s32 {posBytes}, {position}, 4;");
+        L($"add.u64 {posAddr}, {_basePointers![indexBinding.ParameterIndex]}, {posBytes};");
+
+        if (positionPredicate is null)
+        {
+            L($"ld.global.nc.u32 {raw}, [{posAddr}];");
+        }
+        else
+        {
+            // A position outside the index tensor reads nothing and yields a sentinel that
+            // the range test below will reject.
+            L($"mov.u32 {raw}, 0xFFFFFFFF;");
+            L($"@{positionPredicate} ld.global.nc.u32 {raw}, [{posAddr}];");
+        }
+        IndirectIndexLoads++;
+
+        if (indirect.OutOfRange == CodegenIndexOutOfRange.Skip)
+        {
+            string lo = NextP(), hi = NextP(), both = NextP();
+            L($"setp.ge.s32 {lo}, {raw}, 0;");
+            L($"setp.lt.s32 {hi}, {raw}, {I(indirect.Bound)};");
+            L($"and.pred {both}, {lo}, {hi};");
+            predicate = AndPred(predicate, both);
+            if (positionPredicate is not null) predicate = AndPred(predicate, positionPredicate);
+        }
+
+        // The unconditional clamp described above. Both forms need it.
+        string clampedLow = NextR(), clamped = NextR();
+        L($"max.s32 {clampedLow}, {raw}, 0;");
+        L($"min.s32 {clamped}, {clampedLow}, {I(indirect.Bound - 1)};");
+        return clamped;
+    }
+
     /// <summary>Emits a guarded load, yielding 0 for an out-of-range access (zero padding).</summary>
     private string EmitLoad(
         CodegenTensorBinding binding,
@@ -2066,6 +2202,11 @@ public sealed class PtxAffineEmitter
         int[] reductionAxes,
         out string? predicate)
     {
+        if (binding.IsIndexTensor)
+            throw new NotSupportedException(
+                "'" + binding.Name + "' is an int32 index tensor and cannot be read as an " +
+                "arithmetic operand. Reading it as one would compute with a bit pattern.");
+
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out predicate);
         string byteOff = NextRd(), addr = NextRd(), dst = NextF();
         L($"mul.wide.s32 {byteOff}, {offset}, {I(binding.ElementBytes)};");

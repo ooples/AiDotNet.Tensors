@@ -147,11 +147,26 @@ public class CodegenMixedPrecisionTests
     /// <summary>An element type the emitter cannot store is refused, not silently widened.</summary>
     [Theory]
     [InlineData(CodegenElementType.Float64)]
-    [InlineData(CodegenElementType.Int32)]
     public void UnsupportedElementType_IsRefused(CodegenElementType type)
     {
         Assert.Throws<ArgumentException>(() => new CodegenTensorBinding(
             0, "x", new[] { 4 }, new[] { CodegenAffineExpr.Axis(0) }, elementType: type));
+    }
+
+    /// <summary>
+    /// Int32 IS accepted, but only as an index tensor -- it arrived with gather/scatter.
+    /// Letting an index buffer masquerade as fp32 is what the separate type prevents; see
+    /// CodegenGatherScatterTests for the refusal to read one as an operand.
+    /// </summary>
+    [Fact]
+    public void Int32_IsAcceptedAsAnIndexTensor()
+    {
+        var binding = new CodegenTensorBinding(0, "ids", new[] { 4 },
+            new[] { CodegenAffineExpr.Axis(0) }, elementType: CodegenElementType.Int32);
+
+        Assert.True(binding.IsIndexTensor);
+        Assert.Equal(4, binding.ElementBytes);
+        Assert.False(binding.NeedsConversion);
     }
 
     /// <summary>fp32 kernels must be untouched -- no conversion, no 2-byte addressing.</summary>

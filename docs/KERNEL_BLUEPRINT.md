@@ -217,6 +217,7 @@ oracle that is given the *quantised* inputs, so the row reports the kernel rathe
 fp16's rounding of its operands.
 
 | tensor cores (`PtxTensorCoreEmitter`, `wmma` m16n16k16) | fp16 GEMM with a fused element-wise epilogue |
+| `CodegenIndirectIndex` (gather/scatter, int32 index tensors) | embedding lookup and its backward, one-hot projection, sparse accumulation |
 
 The tensor-core path is a *separate* emitter with its own recogniser, because `wmma` is
 warp-collective and its fragment layout is opaque: a lowering that assumes which lane holds
@@ -225,9 +226,28 @@ is refused **with a reason** and falls back to the scalar emitter. It is correct
 still 0.35×–0.05× against cuBLAS; the remaining gap is operand locality, not instruction
 selection, and it is not promoted anywhere until staging lands. See `TENSOR_CORES.md`.
 
-Still absent, so a hand-written kernel is required: **data-dependent indexing**
-(gather/scatter), **complex and hypercomplex types**, and **three or more outputs in one
-space**.
+Data-dependent indexing lives on the **binding**, not on the affine expression, and that
+placement is the whole design. An affine expression is a closed-form function of the axes;
+the bounds predicate, the index folding and the tensor-core recogniser all rely on it, and an
+index fetched from memory has none of those properties. Three rules follow, each of which
+protects against a failure that does not announce itself:
+
+- **The loaded index is clamped unconditionally** before it reaches address arithmetic. That
+  is not the caller's out-of-range policy — it is what stops a malformed index tensor forming
+  an address outside the allocation. Predicating the load alone does not do it, because the
+  address is computed either way.
+- **A scatter store is atomic**, decided by structure rather than by the caller: an output
+  dimension addressed at run time cannot be proven injective. A plain store passes every
+  single-threaded check and then loses gradients when warps collide — a different wrong
+  answer per run, which reads as flakiness. Verified at 4096-way contention onto one row.
+- **An index tensor is a distinct element type** (`Int32`) and is refused as an arithmetic
+  operand *at the spec*, not at the load site. The first version of that guard sat in
+  `EmitLoad` and a test caught a kernel reading the index buffer as fp32 anyway: the emitter
+  has scalar, vectorised, staged and coarsened load paths, so a guard on one is a guard on
+  none.
+
+Still absent, so a hand-written kernel is required: **complex and hypercomplex types**, and
+**three or more outputs in one space**.
 
 ---
 

@@ -121,6 +121,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--gather-check")
+        {
+            GatherScatterCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--tensorcore-check")
         {
             TensorCoreCheckTool.Run(args.Skip(1).ToArray());
