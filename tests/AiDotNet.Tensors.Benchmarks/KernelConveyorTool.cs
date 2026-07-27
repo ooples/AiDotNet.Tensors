@@ -176,7 +176,7 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine("measured column recorded under protocol " + CodegenMeasurementProtocol.Tag);
         Console.WriteLine();
-        Console.WriteLine("kernel                        tile            block  ld/MAC  staged");
+        Console.WriteLine("kernel                        tile            block  ld/MAC  predicted  measured  pred/meas  staged");
 
         foreach (var entry in entries)
         {
@@ -189,6 +189,9 @@ internal static class KernelConveyorTool
             long threads = spec.Space.TotalThreads / Math.Max(1, emitter.CoarsenedLanes);
             var p = CodegenPerformanceModel.Predict(spec, threads, emitter.DynamicLoadsPerThread, machine);
 
+            // The measured column is the point of this table: a prediction printed without
+            // the number that falsifies it is a model asserting itself. Both were computed
+            // and then dropped, which is worse than not computing them.
             double measured = MeasuredMicroseconds(entry.Name);
             string measuredText = measured > 0 ? measured.ToString("F1", CultureInfo.InvariantCulture) : "-";
             string ratioText = measured > 0
@@ -199,6 +202,9 @@ internal static class KernelConveyorTool
                 emitter.TileDescription.PadRight(16) +
                 emitter.LaunchBlockThreads.ToString(CultureInfo.InvariantCulture).PadLeft(5) +
                 p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(8) +
+                p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture).PadLeft(11) +
+                measuredText.PadLeft(10) +
+                ratioText.PadLeft(11) +
                 "  " + emitter.StagedOperands);
         }
 

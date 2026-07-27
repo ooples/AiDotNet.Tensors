@@ -324,6 +324,16 @@ public sealed class PtxAffineEmitter
 
     private int _stageLabel;
 
+    /// <summary>
+    /// PTX literal an out-of-range load yields: the identity of the active reduction.
+    /// </summary>
+    /// <remarks>
+    /// <c>0f00000000</c> for a sum, <c>0fFF800000</c> (negative infinity) for a maximum.
+    /// Set per emission from the spec, because it is a property of the operator and not of
+    /// the emitter.
+    /// </remarks>
+    private string _outOfRangeFill = "0f00000000";
+
     /// <summary>Fallback when staging is disabled: fixed block, nothing invariant.</summary>
     private static int PassThroughBlock(out HashSet<int> axesVaryingInBlock)
     {
@@ -939,6 +949,20 @@ public sealed class PtxAffineEmitter
         // are content-addressed on that text.
         _stageLabel = 0;
 
+        // The out-of-range fill is the reduction's identity, not always zero. A maximum
+        // over zero-filled padding treats the padding as a candidate.
+        _outOfRangeFill = spec.Reduce == CodegenReduceKind.Max ? "0fFF800000" : "0f00000000";
+
+        // Under a maximum the product of several operands has no single sensible identity:
+        // -inf times a positive operand is -inf, but -inf times zero is NaN. No spec needs
+        // it, so refuse rather than emit something whose padding behaviour is undefined.
+        if (spec.Reduce == CodegenReduceKind.Max && spec.ProductInputs.Count > 1)
+            throw new NotSupportedException(
+                "A Max reduction over a product of " + spec.ProductInputs.Count +
+                " operands has no well-defined padding identity: the out-of-range fill " +
+                "would have to be -inf for the product, and -inf times a zero operand is " +
+                "NaN. Express the product as a single operand, or add an explicit mask.");
+
         _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
            .Append(".address_size 64\n\n")
@@ -1550,7 +1574,16 @@ public sealed class PtxAffineEmitter
         return offset!;
     }
 
-    /// <summary>Emits a guarded load, yielding 0 for an out-of-range access (zero padding).</summary>
+    /// <summary>
+    /// Emits a guarded load, yielding the REDUCTION'S IDENTITY for an out-of-range access.
+    /// </summary>
+    /// <remarks>
+    /// Zero is the additive identity, not the universal one. Under a maximum, a zero-filled
+    /// out-of-range tap is a real candidate, so a padded max-pool over all-negative inputs
+    /// returns 0 instead of the true maximum. The oracle had the same bug in the same
+    /// direction, so the exact-agreement gate passed it -- the one class of defect a shared
+    /// oracle cannot catch.
+    /// </remarks>
     private string EmitLoad(
         CodegenTensorBinding binding,
         string basePtr,
@@ -1569,7 +1602,7 @@ public sealed class PtxAffineEmitter
         }
         else
         {
-            L($"mov.f32 {dst}, 0f00000000;");
+            L($"mov.f32 {dst}, {_outOfRangeFill};");
             L($"@{predicate} ld.global.nc.f32 {dst}, [{addr}];");
         }
         EmittedLoads++;

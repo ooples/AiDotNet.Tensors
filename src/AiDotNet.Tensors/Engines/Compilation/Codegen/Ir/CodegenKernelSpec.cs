@@ -205,8 +205,16 @@ public sealed class CodegenKernelSpec
                     if (!ok) { anyOutOfBounds = true; break; }
                     product *= inputData[_productInputs[k]][off];
                 }
-                // Zero padding: an out-of-range tap contributes the additive identity.
-                if (anyOutOfBounds) product = 0.0;
+                // An out-of-range tap contributes the identity OF THE REDUCTION, which is
+                // not always zero. Zero is the additive identity, but for a maximum it is a
+                // real candidate: a padded max-pool over all-negative inputs would return
+                // 0.0 instead of the true maximum.
+                //
+                // This was wrong in the oracle AND in the emitter, in the same direction, so
+                // the exact-agreement gate passed it -- the one failure mode a shared oracle
+                // cannot catch. It is latent only because maxpool2d_2x2 has no padding.
+                if (anyOutOfBounds)
+                    product = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
 
                 acc = Reduce switch
                 {

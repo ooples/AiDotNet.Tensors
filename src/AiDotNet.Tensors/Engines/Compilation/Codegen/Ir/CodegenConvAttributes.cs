@@ -39,8 +39,15 @@ public sealed record CodegenConvAttributes(
     public static int ForwardExtent(int input, int tap, int stride, int padding)
     {
         if (stride <= 0) return -1;
-        int extent = (input + 2 * padding - tap) / stride + 1;
-        return extent > 0 ? extent : -1;
+
+        // The span must be checked BEFORE the division. C# truncates toward zero, so a
+        // kernel larger than its padded input gives a negative span that divides to 0 and
+        // then reports one phantom output row: input 2, tap 5, pad 1, stride 2 is
+        // (2 + 2 - 5) / 2 + 1 = -1/2 + 1 = 1, when nothing fits at all.
+        int span = input + 2 * padding - tap;
+        if (span < 0) return -1;
+
+        return span / stride + 1;
     }
 
     /// <summary>Output extent of a transposed convolution along one spatial axis.</summary>
