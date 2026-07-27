@@ -50,6 +50,24 @@ clocks. The pattern is consistent enough to plan from:
 
 **Aim at the first three. The last two are where effort goes to die.**
 
+### Why dense GEMM lost, refined
+
+The dense-GEMM row was originally read as "cuBLAS is better tuned". It was two separate
+deficits, and separating them changed what the next lever is:
+
+1. **Instruction selection.** The emitter emitted no tensor-core instruction at all, so every
+   generated matmul ran on the FP32 pipes against a competitor on the tensor cores — roughly
+   twenty times the arithmetic throughput. That is now fixed (`PtxTensorCoreEmitter`), and it
+   is worth 2.05–6.77× against our own previous lowering.
+2. **Operand locality.** It was not enough. One warp per 16×16 tile with no staging moves
+   `O(M·N·K)` operand bytes instead of `O(M·N·K / tile)`, and the measurement shows the cliff
+   plainly: 11.8 TFLOP/s at 2048³ falling to **3.0** at 4096³, as the reused bands outgrow
+   L2. cuBLAS holds 57.6 TFLOP/s at the same shape.
+
+Standing against cuBLAS is **0.35× / 0.23× / 0.05×** at 1024³ / 2048³ / 4096³ — a loss, and a
+widening one. See `TENSOR_CORES.md`. The lesson generalises: *having the right instruction is
+necessary and not sufficient; check the data path before claiming a category is closed.*
+
 ---
 
 ## 2. Diagnose with stall reasons, never with throughput percentages
@@ -198,9 +216,18 @@ would read twice the intended span. Measured on device at `0.000E+000` against a
 oracle that is given the *quantised* inputs, so the row reports the kernel rather than
 fp16's rounding of its operands.
 
-Still absent, so a hand-written kernel is required: **tensor cores**, **data-dependent
-indexing** (gather/scatter), **complex and hypercomplex types**, and **three or more
-outputs in one space**.
+| tensor cores (`PtxTensorCoreEmitter`, `wmma` m16n16k16) | fp16 GEMM with a fused element-wise epilogue |
+
+The tensor-core path is a *separate* emitter with its own recogniser, because `wmma` is
+warp-collective and its fragment layout is opaque: a lowering that assumes which lane holds
+which element still assembles, still runs, and is wrong. Anything it cannot express exactly
+is refused **with a reason** and falls back to the scalar emitter. It is correct today and
+still 0.35×–0.05× against cuBLAS; the remaining gap is operand locality, not instruction
+selection, and it is not promoted anywhere until staging lands. See `TENSOR_CORES.md`.
+
+Still absent, so a hand-written kernel is required: **data-dependent indexing**
+(gather/scatter), **complex and hypercomplex types**, and **three or more outputs in one
+space**.
 
 ---
 
