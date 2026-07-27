@@ -159,6 +159,39 @@ internal static class FrontEndCheckTool
             CodegenLowering.LowerConv2D<float>(CodegenOpKind.ConvTranspose2D,
                 new[] { 2, 16, 16, 16 }, new[] { 16, 16, 3, 3 },
                 new CodegenConvAttributes(2, 2, 1, 1)));
+
+        // Activations. These carry APPROXIMATE PTX instructions (ex2, rcp, tanh), so they
+        // are the first kernels that cannot reach exact agreement with the fp64 oracle.
+        // The deviation is the point of the row.
+        foreach (var op in new[]
+                 {
+                     CodegenOpKind.Sigmoid, CodegenOpKind.Tanh,
+                     CodegenOpKind.Swish, CodegenOpKind.GELU,
+                 })
+        {
+            yield return ("conv 1x1 + bias + " + op.ToString().ToLowerInvariant(),
+                ConvWithActivation(op));
+        }
+    }
+
+    /// <summary>A 1x1 convolution with a bias and one activation, to isolate the epilogue.</summary>
+    private static CodegenGraph ConvWithActivation(CodegenOpKind activation)
+    {
+        int[] outShape = { 4, 32, 28, 28 };
+        var g = new CodegenGraph();
+        int input = Load(g, new[] { 4, 32, 28, 28 });
+        int weights = Load(g, new[] { 32, 32, 1, 1 });
+        int bias = Load(g, new[] { 1, 32, 1, 1 });
+
+        int conv = g.AddNode(new CodegenNode(CodegenOpKind.Conv2D, new[] { input, weights },
+            CodegenElementType.Float32, outShape, CodegenConvAttributes.Valid));
+        int add = g.AddNode(new CodegenNode(CodegenOpKind.Add, new[] { conv, bias },
+            CodegenElementType.Float32, outShape));
+        int act = g.AddNode(new CodegenNode(activation, new[] { add },
+            CodegenElementType.Float32, outShape));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { act },
+            CodegenElementType.Float32, outShape));
+        return g;
     }
 
     private static int Load(CodegenGraph g, int[] shape) =>

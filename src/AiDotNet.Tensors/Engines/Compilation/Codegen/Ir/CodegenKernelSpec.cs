@@ -34,7 +34,28 @@ public enum CodegenActivationKind
     None,
 
     /// <summary><c>max(x, 0)</c>.</summary>
-    ReLU
+    ReLU,
+
+    /// <summary><c>1 / (1 + exp(-x))</c>.</summary>
+    Sigmoid,
+
+    /// <summary>Hyperbolic tangent.</summary>
+    Tanh,
+
+    /// <summary>SiLU / swish: <c>x * sigmoid(x)</c>.</summary>
+    Swish,
+
+    /// <summary>
+    /// Gaussian error linear unit, tanh approximation:
+    /// <c>0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))</c>.
+    /// </summary>
+    /// <remarks>
+    /// The TANH form, not the erf form. They differ by up to about 1e-3 absolute near
+    /// |x| = 2, which is far larger than any floating-point concern, so the choice is part
+    /// of the operator's definition rather than an implementation detail. Both the emitter
+    /// and the fp64 oracle evaluate this same formula, so the comparison stays honest.
+    /// </remarks>
+    Gelu
 }
 
 /// <summary>
@@ -136,6 +157,27 @@ public sealed class CodegenKernelSpec
                         $"Output dimension {d} depends on reduction axis '{space.Axes[term.Axis].Name}'.", nameof(output));
     }
 
+    /// <summary>
+    /// The reference definition of every activation, in fp64.
+    /// </summary>
+    /// <remarks>
+    /// This is the oracle the emitted PTX is measured against, so the formulas here ARE
+    /// the operator's definition. GELU uses the tanh approximation; swapping it for the
+    /// erf form would move results by up to about 1e-3 near |x| = 2, which is a different
+    /// operator rather than a rounding difference.
+    /// </remarks>
+    public static double ApplyActivation(CodegenActivationKind kind, double x) => kind switch
+    {
+        CodegenActivationKind.None => x,
+        CodegenActivationKind.ReLU => x < 0.0 ? 0.0 : x,
+        CodegenActivationKind.Sigmoid => 1.0 / (1.0 + Math.Exp(-x)),
+        CodegenActivationKind.Tanh => Math.Tanh(x),
+        CodegenActivationKind.Swish => x / (1.0 + Math.Exp(-x)),
+        CodegenActivationKind.Gelu =>
+            0.5 * x * (1.0 + Math.Tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))),
+        _ => throw new NotSupportedException("Unhandled activation " + kind + "."),
+    };
+
     private void Require(int inputIndex, string paramName)
     {
         if ((uint)inputIndex >= (uint)_inputs.Length)
@@ -236,7 +278,7 @@ public sealed class CodegenKernelSpec
                 long off = s.ResolveOffset(values, out bool ok);
                 if (ok) acc *= inputData[ScaleInput.Value][off];
             }
-            if (Activation == CodegenActivationKind.ReLU && acc < 0.0) acc = 0.0;
+            acc = ApplyActivation(Activation, acc);
 
             long outOff = Output.ResolveOffset(values, out bool outOk);
             if (outOk) output[outOff] = acc;

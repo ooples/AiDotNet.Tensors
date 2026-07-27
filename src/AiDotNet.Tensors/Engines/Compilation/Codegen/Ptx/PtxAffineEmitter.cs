@@ -379,6 +379,131 @@ public sealed class PtxAffineEmitter
         _body.Append(skip).Append(":\n");
     }
 
+    /// <summary>
+    /// Emits the epilogue activation, returning the register holding the result.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// PTX has no <c>exp</c>: it has <c>ex2.approx.f32</c>, so every exponential is
+    /// <c>ex2(x * log2 e)</c> with <c>log2 e = 1.4426950408889634</c>. Reciprocals use
+    /// <c>rcp.approx.f32</c> and <c>tanh.approx.f32</c> is native from sm_75, which this
+    /// emitter already requires.
+    /// </para>
+    /// <para>
+    /// These are APPROXIMATE instructions — roughly 2 ulp for <c>ex2</c>, 1 ulp for
+    /// <c>rcp</c> — so a kernel carrying one of them cannot reach the exact
+    /// <c>0.000E+000</c> the affine kernels hit against the fp64 oracle. The deviation is
+    /// measured and reported per activation rather than assumed; see
+    /// <c>docs/ACTIVATION_ACCURACY.md</c>. ReLU stays exact because <c>max</c> is exact.
+    /// </para>
+    /// </remarks>
+    private string EmitActivation(CodegenActivationKind kind, string x)
+    {
+        const string Log2E = "0f3FB8AA3B";          // 1.4426950408889634
+        const string One = "0f3F800000";
+        const string Half = "0f3F000000";
+        const string GeluOuter = "0f3F4C422A";      // sqrt(2/pi) = 0.7978845608028654
+        const string GeluInner = "0f3D372713";      // 0.044715
+
+        switch (kind)
+        {
+            case CodegenActivationKind.None:
+                return x;
+
+            case CodegenActivationKind.ReLU:
+                L($"max.f32 {x}, {x}, 0f00000000;");
+                return x;
+
+            case CodegenActivationKind.Tanh:
+                return EmitTanh(x, Log2E, One);
+
+            case CodegenActivationKind.Sigmoid:
+                return EmitSigmoid(x, Log2E, One);
+
+            case CodegenActivationKind.Swish:
+            {
+                string s = EmitSigmoid(x, Log2E, One);
+                string r = NextF();
+                L($"mul.rn.f32 {r}, {x}, {s};");
+                return r;
+            }
+
+            case CodegenActivationKind.Gelu:
+            {
+                // 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))
+                string x2 = NextF(), x3 = NextF(), inner = NextF(), scaled = NextF();
+                L($"mul.rn.f32 {x2}, {x}, {x};");
+                L($"mul.rn.f32 {x3}, {x2}, {x};");
+                L($"fma.rn.f32 {inner}, {x3}, {GeluInner}, {x};");
+                L($"mul.rn.f32 {scaled}, {inner}, {GeluOuter};");
+
+                string t = EmitTanh(scaled, Log2E, One);
+                string sum = NextF(), half = NextF(), r = NextF();
+                L($"add.rn.f32 {sum}, {t}, {One};");
+                L($"mul.rn.f32 {half}, {x}, {Half};");
+                L($"mul.rn.f32 {r}, {half}, {sum};");
+                return r;
+            }
+
+            default:
+                throw new NotSupportedException(
+                    "The PTX emitter has no form for activation " + kind + ".");
+        }
+    }
+
+    /// <summary>
+    /// tanh, built from <c>ex2</c> rather than from <c>tanh.approx.f32</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Measured on device against the fp64 oracle, the native instruction is the weakest
+    /// link in the whole activation set:
+    /// </para>
+    /// <code>
+    ///   sigmoid  ex2 + rcp            9.574E-008
+    ///   swish    ex2 + rcp            8.450E-008
+    ///   tanh     tanh.approx.f32      7.268E-006     <- 76x worse
+    ///   gelu     tanh.approx.f32      2.437E-006
+    /// </code>
+    /// <para>
+    /// So tanh is derived from the same primitives the accurate two are:
+    /// <c>tanh(x) = sign(x) * (1 - 2 / (exp(2|x|) + 1))</c>. Taking the absolute value
+    /// first is what makes it stable — for large |x| the exponential saturates to
+    /// infinity, the reciprocal underflows to zero, and the result lands on exactly
+    /// ±1 with no special case. Evaluating the raw ratio instead would produce inf/inf.
+    /// </para>
+    /// </remarks>
+    private string EmitTanh(string x, string log2E, string one)
+    {
+        const string Two = "0f40000000";
+
+        string ax = NextF(), scaled = NextF(), e = NextF();
+        L($"abs.f32 {ax}, {x};");
+        L($"mul.rn.f32 {scaled}, {ax}, {log2E};");
+        L($"add.rn.f32 {scaled}, {scaled}, {scaled};");     // 2|x| log2 e
+        L($"ex2.approx.f32 {e}, {scaled};");
+
+        string denom = NextF(), inv = NextF(), twice = NextF(), magnitude = NextF(), r = NextF();
+        L($"add.rn.f32 {denom}, {e}, {one};");
+        L($"rcp.approx.f32 {inv}, {denom};");
+        L($"mul.rn.f32 {twice}, {inv}, {Two};");
+        L($"sub.rn.f32 {magnitude}, {one}, {twice};");
+        L($"copysign.f32 {r}, {x}, {magnitude};");
+        return r;
+    }
+
+    /// <summary>1 / (1 + exp(-x)), via ex2 and rcp.</summary>
+    private string EmitSigmoid(string x, string log2E, string one)
+    {
+        string negScaled = NextF(), e = NextF(), denom = NextF(), r = NextF();
+        L($"mul.rn.f32 {negScaled}, {x}, {log2E};");
+        L($"neg.f32 {negScaled}, {negScaled};");
+        L($"ex2.approx.f32 {e}, {negScaled};");
+        L($"add.rn.f32 {denom}, {e}, {one};");
+        L($"rcp.approx.f32 {r}, {denom};");
+        return r;
+    }
+
     private int _stageLabel;
 
     /// <summary>
@@ -1545,8 +1670,7 @@ public sealed class PtxAffineEmitter
                 L($"mul.rn.f32 {na}, {acc}, {v};");
                 acc = na;
             }
-            if (spec.Activation == CodegenActivationKind.ReLU)
-                L($"max.f32 {acc}, {acc}, 0f00000000;");
+            acc = EmitActivation(spec.Activation, acc);
 
             string laneOff = EmitOffset(spec.Output, laneAxisReg[l], reductionValues, reduction,
                                        out string? lanePred);

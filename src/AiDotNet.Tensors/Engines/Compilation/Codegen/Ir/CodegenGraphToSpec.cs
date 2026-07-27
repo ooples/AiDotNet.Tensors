@@ -98,9 +98,9 @@ public static class CodegenGraphToSpec
         for (int guard = 0; guard <= graph.Count; guard++)
         {
             var node = graph[cursor];
-            if (node.Op == CodegenOpKind.ReLU && activation == CodegenActivationKind.None)
+            if (activation == CodegenActivationKind.None && TryMapActivation(node.Op) is { } mapped)
             {
-                activation = CodegenActivationKind.ReLU;
+                activation = mapped;
                 cursor = node.Inputs[0];
                 continue;
             }
@@ -205,6 +205,25 @@ public static class CodegenGraphToSpec
         graphNodeOrder = ordered;
         return true;
     }
+
+    /// <summary>
+    /// The epilogue activation an op maps to, or null when it is not one.
+    /// </summary>
+    /// <remarks>
+    /// Only the activations the emitter has a PTX form for. <c>Swish</c> is the IR's name
+    /// for SiLU. <c>LeakyReLU</c> and <c>ELU</c> are deliberately absent: both carry a
+    /// parameter the spec has nowhere to put, and mapping them to their default slope
+    /// would silently compile a different operator.
+    /// </remarks>
+    private static CodegenActivationKind? TryMapActivation(CodegenOpKind op) => op switch
+    {
+        CodegenOpKind.ReLU => CodegenActivationKind.ReLU,
+        CodegenOpKind.Sigmoid => CodegenActivationKind.Sigmoid,
+        CodegenOpKind.Tanh => CodegenActivationKind.Tanh,
+        CodegenOpKind.Swish => CodegenActivationKind.Swish,
+        CodegenOpKind.GELU => CodegenActivationKind.Gelu,
+        _ => null,
+    };
 
     /// <summary>Order the launcher must bind buffers in, matching the translated spec.</summary>
     public static bool TryGetParameterOrder(
