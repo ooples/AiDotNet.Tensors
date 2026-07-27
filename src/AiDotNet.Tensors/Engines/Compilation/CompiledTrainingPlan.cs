@@ -1413,8 +1413,54 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             else
             {
+                // ZZTEMP #1789: producer/consumer ORDER audit. For the first N forward ops of the
+                // first step, log the output magnitude and, for every input, WHICH step produces it.
+                // A producer index greater than the consumer index proves the compiled plan runs a
+                // consumer before its producer (reading an unwritten -> zero buffer).
+                var __zzPath = System.Environment.GetEnvironmentVariable("ZZ_ORDER");
+                bool __zzOn = !string.IsNullOrEmpty(__zzPath) && typeof(T) == typeof(float)
+                              && _optimizerStep == 0 && _forwardSteps != null;
                 for (int i = 0; i < fwd.Length; i++)
+                {
                     fwd[i](engine);
+                    if (!__zzOn || i >= 60) continue;
+                    var __st = _forwardSteps![i];
+                    if (__st == null) continue;
+                    var __obT = __st.OutputBuffer;
+                    if (__obT == null) continue;
+                    var __ob = (Tensor<float>)(object)__obT;
+                    float __omax = 0f; int __obad = 0;
+                    for (int k = 0; k < __ob.Length; k++)
+                    {
+                        float __v = __ob[k];
+                        if (float.IsNaN(__v) || float.IsInfinity(__v)) __obad++;
+                        else { float __a = System.Math.Abs(__v); if (__a > __omax) __omax = __a; }
+                    }
+                    var __sb = new System.Text.StringBuilder();
+                    __sb.Append("op=").Append(i).Append(' ').Append(__st.OpName)
+                        .Append(" shape=[").Append(string.Join(",", __obT._shape)).Append(']')
+                        .Append(" outMax=").Append(__omax.ToString("E3"))
+                        .Append(" bad=").Append(__obad);
+                    for (int q = 0; q < __st.Inputs.Length; q++)
+                    {
+                        var __inT = __st.Inputs[q];
+                        int __prod = -1;
+                        for (int j = 0; j < _forwardSteps.Length; j++)
+                            if (ReferenceEquals(_forwardSteps[j].OutputBuffer, __inT)) { __prod = j; break; }
+                        float __imax = 0f;
+                        var __inF = (Tensor<float>)(object)__inT;
+                        for (int k = 0; k < __inF.Length; k++)
+                        {
+                            float __a = System.Math.Abs(__inF[k]);
+                            if (!float.IsNaN(__a) && !float.IsInfinity(__a) && __a > __imax) __imax = __a;
+                        }
+                        __sb.Append(" | in").Append(q).Append(": producer=").Append(__prod)
+                            .Append(" len=").Append(__inT.Length)
+                            .Append(" max=").Append(__imax.ToString("E3"));
+                        if (__prod > i) __sb.Append(" ***MISORDERED***");
+                    }
+                    System.IO.File.AppendAllText(__zzPath!, __sb.ToString() + System.Environment.NewLine);
+                }
             }
         }
         long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
