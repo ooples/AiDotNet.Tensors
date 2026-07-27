@@ -199,7 +199,7 @@ Reaching for it is cheaper than a hand-written kernel when the operator fits:
 | `PreReduce` (`Exp`, `Square`) + signed `PreBias` | softmax denominators, variance, squared error |
 | activations: ReLU, Sigmoid, Tanh, Swish, GELU, Reciprocal, Rsqrt | epilogues, RMSNorm |
 | `ReduceScale` | means, loss normalisation, `1/denominator` |
-| extra outputs (`ArgMaxIndex`, `AffineOfPrimary`) | pooling indices, optimizer state |
+| extra outputs, **any number** (`ArgMaxIndex`, `AffineOfPrimary`) | pooling indices, optimizer state, multi-state steps |
 | `CodegenAdjoint` | backward kernels derived, never hand-authored |
 | `CodegenSplitReduction` | small-output long-reduction kernels |
 | `ElementType` per binding (fp16 / bf16 storage, fp32 arithmetic) | mixed-precision inference, narrow activations against wide weights |
@@ -267,7 +267,16 @@ Two things this got right only because they were checked properly:
   Component-wise ReLU on a complex number is a *different operator*, not the same one
   generalised. Same for `Max` (no order) and pre-reduction transforms.
 
-Still absent, so a hand-written kernel is required: **three or more outputs in one space**.
+The output count is not capped, and the legacy single-argmax pair is now the *same*
+mechanism — it folds into the extras list rather than living beside it, because two ways to
+say "an extra output" is how one of them ends up unmaintained. Two outputs bound to one
+parameter are refused at construction: both stores would land on the same buffer with no
+ordering between them, giving plausible values and a different answer per run.
+
+**Nothing on this list is now a reason to hand-write a kernel.** All five gaps that were
+recorded here as unfixed — fp16/bf16, tensor cores, gather/scatter, complex/hypercomplex,
+and three-or-more outputs — are closed and verified on device. What remains open is
+*performance*, specifically tensor-core operand locality (§1), not expressiveness.
 
 ---
 

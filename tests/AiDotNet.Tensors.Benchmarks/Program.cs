@@ -121,6 +121,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--multiout-check")
+        {
+            MultiOutputCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--algebra-check")
         {
             AlgebraCheckTool.Run(args.Skip(1).ToArray());

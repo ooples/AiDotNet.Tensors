@@ -84,6 +84,9 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Stores emitted as atomic accumulations because the destination may collide.</summary>
     public int AtomicStores { get; private set; }
 
+    /// <summary>Extra-output stores emitted beyond the primary and any argmax.</summary>
+    public int ExtraOutputStores { get; private set; }
+
     /// <summary>
     /// Emits PTX for <paramref name="spec"/>.
     /// </summary>
@@ -1238,7 +1241,7 @@ public sealed partial class PtxAffineEmitter
         LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
-        IndirectIndexLoads = 0; AtomicStores = 0;
+        IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0;
         _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
         // calls makes the SAME spec emit different text on a second Emit, and cubins
@@ -1855,6 +1858,53 @@ public sealed partial class PtxAffineEmitter
                 L($"add.u64 {secondAddr}, {basePtr[spec.SecondaryOutput.ParameterIndex]}, {secondByte};");
                 if (secondPred is null) L($"st.global.u32 [{secondAddr}], {argIndex[l]};");
                 else L($"@{secondPred} st.global.u32 [{secondAddr}], {argIndex[l]};");
+            }
+
+            // EVERY REMAINING EXTRA OUTPUT, from the SAME accumulator. The count is not
+            // capped: an Adam step writes two moment states and the updated parameter, and
+            // splitting that across kernels re-reads every operand once per kernel -- which
+            // is the exact cost the fusion argument is about.
+            //
+            // The argmax written just above is skipped here because it has already been
+            // emitted through the legacy path; both are entries in the same list.
+            for (int e = 0; e < spec.ExtraOutputs.Count; e++)
+            {
+                var extra = spec.ExtraOutputs[e];
+                if (extra.Kind == CodegenExtraOutputKind.ArgMaxIndex) continue;
+
+                // Scale * primary, then optionally + BiasScale * bias. The primary is the
+                // FINISHED value -- after the epilogue activation -- because an optimizer's
+                // parameter update steps by the state it just computed, not by a partial.
+                string value = NextF();
+                L($"mul.rn.f32 {value}, {acc}, {F32(extra.Scale)};");
+
+                if (extra.BiasInput.HasValue)
+                {
+                    var biasBinding = spec.Inputs[extra.BiasInput.Value];
+                    string biasValue = EmitLoad(
+                        biasBinding, basePtr[biasBinding.ParameterIndex], laneAxisReg[l],
+                        reductionValues, reduction, out _);
+                    string combined = NextF();
+                    L($"fma.rn.f32 {combined}, {biasValue}, {F32(extra.BiasScale)}, {value};");
+                    value = combined;
+                }
+
+                string extraOff = EmitOffset(extra.Binding, laneAxisReg[l],
+                                             reductionValues, reduction, out string? extraPred);
+                string extraAddr = NextRd(), extraByte = NextRd();
+                L($"mul.wide.u32 {extraByte}, {extraOff}, {I(extra.Binding.ElementBytes)};");
+                L($"add.u64 {extraAddr}, {basePtr[extra.Binding.ParameterIndex]}, {extraByte};");
+
+                if (extra.Binding.NeedsConversion)
+                {
+                    string narrowedExtra = EmitNarrow(extra.Binding.ElementType, value);
+                    if (extraPred is null) L($"st.global.u16 [{extraAddr}], {narrowedExtra};");
+                    else L($"@{extraPred} st.global.u16 [{extraAddr}], {narrowedExtra};");
+                }
+                else if (extraPred is null) L($"st.global.f32 [{extraAddr}], {value};");
+                else L($"@{extraPred} st.global.f32 [{extraAddr}], {value};");
+
+                ExtraOutputStores++;
             }
         }
 

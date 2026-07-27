@@ -155,6 +155,7 @@ public sealed class CodegenKernelSpec
 {
     private readonly CodegenTensorBinding[] _inputs;
     private readonly int[] _productInputs;
+    private readonly CodegenExtraOutput[] _extraOutputs;
 
     /// <summary>Stable kernel name; becomes the emitted entry-point symbol.</summary>
     public string Name { get; }
@@ -173,6 +174,17 @@ public sealed class CodegenKernelSpec
 
     /// <summary>How the reduction axes combine.</summary>
     public CodegenReduceKind Reduce { get; }
+
+    /// <summary>
+    /// Outputs beyond the first, all written from the same iteration point.
+    /// </summary>
+    /// <remarks>
+    /// The count is not capped at one. A max-pool writes its values and its argmax indices;
+    /// an Adam step writes the two moment states and the updated parameter, which is three.
+    /// Splitting those across kernels re-reads every operand once per kernel, which is the
+    /// specific cost the whole fusion argument is about.
+    /// </remarks>
+    public IReadOnlyList<CodegenExtraOutput> ExtraOutputs => _extraOutputs;
 
     /// <summary>Optional index into <see cref="Inputs"/> added after the reduction.</summary>
     public int? BiasInput { get; }
@@ -208,7 +220,7 @@ public sealed class CodegenKernelSpec
     /// cannot run without it -- so dispatching a generated max-pool without this would
     /// silently break training rather than merely lose a speedup.
     /// </remarks>
-    public CodegenTensorBinding? SecondaryOutput { get; }
+    public CodegenTensorBinding? SecondaryOutput => FirstArgMax?.Binding;
 
     /// <summary>
     /// Expression whose value at the argmax is written to <see cref="SecondaryOutput"/>.
@@ -222,7 +234,19 @@ public sealed class CodegenKernelSpec
     /// a flat input offset or a tap index instead would compile and produce plausible
     /// numbers while corrupting every gradient.
     /// </remarks>
-    public CodegenAffineExpr? SecondaryIndexExpr { get; }
+    public CodegenAffineExpr? SecondaryIndexExpr => FirstArgMax?.IndexExpr;
+
+    /// <summary>The first argmax extra, which is what the legacy secondary pair named.</summary>
+    private CodegenExtraOutput? FirstArgMax
+    {
+        get
+        {
+            for (int i = 0; i < _extraOutputs.Length; i++)
+                if (_extraOutputs[i].Kind == CodegenExtraOutputKind.ArgMaxIndex)
+                    return _extraOutputs[i];
+            return null;
+        }
+    }
 
     /// <summary>Elementwise transform applied to each term inside the reduction.</summary>
     public CodegenPreReduceOp PreReduce { get; }
@@ -279,6 +303,7 @@ public sealed class CodegenKernelSpec
         int? preBiasInput = null,
         double preBiasScale = 1.0,
         CodegenAlgebra algebra = CodegenAlgebra.Real,
+        CodegenExtraOutput[]? extraOutputs = null,
         CodegenTensorBinding? secondaryOutput = null,
         CodegenAffineExpr? secondaryIndexExpr = null)
     {
@@ -296,9 +321,17 @@ public sealed class CodegenKernelSpec
         PreReduce = preReduce;
         PreBiasInput = preBiasInput;
         PreBiasScale = preBiasScale;
-        SecondaryOutput = secondaryOutput;
-        SecondaryIndexExpr = secondaryIndexExpr;
         Algebra = algebra;
+
+        // ONE MECHANISM. The legacy secondaryOutput/secondaryIndexExpr pair is folded into
+        // the extras list rather than kept beside it: two ways to express "an extra output"
+        // is how one of them ends up unmaintained, and the emitter would have to walk both.
+        var extras = new List<CodegenExtraOutput>();
+        if (secondaryOutput is not null)
+            extras.Add(new CodegenExtraOutput(
+                secondaryOutput, CodegenExtraOutputKind.ArgMaxIndex, secondaryIndexExpr));
+        if (extraOutputs is not null) extras.AddRange(extraOutputs);
+        _extraOutputs = extras.ToArray();
 
         // WHAT A NON-REAL ALGEBRA CANNOT COMBINE WITH. Each of these is refused because it
         // is not defined on the number system, not because it is unimplemented -- and the
@@ -316,6 +349,12 @@ public sealed class CodegenKernelSpec
                 throw new ArgumentException(
                     "An argmax secondary output requires an ordered reduction, which " +
                     algebra + " does not have.", nameof(secondaryOutput));
+
+            if (_extraOutputs.Length > 0)
+                throw new ArgumentException(
+                    "Extra outputs over " + algebra + " are not defined here: an argmax needs " +
+                    "an order the algebra does not have, and an affine-of-primary would have " +
+                    "to say which components it scales. Write it as its own kernel.");
 
             if (activation != CodegenActivationKind.None)
                 throw new ArgumentException(
@@ -345,13 +384,45 @@ public sealed class CodegenKernelSpec
             throw new ArgumentException(
                 "A secondary output needs an index expression and vice versa; one without " +
                 "the other would write an undefined value.", nameof(secondaryOutput));
-        if (secondaryOutput is not null && reduce != CodegenReduceKind.Max)
-            throw new ArgumentException(
-                "A secondary output currently means the ARGMAX position, so it requires a " +
-                "Max reduction; got " + reduce + ".", nameof(secondaryOutput));
-        if (secondaryOutput is not null && !secondaryOutput.IsOutput)
-            throw new ArgumentException(
-                "Secondary output binding must be marked IsOutput.", nameof(secondaryOutput));
+
+        var claimed = new HashSet<int> { output.ParameterIndex };
+        for (int i = 0; i < _extraOutputs.Length; i++)
+        {
+            var extra = _extraOutputs[i];
+
+            if (!extra.Binding.IsOutput)
+                throw new ArgumentException(
+                    "Extra output '" + extra.Binding.Name + "' must be marked IsOutput.");
+
+            // TWO OUTPUTS ON ONE PARAMETER IS A SILENT DATA RACE. Both stores would land on
+            // the same buffer with no ordering between them, so the result depends on warp
+            // scheduling -- it produces plausible values and a different answer per run.
+            if (!claimed.Add(extra.Binding.ParameterIndex))
+                throw new ArgumentException(
+                    "Extra output '" + extra.Binding.Name + "' binds parameter " +
+                    extra.Binding.ParameterIndex + ", which another output already writes. " +
+                    "Two outputs on one buffer race with no ordering between them.");
+
+            if (extra.Kind == CodegenExtraOutputKind.ArgMaxIndex)
+            {
+                if (extra.IndexExpr is null)
+                    throw new ArgumentException(
+                        "Argmax extra output '" + extra.Binding.Name + "' needs an index " +
+                        "expression; without one it would write an undefined value.");
+
+                if (reduce != CodegenReduceKind.Max)
+                    throw new ArgumentException(
+                        "Extra output '" + extra.Binding.Name + "' is an ARGMAX position, so " +
+                        "it requires a Max reduction; got " + reduce + ".");
+            }
+            else if (extra.BiasInput.HasValue)
+            {
+                RefuseIndexOperand(extra.BiasInput.Value, "the bias of extra output '" +
+                    extra.Binding.Name + "'");
+            }
+
+            ValidateIndirection(extra.Binding, "extra output '" + extra.Binding.Name + "'");
+        }
 
         // EVERY INDIRECTION MUST POINT AT A REAL INDEX TENSOR. If it pointed at a float
         // operand the emitter would reinterpret that operand's bit pattern as an integer and
@@ -434,7 +505,7 @@ public sealed class CodegenKernelSpec
     }
 
     /// <summary>Number of kernel pointer parameters (inputs then output).</summary>
-    public int ParameterCount => _inputs.Length + 1 + (SecondaryOutput is null ? 0 : 1);
+    public int ParameterCount => _inputs.Length + 1 + _extraOutputs.Length;
 
     /// <summary>
     /// CPU reference execution of the spec, in fp64.
@@ -622,23 +693,58 @@ public sealed class CodegenKernelSpec
     public double[] Interpret(IReadOnlyList<double[]> inputData) => Interpret(inputData, out _);
 
     /// <summary>
+    /// CPU reference execution returning EVERY output: the primary, then one buffer per
+    /// entry of <see cref="ExtraOutputs"/> in order.
+    /// </summary>
+    /// <remarks>
+    /// The single-secondary overload cannot express a three-output kernel, and quietly
+    /// returning only the first extra would let a kernel that writes garbage to its third
+    /// buffer pass every check. Callers with more than one extra must use this.
+    /// </remarks>
+    public double[][] InterpretAll(IReadOnlyList<double[]> inputData)
+    {
+        var primary = Interpret(inputData, out _, out double[][] extras);
+        var all = new double[1 + extras.Length][];
+        all[0] = primary;
+        Array.Copy(extras, 0, all, 1, extras.Length);
+        return all;
+    }
+
+    /// <summary>
     /// CPU reference execution, also returning the secondary output when there is one.
     /// </summary>
     /// <param name="inputData">Operand buffers, in parameter order.</param>
     /// <param name="secondary">
     /// The argmax positions, or null when the spec has no secondary output.
     /// </param>
-    public double[] Interpret(IReadOnlyList<double[]> inputData, out double[]? secondary)
+    public double[] Interpret(IReadOnlyList<double[]> inputData, out double[]? secondary) =>
+        Interpret(inputData, out secondary, out _);
+
+    /// <summary>CPU reference execution, also returning every extra output buffer.</summary>
+    public double[] Interpret(
+        IReadOnlyList<double[]> inputData, out double[]? secondary, out double[][] extraData)
     {
         if (inputData is null) throw new ArgumentNullException(nameof(inputData));
         if (inputData.Count != _inputs.Length)
             throw new ArgumentException($"Expected {_inputs.Length} input buffers, got {inputData.Count}.", nameof(inputData));
 
-        if (Algebra != CodegenAlgebra.Real) return InterpretAlgebraic(inputData, out secondary);
+        if (Algebra != CodegenAlgebra.Real)
+        {
+            extraData = Array.Empty<double[]>();
+            return InterpretAlgebraic(inputData, out secondary);
+        }
 
-        double[]? secondaryData = SecondaryOutput is null
-            ? null
-            : new double[SecondaryOutput.ElementCount];
+        extraData = new double[_extraOutputs.Length][];
+        for (int e = 0; e < _extraOutputs.Length; e++)
+            extraData[e] = new double[_extraOutputs[e].Binding.ElementCount];
+
+        double[]? secondaryData = null;
+        for (int e = 0; e < _extraOutputs.Length; e++)
+            if (_extraOutputs[e].Kind == CodegenExtraOutputKind.ArgMaxIndex)
+            {
+                secondaryData = extraData[e];
+                break;
+            }
         secondary = secondaryData;
 
         var axes = Space.Axes;
@@ -751,10 +857,29 @@ public sealed class CodegenKernelSpec
             }
             acc = ApplyActivation(Activation, acc);
 
-            if (SecondaryOutput is not null)
+            for (int e = 0; e < _extraOutputs.Length; e++)
             {
-                long secondaryOff = SecondaryOutput.ResolveOffset(values, inputData, out bool secondaryOk);
-                if (secondaryOk) secondaryData![secondaryOff] = argIndex;
+                var extra = _extraOutputs[e];
+                long extraOff = extra.Binding.ResolveOffset(values, inputData, out bool extraOk);
+                if (!extraOk) continue;
+
+                if (extra.Kind == CodegenExtraOutputKind.ArgMaxIndex)
+                {
+                    extraData[e][extraOff] = argIndex;
+                    continue;
+                }
+
+                // Scale * primary, then optionally + BiasScale * bias. The primary here is
+                // the FINISHED value -- after the epilogue activation -- because an
+                // optimizer's parameter update steps by the state just computed.
+                double value = ApplyActivation(Activation, acc) * extra.Scale;
+                if (extra.BiasInput.HasValue)
+                {
+                    var biasBinding = _inputs[extra.BiasInput.Value];
+                    long biasOff = biasBinding.ResolveOffset(values, inputData, out bool biasOk);
+                    if (biasOk) value += extra.BiasScale * inputData[extra.BiasInput.Value][biasOff];
+                }
+                extraData[e][extraOff] = value;
             }
 
             long outOff = Output.ResolveOffset(values, inputData, out bool outOk);
