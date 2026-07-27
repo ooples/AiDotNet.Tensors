@@ -43,9 +43,9 @@ internal static class TensorCoreCheckTool
         Console.WriteLine("device sm_{0}{1}", major, minor);
         Console.WriteLine();
         Console.WriteLine(
-            "{0,-40} {1,9} {2,12} {3,7} {4,10} {5,10} {6,8} {7,9}",
-            "kernel", "elements", "max rel dev", "result", "wmma", "scalar", "speedup",
-            "TFLOP/s");
+            "{0,-40} {1,9} {2,12} {3,7} {4,8} {5,10} {6,10} {7,8} {8,9}",
+            "kernel", "elements", "max rel dev", "result", "lowering", "wmma", "scalar",
+            "speedup", "TFLOP/s");
 
         int passed = 0, failed = 0;
         foreach (var (label, spec, verify) in Cases())
@@ -166,11 +166,12 @@ internal static class TensorCoreCheckTool
             }
 
             Console.WriteLine(
-                "{0,-40} {1,9} {2,12} {3,7} {4,10} {5,10} {6,8} {7,9}",
+                "{0,-40} {1,9} {2,12} {3,7} {4,8} {5,10} {6,10} {7,8} {8,9}",
                 label,
                 outCount.ToString("N0", CultureInfo.InvariantCulture),
                 verify ? deviation.ToString("0.000E+000", CultureInfo.InvariantCulture) : "timing",
                 ok ? (verify ? "PASS" : "-") : "FAIL",
+                emitter.Staged ? "staged" : "naive",
                 wmmaUs > 0 ? wmmaUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
                 scalarUs > 0 ? scalarUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
                 (wmmaUs > 0 && scalarUs > 0)

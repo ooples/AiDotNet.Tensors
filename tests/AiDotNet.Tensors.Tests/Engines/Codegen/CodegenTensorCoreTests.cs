@@ -23,6 +23,17 @@ public class CodegenTensorCoreTests
 {
     private const int Sm86Major = 8, Sm86Minor = 6;
 
+    /// <summary>
+    /// An emitter pinned to the NAIVE lowering.
+    /// </summary>
+    /// <remarks>
+    /// Staging is the default and is preferred wherever the shape allows it, so a test about
+    /// the naive path has to ask for it. These tests are not obsolete -- the naive lowering is
+    /// still what runs for partial block tiles and transposed operands, which staging cannot
+    /// cover. See CodegenTensorCoreStagingTests for the staged equivalents.
+    /// </remarks>
+    private static PtxTensorCoreEmitter Naive() => new() { EnableStaging = false };
+
     private static CodegenKernelSpec MatMul(
         int m, int k, int n,
         CodegenElementType operands = CodegenElementType.Float16,
@@ -78,7 +89,7 @@ public class CodegenTensorCoreTests
     [Fact]
     public void EmittedKernel_UsesWmma()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(64, 64, 64), Sm86Major, Sm86Minor);
+        string ptx = Naive().Emit(MatMul(64, 64, 64), Sm86Major, Sm86Minor);
 
         Assert.Contains("wmma.load.a.sync.aligned.row.m16n16k16.global.f16", ptx, StringComparison.Ordinal);
         Assert.Contains("wmma.load.b.sync.aligned.row.m16n16k16.global.f16", ptx, StringComparison.Ordinal);
@@ -94,7 +105,7 @@ public class CodegenTensorCoreTests
     [Fact]
     public void TileIndex_ComesFromTheWarp()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(64, 64, 64), Sm86Major, Sm86Minor);
+        string ptx = Naive().Emit(MatMul(64, 64, 64), Sm86Major, Sm86Minor);
 
         // tid >> 5 is the warp within the block; every lane of a warp gets the same value,
         // so the tile index and the guard that follows are warp-uniform by construction.
@@ -119,6 +130,7 @@ public class CodegenTensorCoreTests
 
         Assert.False(plan!.BRowMajor);
 
+        // Staging refuses a transposed operand, so this is the naive path either way.
         string ptx = new PtxTensorCoreEmitter().Emit(
             MatMul(64, 64, 64, transposeB: true), Sm86Major, Sm86Minor);
         Assert.Contains("wmma.load.b.sync.aligned.col.m16n16k16", ptx, StringComparison.Ordinal);
@@ -133,7 +145,7 @@ public class CodegenTensorCoreTests
     [Fact]
     public void Activation_IsFusedIntoTheAccumulatorFragment()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(
+        string ptx = Naive().Emit(
             MatMul(64, 64, 64, activation: CodegenActivationKind.ReLU), Sm86Major, Sm86Minor);
 
         // Once per accumulator register, and before the store.
@@ -150,7 +162,7 @@ public class CodegenTensorCoreTests
     [Fact]
     public void LongContraction_BecomesALoop()
     {
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Naive();
         string ptx = emitter.Emit(MatMul(64, 4096, 64), Sm86Major, Sm86Minor);
 
         Assert.False(emitter.Unrolled);
@@ -162,7 +174,7 @@ public class CodegenTensorCoreTests
     [Fact]
     public void ShortContraction_IsUnrolled()
     {
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Naive();
         emitter.Emit(MatMul(64, 128, 64), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.Unrolled);
@@ -276,7 +288,7 @@ public class CodegenTensorCoreTests
     [InlineData(48, 32, 2)]        // 6 tiles  -> 2 blocks, last one partly idle
     public void LaunchGeometry_CoversEveryTile(int m, int n, int expectedBlocks)
     {
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Naive();
         Assert.True(PtxTensorCoreEmitter.TryPlan(
             MatMul(m, 64, n), Sm86Major, Sm86Minor, out var plan, out string reason), reason);
 

@@ -90,7 +90,7 @@ cuBLAS does the opposite: 128×128 block tiles staged through shared memory with
 pipelining, so each element of A and B is fetched from global roughly once per block rather
 than once per warp.
 
-### The next lever, named
+### The next lever, named (now built — see below)
 
 Shared-memory staging of the A and B bands plus multiple tiles per warp. That is the
 difference between `O(M·N·K)` and `O(M·N·K / tile)` operand traffic, and it is what stands
@@ -140,11 +140,58 @@ cores never helping.
 
 ---
 
+## Shared-memory staging — the named lever, measured
+
+A block of four warps owns a 64x64 output tile and stages the 64x16 slab of A and the 16x64
+slab of B into shared memory once per K step. Each element is fetched from global once per
+BLOCK rather than once per warp:
+
+| | operand traffic | fragment loads per mma |
+|---|---|---|
+| naive, 16x16 per warp | `M·N·K / 8` halves | 2 |
+| staged, 64x64 per block | `M·N·K / 32` halves | 0.5 |
+
+| shape | naive | **staged** | cuBLAS | old ratio | **new ratio** |
+|---|---|---|---|---|---|
+| 1024³ | 190.1 µs · 11.3 TF | **83.0 µs · 25.9 TF** | 66.6 µs · 32.2 TF | 0.35× | **0.80×** |
+| 2048³ | 1455.4 µs · 11.8 TF | **553.1 µs · 31.1 TF** | 333.8 µs · 51.5 TF | 0.23× | **0.60×** |
+| 4096³ | 45810.5 µs · 3.0 TF | **4200.8 µs · 32.7 TF** | 2384.1 µs · 57.6 TF | 0.05× | **0.57×** |
+
+**The collapse is gone.** Throughput now RISES with size — 25.9, 31.1, 32.7 TFLOP/s — where
+before it fell off a cliff at 4096³. That shape improved 10.9×.
+
+This is still a loss against cuBLAS, and is reported as one: we sit at roughly 53% of device
+peak against its 93%. But it is a different kind of loss — 1.75× away rather than 20×.
+
+### Why this lever was legitimate when the convolution one was not
+
+Shared-memory staging was built and REFUTED earlier in this campaign, on dense 3×3
+convolution: it raised L1 from 64.08% to 77.45%, because on NVIDIA hardware shared memory
+*is* L1TEX, so `ld.shared` is counted by the very metric it was meant to relieve. That lever
+died because `mio_throttle` sat at 3.03% — the load pipe was never that kernel's bottleneck.
+
+The justification here never rested on a throughput percentage. Throughput **fell fourfold**
+when the working set outgrew L2, which is a locality statement no stall counter is needed to
+read. Same lever, different evidence, opposite outcome.
+
+### The next levers, named again
+
+1. **Double-buffer the shared slabs.** Two `bar.sync`s per K step currently serialise the
+   global load against the mma work; a second slab would let step k+1's copy overlap step k's
+   arithmetic.
+2. **A larger block tile.** 128×128 quadruples reuse again; cuBLAS uses that scale.
+
+Neither is measured yet, so neither is claimed.
+
 ## Standing
 
 Expressiveness: **closed.** The generator can emit tensor-core kernels, with fused
 element-wise epilogues cuBLAS cannot fuse through its own call boundary.
 
-Performance: **open, and quantified.** 0.35× / 0.23× / 0.05× against cuBLAS, ~19% of device
-peak, with the cause identified as operand locality rather than instruction selection. No
-promotion is claimed on this evidence, and none should be until staging lands.
+Performance: **improved and still a loss.** 0.80× / 0.60× / 0.57× against cuBLAS after
+staging, up from 0.35× / 0.23× / 0.05×, at ~53% of device peak against its 93%. The next two
+levers are named above and unmeasured.
+
+Promotion: still **withheld everywhere**. At 0.57–0.80×, routing a caller who could reach
+cuBLAS to us is still a regression — smaller, but a regression. The capability ships; the
+promotion does not.
