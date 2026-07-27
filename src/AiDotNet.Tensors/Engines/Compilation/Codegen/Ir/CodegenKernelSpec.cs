@@ -228,6 +228,17 @@ public sealed class CodegenKernelSpec
     public CodegenPreReduceOp PreReduce { get; }
 
     /// <summary>
+    /// The number system the arithmetic is carried out in. An element occupies
+    /// <see cref="CodegenAlgebraTables.Components"/> adjacent fp32 values.
+    /// </summary>
+    /// <remarks>
+    /// The shapes and index maps are UNCHANGED by this: a tensor of complex numbers has
+    /// exactly the shape it says it has, and the components live inside one element. Only
+    /// the product and the accumulator widen.
+    /// </remarks>
+    public CodegenAlgebra Algebra { get; }
+
+    /// <summary>
     /// Optional index into <see cref="Inputs"/> added to each term BEFORE
     /// <see cref="PreReduce"/>.
     /// </summary>
@@ -267,6 +278,7 @@ public sealed class CodegenKernelSpec
         CodegenPreReduceOp preReduce = CodegenPreReduceOp.None,
         int? preBiasInput = null,
         double preBiasScale = 1.0,
+        CodegenAlgebra algebra = CodegenAlgebra.Real,
         CodegenTensorBinding? secondaryOutput = null,
         CodegenAffineExpr? secondaryIndexExpr = null)
     {
@@ -286,6 +298,48 @@ public sealed class CodegenKernelSpec
         PreBiasScale = preBiasScale;
         SecondaryOutput = secondaryOutput;
         SecondaryIndexExpr = secondaryIndexExpr;
+        Algebra = algebra;
+
+        // WHAT A NON-REAL ALGEBRA CANNOT COMBINE WITH. Each of these is refused because it
+        // is not defined on the number system, not because it is unimplemented -- and the
+        // difference matters: an approximation here would produce a kernel that runs and
+        // returns something that is not the operator's value.
+        if (algebra != CodegenAlgebra.Real)
+        {
+            if (reduce == CodegenReduceKind.Max)
+                throw new ArgumentException(
+                    "There is no order on " + algebra + ", so a Max reduction over it is " +
+                    "undefined. Reduce the magnitudes explicitly if that is what is wanted.",
+                    nameof(reduce));
+
+            if (secondaryOutput is not null)
+                throw new ArgumentException(
+                    "An argmax secondary output requires an ordered reduction, which " +
+                    algebra + " does not have.", nameof(secondaryOutput));
+
+            if (activation != CodegenActivationKind.None)
+                throw new ArgumentException(
+                    "Activation " + activation + " is a real function. Applying it " +
+                    "component-wise to a " + algebra + " value is a DIFFERENT operator, not " +
+                    "the same one generalised, so it must be written as one.",
+                    nameof(activation));
+
+            if (preReduce != CodegenPreReduceOp.None)
+                throw new ArgumentException(
+                    "Pre-reduction " + preReduce + " is a real transform; over " + algebra +
+                    " it is a different operator.", nameof(preReduce));
+
+            for (int i = 0; i < _inputs.Length; i++)
+                if (_inputs[i].ElementType != CodegenElementType.Float32)
+                    throw new ArgumentException(
+                        "A " + algebra + " kernel stores its components as fp32; input '" +
+                        _inputs[i].Name + "' is " + _inputs[i].ElementType + ".");
+
+            if (output.ElementType != CodegenElementType.Float32)
+                throw new ArgumentException(
+                    "A " + algebra + " kernel stores its components as fp32; the output is " +
+                    output.ElementType + ".");
+        }
 
         if ((secondaryOutput is null) != (secondaryIndexExpr is null))
             throw new ArgumentException(
@@ -393,6 +447,131 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     /// <param name="inputData">Buffers for each input binding, in binding order.</param>
     /// <returns>The output buffer, row-major, of <c>Output.ElementCount</c> elements.</returns>
+    /// <summary>
+    /// CPU reference execution for a complex or quaternion kernel.
+    /// </summary>
+    /// <remarks>
+    /// Written as its own walk rather than folded into the real one for the same reason the
+    /// emitter keeps its paths apart: the real interpreter's value is a scalar threaded
+    /// through max-tracking and argmax bookkeeping that a non-real algebra refuses at
+    /// construction anyway. Both walks decompose the iteration space identically, which is
+    /// what the comparison actually depends on.
+    /// </remarks>
+    private double[] InterpretAlgebraic(IReadOnlyList<double[]> inputData, out double[]? secondary)
+    {
+        secondary = null;
+        int components = Algebra.Components();
+
+        var axes = Space.Axes;
+        int[] parallel = Space.ParallelAxes;
+        int[] reduction = Space.ReductionAxes;
+        var values = new int[axes.Count];
+        var output = new double[Output.ElementCount * components];
+
+        var accumulator = new double[components];
+        var operand = new double[components];
+        var product = new double[components];
+        var scratch = new double[components];
+
+        long threads = Space.TotalThreads;
+        for (long tid = 0; tid < threads; tid++)
+        {
+            long rest = tid;
+            for (int p = parallel.Length - 1; p >= 0; p--)
+            {
+                int extent = axes[parallel[p]].Extent;
+                values[parallel[p]] = (int)(rest % extent);
+                rest /= extent;
+            }
+            for (int r = 0; r < reduction.Length; r++) values[reduction[r]] = 0;
+
+            for (int c = 0; c < components; c++) accumulator[c] = 0.0;
+
+            long trips = Space.ReductionTripCount;
+            for (long t = 0; t < trips; t++)
+            {
+                long rrest = t;
+                for (int r = reduction.Length - 1; r >= 0; r--)
+                {
+                    int extent = axes[reduction[r]].Extent;
+                    values[reduction[r]] = (int)(rrest % extent);
+                    rrest /= extent;
+                }
+
+                bool outOfBounds = false;
+                for (int c = 0; c < components; c++) product[c] = 0.0;
+
+                for (int k = 0; k < _productInputs.Length; k++)
+                {
+                    var binding = _inputs[_productInputs[k]];
+                    long off = binding.ResolveOffset(values, inputData, out bool ok);
+                    if (!ok) { outOfBounds = true; break; }
+
+                    var buffer = inputData[_productInputs[k]];
+                    for (int c = 0; c < components; c++) operand[c] = buffer[off * components + c];
+
+                    if (k == 0) Array.Copy(operand, product, components);
+                    else
+                    {
+                        // Left-folded, and the ORDER MATTERS: a quaternion product does not
+                        // commute, so this must walk ProductInputs in the same direction the
+                        // emitter does.
+                        Algebra.Multiply(product, operand, scratch);
+                        Array.Copy(scratch, product, components);
+                    }
+                }
+
+                // Zero is the additive identity in all of these algebras, so an out-of-range
+                // operand contributes nothing -- the same argument that lets the emitter skip
+                // a select, and the reason Max is refused rather than approximated.
+                if (outOfBounds) continue;
+
+                for (int c = 0; c < components; c++) accumulator[c] += product[c];
+            }
+
+            if (ReduceScale != 1.0)
+                for (int c = 0; c < components; c++) accumulator[c] *= ReduceScale;
+
+            if (BiasInput.HasValue)
+            {
+                var bias = _inputs[BiasInput.Value];
+                long off = bias.ResolveOffset(values, inputData, out bool ok);
+                if (ok)
+                {
+                    var buffer = inputData[BiasInput.Value];
+                    for (int c = 0; c < components; c++) accumulator[c] += buffer[off * components + c];
+                }
+            }
+
+            if (ScaleInput.HasValue)
+            {
+                var scale = _inputs[ScaleInput.Value];
+                long off = scale.ResolveOffset(values, inputData, out bool ok);
+                if (ok)
+                {
+                    var buffer = inputData[ScaleInput.Value];
+                    for (int c = 0; c < components; c++) operand[c] = buffer[off * components + c];
+
+                    // A full algebra multiply, not a component-wise one: scaling a quaternion
+                    // by a quaternion is a rotation.
+                    Algebra.Multiply(accumulator, operand, scratch);
+                    Array.Copy(scratch, accumulator, components);
+                }
+            }
+
+            long outOff = Output.ResolveOffset(values, inputData, out bool outOk);
+            if (!outOk) continue;
+
+            for (int c = 0; c < components; c++)
+            {
+                if (Output.NeedsAtomicStore) output[outOff * components + c] += accumulator[c];
+                else output[outOff * components + c] = accumulator[c];
+            }
+        }
+
+        return output;
+    }
+
     /// <summary>Refuses an int32 index tensor used where a value operand is expected.</summary>
     private void RefuseIndexOperand(int input, string role)
     {
@@ -454,6 +633,8 @@ public sealed class CodegenKernelSpec
         if (inputData is null) throw new ArgumentNullException(nameof(inputData));
         if (inputData.Count != _inputs.Length)
             throw new ArgumentException($"Expected {_inputs.Length} input buffers, got {inputData.Count}.", nameof(inputData));
+
+        if (Algebra != CodegenAlgebra.Real) return InterpretAlgebraic(inputData, out secondary);
 
         double[]? secondaryData = SecondaryOutput is null
             ? null

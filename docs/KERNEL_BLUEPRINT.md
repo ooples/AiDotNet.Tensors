@@ -218,6 +218,7 @@ fp16's rounding of its operands.
 
 | tensor cores (`PtxTensorCoreEmitter`, `wmma` m16n16k16) | fp16 GEMM with a fused element-wise epilogue |
 | `CodegenIndirectIndex` (gather/scatter, int32 index tensors) | embedding lookup and its backward, one-hot projection, sparse accumulation |
+| `CodegenAlgebra` (complex, quaternion) | FFT-class kernels, complex linear algebra, rotation composition |
 
 The tensor-core path is a *separate* emitter with its own recogniser, because `wmma` is
 warp-collective and its fragment layout is opaque: a lowering that assumes which lane holds
@@ -246,8 +247,27 @@ protects against a failure that does not announce itself:
   has scalar, vectorised, staged and coarsened load paths, so a guard on one is a guard on
   none.
 
-Still absent, so a hand-written kernel is required: **complex and hypercomplex types**, and
-**three or more outputs in one space**.
+Complex and quaternion arithmetic take a **separate path inside the same emitter**, and the
+separation is the same judgement the tensor-core one made: the real path's value is a single
+fp32 register threaded through the operand cache, shared staging, split reductions, coarsened
+lanes and argmax tracking. Widening that everywhere would risk thirteen verified kernels to
+gain nothing, because none of those mechanisms mean anything here — there is no order to
+maximise over, the vector path assumes unit-stride scalars, and a complex operand's two
+floats are already adjacent. The real path is untouched; only the product and the accumulator
+widen.
+
+Two things this got right only because they were checked properly:
+
+- **The multiplication table is verified against the defining relations**, never against a
+  second copy of the same formula. `i² = j² = k² = ijk = -1`, `ij = k`, norm multiplicativity
+  `|ab| = |a||b|`, and associativity. A single wrong sign yields a kernel that runs and
+  returns a rotation that is subtly not a rotation, and a self-consistent check would agree
+  with it.
+- **A real activation over a non-real algebra is refused**, not applied component-wise.
+  Component-wise ReLU on a complex number is a *different operator*, not the same one
+  generalised. Same for `Max` (no order) and pre-reduction transforms.
+
+Still absent, so a hand-written kernel is required: **three or more outputs in one space**.
 
 ---
 

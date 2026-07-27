@@ -23,7 +23,7 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>
 /// Emits SM86 PTX for a <see cref="CodegenKernelSpec"/>.
 /// </summary>
-public sealed class PtxAffineEmitter
+public sealed partial class PtxAffineEmitter
 {
     /// <summary>Threads per block. Matches the hand-written kernels so metrics compare like-for-like.</summary>
     public const int BlockThreads = 256;
@@ -946,6 +946,11 @@ public sealed class PtxAffineEmitter
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
 
+        // A non-real algebra takes its own path, leaving everything below untouched. See
+        // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
+        if (spec.Algebra != CodegenAlgebra.Real)
+            return EmitAlgebraic(spec, computeMajor, computeMinor);
+
         var space = spec.Space;
         var axes = space.Axes;
         axesMeta = axes;
@@ -1860,16 +1865,7 @@ public sealed class PtxAffineEmitter
 
         CheckEmittedSize(spec);
         _body.Append("END:\n    ret;\n}\n");
-
-        if (SharedMemoryBytes > 0)
-            _sb.Append("    .shared .align 4 .b8 stageBuf[")
-               .Append(I(SharedMemoryBytes)).Append("];\n");
-        _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
-           .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
-           .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")
-           .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
-           .Append(_body);
-        return _sb.ToString();
+        return Assemble();
     }
 
     /// <summary>
@@ -1936,6 +1932,30 @@ public sealed class PtxAffineEmitter
     /// terms fold to constants exactly as they do in an address, because the value is
     /// emitted once per unrolled term.
     /// </remarks>
+    /// <summary>
+    /// Closes the module: register declarations sized from what the body actually used,
+    /// then the body.
+    /// </summary>
+    /// <remarks>
+    /// The bound is DERIVED FROM USAGE rather than fixed. It was previously a literal
+    /// %p&lt;256&gt;/%f&lt;512&gt;, which is a silent ceiling rather than a generous bound:
+    /// coarsening pushed the transposed convolution one past the declared range, and ptxas
+    /// reported it as "Arguments mismatch for instruction 'setp'" -- an undeclared register,
+    /// not a malformed instruction.
+    /// </remarks>
+    private string Assemble()
+    {
+        if (SharedMemoryBytes > 0)
+            _sb.Append("    .shared .align 4 .b8 stageBuf[")
+               .Append(I(SharedMemoryBytes)).Append("];\n");
+        _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
+           .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
+           .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")
+           .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
+           .Append(_body);
+        return _sb.ToString();
+    }
+
     private string EmitAffine(
         CodegenAffineExpr expr, string[] axisReg, int[] reductionValues, int[] reductionAxes)
     {
