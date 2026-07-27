@@ -1025,6 +1025,11 @@ public sealed class PtxAffineEmitter
         {
             foreach (int inputIdx in spec.ProductInputs)
             {
+                // The staged slice is addressed in 4-byte units and re-read as f32, so a
+                // narrow binding would be staged at the wrong stride. Excluded until the
+                // staging path carries an element size of its own.
+                if (spec.Inputs[inputIdx].NeedsConversion) continue;
+
                 bool varies = false;
                 foreach (int ax in varyingAxes)
                     if (ReferencesAxis(spec.Inputs[inputIdx], ax)) varies = true;
@@ -1138,6 +1143,7 @@ public sealed class PtxAffineEmitter
                 foreach (int inputIdx in spec.ProductInputs)
                 {
                     var binding = spec.Inputs[inputIdx];
+                    if (binding.NeedsConversion) continue;   // see the flat staging note
 
                     // Keyed by this dimension only if it varies here and is invariant in
                     // the other -- that invariance is the reuse being exploited.
@@ -1444,7 +1450,12 @@ public sealed class PtxAffineEmitter
         if (EnableVectorLoads && innermost >= 0 && axes[innermost].Extent % VectorWidth == 0)
         {
             foreach (int inputIdx in spec.ProductInputs)
-                if (IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
+                // A narrow binding is excluded: the vector path emits ld.global.v4.f32 and
+                // scales its address by four bytes per element, so on a 16-bit tensor it
+                // would read twice the intended span and silently return neighbouring data.
+                // Widening a v4 load is a separate lowering, not a flag.
+                if (!spec.Inputs[inputIdx].NeedsConversion &&
+                    IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
                 {
                     vectorisable[inputIdx] = true;
                     vectorGroup = VectorWidth;
@@ -1779,9 +1790,15 @@ public sealed class PtxAffineEmitter
             string laneOff = EmitOffset(spec.Output, laneAxisReg[l], reductionValues, reduction,
                                        out string? lanePred);
             string laneAddr = NextRd(), laneByte = NextRd();
-            L($"mul.wide.u32 {laneByte}, {laneOff}, 4;");
+            L($"mul.wide.u32 {laneByte}, {laneOff}, {I(spec.Output.ElementBytes)};");
             L($"add.u64 {laneAddr}, {basePtr[spec.Output.ParameterIndex]}, {laneByte};");
-            if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
+            if (spec.Output.NeedsConversion)
+            {
+                string narrowed = EmitNarrow(spec.Output.ElementType, acc);
+                if (lanePred is null) L($"st.global.u16 [{laneAddr}], {narrowed};");
+                else L($"@{lanePred} st.global.u16 [{laneAddr}], {narrowed};");
+            }
+            else if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
             else L($"@{lanePred} st.global.f32 [{laneAddr}], {acc};");
 
             // The secondary output holds the argmax position, stored as a 32-bit INTEGER --
@@ -2051,8 +2068,41 @@ public sealed class PtxAffineEmitter
     {
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out predicate);
         string byteOff = NextRd(), addr = NextRd(), dst = NextF();
-        L($"mul.wide.s32 {byteOff}, {offset}, 4;");
+        L($"mul.wide.s32 {byteOff}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {addr}, {basePtr}, {byteOff};");
+
+        if (binding.NeedsConversion)
+        {
+            // NARROW STORAGE, WIDE ARITHMETIC. A 16-bit operand is widened the moment it
+            // is read and everything downstream stays fp32, which is what mixed precision
+            // means: the operands are narrow, the accumulator is not. Accumulating in fp16
+            // would lose roughly three decimal digits over a long reduction and is never
+            // what a caller wants from a narrow INPUT.
+            string raw = NextR();
+            if (predicate is null)
+            {
+                L($"ld.global.nc.u16 {raw}, [{addr}];");
+            }
+            else
+            {
+                L($"mov.u32 {raw}, 0;");
+                L($"@{predicate} ld.global.nc.u16 {raw}, [{addr}];");
+            }
+            EmitWiden(binding.ElementType, raw, dst);
+
+            // The out-of-range fill has to be applied AFTER widening: a zero bit pattern is
+            // zero in both formats, but the Max identity is negative infinity and its fp16
+            // pattern differs from its fp32 one.
+            if (predicate is not null && _outOfRangeFill != "0f00000000")
+            {
+                string fill = NextF();
+                L($"mov.f32 {fill}, {_outOfRangeFill};");
+                L($"selp.f32 {dst}, {dst}, {fill}, {predicate};");
+            }
+            EmittedLoads++;
+            return dst;
+        }
+
         if (predicate is null)
         {
             L($"ld.global.nc.f32 {dst}, [{addr}];");
@@ -2064,6 +2114,51 @@ public sealed class PtxAffineEmitter
         }
         EmittedLoads++;
         return dst;
+    }
+
+    /// <summary>Widens a 16-bit stored element in a b32 register into an f32 register.</summary>
+    /// <remarks>
+    /// fp16 has a hardware conversion. bf16 does not need one: it is the TOP 16 bits of the
+    /// fp32 pattern, so widening is a shift and narrowing is a truncation. Doing bf16
+    /// through <c>cvt</c> would be both slower and wrong, since no such instruction exists
+    /// for it on this architecture.
+    /// </remarks>
+    private void EmitWiden(CodegenElementType type, string rawB32, string destF32)
+    {
+        if (type == CodegenElementType.Float16)
+        {
+            L($"cvt.f32.f16 {destF32}, {rawB32};");
+            return;
+        }
+
+        string shifted = NextR();
+        L($"shl.b32 {shifted}, {rawB32}, 16;");
+        L($"mov.b32 {destF32}, {shifted};");
+    }
+
+    /// <summary>Narrows an f32 register into the low 16 bits of a b32 register.</summary>
+    /// <remarks>
+    /// bf16 narrowing rounds to nearest even rather than truncating. Truncation is the
+    /// obvious implementation and biases every value toward zero, which accumulates into a
+    /// systematic drift over a training run rather than showing up as noise in one kernel.
+    /// </remarks>
+    private string EmitNarrow(CodegenElementType type, string sourceF32)
+    {
+        string result = NextR();
+        if (type == CodegenElementType.Float16)
+        {
+            L($"cvt.rn.f16.f32 {result}, {sourceF32};");
+            return result;
+        }
+
+        string bits = NextR(), lsb = NextR(), bias = NextR(), rounded = NextR();
+        L($"mov.b32 {bits}, {sourceF32};");
+        L($"shr.u32 {lsb}, {bits}, 16;");
+        L($"and.b32 {lsb}, {lsb}, 1;");
+        L($"add.u32 {bias}, {lsb}, 32767;");
+        L($"add.u32 {rounded}, {bits}, {bias};");
+        L($"shr.u32 {result}, {rounded}, 16;");
+        return result;
     }
 
     private string? AndPred(string? a, string? b)

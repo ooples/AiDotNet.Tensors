@@ -211,6 +211,9 @@ internal static class FrontEndCheckTool
         yield return ("softmax rows 512x256 (3 passes)", CodegenFusedStatistics.Softmax(512, 256));
         // Two lengths of the SAME operator. If the deviation tracks the reduction length
         // it is fp32 accumulation; if it does not, something is wrong with the maths.
+        yield return ("fp16 operands -> fp32 matmul 128x96x64",
+            new CodegenProgram(new[] { Fp16MatMul(128, 96, 64) },
+                new long[] { 128L * 64 }, "fp16 matmul"));
         yield return ("rmsnorm scale 512x256 (1 kernel, rsqrt)",
             new CodegenProgram(new[] { RmsNormScale(512, 256) }, new long[] { 512 }, "rmsnorm"));
         yield return ("mse per-sample 512x256 (1 kernel)",
@@ -239,7 +242,8 @@ internal static class FrontEndCheckTool
         var modules = new List<DirectPtxModule>();
         try
         {
-            long sourceCount = program.Passes[0].Inputs[0].ElementCount;
+            var firstBinding = program.Passes[0].Inputs[0];
+            long sourceCount = firstBinding.ElementCount;
             var host = new float[sourceCount];
             var wide = new double[sourceCount];
             for (long e = 0; e < sourceCount; e++)
@@ -249,8 +253,11 @@ internal static class FrontEndCheckTool
                 wide[e] = v;
             }
 
-            var source = runtime.AllocateBytes((nuint)(sourceCount * sizeof(float)));
-            source.Upload<float>(host);
+            // A NARROW BINDING IS QUANTISED FIRST, and the oracle is given the SAME
+            // quantised values. Otherwise the comparison would measure fp16's rounding of
+            // the inputs -- about 1e-3 -- rather than anything about the kernel, and the
+            // row would report a large deviation that says nothing.
+            var source = UploadOperand(runtime, firstBinding, host, wide);
             buffers.Add(source);
 
             var producedGpu = new List<DirectPtxBuffer>();
@@ -293,8 +300,7 @@ internal static class FrontEndCheckTool
                             extraHost[e] = (float)v;
                             extraWide[e] = v;
                         }
-                        var extraBuffer = runtime.AllocateBytes((nuint)(extra * sizeof(float)));
-                        extraBuffer.Upload<float>(extraHost);
+                        var extraBuffer = UploadOperand(runtime, pass.Inputs[i], extraHost, extraWide);
                         buffers.Add(extraBuffer);
                         args[i] = extraBuffer.Pointer;
                         cpuOperands[i] = extraWide;
@@ -352,6 +358,53 @@ internal static class FrontEndCheckTool
             foreach (var m in modules) m.Dispose();
             DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
         }
+    }
+
+    /// <summary>
+    /// Uploads an operand in its binding's storage format, quantising <paramref name="wide"/>
+    /// in place so the oracle sees exactly what the device will read.
+    /// </summary>
+    private static DirectPtxBuffer UploadOperand(
+        DirectPtxRuntime runtime, CodegenTensorBinding binding, float[] host, double[] wide)
+    {
+        if (binding.ElementType != CodegenElementType.Float16)
+        {
+            var wideBuffer = runtime.AllocateBytes((nuint)(host.Length * sizeof(float)));
+            wideBuffer.Upload<float>(host);
+            return wideBuffer;
+        }
+
+        var bits = new ushort[host.Length];
+        for (int e = 0; e < host.Length; e++)
+        {
+            var half = (Half)host[e];
+            bits[e] = BitConverter.HalfToUInt16Bits(half);
+            wide[e] = (float)half;      // the oracle sees the QUANTISED value
+        }
+
+        var narrow = runtime.AllocateBytes((nuint)(host.Length * sizeof(ushort)));
+        narrow.Upload<ushort>(bits);
+        return narrow;
+    }
+
+    /// <summary>A matmul whose operands are stored fp16 and whose accumulator is fp32.</summary>
+    private static CodegenKernelSpec Fp16MatMul(int m, int k, int n)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("m", m), CodegenAxis.Parallel("n", n),
+            CodegenAxis.Reduce("k", k));
+
+        var a = new CodegenTensorBinding(0, "a", new[] { m, k },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) },
+            elementType: CodegenElementType.Float16);
+        var b = new CodegenTensorBinding(1, "b", new[] { k, n },
+            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) },
+            elementType: CodegenElementType.Float16);
+        var output = new CodegenTensorBinding(2, "out", new[] { m, n },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
+
+        return new CodegenKernelSpec("fp16_matmul", space, new[] { a, b }, output,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
     }
 
     /// <summary>1 / sqrt(mean(x^2)) per row -- the RMSNorm normalising factor.</summary>

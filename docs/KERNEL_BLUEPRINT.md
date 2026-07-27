@@ -184,10 +184,23 @@ Reaching for it is cheaper than a hand-written kernel when the operator fits:
 | extra outputs (`ArgMaxIndex`, `AffineOfPrimary`) | pooling indices, optimizer state |
 | `CodegenAdjoint` | backward kernels derived, never hand-authored |
 | `CodegenSplitReduction` | small-output long-reduction kernels |
+| `ElementType` per binding (fp16 / bf16 storage, fp32 arithmetic) | mixed-precision inference, narrow activations against wide weights |
 
-Still absent, so a hand-written kernel is required: **fp16/bf16**, **tensor cores**,
-**data-dependent indexing** (gather/scatter), **complex and hypercomplex types**, and
-**three or more outputs in one space**.
+Storage is a property of each **binding**, not of the kernel, which is what lets one
+kernel read fp16 activations against fp32 weights — the common decode shape. Arithmetic
+stays fp32 regardless: an fp16 accumulator over a long reduction loses roughly three
+decimal digits, and is a different operator rather than a cheaper one. Two details are
+easy to get wrong and are covered by tests: bf16 is the *top half of the fp32 pattern*, so
+it shifts rather than converting (no `cvt.f32.bf16` exists on this architecture), and
+narrowing must round to nearest even — truncating biases every value toward zero. A narrow
+binding is also excluded from the vector path, since `v4.f32` scales by four bytes and
+would read twice the intended span. Measured on device at `0.000E+000` against an fp64
+oracle that is given the *quantised* inputs, so the row reports the kernel rather than
+fp16's rounding of its operands.
+
+Still absent, so a hand-written kernel is required: **tensor cores**, **data-dependent
+indexing** (gather/scatter), **complex and hypercomplex types**, and **three or more
+outputs in one space**.
 
 ---
 

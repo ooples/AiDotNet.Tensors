@@ -365,6 +365,32 @@ public sealed class CodegenTensorBinding
     public bool IsOutput { get; }
 
     /// <summary>
+    /// How this tensor is stored in memory. Arithmetic is always fp32.
+    /// </summary>
+    /// <remarks>
+    /// Storage and compute are deliberately separate. A binding may be fp16 or bf16 while
+    /// the accumulator stays fp32, which is what mixed precision means and what every
+    /// tensor-core path requires: the operands are narrow, the accumulator is not. Making
+    /// this a property of the BINDING rather than of the kernel is what lets one kernel
+    /// read fp16 activations against fp32 weights, which is the common decode shape.
+    ///
+    /// Before this existed the emitter hardcoded fp32 in 69 places, so no mixed-precision
+    /// kernel could be expressed at all and every such PR had to hand-write one.
+    /// </remarks>
+    public CodegenElementType ElementType { get; }
+
+    /// <summary>Bytes one element occupies in memory.</summary>
+    public int ElementBytes => ElementType switch
+    {
+        CodegenElementType.Float16 or CodegenElementType.BFloat16 => 2,
+        _ => 4,
+    };
+
+    /// <summary>True when a load has to widen, or a store narrow, to reach fp32.</summary>
+    public bool NeedsConversion =>
+        ElementType is CodegenElementType.Float16 or CodegenElementType.BFloat16;
+
+    /// <summary>
     /// True when at least one dimension can address outside the tensor, so the
     /// emitter must guard the access. Computed from the maps, never supplied.
     /// </summary>
@@ -394,8 +420,17 @@ public sealed class CodegenTensorBinding
         string name,
         int[] shape,
         CodegenAffineExpr[] map,
-        bool isOutput = false)
+        bool isOutput = false,
+        CodegenElementType elementType = CodegenElementType.Float32)
     {
+        ElementType = elementType;
+        if (elementType is not (CodegenElementType.Float32 or CodegenElementType.Float16
+                or CodegenElementType.BFloat16))
+            throw new ArgumentException(
+                "The PTX emitter stores fp32, fp16 or bf16; got " + elementType +
+                ". Anything else must be refused here rather than silently emitted as fp32.",
+                nameof(elementType));
+
         if (parameterIndex < 0) throw new ArgumentOutOfRangeException(nameof(parameterIndex));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Binding needs a name.", nameof(name));
         _shape = shape ?? throw new ArgumentNullException(nameof(shape));
