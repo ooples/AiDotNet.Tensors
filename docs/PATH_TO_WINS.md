@@ -216,3 +216,65 @@ competitor ratio and a limiter verdict. Thirteen of thirteen currently carry bot
 When a lever lands, the prediction in its section is either met or it is not, and the
 falsifier says which. A lever that fails its falsifier gets recorded in
 `mechanism_failures`-style prose in its own doc, not quietly retried.
+
+---
+
+# The measured re-aim (FE-13)
+
+The blueprint above was built on throughput percentages, and two levers derived from them
+died. The limiter now records **why a warp is not issuing**, for all thirteen kernels, and
+the picture is different from the one the percentages suggested.
+
+| kernel | L1% | DRAM% | SM% | wait% | longSb% | mio% | lever the profile points at |
+|---|---|---|---|---|---|---|---|
+| `maxpool2d_2x2` | 16.5 | 94.5 | 18.6 | 6.2 | **88.3** | 0.6 | hide global latency |
+| `depthwise_conv2d_3x3_bwd_weights` | 74.4 | 26.3 | 16.0 | 9.6 | **84.3** | 0.0 | hide global latency |
+| `conv2d_1x1_deep_epilogue` | 32.3 | 20.0 | 24.0 | 1.9 | **80.9** | 0.2 | hide global latency |
+| `conv2d_1x1_bwd_weights` | 78.0 | 16.7 | 23.4 | 9.2 | **76.9** | 0.1 | hide global latency |
+| `conv2d_1x1_bwd_data` | 31.8 | 18.8 | 28.0 | 2.7 | **73.3** | 0.2 | hide global latency |
+| `conv2d_1x1_bias_relu` | 38.7 | 24.3 | 28.9 | 2.2 | **69.6** | 0.3 | hide global latency |
+| `conv2d_3x3_bwd_weights` | 77.8 | 37.3 | 21.9 | 5.9 | **66.1** | 0.1 | hide global latency |
+| `depthwise_conv2d_3x3_bias_relu` | 93.3 | 77.1 | 53.2 | 6.0 | 22.1 | 3.8 | hide global latency |
+| `depthwise_conv2d_3x3` | 87.8 | 79.5 | 52.1 | 6.1 | 22.4 | 3.8 | hide global latency |
+| `depthwise_conv2d_3x3_bwd_data` | 93.0 | 78.0 | 52.4 | 5.9 | 20.7 | 3.8 | hide global latency |
+| `conv2d_3x3_bias_relu` | 59.5 | 4.4 | 53.6 | 17.1 | 10.3 | 2.9 | **balanced — no codegen lever** |
+| `conv2d_3x3_bwd_data` | 36.4 | 3.0 | 33.0 | 16.8 | 13.5 | 0.8 | **balanced — no codegen lever** |
+| `conv_transpose2d_3x3_stride2` | 20.9 | 17.5 | 82.5 | 12.3 | 1.1 | 0.3 | **balanced — no codegen lever** |
+
+## What this overturns
+
+**`mio_throttle` never exceeds 3.8%, anywhere.** The load/store pipe is not the bottleneck
+in a single kernel of the thirteen. Every lever aimed at issuing *fewer memory
+instructions* — shared staging, register reuse, vectorising — was aimed at a queue that was
+never full. That is why per-dimension staging raised L1 from 64.08% to 77.45% and moved
+nothing: it traded global traffic for shared traffic while the kernel was waiting on
+neither.
+
+**The dominant stall is `long_scoreboard` — global memory LATENCY, not throughput.** Seven
+kernels sit between 66% and 88%. Latency is hidden by overlapping loads with compute, which
+is what `cp.async` and prefetching do, and is precisely the opposite of adding a
+`bar.sync`-per-step staging scheme.
+
+**Three kernels are balanced, and they are the three the earlier analysis already reached
+by hand.** `conv2d_3x3_bias_relu`, `conv2d_3x3_bwd_data` and `conv_transpose2d_3x3_stride2`
+show no dominant stall — the profile the dense-3×3 investigation ran into and correctly
+called an algorithm gap. That conclusion now falls out of the counters instead of a
+one-off manual profiling session.
+
+## The corrected order of work
+
+1. **`cp.async` / prefetch**, aimed by `longSb%`. Ten of thirteen kernels point at it, and
+   this is the lever the earlier blueprint never considered because throughput percentages
+   cannot see latency.
+2. **Leave the three balanced kernels alone** until a different algorithm (Winograd,
+   implicit GEMM) is on the table.
+3. **Nothing aimed at `mio_throttle`** until a kernel actually shows one. Three kernels sit
+   at 3.8% and the rest below 1%.
+
+## Why the limiter records the lever
+
+Each row now names the lever its own stall profile implies, from a fixed mapping:
+`mio ≥ 15%` → fewer LSU instructions; `longSb ≥ 20%` → hide global latency; `shortSb ≥ 15%`
+→ reduce shared dependency; `wait ≥ 25%` → more independent accumulators; otherwise
+balanced. The point is that a future lever has to be justified by a number in this table
+before the work starts, which is exactly what did not happen twice.

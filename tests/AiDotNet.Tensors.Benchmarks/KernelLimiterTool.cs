@@ -36,7 +36,48 @@ internal static class KernelLimiterTool
         "sm__throughput.avg.pct_of_peak_sustained_elapsed",
         "smsp__inst_executed_op_global_ld.sum",
         "gpu__time_duration.sum",
+
+        // WHY A WARP IS NOT ISSUING. The throughput percentages above say which unit is
+        // busiest; they do not say what the kernel is waiting on, and reading them as if
+        // they did killed two levers on this branch.
+        //
+        // Per-dimension staging was aimed at "L1 59%" read as "too many global loads".
+        // It raised L1 to 77.45% instead, because shared memory IS L1TEX and ld.shared is
+        // counted by the same metric. Register reuse was aimed at the same number and
+        // moved it not at all: 64.27 / 64.11 / 64.20 at coarsening 2 / 4 / 8.
+        //
+        // The stall breakdown said what neither could: mio_throttle 3.03%, so the load
+        // pipe was never the bottleneck and no amount of load reduction could have helped.
+        // These counters exist so that is visible BEFORE the work, not after it.
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
+        "smsp__warp_issue_stalled_wait_per_warp_active.pct",
+        "smsp__warp_issue_stalled_no_instruction_per_warp_active.pct",
     };
+
+    /// <summary>
+    /// The lever a stall profile actually points at.
+    /// </summary>
+    /// <remarks>
+    /// Ordered by how specific the signal is. A high mio_throttle means the load/store
+    /// pipe's queue is full, so fewer memory INSTRUCTIONS is the fix -- vectorising or
+    /// staging. A high long_scoreboard means warps wait on global latency that occupancy
+    /// is not hiding, which is what cp.async and prefetching address. A high
+    /// short_scoreboard is the same for shared memory. A high `wait` is arithmetic
+    /// dependency: more independent accumulators. And a profile where nothing dominates is
+    /// a balanced kernel, where a code generator has no lever at all and only a different
+    /// algorithm helps -- which is exactly what dense 3x3 turned out to be.
+    /// </remarks>
+    private static string LeverFor(double mio, double longSb, double shortSb, double wait, double noInst)
+    {
+        if (mio >= 15.0) return "fewer LSU instructions (vectorise/stage)";
+        if (longSb >= 20.0) return "hide global latency (cp.async/prefetch)";
+        if (shortSb >= 15.0) return "reduce shared-memory dependency";
+        if (wait >= 25.0) return "more independent accumulators (ILP)";
+        if (noInst >= 10.0) return "instruction fetch: shorten the body";
+        return "balanced -- no codegen lever; needs a different algorithm";
+    }
 
     internal static void Run(string[] args)
     {
@@ -63,7 +104,7 @@ internal static class KernelLimiterTool
         Console.WriteLine("LIMITER GATE - which unit is saturated, measured");
         Console.WriteLine("protocol " + CodegenMeasurementProtocol.Tag);
         Console.WriteLine();
-        Console.WriteLine("kernel                            L1%    DRAM%    L2%     SM%   saturated  gate");
+        Console.WriteLine("kernel                            L1%  DRAM%    SM%    wait% longSb%  mio%  status    next lever");
 
         var rows = new List<string>();
         int satisfied = 0, unresolved = 0;
@@ -92,13 +133,21 @@ internal static class KernelLimiterTool
             bool saturated = value >= SaturatedAt;
             if (saturated) satisfied++; else unresolved++;
 
+            double longSb = counters.GetValueOrDefault(Metrics[6]);
+            double shortSb = counters.GetValueOrDefault(Metrics[7]);
+            double mio = counters.GetValueOrDefault(Metrics[8]);
+            double wait = counters.GetValueOrDefault(Metrics[9]);
+            double noInst = counters.GetValueOrDefault(Metrics[10]);
+            string lever = LeverFor(mio, longSb, shortSb, wait, noInst);
+
             Console.WriteLine(entry.Name.PadRight(32) +
                 l1.ToString("F1", CultureInfo.InvariantCulture).PadLeft(6) +
-                dram.ToString("F1", CultureInfo.InvariantCulture).PadLeft(8) +
-                l2.ToString("F1", CultureInfo.InvariantCulture).PadLeft(8) +
-                sm.ToString("F1", CultureInfo.InvariantCulture).PadLeft(8) +
-                ("  " + unit + " " + value.ToString("F0", CultureInfo.InvariantCulture) + "%").PadLeft(12) +
-                (saturated ? "  AT ROOFLINE" : "  HEADROOM"));
+                dram.ToString("F1", CultureInfo.InvariantCulture).PadLeft(7) +
+                sm.ToString("F1", CultureInfo.InvariantCulture).PadLeft(7) +
+                wait.ToString("F1", CultureInfo.InvariantCulture).PadLeft(8) +
+                longSb.ToString("F1", CultureInfo.InvariantCulture).PadLeft(8) +
+                mio.ToString("F1", CultureInfo.InvariantCulture).PadLeft(6) +
+                "  " + (saturated ? "roofline" : "headroom").PadRight(10) + lever);
 
             rows.Add(string.Join("\t", entry.Name, unit,
                 value.ToString("F2", CultureInfo.InvariantCulture),
@@ -107,12 +156,20 @@ internal static class KernelLimiterTool
                 l2.ToString("F2", CultureInfo.InvariantCulture),
                 sm.ToString("F2", CultureInfo.InvariantCulture),
                 saturated ? "at-roofline" : "headroom",
+                wait.ToString("F2", CultureInfo.InvariantCulture),
+                longSb.ToString("F2", CultureInfo.InvariantCulture),
+                shortSb.ToString("F2", CultureInfo.InvariantCulture),
+                mio.ToString("F2", CultureInfo.InvariantCulture),
+                noInst.ToString("F2", CultureInfo.InvariantCulture),
+                lever,
                 CodegenMeasurementProtocol.Tag));
         }
 
         var text = new StringBuilder();
         text.AppendLine("# protocol " + CodegenMeasurementProtocol.Tag + ": " + CodegenMeasurementProtocol.Description);
-        text.AppendLine("kernel\tlimiter\tpct_of_peak\tl1\tdram\tl2\tsm\tstatus\tprotocol");
+        text.AppendLine("kernel\tlimiter\tpct_of_peak\tl1\tdram\tl2\tsm\tstatus" +
+                        "\tstall_wait\tstall_long_sb\tstall_short_sb\tstall_mio\tstall_no_inst" +
+                        "\tlever\tprotocol");
         foreach (string row in rows) text.AppendLine(row);
         File.WriteAllText(outputPath, text.ToString());
 
