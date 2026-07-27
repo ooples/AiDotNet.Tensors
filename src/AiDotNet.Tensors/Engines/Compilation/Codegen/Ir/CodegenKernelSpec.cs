@@ -27,6 +27,28 @@ public enum CodegenReduceKind
     Max
 }
 
+/// <summary>
+/// Elementwise transform applied INSIDE the reduction, to each term before it is combined.
+/// </summary>
+/// <remarks>
+/// The activation is an epilogue: it runs once, on the finished accumulator. Softmax's
+/// denominator needs the opposite -- <c>sum(exp(x - max))</c> applies exp to every term
+/// BEFORE summing -- and LayerNorm's variance needs a square in the same position. Neither
+/// is expressible by sequencing two kernels, because the missing piece is the body's shape
+/// rather than the number of passes.
+/// </remarks>
+public enum CodegenPreReduceOp
+{
+    /// <summary>Reduce the operand product directly.</summary>
+    None,
+
+    /// <summary><c>exp(t)</c> -- softmax's denominator.</summary>
+    Exp,
+
+    /// <summary><c>t * t</c> -- LayerNorm's variance, and any sum of squares.</summary>
+    Square
+}
+
 /// <summary>Epilogue activation applied after bias and scale.</summary>
 public enum CodegenActivationKind
 {
@@ -44,6 +66,9 @@ public enum CodegenActivationKind
 
     /// <summary>SiLU / swish: <c>x * sigmoid(x)</c>.</summary>
     Swish,
+
+    /// <summary><c>1 / x</c>. Turns a summed denominator into the factor to multiply by.</summary>
+    Reciprocal,
 
     /// <summary>
     /// Gaussian error linear unit, tanh approximation:
@@ -125,6 +150,21 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     public double ReduceScale { get; }
 
+    /// <summary>Elementwise transform applied to each term inside the reduction.</summary>
+    public CodegenPreReduceOp PreReduce { get; }
+
+    /// <summary>
+    /// Optional index into <see cref="Inputs"/> added to each term BEFORE
+    /// <see cref="PreReduce"/>.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes the shift in <c>exp(x - max)</c> and the centring in
+    /// <c>(x - mean)^2</c> expressible: both are a broadcast add of a per-row statistic
+    /// computed by an earlier pass. It is a separate slot from <see cref="BiasInput"/>,
+    /// which lands after the reduction.
+    /// </remarks>
+    public int? PreBiasInput { get; }
+
     /// <summary>Creates a kernel spec and validates its internal consistency.</summary>
     public CodegenKernelSpec(
         string name,
@@ -136,7 +176,9 @@ public sealed class CodegenKernelSpec
         int? biasInput = null,
         int? scaleInput = null,
         CodegenActivationKind activation = CodegenActivationKind.None,
-        double reduceScale = 1.0)
+        double reduceScale = 1.0,
+        CodegenPreReduceOp preReduce = CodegenPreReduceOp.None,
+        int? preBiasInput = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
@@ -149,6 +191,8 @@ public sealed class CodegenKernelSpec
         ScaleInput = scaleInput;
         Activation = activation;
         ReduceScale = reduceScale;
+        PreReduce = preReduce;
+        PreBiasInput = preBiasInput;
 
         if (double.IsNaN(reduceScale) || double.IsInfinity(reduceScale))
             throw new ArgumentException(
@@ -159,6 +203,7 @@ public sealed class CodegenKernelSpec
         foreach (int i in _productInputs) Require(i, nameof(productInputs));
         if (biasInput.HasValue) Require(biasInput.Value, nameof(biasInput));
         if (scaleInput.HasValue) Require(scaleInput.Value, nameof(scaleInput));
+        if (preBiasInput.HasValue) Require(preBiasInput.Value, nameof(preBiasInput));
         if (!output.IsOutput)
             throw new ArgumentException("Output binding must be marked IsOutput.", nameof(output));
 
@@ -194,6 +239,7 @@ public sealed class CodegenKernelSpec
         CodegenActivationKind.Sigmoid => 1.0 / (1.0 + Math.Exp(-x)),
         CodegenActivationKind.Tanh => Math.Tanh(x),
         CodegenActivationKind.Swish => x / (1.0 + Math.Exp(-x)),
+        CodegenActivationKind.Reciprocal => 1.0 / x,
         CodegenActivationKind.Gelu =>
             0.5 * x * (1.0 + Math.Tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))),
         _ => throw new NotSupportedException("Unhandled activation " + kind + "."),
@@ -278,6 +324,27 @@ public sealed class CodegenKernelSpec
                 // cannot catch. It is latent only because maxpool2d_2x2 has no padding.
                 if (anyOutOfBounds)
                     product = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
+
+                // The pre-reduction slot: a broadcast shift, then an elementwise transform,
+                // applied to EACH term before it is combined. This is what softmax's
+                // sum(exp(x - max)) and LayerNorm's sum((x - mean)^2) need and what an
+                // epilogue activation cannot provide.
+                if (!anyOutOfBounds)
+                {
+                    if (PreBiasInput.HasValue)
+                    {
+                        var pb = _inputs[PreBiasInput.Value];
+                        long pbOff = pb.ResolveOffset(values, out bool pbOk);
+                        if (pbOk) product += inputData[PreBiasInput.Value][pbOff];
+                    }
+                    product = PreReduce switch
+                    {
+                        CodegenPreReduceOp.None => product,
+                        CodegenPreReduceOp.Exp => Math.Exp(product),
+                        CodegenPreReduceOp.Square => product * product,
+                        _ => throw new NotSupportedException("Unhandled pre-reduce " + PreReduce + "."),
+                    };
+                }
 
                 acc = Reduce switch
                 {

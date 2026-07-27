@@ -99,6 +99,21 @@ internal static class FrontEndCheckTool
             }
         }
 
+        foreach (var (label, program) in Programs())
+        {
+            try
+            {
+                bool ok = CheckProgram(runtime, label, program);
+                if (ok) passed++; else failed++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Console.WriteLine(label.PadRight(38) + "        -             -     ERROR");
+                Console.WriteLine("    " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+            }
+        }
+
         Console.WriteLine();
         Console.WriteLine("front end: " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
@@ -175,6 +190,133 @@ internal static class FrontEndCheckTool
         {
             yield return ("conv 1x1 + bias + " + op.ToString().ToLowerInvariant(),
                 ConvWithActivation(op));
+        }
+    }
+
+    /// <summary>Longest reduction any pass performs, which bounds the accumulated error.</summary>
+    private static long LongestReduction(CodegenProgram program)
+    {
+        long longest = 1;
+        foreach (var pass in program.Passes)
+        {
+            long trips = 1;
+            foreach (int axis in pass.Space.ReductionAxes) trips *= pass.Space.Axes[axis].Extent;
+            longest = Math.Max(longest, trips);
+        }
+        return longest;
+    }
+
+    private static IEnumerable<(string Label, CodegenProgram Program)> Programs()
+    {
+        yield return ("softmax rows 512x256 (3 passes)", CodegenFusedStatistics.Softmax(512, 256));
+        // Two lengths of the SAME operator. If the deviation tracks the reduction length
+        // it is fp32 accumulation; if it does not, something is wrong with the maths.
+        yield return ("layernorm stats 512x64 (2 passes)",
+            CodegenFusedStatistics.LayerNormStatistics(512, 64));
+        yield return ("layernorm stats 512x256 (2 passes)",
+            CodegenFusedStatistics.LayerNormStatistics(512, 256));
+    }
+
+    /// <summary>
+    /// Runs a multi-pass program on the device and compares the final output against the
+    /// fp64 interpretation of the same passes.
+    /// </summary>
+    /// <remarks>
+    /// Parameter 0 of every pass is the source tensor; later parameters are the statistics
+    /// earlier passes produced, in order. That convention is what lets the passes be
+    /// chained without a scheduler.
+    /// </remarks>
+    private static bool CheckProgram(DirectPtxRuntime runtime, string label, CodegenProgram program)
+    {
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        var buffers = new List<DirectPtxBuffer>();
+        var modules = new List<DirectPtxModule>();
+        try
+        {
+            long sourceCount = program.Passes[0].Inputs[0].ElementCount;
+            var host = new float[sourceCount];
+            var wide = new double[sourceCount];
+            for (long e = 0; e < sourceCount; e++)
+            {
+                double v = ((((e * 37) % 97) - 48) / 16.0);
+                host[e] = (float)v;
+                wide[e] = v;
+            }
+
+            var source = runtime.AllocateBytes((nuint)(sourceCount * sizeof(float)));
+            source.Upload<float>(host);
+            buffers.Add(source);
+
+            var producedGpu = new List<DirectPtxBuffer>();
+            var producedCpu = new List<double[]>();
+
+            foreach (var pass in program.Passes)
+            {
+                var emitter = new PtxAffineEmitter();
+                string ptx = emitter.Emit(pass, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                var module = runtime.LoadModule(ptx);
+                modules.Add(module);
+                IntPtr fn = module.GetFunction(pass.Name, out _);
+
+                var args = new IntPtr[pass.ParameterCount];
+                var cpuOperands = new double[pass.Inputs.Count][];
+                for (int i = 0; i < pass.Inputs.Count; i++)
+                {
+                    args[i] = i == 0 ? source.Pointer : producedGpu[i - 1].Pointer;
+                    cpuOperands[i] = i == 0 ? wide : producedCpu[i - 1];
+                }
+
+                long outCount = pass.Output.ElementCount;
+                var outBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
+                buffers.Add(outBuffer);
+                args[pass.Inputs.Count] = outBuffer.Pointer;
+
+                Launch(module, fn, args, emitter.LaunchBlocks,
+                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
+
+                producedGpu.Add(outBuffer);
+                producedCpu.Add(pass.Interpret(cpuOperands));
+            }
+            runtime.Synchronize();
+
+            var final = program.Passes[program.Passes.Count - 1];
+            long count = final.Output.ElementCount;
+            var got = new float[count];
+            producedGpu[producedGpu.Count - 1].Download<float>(got);
+            double[] want = producedCpu[producedCpu.Count - 1];
+
+            double worst = 0, scale = 0;
+            for (long e = 0; e < count; e++)
+            {
+                worst = Math.Max(worst, Math.Abs(got[e] - want[e]));
+                scale = Math.Max(scale, Math.Abs(want[e]));
+            }
+            double deviation = scale > 0 ? worst / scale : worst;
+
+            // THE TOLERANCE IS A FUNCTION OF THE REDUCTION LENGTH, not a constant.
+            // Sequential fp32 accumulation drifts with the number of terms, and measuring
+            // the same operator at two lengths showed exactly that: the LayerNorm variance
+            // read 8.316E-007 over 64 terms and 3.335E-006 over 256 -- a 4.01x rise for a
+            // 4x longer reduction, which is n*eps and not a defect. A fixed 1e-6 gate is
+            // the wrong SHAPE for that, the same way an absolute tolerance was the wrong
+            // shape for the autotuner's agreement check.
+            long trips = LongestReduction(program);
+            double bound = Math.Max(1e-6, trips * 1.2e-7);
+            bool ok = deviation <= bound;
+
+            Console.WriteLine(label.PadRight(38) +
+                count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
+                deviation.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
+                "  fp64 " + (ok ? "PASS" : "FAIL").PadLeft(7) +
+                ("  <= " + bound.ToString("E1", CultureInfo.InvariantCulture)).PadLeft(14));
+            return ok;
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+            foreach (var m in modules) m.Dispose();
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
         }
     }
 

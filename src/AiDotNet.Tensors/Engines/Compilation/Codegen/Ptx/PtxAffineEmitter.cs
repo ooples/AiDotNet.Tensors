@@ -417,6 +417,13 @@ public sealed class PtxAffineEmitter
             case CodegenActivationKind.Tanh:
                 return EmitTanh(x, Log2E, One);
 
+            case CodegenActivationKind.Reciprocal:
+            {
+                string r = NextF();
+                L($"rcp.approx.f32 {r}, {x};");
+                return r;
+            }
+
             case CodegenActivationKind.Sigmoid:
                 return EmitSigmoid(x, Log2E, One);
 
@@ -1607,6 +1614,35 @@ public sealed class PtxAffineEmitter
                         product = mul;
                         productPred = AndPred(productPred, pred);
                     }
+                }
+
+                // The pre-reduction slot: shift, then transform, per TERM. An epilogue
+                // activation cannot do this -- it runs once on the finished accumulator,
+                // while softmax needs exp applied to every term before summing.
+                if (spec.PreBiasInput.HasValue)
+                {
+                    var pb = spec.Inputs[spec.PreBiasInput.Value];
+                    string pv = EmitLoad(pb, basePtr[pb.ParameterIndex], laneAxisReg[l],
+                                         reductionValues, reduction, out _);
+                    string shifted = NextF();
+                    L($"add.rn.f32 {shifted}, {product!}, {pv};");
+                    product = shifted;
+                }
+                if (spec.PreReduce != CodegenPreReduceOp.None)
+                {
+                    string transformed = NextF();
+                    if (spec.PreReduce == CodegenPreReduceOp.Square)
+                    {
+                        L($"mul.rn.f32 {transformed}, {product!}, {product!};");
+                    }
+                    else
+                    {
+                        // exp(t) = ex2(t * log2 e); PTX has no exp.
+                        string scaledT = NextF();
+                        L($"mul.rn.f32 {scaledT}, {product!}, 0f3FB8AA3B;");
+                        L($"ex2.approx.f32 {transformed}, {scaledT};");
+                    }
+                    product = transformed;
                 }
 
                 // An out-of-range tap contributes the additive identity; the guarded
