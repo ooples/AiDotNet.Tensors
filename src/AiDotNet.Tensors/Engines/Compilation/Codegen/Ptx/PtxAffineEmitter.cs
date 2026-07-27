@@ -1360,6 +1360,18 @@ public sealed class PtxAffineEmitter
                 : $"mov.f32 {accs[l]}, 0f00000000;");
         }
 
+        // One index register per lane, tracking which reduction term is currently winning.
+        string[]? argIndex = null;
+        if (spec.SecondaryOutput is not null && spec.SecondaryIndexExpr is not null)
+        {
+            argIndex = new string[lanes];
+            for (int l = 0; l < lanes; l++)
+            {
+                argIndex[l] = NextR();
+                L($"mov.u32 {argIndex[l]}, 0;");
+            }
+        }
+
         // Open one runtime loop per peeled axis. Each level emits its counter reset
         // BEFORE its own label, so the reset for level i+1 lands inside level i's
         // body and re-runs on every outer trip.
@@ -1657,6 +1669,21 @@ public sealed class PtxAffineEmitter
                 // load already produced 0, so no extra select is needed for Sum.
                 if (spec.Reduce == CodegenReduceKind.Max)
                 {
+                    if (argIndex is not null)
+                    {
+                        // Track WHICH term won, not just the value. Strictly greater keeps
+                        // the FIRST maximum on a tie, matching the established kernel --
+                        // the backward pass routes a gradient by this index, so a different
+                        // tie-break silently sends it to the wrong element.
+                        string beats = NextP();
+                        L($"setp.gt.f32 {beats}, {product!}, {accs[l]};");
+
+                        string candidate = EmitAffine(
+                            spec.SecondaryIndexExpr!, laneAxisReg[l], reductionValues, reduction);
+                        string chosen = NextR();
+                        L($"selp.b32 {chosen}, {candidate}, {argIndex[l]}, {beats};");
+                        argIndex[l] = chosen;
+                    }
                     L($"max.f32 {accs[l]}, {accs[l]}, {product!};");
                 }
                 else
@@ -1749,6 +1776,21 @@ public sealed class PtxAffineEmitter
             L($"add.u64 {laneAddr}, {basePtr[spec.Output.ParameterIndex]}, {laneByte};");
             if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
             else L($"@{lanePred} st.global.f32 [{laneAddr}], {acc};");
+
+            // The secondary output holds the argmax position, stored as a 32-bit INTEGER --
+            // the consumer is an indices buffer that the backward pass indexes with, not a
+            // float. Writing it as f32 would round above 2^24 and silently misroute
+            // gradients on a large enough tensor.
+            if (argIndex is not null && spec.SecondaryOutput is not null)
+            {
+                string secondOff = EmitOffset(spec.SecondaryOutput, laneAxisReg[l],
+                                              reductionValues, reduction, out string? secondPred);
+                string secondAddr = NextRd(), secondByte = NextRd();
+                L($"mul.wide.u32 {secondByte}, {secondOff}, 4;");
+                L($"add.u64 {secondAddr}, {basePtr[spec.SecondaryOutput.ParameterIndex]}, {secondByte};");
+                if (secondPred is null) L($"st.global.u32 [{secondAddr}], {argIndex[l]};");
+                else L($"@{secondPred} st.global.u32 [{secondAddr}], {argIndex[l]};");
+            }
         }
 
         // Loads before the loop run once, loads in its body run once per trip, loads
@@ -1825,6 +1867,63 @@ public sealed class PtxAffineEmitter
     /// Emits the flat element offset for a binding, plus the DERIVED validity
     /// predicate (null when the maps provably cannot leave the tensor).
     /// </summary>
+    /// <summary>
+    /// Evaluates a single affine expression into a register.
+    /// </summary>
+    /// <remarks>
+    /// Used for the secondary output's index, which is an expression rather than a tensor
+    /// map: it names a POSITION in the input, not an address in a binding. Reduction-axis
+    /// terms fold to constants exactly as they do in an address, because the value is
+    /// emitted once per unrolled term.
+    /// </remarks>
+    private string EmitAffine(
+        CodegenAffineExpr expr, string[] axisReg, int[] reductionValues, int[] reductionAxes)
+    {
+        var reductionSet = new HashSet<int>(reductionAxes);
+
+        int folded = expr.Constant;
+        var symbolic = new List<CodegenAffineTerm>();
+        foreach (var term in expr.Terms)
+        {
+            if (reductionSet.Contains(term.Axis)) folded += term.Coefficient * reductionValues[term.Axis];
+            else symbolic.Add(term);
+        }
+
+        string? value = null;
+        foreach (var term in symbolic)
+        {
+            string contribution;
+            if (term.Coefficient == 1) contribution = axisReg[term.Axis];
+            else
+            {
+                contribution = NextR();
+                L($"mul.lo.s32 {contribution}, {axisReg[term.Axis]}, {I(term.Coefficient)};");
+            }
+            if (value is null) value = contribution;
+            else { string sum = NextR(); L($"add.s32 {sum}, {value}, {contribution};"); value = sum; }
+        }
+
+        if (value is null)
+        {
+            value = NextR();
+            L($"mov.u32 {value}, {I(folded)};");
+        }
+        else if (folded != 0)
+        {
+            string sum = NextR();
+            L($"add.s32 {sum}, {value}, {I(folded)};");
+            value = sum;
+        }
+
+        if (expr.Divisor != 1)
+        {
+            string divided = NextR();
+            L($"div.s32 {divided}, {value}, {I(expr.Divisor)};");
+            value = divided;
+        }
+        return value;
+    }
+
     private string EmitOffset(
         CodegenTensorBinding binding,
         string[] axisReg,

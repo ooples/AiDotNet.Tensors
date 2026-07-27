@@ -150,6 +150,32 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     public double ReduceScale { get; }
 
+    /// <summary>
+    /// Optional SECOND output, written alongside the first.
+    /// </summary>
+    /// <remarks>
+    /// Addressed by parallel axes exactly like <see cref="Output"/>, and written with the
+    /// value of <see cref="SecondaryIndexExpr"/> evaluated AT THE WINNING TERM of a Max
+    /// reduction. That is what a max-pool's indices buffer holds, and its backward pass
+    /// cannot run without it -- so dispatching a generated max-pool without this would
+    /// silently break training rather than merely lose a speedup.
+    /// </remarks>
+    public CodegenTensorBinding? SecondaryOutput { get; }
+
+    /// <summary>
+    /// Expression whose value at the argmax is written to <see cref="SecondaryOutput"/>.
+    /// </summary>
+    /// <remarks>
+    /// An affine expression over ALL axes, reduction ones included -- it has to be, because
+    /// the whole point is which reduction position won. For a max-pool the expression is
+    /// the winning input's SPATIAL index, <c>ih * inWidth + iw</c>, because that is the
+    /// convention the existing backward kernel reads: it recovers <c>ih = idx / inWidth</c>
+    /// and <c>iw = idx % inWidth</c> and adds the batch and channel offset itself. Writing
+    /// a flat input offset or a tap index instead would compile and produce plausible
+    /// numbers while corrupting every gradient.
+    /// </remarks>
+    public CodegenAffineExpr? SecondaryIndexExpr { get; }
+
     /// <summary>Elementwise transform applied to each term inside the reduction.</summary>
     public CodegenPreReduceOp PreReduce { get; }
 
@@ -192,7 +218,9 @@ public sealed class CodegenKernelSpec
         double reduceScale = 1.0,
         CodegenPreReduceOp preReduce = CodegenPreReduceOp.None,
         int? preBiasInput = null,
-        double preBiasScale = 1.0)
+        double preBiasScale = 1.0,
+        CodegenTensorBinding? secondaryOutput = null,
+        CodegenAffineExpr? secondaryIndexExpr = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
@@ -208,6 +236,20 @@ public sealed class CodegenKernelSpec
         PreReduce = preReduce;
         PreBiasInput = preBiasInput;
         PreBiasScale = preBiasScale;
+        SecondaryOutput = secondaryOutput;
+        SecondaryIndexExpr = secondaryIndexExpr;
+
+        if ((secondaryOutput is null) != (secondaryIndexExpr is null))
+            throw new ArgumentException(
+                "A secondary output needs an index expression and vice versa; one without " +
+                "the other would write an undefined value.", nameof(secondaryOutput));
+        if (secondaryOutput is not null && reduce != CodegenReduceKind.Max)
+            throw new ArgumentException(
+                "A secondary output currently means the ARGMAX position, so it requires a " +
+                "Max reduction; got " + reduce + ".", nameof(secondaryOutput));
+        if (secondaryOutput is not null && !secondaryOutput.IsOutput)
+            throw new ArgumentException(
+                "Secondary output binding must be marked IsOutput.", nameof(secondaryOutput));
 
         if (double.IsNaN(preBiasScale) || double.IsInfinity(preBiasScale))
             throw new ArgumentException(
@@ -271,7 +313,7 @@ public sealed class CodegenKernelSpec
     }
 
     /// <summary>Number of kernel pointer parameters (inputs then output).</summary>
-    public int ParameterCount => _inputs.Length + 1;
+    public int ParameterCount => _inputs.Length + 1 + (SecondaryOutput is null ? 0 : 1);
 
     /// <summary>
     /// CPU reference execution of the spec, in fp64.
@@ -284,11 +326,25 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     /// <param name="inputData">Buffers for each input binding, in binding order.</param>
     /// <returns>The output buffer, row-major, of <c>Output.ElementCount</c> elements.</returns>
-    public double[] Interpret(IReadOnlyList<double[]> inputData)
+    public double[] Interpret(IReadOnlyList<double[]> inputData) => Interpret(inputData, out _);
+
+    /// <summary>
+    /// CPU reference execution, also returning the secondary output when there is one.
+    /// </summary>
+    /// <param name="inputData">Operand buffers, in parameter order.</param>
+    /// <param name="secondary">
+    /// The argmax positions, or null when the spec has no secondary output.
+    /// </param>
+    public double[] Interpret(IReadOnlyList<double[]> inputData, out double[]? secondary)
     {
         if (inputData is null) throw new ArgumentNullException(nameof(inputData));
         if (inputData.Count != _inputs.Length)
             throw new ArgumentException($"Expected {_inputs.Length} input buffers, got {inputData.Count}.", nameof(inputData));
+
+        double[]? secondaryData = SecondaryOutput is null
+            ? null
+            : new double[SecondaryOutput.ElementCount];
+        secondary = secondaryData;
 
         var axes = Space.Axes;
         int axisCount = axes.Count;
@@ -312,6 +368,7 @@ public sealed class CodegenKernelSpec
             for (int r = 0; r < reduction.Length; r++) values[reduction[r]] = 0;
 
             double acc = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
+            long argIndex = 0;
             long trips = Space.ReductionTripCount;
 
             for (long t = 0; t < trips; t++)
@@ -365,6 +422,16 @@ public sealed class CodegenKernelSpec
                     };
                 }
 
+                // Which term won, evaluated at the moment it wins. Strictly greater, so
+                // the FIRST maximum is kept on a tie -- the same choice the existing CUDA
+                // kernel makes, and a tie-break the backward pass depends on.
+                if (SecondaryIndexExpr is not null && Reduce == CodegenReduceKind.Max &&
+                    product > acc)
+                {
+                    long candidate = SecondaryIndexExpr.Evaluate(values, out bool indexValid);
+                    if (indexValid) argIndex = candidate;
+                }
+
                 acc = Reduce switch
                 {
                     CodegenReduceKind.Sum => acc + product,
@@ -388,6 +455,12 @@ public sealed class CodegenKernelSpec
                 if (ok) acc *= inputData[ScaleInput.Value][off];
             }
             acc = ApplyActivation(Activation, acc);
+
+            if (SecondaryOutput is not null)
+            {
+                long secondaryOff = SecondaryOutput.ResolveOffset(values, out bool secondaryOk);
+                if (secondaryOk) secondaryData![secondaryOff] = argIndex;
+            }
 
             long outOff = Output.ResolveOffset(values, out bool outOk);
             if (outOk) output[outOff] = acc;

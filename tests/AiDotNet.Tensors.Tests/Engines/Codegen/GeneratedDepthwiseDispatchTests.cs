@@ -174,4 +174,77 @@ public class GeneratedDepthwiseDispatchTests
             DirectPtxFeatureGate.TestOverride = prior;
         }
     }
+
+    /// <summary>
+    /// The generated max pool must agree with the established kernel on BOTH outputs. The
+    /// indices matter more than the values: the backward pass routes every gradient by
+    /// them, so a wrong convention corrupts training while the pooled values still look
+    /// right.
+    /// </summary>
+    [Fact]
+    public void GeneratedMaxPool_AgreesOnValuesAndIndices()
+    {
+        if (!TryOpenBackend(out var backend)) return;
+        using var _ = backend!;
+
+        const int N = 2, C = 8, H = 16, W = 16;
+        const int OutH = H / 2, OutW = W / 2;
+        long inElements = (long)N * C * H * W;
+        long outElements = (long)N * C * OutH * OutW;
+
+        var host = new float[inElements];
+        for (long i = 0; i < inElements; i++) host[i] = (float)((((i * 37) % 97) - 48) / 64.0);
+
+        using var input = backend.AllocateBuffer(host);
+        using var generatedOut = backend.AllocateBuffer((int)outElements);
+        using var establishedOut = backend.AllocateBuffer((int)outElements);
+        using var generatedIdx = backend.AllocateIntBuffer((int)outElements);
+        using var establishedIdx = backend.AllocateIntBuffer((int)outElements);
+
+        bool? prior = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            long before = backend.GeneratedDispatchCount;
+            bool took = backend.TryDirectPtxMaxPool2D(
+                input, generatedOut, generatedIdx,
+                N, C, H, W, OutH, OutW, 2, 2, 2, 2, 0, 0);
+
+            if (!took)
+            {
+                Assert.False(backend.IsDirectPtxConvolutionEnabled,
+                    "the generated max pool must dispatch on the architecture it was measured on");
+                return;
+            }
+            Assert.True(backend.GeneratedDispatchCount > before);
+
+            // The established kernel, reached by disabling the generated path.
+            DirectPtxFeatureGate.TestOverride = false;
+            backend.MaxPool2D(input, establishedOut, establishedIdx,
+                N, C, H, W, OutH, OutW, 2, 2, 2, 2, 0, 0);
+            backend.Synchronize();
+
+            var gv = new float[outElements];
+            var ev = new float[outElements];
+            backend.DownloadBuffer(generatedOut, gv);
+            backend.DownloadBuffer(establishedOut, ev);
+
+            var gi = new int[outElements];
+            var ei = new int[outElements];
+            backend.DownloadIntBuffer(generatedIdx, gi);
+            backend.DownloadIntBuffer(establishedIdx, ei);
+
+            for (long i = 0; i < outElements; i++)
+            {
+                // A maximum is a SELECTION, so the value must be bit-identical -- unlike a
+                // sum, there is no reordering freedom to excuse a difference.
+                Assert.Equal(ev[i], gv[i]);
+                Assert.Equal(ei[i], gi[i]);
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = prior;
+        }
+    }
 }

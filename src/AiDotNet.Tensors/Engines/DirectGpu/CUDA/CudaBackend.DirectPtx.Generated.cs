@@ -104,12 +104,133 @@ public sealed partial class CudaBackend
         return true;
     }
 
+    /// <summary>
+    /// Attempts the generated 2x2 stride-2 max pool, values and argmax indices together.
+    /// </summary>
+    /// <remarks>
+    /// Measured at 1.41x against cuDNN and sitting at DRAM 94.6% — a roofline, so the only
+    /// way past it would be moving less data.
+    ///
+    /// The indices matter more than the speed. The backward pass routes every gradient by
+    /// them, and it decodes them as a SPATIAL index: <c>ih = idx / inWidth</c>,
+    /// <c>iw = idx % inWidth</c>, with the batch and channel offset added separately. The
+    /// generated kernel writes exactly that, and ties keep the FIRST maximum, matching the
+    /// established kernel. Either convention wrong would compile, produce plausible pooled
+    /// values, and corrupt training.
+    /// </remarks>
+    internal unsafe bool TryDirectPtxMaxPool2D(
+        IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
+        int batch, int channels, int inHeight, int inWidth,
+        int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        if (!_directPtxConvolutionOptedIn || !IsAvailable) return false;
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(_ccMajor, _ccMinor)) return false;
+        if (!DirectPtxConvolutionPromotion.IsPromoted(
+                DirectPtxConvolutionFamily.MaxPool2x2, out _)) return false;
+
+        // Only the measured geometry: 2x2, stride 2, no padding, exact halving.
+        if (kernelH != 2 || kernelW != 2) return false;
+        if (strideH != 2 || strideW != 2 || padH != 0 || padW != 0) return false;
+        if (inHeight % 2 != 0 || inWidth % 2 != 0) return false;
+        if (outHeight != inHeight / 2 || outWidth != inWidth / 2) return false;
+        if (batch <= 0 || channels <= 0 || inHeight <= 0 || inWidth <= 0) return false;
+
+        // Without an indices buffer the backward pass has nothing to route by. Rather than
+        // guess whether the caller needs one, decline and let the established kernel decide.
+        if (indices is null) return false;
+        if (input is null || output is null) return false;
+        if (input.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero ||
+            indices.Handle == IntPtr.Zero) return false;
+
+        long inputElements = (long)batch * channels * inHeight * inWidth;
+        long outputElements = (long)batch * channels * outHeight * outWidth;
+        if (input.SizeInBytes != inputElements * sizeof(float)) return false;
+        if (output.SizeInBytes != outputElements * sizeof(float)) return false;
+        if (indices.SizeInBytes != outputElements * sizeof(int)) return false;
+
+        string key = "maxpool2x2:" + batch + "x" + channels + "x" + inHeight + "x" + inWidth;
+        GeneratedKernel? entry;
+        lock (_directPtxLock)
+        {
+            if (!_generatedKernels.TryGetValue(key, out entry))
+            {
+                entry = BuildFromSpec(MaxPoolSpec(batch, channels, inHeight, inWidth));
+                if (entry is null) return false;
+                _generatedKernels[key] = entry;
+            }
+        }
+
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle, indicesPtr = indices.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &indicesPtr;
+
+        using var scope = PushContext();
+        entry.Module.Launch(entry.Function, entry.Blocks, 1, 1, entry.BlockX, entry.BlockY, 1, 0, args);
+        System.Threading.Interlocked.Increment(ref _generatedDispatchCount);
+        return true;
+    }
+
+    /// <summary>The 2x2 stride-2 max pool, with the argmax spatial index as a second output.</summary>
+    private static CodegenKernelSpec MaxPoolSpec(int batch, int channels, int height, int width)
+    {
+        int outH = height / 2, outW = width / 2;
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("n", batch), CodegenAxis.Parallel("c", channels),
+            CodegenAxis.Parallel("oh", outH), CodegenAxis.Parallel("ow", outW),
+            CodegenAxis.Reduce("kh", 2), CodegenAxis.Reduce("kw", 2));
+        const int N = 0, C = 1, OH = 2, OW = 3, KH = 4, KW = 5;
+
+        var input = new CodegenTensorBinding(0, "input", new[] { batch, channels, height, width },
+            new[]
+            {
+                CodegenAffineExpr.Axis(N), CodegenAffineExpr.Axis(C),
+                CodegenAffineExpr.Window(OH, KH, 2, 0), CodegenAffineExpr.Window(OW, KW, 2, 0)
+            });
+        var outputMap = new[]
+        {
+            CodegenAffineExpr.Axis(N), CodegenAffineExpr.Axis(C),
+            CodegenAffineExpr.Axis(OH), CodegenAffineExpr.Axis(OW)
+        };
+        var output = new CodegenTensorBinding(
+            1, "output", new[] { batch, channels, outH, outW }, outputMap, isOutput: true);
+        var indices = new CodegenTensorBinding(
+            2, "indices", new[] { batch, channels, outH, outW },
+            new[]
+            {
+                CodegenAffineExpr.Axis(N), CodegenAffineExpr.Axis(C),
+                CodegenAffineExpr.Axis(OH), CodegenAffineExpr.Axis(OW)
+            }, isOutput: true);
+
+        // ih * inWidth + iw, with ih = oh*2 + kh and iw = ow*2 + kw -- the convention
+        // maxpool2d_backward decodes.
+        var spatial = new CodegenAffineExpr(
+            new[]
+            {
+                new CodegenAffineTerm(OH, 2 * width),
+                new CodegenAffineTerm(KH, width),
+                new CodegenAffineTerm(OW, 2),
+                new CodegenAffineTerm(KW, 1),
+            },
+            constant: 0, divisor: 1, requiresExactDivision: false);
+
+        return new CodegenKernelSpec("generated_maxpool2d_2x2", space,
+            new[] { input }, output, new[] { 0 }, CodegenReduceKind.Max,
+            secondaryOutput: indices, secondaryIndexExpr: spatial);
+    }
+
     /// <summary>Emits and loads the depthwise kernel, or null when the emitter refuses.</summary>
     private GeneratedKernel? BuildDepthwise(int batch, int channels, int height, int width)
+        => BuildFromSpec(DepthwiseSpec(batch, channels, height, width));
+
+    /// <summary>Emits and loads any spec, or null when the emitter refuses it.</summary>
+    private GeneratedKernel? BuildFromSpec(CodegenKernelSpec spec)
     {
         try
         {
-            var spec = DepthwiseSpec(batch, channels, height, width);
             var emitter = new PtxAffineEmitter();
             string ptx = emitter.Emit(spec, _ccMajor, _ccMinor);
 
