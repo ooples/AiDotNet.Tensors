@@ -49,6 +49,51 @@ public enum CodegenPreReduceOp
     Square
 }
 
+/// <summary>What an extra output holds.</summary>
+public enum CodegenExtraOutputKind
+{
+    /// <summary>
+    /// The position of the winning term of a Max reduction, as an integer.
+    /// </summary>
+    /// <remarks>
+    /// A max-pool's indices buffer. The backward pass routes every gradient by it.
+    /// </remarks>
+    ArgMaxIndex,
+
+    /// <summary>
+    /// <c>Scale * primary + BiasScale * bias</c>, as a float.
+    /// </summary>
+    /// <remarks>
+    /// An optimizer state update: the primary output is the new state, and a parameter is
+    /// the old value stepped by it. SGD-with-momentum is exactly this shape --
+    /// <c>v' = mu*v + g</c> as the primary, <c>p' = p - lr*v'</c> as the extra.
+    ///
+    /// Worth knowing before reaching for it: PR #874 measured a hand-written fused SGD
+    /// against the EXISTING AiDotNet kernel and found a tie (0.73x-1.05x), because that
+    /// kernel is already single-pass. The measured headroom in this family is Adam and
+    /// AdamW, which the existing kernels do not fuse -- and those need a third state and a
+    /// reciprocal square root, not just this.
+    /// </remarks>
+    AffineOfPrimary
+}
+
+/// <summary>One output beyond the first, written from the same iteration point.</summary>
+/// <param name="Binding">Where it is written; addressed by parallel axes.</param>
+/// <param name="Kind">What it holds.</param>
+/// <param name="IndexExpr">For <see cref="CodegenExtraOutputKind.ArgMaxIndex"/>, the
+/// expression evaluated at the winning term.</param>
+/// <param name="Scale">For <see cref="CodegenExtraOutputKind.AffineOfPrimary"/>, the
+/// multiplier on the primary result.</param>
+/// <param name="BiasInput">Optional input added after that multiplier.</param>
+/// <param name="BiasScale">Multiplier on that input.</param>
+public sealed record CodegenExtraOutput(
+    CodegenTensorBinding Binding,
+    CodegenExtraOutputKind Kind,
+    CodegenAffineExpr? IndexExpr = null,
+    double Scale = 1.0,
+    int? BiasInput = null,
+    double BiasScale = 1.0);
+
 /// <summary>Epilogue activation applied after bias and scale.</summary>
 public enum CodegenActivationKind
 {
@@ -69,6 +114,9 @@ public enum CodegenActivationKind
 
     /// <summary><c>1 / x</c>. Turns a summed denominator into the factor to multiply by.</summary>
     Reciprocal,
+
+    /// <summary><c>1 / sqrt(x)</c>. The normalising factor of RMSNorm and Adam.</summary>
+    Rsqrt,
 
     /// <summary>
     /// Gaussian error linear unit, tanh approximation:
@@ -301,6 +349,7 @@ public sealed class CodegenKernelSpec
         CodegenActivationKind.Tanh => Math.Tanh(x),
         CodegenActivationKind.Swish => x / (1.0 + Math.Exp(-x)),
         CodegenActivationKind.Reciprocal => 1.0 / x,
+        CodegenActivationKind.Rsqrt => 1.0 / Math.Sqrt(x),
         CodegenActivationKind.Gelu =>
             0.5 * x * (1.0 + Math.Tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))),
         _ => throw new NotSupportedException("Unhandled activation " + kind + "."),

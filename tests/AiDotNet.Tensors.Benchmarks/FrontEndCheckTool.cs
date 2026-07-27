@@ -211,6 +211,8 @@ internal static class FrontEndCheckTool
         yield return ("softmax rows 512x256 (3 passes)", CodegenFusedStatistics.Softmax(512, 256));
         // Two lengths of the SAME operator. If the deviation tracks the reduction length
         // it is fp32 accumulation; if it does not, something is wrong with the maths.
+        yield return ("rmsnorm scale 512x256 (1 kernel, rsqrt)",
+            new CodegenProgram(new[] { RmsNormScale(512, 256) }, new long[] { 512 }, "rmsnorm"));
         yield return ("mse per-sample 512x256 (1 kernel)",
             new CodegenProgram(new[] { CodegenFusedStatistics.MeanSquaredError(512, 256) },
                 new long[] { 512 }, "mse"));
@@ -350,6 +352,23 @@ internal static class FrontEndCheckTool
             foreach (var m in modules) m.Dispose();
             DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
         }
+    }
+
+    /// <summary>1 / sqrt(mean(x^2)) per row -- the RMSNorm normalising factor.</summary>
+    private static CodegenKernelSpec RmsNormScale(int rows, int columns)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("j", columns));
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, columns },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var output = new CodegenTensorBinding(1, "scale", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+
+        return new CodegenKernelSpec("rmsnorm_scale", space, new[] { x }, output,
+            new[] { 0 }, CodegenReduceKind.Sum,
+            activation: CodegenActivationKind.Rsqrt,
+            reduceScale: 1.0 / columns,
+            preReduce: CodegenPreReduceOp.Square);
     }
 
     /// <summary>Mean over the two spatial axes of an NCHW tensor.</summary>

@@ -424,6 +424,13 @@ public sealed class PtxAffineEmitter
                 return r;
             }
 
+            case CodegenActivationKind.Rsqrt:
+            {
+                string r = NextF();
+                L($"rsqrt.approx.f32 {r}, {x};");
+                return r;
+            }
+
             case CodegenActivationKind.Sigmoid:
                 return EmitSigmoid(x, Log2E, One);
 
