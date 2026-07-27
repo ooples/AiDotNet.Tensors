@@ -1661,6 +1661,45 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return result;
     }
 
+    /// <summary>
+    /// Reads an integer buffer back to the host.
+    /// </summary>
+    /// <remarks>
+    /// The counterpart to <see cref="AllocateIntBuffer(int)"/>, which existed with no way
+    /// to read what it held. Max-pool indices are the first caller that needs it: they
+    /// route every gradient in the backward pass, so verifying them requires reading them.
+    /// </remarks>
+    public void DownloadIntBuffer(IGpuBuffer buffer, int[] destination)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its download (issue #226).");
+        if (destination.Length < buffer.Size)
+            throw new ArgumentException("Destination array is too small.", nameof(destination));
+
+        using var _ = PushContext();
+
+        // Same stream-ordering hazard as the float path: kernels run on _stream while
+        // cuMemcpyDtoH issues on the null stream, which does not implicitly wait for it.
+        AuditSyncIO("DtoH-download-int", (long)buffer.Size * sizeof(int));
+        LogCaptureBlockerIfCapturing("DtoH-download-int", (long)buffer.Size * sizeof(int));
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download-int)");
+
+        ulong byteSize = (ulong)(buffer.Size * sizeof(int));
+        unsafe
+        {
+            fixed (int* dst = destination)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemcpyDtoH((IntPtr)dst, buffer.Handle, byteSize),
+                    "cuMemcpyDtoH(int download)");
+            }
+        }
+    }
+
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
@@ -6049,6 +6088,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        // The generated depthwise kernel measured 2.08x-2.99x against cuDNN and sits at an
+        // L1 roofline. It takes over only for the exact geometry that evidence covers and
+        // only when the family is promoted; anything else falls through to the kernel below.
+        if (TryDirectPtxDepthwiseConv2D(input, kernel, output, batch, channels,
+                inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW))
+            return;
+
         if (!_kernelCache.TryGetValue("depthwise_conv2d", out var cudaKernel))
             throw new InvalidOperationException("CUDA kernel not found: depthwise_conv2d");
 
@@ -6639,6 +6686,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        // The generated max pool measured 1.41x against cuDNN and sits at a DRAM roofline.
+        // It writes the argmax indices in the same convention maxpool2d_backward decodes,
+        // and declines outright when no indices buffer is supplied rather than guessing.
+        if (TryDirectPtxMaxPool2D(input, output, indices, batch, channels,
+                inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW))
+            return;
+
         if (!_kernelCache.TryGetValue("maxpool2d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: maxpool2d");
 

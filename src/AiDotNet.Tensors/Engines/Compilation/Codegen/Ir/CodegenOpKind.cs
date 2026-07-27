@@ -121,6 +121,31 @@ public enum CodegenOpKind
     /// <summary>Batched MatMul: <c>C[b] = A[b] · B[b]</c>.</summary>
     BatchMatMul,
 
+    // ─── Convolution ──────────────────────────────────────────────────
+    //
+    // Convolution had no op kind at all, so it arrived as Opaque or not at all. That put
+    // the whole catalog of measured convolution kernels out of reach of every graph: the
+    // index-map layer expresses convolution exactly and CodegenAdjoint already derives
+    // its backward maps, but nothing upstream could ASK for one.
+    //
+    // The attribute is a CodegenConvAttributes. Operands are [input, weights].
+
+    /// <summary>
+    /// Dense 2-D cross-correlation, <c>out[n,k,oh,ow] = Σ_{c,kh,kw} in[n,c,·,·]·w[k,c,kh,kw]</c>.
+    /// </summary>
+    Conv2D,
+
+    /// <summary>
+    /// Depthwise 2-D convolution: one filter per channel, no summation over channels.
+    /// </summary>
+    DepthwiseConv2D,
+
+    /// <summary>
+    /// Transposed ("fractionally strided") 2-D convolution — the adjoint of
+    /// <see cref="Conv2D"/> with respect to its input.
+    /// </summary>
+    ConvTranspose2D,
+
     // ─── Softmax (reduction + pointwise, fused as one op for numerical stability) ──
 
     /// <summary>Numerically stable <c>softmax(x) = exp(x - max(x)) / Σ exp(x - max(x))</c>.</summary>
@@ -168,6 +193,8 @@ public enum CodegenOpCategory
     Matmul,
     /// <summary>Flash-attention-style — custom kernel per emitter.</summary>
     Attention,
+    /// <summary>Sliding-window contraction — a reduction with windowed index maps.</summary>
+    Convolution,
     /// <summary>Layout/movement ops that don't need codegen (handled by optimizer).</summary>
     Movement,
     /// <summary>Escape hatch.</summary>
@@ -214,6 +241,10 @@ public static class CodegenOpKinds
         CodegenOpKind.MatMul or CodegenOpKind.MatMulTransposeA or
         CodegenOpKind.MatMulTransposeB or CodegenOpKind.BatchMatMul
             => CodegenOpCategory.Matmul,
+
+        CodegenOpKind.Conv2D or CodegenOpKind.DepthwiseConv2D or
+        CodegenOpKind.ConvTranspose2D
+            => CodegenOpCategory.Convolution,
 
         CodegenOpKind.ScaledDotProductAttention
             => CodegenOpCategory.Attention,

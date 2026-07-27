@@ -112,4 +112,44 @@ internal static class GpuBenchmarkEnvironment
             throw new InvalidOperationException($"nvidia-smi exited with code {process.ExitCode}.");
         return output.GetAwaiter().GetResult().Trim();
     }
+
+    /// <summary>
+    /// Current SM clock in MHz, or 0 if it cannot be read.
+    /// </summary>
+    /// <remarks>
+    /// RequireIdleGpu and RequireNoForeignCompute only check the START and END of a
+    /// run, which is not enough. A depthwise row was published three times with a
+    /// 7.2-7.5% run spread and a P95/median near 2.0; re-measuring the SAME lowering on
+    /// the SAME code path later gave 0.1-0.9% and 1.25. Nothing about the kernel had
+    /// changed, so the earlier numbers were contaminated by concurrent activity that
+    /// the boundary checks did not catch. Sampling the clock around each measurement
+    /// lets a contaminated row be flagged instead of quietly reported as evidence.
+    /// </remarks>
+    internal static int SampleSmClockMhz()
+    {
+        try
+        {
+            string output = RunNvidiaSmi("--query-gpu=clocks.sm", "--format=csv,noheader,nounits");
+            return int.TryParse(output.Trim().Split('\n')[0].Trim(), out int mhz) ? mhz : 0;
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Reports SM-clock movement across a measurement. A drift beyond a couple of
+    /// percent means the two halves of the measurement did not run on the same machine
+    /// state, so any ratio taken across them is suspect.
+    /// </summary>
+    internal static string DescribeClockDrift(int startMhz, int endMhz)
+    {
+        if (startMhz <= 0 || endMhz <= 0) return "clock unknown";
+        double drift = (endMhz - startMhz) / (double)startMhz * 100.0;
+        string text = startMhz.ToString(System.Globalization.CultureInfo.InvariantCulture) + "->" +
+                      endMhz.ToString(System.Globalization.CultureInfo.InvariantCulture) + " MHz (" +
+                      drift.ToString("+0.0;-0.0", System.Globalization.CultureInfo.InvariantCulture) + "%)";
+        return Math.Abs(drift) > 2.0 ? text + " SUSPECT" : text;
+    }
 }
