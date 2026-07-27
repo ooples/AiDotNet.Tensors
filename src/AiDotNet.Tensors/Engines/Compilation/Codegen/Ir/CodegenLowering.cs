@@ -280,6 +280,21 @@ public static class CodegenLowering
 
         attributes.Validate();
 
+        // Channel agreement, checked HERE rather than left to the translator. LowerConv2D
+        // derives the output shape, so a mismatched weight tensor would produce a graph that
+        // is internally consistent and still wrong -- and the translator would then decline
+        // it with a message about a graph the caller did not write.
+        if (depthwise && weightShape[0] != inputShape[1])
+            throw new ArgumentException(
+                $"A depthwise convolution has one filter per channel, so weights[0] " +
+                $"({weightShape[0]}) must equal the input channels ({inputShape[1]}).",
+                nameof(weightShape));
+        if (!depthwise && weightShape[1] != inputShape[1])
+            throw new ArgumentException(
+                $"Weights are [K,C,kh,kw], so weights[1] ({weightShape[1]}) must equal the " +
+                $"input channels ({inputShape[1]}).",
+                nameof(weightShape));
+
         int tapH = depthwise ? weightShape[1] : weightShape[2];
         int tapW = depthwise ? weightShape[2] : weightShape[3];
         int outChannels = weightShape[0];

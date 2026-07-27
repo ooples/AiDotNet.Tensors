@@ -259,7 +259,9 @@ public class PtxAffineEmitterTests
         }
 
         double[] result = spec.Interpret(inputs);
-        Assert.All(result, v => Assert.True(double.IsFinite(v)));
+        // Spelled out rather than double.IsFinite: that method does not exist on net471,
+        // and this project builds every target framework.
+        Assert.All(result, v => Assert.True(!double.IsNaN(v) && !double.IsInfinity(v)));
         Assert.Contains(result, v => v != 0.0);
     }
 

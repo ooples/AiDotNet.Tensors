@@ -95,6 +95,16 @@ public static class CodegenAdjoint
                 "The adjoint is defined here for a two-operand product, got " +
                 forward.ProductInputs.Count + ".");
 
+        // dataInput has to BE one of the operands. Deriving weightInput as "the other one"
+        // cannot detect a bogus dataInput: with operands {0,1} and dataInput 7, the loop
+        // simply assigns weightInput 1 and the guard below never fires, so the adjoint is
+        // built against the wrong operand instead of being refused.
+        bool namesAnOperand = false;
+        foreach (int i in forward.ProductInputs) if (i == dataInput) namesAnOperand = true;
+        if (!namesAnOperand)
+            throw new ArgumentOutOfRangeException(nameof(dataInput),
+                "dataInput " + dataInput + " is not one of this operator's product operands.");
+
         int weightInput = -1;
         foreach (int i in forward.ProductInputs)
             if (i != dataInput) weightInput = i;

@@ -180,7 +180,11 @@ public sealed class CodegenAffineExpr
         }
         if (Constant != 0 || first)
         {
+            // A constant-only expression has no preceding term, so there is no " - " to
+            // carry the sign: it has to be written onto the number itself, or Const(-3)
+            // renders as "3".
             if (!first) sb.Append(Constant < 0 ? " - " : " + ");
+            else if (Constant < 0) sb.Append('-');
             sb.Append(Math.Abs(Constant).ToString(CultureInfo.InvariantCulture));
         }
         if (Divisor != 1)

@@ -169,8 +169,16 @@ public static class CodegenSplitReduction
         long threads = spec.Output.ElementCount;
         if ((threads + blockThreads - 1) / blockThreads >= target) return chosen;
 
+        // Largest extent first, ties broken by axis index. List.Sort is UNSTABLE, so
+        // without the tie-break two axes of equal extent could order differently between
+        // runs and emit different PTX for the same spec -- and emission determinism is
+        // what makes the content-addressed cubin cache sound.
         var candidates = new List<int>(spec.Space.ReductionAxes);
-        candidates.Sort((a, b) => spec.Space.Axes[b].Extent.CompareTo(spec.Space.Axes[a].Extent));
+        candidates.Sort((a, b) =>
+        {
+            int byExtent = spec.Space.Axes[b].Extent.CompareTo(spec.Space.Axes[a].Extent);
+            return byExtent != 0 ? byExtent : a.CompareTo(b);
+        });
 
         foreach (int axis in candidates)
         {

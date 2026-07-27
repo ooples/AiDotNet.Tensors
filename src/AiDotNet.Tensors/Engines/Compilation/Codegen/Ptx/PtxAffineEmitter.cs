@@ -381,6 +381,17 @@ public sealed class PtxAffineEmitter
 
     private int _stageLabel;
 
+    /// <summary>
+    /// PTX literal an out-of-range load yields: the identity of the active reduction.
+    /// </summary>
+    /// <remarks>
+    /// <c>0f00000000</c> for a sum, <c>0fFF800000</c> (negative infinity) for a maximum.
+    /// Zero is the ADDITIVE identity; under a maximum it is a real candidate, so a padded
+    /// max-pool over all-negative inputs returned 0 instead of the true maximum -- in the
+    /// oracle and the emitter alike, which is why the agreement gate passed it.
+    /// </remarks>
+    private string _outOfRangeFill = "0f00000000";
+
     /// <summary>Fallback when staging is disabled: fixed block, nothing invariant.</summary>
     private static int PassThroughBlock(out HashSet<int> axesVaryingInBlock)
     {
@@ -1053,6 +1064,18 @@ public sealed class PtxAffineEmitter
         // calls makes the SAME spec emit different text on a second Emit, and cubins
         // are content-addressed on that text.
         _stageLabel = 0;
+
+        // The out-of-range fill is the reduction's identity, not always zero.
+        _outOfRangeFill = spec.Reduce == CodegenReduceKind.Max ? "0fFF800000" : "0f00000000";
+
+        // Under a maximum, a product of operands has no single sensible identity: -inf times
+        // a positive operand is -inf, but -inf times zero is NaN.
+        if (spec.Reduce == CodegenReduceKind.Max && spec.ProductInputs.Count > 1)
+            throw new NotSupportedException(
+                "A Max reduction over a product of " + spec.ProductInputs.Count +
+                " operands has no well-defined padding identity: the out-of-range fill " +
+                "would have to be -inf for the product, and -inf times a zero operand is " +
+                "NaN. Express the product as a single operand, or add an explicit mask.");
 
         _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
@@ -1736,7 +1759,7 @@ public sealed class PtxAffineEmitter
         }
         else
         {
-            L($"mov.f32 {dst}, 0f00000000;");
+            L($"mov.f32 {dst}, {_outOfRangeFill};");
             L($"@{predicate} ld.global.nc.f32 {dst}, [{addr}];");
         }
         EmittedLoads++;
