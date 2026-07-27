@@ -50,6 +50,14 @@ internal static class DirectPtxConvolutionEligibility
     {
         if (!featureEnabled) return FeatureDisabled;
         if (!backendAvailable) return BackendUnavailable;
+
+        // Promotion is PER FAMILY and measured. The feature flag says the caller opted
+        // into generated convolution; this says the family actually beat the alternative.
+        // A shape that belongs to an excluded family fails closed here even with the flag
+        // on, so no environment variable can route work to a kernel measured at 0.33x.
+        if (!DirectPtxConvolutionPromotion.IsPromoted(
+                DirectPtxConvolutionFamily.Dense1x1, out string? notPromoted))
+            return notPromoted;
         if (!DirectPtxArchitecture.HasExperimentalConvolution(
                 computeCapabilityMajor, computeCapabilityMinor))
             return ArchitectureNotImplemented;
