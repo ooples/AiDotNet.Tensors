@@ -259,11 +259,16 @@ public class CodegenGraphReductionTests
     }
 
     /// <summary>
-    /// ReduceMean has no spec form -- the spec can scale by a TENSOR, not by 1/n -- so it
-    /// must decline rather than silently return a sum.
+    /// ReduceMean translates as a SUM carrying a constant 1/n epilogue, and must not come
+    /// back as a bare sum.
     /// </summary>
+    /// <remarks>
+    /// This test previously asserted the opposite -- that ReduceMean declines -- which was
+    /// correct while the spec had no way to express 1/n. EXP-2 gave it one, so the
+    /// assertion is now that the mean is actually a mean.
+    /// </remarks>
     [Fact]
-    public void ReduceMean_DeclinesRatherThanReturningASum()
+    public void ReduceMean_TranslatesAsASumWithAConstantScale()
     {
         var g = new CodegenGraph();
         int x = Load(g, new[] { 4, 8 });
@@ -271,8 +276,18 @@ public class CodegenGraphReductionTests
             CodegenElementType.Float32, new[] { 4 }, new[] { 1 }));
         Store(g, r, new[] { 4 });
 
-        Assert.False(CodegenGraphToSpec.TryTranslate(g, "mean", out _, out string reason));
-        Assert.Contains("ReduceMean", reason, StringComparison.Ordinal);
+        Assert.True(CodegenGraphToSpec.TryTranslate(g, "mean", out var spec, out string reason), reason);
+        Assert.Equal(CodegenReduceKind.Sum, spec!.Reduce);
+        Assert.Equal(0.125, spec.ReduceScale, 12);
+
+        double[] xv = Fill(32, 5);
+        double[] got = spec.Interpret(new[] { xv });
+        for (int i = 0; i < 4; i++)
+        {
+            double sum = 0;
+            for (int j = 0; j < 8; j++) sum += xv[i * 8 + j];
+            Assert.Equal(sum / 8.0, got[i], 9);
+        }
     }
 
     /// <summary>

@@ -124,6 +124,7 @@ public static class CodegenGraphToSpec
         CodegenAffineExpr[][] operandMaps;
         CodegenAffineExpr[] outputMap;
         CodegenReduceKind reduce;
+        double reduceScale = 1.0;
 
         switch (core.Op)
         {
@@ -148,9 +149,26 @@ public static class CodegenGraphToSpec
 
             case CodegenOpKind.ReduceSum:
             case CodegenOpKind.ReduceMax:
+            case CodegenOpKind.ReduceMean:
                 if (!TryBuildReduce(graph, core, outShape, operands,
                         out axes!, out operandMaps!, out outputMap!, out reduce, out declineReason))
                     return false;
+
+                // A mean is a sum times 1/count. The count is the product of the reduced
+                // extents, which is known here and constant, so it becomes the spec's
+                // scalar epilogue rather than a separate reduce kind.
+                if (core.Op == CodegenOpKind.ReduceMean)
+                {
+                    long reduced = 1;
+                    foreach (var axis in axes!)
+                        if (axis.IsReduction) reduced *= axis.Extent;
+                    if (reduced <= 0)
+                    {
+                        declineReason = "a mean over " + reduced + " elements has no value";
+                        return false;
+                    }
+                    reduceScale = 1.0 / reduced;
+                }
                 break;
 
             case CodegenOpKind.Mul:
@@ -201,7 +219,8 @@ public static class CodegenGraphToSpec
         spec = new CodegenKernelSpec(
             name, new CodegenIterationSpace(axes), bindings, output, productIndices, reduce,
             biasInput: biasNode.HasValue ? ordered.Count - 1 : null,
-            activation: activation);
+            activation: activation,
+            reduceScale: reduceScale);
         graphNodeOrder = ordered;
         return true;
     }
@@ -465,6 +484,7 @@ public static class CodegenGraphToSpec
         out CodegenAffineExpr[]? outputMap, out CodegenReduceKind reduce, out string reason)
     {
         axes = null; operandMaps = null; outputMap = null; reason = string.Empty;
+        // A mean reduces by SUMMING; the division is the scalar epilogue the caller sets.
         reduce = core.Op == CodegenOpKind.ReduceMax ? CodegenReduceKind.Max : CodegenReduceKind.Sum;
 
         if (core.Inputs.Length != 1)

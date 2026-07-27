@@ -160,6 +160,10 @@ internal static class FrontEndCheckTool
                 new[] { 2, 16, 16, 16 }, new[] { 16, 16, 3, 3 },
                 new CodegenConvAttributes(2, 2, 1, 1)));
 
+        // Global average pooling: a mean over the spatial axes, which is a SUM with a
+        // constant 1/(H*W) epilogue rather than its own reduce kind.
+        yield return ("global average pool [8,64,28,28] -> [8,64]", GlobalAveragePool(8, 64, 28, 28));
+
         // Activations. These carry APPROXIMATE PTX instructions (ex2, rcp, tanh), so they
         // are the first kernels that cannot reach exact agreement with the fp64 oracle.
         // The deviation is the point of the row.
@@ -172,6 +176,18 @@ internal static class FrontEndCheckTool
             yield return ("conv 1x1 + bias + " + op.ToString().ToLowerInvariant(),
                 ConvWithActivation(op));
         }
+    }
+
+    /// <summary>Mean over the two spatial axes of an NCHW tensor.</summary>
+    private static CodegenGraph GlobalAveragePool(int n, int c, int h, int w)
+    {
+        var g = new CodegenGraph();
+        int x = Load(g, new[] { n, c, h, w });
+        int mean = g.AddNode(new CodegenNode(CodegenOpKind.ReduceMean, new[] { x },
+            CodegenElementType.Float32, new[] { n, c }, new[] { 2, 3 }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { mean },
+            CodegenElementType.Float32, new[] { n, c }));
+        return g;
     }
 
     /// <summary>A 1x1 convolution with a bias and one activation, to isolate the epilogue.</summary>

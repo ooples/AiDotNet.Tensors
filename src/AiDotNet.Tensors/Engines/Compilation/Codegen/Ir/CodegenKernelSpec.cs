@@ -110,6 +110,21 @@ public sealed class CodegenKernelSpec
     /// <summary>Epilogue activation.</summary>
     public CodegenActivationKind Activation { get; }
 
+    /// <summary>
+    /// Constant multiplied into the reduction result, BEFORE bias and scale. 1.0 means none.
+    /// </summary>
+    /// <remarks>
+    /// This is how a mean is expressed: a sum with <c>ReduceScale = 1/count</c>. A separate
+    /// <c>Mean</c> reduce kind was the obvious alternative and is the worse one, because the
+    /// same constant also serves a loss normalisation and softmax's <c>1/denominator</c> --
+    /// one scalar covers three operators where a reduce kind covers one.
+    ///
+    /// It applies before the bias because a mean-then-add-bias is the operator people mean;
+    /// scaling after the bias would scale the bias too. <see cref="ScaleInput"/> is a
+    /// TENSOR and stays where it is, after the bias.
+    /// </remarks>
+    public double ReduceScale { get; }
+
     /// <summary>Creates a kernel spec and validates its internal consistency.</summary>
     public CodegenKernelSpec(
         string name,
@@ -120,7 +135,8 @@ public sealed class CodegenKernelSpec
         CodegenReduceKind reduce,
         int? biasInput = null,
         int? scaleInput = null,
-        CodegenActivationKind activation = CodegenActivationKind.None)
+        CodegenActivationKind activation = CodegenActivationKind.None,
+        double reduceScale = 1.0)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
@@ -132,6 +148,11 @@ public sealed class CodegenKernelSpec
         BiasInput = biasInput;
         ScaleInput = scaleInput;
         Activation = activation;
+        ReduceScale = reduceScale;
+
+        if (double.IsNaN(reduceScale) || double.IsInfinity(reduceScale))
+            throw new ArgumentException(
+                "ReduceScale must be finite; got " + reduceScale + ".", nameof(reduceScale));
 
         if (_productInputs.Length == 0)
             throw new ArgumentException("At least one operand must feed the body.", nameof(productInputs));
@@ -265,6 +286,8 @@ public sealed class CodegenKernelSpec
                     _ => product
                 };
             }
+
+            if (ReduceScale != 1.0) acc *= ReduceScale;
 
             if (BiasInput.HasValue)
             {

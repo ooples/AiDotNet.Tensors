@@ -499,7 +499,11 @@ public static class CodegenSplitReduction
         return new CodegenKernelSpec(
             spec.Name + "_combine", combineSpace, combineInputs.ToArray(), combineOutput,
             new[] { 0 }, CodegenReduceKind.Sum,
-            biasInput: combineBias, scaleInput: combineScale, activation: spec.Activation);
+            biasInput: combineBias, scaleInput: combineScale, activation: spec.Activation,
+            // The constant scale is part of the epilogue and moves with it. Leaving it on
+            // the partial pass would divide once per partial and then again nowhere -- a
+            // mean split four ways would come out four times too small.
+            reduceScale: spec.ReduceScale);
     }
 
     /// <summary>

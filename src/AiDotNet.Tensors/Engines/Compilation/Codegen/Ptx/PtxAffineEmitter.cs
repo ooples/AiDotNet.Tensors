@@ -492,6 +492,22 @@ public sealed class PtxAffineEmitter
         return r;
     }
 
+    /// <summary>
+    /// A double as a PTX fp32 hex literal, which is how PTX spells a float constant.
+    /// </summary>
+    /// <remarks>
+    /// Emitting the decimal form would let ptxas re-parse and re-round the value; the hex
+    /// form names the exact bit pattern, so the constant in the kernel is the constant the
+    /// oracle used.
+    /// </remarks>
+    private static string F32(double value)
+    {
+        // GetBytes/ToUInt32 rather than SingleToUInt32Bits, which does not exist on
+        // net471 -- and this project builds every target framework.
+        uint bits = BitConverter.ToUInt32(BitConverter.GetBytes((float)value), 0);
+        return "0f" + bits.ToString("X8", CultureInfo.InvariantCulture);
+    }
+
     /// <summary>1 / (1 + exp(-x)), via ex2 and rcp.</summary>
     private string EmitSigmoid(string x, string log2E, string one)
     {
@@ -1642,6 +1658,16 @@ public sealed class PtxAffineEmitter
         for (int l = 0; l < lanes; l++)
         {
             string acc = accs[l];
+
+            // The constant scale lands BEFORE the bias: a mean-then-add-bias is the
+            // operator, and scaling afterwards would scale the bias too.
+            if (spec.ReduceScale != 1.0)
+            {
+                string scaled = NextF();
+                L($"mul.rn.f32 {scaled}, {acc}, {F32(spec.ReduceScale)};");
+                acc = scaled;
+            }
+
             if (spec.BiasInput.HasValue)
             {
                 var b = spec.Inputs[spec.BiasInput.Value];
