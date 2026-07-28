@@ -37,6 +37,17 @@ public class CodegenTensorCoreStagingTests
     private static PtxTensorCoreEmitter Tile2x2() =>
         new() { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
 
+    /// <summary>
+    /// An emitter pinned to 2x2 with REGISTER staging.
+    /// </summary>
+    /// <remarks>
+    /// cp.async is the default where the architecture supports it, so a test about the
+    /// register-staged form -- its ld.global/st.shared pair, its prefetch registers -- has to
+    /// ask for it. That form is still what runs below sm_80.
+    /// </remarks>
+    private static PtxTensorCoreEmitter RegisterStaged() =>
+        new() { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true, EnableAsyncCopy = false };
+
     private static CodegenKernelSpec MatMul(
         int m, int k, int n,
         CodegenActivationKind activation = CodegenActivationKind.None,
@@ -190,7 +201,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void DoubleBuffered_IssuesThePrefetchBeforeTheArithmetic()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+        string ptx = RegisterStaged().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
         Assert.True(loopStart >= 0);
@@ -232,7 +243,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void DoubleBuffered_PredicatesThePrefetchPastTheEnd()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+        string ptx = RegisterStaged().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
         string body = ptx.Substring(loopStart);
@@ -275,7 +286,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void StagedKernel_ReservesBothSlabs()
     {
-        var emitter = Tile2x2();
+        var emitter = RegisterStaged();
         emitter.EnableDoubleBuffering = false;
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
@@ -353,19 +364,56 @@ public class CodegenTensorCoreStagingTests
     /// the tensor pipe rises from 26.79% to 35.74%.
     /// </remarks>
     [Theory]
-    [InlineData(128, 128, 4, 4)]      // both divide by 128
-    [InlineData(128, 64, 4, 2)]       // N only reaches 64
+    [InlineData(128, 128, 4, 2)]      // 4x2 leads the ladder: it won most measured shapes
+    [InlineData(128, 64, 4, 2)]
     [InlineData(64, 128, 2, 4)]
     [InlineData(64, 64, 2, 2)]
-    [InlineData(1024, 1024, 4, 4)]
-    public void WarpTileSelection_PicksTheLargestThatFits(int m, int n, int tileM, int tileN)
+    public void WarpTileSelection_FollowsTheLadder(int m, int n, int tileM, int tileN)
     {
+        // K = 64 here, so none of these hit a measured catalog entry: this covers the LADDER.
         var emitter = new PtxTensorCoreEmitter();
         emitter.Emit(MatMul(m, 64, n), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.Staged);
+        Assert.False(emitter.WarpTileWasMeasured);
         Assert.Equal(tileM, emitter.WarpTilesM);
         Assert.Equal(tileN, emitter.WarpTilesN);
+    }
+
+    /// <summary>
+    /// A measured shape takes its MEASURED tile, which at 1024^3 is not the largest that
+    /// fits: 4x2 timed 71.9us against 4x4's 75.0us. This is the case the ladder gets wrong
+    /// and the catalog exists for.
+    /// </summary>
+    [Fact]
+    public void MeasuredShape_OverridesTheLadder()
+    {
+        var emitter = new PtxTensorCoreEmitter();
+        emitter.Emit(MatMul(1024, 1024, 1024), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.WarpTileWasMeasured);
+        Assert.Equal(4, emitter.WarpTilesM);
+        Assert.Equal(2, emitter.WarpTilesN);
+
+        // The ladder alone would have said 4x4, since 1024 divides 128 both ways.
+        var ladder = TensorCoreWarpTileCatalog.Select(1024, 1024, 64, out bool measured);
+        Assert.False(measured);
+        Assert.Equal(4, ladder.TileM);
+        Assert.Equal(2, ladder.TileN);
+    }
+
+    /// <summary>Every catalog entry must be reachable, or it is a silently dead measurement.</summary>
+    [Fact]
+    public void EveryMeasuredShape_IsReachable()
+    {
+        foreach (var (m, n, k) in TensorCoreWarpTileCatalog.MeasuredShapes)
+        {
+            var emitter = new PtxTensorCoreEmitter();
+            emitter.Emit(MatMul(m, k, n), Sm86Major, Sm86Minor);
+
+            Assert.True(emitter.Staged, $"{m}x{k}x{n} does not stage");
+            Assert.True(emitter.WarpTileWasMeasured, $"{m}x{k}x{n} did not hit its catalog entry");
+        }
     }
 
     /// <summary>A pinned tile is not overridden -- that is what the sweep depends on.</summary>
@@ -395,6 +443,102 @@ public class CodegenTensorCoreStagingTests
         Assert.True(large.SharedMemoryBytes > small.SharedMemoryBytes);
         Assert.Equal(16, large.MmaInstructions / 2);       // 16 per body, two bodies
         Assert.Equal(4, small.MmaInstructions / 2);
+    }
+
+    // ---- cp.async staging ----------------------------------------------------------------
+
+    /// <summary>
+    /// cp.async copies global to shared directly, so the staged words never occupy a register
+    /// and one instruction moves 16 bytes instead of four.
+    /// </summary>
+    /// <remarks>
+    /// This is what took the kernel off its register occupancy limit: at the 4x4 tile the
+    /// register-staged form used 240 registers per thread, allowing 2 blocks per SM and
+    /// 16.41% of peak warps active, with `mio_throttle` the largest remaining stall.
+    /// </remarks>
+    [Fact]
+    public void AsyncCopy_ReplacesTheLoadStorePair()
+    {
+        var emitter = Tile2x2();
+        string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.AsyncCopy);
+        Assert.Contains("cp.async.ca.shared.global", ptx, StringComparison.Ordinal);
+        Assert.Contains("cp.async.commit_group;", ptx, StringComparison.Ordinal);
+        Assert.Contains("cp.async.wait_group 0;", ptx, StringComparison.Ordinal);
+
+        // The register round-trip is gone entirely.
+        Assert.DoesNotContain("st.shared.u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.global.nc.u32", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The copy must be COMMITTED before the arithmetic and WAITED on after it. Waiting before
+    /// the mma work would serialise exactly what the async form exists to overlap.
+    /// </summary>
+    [Fact]
+    public void AsyncCopy_WaitsAfterTheArithmeticNotBefore()
+    {
+        string ptx = Tile2x2().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
+        string body = ptx.Substring(loopStart);
+
+        int commit = body.IndexOf("cp.async.commit_group;", StringComparison.Ordinal);
+        int mma = body.IndexOf("wmma.mma.sync", StringComparison.Ordinal);
+        int wait = body.IndexOf("cp.async.wait_group 0;", StringComparison.Ordinal);
+
+        Assert.True(commit >= 0 && mma >= 0 && wait >= 0);
+        Assert.True(commit < mma, "the copy must be committed before the arithmetic");
+        Assert.True(mma < wait, "the wait must come after the arithmetic it overlaps with");
+    }
+
+    /// <summary>A copy past the end of K must still be predicated off.</summary>
+    [Fact]
+    public void AsyncCopy_PredicatesThePrefetchPastTheEnd()
+    {
+        string ptx = Tile2x2().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
+        string body = ptx.Substring(loopStart);
+
+        int copies = CountOccurrences(body, "cp.async.ca.shared.global");
+        int guarded = CountOccurrences(body, "@%p") - CountOccurrences(body, "@%p1 bra");
+        Assert.True(copies > 0);
+        Assert.True(guarded >= copies, $"{copies} async copies but only {guarded} guards");
+    }
+
+    /// <summary>
+    /// cp.async is sm_80+. A pre-Ampere target must fall back to register staging rather than
+    /// emitting an instruction the assembler will reject.
+    /// </summary>
+    [Fact]
+    public void AsyncCopy_FallsBackBeforeAmpere()
+    {
+        var emitter = Tile2x2();
+        string ptx = emitter.Emit(MatMul(512, 512, 512), computeMajor: 7, computeMinor: 5);
+
+        Assert.False(emitter.AsyncCopy);
+        Assert.DoesNotContain("cp.async", ptx, StringComparison.Ordinal);
+        Assert.Contains("st.shared.u32", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The catalog records the tile and the staging form TOGETHER, because they interact: at
+    /// 4096^3 the 4x4 tile is faster with registers (45.0 TF) than with cp.async (41.6), while
+    /// 4x2 is much faster with cp.async (47.0) than without (38.4). Picking them independently
+    /// selects 4x4 + cp.async, the worst of those four.
+    /// </summary>
+    [Fact]
+    public void CatalogChoosesTileAndStagingTogether()
+    {
+        var emitter = new PtxTensorCoreEmitter();
+        emitter.Emit(MatMul(4096, 4096, 4096), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.WarpTileWasMeasured);
+        Assert.Equal(4, emitter.WarpTilesM);
+        Assert.Equal(2, emitter.WarpTilesN);
+        Assert.True(emitter.AsyncCopy);
     }
 
     private static int CountOccurrences(string haystack, string needle)

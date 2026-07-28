@@ -44,6 +44,9 @@ internal static class WarpTileSweepTool
         (4, 4),        // 128x128 block, 0.50 -- and 128 accumulator registers per thread
     };
 
+    /// <summary>Staging forms, swept alongside the tile so the comparison is paired.</summary>
+    private static readonly bool[] AsyncForms = { true, false };
+
     internal static void Run(string[] args)
     {
         using var runtime = new DirectPtxRuntime();
@@ -55,7 +58,7 @@ internal static class WarpTileSweepTool
         Console.WriteLine();
         Console.WriteLine(
             "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
-            "shape", "tile", "block", "acc reg", "ld/mma", "shared B", "max abs dev", "us", "TFLOP/s");
+            "shape", "tile", "staging", "acc reg", "ld/mma", "shared B", "max abs dev", "us", "TFLOP/s");
 
         // A single tile can be selected so a profiler can attribute counters to it: the sweep
         // otherwise launches the 2x2 reference between candidates, and every launch of the
@@ -71,9 +74,12 @@ internal static class WarpTileSweepTool
             foreach (var (tm, tn) in Candidates)
             {
                 if (only is not null && only != tm + "x" + tn) continue;
-                double us = Measure(runtime, spec, major, minor, tm, tn, m, n, k, label,
-                                    ref baseline);
-                if (us > 0 && baseline == 0) baseline = us;
+                foreach (bool async in AsyncForms)
+                {
+                    double us = Measure(runtime, spec, major, minor, tm, tn, async,
+                                        m, n, k, label, ref baseline);
+                    if (us > 0 && baseline == 0) baseline = us;
+                }
             }
             Console.WriteLine();
         }
@@ -81,12 +87,15 @@ internal static class WarpTileSweepTool
 
     private static double Measure(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        int tileM, int tileN, int m, int n, int k, string label, ref double baseline)
+        int tileM, int tileN, bool async, int m, int n, int k, string label, ref double baseline)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
         {
-            var emitter = new PtxTensorCoreEmitter { WarpTilesM = tileM, WarpTilesN = tileN, PinWarpTile = true };
+            var emitter = new PtxTensorCoreEmitter
+            {
+                WarpTilesM = tileM, WarpTilesN = tileN, PinWarpTile = true, EnableAsyncCopy = async,
+            };
 
             if (!PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out string why))
             {
@@ -230,7 +239,7 @@ internal static class WarpTileSweepTool
             "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}{9}",
             label,
             tileM + "x" + tileN,
-            emitter.BlockTileM + "x" + emitter.BlockTileN,
+            emitter.AsyncCopy ? "cp.async" : "registers",
             accRegisters.ToString(CultureInfo.InvariantCulture),
             loadsPerMma.ToString("0.00", CultureInfo.InvariantCulture),
             note is null ? emitter.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) : "-",
