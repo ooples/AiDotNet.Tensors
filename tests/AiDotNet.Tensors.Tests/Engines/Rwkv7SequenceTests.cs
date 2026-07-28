@@ -437,7 +437,10 @@ public class Rwkv7SequenceTests
         double maxAbs = 0.0;
         foreach (var value in got)
         {
-            Assert.True(double.IsFinite(value), "RWKV-7 readout produced a non-finite value.");
+            // double.IsFinite does not exist on net471 (netstandard2.0-era BCL), and this suite is
+            // multi-targeted — use the NaN/Infinity pair, which is available on both TFMs.
+            Assert.True(!double.IsNaN(value) && !double.IsInfinity(value),
+                "RWKV-7 readout produced a non-finite value.");
             maxAbs = Math.Max(maxAbs, Math.Abs(value));
         }
         // The injected v (*) kTilde magnitude is O(1) per step; a bounded transition keeps the

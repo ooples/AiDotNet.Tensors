@@ -5000,7 +5000,15 @@ public partial class DirectGpuTensorEngine
         if (vProj is null) throw new ArgumentNullException(nameof(vProj));
         if (decayLogit is null) throw new ArgumentNullException(nameof(decayLogit));
         if (iclRate is null) throw new ArgumentNullException(nameof(iclRate));
-        if (typeof(T) != typeof(float) || rProj.Rank != 3 || numHeads < 1 || !TryGetBackend(out var backend))
+        // IsTapeActive / GraphMode MUST be part of the fallback condition, matching the other
+        // overrides in this file. This GPU path returns a plain Tensor<T> and records NO backward,
+        // whereas the CPU base calls DifferentiableOps.RecordIfActive(..., Rwkv7SequenceBackward).
+        // Taking the GPU path under an active tape would therefore leave rProj / kappa / kTilde /
+        // vProj / decayLogit / iclRate with ZERO gradients — training would silently not learn
+        // rather than fail, which is the worst possible failure mode for an autodiff op.
+        if (typeof(T) != typeof(float) || rProj.Rank != 3 || numHeads < 1
+            || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || !TryGetBackend(out var backend))
             return base.Rwkv7SequenceForward(rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads);
         int batch = rProj._shape[0], seqLen = rProj._shape[1], modelDim = rProj._shape[2];
         if (modelDim % numHeads != 0

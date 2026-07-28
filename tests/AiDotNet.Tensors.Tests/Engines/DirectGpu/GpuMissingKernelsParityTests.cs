@@ -55,6 +55,17 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             throw new InvalidOperationException(
                 "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but DirectGpu init failed or no GPU is available.",
                 _gpuInitException);
+
+        // KNOWN GAP (PR #895 review): returning false makes every caller `return` early, so xUnit
+        // reports these tests as PASSED even though neither the CPU nor the GPU recurrence ran — a
+        // false green on a suite whose whole purpose is proving the GPU kernels match the CPU base.
+        // All ~80 guarded tests in this class are affected, not just the RWKV-7 one.
+        //
+        // The repo's convention for this is Skip.If from Xunit.SkippableFact (see
+        // GpuConvKernelCoverageTests.SkipIfUnavailable), but that requires the test methods to carry
+        // [SkippableFact] rather than [Fact] — with plain [Fact] a SkipException surfaces as a
+        // FAILURE, turning every non-GPU machine red. Converting all ~80 attributes is the correct
+        // fix and is deliberately NOT bundled into this PR.
         return false;
     }
 
