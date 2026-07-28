@@ -240,6 +240,27 @@ public static class CodegenPerformanceModel
     private const int BytesPerElement = 4;
 
     /// <summary>
+    /// Whether a spec is the shape a tensor-core lowering will take: an fp16 contraction of
+    /// two operands over a sum.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately structural rather than a caller-supplied flag. A prediction whose pipe is
+    /// asserted by its caller is a prediction that silently disagrees with the emitter as soon
+    /// as the recogniser's rules move.
+    /// </remarks>
+    private static bool UsesTensorCores(CodegenKernelSpec spec)
+    {
+        if (spec.Reduce != CodegenReduceKind.Sum) return false;
+        if (spec.ProductInputs.Count != 2) return false;
+        if (spec.Space.ParallelAxes.Length != 2 || spec.Space.ReductionAxes.Length != 1) return false;
+
+        foreach (int index in spec.ProductInputs)
+            if (spec.Inputs[index].ElementType != CodegenElementType.Float16) return false;
+
+        return true;
+    }
+
+    /// <summary>
     /// Predicts the bottleneck for <paramref name="spec"/> under a lowering that
     /// executes <paramref name="dynamicLoadsPerThread"/> global loads per thread across
     /// <paramref name="threads"/> threads.
@@ -263,9 +284,20 @@ public static class CodegenPerformanceModel
         long outputs = spec.Output.ElementCount;
         long macs = outputs * Math.Max(1, spec.Space.ReductionTripCount);
 
-        long uniqueBytes = spec.Output.ElementCount * BytesPerElement;
+        // BYTES COME FROM EACH BINDING'S OWN STORAGE. This was a fixed 4, which silently
+        // doubled the predicted traffic of every fp16 kernel and halved its apparent
+        // arithmetic intensity -- moving it to the wrong side of the roofline and pointing
+        // any lever chosen from the prediction at the wrong thing.
+        int components = spec.Algebra.Components();
+        long uniqueBytes = spec.Output.ElementCount * spec.Output.ElementBytes * components;
         for (int i = 0; i < spec.Inputs.Count; i++)
-            uniqueBytes += spec.Inputs[i].ElementCount * BytesPerElement;
+        {
+            var input = spec.Inputs[i];
+            uniqueBytes += input.ElementCount * input.ElementBytes
+                         * (input.IsIndexTensor ? 1 : components);
+        }
+        foreach (var extra in spec.ExtraOutputs)
+            uniqueBytes += extra.Binding.ElementCount * extra.Binding.ElementBytes;
 
         // A warp issues one instruction for its 32 threads, so instruction count is
         // thread-load-count scaled by threads and divided by the warp width.
@@ -276,7 +308,12 @@ public static class CodegenPerformanceModel
 
         double loadIssueUs = warpLoads / machine.LoadInstructionsPerSecond * 1e6;
         double dramUs = uniqueBytes / machine.DramBytesPerSecond * 1e6;
-        double computeUs = macs / machine.MacsPerSecond * 1e6;
+        // THE ARITHMETIC RATE DEPENDS ON WHICH PIPE THE KERNEL USES. Scoring a tensor-core
+        // contraction against the fp32 pipe -- 30.8 TFLOP/s on this device against 61.6 --
+        // makes a finished kernel read as 180%+ of peak, which is a category error rather
+        // than a headroom figure.
+        bool tensorCore = UsesTensorCores(spec);
+        double computeUs = macs / machine.MacsPerSecondFor(tensorCore) * 1e6;
 
         var prediction = new CodegenPerformancePrediction(
             spec.Name, outputs, macs, uniqueBytes, warpLoads, loadsPerMac,
