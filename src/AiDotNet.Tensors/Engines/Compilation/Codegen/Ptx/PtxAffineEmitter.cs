@@ -934,12 +934,45 @@ public sealed partial class PtxAffineEmitter
                 "A vectorised binding must be provably in range; " + binding.Name + " produced a guard.");
 
         string byteOffset = NextRd(), address = NextRd();
-        L($"mul.wide.u32 {byteOffset}, {offset}, 4;");
+        L($"mul.wide.u32 {byteOffset}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {address}, {basePointer}, {byteOffset};");
 
         var regs = new string[width];
         for (int i = 0; i < width; i++) regs[i] = NextF();
-        L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+
+        if (binding.NeedsConversion)
+        {
+            // FOUR HALVES ARE TWO WORDS, and two words is v2.u32 -- the same FOUR elements a
+            // v4.f32 carries, so the lane model above is unchanged and only the instruction,
+            // the byte scale and the unpacking differ.
+            //
+            // Without this a narrow tensor took the scalar path, and the profile said what
+            // that costs: 32 lanes at 2 bytes is a 64-byte request, half a cache line, which
+            // measured 2 sectors per request against fp32's 4 and reached only 66.6% of DRAM
+            // peak against fp32's 89.1%. The access was perfectly coalesced FOR ITS WIDTH and
+            // still wasted half the bus.
+            //
+            // This is emphatically not the v4.f32 path re-enabled for narrow bindings. That
+            // one scales by four bytes an element and would read twice the intended span,
+            // returning neighbouring data with no complaint -- which is why it was excluded.
+            string lo = NextR(), hi = NextR();
+            L($"ld.global.nc.v2.u32 {{{lo}, {hi}}}, [{address}];");
+
+            EmitWiden(binding.ElementType, lo, regs[0]);
+            string loHigh = NextR();
+            L($"shr.b32 {loHigh}, {lo}, 16;");
+            EmitWiden(binding.ElementType, loHigh, regs[1]);
+
+            EmitWiden(binding.ElementType, hi, regs[2]);
+            string hiHigh = NextR();
+            L($"shr.b32 {hiHigh}, {hi}, 16;");
+            EmitWiden(binding.ElementType, hiHigh, regs[3]);
+        }
+        else
+        {
+            L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+        }
+
         VectorisedLoads++;
         EmittedLoads++;
         return regs;
@@ -1473,11 +1506,14 @@ public sealed partial class PtxAffineEmitter
         if (EnableVectorLoads && innermost >= 0 && axes[innermost].Extent % VectorWidth == 0)
         {
             foreach (int inputIdx in spec.ProductInputs)
-                // A narrow binding is excluded: the vector path emits ld.global.v4.f32 and
-                // scales its address by four bytes per element, so on a 16-bit tensor it
-                // would read twice the intended span and silently return neighbouring data.
-                // Widening a v4 load is a separate lowering, not a flag.
-                if (!spec.Inputs[inputIdx].NeedsConversion &&
+                // A narrow binding vectorises through v2.u32 -- four halves, the same four
+                // elements a v4.f32 carries -- rather than being excluded. It cannot use the
+                // f32 form, which scales by four bytes an element and would read twice the
+                // intended span; see EmitVectorLoad.
+                //
+                // An INDEX tensor is still excluded: it is never an arithmetic operand, so
+                // there is nothing to widen it into.
+                if (!spec.Inputs[inputIdx].IsIndexTensor &&
                     IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
                 {
                     vectorisable[inputIdx] = true;

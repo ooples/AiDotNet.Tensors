@@ -60,10 +60,15 @@ public class CodegenMixedPrecisionTests
     }
 
     /// <summary>An fp16 operand must load through a 16-bit load and a widening convert.</summary>
+    /// <remarks>
+    /// The VECTOR path is disabled here so this covers the scalar form. A unit-stride narrow
+    /// binding now vectorises through v2.u32, which is a different instruction and is covered
+    /// by NarrowBinding_VectorisesThroughTwoWords.
+    /// </remarks>
     [Fact]
     public void Fp16Operand_LoadsNarrowAndWidens()
     {
-        string ptx = new PtxAffineEmitter().Emit(
+        string ptx = new PtxAffineEmitter { EnableVectorLoads = false }.Emit(
             MatMul(32, 16, 32, aType: CodegenElementType.Float16), 8, 6);
 
         Assert.Contains("ld.global.nc.u16", ptx, StringComparison.Ordinal);
@@ -106,7 +111,7 @@ public class CodegenMixedPrecisionTests
     [Fact]
     public void MixedOperands_EmitBothLoadForms()
     {
-        string ptx = new PtxAffineEmitter().Emit(
+        string ptx = new PtxAffineEmitter { EnableVectorLoads = false }.Emit(
             MatMul(32, 16, 32, aType: CodegenElementType.Float16), 8, 6);
 
         Assert.Contains("ld.global.nc.u16", ptx, StringComparison.Ordinal);   // fp16 operand
@@ -131,17 +136,29 @@ public class CodegenMixedPrecisionTests
     }
 
     /// <summary>
-    /// A narrow binding must NOT take the vector path: it emits v4.f32 and scales by four
-    /// bytes, so on a 16-bit tensor it would read twice the intended span.
+    /// A narrow binding vectorises through v2.u32 -- four halves, the same four elements a
+    /// v4.f32 carries -- and never through the f32 form.
     /// </summary>
+    /// <remarks>
+    /// The f32 form scales by four bytes an element, so on a 16-bit tensor it would read
+    /// twice the intended span and return neighbouring data without complaint. That is why
+    /// narrow bindings were excluded from vectorising at all; the profile then showed what
+    /// the exclusion cost -- 2 sectors per request against fp32's 4, and 66.6% of DRAM peak
+    /// against 89.1% -- because 32 lanes at 2 bytes is a 64-byte request, half a cache line.
+    /// </remarks>
     [Fact]
-    public void NarrowBinding_DoesNotTakeTheVectorPath()
+    public void NarrowBinding_VectorisesThroughTwoWords()
     {
         var emitter = new PtxAffineEmitter { EnableVectorLoads = true };
         string ptx = emitter.Emit(MatMul(64, 64, 64, bType: CodegenElementType.Float16), 8, 6);
 
-        // The fp16 operand is the unit-stride one here, so no v4 load may appear for it.
+        Assert.Contains("ld.global.nc.v2.u32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("ld.global.nc.v4.f32", ptx, StringComparison.Ordinal);
+
+        // Each word carries TWO halves, so the upper one is shifted down before widening.
+        Assert.Contains("shr.b32", ptx, StringComparison.Ordinal);
+        Assert.Contains("cvt.f32.f16", ptx, StringComparison.Ordinal);
+        Assert.True(emitter.VectorisedLoads > 0);
     }
 
     /// <summary>An element type the emitter cannot store is refused, not silently widened.</summary>
