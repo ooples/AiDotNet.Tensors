@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.120.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.0...v0.120.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **rwkv7:** implement the paper-faithful RWKV-7 generalized delta rule ([#895](https://github.com/ooples/AiDotNet.Tensors/issues/895)) ([ecad0b7](https://github.com/ooples/AiDotNet.Tensors/commit/ecad0b7870d401596bd2dfd293ae40ed8859ce34))
+
 ## [0.120.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.119.0...v0.120.0) (2026-07-28)
 
 
