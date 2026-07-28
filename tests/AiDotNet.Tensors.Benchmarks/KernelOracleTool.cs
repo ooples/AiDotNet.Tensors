@@ -192,11 +192,21 @@ internal static class KernelOracleTool
     /// because a report that only covers compute-bound kernels cannot show that the limiter
     /// column is doing any work.
     /// </summary>
+    /// <summary>
+    /// One kernel per family the generator can emit, spanning both roofline sides.
+    /// </summary>
+    /// <remarks>
+    /// A report that only covers compute-bound kernels cannot show that the limiter column is
+    /// doing any work, and one that only covers the families somebody happened to be
+    /// optimising cannot find the neglected ones -- which is the whole purpose. Every family
+    /// the emitter supports appears here: streaming, epilogues, reductions, contractions,
+    /// convolution, gather, scatter, complex arithmetic, mixed precision and multi-output.
+    /// </remarks>
     private static IEnumerable<(string, CodegenKernelSpec)> Kernels()
     {
         var map1 = new[] { CodegenAffineExpr.Axis(0) };
 
-        // Pure streaming: no reduction at all, so this must land memory-bound.
+        // ---- streaming: no reduction, so these must land memory-bound --------------------
         {
             const int N = 1 << 22;
             var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", N));
@@ -205,58 +215,138 @@ internal static class KernelOracleTool
                     new[] { new CodegenTensorBinding(0, "x", new[] { N }, map1) },
                     new CodegenTensorBinding(1, "y", new[] { N }, map1, isOutput: true),
                     new[] { 0 }, CodegenReduceKind.None));
-        }
 
-        // Streaming with an epilogue: more arithmetic, same bytes.
-        {
-            const int N = 1 << 22;
-            var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", N));
             yield return ("elementwise gelu 4M",
                 new CodegenKernelSpec("orc_gelu", space,
                     new[] { new CodegenTensorBinding(0, "x", new[] { N }, map1) },
                     new CodegenTensorBinding(1, "y", new[] { N }, map1, isOutput: true),
                     new[] { 0 }, CodegenReduceKind.None,
                     activation: CodegenActivationKind.Gelu));
+
+            // Mixed precision: half the bytes for the same arithmetic, so its ceiling halves.
+            yield return ("elementwise copy 4M, fp16",
+                new CodegenKernelSpec("orc_copy16", space,
+                    new[]
+                    {
+                        new CodegenTensorBinding(0, "x", new[] { N }, map1,
+                            elementType: CodegenElementType.Float16),
+                    },
+                    new CodegenTensorBinding(1, "y", new[] { N }, map1, isOutput: true,
+                        elementType: CodegenElementType.Float16),
+                    new[] { 0 }, CodegenReduceKind.None));
+
+            // Three outputs from one pass: the fusion case, where the ceiling counts the
+            // bytes ONCE while three separate kernels would move the input three times.
+            yield return ("three outputs from one pass 4M",
+                new CodegenKernelSpec("orc_multi", space,
+                    new[] { new CodegenTensorBinding(0, "x", new[] { N }, map1) },
+                    new CodegenTensorBinding(1, "a", new[] { N }, map1, isOutput: true),
+                    new[] { 0 }, CodegenReduceKind.None,
+                    extraOutputs: new[]
+                    {
+                        new CodegenExtraOutput(
+                            new CodegenTensorBinding(2, "b", new[] { N }, map1, isOutput: true),
+                            CodegenExtraOutputKind.AffineOfPrimary, Scale: 2.0),
+                        new CodegenExtraOutput(
+                            new CodegenTensorBinding(3, "c", new[] { N }, map1, isOutput: true),
+                            CodegenExtraOutputKind.AffineOfPrimary, Scale: -1.0),
+                    }));
         }
 
-        // A long reduction to a small output: reads a lot, writes almost nothing.
+        // ---- reductions ------------------------------------------------------------------
         {
             const int Rows = 4096, Inner = 1024;
             var space = new CodegenIterationSpace(
                 CodegenAxis.Parallel("i", Rows), CodegenAxis.Reduce("k", Inner));
-            yield return ("row sum 4096x1024",
-                new CodegenKernelSpec("orc_rowsum", space,
-                    new[]
-                    {
-                        new CodegenTensorBinding(0, "x", new[] { Rows, Inner },
-                            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }),
-                    },
-                    new CodegenTensorBinding(1, "y", new[] { Rows }, map1, isOutput: true),
-                    new[] { 0 }, CodegenReduceKind.Sum));
+            var x = new CodegenTensorBinding(0, "x", new[] { Rows, Inner },
+                new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+            var y = new CodegenTensorBinding(1, "y", new[] { Rows }, map1, isOutput: true);
+
+            var rowSum = new CodegenKernelSpec("orc_rowsum", space, new[] { x }, y,
+                new[] { 0 }, CodegenReduceKind.Sum);
+            yield return ("row sum 4096x1024", rowSum);
+
+            // THE SAME REDUCTION, SPLIT. One thread per row means consecutive threads read
+            // 1024 elements apart, so a warp touches 32 separate cache lines per load instead
+            // of four. Splitting the reduction axis gives consecutive threads consecutive k,
+            // which is the whole difference. Both halves are reported: a split that only
+            // moves cost into the combine pass is not a win.
+            var chunked = CodegenSplitReduction.SplitChunked(rowSum, reductionAxis: 1, splitFactor: 32);
+            yield return ("  row sum, split x32 (partial)", chunked.Partial);
+            yield return ("  row sum, split x32 (combine)", chunked.Combine);
+
+            // A softmax denominator: a reduction with a transform inside it.
+            yield return ("softmax denom 4096x1024",
+                new CodegenKernelSpec("orc_softden", space, new[] { x }, y,
+                    new[] { 0 }, CodegenReduceKind.Sum,
+                    preReduce: CodegenPreReduceOp.Exp));
+
+            // A max reduction: same traffic, different combine, and it cannot be split.
+            yield return ("row max 4096x1024",
+                new CodegenKernelSpec("orc_rowmax", space, new[] { x }, y,
+                    new[] { 0 }, CodegenReduceKind.Max));
         }
 
-        // fp32 matmul: the classic compute-bound shape, on the scalar pipe.
+        // ---- contractions ----------------------------------------------------------------
         {
             const int Size = 1024;
             var space = new CodegenIterationSpace(
                 CodegenAxis.Parallel("m", Size), CodegenAxis.Parallel("n", Size),
                 CodegenAxis.Reduce("k", Size));
-            yield return ("fp32 matmul 1024^3",
-                new CodegenKernelSpec("orc_gemm32", space,
+
+            CodegenKernelSpec Gemm(string name, CodegenElementType type) =>
+                new(name, space,
                     new[]
                     {
                         new CodegenTensorBinding(0, "a", new[] { Size, Size },
-                            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) }),
+                            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) },
+                            elementType: type),
                         new CodegenTensorBinding(1, "b", new[] { Size, Size },
-                            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) }),
+                            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) },
+                            elementType: type),
                     },
                     new CodegenTensorBinding(2, "c", new[] { Size, Size },
                         new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true),
-                    new[] { 0, 1 }, CodegenReduceKind.Sum));
+                    new[] { 0, 1 }, CodegenReduceKind.Sum);
+
+            yield return ("fp32 matmul 1024^3", Gemm("orc_gemm32", CodegenElementType.Float32));
+
+            // The fp16 shape is scored against the TENSOR-CORE rate, which is the only reason
+            // its ceiling is meaningful -- against the fp32 pipe it would read as over 100%.
+            yield return ("fp16 matmul 1024^3 (tensor core)",
+                Gemm("orc_gemm16", CodegenElementType.Float16));
         }
 
-        // An embedding gather: pure memory, and data-dependent, so its minimum traffic is not
-        // what a naive read of the shapes would suggest.
+        // ---- convolution -----------------------------------------------------------------
+        {
+            const int Batch = 32, Channels = 64, Height = 32, Width = 32, Filters = 64;
+            var space = new CodegenIterationSpace(
+                CodegenAxis.Parallel("n", Batch), CodegenAxis.Parallel("k", Filters),
+                CodegenAxis.Parallel("oh", Height), CodegenAxis.Parallel("ow", Width),
+                CodegenAxis.Reduce("c", Channels));
+
+            var input = new CodegenTensorBinding(0, "x", new[] { Batch, Channels, Height, Width },
+                new[]
+                {
+                    CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(4),
+                    CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(3),
+                });
+            var weights = new CodegenTensorBinding(1, "w", new[] { Filters, Channels },
+                new[] { CodegenAffineExpr.Axis(1), CodegenAffineExpr.Axis(4) });
+            var output = new CodegenTensorBinding(2, "y", new[] { Batch, Filters, Height, Width },
+                new[]
+                {
+                    CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1),
+                    CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(3),
+                }, isOutput: true);
+
+            yield return ("conv 1x1 32x64x32x32 -> 64",
+                new CodegenKernelSpec("orc_conv1x1", space, new[] { input, weights }, output,
+                    new[] { 0, 1 }, CodegenReduceKind.Sum,
+                    activation: CodegenActivationKind.ReLU));
+        }
+
+        // ---- data-dependent indexing -----------------------------------------------------
         {
             const int Tokens = 1 << 20, Vocabulary = 4096, Width = 64;
             var space = new CodegenIterationSpace(
@@ -271,12 +361,45 @@ internal static class KernelOracleTool
                     new CodegenIndirectIndex(0, CodegenAffineExpr.Axis(0), Vocabulary),
                     null,
                 });
-            var output = new CodegenTensorBinding(2, "out", new[] { Tokens, Width },
+            var gathered = new CodegenTensorBinding(2, "out", new[] { Tokens, Width },
                 new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
 
             yield return ("embedding gather 1M x 64",
-                new CodegenKernelSpec("orc_gather", space, new[] { ids, table }, output,
+                new CodegenKernelSpec("orc_gather", space, new[] { ids, table }, gathered,
                     new[] { 1 }, CodegenReduceKind.None));
+
+            // The backward: same traffic, but every store is an atomic accumulation.
+            var grad = new CodegenTensorBinding(1, "grad", new[] { Tokens, Width },
+                new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+            var gradTable = new CodegenTensorBinding(2, "grad_table", new[] { Vocabulary, Width },
+                new[] { CodegenAffineExpr.Const(0), CodegenAffineExpr.Axis(1) },
+                isOutput: true,
+                indirect: new CodegenIndirectIndex?[]
+                {
+                    new CodegenIndirectIndex(0, CodegenAffineExpr.Axis(0), Vocabulary),
+                    null,
+                });
+
+            yield return ("embedding scatter 1M x 64 (atomic)",
+                new CodegenKernelSpec("orc_scatter", space, new[] { ids, grad }, gradTable,
+                    new[] { 1 }, CodegenReduceKind.None));
+        }
+
+        // ---- complex arithmetic ----------------------------------------------------------
+        {
+            const int N = 1 << 21;
+            var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", N));
+
+            yield return ("complex elementwise product 2M",
+                new CodegenKernelSpec("orc_cmul", space,
+                    new[]
+                    {
+                        new CodegenTensorBinding(0, "a", new[] { N }, map1),
+                        new CodegenTensorBinding(1, "b", new[] { N }, map1),
+                    },
+                    new CodegenTensorBinding(2, "c", new[] { N }, map1, isOutput: true),
+                    new[] { 0, 1 }, CodegenReduceKind.None,
+                    algebra: CodegenAlgebra.Complex));
         }
     }
 }
