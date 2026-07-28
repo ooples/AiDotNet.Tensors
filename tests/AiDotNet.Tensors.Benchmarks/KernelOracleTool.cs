@@ -62,7 +62,7 @@ internal static class KernelOracleTool
 
         Console.WriteLine();
         Console.WriteLine(
-            "{0,-34} {1,10} {2,9} {3,10} {4,10} {5,9} {6,8}",
+            "{0,-34} {1,10} {2,9} {3,14} {4,10} {5,9} {6,8}",
             "kernel", "GFLOP", "AI f/B", "measured", "ceiling", "% of max", "limiter");
 
         foreach (var (label, spec) in Kernels())
@@ -137,12 +137,17 @@ internal static class KernelOracleTool
                 pointers[binding.ParameterIndex] = buffer.Pointer;
             }
 
-            var prediction = CodegenPerformanceModel.Predict(
+            var prediction0 = CodegenPerformanceModel.Predict(
                 spec, spec.Space.TotalThreads, emitter.DynamicLoadsPerThread,
                 machine, emitter.LaunchBlockX);
+            var prediction = prediction0;
 
-            double measured = Time(runtime, module, fn, pointers,
-                (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
+            var timing = StableTimer.Measure(
+                runtime,
+                () => Launch(module, fn, pointers,
+                             (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX),
+                workUnits: Math.Max(prediction0.Macs, prediction0.UniqueBytes));
+            double measured = timing.Microseconds;
 
             // The CEILING is the binding roofline term, not the model's full prediction: the
             // prediction includes issue and occupancy penalties, which are properties of the
@@ -153,14 +158,19 @@ internal static class KernelOracleTool
             double intensity = prediction.UniqueBytes > 0
                 ? flops / prediction.UniqueBytes : double.PositiveInfinity;
 
+            // AN UNSTABLE ROW REPORTS NO PERCENTAGE. Deriving "13.5% of ceiling" from samples
+            // that disagree by half is how a ranked work list gets built on noise, which is
+            // what happened before this gate existed.
             Console.WriteLine(
-                "{0,-34} {1,10} {2,9} {3,10} {4,10} {5,9} {6,8}",
+                "{0,-34} {1,10} {2,9} {3,14} {4,10} {5,9} {6,8}",
                 label,
                 (flops / 1e9).ToString("0.00", CultureInfo.InvariantCulture),
                 intensity.ToString("0.0", CultureInfo.InvariantCulture),
-                measured.ToString("0.0", CultureInfo.InvariantCulture) + " us",
+                timing.Describe(),
                 ceiling.ToString("0.0", CultureInfo.InvariantCulture) + " us",
-                (ceiling / measured * 100.0).ToString("0.0", CultureInfo.InvariantCulture) + "%",
+                timing.Stable
+                    ? (ceiling / measured * 100.0).ToString("0.0", CultureInfo.InvariantCulture) + "%"
+                    : "-",
                 prediction.ComputeMicroseconds >= prediction.DramMicroseconds ? "compute" : "memory");
         }
         catch (Exception ex)
