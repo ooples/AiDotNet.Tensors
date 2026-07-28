@@ -211,7 +211,7 @@ internal static class TensorCoreCheckTool
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
         IntPtr[] pointers, long macs, PtxTensorCoreEmitter.Plan plan)
     {
-        if (!PtxTensorCoreEmitter.CanDoubleBuffer(plan, out _)) return 0;
+        if (!new PtxTensorCoreEmitter().CanDoubleBuffer(plan, out _)) return 0;
 
         try
         {

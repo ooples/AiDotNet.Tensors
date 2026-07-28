@@ -25,6 +25,18 @@ public class CodegenTensorCoreStagingTests
 {
     private const int Sm86Major = 8, Sm86Minor = 6;
 
+    /// <summary>
+    /// An emitter pinned to the 2x2 warp tile.
+    /// </summary>
+    /// <remarks>
+    /// The emitter now SELECTS the largest warp tile the shape allows, so a test about the
+    /// structure a particular tile produces -- how many mma instructions, how much shared
+    /// memory, how many stores -- has to pin one. See WarpTileSelection_PicksTheLargestThatFits
+    /// for the selector itself.
+    /// </remarks>
+    private static PtxTensorCoreEmitter Tile2x2() =>
+        new() { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
+
     private static CodegenKernelSpec MatMul(
         int m, int k, int n,
         CodegenActivationKind activation = CodegenActivationKind.None,
@@ -67,7 +79,7 @@ public class CodegenTensorCoreStagingTests
     [InlineData(1024, 4096, 1024)]
     public void WholeBlockTiles_AreEligible(int m, int k, int n)
     {
-        Assert.True(PtxTensorCoreEmitter.CanStage(PlanFor(MatMul(m, k, n)), out string reason),
+        Assert.True(Tile2x2().CanStage(PlanFor(MatMul(m, k, n)), out string reason),
             reason);
     }
 
@@ -80,7 +92,7 @@ public class CodegenTensorCoreStagingTests
     [InlineData(64, 64, 48)]
     public void PartialBlockTiles_FallBack(int m, int k, int n)
     {
-        Assert.False(PtxTensorCoreEmitter.CanStage(PlanFor(MatMul(m, k, n)), out string reason));
+        Assert.False(Tile2x2().CanStage(PlanFor(MatMul(m, k, n)), out string reason));
         Assert.Contains("block tile", reason, StringComparison.Ordinal);
 
         // ...and the naive path still handles them, exactly as before.
@@ -93,7 +105,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void TransposedB_FallsBack()
     {
-        Assert.False(PtxTensorCoreEmitter.CanStage(
+        Assert.False(Tile2x2().CanStage(
             PlanFor(MatMul(128, 128, 128, transposeB: true)), out string reason));
         Assert.Contains("column-wise", reason, StringComparison.Ordinal);
     }
@@ -118,7 +130,8 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void StagedKernel_IssuesFourMmaPerStep()
     {
-        var emitter = new PtxTensorCoreEmitter { EnableDoubleBuffering = false };
+        var emitter = Tile2x2();
+        emitter.EnableDoubleBuffering = false;
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         Assert.Equal(4, emitter.MmaInstructions);
@@ -135,7 +148,8 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void SingleBuffered_BarriersOnBothSidesOfTheComputation()
     {
-        var emitter = new PtxTensorCoreEmitter { EnableDoubleBuffering = false };
+        var emitter = Tile2x2();
+        emitter.EnableDoubleBuffering = false;
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.Staged);
@@ -158,7 +172,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void DoubleBuffered_NeedsOneBarrierPerStep()
     {
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Tile2x2();
         emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.DoubleBuffered);
@@ -200,10 +214,10 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void DoubleBuffered_ReservesTwoDistinctBuffers()
     {
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Tile2x2();
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
-        Assert.Equal(PtxTensorCoreEmitter.StageBufferBytes * 2, emitter.SharedMemoryBytes);
+        Assert.Equal(emitter.StageBufferBytes * 2, emitter.SharedMemoryBytes);
         Assert.Contains(".shared .align 16 .b8 stage[8192];", ptx, StringComparison.Ordinal);
 
         // Buffer 1's slabs sit one whole buffer further along.
@@ -236,23 +250,23 @@ public class CodegenTensorCoreStagingTests
     public void OddStepCount_FallsBackToSingleBuffered()
     {
         // K = 48 gives three 16-deep steps.
-        Assert.False(PtxTensorCoreEmitter.CanDoubleBuffer(
+        Assert.False(Tile2x2().CanDoubleBuffer(
             PlanFor(MatMul(64, 48, 64)), out string reason));
         Assert.Contains("even", reason, StringComparison.Ordinal);
 
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Tile2x2();
         emitter.Emit(MatMul(64, 48, 64), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.Staged);
         Assert.False(emitter.DoubleBuffered);
-        Assert.Equal(PtxTensorCoreEmitter.StageBufferBytes, emitter.SharedMemoryBytes);
+        Assert.Equal(Tile2x2().StageBufferBytes, emitter.SharedMemoryBytes);
     }
 
     /// <summary>A single K step has nothing to overlap with.</summary>
     [Fact]
     public void SingleStep_FallsBackToSingleBuffered()
     {
-        Assert.False(PtxTensorCoreEmitter.CanDoubleBuffer(
+        Assert.False(Tile2x2().CanDoubleBuffer(
             PlanFor(MatMul(64, 16, 64)), out string reason));
         Assert.Contains("at least two", reason, StringComparison.Ordinal);
     }
@@ -261,7 +275,8 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void StagedKernel_ReservesBothSlabs()
     {
-        var emitter = new PtxTensorCoreEmitter { EnableDoubleBuffering = false };
+        var emitter = Tile2x2();
+        emitter.EnableDoubleBuffering = false;
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         // 64x16 halves of A plus 16x64 of B, two bytes each.
@@ -282,7 +297,7 @@ public class CodegenTensorCoreStagingTests
     [InlineData(1024, 1024, 256)]
     public void StagedGrid_IsOneBlockPerBlockTile(int m, int n, int expectedBlocks)
     {
-        var emitter = new PtxTensorCoreEmitter();
+        var emitter = Tile2x2();
         var plan = PlanFor(MatMul(m, 64, n));
 
         Assert.Equal(expectedBlocks, emitter.BlockCount(plan));
@@ -310,7 +325,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void StagedKernel_KeepsTheFusedEpilogue()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(
+        string ptx = Tile2x2().Emit(
             MatMul(512, 512, 512, CodegenActivationKind.ReLU), Sm86Major, Sm86Minor);
 
         // Once per accumulator register of all four tiles.
@@ -323,9 +338,63 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void StagedKernel_StoresAllFourTiles()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+        string ptx = Tile2x2().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         Assert.Equal(4, CountOccurrences(ptx, "wmma.store.d.sync"));
+    }
+
+    /// <summary>
+    /// The emitter picks the LARGEST warp tile whose block tile divides the output.
+    /// </summary>
+    /// <remarks>
+    /// Derived from `--warp-tile-sweep`, which verified and timed every candidate at four
+    /// shapes: the bigger tile won wherever it fits, by 1.28x at 2048^3 and 1.32x at 4096^3.
+    /// The mechanism is the one the profile named -- L1TEX falls from 92.34% to 61.38% and
+    /// the tensor pipe rises from 26.79% to 35.74%.
+    /// </remarks>
+    [Theory]
+    [InlineData(128, 128, 4, 4)]      // both divide by 128
+    [InlineData(128, 64, 4, 2)]       // N only reaches 64
+    [InlineData(64, 128, 2, 4)]
+    [InlineData(64, 64, 2, 2)]
+    [InlineData(1024, 1024, 4, 4)]
+    public void WarpTileSelection_PicksTheLargestThatFits(int m, int n, int tileM, int tileN)
+    {
+        var emitter = new PtxTensorCoreEmitter();
+        emitter.Emit(MatMul(m, 64, n), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.Staged);
+        Assert.Equal(tileM, emitter.WarpTilesM);
+        Assert.Equal(tileN, emitter.WarpTilesN);
+    }
+
+    /// <summary>A pinned tile is not overridden -- that is what the sweep depends on.</summary>
+    [Fact]
+    public void PinnedWarpTile_IsNotOverridden()
+    {
+        var emitter = Tile2x2();
+        emitter.Emit(MatMul(1024, 64, 1024), Sm86Major, Sm86Minor);
+
+        Assert.Equal(2, emitter.WarpTilesM);
+        Assert.Equal(2, emitter.WarpTilesN);
+    }
+
+    /// <summary>
+    /// A larger tile means more accumulator registers -- 8 per wmma tile per thread -- and
+    /// that is the trade the sweep exists to measure rather than assume.
+    /// </summary>
+    [Fact]
+    public void LargerWarpTile_CostsMoreSharedMemoryAndRegisters()
+    {
+        var small = new PtxTensorCoreEmitter { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
+        var large = new PtxTensorCoreEmitter { WarpTilesM = 4, WarpTilesN = 4, PinWarpTile = true };
+
+        small.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+        large.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.True(large.SharedMemoryBytes > small.SharedMemoryBytes);
+        Assert.Equal(16, large.MmaInstructions / 2);       // 16 per body, two bodies
+        Assert.Equal(4, small.MmaInstructions / 2);
     }
 
     private static int CountOccurrences(string haystack, string needle)

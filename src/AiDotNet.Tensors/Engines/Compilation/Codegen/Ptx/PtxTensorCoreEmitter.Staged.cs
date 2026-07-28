@@ -39,26 +39,45 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
 public sealed partial class PtxTensorCoreEmitter
 {
-    /// <summary>Output rows a block computes.</summary>
-    public const int BlockTileM = 64;
-
-    /// <summary>Output columns a block computes.</summary>
-    public const int BlockTileN = 64;
-
     /// <summary>Contraction depth staged per step.</summary>
     public const int BlockTileK = 16;
 
     /// <summary>Warps per staged block. Four, arranged 2x2 over the block tile.</summary>
     public const int StagedWarps = 4;
 
-    /// <summary>wmma tiles a warp owns along each axis (its quadrant is 32x32).</summary>
-    private const int WarpTiles = 2;
+    /// <summary>
+    /// wmma tiles a warp owns along the M axis.
+    /// </summary>
+    /// <remarks>
+    /// THIS IS THE SHARED-TRAFFIC KNOB, and it is measured rather than argued. A warp loads
+    /// <c>WarpTilesM + WarpTilesN</c> fragments and issues <c>WarpTilesM * WarpTilesN</c> mma
+    /// instructions from them, so the fragment loads per unit of arithmetic fall as the tile
+    /// grows: 2x2 is one load per mma, 4x4 is half that. The profile said that ratio is what
+    /// matters -- L1TEX at 87.14% with the tensor pipe at 25.29%, and shared memory IS L1TEX
+    /// on this hardware.
+    ///
+    /// It trades against registers: the accumulators alone are
+    /// <c>WarpTilesM * WarpTilesN * 8</c> fp32 per thread, so 4x4 is 128 before any operand
+    /// or address register. Past some point ptxas spills, and a spilling GEMM is slower than
+    /// a small-tiled one. Which side of that point a shape sits on is not something to
+    /// predict -- see the two levers on this branch that were predicted and did not pay.
+    /// </remarks>
+    public int WarpTilesM { get; set; } = 2;
+
+    /// <summary>wmma tiles a warp owns along the N axis. See <see cref="WarpTilesM"/>.</summary>
+    public int WarpTilesN { get; set; } = 2;
+
+    /// <summary>Output rows a block computes: two warp rows of <see cref="WarpTilesM"/> tiles.</summary>
+    public int BlockTileM => WarpTilesM * 16 * 2;
+
+    /// <summary>Output columns a block computes.</summary>
+    public int BlockTileN => WarpTilesN * 16 * 2;
 
     /// <summary>Bytes one staging buffer occupies: the A slab followed by the B slab.</summary>
-    public const int StageBufferBytes = (BlockTileM * BlockTileK + BlockTileK * BlockTileN) * 2;
+    public int StageBufferBytes => (BlockTileM * BlockTileK + BlockTileK * BlockTileN) * 2;
 
     /// <summary>Byte offset of the B slab inside a buffer.</summary>
-    private const int BSlabOffset = BlockTileM * BlockTileK * 2;
+    private int BSlabOffset => BlockTileM * BlockTileK * 2;
 
     /// <summary>Whether the last emission used the shared-memory staged lowering.</summary>
     public bool Staged { get; private set; }
@@ -91,7 +110,7 @@ public sealed partial class PtxTensorCoreEmitter
     /// its slab gathered column-wise instead of copied. Both fall back to the naive path,
     /// which is correct at every shape.
     /// </remarks>
-    public static bool CanStage(Plan plan, out string reason)
+    public bool CanStage(Plan plan, out string reason)
     {
         if (plan is null) throw new ArgumentNullException(nameof(plan));
 
@@ -129,7 +148,7 @@ public sealed partial class PtxTensorCoreEmitter
     /// an even step count. An odd one falls back to single-buffered staging, which is correct
     /// and merely slower -- padding K to make it even would change the operator.
     /// </remarks>
-    public static bool CanDoubleBuffer(Plan plan, out string reason)
+    public bool CanDoubleBuffer(Plan plan, out string reason)
     {
         if (plan is null) throw new ArgumentNullException(nameof(plan));
 
@@ -154,18 +173,18 @@ public sealed partial class PtxTensorCoreEmitter
     }
 
     /// <summary>Blocks a staged plan launches.</summary>
-    public static int StagedBlockCount(Plan plan) =>
+    public int StagedBlockCount(Plan plan) =>
         plan is null ? throw new ArgumentNullException(nameof(plan))
                      : (plan.M / BlockTileM) * (plan.N / BlockTileN);
 
     // Shared slab geometry, in u32 words, which is what the cooperative copy moves.
-    private const int AWords = BlockTileM * BlockTileK / 2;      // 512
-    private const int BWords = BlockTileK * BlockTileN / 2;      // 512
+    private int AWords => BlockTileM * BlockTileK / 2;
+    private int BWords => BlockTileK * BlockTileN / 2;
     private const int StageThreads = StagedWarps * 32;           // 128
-    private const int AWordsPerThread = AWords / StageThreads;   // 4
-    private const int BWordsPerThread = BWords / StageThreads;   // 4
+    private int AWordsPerThread => AWords / StageThreads;
+    private int BWordsPerThread => BWords / StageThreads;
     private const int AWordsPerRow = BlockTileK / 2;             // 8
-    private const int BWordsPerRow = BlockTileN / 2;             // 32
+    private int BWordsPerRow => BlockTileN / 2;
 
     /// <summary>Emits the staged kernel, double-buffered where the shape allows it.</summary>
     private string EmitStaged(CodegenKernelSpec spec, Plan plan, int computeMajor, int computeMinor)
@@ -288,14 +307,14 @@ public sealed partial class PtxTensorCoreEmitter
         string warpAOffset = NextRd(), warpBOffset = NextRd();
         {
             string aBytes = NextR(), bBytes = NextR();
-            L($"mul.lo.u32 {aBytes}, %r5, {I(WarpTiles * 16 * BlockTileK * 2)};");
+            L($"mul.lo.u32 {aBytes}, %r5, {I(WarpTilesM * 16 * BlockTileK * 2)};");
             L($"mul.wide.u32 {warpAOffset}, {aBytes}, 1;");
-            L($"mul.lo.u32 {bBytes}, %r6, {I(WarpTiles * 16 * 2)};");
+            L($"mul.lo.u32 {bBytes}, %r6, {I(WarpTilesN * 16 * 2)};");
             L($"mul.wide.u32 {warpBOffset}, {bBytes}, 1;");
         }
 
         // Accumulators: one fragment per (i, j) quadrant tile.
-        for (int t = 0; t < WarpTiles * WarpTiles; t++)
+        for (int t = 0; t < WarpTilesM * WarpTilesN; t++)
             for (int f = 0; f < FragmentRegisters; f++)
                 L($"mov.f32 %fc{I(t * FragmentRegisters + f)}, 0f00000000;");
 
@@ -374,30 +393,30 @@ public sealed partial class PtxTensorCoreEmitter
 
         // ---- epilogue and store ----------------------------------------------------------
         if (spec.Activation != CodegenActivationKind.None)
-            for (int t = 0; t < WarpTiles * WarpTiles; t++)
+            for (int t = 0; t < WarpTilesM * WarpTilesN; t++)
                 for (int f = 0; f < FragmentRegisters; f++)
                     EmitActivation(spec.Activation, $"%fc{I(t * FragmentRegisters + f)}");
 
         if (spec.ReduceScale != 1.0)
-            for (int t = 0; t < WarpTiles * WarpTiles; t++)
+            for (int t = 0; t < WarpTilesM * WarpTilesN; t++)
                 for (int f = 0; f < FragmentRegisters; f++)
                 {
                     string reg = $"%fc{I(t * FragmentRegisters + f)}";
                     L($"mul.f32 {reg}, {reg}, {F32(spec.ReduceScale)};");
                 }
 
-        for (int i = 0; i < WarpTiles; i++)
-            for (int j = 0; j < WarpTiles; j++)
+        for (int i = 0; i < WarpTilesM; i++)
+            for (int j = 0; j < WarpTilesN; j++)
             {
-                int t = i * WarpTiles + j;
+                int t = i * WarpTilesN + j;
                 string row = NextR(), col = NextR(), off = NextR();
 
                 L($"mul.lo.u32 {row}, %r2, {I(BlockTileM)};");
-                L($"mad.lo.u32 {row}, %r5, {I(WarpTiles * 16)}, {row};");
+                L($"mad.lo.u32 {row}, %r5, {I(WarpTilesM * 16)}, {row};");
                 L($"add.u32 {row}, {row}, {I(i * 16)};");
 
                 L($"mul.lo.u32 {col}, %r3, {I(BlockTileN)};");
-                L($"mad.lo.u32 {col}, %r6, {I(WarpTiles * 16)}, {col};");
+                L($"mad.lo.u32 {col}, %r6, {I(WarpTilesN * 16)}, {col};");
                 L($"add.u32 {col}, {col}, {I(j * 16)};");
 
                 L($"mad.lo.u32 {off}, {row}, {I(plan.N)}, {col};");
@@ -416,10 +435,10 @@ public sealed partial class PtxTensorCoreEmitter
               .Append("    .reg .b32    %r<").Append(I(_reg + 8)).Append(">;\n")
               .Append("    .reg .f32    %f<40>;\n")
               .Append("    .reg .b64    %rd<").Append(I(_reg64 + 8)).Append(">;\n")
-              .Append("    .reg .b32    %fa<").Append(I(WarpTiles * FragmentRegisters)).Append(">;\n")
-              .Append("    .reg .b32    %fb<").Append(I(WarpTiles * FragmentRegisters)).Append(">;\n")
+              .Append("    .reg .b32    %fa<").Append(I(Math.Max(WarpTilesM, WarpTilesN) * FragmentRegisters)).Append(">;\n")
+              .Append("    .reg .b32    %fb<").Append(I(Math.Max(WarpTilesM, WarpTilesN) * FragmentRegisters)).Append(">;\n")
               .Append("    .reg .f32    %fc<")
-              .Append(I(WarpTiles * WarpTiles * FragmentRegisters)).Append(">;\n\n")
+              .Append(I(WarpTilesM * WarpTilesN * FragmentRegisters)).Append(">;\n\n")
               .Append(_sb);
 
         return header.ToString();
@@ -485,7 +504,7 @@ public sealed partial class PtxTensorCoreEmitter
     {
         int bufferBase = buffer * StageBufferBytes;
 
-        for (int i = 0; i < WarpTiles; i++)
+        for (int i = 0; i < WarpTilesM; i++)
         {
             string addr = NextRd();
             L($"add.u64 {addr}, %rd3, {warpAOffset};");
@@ -494,7 +513,7 @@ public sealed partial class PtxTensorCoreEmitter
               $"[{addr}+{I(bufferBase + i * 16 * BlockTileK * 2)}], {I(BlockTileK)};");
         }
 
-        for (int j = 0; j < WarpTiles; j++)
+        for (int j = 0; j < WarpTilesN; j++)
         {
             string addr = NextRd();
             L($"add.u64 {addr}, %rd3, {warpBOffset};");
@@ -503,10 +522,10 @@ public sealed partial class PtxTensorCoreEmitter
               $"[{addr}+{I(bufferBase + BSlabOffset + j * 16 * 2)}], {I(BlockTileN)};");
         }
 
-        for (int i = 0; i < WarpTiles; i++)
-            for (int j = 0; j < WarpTiles; j++)
+        for (int i = 0; i < WarpTilesM; i++)
+            for (int j = 0; j < WarpTilesN; j++)
             {
-                int t = i * WarpTiles + j;
+                int t = i * WarpTilesN + j;
                 L($"wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 " +
                   $"{Fragment("%fc", t * FragmentRegisters)}, {Fragment("%fa", i * FragmentRegisters)}, " +
                   $"{Fragment("%fb", j * FragmentRegisters)}, {Fragment("%fc", t * FragmentRegisters)};");

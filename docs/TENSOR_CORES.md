@@ -229,26 +229,56 @@ this hardware, so the `wmma.load.*.shared` traffic feeding the fragments is at a
 kernel is not waiting on global memory — DRAM is at 52.85% — it is waiting on shared-memory
 reads.
 
-### The next lever, derived rather than guessed
+### The larger warp tile — derived from the profile, then measured
 
-A **larger per-warp register tile**, not a larger block tile. Each warp currently loads two A
-fragments and two B fragments to issue four mma instructions — one fragment load per mma. A
-4×4 warp tile loads four and four to issue sixteen: **half the shared traffic per unit of
-arithmetic**, aimed directly at the 87% L1TEX figure.
+A warp loads `M + N` fragments and issues `M × N` mma instructions from them, so the fragment
+loads per unit of arithmetic fall as the tile grows. That is the ratio the profile pointed at.
 
-Note this is *not* what the previous version of this document proposed. That said "a 128×128
-block tile, quadrupling reuse again", which targets global traffic — and DRAM is at 52.85%,
-not the limiter. The profile changed the answer.
+Swept rather than chosen, because the accumulators are `M × N × 8` fp32 per thread and past
+some point ptxas spills. Every candidate verified at `0.000E+000` before being timed:
 
-## Standing## Standing
+| shape | 2×2 | 2×4 | 4×2 | 4×4 |
+|---|---|---|---|---|
+| 512³ | 7.0 TF | 6.8 | **8.8** | 6.4 |
+| 1024³ | 26.2 TF | 27.2 | **29.9** | 28.6 |
+| 2048³ | 31.4 TF | 29.8 | 37.6 | **40.2** |
+| 4096³ | 33.2 TF | 36.7 | 42.8 | **43.9** |
+
+**1.28× at 2048³ and 1.32× at 4096³.** And the mechanism is confirmed rather than assumed —
+re-profiling 4096³ at both tiles:
+
+| metric | 2×2 | 4×4 |
+|---|---|---|
+| **l1tex throughput** | 92.34% | **61.38%** |
+| dram throughput | 52.05% | **22.40%** |
+| **tensor pipe active** | 26.79% | **35.74%** |
+| registers per thread | 79 | 240 (no spill) |
+
+L1TEX came off the roofline exactly as the shared-traffic argument predicted, and the tensor
+pipe rose. DRAM fell too, because a bigger block tile also cuts global traffic.
+
+The emitter now picks the largest warp tile whose block tile divides the output. That is a
+**ladder derived from measurement**, not a cost model, and it is not optimal everywhere: at
+1024³ the measured best was 4×2 at 71.9 µs against 4×4's 75.0 µs, so the rule gives up 4%
+there. Closing that needs a per-shape autotune pass, not a cleverer rule — a static model
+picked lowerings four times on this branch and lost to the hardware every time it was checked.
+
+## Standing## Standing## Standing
 
 Expressiveness: **closed.** The generator can emit tensor-core kernels, with fused
 element-wise epilogues cuBLAS cannot fuse through its own call boundary.
 
-Performance: **improved and still a loss.** 0.84× / 0.63× / 0.57× against cuBLAS after staging
-and double buffering, up from 0.35× / 0.23× / 0.05%. Roughly 53% of device peak against its
-93%. The limiter is now measured rather than assumed: L1TEX at 87.14% with the tensor pipe at
-25.29%.
+Performance: **improved and still a loss.** Against cuBLAS, across the campaign:
+
+| shape | naive | staged | + double buffer | **+ warp tile** | cuBLAS |
+|---|---|---|---|---|---|
+| 1024³ | 0.35× | 0.80× | 0.84× | **0.93×** | 32.2 TF |
+| 2048³ | 0.23× | 0.60× | 0.63× | **0.78×** | 51.5 TF |
+| 4096³ | 0.05× | 0.57× | 0.57× | **0.76×** | 57.6 TF |
+
+Roughly 76% of cuBLAS at the largest shape, from 5%. Still a loss, and still reported as one.
+L1TEX is now 61.38% rather than a roofline, so the next limiter is no longer the one this
+work addressed and must be re-measured before anything else is built.
 
 Promotion: still **withheld everywhere**. At 0.57–0.80×, routing a caller who could reach
 cuBLAS to us is still a regression — smaller, but a regression. The capability ships; the

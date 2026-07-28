@@ -265,6 +265,46 @@ public sealed partial class PtxTensorCoreEmitter
     /// <summary>Threads a block launches: one warp per output tile, <see cref="WarpsPerBlock"/> per block.</summary>
     public int BlockThreads => WarpsPerBlock * 32;
 
+    /// <summary>
+    /// Picks the largest warp tile whose block tile divides the output, unless the caller
+    /// pinned one.
+    /// </summary>
+    /// <remarks>
+    /// A LADDER DERIVED FROM MEASUREMENT, not from a cost model. `--warp-tile-sweep` timed
+    /// every candidate at four shapes on an idle GPU, and the bigger tile won wherever it
+    /// fits, by 1.28x at 2048^3 and 1.32x at 4096^3, for the reason the profile gave: L1TEX
+    /// falls from 92.34% to 61.38% and the tensor pipe rises from 26.79% to 35.74%.
+    ///
+    /// It is not optimal everywhere. At 1024^3 the measured best was 4x2 at 71.9us against
+    /// 4x4's 75.0us -- this rule gives up 4% there. Closing that needs a per-shape autotune
+    /// pass (`--kernel-autotune` already exists for the affine kernels), not a cleverer rule:
+    /// a static model picked lowerings four times on this branch and lost to the hardware
+    /// every time it was checked.
+    /// </remarks>
+    private void SelectWarpTile(Plan plan)
+    {
+        if (PinWarpTile) return;
+
+        foreach (var (m, n) in new[] { (4, 4), (4, 2), (2, 4), (2, 2) })
+        {
+            if (plan.M % (m * 32) == 0 && plan.N % (n * 32) == 0)
+            {
+                WarpTilesM = m;
+                WarpTilesN = n;
+                return;
+            }
+        }
+
+        WarpTilesM = 2;
+        WarpTilesN = 2;
+    }
+
+    /// <summary>
+    /// Keeps the caller's <see cref="WarpTilesM"/>/<see cref="WarpTilesN"/> instead of
+    /// selecting one. Used by the sweep, which is measuring the candidates.
+    /// </summary>
+    public bool PinWarpTile { get; set; }
+
     /// <summary>Blocks needed to cover a plan, under the lowering this emitter will pick.</summary>
     /// <remarks>
     /// THE TWO LOWERINGS NEED DIFFERENT GRIDS and it is not a small difference: staged, four
@@ -276,7 +316,11 @@ public sealed partial class PtxTensorCoreEmitter
     {
         if (plan is null) throw new ArgumentNullException(nameof(plan));
 
-        if (EnableStaging && CanStage(plan, out _)) return StagedBlockCount(plan);
+        if (EnableStaging)
+        {
+            SelectWarpTile(plan);
+            if (CanStage(plan, out _)) return StagedBlockCount(plan);
+        }
         return (plan.TileCount + WarpsPerBlock - 1) / WarpsPerBlock;
     }
 
@@ -302,8 +346,12 @@ public sealed partial class PtxTensorCoreEmitter
         // the naive one moves O(M*N*K) operand bytes and collapses from 11.8 to 3.0 TFLOP/s
         // when the reused bands outgrow L2. Shapes it cannot cover fall back, and the naive
         // path stays correct at every shape.
-        if (EnableStaging && CanStage(plan, out _))
-            return EmitStaged(spec, plan, computeMajor, computeMinor);
+        if (EnableStaging)
+        {
+            SelectWarpTile(plan);
+            if (CanStage(plan, out _))
+                return EmitStaged(spec, plan, computeMajor, computeMinor);
+        }
 
         int aIndex = spec.ProductInputs[0], bIndex = spec.ProductInputs[1];
         int outIndex = spec.Inputs.Count;
