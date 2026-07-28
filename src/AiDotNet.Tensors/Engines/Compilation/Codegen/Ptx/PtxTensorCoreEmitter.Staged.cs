@@ -73,11 +73,44 @@ public sealed partial class PtxTensorCoreEmitter
     /// <summary>Output columns a block computes.</summary>
     public int BlockTileN => WarpTilesN * 16 * 2;
 
+    /// <summary>
+    /// Halves of padding added to each shared-memory row, to break bank conflicts.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// MEASURED, not theoretical: the unpadded kernel reported 150,994,944 shared-load bank
+    /// conflicts against 201,784,580 wavefronts -- 74.8% -- while store conflicts were zero.
+    /// An A row of 16 halves is 32 bytes, and shared memory has 32 four-byte banks, so rows
+    /// four apart land on identical banks and a warp's fragment read serialises.
+    /// </para>
+    /// <para>
+    /// Padding changes the row stride so successive rows walk the banks instead of stacking on
+    /// them. It is the ONLY such lever available while fragments are read with
+    /// <c>wmma.load</c>: that instruction takes a base address and a stride and generates its
+    /// own lane addresses, so an XOR swizzle -- which remaps individual addresses -- cannot be
+    /// applied to it. XOR would require <c>ldmatrix</c> + <c>mma.sync</c>, where the emitter
+    /// computes each lane's address itself.
+    /// </para>
+    /// <para>
+    /// EIGHT halves, not one. One would break the 16-byte alignment <c>cp.async</c> requires;
+    /// eight is 16 bytes and keeps every row start aligned while still moving each row on by
+    /// a non-power-of-two number of banks.
+    /// </para>
+    /// </remarks>
+    public int SharedPadHalves { get; set; } = 8;
+
+    /// <summary>Bytes of one padded shared row of the A slab.</summary>
+    private int ASharedRowBytes => (BlockTileK + SharedPadHalves) * 2;
+
+    /// <summary>Bytes of one padded shared row of the B slab.</summary>
+    private int BSharedRowBytes => (BlockTileN + SharedPadHalves) * 2;
+
     /// <summary>Bytes one staging buffer occupies: the A slab followed by the B slab.</summary>
-    public int StageBufferBytes => (BlockTileM * BlockTileK + BlockTileK * BlockTileN) * 2;
+    public int StageBufferBytes =>
+        BlockTileM * ASharedRowBytes + BlockTileK * BSharedRowBytes;
 
     /// <summary>Byte offset of the B slab inside a buffer.</summary>
-    private int BSlabOffset => BlockTileM * BlockTileK * 2;
+    private int BSlabOffset => BlockTileM * ASharedRowBytes;
 
     /// <summary>Whether the last emission used the shared-memory staged lowering.</summary>
     public bool Staged { get; private set; }
@@ -115,6 +148,30 @@ public sealed partial class PtxTensorCoreEmitter
 
     /// <summary>Whether the last emission staged with <c>cp.async</c>.</summary>
     public bool AsyncCopy { get; private set; }
+
+    /// <summary>
+    /// Emits a CEILING PROBE instead of a real kernel: the fragment loads are hoisted out of
+    /// the K loop so the loop body is nothing but <c>wmma.mma</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is an ORACLE, not an optimisation. It computes the wrong answer -- every K step
+    /// multiplies the same fragments -- and exists only to answer one question: with memory
+    /// traffic removed entirely, what does THIS tile shape and THIS instruction mix achieve?
+    /// </para>
+    /// <para>
+    /// Without it, progress can only be measured against cuBLAS, which conflates "how much
+    /// headroom is left" with "how good is the competitor". The probe splits that: the gap
+    /// from probe to hardware peak is what the instruction mix costs, and the gap from the
+    /// real kernel to the probe is what memory costs. Only the second is addressable by
+    /// staging, swizzling or pipelining.
+    /// </para>
+    /// <para>
+    /// The accumulator chain is loop-carried, so the mma instructions cannot be hoisted or
+    /// eliminated by ptxas -- each depends on the previous one's result.
+    /// </para>
+    /// </remarks>
+    public bool MmaCeilingProbe { get; set; }
 
     /// <summary>
     /// Whether to double-buffer the staging slabs when the shape allows it.
@@ -342,13 +399,23 @@ public sealed partial class PtxTensorCoreEmitter
         var bSharedOffset = new string[BWordsPerThread];
         for (int w = 0; w < AWordsPerThread; w++)
         {
+            string row = NextR(), col = NextR(), off = NextR();
+            L($"div.u32 {row}, {aWordIndex[w]}, {I(AWordsPerRow)};");
+            L($"rem.u32 {col}, {aWordIndex[w]}, {I(AWordsPerRow)};");
+            L($"mul.lo.u32 {off}, {row}, {I(ASharedRowBytes)};");
+            L($"mad.lo.u32 {off}, {col}, 4, {off};");
             aSharedOffset[w] = NextRd();
-            L($"mul.wide.u32 {aSharedOffset[w]}, {aWordIndex[w]}, 4;");
+            L($"mul.wide.u32 {aSharedOffset[w]}, {off}, 1;");
         }
         for (int w = 0; w < BWordsPerThread; w++)
         {
+            string row = NextR(), col = NextR(), off = NextR();
+            L($"div.u32 {row}, {bWordIndex[w]}, {I(BWordsPerRow)};");
+            L($"rem.u32 {col}, {bWordIndex[w]}, {I(BWordsPerRow)};");
+            L($"mul.lo.u32 {off}, {row}, {I(BSharedRowBytes)};");
+            L($"mad.lo.u32 {off}, {col}, 4, {off};");
             bSharedOffset[w] = NextRd();
-            L($"mul.wide.u32 {bSharedOffset[w]}, {bWordIndex[w]}, 4;");
+            L($"mul.wide.u32 {bSharedOffset[w]}, {off}, 1;");
         }
 
         // cp.async addressing: each thread owns whole 16-byte chunks. Within a slab, chunk c
@@ -376,7 +443,8 @@ public sealed partial class PtxTensorCoreEmitter
                 L($"mul.wide.u32 {asyncAGlobal[w]}, {off}, 1;");
 
                 string sharedOff = NextR();
-                L($"mul.lo.u32 {sharedOff}, {chunk}, {I(AsyncChunkBytes)};");
+                L($"mul.lo.u32 {sharedOff}, {row}, {I(ASharedRowBytes)};");
+                L($"mad.lo.u32 {sharedOff}, {inRow}, {I(AsyncChunkBytes)}, {sharedOff};");
                 asyncAShared[w] = NextRd();
                 L($"mul.wide.u32 {asyncAShared[w]}, {sharedOff}, 1;");
             }
@@ -393,7 +461,8 @@ public sealed partial class PtxTensorCoreEmitter
                 L($"mul.wide.u32 {asyncBGlobal[w]}, {off}, 1;");
 
                 string sharedOff = NextR();
-                L($"mul.lo.u32 {sharedOff}, {chunk}, {I(AsyncChunkBytes)};");
+                L($"mul.lo.u32 {sharedOff}, {row}, {I(BSharedRowBytes)};");
+                L($"mad.lo.u32 {sharedOff}, {inRow}, {I(AsyncChunkBytes)}, {sharedOff};");
                 asyncBShared[w] = NextRd();
                 L($"mul.wide.u32 {asyncBShared[w]}, {sharedOff}, 1;");
             }
@@ -402,7 +471,7 @@ public sealed partial class PtxTensorCoreEmitter
         string warpAOffset = NextRd(), warpBOffset = NextRd();
         {
             string aBytes = NextR(), bBytes = NextR();
-            L($"mul.lo.u32 {aBytes}, %r5, {I(WarpTilesM * 16 * BlockTileK * 2)};");
+            L($"mul.lo.u32 {aBytes}, %r5, {I(WarpTilesM * 16 * ASharedRowBytes)};");
             L($"mul.wide.u32 {warpAOffset}, {aBytes}, 1;");
             L($"mul.lo.u32 {bBytes}, %r6, {I(WarpTilesN * 16 * 2)};");
             L($"mul.wide.u32 {warpBOffset}, {bBytes}, 1;");
@@ -415,7 +484,32 @@ public sealed partial class PtxTensorCoreEmitter
 
         var prefetch = new List<string>();
 
-        if (!doubleBuffer)
+        if (MmaCeilingProbe)
+        {
+            // Stage ONCE, load the fragments ONCE, then loop only the arithmetic.
+            if (asyncCopy)
+            {
+                EmitAsyncCopy(asyncAGlobal, asyncAShared, asyncBGlobal, asyncBShared, 0, null);
+                L("cp.async.commit_group;");
+                L("cp.async.wait_group 0;");
+            }
+            else
+            {
+                var once = EmitSlabLoad(aGlobalOffset, bGlobalOffset, null);
+                EmitSlabStore(once, aSharedOffset, bSharedOffset, buffer: 0);
+            }
+            L("bar.sync 0;");
+
+            EmitFragmentLoads(warpAOffset, warpBOffset, buffer: 0);
+
+            L("mov.u32 %r9, 0;");
+            _sb.Append("KLOOP:\n");
+            EmitMmaOnly();
+            L("add.u32 %r9, %r9, 1;");
+            L($"setp.lt.u32 %p1, %r9, {I(steps)};");
+            L("@%p1 bra KLOOP;");
+        }
+        else if (!doubleBuffer)
         {
             // ---- single-buffered: copy, fence, compute, fence -----------------------------
             L("mov.u32 %r9, 0;                        // k step");
@@ -652,7 +746,7 @@ public sealed partial class PtxTensorCoreEmitter
         {
             string addr = NextRd();
             L($"add.u64 {addr}, %rd3, {aSharedOffset[w]};");
-            L($"st.shared.u32 [{addr}+{I(bufferBase)}], {regs[w]};");
+            L($"st.shared.u32 [{addr}+{I(bufferBase)}], {regs[w]};");   // padded row stride
         }
 
         for (int w = 0; w < BWordsPerThread; w++)
@@ -667,6 +761,13 @@ public sealed partial class PtxTensorCoreEmitter
     private void EmitComputeStep(
         CodegenKernelSpec spec, Plan plan, string warpAOffset, string warpBOffset, int buffer)
     {
+        EmitFragmentLoads(warpAOffset, warpBOffset, buffer);
+        EmitMmaOnly();
+    }
+
+    /// <summary>Loads this warp's A and B fragments from one staging buffer.</summary>
+    private void EmitFragmentLoads(string warpAOffset, string warpBOffset, int buffer)
+    {
         int bufferBase = buffer * StageBufferBytes;
 
         for (int i = 0; i < WarpTilesM; i++)
@@ -675,7 +776,7 @@ public sealed partial class PtxTensorCoreEmitter
             L($"add.u64 {addr}, %rd3, {warpAOffset};");
             L($"wmma.load.a.sync.aligned.row.m16n16k16.shared.f16 " +
               $"{Fragment("%fa", i * FragmentRegisters)}, " +
-              $"[{addr}+{I(bufferBase + i * 16 * BlockTileK * 2)}], {I(BlockTileK)};");
+              $"[{addr}+{I(bufferBase + i * 16 * ASharedRowBytes)}], {I(BlockTileK + SharedPadHalves)};");
         }
 
         for (int j = 0; j < WarpTilesN; j++)
@@ -684,9 +785,13 @@ public sealed partial class PtxTensorCoreEmitter
             L($"add.u64 {addr}, %rd3, {warpBOffset};");
             L($"wmma.load.b.sync.aligned.row.m16n16k16.shared.f16 " +
               $"{Fragment("%fb", j * FragmentRegisters)}, " +
-              $"[{addr}+{I(bufferBase + BSlabOffset + j * 16 * 2)}], {I(BlockTileN)};");
+              $"[{addr}+{I(bufferBase + BSlabOffset + j * 16 * 2)}], {I(BlockTileN + SharedPadHalves)};");
         }
+    }
 
+    /// <summary>Issues this warp's mma instructions from fragments already loaded.</summary>
+    private void EmitMmaOnly()
+    {
         for (int i = 0; i < WarpTilesM; i++)
             for (int j = 0; j < WarpTilesN; j++)
             {

@@ -228,12 +228,15 @@ public class CodegenTensorCoreStagingTests
         var emitter = Tile2x2();
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
+        // Asserted through the emitter's own arithmetic rather than literals: 8192/4096/6144
+        // were correct until shared rows gained padding, and hand-recomputed constants would
+        // simply go stale again the next time the layout moves.
         Assert.Equal(emitter.StageBufferBytes * 2, emitter.SharedMemoryBytes);
-        Assert.Contains(".shared .align 16 .b8 stage[8192];", ptx, StringComparison.Ordinal);
+        Assert.Contains($".shared .align 16 .b8 stage[{emitter.StageBufferBytes * 2}];", ptx,
+            StringComparison.Ordinal);
 
         // Buffer 1's slabs sit one whole buffer further along.
-        Assert.Contains("+4096]", ptx, StringComparison.Ordinal);
-        Assert.Contains("+6144]", ptx, StringComparison.Ordinal);
+        Assert.Contains($"+{emitter.StageBufferBytes}]", ptx, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -290,10 +293,13 @@ public class CodegenTensorCoreStagingTests
         emitter.EnableDoubleBuffering = false;
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
-        // 64x16 halves of A plus 16x64 of B, two bytes each.
-        Assert.Equal((64 * 16 + 16 * 64) * 2, emitter.SharedMemoryBytes);
-        Assert.Contains(".shared .align 16 .b8 stage[4096];", ptx, StringComparison.Ordinal);
+        // A's rows and B's, each PADDED to break bank conflicts. Asserted through the
+        // emitter's own arithmetic: the unpadded 4096 was right until the layout changed.
+        Assert.Equal(emitter.StageBufferBytes, emitter.SharedMemoryBytes);
+        Assert.Contains($".shared .align 16 .b8 stage[{emitter.StageBufferBytes}];", ptx,
+            StringComparison.Ordinal);
         Assert.Contains("st.shared.u32", ptx, StringComparison.Ordinal);
+        Assert.True(emitter.StageBufferBytes > 4096, "rows are not padded");
     }
 
     /// <summary>
@@ -364,8 +370,8 @@ public class CodegenTensorCoreStagingTests
     /// the tensor pipe rises from 26.79% to 35.74%.
     /// </remarks>
     [Theory]
-    [InlineData(128, 128, 4, 2)]      // 4x2 leads the ladder: it won most measured shapes
-    [InlineData(128, 64, 4, 2)]
+    [InlineData(128, 128, 2, 4)]      // 2x4 leads the ladder AFTER the padding fix
+    [InlineData(128, 64, 2, 2)]
     [InlineData(64, 128, 2, 4)]
     [InlineData(64, 64, 2, 2)]
     public void WarpTileSelection_FollowsTheLadder(int m, int n, int tileM, int tileN)
@@ -392,14 +398,13 @@ public class CodegenTensorCoreStagingTests
         emitter.Emit(MatMul(1024, 1024, 1024), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.WarpTileWasMeasured);
-        Assert.Equal(4, emitter.WarpTilesM);
-        Assert.Equal(2, emitter.WarpTilesN);
+        Assert.Equal(2, emitter.WarpTilesM);
+        Assert.Equal(4, emitter.WarpTilesN);
 
-        // The ladder alone would have said 4x4, since 1024 divides 128 both ways.
-        var ladder = TensorCoreWarpTileCatalog.Select(1024, 1024, 64, out bool measured);
-        Assert.False(measured);
-        Assert.Equal(4, ladder.TileM);
-        Assert.Equal(2, ladder.TileN);
+        // The measured winner at 1024^3 also staged with REGISTERS, not cp.async. The tile
+        // and the staging form are recorded together precisely because one does not follow
+        // from the other.
+        Assert.False(emitter.AsyncCopy);
     }
 
     /// <summary>Every catalog entry must be reachable, or it is a silently dead measurement.</summary>
