@@ -337,10 +337,18 @@ internal static class KernelOracleTool
                     new[] { 0 }, CodegenReduceKind.Sum,
                     preReduce: CodegenPreReduceOp.Exp));
 
-            // A max reduction: same traffic, different combine, and it cannot be split.
-            yield return ("row max 4096x1024",
-                new CodegenKernelSpec("orc_rowmax", space, new[] { x }, y,
-                    new[] { 0 }, CodegenReduceKind.Max));
+            // A max reduction. It CAN be split -- max is associative -- which the splitter
+            // used to deny, leaving this the only reduction shape with no available fix.
+            var rowMax = new CodegenKernelSpec("orc_rowmax", space, new[] { x }, y,
+                new[] { 0 }, CodegenReduceKind.Max);
+            yield return ("row max 4096x1024", rowMax);
+
+            var maxPlan = CodegenSplitReduction.TryPlan(rowMax);
+            if (maxPlan is not null)
+            {
+                yield return ("  row max, PLANNED (partial)", maxPlan.Partial);
+                yield return ("  row max, PLANNED (combine)", maxPlan.Combine);
+            }
         }
 
         // ---- contractions ----------------------------------------------------------------
