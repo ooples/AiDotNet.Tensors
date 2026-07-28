@@ -44,8 +44,10 @@ public sealed class CodegenMachineModel
     /// <summary>Creates a machine model.</summary>
     public CodegenMachineModel(
         string name, int multiprocessors, double clockHz,
-        double loadInstructionsPerSmPerCycle, double fmaLanesPerSm, double dramBytesPerSecond)
+        double loadInstructionsPerSmPerCycle, double fmaLanesPerSm, double dramBytesPerSecond,
+        double tensorCoreMacsPerSmPerCycle = 0)
     {
+        TensorCoreMacsPerSmPerCycle = tensorCoreMacsPerSmPerCycle;
         Name = name;
         Multiprocessors = multiprocessors;
         ClockHz = clockHz;
@@ -88,6 +90,32 @@ public sealed class CodegenMachineModel
     public double MacsPerSecond => FmaLanesPerSm * Multiprocessors * ClockHz;
 
     /// <summary>
+    /// Tensor-core multiply-accumulates per SM per cycle, or zero when the model has none.
+    /// </summary>
+    /// <remarks>
+    /// WITHOUT THIS THE MODEL CANNOT SCORE A TENSOR-CORE KERNEL AT ALL. FmaLanesPerSm counts
+    /// the fp32 pipe: 128 lanes at 68 SMs and 1.77 GHz is 30.8 TFLOP/s, and a measured
+    /// tensor-core matmul on the same device reaches 61.3. Scored against the fp32 rate such a
+    /// kernel reads as 180%+ of "peak", which is not a headroom figure -- it is a category
+    /// error, and it silently reports finished work on kernels with half their performance
+    /// still on the table.
+    /// </remarks>
+    public double TensorCoreMacsPerSmPerCycle { get; }
+
+    /// <summary>Tensor-core multiply-accumulates per second.</summary>
+    public double TensorCoreMacsPerSecond =>
+        TensorCoreMacsPerSmPerCycle * Multiprocessors * ClockHz;
+
+    /// <summary>True when this model can bound a tensor-core kernel.</summary>
+    public bool HasTensorCores => TensorCoreMacsPerSmPerCycle > 0;
+
+    /// <summary>
+    /// The arithmetic rate for a kernel, picking the tensor-core pipe when the kernel uses it.
+    /// </summary>
+    public double MacsPerSecondFor(bool usesTensorCores) =>
+        usesTensorCores && HasTensorCores ? TensorCoreMacsPerSecond : MacsPerSecond;
+
+    /// <summary>
     /// Coefficient of the occupancy penalty <c>1 + c / blocksPerSm</c>.
     /// </summary>
     /// <remarks>
@@ -116,7 +144,13 @@ public sealed class CodegenMachineModel
         clockHz: 1.77e9,
         loadInstructionsPerSmPerCycle: 0.293,
         fmaLanesPerSm: 128,
-        dramBytesPerSecond: 760e9);
+        dramBytesPerSecond: 760e9,
+
+        // 256 fp16 MACs per SM per cycle with an fp32 accumulator: 256 * 68 * 1.77e9 = 30.8
+        // TMAC/s = 61.6 TFLOP/s. CONFIRMED by measurement rather than taken from the
+        // datasheet -- the mma ceiling probe, which runs the same instruction mix with the
+        // fragment loads hoisted out of the K loop, reaches 61.3 TFLOP/s, or 99.5% of it.
+        tensorCoreMacsPerSmPerCycle: 256);
 }
 
 /// <summary>What the model predicts for one kernel.</summary>

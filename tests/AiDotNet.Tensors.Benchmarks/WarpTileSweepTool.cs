@@ -80,6 +80,13 @@ internal static class WarpTileSweepTool
                                         m, n, k, label, ref baseline);
                     if (us > 0 && baseline == 0) baseline = us;
                 }
+
+                // THE ORACLE: the same tile and the same mma instructions with the fragment
+                // loads hoisted out of the K loop. It computes the wrong answer on purpose --
+                // it exists to bound what this instruction mix can reach with memory traffic
+                // removed, so progress is measured against a ceiling rather than against a
+                // competitor.
+                MeasureCeiling(runtime, spec, major, minor, tm, tn, m, n, k, label);
             }
             Console.WriteLine();
         }
@@ -270,6 +277,59 @@ internal static class WarpTileSweepTool
             best = Math.Min(best, sw.Elapsed.TotalMilliseconds * 1000.0 / iterations);
         }
         return best;
+    }
+
+    /// <summary>Times the mma ceiling probe: same instructions, no loop-carried memory.</summary>
+    private static void MeasureCeiling(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
+        int tileM, int tileN, int m, int n, int k, string label)
+    {
+        var buffers = new List<DirectPtxBuffer>();
+        try
+        {
+            var emitter = new PtxTensorCoreEmitter
+            {
+                WarpTilesM = tileM, WarpTilesN = tileN, PinWarpTile = true,
+                MmaCeilingProbe = true,
+            };
+
+            PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _);
+            if (plan is null || !emitter.CanStage(plan, out _)) return;
+
+            string ptx = emitter.Emit(spec, major, minor);
+            using var module = runtime.LoadModule(ptx);
+            IntPtr fn = module.GetFunction(spec.Name, out _);
+
+            var pointers = new IntPtr[spec.ParameterCount];
+            for (int i = 0; i < 2; i++)
+            {
+                var buffer = runtime.AllocateBytes((nuint)(spec.Inputs[i].ElementCount * sizeof(ushort)));
+                buffers.Add(buffer);
+                pointers[i] = buffer.Pointer;
+            }
+            var outBuffer = runtime.AllocateBytes((nuint)(spec.Output.ElementCount * sizeof(float)));
+            buffers.Add(outBuffer);
+            pointers[2] = outBuffer.Pointer;
+
+            long macs = (long)m * n * k;
+            double us = TimeIt(runtime, module, fn, pointers,
+                (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads, macs);
+
+            Console.WriteLine(
+                "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
+                label, tileM + "x" + tileN, "ORACLE", "-", "0.00", "-", "(no answer)",
+                us.ToString("0.0", CultureInfo.InvariantCulture) + " us",
+                (2.0 * macs / us / 1e6).ToString("0.0", CultureInfo.InvariantCulture));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("{0,-16} {1,7} {2,10}  oracle failed: {3}",
+                label, tileM + "x" + tileN, "ORACLE", ex.Message.Replace('\n', ' '));
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+        }
     }
 
     private static unsafe void Launch(
