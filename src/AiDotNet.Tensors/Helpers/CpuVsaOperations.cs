@@ -644,6 +644,17 @@ public static class CpuVsaOperations
             var ASpan = Aspec.AsWritableSpan();
             var BSpan = Bspec.AsSpan();
             HrrSpectralMultiplyInPlace(ASpan, BSpan, conjugate);
+            // AsWritableSpan does NOT bump Version — its contract puts that on the mutating caller
+            // ("every CpuEngine in-place kernel already does this"), and this one did not. When
+            // Fft.Fft1 takes its GPU fast path, Aspec carries a _gpuBuffer whose _gpuBufferVersion
+            // still equals Version after the mutation above, so the IFft1 below re-uploaded the
+            // STALE pre-multiplication spectrum: the result was IFFT(FFT(a)) = a, i.e. HrrBind
+            // silently returned its first operand and ignored the second entirely.
+            //
+            // Only reachable on the GPU engine (with GPU execution enabled), and the tell was that
+            // the output was independent of N while differing in the last ~1e-8 — a recovered `a`
+            // with N-dependent FFT rounding, not a constant.
+            Aspec.IncrementVersion();
 
             // Inverse FFT — Aspec now holds A[k] * conj?(B[k]).
             var inverse = Fft.IFft1(Aspec);

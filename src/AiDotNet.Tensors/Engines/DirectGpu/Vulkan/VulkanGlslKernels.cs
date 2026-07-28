@@ -31,7 +31,21 @@ void main() {
     float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1), v2 = uintBitsToFloat(p2);
     float y = 0.0;
     switch (op) {
-        case 0u: y = pow(x, v0); break;
+        case 0u: {
+            // GLSL pow is undefined for a negative base. Integral exponents
+            // are valid, so evaluate |x|^v0 and restore odd parity.
+            if (x < 0.0) {
+                if (v0 == trunc(v0)) {
+                    float magnitude = pow(-x, v0);
+                    y = (mod(abs(v0), 2.0) == 1.0) ? -magnitude : magnitude;
+                } else {
+                    y = uintBitsToFloat(0x7fc00000u);
+                }
+            } else {
+                y = pow(x, v0);
+            }
+            break;
+        }
         case 1u: y = abs(x); break;
         case 2u: y = exp(x); break;
         case 3u: y = exp2(x); break;
@@ -322,7 +336,8 @@ void main() {
     uint offset = capsule * capsuleDim;
     float squaredNorm = 0.0;
     for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += a[offset + d0] * a[offset + d0];
-    float scale = squaredNorm / ((1.0 + squaredNorm) * sqrt(squaredNorm + epsilon));
+    float denominator = (1.0 + squaredNorm) * (sqrt(squaredNorm) + epsilon);
+    float scale = denominator != 0.0 ? squaredNorm / denominator : 0.0;
     for (uint d0 = 0u; d0 < capsuleDim; ++d0) b[offset + d0] = a[offset + d0] * scale;
 }";
 
@@ -333,11 +348,21 @@ void main() {
     if (capsule >= numCapsules) return;
     uint offset = capsule * capsuleDim;
     float squaredNorm = 0.0;
-    for (uint d0 = 0u; d0 < capsuleDim; ++d0) squaredNorm += bdata[offset + d0] * bdata[offset + d0];
-    float norm = sqrt(squaredNorm + epsilon);
-    float denominator = (1.0 + squaredNorm) * norm;
-    float factor = (squaredNorm + 2.0 * squaredNorm / (1.0 + squaredNorm)) / (denominator * denominator);
-    for (uint d0 = 0u; d0 < capsuleDim; ++d0) c[offset + d0] = a[offset + d0] * factor;
+    float dot = 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0) {
+        float value = bdata[offset + d0];
+        squaredNorm += value * value;
+        dot += value * a[offset + d0];
+    }
+    float norm = sqrt(squaredNorm);
+    float normPlusEpsilon = norm + epsilon;
+    float denominator = (1.0 + squaredNorm) * normPlusEpsilon;
+    float scale = denominator != 0.0 ? squaredNorm / denominator : 0.0;
+    float coefficient = denominator != 0.0
+        ? (norm + 2.0 * epsilon - squaredNorm * norm) / (denominator * denominator)
+        : 0.0;
+    for (uint d0 = 0u; d0 < capsuleDim; ++d0)
+        c[offset + d0] = scale * a[offset + d0] + coefficient * bdata[offset + d0] * dot;
 }";
 
     public static string CapsulePredictions => Header + ThreeBufferLayout + @"
@@ -393,6 +418,33 @@ void main() {
     c[idx] = dot;
 }";
 
+    // Fused interleaved RoPE (GPT-NeoX / LLaMA / GGML). One invocation per (row, pair).
+    // cos/sin are [maxSeq, headDim/2], indexed by absolute position (startPosition + rowWithinSequence).
+    public static string RopeInterleaved => Header + @"
+layout(set = 0, binding = 0) readonly buffer Input { float inputData[]; };
+layout(set = 0, binding = 1) readonly buffer Cos { float cosData[]; };
+layout(set = 0, binding = 2) readonly buffer Sin { float sinData[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float outputData[]; };
+layout(push_constant) uniform Params { uint rows; uint headDim; uint seqLen; uint startPosition; };
+void main() {
+    uint halfDim = headDim / 2u;
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= rows * halfDim) return;
+    uint i = g % halfDim;
+    uint row = g / halfDim;
+    uint s = row % seqLen;
+    uint pos = startPosition + s;
+    uint baseIdx = row * headDim;
+    uint cacheIdx = pos * halfDim + i;
+    float c = cosData[cacheIdx];
+    float sn = sinData[cacheIdx];
+    float xEven = inputData[baseIdx + 2u * i];
+    float xOdd = inputData[baseIdx + 2u * i + 1u];
+    outputData[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputData[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
+}
+";
+
     public static string AttentionForward => Header + @"
 layout(set = 0, binding = 0) readonly buffer Query { float queryData[]; };
 layout(set = 0, binding = 1) readonly buffer Key { float keyData[]; };
@@ -402,14 +454,16 @@ layout(set = 0, binding = 4) writeonly buffer Weights { float weightData[]; };
 layout(set = 0, binding = 5) readonly buffer Mask { float maskData[]; };
 layout(push_constant) uniform Params {
     uint batch; uint queryHeads; uint kvHeads; uint seqQ; uint seqK; uint headDim;
-    float scale; uint causal; uint writeWeights; uint maskMode; uint maskBatchStride;
+    float scale; uint causal; uint writeWeights; uint maskMode; uint maskBatchStride; float softcap;
 };
 float attentionScore(uint batchIndex, uint queryHead, uint kvHead, uint queryIndex, uint keyIndex) {
     uint queryOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * headDim;
     uint keyOffset = ((batchIndex * kvHeads + kvHead) * seqK + keyIndex) * headDim;
     float score = 0.0;
     for (uint d0 = 0u; d0 < headDim; ++d0) score += queryData[queryOffset + d0] * keyData[keyOffset + d0];
-    return score * scale;
+    float logit = score * scale;
+    // Attention-logit soft-cap (Gemma-2): softcap * tanh(logit / softcap); softcap<=0 disables.
+    return softcap > 0.0 ? softcap * tanh(logit / softcap) : logit;
 }
 bool attentionMasked(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex) {
     if (maskMode == 0u) return false;
@@ -420,6 +474,9 @@ void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= batch * queryHeads * seqQ) return;
     uint queryIndex = row % seqQ;
+    // KV-cache causal offset: query row queryIndex is at absolute position queryIndex + (seqK - seqQ);
+    // seqQ==seqK collapses to keyIndex > queryIndex (prefill), decode attends to the whole cached prefix.
+    uint qPos = queryIndex + (seqK - seqQ);
     uint q = row / seqQ;
     uint queryHead = q % queryHeads;
     uint batchIndex = q / queryHeads;
@@ -427,19 +484,19 @@ void main() {
     uint kvHead = queryHead / queriesPerKv;
     float rowMax = -3.402823466e+38;
     for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
         rowMax = max(rowMax, attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex));
     }
     float denominator = 0.0;
     for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-        if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
+        if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex)) continue;
         denominator += exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax);
     }
     uint weightOffset = row * seqK;
     if (writeWeights != 0u) {
         for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
             float weight = 0.0;
-            if ((causal == 0u || keyIndex <= queryIndex) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
+            if ((causal == 0u || keyIndex <= qPos) && !attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) && denominator > 0.0)
                 weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
             weightData[weightOffset + keyIndex] = weight;
         }
@@ -449,7 +506,7 @@ void main() {
     for (uint d0 = 0u; d0 < headDim; ++d0) {
         float sum = 0.0;
         for (uint keyIndex = 0u; keyIndex < seqK; ++keyIndex) {
-            if ((causal != 0u && keyIndex > queryIndex) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
+            if ((causal != 0u && keyIndex > qPos) || attentionMasked(batchIndex, queryHead, queryIndex, keyIndex) || denominator <= 0.0) continue;
             float weight = exp(attentionScore(batchIndex, queryHead, kvHead, queryIndex, keyIndex) - rowMax) / denominator;
             sum += weight * valueData[valueOffset + keyIndex * headDim + d0];
         }
@@ -498,7 +555,7 @@ float gradAttention(uint batchIndex, uint queryHead, uint queryIndex, uint keyIn
     return sum;
 }
 float gradScore(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex, uint kvHead) {
-    if (causal != 0u && keyIndex > queryIndex) return 0.0;
+    if (causal != 0u && keyIndex > qPos) return 0.0;
     uint weightOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * seqK;
     float dot = 0.0;
     for (uint j = 0u; j < seqK; ++j)
@@ -2734,6 +2791,253 @@ layout(set = 0, binding = 1) readonly buffer Weight { float wt[]; };
 layout(set = 0, binding = 2) readonly buffer Bias { float bias[]; };
 layout(set = 0, binding = 3) writeonly buffer Output { float outp[]; };
 layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint outFeatures; };
+";
+
+    // Weight-only fused dequant-GEMM (P0). bindings: 0=act(float) 1=w(int) 2=scales(float) 3=out(float).
+    // Contract matches FusedDequantMatmulKernels: C[M,N]=act[M,K].dequant(W[K,N]); symmetric scales,
+    // per-tensor (scaleCount==1) or per-group over flat k*N. Integer weights are pre-decoded values
+    // (int8, or unpacked int4); fp8 uses the raw e4m3 byte + in-shader decode.
+    private const string DequantGemmLayout = @"
+layout(set = 0, binding = 0) readonly buffer A { float act[]; };
+layout(set = 0, binding = 1) readonly buffer W { int w[]; };
+layout(set = 0, binding = 2) readonly buffer S { float scales[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float outp[]; };
+layout(push_constant) uniform P { uint M; uint K; uint N; uint groupSize; uint scaleCount; };
+";
+
+    /// <summary>Integer weight-only dequant-GEMM (int8 / unpacked int4).</summary>
+    public static string DequantGemmInt => Header + DequantGemmLayout + @"void main(){ uint idx=gl_GlobalInvocationID.x; if(idx>=M*N) return; uint i=idx/N, j=idx%N; float acc=0.0; if(scaleCount==1u){ float s=scales[0]; for(uint k=0u;k<K;k++) acc+=act[i*K+k]*float(w[k*N+j]); acc*=s; } else { for(uint k=0u;k<K;k++){ uint flat=k*N+j; acc+=act[i*K+k]*float(w[flat])*scales[flat/groupSize]; } } outp[idx]=acc; }";
+
+    /// <summary>FP8 E4M3 weight-only dequant-GEMM (in-shader decode matching Float8E4M3.ToFloat).</summary>
+    public static string DequantGemmFp8E4M3 => Header + DequantGemmLayout + @"float decode_e4m3(uint raw){ uint r=raw&0xFFu; if((r&0x7Fu)==0x7Fu) return uintBitsToFloat(0x7FC00000u); if((r&0x7Fu)==0u) return 0.0; uint sign=(r&0x80u)>>7u; uint exp4=(r&0x78u)>>3u; uint m3=(r&0x07u); int exp32=int(exp4)-7+127; uint bits=(sign<<31u)|(uint(exp32 & 0xFF)<<23u)|(m3<<20u); return uintBitsToFloat(bits);} void main(){ uint idx=gl_GlobalInvocationID.x; if(idx>=M*N) return; uint i=idx/N, j=idx%N; float acc=0.0; if(scaleCount==1u){ float s=scales[0]; for(uint k=0u;k<K;k++) acc+=act[i*K+k]*decode_e4m3(uint(w[k*N+j])); acc*=s; } else { for(uint k=0u;k<K;k++){ uint flat=k*N+j; acc+=act[i*K+k]*decode_e4m3(uint(w[flat]))*scales[flat/groupSize]; } } outp[idx]=acc; }";
+
+    /// <summary>Paged-attention decode (P1): single-query attention gathering K/V via a block table.
+    /// K/V pool [maxBlocks, blockSize, heads, headDim]; online-softmax; headDim &lt;= 256. One work-item
+    /// per head. Uses -3.4e38 (not inf) as the running-max init so it is safe under any math flags.</summary>
+    public static string PagedAttentionDecode => Header + @"
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float kcache[]; };
+layout(set = 0, binding = 2) readonly buffer V { float vcache[]; };
+layout(set = 0, binding = 3) readonly buffer BT { int blockTable[]; };
+layout(set = 0, binding = 4) writeonly buffer O { float outbuf[]; };
+layout(push_constant) uniform P { uint heads; uint headDim; uint blockSize; uint seqLen; float scale; };
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= heads) return;
+    float acc[256];
+    for (uint d = 0u; d < headDim; d++) acc[d] = 0.0;
+    float m = -3.4e38;
+    float l = 0.0;
+    for (uint t = 0u; t < seqLen; t++) {
+        uint blk = uint(blockTable[t / blockSize]);
+        uint pos = t % blockSize;
+        uint base = ((blk * blockSize + pos) * heads + h) * headDim;
+        float dot = 0.0;
+        for (uint d = 0u; d < headDim; d++) dot += q[h * headDim + d] * kcache[base + d];
+        float logit = dot * scale;
+        float new_m = max(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (uint d = 0u; d < headDim; d++) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+    float inv = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < headDim; d++) outbuf[h * headDim + d] = acc[d] * inv;
+}
+";
+
+    /// <summary>Prefill / multi-query paged attention (P1, causal). One work-item per (query, head);
+    /// query qi (logical position startPos+qi) attends to key positions 0..(startPos+qi). headDim &lt;= 256.</summary>
+    public static string PagedAttentionPrefill => Header + @"
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float kcache[]; };
+layout(set = 0, binding = 2) readonly buffer V { float vcache[]; };
+layout(set = 0, binding = 3) readonly buffer BT { int blockTable[]; };
+layout(set = 0, binding = 4) writeonly buffer O { float outbuf[]; };
+layout(push_constant) uniform P { uint heads; uint headDim; uint blockSize; uint numQueries; uint startPos; float scale; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = numQueries * heads;
+    if (gid >= total) return;
+    uint qi = gid / heads;
+    uint h = gid % heads;
+    uint keyLen = startPos + qi + 1u;
+    uint qbase = (qi * heads + h) * headDim;
+    float acc[256];
+    for (uint d = 0u; d < headDim; d++) acc[d] = 0.0;
+    float m = -3.4e38;
+    float l = 0.0;
+    for (uint t = 0u; t < keyLen; t++) {
+        uint blk = uint(blockTable[t / blockSize]);
+        uint pos = t % blockSize;
+        uint base = ((blk * blockSize + pos) * heads + h) * headDim;
+        float dot = 0.0;
+        for (uint d = 0u; d < headDim; d++) dot += q[qbase + d] * kcache[base + d];
+        float logit = dot * scale;
+        float new_m = max(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (uint d = 0u; d < headDim; d++) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+    float inv = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < headDim; d++) outbuf[qbase + d] = acc[d] * inv;
+}
+";
+
+    /// <summary>GQA decode (P1): query head h shares KV head h/(heads/kvHeads); K/V pool
+    /// [maxBlocks, blockSize, kvHeads, headDim]. One work-item per head; headDim &lt;= 256.</summary>
+    public static string PagedAttentionDecodeGqa => Header + @"
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float kcache[]; };
+layout(set = 0, binding = 2) readonly buffer V { float vcache[]; };
+layout(set = 0, binding = 3) readonly buffer BT { int blockTable[]; };
+layout(set = 0, binding = 4) writeonly buffer O { float outbuf[]; };
+layout(push_constant) uniform P { uint heads; uint kvHeads; uint headDim; uint blockSize; uint seqLen; float scale; };
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= heads) return;
+    uint kvHead = h / (heads / kvHeads);
+    float acc[256];
+    for (uint d = 0u; d < headDim; d++) acc[d] = 0.0;
+    float m = -3.4e38;
+    float l = 0.0;
+    for (uint t = 0u; t < seqLen; t++) {
+        uint blk = uint(blockTable[t / blockSize]);
+        uint pos = t % blockSize;
+        uint base = ((blk * blockSize + pos) * kvHeads + kvHead) * headDim;
+        float dot = 0.0;
+        for (uint d = 0u; d < headDim; d++) dot += q[h * headDim + d] * kcache[base + d];
+        float logit = dot * scale;
+        float new_m = max(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (uint d = 0u; d < headDim; d++) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+    float inv = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < headDim; d++) outbuf[h * headDim + d] = acc[d] * inv;
+}
+";
+
+    /// <summary>GQA prefill (P1, causal): query head h shares KV head h/(heads/kvHeads); K/V pool
+    /// [maxBlocks, blockSize, kvHeads, headDim]. One work-item per (query, head); headDim &lt;= 256.</summary>
+    public static string PagedAttentionPrefillGqa => Header + @"
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float kcache[]; };
+layout(set = 0, binding = 2) readonly buffer V { float vcache[]; };
+layout(set = 0, binding = 3) readonly buffer BT { int blockTable[]; };
+layout(set = 0, binding = 4) writeonly buffer O { float outbuf[]; };
+layout(push_constant) uniform P { uint heads; uint kvHeads; uint headDim; uint blockSize; uint numQueries; uint startPos; float scale; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = numQueries * heads;
+    if (gid >= total) return;
+    uint qi = gid / heads;
+    uint h = gid % heads;
+    uint kvHead = h / (heads / kvHeads);
+    uint keyLen = startPos + qi + 1u;
+    uint qbase = (qi * heads + h) * headDim;
+    float acc[256];
+    for (uint d = 0u; d < headDim; d++) acc[d] = 0.0;
+    float m = -3.4e38;
+    float l = 0.0;
+    for (uint t = 0u; t < keyLen; t++) {
+        uint blk = uint(blockTable[t / blockSize]);
+        uint pos = t % blockSize;
+        uint base = ((blk * blockSize + pos) * kvHeads + kvHead) * headDim;
+        float dot = 0.0;
+        for (uint d = 0u; d < headDim; d++) dot += q[qbase + d] * kcache[base + d];
+        float logit = dot * scale;
+        float new_m = max(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (uint d = 0u; d < headDim; d++) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+    float inv = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < headDim; d++) outbuf[qbase + d] = acc[d] * inv;
+}
+";
+
+    /// <summary>Fused decode attention (P2, FlashDecoding) pass 1: per-(head, split) online-softmax
+    /// partials over contiguous K/V [seqLen, kvHeads, headDim]. GQA via kvHead=h/(heads/kvHeads). headDim &lt;= 256.</summary>
+    public static string FlashDecodePartial => Header + @"
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float kbuf[]; };
+layout(set = 0, binding = 2) readonly buffer V { float vbuf[]; };
+layout(set = 0, binding = 3) writeonly buffer PM { float partialM[]; };
+layout(set = 0, binding = 4) writeonly buffer PL { float partialL[]; };
+layout(set = 0, binding = 5) writeonly buffer PA { float partialAcc[]; };
+layout(push_constant) uniform P { uint heads; uint kvHeads; uint headDim; uint seqLen; uint splits; uint splitLen; float scale; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = heads * splits;
+    if (gid >= total) return;
+    uint h = gid / splits;
+    uint s = gid % splits;
+    uint kvHead = h / (heads / kvHeads);
+    uint start = s * splitLen;
+    uint end = start + splitLen;
+    if (end > seqLen) end = seqLen;
+    float acc[256];
+    for (uint d = 0u; d < headDim; d++) acc[d] = 0.0;
+    float m = -3.4e38;
+    float l = 0.0;
+    for (uint t = start; t < end; t++) {
+        uint kb = (t * kvHeads + kvHead) * headDim;
+        float dot = 0.0;
+        for (uint d = 0u; d < headDim; d++) dot += q[h * headDim + d] * kbuf[kb + d];
+        float logit = dot * scale;
+        float new_m = max(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (uint d = 0u; d < headDim; d++) acc[d] = acc[d] * corr + p * vbuf[kb + d];
+        m = new_m;
+    }
+    partialM[gid] = m;
+    partialL[gid] = l;
+    uint accBase = gid * headDim;
+    for (uint d = 0u; d < headDim; d++) partialAcc[accBase + d] = acc[d];
+}
+";
+
+    /// <summary>Fused decode attention (P2, FlashDecoding) pass 2: merge per-head split partials with the
+    /// online-softmax combine rule. headDim &lt;= 256.</summary>
+    public static string FlashDecodeReduce => Header + @"
+layout(set = 0, binding = 0) readonly buffer PM { float partialM[]; };
+layout(set = 0, binding = 1) readonly buffer PL { float partialL[]; };
+layout(set = 0, binding = 2) readonly buffer PA { float partialAcc[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float outbuf[]; };
+layout(push_constant) uniform P { uint heads; uint headDim; uint splits; };
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= heads) return;
+    float m = -3.4e38;
+    for (uint s = 0u; s < splits; s++) {
+        float ms = partialM[h * splits + s];
+        if (ms > m) m = ms;
+    }
+    float acc[256];
+    for (uint d = 0u; d < headDim; d++) acc[d] = 0.0;
+    float l = 0.0;
+    for (uint s = 0u; s < splits; s++) {
+        uint idx = h * splits + s;
+        float ls = partialL[idx];
+        if (ls <= 0.0) continue;
+        float w = exp(partialM[idx] - m);
+        l += ls * w;
+        uint accBase = idx * headDim;
+        for (uint d = 0u; d < headDim; d++) acc[d] += partialAcc[accBase + d] * w;
+    }
+    float inv = (l > 0.0) ? (1.0 / l) : 0.0;
+    for (uint d = 0u; d < headDim; d++) outbuf[h * headDim + d] = acc[d] * inv;
+}
 ";
 
     public static string FusedLinearReLU => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=max(sum,0.0); }";

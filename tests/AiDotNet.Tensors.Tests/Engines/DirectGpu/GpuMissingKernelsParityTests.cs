@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -562,6 +563,42 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var cpu = _cpu.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
         var gpu = _gpu.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
         AssertMatch(gpu, cpu, $"LSTM[b{batch};s{seq};in{inF};h{hidden};seq={returnSeq}]");
+    }
+
+    // BPTT parity: run the fused LSTM forward+backward through a GradientTape on the CPU and the GPU and
+    // compare every gradient (dInput, dWih, dWhh, dBih, dBhh). Guards the GPU BPTT kernel + its autograd
+    // wiring; the CPU fused backward is the trusted oracle.
+    [Theory]
+    [InlineData(2, 5, 4, 6, false)]
+    [InlineData(2, 5, 4, 6, true)]
+    [InlineData(3, 7, 8, 5, true)]
+    public void LstmSequenceBackward_GpuMatchesCpu(int batch, int seq, int inF, int hidden, bool returnSeq)
+    {
+        if (!EnsureGpuReady()) return;
+        var input = Rand(250, batch, seq, inF);
+        var wIh = Rand(251, 4 * hidden, inF);
+        var wHh = Rand(252, 4 * hidden, hidden);
+        var bIh = Rand(253, 4 * hidden);
+        var bHh = Rand(254, 4 * hidden);
+
+        var c = RunLstmBackward(_cpu, input, wIh, wHh, bIh, bHh, returnSeq);
+        var g = RunLstmBackward(_gpu, input, wIh, wHh, bIh, bHh, returnSeq);
+        string tag = $"LSTM-bwd[b{batch};s{seq};in{inF};h{hidden};seq={returnSeq}]";
+        AssertMatch(g.dInput, c.dInput, tag + " dInput");
+        AssertMatch(g.dWih, c.dWih, tag + " dWih");
+        AssertMatch(g.dWhh, c.dWhh, tag + " dWhh");
+        AssertMatch(g.dBih, c.dBih, tag + " dBih");
+        AssertMatch(g.dBhh, c.dBhh, tag + " dBhh");
+    }
+
+    private static (Tensor<float> dInput, Tensor<float> dWih, Tensor<float> dWhh, Tensor<float> dBih, Tensor<float> dBhh)
+        RunLstmBackward(IEngine eng, Tensor<float> input, Tensor<float> wIh, Tensor<float> wHh, Tensor<float> bIh, Tensor<float> bHh, bool returnSeq)
+    {
+        using var tape = new GradientTape<float>();
+        tape.BindEngineIfUnset(eng);
+        var output = eng.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
+        var grads = tape.ComputeGradients(output, new[] { input, wIh, wHh, bIh, bHh });
+        return (grads[input], grads[wIh], grads[wHh], grads[bIh], grads[bHh]);
     }
 
     [Theory]

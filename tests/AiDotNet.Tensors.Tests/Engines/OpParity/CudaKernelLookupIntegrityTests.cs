@@ -1,0 +1,146 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// Every kernel name CudaBackend looks up must actually be defined in a CUDA kernel source (#775).
+//
+// WHY THIS EXISTS. CudaBackend.BroadcastMultiplyLastAxis asked the kernel cache for
+// "broadcast_multiply_last_axis", a name defined NOWHERE. Every call threw kernel-not-found and
+// DirectGpuTensorEngine.TensorBroadcastMultiply swallowed it in a bare catch, returning a correct CPU
+// result while doing zero GPU work. It survived because:
+//   - the hollow-override probe only counts the THROWING kernel-cache indexer, and this site used
+//     TryGetValue, so no KernelMiss was ever recorded; and
+//   - broadcast_multiply_FIRST_axis genuinely exists, so the naming looked internally consistent.
+// It was found only after the launch-counting fixes cleared the ops that were merely mismeasured.
+//
+// This guard is static — it reads the sources, needs no GPU, and runs everywhere. It catches the whole
+// class at authoring time instead of waiting for an op to be exercised at runtime on CUDA.
+#if !NETFRAMEWORK
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.OpParity;
+
+public sealed class CudaKernelLookupIntegrityTests
+{
+    // Kernel names CudaBackend looks up that have NO definition in any CUDA kernel source. Each one
+    // throws the moment its op runs on CUDA. They are NOT renames — verified against the nearest
+    // similarly named kernels:
+    // copy_2d_strided, squash, squash_backward and var_axis are now IMPLEMENTED in
+    // CudaMissingLookupKernels — each had an unambiguous reference to match (the caller's own index
+    // arithmetic, or FusedActivationBackwardMath's exact double-precision math).
+    //
+    // The four below are deliberately NOT implemented, because implementing them means INVENTING a
+    // contract, and a wrong kernel is worse than the current state: today these throw and the caller
+    // degrades to a correct CPU result, whereas a wrong kernel would return a plausible wrong answer.
+    //   tile_batch    : BOTH CALL SITES ARE THEMSELVES WRONG — this is not just a missing kernel, and
+    //                   adding one without fixing them would replace a safe throw-and-fall-back with
+    //                   silent corruption. Neither has ever executed (the kernel never existed), so
+    //                   nothing has ever validated their arguments. Diagnosis and fix, both verified
+    //                   by reading the callers:
+    //
+    //                   The documented contract is  out[i*repeats + r] = in[i],  total = innerSize*repeats.
+    //
+    //                   (a) GlobalMeanPoolBackwardGpu wants out[o*reduceSize + r] = grad[o]. It calls
+    //                       TileBatch(grad, out, reduceSize, 1) => total reduceSize, into a buffer it
+    //                       sized outerSize*reduceSize, and then Scales all totalSize elements — so for
+    //                       outerSize > 1 it scales UNINITIALISED memory. The call should be
+    //                       TileBatch(grad, out, reduceSize, outerSize), which under the contract above
+    //                       yields exactly total = outerSize*reduceSize and out[o*reduceSize+r] = grad[o].
+    //
+    //                   (b) TileBatchGpu wants the whole input repeated: out[i] = in[i % inputLength],
+    //                       an INTERLEAVED tile, not the blocked repeat this contract describes. It also
+    //                       never passes batchSize, so this kernel signature cannot express what it
+    //                       needs at all. It requires a different kernel (out[idx] = in[idx % inLen]),
+    //                       not this one — see the registered tile_last_axis family.
+    //
+    //                   So: write tile_batch to the documented contract, fix (a)'s arguments, and route
+    //                   (b) elsewhere — with a test that exercises outerSize > 1 and batchSize > 1,
+    //                   which is precisely the case both callers get wrong today.
+    // RATCHETS DOWN ONLY. Define or correctly repoint a kernel and remove its entry. Never add one.
+    private static readonly HashSet<string> KnownDangling = new(StringComparer.Ordinal)
+    {
+    };
+
+    private static string? RepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !Directory.Exists(Path.Combine(dir.FullName, "src", "AiDotNet.Tensors")))
+            dir = dir.Parent;
+        return dir?.FullName;
+    }
+
+    private static IEnumerable<string> RegisteredKernelNames(string source)
+    {
+        // Read quoted names only from GetKernelNames' returned array. Matching arbitrary quoted lines in
+        // an entire source file admits exception text and diagnostics as fake definitions.
+        const string tablePattern =
+            @"GetKernelNames\s*\(\s*\)\s*(?:=>|\{[\s\S]*?\breturn)\s*"
+            + @"(?:new\s*\[\s*\]\s*)?(?:\[(?<square>[\s\S]*?)\]|\{(?<brace>[\s\S]*?)\})\s*;";
+        foreach (Match table in Regex.Matches(source, tablePattern))
+        {
+            string body = table.Groups["square"].Success
+                ? table.Groups["square"].Value
+                : table.Groups["brace"].Value;
+            foreach (Match name in Regex.Matches(body, @"""([a-z0-9_]+)"""))
+                yield return name.Groups[1].Value;
+        }
+    }
+
+    [Fact]
+    public void EveryCudaKernelLookupHasADefinition()
+    {
+        string? root = RepoRoot();
+        Skip.If(root is null, "Repository sources not present.");
+        string cuda = Path.Combine(root!, "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA");
+        Skip.If(!Directory.Exists(cuda), "CUDA backend sources not present.");
+
+        string[] backendFiles = Directory.GetFiles(cuda, "CudaBackend*.cs", SearchOption.TopDirectoryOnly);
+        Assert.NotEmpty(backendFiles);
+        string backend = string.Join("\n", backendFiles.Select(File.ReadAllText));
+        var lookedUp = new HashSet<string>(
+            Regex.Matches(backend,
+                    @"_kernelCache\s*(?:(?:\.TryGetValue|\.ContainsKey)\s*\(\s*|\[\s*)""([a-z0-9_]+)""")
+                 .Select(m => m.Groups[1].Value),
+            StringComparer.Ordinal);
+
+        var defined = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var file in Directory.GetFiles(Path.Combine(cuda, "Kernels"), "*.cs"))
+        {
+            string src = File.ReadAllText(file);
+            // The declaration frequently wraps, e.g.
+            //     extern ""C"" __global__ __launch_bounds__(256)
+            //     void normalize_rows_fused(
+            // so this must cross newlines. A single-line pattern silently reports ~13 live kernels as
+            // missing (normalize_rows_fused, mel_filterbank_apply, bispectrum_gather, ...) — a false
+            // alarm that would have been "fixed" by padding the allowlist, hiding the real 8.
+            foreach (Match m in Regex.Matches(src, @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
+                defined.Add(m.Groups[1].Value);
+            // Names the module registers with cuModuleGetFunction count as defined too, but only when
+            // they occur in an actual GetKernelNames return table.
+            foreach (string name in RegisteredKernelNames(src))
+                defined.Add(name);
+        }
+
+        Assert.NotEmpty(lookedUp);
+        Assert.NotEmpty(defined);
+
+        var dangling = lookedUp.Where(n => !defined.Contains(n)).OrderBy(n => n, StringComparer.Ordinal).ToList();
+        var unexpected = dangling.Where(n => !KnownDangling.Contains(n)).ToList();
+
+        Assert.True(unexpected.Count == 0,
+            $"CudaBackend looks up {unexpected.Count} kernel name(s) that no CUDA source defines: " +
+            $"{string.Join(", ", unexpected)}. Each throws kernel-not-found the moment its op runs and, " +
+            "if a caller wraps it in a catch, degrades silently to the CPU with a correct-looking result. " +
+            "Define the kernel or point the lookup at the real one — and check the ARGUMENT COUNT matches, " +
+            "since a near-name with a different arity reproduces the launch-truncation class.");
+
+        // Ratchet: entries that got fixed must be removed from KnownDangling so it cannot drift upward.
+        var stale = KnownDangling.Where(n => !dangling.Contains(n)).OrderBy(n => n, StringComparer.Ordinal).ToList();
+        Assert.True(stale.Count == 0,
+            $"KnownDangling lists {stale.Count} name(s) that now resolve: {string.Join(", ", stale)}. " +
+            "Remove them from the set — this list ratchets DOWN only.");
+    }
+}
+#endif

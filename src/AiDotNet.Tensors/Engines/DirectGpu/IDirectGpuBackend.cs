@@ -1412,13 +1412,38 @@ public interface IDirectGpuBackend : IDisposable
 
     #region Attention Operations
 
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0, each scaled score
+    /// is passed through <c>softcap · tanh(score / softcap)</c> before the softmax. 0 disables it.</param>
+    /// <param name="numKVHeads">Grouped-Query Attention: number of key/value heads, each shared by
+    /// <c>numHeads / numKVHeads</c> query heads. When &lt;= 0 it defaults to <paramref name="numHeads"/> (standard
+    /// multi-head attention). When &gt; 0 the key/value buffers are sized [batch * numKVHeads * seqK * headDim] and
+    /// the shared K/V heads are broadcast internally — the caller never materializes the expanded K/V.</param>
     void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0);
 
     void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+
+    /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE), the GPT-NeoX / LLaMA / GGML variant that rotates each
+    /// adjacent dim pair (2i, 2i+1). Operates on a row-major [rows, headDim] view (rows = leading * seqLen) and
+    /// writes the rotated result to <paramref name="output"/> (may alias <paramref name="input"/>). The cos/sin
+    /// caches are precomputed host-side as [maxSeq, headDim/2] and indexed by absolute position
+    /// (startPosition + rowWithinSequence).
+    /// </summary>
+    /// <param name="input">Q or K activations, [rows * headDim] row-major, GPU-resident.</param>
+    /// <param name="cos">Cosine cache [maxSeq * (headDim/2)], GPU-resident.</param>
+    /// <param name="sin">Sine cache [maxSeq * (headDim/2)], GPU-resident.</param>
+    /// <param name="output">Rotated output [rows * headDim], GPU-resident.</param>
+    /// <param name="rows">Number of (leading × seq) rows.</param>
+    /// <param name="headDim">Per-head dimension (must be even).</param>
+    /// <param name="seqLen">Sequence length, used to recover the position of each row.</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (for incremental decode).</param>
+    void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition);
 
     void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
@@ -3315,6 +3340,32 @@ public interface IDirectGpuBackend : IDisposable
     // Tensor<Complex<T>> (array-of-structs) and split buffers at the GPU boundary.
     // Callers of IEngine never see the split format — it's an internal GPU optimization.
 
+    /// <summary>
+    /// Packs split real/imag buffers into one interleaved [re0, im0, re1, im1, ...] buffer.
+    /// </summary>
+    /// <param name="real">Real parts, n elements.</param>
+    /// <param name="imag">Imaginary parts, n elements.</param>
+    /// <param name="interleaved">Destination, 2*n elements.</param>
+    /// <param name="n">Number of complex values.</param>
+    /// <remarks>
+    /// The GPU keeps complex data SPLIT (hence the SplitComplex* family below); interleaved is the layout
+    /// IEngine.RFFT's tensor contract requires. Without this primitive the dispatch layer bridged the two by
+    /// issuing two Copy calls PER FREQUENCY BIN — at numFreqs=129 and batch=4096 that is ~1.06 million
+    /// device-to-device copies for a single RFFT, which dominated the operation completely. One kernel with a
+    /// stride-2 write replaces all of them.
+    /// </remarks>
+    void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n);
+
+    /// <summary>
+    /// Splits an interleaved [re0, im0, ...] buffer into separate real/imag buffers. Inverse of
+    /// <see cref="InterleaveComplex"/>; used by IRFFT, whose input arrives interleaved.
+    /// </summary>
+    /// <param name="interleaved">Source, 2*n elements.</param>
+    /// <param name="real">Real destination, n elements.</param>
+    /// <param name="imag">Imaginary destination, n elements.</param>
+    /// <param name="n">Number of complex values.</param>
+    void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n);
+
     /// <summary>Element-wise complex multiply with split real/imag buffers.</summary>
     void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int n);
@@ -3508,6 +3559,29 @@ public interface IDirectGpuBackend : IDisposable
     /// </para>
     /// </summary>
     AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv { get; }
+
+    #endregion
+
+    #region Paged Attention (P1)
+
+    /// <summary>Single-query paged-attention decode over a vLLM-style paged KV cache (see DevicePagedKVCache):
+    /// <c>out[h] = softmax(scale · Q[h]·K[.,h]) · V[.,h]</c>, gathering K/V through the block table. All six
+    /// backends implement this; higher layers (inference/serving) invoke it via the engine's backend.</summary>
+    IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale);
+
+    /// <summary>Multi-query paged-attention prefill with causal masking: query <c>qi</c> attends to key
+    /// positions <c>0..(startPos+qi)</c>.</summary>
+    IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale);
+
+    /// <summary>Grouped-query variant of <see cref="PagedAttentionDecode"/> (<paramref name="kvHeads"/> &lt; heads).</summary>
+    IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale);
+
+    /// <summary>Grouped-query variant of <see cref="PagedAttentionPrefill"/> (<paramref name="kvHeads"/> &lt; heads).</summary>
+    IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale);
 
     #endregion
 }

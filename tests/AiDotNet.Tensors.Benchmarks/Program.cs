@@ -13,6 +13,291 @@ class Program
 
     static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention")
+        {
+            DirectPtxAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-attention")
+        {
+            DirectPtxFusedAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-online-attention")
+        {
+            DirectPtxOnlineAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-gpu-matrix")
+        {
+            DirectPtxGpuMatrixExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention-family")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxAttentionFamilyExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-decode")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxDecodeExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-paged-prefill")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxPagedPrefillExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxAttentionBackwardExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-flash-attention-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFlashAttentionBackwardExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-qkv-rope-cache")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxQkvRopeCacheExperiment.Run(runs, includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
+        {
+            DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "normalization", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--resident-spike")
+        {
+            ResidentProgramSpike.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-vector-ab")
+        {
+            KernelConveyorTool.Run("vector-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-coarsen-ab")
+        {
+            KernelConveyorTool.Run("coarsen-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-autotune")
+        {
+            KernelAutotuneTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-splitk")
+        {
+            KernelSplitTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--warp-tile-sweep")
+        {
+            WarpTileSweepTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--multiout-check")
+        {
+            MultiOutputCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--algebra-check")
+        {
+            AlgebraCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--gather-check")
+        {
+            GatherScatterCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--tensorcore-check")
+        {
+            TensorCoreCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--frontend-check")
+        {
+            FrontEndCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-limiter")
+        {
+            KernelLimiterTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-predict")
+        {
+            KernelConveyorTool.Run("predict", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-once")
+        {
+            KernelConveyorTool.Run("once", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-dump")
+        {
+            KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-verify")
+        {
+            KernelConveyorTool.Run("verify", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-release")
+        {
+            KernelConveyorTool.Run("release", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-bench")
+        {
+            KernelConveyorTool.Run("bench", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--bench-calibrate")
+        {
+            BenchmarkCalibrationExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--codegen-bakeoff")
+        {
+            CodegenBakeOffExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-convolution")
+        {
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxConvolutionExperiment.Run(includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-convolution-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            DirectPtxConvolutionArtifactTool.Run(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-convolution-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            DirectPtxConvolutionArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-convolution-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "convolution", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory,
+                "convolution-cubins.tsv", "convolution-sass-audit.tsv", "convolution");
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
+        {
+            DirectPtxExternalBaselines.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-attention")
+        {
+            DirectPtxProfileTarget.RunAttention();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
+        {
+            DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
+        {
+            DirectPtxProfileTarget.RunDecode();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-paged-prefill")
+        {
+            DirectPtxProfileTarget.RunPagedPrefill();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-attention-backward")
+        {
+            DirectPtxProfileTarget.RunAttentionBackward();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-flash-attention-backward")
+        {
+            DirectPtxProfileTarget.RunFlashAttentionBackward();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
+        {
+            DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")
+        {
+            DirectPtxProfileTarget.RunConvolution();
+            return;
+        }
+        if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
+        {
+            DirectPtxProfileTarget.VerifyNcuCsv(args[1]);
+            return;
+        }
+
         // Run quick performance test first for immediate feedback
         if (args.Length == 0 || args[0] == "--quick")
         {
@@ -944,6 +1229,29 @@ class Program
         Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");
         Console.WriteLine("  --verify-bf16gemm: Verify the BF16 GEMM microkernel end to end (run under Intel SDE); exits non-zero on mismatch (#378)");
 #if !NET462
+        Console.WriteLine("  --direct-ptx-attention: Driver-only emitted-PTX Q*K^T vs cuBLAS/current CUDA path");
+        Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
+        Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
+        Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
+        Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
+        Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
+        Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
+        Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
+        Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
+        Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
+        Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
+        Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-convolution-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
+        Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
+        Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
+        Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
+        Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
+        Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
+        Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
+        Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
+        Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");

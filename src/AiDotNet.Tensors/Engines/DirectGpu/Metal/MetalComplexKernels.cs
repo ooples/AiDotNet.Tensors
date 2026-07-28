@@ -26,6 +26,30 @@ kernel void split_complex_multiply(
     outImag[idx] = ar * bi + ai * br;
 }
 
+kernel void interleave_complex(
+    device const float* real [[buffer(0)]],
+    device const float* imag [[buffer(1)]],
+    device float* interleaved [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= n) return;
+    interleaved[2 * idx] = real[idx];
+    interleaved[2 * idx + 1] = imag[idx];
+}
+
+kernel void deinterleave_complex(
+    device const float* interleaved [[buffer(0)]],
+    device float* real [[buffer(1)]],
+    device float* imag [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= n) return;
+    real[idx] = interleaved[2 * idx];
+    imag[idx] = interleaved[2 * idx + 1];
+}
+
 kernel void split_complex_conjugate(
     device const float* inReal [[buffer(0)]],
     device const float* inImag [[buffer(1)]],

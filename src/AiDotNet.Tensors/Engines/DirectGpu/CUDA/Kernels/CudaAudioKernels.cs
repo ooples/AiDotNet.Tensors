@@ -118,8 +118,11 @@ extern ""C"" __global__ __launch_bounds__(256) void audio_resample(
         int idx = centre + k;
         if (idx < 0 || idx >= inLen) continue;
         float t = (idx - srcIdx) * cutoff;
-        float sinc = (fabsf(t) < 1e-12f) ? 1.0f : __sinf(PI * t) / (PI * t);
-        float hann = 0.5f - 0.5f * __cosf(2.0f * PI * (k + halfWidth) / (2.0f * halfWidth));
+        // Full-precision sinf/cosf (NOT fast-math __sinf/__cosf): the Hann arg spans [0,2π] where the fast
+        // intrinsics lose accuracy, biasing this 513-tap filter ~2% off the CPU Math.Sin/Cos reference.
+        // Matches the HIP port of this kernel.
+        float sinc = (fabsf(t) < 1e-12f) ? 1.0f : sinf(PI * t) / (PI * t);
+        float hann = 0.5f - 0.5f * cosf(2.0f * PI * (k + halfWidth) / (2.0f * halfWidth));
         float w = sinc * hann;
         acc += w * input[sBase + idx];
         wSum += w;

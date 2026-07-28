@@ -343,7 +343,19 @@ extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* A,
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = powf(A[idx], exponent);
+    float x = A[idx];
+    // Fast pow implementations route through log2(x), which is invalid for a
+    // negative x even when the exponent is integral. Compute the magnitude
+    // from |x| and restore the sign for odd exponents.
+    if (x < 0.0f && exponent == truncf(exponent))
+    {
+        float magnitude = powf(-x, exponent);
+        B[idx] = (fmodf(fabsf(exponent), 2.0f) == 1.0f) ? -magnitude : magnitude;
+    }
+    else
+    {
+        B[idx] = powf(x, exponent);
+    }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* input, float* output, int size)
@@ -743,7 +755,9 @@ extern ""C"" __global__ __launch_bounds__(256) void selu_backward(const float* g
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    float grad = x > 0.0f ? scale : scale * alpha * expf(x);
+    // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)), as OpenCL and WebGpu
+    // already do. Differs only at x==0 and x==-0, where it is a factor-of-alpha error.
+    float grad = x >= 0.0f ? scale : scale * alpha * expf(x);
     gradInput[idx] = gradOutput[idx] * grad;
 }
 

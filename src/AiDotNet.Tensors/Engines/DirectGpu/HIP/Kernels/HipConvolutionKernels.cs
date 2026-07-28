@@ -30,7 +30,8 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col(
     int ow = rem % outW;
 
     int patchSize = channels * kernelH * kernelW;
-    float* outPtr = output + idx * patchSize;
+    int L = outH * outW;
+    int s = oh * outW + ow;
 
     for (int c = 0; c < channels; c++) {
         for (int kh = 0; kh < kernelH; kh++) {
@@ -41,8 +42,8 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col(
                 if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
                     val = input[((b * channels + c) * height + ih) * width + iw];
                 }
-                int outIdx = (c * kernelH + kh) * kernelW + kw;
-                outPtr[outIdx] = val;
+                int colRow = (c * kernelH + kh) * kernelW + kw;
+                output[(b * patchSize + colRow) * L + s] = val;
             }
         }
     }
@@ -67,6 +68,7 @@ extern ""C"" __global__ __launch_bounds__(256) void col2im(
 
     float sum = 0.0f;
     int patchSize = channels * kernelH * kernelW;
+    int L = outH * outW;
 
     for (int kh = 0; kh < kernelH; kh++) {
         for (int kw = 0; kw < kernelW; kw++) {
@@ -76,9 +78,9 @@ extern ""C"" __global__ __launch_bounds__(256) void col2im(
                 int oh = oh_base / strideH;
                 int ow = ow_base / strideW;
                 if (oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
-                    int patchIdx = (b * outH + oh) * outW + ow;
                     int colIdx = (c * kernelH + kh) * kernelW + kw;
-                    sum += input[patchIdx * patchSize + colIdx];
+                    int s = oh * outW + ow;
+                    sum += input[(b * patchSize + colIdx) * L + s];
                 }
             }
         }

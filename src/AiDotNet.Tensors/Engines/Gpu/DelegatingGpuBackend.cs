@@ -95,6 +95,26 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.MatMul(A, B, M, N, K);
 
     /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+        => Inner.PagedAttentionDecode(q, kcache, vcache, blockTable, heads, headDim, blockSize, seqLen, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        => Inner.PagedAttentionPrefill(q, kcache, vcache, blockTable, heads, headDim, blockSize, numQueries, startPos, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+        => Inner.PagedAttentionDecodeGqa(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        => Inner.PagedAttentionPrefillGqa(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
+
+    /// <inheritdoc/>
     public virtual void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         => Inner.MatMulTransposed(A, B, C, M, N, K, alpha, beta);
 
@@ -853,9 +873,15 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
         => Inner.ScaledDotProductAttention(query, key, value, output, attentionWeights, mask,
-            batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap, numKVHeads);
+
+    /// <inheritdoc/>
+    public virtual void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+        => Inner.RopeInterleaved(input, cos, sin, output, rows, headDim, seqLen, startPosition);
 
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -1987,6 +2013,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     // --- Split-buffer native Complex<T> operations ---
     public virtual void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexMultiply(aReal, aImag, bReal, bImag, outReal, outImag, n);
+    public virtual void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n) => Inner.InterleaveComplex(real, imag, interleaved, n);
+    public virtual void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n) => Inner.DeinterleaveComplex(interleaved, real, imag, n);
     public virtual void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexConjugate(inReal, inImag, outReal, outImag, n);
     public virtual void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => Inner.SplitComplexMagnitude(inReal, inImag, outMag, n);
     public virtual void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => Inner.SplitComplexMagnitudeSquared(inReal, inImag, outMagSq, n);

@@ -28,6 +28,7 @@ internal sealed class MockGpuBuffer : IGpuBuffer
     public int Size => Data.Length;
     public long SizeInBytes => (long)Data.Length * sizeof(float);
     public IntPtr Handle { get; }
+    public int DisposeCount { get; private set; }
 
     public MockGpuBuffer(float[] data)
     {
@@ -38,7 +39,7 @@ internal sealed class MockGpuBuffer : IGpuBuffer
     }
 
     private static int _handleCounter;
-    public void Dispose() { }
+    public void Dispose() => DisposeCount++;
 }
 
 /// <summary>
@@ -60,6 +61,7 @@ internal sealed class MockBackendState
     public string DeviceName { get; set; } = "MockDevice";
     public string DeviceVendor { get; set; } = "Mock";
     public List<int> AllocationSizes { get; } = new();
+    public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
     public int DownloadBufferCalls { get; set; }
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
@@ -110,14 +112,18 @@ public class MockDirectGpuBackend : DispatchProxy
                 // Copy so subsequent host writes don't affect the buffer.
                 var copy = new float[arr.Length];
                 Array.Copy(arr, copy, arr.Length);
-                return new MockGpuBuffer(copy);
+                var buffer = new MockGpuBuffer(copy);
+                _state.AllocatedBuffers.Add(buffer);
+                return buffer;
             }
             case "AllocateBuffer" when args.Length == 1 && args[0] is int size:
             {
                 long bytes = (long)size * sizeof(float);
                 GpuBufferSizeGuard.EnsureFits("Mock", bytes, _state.MaxBufferAllocBytes, _state.DeviceName);
                 _state.AllocationSizes.Add(size);
-                return new MockGpuBuffer(new float[size]);
+                var buffer = new MockGpuBuffer(new float[size]);
+                _state.AllocatedBuffers.Add(buffer);
+                return buffer;
             }
             case "DownloadBuffer" when args.Length == 1:
             {

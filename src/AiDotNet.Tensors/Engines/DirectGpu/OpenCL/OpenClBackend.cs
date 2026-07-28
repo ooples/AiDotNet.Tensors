@@ -318,6 +318,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 WriteDiag($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
 
+                // Weight-only fused dequant-GEMM (P0: quantized LLM-serving hot path).
+                var quantGemmProgram = CompileOrLoadCached(QuantGemmKernels.GetSource(), optimizationFlags, "Quant dequant-GEMM kernels");
+                _programs.Add(quantGemmProgram);
+                foreach (var name in QuantGemmKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, quantGemmProgram, name);
+                }
+                WriteDiag($"[OpenClBackend] Quant GEMM kernels: {string.Join(", ", QuantGemmKernels.GetKernelNames())}");
+
+                // Paged attention (P1). SafeMathFlags: the kernel relies on INFINITY / exp semantics
+                // that -cl-finite-math-only would optimize away.
+                var pagedAttnProgram = CompileOrLoadCached(PagedAttentionKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Paged attention kernels");
+                _programs.Add(pagedAttnProgram);
+                foreach (var name in PagedAttentionKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, pagedAttnProgram, name);
+                }
+                WriteDiag($"[OpenClBackend] Paged attention kernels: {string.Join(", ", PagedAttentionKernels.GetKernelNames())}");
+
+                // Fused decode attention (P2: FlashDecoding). SafeMathFlags for INFINITY / exp semantics.
+                var flashDecodeProgram = CompileOrLoadCached(FlashDecodeKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Flash decode kernels");
+                _programs.Add(flashDecodeProgram);
+                foreach (var name in FlashDecodeKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, flashDecodeProgram, name);
+                }
+                WriteDiag($"[OpenClBackend] Flash decode kernels: {string.Join(", ", FlashDecodeKernels.GetKernelNames())}");
+
                 // Compile activation kernels with NaN-preserving math flags: the
                 // relu kernel propagates NaN by contract, which -cl-finite-math-only
                 // / -cl-fast-relaxed-math would optimize away (the compiler assumes
@@ -784,6 +812,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"OpenCL Detection compilation failed: {ex.Message}");
+                }
+
+                // Compile fused ANN kernels (IVF / PQ / IVFPQ / HNSW). Optional —
+                // same fallback pattern as Detection: on compile failure the
+                // kernels are simply absent from _kernelCache, the IAnnBackend
+                // implementation throws on call, and the engine falls through to
+                // the managed AnnPrimitives CPU reference.
+                try
+                {
+                    var annProgram = CompileOrLoadCached(OpenClAnnKernels.GetSource(), optimizationFlags, "ANN kernels");
+                    // Commit program + kernels together so a partial failure
+                    // doesn't leave _kernelCache in a half-populated state.
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClAnnKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, annProgram, name)));
+                    _programs.Add(annProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL ANN compilation failed: {ex.Message}");
                 }
 
                 // Compile Geometry / sampling kernels (Issue #217 second half).
@@ -2623,6 +2672,359 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 output?.Dispose();
                 temp?.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Paged-attention decode for a single query token (P1): out[heads*headDim] =
+        /// softmax(scale · Q·K) · V over the sequence, reading K/V from the physical block pool
+        /// (layout [maxBlocks, blockSize, heads, headDim]) via <paramref name="blockTable"/> (an int
+        /// buffer of physical block ids). headDim &lt;= 256. Matches a standard-attention CPU oracle.
+        /// </summary>
+        public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+            int heads, int headDim, int blockSize, int seqLen, float scale)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
+            var output = AllocateBuffer(heads * headDim);
+            try
+            {
+                var kernel = _kernelCache["paged_attention_decode"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuBuffer)kcache).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)vcache).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)blockTable).Buffer.Handle);
+                kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(5, heads);
+                kernel.SetArg(6, headDim);
+                kernel.SetArg(7, blockSize);
+                kernel.SetArg(8, seqLen);
+                kernel.SetArg(9, scale);
+                int local = CalculateOptimalWorkGroupSize1D(heads);
+                int global = ((heads + local - 1) / local) * local;
+                kernel.Execute1D(global, local);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Prefill / multi-query paged attention (P1): causal attention for <paramref name="numQueries"/>
+        /// query positions (logical positions startPos..startPos+numQueries-1) over K/V read from the
+        /// physical block pool via <paramref name="blockTable"/>. Query qi attends to key positions
+        /// 0..(startPos+qi). q/out are [numQueries, heads, headDim]; headDim &lt;= 256.
+        /// </summary>
+        public IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+            int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+            if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
+            var output = AllocateBuffer(numQueries * heads * headDim);
+            try
+            {
+                var kernel = _kernelCache["paged_attention_prefill"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuBuffer)kcache).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)vcache).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)blockTable).Buffer.Handle);
+                kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(5, heads);
+                kernel.SetArg(6, headDim);
+                kernel.SetArg(7, blockSize);
+                kernel.SetArg(8, numQueries);
+                kernel.SetArg(9, startPos);
+                kernel.SetArg(10, scale);
+                int totalItems = numQueries * heads;
+                int local = CalculateOptimalWorkGroupSize1D(totalItems);
+                int global = ((totalItems + local - 1) / local) * local;
+                kernel.Execute1D(global, local);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>GQA decode (P1): grouped-query paged attention decode. Query head h shares KV head
+        /// h/(heads/kvHeads); K/V pool laid out [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+        public IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+            int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+            GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
+            var output = AllocateBuffer(heads * headDim);
+            try
+            {
+                var kernel = _kernelCache["paged_attention_decode_gqa"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuBuffer)kcache).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)vcache).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)blockTable).Buffer.Handle);
+                kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(5, heads);
+                kernel.SetArg(6, kvHeads);
+                kernel.SetArg(7, headDim);
+                kernel.SetArg(8, blockSize);
+                kernel.SetArg(9, seqLen);
+                kernel.SetArg(10, scale);
+                int local = CalculateOptimalWorkGroupSize1D(heads);
+                int global = ((heads + local - 1) / local) * local;
+                kernel.Execute1D(global, local);
+                _context.Finish();
+                return output;
+            }
+            catch { output.Dispose(); throw; }
+        }
+
+        /// <summary>GQA prefill (P1): causal multi-query paged attention with grouped KV heads.</summary>
+        public IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+            int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+            GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+            if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+            GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
+            var output = AllocateBuffer(numQueries * heads * headDim);
+            try
+            {
+                var kernel = _kernelCache["paged_attention_prefill_gqa"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuBuffer)kcache).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)vcache).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)blockTable).Buffer.Handle);
+                kernel.SetArg(4, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(5, heads);
+                kernel.SetArg(6, kvHeads);
+                kernel.SetArg(7, headDim);
+                kernel.SetArg(8, blockSize);
+                kernel.SetArg(9, numQueries);
+                kernel.SetArg(10, startPos);
+                kernel.SetArg(11, scale);
+                int totalItems = numQueries * heads;
+                int local = CalculateOptimalWorkGroupSize1D(totalItems);
+                int global = ((totalItems + local - 1) / local) * local;
+                kernel.Execute1D(global, local);
+                _context.Finish();
+                return output;
+            }
+            catch { output.Dispose(); throw; }
+        }
+
+        /// <summary>
+        /// Fused decode attention (P2, FlashDecoding): single-query attention for one token per head over
+        /// contiguous K/V of shape [seqLen, kvHeads, headDim]. The sequence is split into
+        /// <paramref name="splits"/> chunks computed in parallel, then merged with an online-softmax
+        /// reduction — parallelising the autoregressive-decode hot path across the KV sequence. GQA via
+        /// kvHead = h/(heads/kvHeads); pass <paramref name="kvHeads"/> == heads for standard MHA.
+        /// q is [heads*headDim], output is [heads*headDim]; headDim &lt;= 256. Matches a CPU attention oracle.
+        /// </summary>
+        public IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+            int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+            GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+            GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+            GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
+            // Default split count: enough to expose parallelism without tiny chunks. Clamp to seqLen.
+            int effSplits = splits > 0 ? splits : Math.Min(seqLen, 8);
+            if (effSplits > seqLen) effSplits = seqLen;
+            int splitLen = (seqLen + effSplits - 1) / effSplits;
+
+            var output = AllocateBuffer(heads * headDim);
+            var partialM = AllocateBuffer(heads * effSplits);
+            var partialL = AllocateBuffer(heads * effSplits);
+            var partialAcc = AllocateBuffer(heads * effSplits * headDim);
+            try
+            {
+                var part = _kernelCache["flash_decode_partial"];
+                part.SetArg(0, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+                part.SetArg(1, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+                part.SetArg(2, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+                part.SetArg(3, ((DirectOpenClGpuBuffer)partialM).Buffer.Handle);
+                part.SetArg(4, ((DirectOpenClGpuBuffer)partialL).Buffer.Handle);
+                part.SetArg(5, ((DirectOpenClGpuBuffer)partialAcc).Buffer.Handle);
+                part.SetArg(6, heads);
+                part.SetArg(7, kvHeads);
+                part.SetArg(8, headDim);
+                part.SetArg(9, seqLen);
+                part.SetArg(10, effSplits);
+                part.SetArg(11, splitLen);
+                part.SetArg(12, scale);
+                int totalItems = heads * effSplits;
+                int localP = CalculateOptimalWorkGroupSize1D(totalItems);
+                int globalP = ((totalItems + localP - 1) / localP) * localP;
+                part.Execute1D(globalP, localP);
+
+                var reduce = _kernelCache["flash_decode_reduce"];
+                reduce.SetArg(0, ((DirectOpenClGpuBuffer)partialM).Buffer.Handle);
+                reduce.SetArg(1, ((DirectOpenClGpuBuffer)partialL).Buffer.Handle);
+                reduce.SetArg(2, ((DirectOpenClGpuBuffer)partialAcc).Buffer.Handle);
+                reduce.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                reduce.SetArg(4, heads);
+                reduce.SetArg(5, headDim);
+                reduce.SetArg(6, effSplits);
+                int localR = CalculateOptimalWorkGroupSize1D(heads);
+                int globalR = ((heads + localR - 1) / localR) * localR;
+                reduce.Execute1D(globalR, localR);
+                _context.Finish();
+                return output;
+            }
+            catch { output.Dispose(); throw; }
+            finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
+        }
+
+        /// <summary>
+        /// Weight-only fused dequant-GEMM: <c>C[M,N] = activations[M,K] · dequant(int8 W[K,N])</c>.
+        /// Symmetric scales, matching the CPU oracle <c>FusedDequantMatmulKernels.Q8MatMul</c>
+        /// (per-tensor when <paramref name="scaleCount"/> == 1, else per-group over the flattened
+        /// buffer with <paramref name="groupSize"/>). <paramref name="weightsInt8"/> is a byte buffer
+        /// (the sbyte payload reinterpreted as bytes via <see cref="AllocateByteBuffer"/> +
+        /// <see cref="UploadByteBuffer"/>); <paramref name="scales"/> is a float buffer. Returns a
+        /// freshly allocated float output buffer [M*N].
+        /// </summary>
+        public IGpuBuffer DequantGemmInt8(
+            IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
+            int M, int K, int N, int groupSize, int scaleCount)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
+            GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+            GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
+            GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
+
+            var output = AllocateBuffer(M * N);
+            try
+            {
+                var kernel = _kernelCache["dequant_gemm_int8"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)activations).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuByteBuffer)weightsInt8).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(4, M);
+                kernel.SetArg(5, K);
+                kernel.SetArg(6, N);
+                kernel.SetArg(7, groupSize);
+                kernel.SetArg(8, scaleCount);
+
+                var (localX, localY) = CalculateOptimalWorkGroupSize(M, N);
+                int globalX = ((M + localX - 1) / localX) * localX;
+                int globalY = ((N + localY - 1) / localY) * localY;
+                kernel.Execute2D(globalX, globalY, localX, localY);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Weight-only fused dequant-GEMM for int4 weights (2 signed nibbles per byte, low nibble =
+        /// even element; matches <c>PackedInt4</c> / llama.cpp Q4_0 and the CPU oracle
+        /// <c>FusedDequantMatmulKernels.Q4MatMul</c>). <paramref name="weightsInt4Packed"/> is a byte
+        /// buffer of length <c>ceil(K*N/2)</c>; scales are symmetric (per-tensor when
+        /// <paramref name="scaleCount"/> == 1, else per-group over the flattened K*N buffer).
+        /// </summary>
+        public IGpuBuffer DequantGemmInt4(
+            IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
+            int M, int K, int N, int groupSize, int scaleCount)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
+            GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+            GpuKernelGuards.Capacity(weightsInt4Packed, ((long)K * N + 1) / 2, nameof(weightsInt4Packed), nameof(DequantGemmInt4));
+            GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
+
+            var output = AllocateBuffer(M * N);
+            try
+            {
+                var kernel = _kernelCache["dequant_gemm_int4"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)activations).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuByteBuffer)weightsInt4Packed).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(4, M);
+                kernel.SetArg(5, K);
+                kernel.SetArg(6, N);
+                kernel.SetArg(7, groupSize);
+                kernel.SetArg(8, scaleCount);
+
+                var (localX, localY) = CalculateOptimalWorkGroupSize(M, N);
+                int globalX = ((M + localX - 1) / localX) * localX;
+                int globalY = ((N + localY - 1) / localY) * localY;
+                kernel.Execute2D(globalX, globalY, localX, localY);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: <c>C[M,N] = act[M,K] ·
+        /// (scale · decode_e4m3(W[K,N]))</c>. <paramref name="weightsFp8"/> is a byte buffer of the
+        /// raw fp8 e4m3 bytes (matching <c>Float8E4M3.RawValue</c> / decode via <c>ToFloat</c>);
+        /// symmetric scales (per-tensor when <paramref name="scaleCount"/> == 1, else per-group over
+        /// the flattened K*N buffer).
+        /// </summary>
+        public IGpuBuffer DequantGemmFp8E4M3(
+            IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
+            int M, int K, int N, int groupSize, int scaleCount)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+            GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+            GpuKernelGuards.Capacity(weightsFp8, (long)K * N, nameof(weightsFp8), nameof(DequantGemmFp8E4M3));
+            GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
+
+            var output = AllocateBuffer(M * N);
+            try
+            {
+                var kernel = _kernelCache["dequant_gemm_fp8_e4m3"];
+                kernel.SetArg(0, ((DirectOpenClGpuBuffer)activations).Buffer.Handle);
+                kernel.SetArg(1, ((DirectOpenClGpuByteBuffer)weightsFp8).Buffer.Handle);
+                kernel.SetArg(2, ((DirectOpenClGpuBuffer)scales).Buffer.Handle);
+                kernel.SetArg(3, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kernel.SetArg(4, M);
+                kernel.SetArg(5, K);
+                kernel.SetArg(6, N);
+                kernel.SetArg(7, groupSize);
+                kernel.SetArg(8, scaleCount);
+
+                var (localX, localY) = CalculateOptimalWorkGroupSize(M, N);
+                int globalX = ((M + localX - 1) / localX) * localX;
+                int globalY = ((N + localY - 1) / localY) * localY;
+                kernel.Execute2D(globalX, globalY, localX, localY);
+                _context.Finish();
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
                 throw;
             }
         }
@@ -7951,12 +8353,18 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+            int numKVHeads = 0)
         {
             if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
+            // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+            // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+            int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+            if (numHeads % kvHeads != 0)
+                throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
             int querySize = checked(batch * numHeads * seqQ * headDim);
-            int keyValueSize = checked(batch * numHeads * seqK * headDim);
+            int keyValueSize = checked(batch * kvHeads * seqK * headDim);
             int weightsSize = checked(batch * numHeads * seqQ * seqK);
             if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
                 throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
@@ -7983,9 +8391,37 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, isCausal ? 1 : 0);
             k.SetArg(arg++, maskMode);
             k.SetArg(arg++, attentionWeights != null ? 1 : 0);
+            k.SetArg(arg++, softcap);
+            k.SetArg(arg++, kvHeads);
 
             int rows = checked(batch * numHeads * seqQ);
             k.Execute1D(rows, Math.Min(256, rows));
+        }
+
+        public void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+            int rows, int headDim, int seqLen, int startPosition)
+        {
+            if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+                throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+            if ((headDim & 1) != 0)
+                throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+            int total = checked(rows * headDim);
+            if (input.Size < total || output.Size < total)
+                throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+
+            var k = _kernelCache["rope_interleaved"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)cos).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)sin).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, rows);
+            k.SetArg(arg++, headDim);
+            k.SetArg(arg++, seqLen);
+            k.SetArg(arg++, startPosition);
+
+            int pairs = checked(rows * (headDim / 2));
+            k.Execute1D(pairs, Math.Min(256, pairs));
         }
 
         public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -11897,8 +12333,35 @@ KERNEL VARIANTS (A/B testing):
         kernel.Execute1D(n, localSize);
     }
 
+    private static void ValidateComplexLayoutBuffers(
+        IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n, string opName)
+    {
+        if (real is null) throw new ArgumentNullException(nameof(real));
+        if (imag is null) throw new ArgumentNullException(nameof(imag));
+        if (interleaved is null) throw new ArgumentNullException(nameof(interleaved));
+        long requiredInterleaved = checked((long)n * 2);
+        if (real.Size < n || imag.Size < n || interleaved.Size < requiredInterleaved)
+            throw new ArgumentException(
+                $"{opName}: real and imag require {n} elements and interleaved requires {requiredInterleaved}; "
+                + $"actual sizes are {real.Size}, {imag.Size}, and {interleaved.Size}.");
+    }
+
     public void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_multiply", [aReal, aImag, bReal, bImag, outReal, outImag], n);
+
+    public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(InterleaveComplex));
+        DispatchSplitComplex("interleave_complex", [real, imag, interleaved], n);
+    }
+
+    public void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n)
+    {
+        if (n <= 0) return;
+        ValidateComplexLayoutBuffers(real, imag, interleaved, n, nameof(DeinterleaveComplex));
+        DispatchSplitComplex("deinterleave_complex", [interleaved, real, imag], n);
+    }
 
     public void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n)
         => DispatchSplitComplex("split_complex_conjugate", [inReal, inImag, outReal, outImag], n);

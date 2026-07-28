@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.119.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.118.0...v0.119.0) (2026-07-21)
+
+
+### Features
+
+* **simd:** block-Q8_0 GEMM matching ggml_vec_dot_q8_0_q8_0 ([#830](https://github.com/ooples/AiDotNet.Tensors/issues/830)) ([3a4d27e](https://github.com/ooples/AiDotNet.Tensors/commit/3a4d27eaadb2382f71277b3487fe64fde9f1ed33))
+
+
+### Bug Fixes
+
+* **cuda:** power_scalar returned NaN for negative bases under --use_fast_math ([#827](https://github.com/ooples/AiDotNet.Tensors/issues/827)) ([4ae2377](https://github.com/ooples/AiDotNet.Tensors/commit/4ae237736a7196c717efbe486cbf2b1d9653a19a))
+* **gpu:** add tape-gradient parity and correct backward kernels ([#829](https://github.com/ooples/AiDotNet.Tensors/issues/829)) ([f1b6dff](https://github.com/ooples/AiDotNet.Tensors/commit/f1b6dff4df7f5aea7b675bb56201f82366d57ece))
+
+
+### Performance
+
+* **fft:** blittable buffer-reusing NativeComplexFFT — kill per-call Complex&lt;T&gt; allocation ([#855](https://github.com/ooples/AiDotNet.Tensors/issues/855)) ([b61cd73](https://github.com/ooples/AiDotNet.Tensors/commit/b61cd730c01e7596c522e7fdc630d789c268c9f7))
+* **fft:** wire NativeComplexFFT butterfly to SIMD radix-2 (test-gated) ([#831](https://github.com/ooples/AiDotNet.Tensors/issues/831)) ([7938eb2](https://github.com/ooples/AiDotNet.Tensors/commit/7938eb2f5ddb24914e7fe0cc348dc6e2c360ec46))
+
+## [0.118.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.2...v0.118.0) (2026-07-20)
+
+
+### Features
+
+* document and release the native ANN kernel stack (0.118.0) ([#825](https://github.com/ooples/AiDotNet.Tensors/issues/825)) ([fb5a70e](https://github.com/ooples/AiDotNet.Tensors/commit/fb5a70ea1457af41367388a5fffc13a13b2de184))
+
+## [0.117.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.1...v0.117.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* **gpu:** centralize the persistent-weight version gate into the shared cache lookup ([#821](https://github.com/ooples/AiDotNet.Tensors/issues/821) follow-up) ([#822](https://github.com/ooples/AiDotNet.Tensors/issues/822)) ([87aebd0](https://github.com/ooples/AiDotNet.Tensors/commit/87aebd067219a231d7852d16431f9b99d12188ef))
+* **gpu:** version-gate the persistent weight buffer so in-place weight loads under a GPU engine are not served stale ([#821](https://github.com/ooples/AiDotNet.Tensors/issues/821)) ([4c44737](https://github.com/ooples/AiDotNet.Tensors/commit/4c447370c0a08e4777de2d5f68fe2868efe92f20))
+
+## [0.117.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.0...v0.117.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* GPU [#226](https://github.com/ooples/AiDotNet.Tensors/issues/226) concurrency crash and a chain of pre-existing DirectGpu bugs ([#818](https://github.com/ooples/AiDotNet.Tensors/issues/818)) ([4af7ba8](https://github.com/ooples/AiDotNet.Tensors/commit/4af7ba83ed755be90ad9b8017713a417366dc1e0))
+
+## [0.117.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.116.0...v0.117.0) (2026-07-19)
+
+
+### Features
+
+* **attention:** optional logit soft-cap on ScaledDotProductAttention (CPU + all 6 GPU backends) ([#816](https://github.com/ooples/AiDotNet.Tensors/issues/816)) ([ddccf57](https://github.com/ooples/AiDotNet.Tensors/commit/ddccf57207c9000ad51399fbedbd4d6f81e27bc9))
+* batch-vectorized float FFT + CUDA/HIP FFT correctness fixes ([#811](https://github.com/ooples/AiDotNet.Tensors/issues/811)) ([#812](https://github.com/ooples/AiDotNet.Tensors/issues/812)) ([77320ef](https://github.com/ooples/AiDotNet.Tensors/commit/77320ef07cf4ccf5f51115651cb2ec8c7345f2b1))
+
+
+### Bug Fixes
+
+* **cpu:** bound Tanh/Sigmoid SIMD backward by logical length (fixes OOB write / AccessViolation) ([#815](https://github.com/ooples/AiDotNet.Tensors/issues/815)) ([8daadc1](https://github.com/ooples/AiDotNet.Tensors/commit/8daadc1bd808bc48579cdf8416d69b346a970aba))
+
+## [0.116.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.1...v0.116.0) (2026-07-18)
+
+
+### Features
+
+* **gpu:** expose paged-attention kernels via IPagedAttentionBackend capability interface ([#806](https://github.com/ooples/AiDotNet.Tensors/issues/806)) ([2ccba00](https://github.com/ooples/AiDotNet.Tensors/commit/2ccba0029f5e3e7ccad7740832e018cdbc4ee683))
+* **licensing:** P1 mirror — scope binding + jti/CRL revocation on signed entitlements ([#808](https://github.com/ooples/AiDotNet.Tensors/issues/808)) ([1db25fc](https://github.com/ooples/AiDotNet.Tensors/commit/1db25fcdfc0c2c503c672c1c3373f54470a755f5))
+
+
+### Refactoring
+
+* **gpu:** put paged-attention on IDirectGpuBackend; drop the capability interface ([#809](https://github.com/ooples/AiDotNet.Tensors/issues/809)) ([c369ab4](https://github.com/ooples/AiDotNet.Tensors/commit/c369ab4cc692500b9fff42b8212352d1dd5bca2a))
+
+## [0.115.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.0...v0.115.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* **ci:** repair line-ending autofix workflow (revives release automation) ([#804](https://github.com/ooples/AiDotNet.Tensors/issues/804)) ([e35fc35](https://github.com/ooples/AiDotNet.Tensors/commit/e35fc355adf4eacfa025a0c65f853f003eef95be))
+
 ## [0.115.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.5...v0.115.0) (2026-07-16)
 
 

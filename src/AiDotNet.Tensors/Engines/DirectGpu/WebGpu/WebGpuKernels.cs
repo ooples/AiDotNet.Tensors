@@ -178,7 +178,22 @@ fn mul_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn pow_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = pow(A[idx], params.scalar);
+        let x = A[idx];
+        let exponent = params.scalar;
+        // WGSL pow is undefined for a negative base. Integral exponents are
+        // valid, so evaluate |x|^exponent and restore odd parity.
+        if (x < 0.0) {
+            if (exponent == trunc(exponent)) {
+                let magnitude = pow(-x, exponent);
+                let abs_exponent = abs(exponent);
+                let is_odd = (abs_exponent - 2.0 * floor(abs_exponent * 0.5)) == 1.0;
+                B[idx] = select(magnitude, -magnitude, is_odd);
+            } else {
+                B[idx] = bitcast<f32>(0x7fc00000u);
+            }
+        } else {
+            B[idx] = pow(x, exponent);
+        }
     }
 }
 
@@ -188,6 +203,46 @@ fn clamp_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < params.size) {
         B[idx] = clamp(A[idx], -params.scalar, params.scalar);
     }
+}
+";
+
+    /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE) — GPT-NeoX / LLaMA / GGML variant.
+    /// Rotates each adjacent dim pair (2i, 2i+1) of every [rows, headDim] row. One invocation per (row, pair).
+    /// </summary>
+    public const string RopeSource = @"
+@group(0) @binding(0) var<storage, read> inputBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> cosCache: array<f32>;
+@group(0) @binding(2) var<storage, read> sinCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputBuf: array<f32>;
+
+struct RopeParams {
+    rows: u32,
+    headDim: u32,
+    seqLen: u32,
+    startPosition: u32,
+}
+@group(0) @binding(4) var<uniform> params: RopeParams;
+
+@compute @workgroup_size(256)
+fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let halfDim = params.headDim / 2u;
+    let g = gid.x;
+    if (g >= params.rows * halfDim) {
+        return;
+    }
+    let i = g % halfDim;
+    let row = g / halfDim;
+    let s = row % params.seqLen;
+    let pos = params.startPosition + s;
+    let baseIdx = row * params.headDim;
+    let cacheIdx = pos * halfDim + i;
+    let c = cosCache[cacheIdx];
+    let sn = sinCache[cacheIdx];
+    let xEven = inputBuf[baseIdx + 2u * i];
+    let xOdd = inputBuf[baseIdx + 2u * i + 1u];
+    outputBuf[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputBuf[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
 }
 ";
 
@@ -4586,13 +4641,15 @@ struct AttentionForwardParams {
     store_weights: u32,
     store_stats: u32,
     boolean_mask_mode: u32,
-    _pad2: u32,
+    softcap: f32,
     _pad3: u32,
 }
 @group(0) @binding(7) var<uniform> attention_params: AttentionForwardParams;
 
 fn attention_forward_excluded(b: u32, q_head: u32, q_pos: u32, k_pos: u32) -> bool {
-    if (attention_params.is_causal != 0u && k_pos > q_pos) { return true; }
+    // KV-cache causal offset: query q_pos sits at absolute position q_pos + (seq_k - seq_q); seq_q==seq_k
+    // collapses to k_pos > q_pos (prefill), while a decode step attends to the whole cached prefix.
+    if (attention_params.is_causal != 0u && k_pos > q_pos + (attention_params.seq_k - attention_params.seq_q)) { return true; }
     if (attention_params.boolean_mask_mode == 0u) { return false; }
     var mask_base: u32 = 0u;
     if (attention_params.boolean_mask_mode == 2u) {
@@ -4615,6 +4672,9 @@ fn attention_forward_score(b: u32, q_head: u32, kv_head: u32, q_pos: u32, k_pos:
     }
 
     var score = dot * attention_params.scale;
+    if (attention_params.softcap > 0.0) {
+        score = attention_params.softcap * tanh(score / attention_params.softcap);
+    }
     if (attention_params.has_bias != 0u && attention_params.boolean_mask_mode == 0u) {
         var bias_base: u32 = 0u;
         if (attention_params.bias_batch_stride != 0u) {
@@ -5724,6 +5784,334 @@ fn permute_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Fused GEMM + Bias + Activation kernel with proper separate bias buffer.
     /// </summary>
+    // Paged-attention decode (P1). K/V in a physical block pool [maxBlocks, blockSize, heads, headDim];
+    // a block table maps logical -> physical block id. Single-query online-softmax; headDim <= 256.
+    // Dispatched via DispatchRecurrence (5 storage buffers at 0-4, scalar uniform at 5, entry `main`).
+    // scale is passed as its int32 bit pattern and recovered via bitcast (scalars are i32).
+    public const string PagedAttentionDecodeSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, headDim: i32, blockSize: i32, seqLen: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = i32(gid.x);
+    if (h >= p.heads) { return; }
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < p.seqLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.heads + h) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[h * p.headDim + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[h * p.headDim + d] = acc[d] * inv; }
+}
+";
+
+    // Prefill / multi-query paged attention (P1, causal). One work-item per (query, head); query qi
+    // (logical position startPos+qi) attends to key positions 0..(startPos+qi). Dispatched via
+    // DispatchRecurrence (5 storage buffers + i32 scalar uniform; scale passed as its int bit pattern).
+    public const string PagedAttentionPrefillSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, headDim: i32, blockSize: i32, numQueries: i32, startPos: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let total = p.numQueries * p.heads;
+    if (idx >= total) { return; }
+    let qi = idx / p.heads;
+    let h = idx % p.heads;
+    let keyLen = p.startPos + qi + 1;
+    let qbase = (qi * p.heads + h) * p.headDim;
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < keyLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.heads + h) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[qbase + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[qbase + d] = acc[d] * inv; }
+}
+";
+
+    // GQA decode (P1): query head h shares KV head h/(heads/kvHeads); K/V pool
+    // [maxBlocks, blockSize, kvHeads, headDim]. One work-item per head; headDim <= 256.
+    public const string PagedAttentionDecodeGqaSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, kvHeads: i32, headDim: i32, blockSize: i32, seqLen: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = i32(gid.x);
+    if (h >= p.heads) { return; }
+    let kvHead = h / (p.heads / p.kvHeads);
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < p.seqLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.kvHeads + kvHead) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[h * p.headDim + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[h * p.headDim + d] = acc[d] * inv; }
+}
+";
+
+    // GQA prefill (P1, causal): query head h shares KV head h/(heads/kvHeads); K/V pool
+    // [maxBlocks, blockSize, kvHeads, headDim]. One work-item per (query, head); headDim <= 256.
+    public const string PagedAttentionPrefillGqaSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, kvHeads: i32, headDim: i32, blockSize: i32, numQueries: i32, startPos: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let total = p.numQueries * p.heads;
+    if (idx >= total) { return; }
+    let qi = idx / p.heads;
+    let h = idx % p.heads;
+    let kvHead = h / (p.heads / p.kvHeads);
+    let keyLen = p.startPos + qi + 1;
+    let qbase = (qi * p.heads + h) * p.headDim;
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < keyLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.kvHeads + kvHead) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[qbase + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[qbase + d] = acc[d] * inv; }
+}
+";
+
+    // Fused decode attention (P2, FlashDecoding) pass 1: per-(head, split) online-softmax partials over
+    // contiguous K/V [seqLen, kvHeads, headDim]. GQA via kvHead=h/(heads/kvHeads). scale passed as i32
+    // bit pattern (uniform is i32). Dispatched via DispatchRecurrence (6 storage buffers + uniform@6).
+    public const string FlashDecodePartialSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> partialM: array<f32>;
+@group(0) @binding(4) var<storage, read_write> partialL: array<f32>;
+@group(0) @binding(5) var<storage, read_write> partialAcc: array<f32>;
+struct P { heads: i32, kvHeads: i32, headDim: i32, seqLen: i32, splits: i32, splitLen: i32, scaleBits: i32 };
+@group(0) @binding(6) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let total = p.heads * p.splits;
+    if (idx >= total) { return; }
+    let h = idx / p.splits;
+    let s = idx % p.splits;
+    let kvHead = h / (p.heads / p.kvHeads);
+    let start = s * p.splitLen;
+    var end = start + p.splitLen;
+    if (end > p.seqLen) { end = p.seqLen; }
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = start; t < end; t = t + 1) {
+        let kb = (t * p.kvHeads + kvHead) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[h * p.headDim + d] * k[kb + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * v[kb + d]; }
+        m = new_m;
+    }
+    partialM[idx] = m;
+    partialL[idx] = l;
+    let accBase = idx * p.headDim;
+    for (var d = 0; d < p.headDim; d = d + 1) { partialAcc[accBase + d] = acc[d]; }
+}
+";
+
+    // Fused decode attention (P2, FlashDecoding) pass 2: merge per-head split partials with the
+    // online-softmax combine. Dispatched via DispatchRecurrence (4 storage buffers + uniform@4).
+    public const string FlashDecodeReduceSource = @"
+@group(0) @binding(0) var<storage, read> partialM: array<f32>;
+@group(0) @binding(1) var<storage, read> partialL: array<f32>;
+@group(0) @binding(2) var<storage, read> partialAcc: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, headDim: i32, splits: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = i32(gid.x);
+    if (h >= p.heads) { return; }
+    var m = -3.4e38;
+    for (var s = 0; s < p.splits; s = s + 1) {
+        let ms = partialM[h * p.splits + s];
+        if (ms > m) { m = ms; }
+    }
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var l = 0.0;
+    for (var s = 0; s < p.splits; s = s + 1) {
+        let idx = h * p.splits + s;
+        let ls = partialL[idx];
+        if (ls <= 0.0) { continue; }
+        let w = exp(partialM[idx] - m);
+        l = l + ls * w;
+        let accBase = idx * p.headDim;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] + partialAcc[accBase + d] * w; }
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[h * p.headDim + d] = acc[d] * inv; }
+}
+";
+
+    // Weight-only fused dequant-GEMM (P0). Contract matches FusedDequantMatmulKernels:
+    // C[M,N]=act[M,K].dequant(W[K,N]); symmetric scales, per-tensor (scaleCount==1) or per-group
+    // over flat k*N. Integer weights (int8 / unpacked int4) uploaded as array<i32>; fp8 uses raw
+    // e4m3 byte + in-shader decode. Uniform struct padded to 32 bytes (WebGPU 16-byte alignment).
+    public const string DequantGemmIntSource = @"
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<i32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
+@group(0) @binding(4) var<uniform> params: QParams;
+
+@compute @workgroup_size(256)
+fn dequant_gemm_int(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let i = idx / params.N;
+    let j = idx % params.N;
+    var acc = 0.0;
+    if (params.scaleCount == 1u) {
+        let s = scales[0];
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            acc = acc + act[i * params.K + k] * f32(W[k * params.N + j]);
+        }
+        acc = acc * s;
+    } else {
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            let flat = k * params.N + j;
+            acc = acc + act[i * params.K + k] * f32(W[flat]) * scales[flat / params.groupSize];
+        }
+    }
+    outbuf[idx] = acc;
+}
+";
+
+    // FP8 E4M3 weight-only variant; decode matches Float8E4M3.ToFloat.
+    public const string DequantGemmFp8Source = @"
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<i32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
+@group(0) @binding(4) var<uniform> params: QParams;
+
+fn decode_e4m3(raw: u32) -> f32 {
+    let r = raw & 0xFFu;
+    if ((r & 0x7Fu) == 0x7Fu) { return bitcast<f32>(0x7FC00000u); }
+    if ((r & 0x7Fu) == 0u) { return 0.0; }
+    let sign = (r & 0x80u) >> 7u;
+    let exp4 = (r & 0x78u) >> 3u;
+    let m3 = r & 0x07u;
+    let exp32 = i32(exp4) - 7 + 127;
+    let bits = (sign << 31u) | (u32(exp32 & 0xFF) << 23u) | (m3 << 20u);
+    return bitcast<f32>(bits);
+}
+
+@compute @workgroup_size(256)
+fn dequant_gemm_fp8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let i = idx / params.N;
+    let j = idx % params.N;
+    var acc = 0.0;
+    if (params.scaleCount == 1u) {
+        let s = scales[0];
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            acc = acc + act[i * params.K + k] * decode_e4m3(u32(W[k * params.N + j]));
+        }
+        acc = acc * s;
+    } else {
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            let flat = k * params.N + j;
+            acc = acc + act[i * params.K + k] * decode_e4m3(u32(W[flat])) * scales[flat / params.groupSize];
+        }
+    }
+    outbuf[idx] = acc;
+}
+";
+
     public const string FusedGemmBiasSource = @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
@@ -5861,7 +6249,8 @@ fn squash(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         sq = sq + input[off + d] * input[off + d];
     }
-    let scale = sq / ((1.0 + sq) * sqrt(sq + params.epsilon));
+    let denominator = (1.0 + sq) * (sqrt(sq) + params.epsilon);
+    let scale = select(0.0, sq / denominator, denominator != 0.0);
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         output[off + d] = input[off + d] * scale;
     }
@@ -10525,10 +10914,14 @@ fn squash_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         sq_norm = sq_norm + x * x;
         dot = dot + x * csb_grad_output[base + d];
     }
-    let norm = sqrt(sq_norm + csb_params.epsilon);
-    let scale = sq_norm / ((1.0 + sq_norm) * norm);
-    let dscale = 1.0 / ((1.0 + sq_norm) * (1.0 + sq_norm) * norm);
-    csb_grad_input[idx] = scale * csb_grad_output[idx] - dscale * csb_input[idx] * dot;
+    let norm = sqrt(sq_norm);
+    let norm_plus_epsilon = norm + csb_params.epsilon;
+    let denominator = (1.0 + sq_norm) * norm_plus_epsilon;
+    let valid = denominator != 0.0;
+    let scale = select(0.0, sq_norm / denominator, valid);
+    let coefficient = select(0.0,
+        (norm + 2.0 * csb_params.epsilon - sq_norm * norm) / (denominator * denominator), valid);
+    csb_grad_input[idx] = scale * csb_grad_output[idx] + coefficient * csb_input[idx] * dot;
 }
 ";
 
