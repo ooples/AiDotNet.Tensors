@@ -251,7 +251,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             catch { }
         }
 
-        var result = new Tensor<T>(_shape);
+        // Arena-aware output: every element is written below (bulk copy or odometer
+        // walk), so an uninitialized pooled/arena buffer is safe — and this makes the
+        // materialization reuse across fused-training steps instead of GC-allocating a
+        // fresh backing each step (the transpose/permute → Contiguous path is a large
+        // slice of the per-step allocation on foundation-scale training).
+        var result = Helpers.TensorAllocator.RentUninitialized<T>(_shape);
         var dstSpan = result._data.AsWritableSpan();
 
         if (IsContiguous)
