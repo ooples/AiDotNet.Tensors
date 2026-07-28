@@ -106,6 +106,47 @@ internal static class StableTimer
     }
 
     /// <summary>
+    /// Times a launch that does NOT go through the direct-PTX runtime, using the same
+    /// convergence protocol.
+    /// </summary>
+    /// <remarks>
+    /// The backend owns its own context and stream, so its kernels cannot be bracketed by
+    /// events recorded on the direct-PTX stream. Host timing over a batch is the honest
+    /// alternative, and the stability gate matters MORE here rather than less: host timing
+    /// includes launch cost, so an unstable result is the expected outcome for a short kernel
+    /// and must be reported as one rather than averaged into a confident number.
+    ///
+    /// Both sides of a head-to-head must use the same method, or the comparison measures the
+    /// methods.
+    /// </remarks>
+    internal static Result MeasureHost(
+        Action launch, Action synchronize, long workUnits, int maxAttempts = 7)
+    {
+        if (launch is null) throw new ArgumentNullException(nameof(launch));
+        if (synchronize is null) throw new ArgumentNullException(nameof(synchronize));
+
+        int iterations = IterationsFor(workUnits);
+
+        for (int i = 0; i < Math.Max(3, iterations / 10); i++) launch();
+        synchronize();
+
+        var samples = new List<double>(maxAttempts);
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iterations; i++) launch();
+            synchronize();
+            sw.Stop();
+            samples.Add(sw.Elapsed.TotalMilliseconds * 1000.0 / iterations);
+
+            if (samples.Count >= 3 && SpreadOf(samples) <= StableSpread) break;
+        }
+
+        double spread = SpreadOf(samples);
+        return new Result(Median(samples), spread, samples.Count, spread <= StableSpread);
+    }
+
+    /// <summary>
     /// Iterations for a kernel of a given size: enough to swamp launch overhead, capped so a
     /// large kernel does not run for minutes.
     /// </summary>
