@@ -4991,44 +4991,53 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> Rwkv7SequenceForward<T>(
-        Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> aProj, Tensor<T> bProj, int numHeads)
+        Tensor<T> rProj, Tensor<T> kappa, Tensor<T> kTilde, Tensor<T> vProj,
+        Tensor<T> decayLogit, Tensor<T> iclRate, int numHeads)
     {
         if (rProj is null) throw new ArgumentNullException(nameof(rProj));
-        if (kProj is null) throw new ArgumentNullException(nameof(kProj));
+        if (kappa is null) throw new ArgumentNullException(nameof(kappa));
+        if (kTilde is null) throw new ArgumentNullException(nameof(kTilde));
         if (vProj is null) throw new ArgumentNullException(nameof(vProj));
-        if (aProj is null) throw new ArgumentNullException(nameof(aProj));
-        if (bProj is null) throw new ArgumentNullException(nameof(bProj));
+        if (decayLogit is null) throw new ArgumentNullException(nameof(decayLogit));
+        if (iclRate is null) throw new ArgumentNullException(nameof(iclRate));
         if (typeof(T) != typeof(float) || rProj.Rank != 3 || numHeads < 1 || !TryGetBackend(out var backend))
-            return base.Rwkv7SequenceForward(rProj, kProj, vProj, aProj, bProj, numHeads);
+            return base.Rwkv7SequenceForward(rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads);
         int batch = rProj._shape[0], seqLen = rProj._shape[1], modelDim = rProj._shape[2];
         if (modelDim % numHeads != 0
-            || !ShapesEqual(kProj._shape, rProj._shape) || !ShapesEqual(vProj._shape, rProj._shape)
-            || !ShapesEqual(aProj._shape, rProj._shape) || !ShapesEqual(bProj._shape, rProj._shape))
-            return base.Rwkv7SequenceForward(rProj, kProj, vProj, aProj, bProj, numHeads);
+            || !ShapesEqual(kappa._shape, rProj._shape) || !ShapesEqual(kTilde._shape, rProj._shape)
+            || !ShapesEqual(vProj._shape, rProj._shape) || !ShapesEqual(decayLogit._shape, rProj._shape)
+            || !ShapesEqual(iclRate._shape, rProj._shape))
+            return base.Rwkv7SequenceForward(rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads);
         int headDim = modelDim / numHeads;
         try
         {
             var cr = rProj.IsContiguous ? rProj : (Tensor<T>)rProj.Contiguous();
-            var ck = kProj.IsContiguous ? kProj : (Tensor<T>)kProj.Contiguous();
+            var ckap = kappa.IsContiguous ? kappa : (Tensor<T>)kappa.Contiguous();
+            var ckt = kTilde.IsContiguous ? kTilde : (Tensor<T>)kTilde.Contiguous();
             var cv = vProj.IsContiguous ? vProj : (Tensor<T>)vProj.Contiguous();
-            var ca = aProj.IsContiguous ? aProj : (Tensor<T>)aProj.Contiguous();
-            var cb = bProj.IsContiguous ? bProj : (Tensor<T>)bProj.Contiguous();
+            var cd = decayLogit.IsContiguous ? decayLogit : (Tensor<T>)decayLogit.Contiguous();
+            var ca = iclRate.IsContiguous ? iclRate : (Tensor<T>)iclRate.Contiguous();
             int total = batch * seqLen * modelDim;
             using var bufR = GetOrAllocateBuffer(backend, cr);
-            using var bufK = GetOrAllocateBuffer(backend, ck);
+            using var bufKap = GetOrAllocateBuffer(backend, ckap);
+            using var bufKt = GetOrAllocateBuffer(backend, ckt);
             using var bufV = GetOrAllocateBuffer(backend, cv);
+            using var bufD = GetOrAllocateBuffer(backend, cd);
             using var bufA = GetOrAllocateBuffer(backend, ca);
-            using var bufB = GetOrAllocateBuffer(backend, cb);
-            using var bufS = AllocateOutputBuffer(backend, batch * numHeads * headDim * headDim);
+            // Scratch per (batch, head): the headDim x headDim state S followed by the three
+            // per-step gate vectors (kappaHat, w, a) the kernel needs — GPU kernels cannot size
+            // local arrays from a runtime headDim, so they live in this buffer.
+            using var bufS = AllocateOutputBuffer(backend,
+                batch * numHeads * (headDim * headDim + 3 * headDim));
             var bufOut = AllocateOutputBuffer(backend, total);
-            backend.Rwkv7Forward(bufR.Buffer, bufK.Buffer, bufV.Buffer, bufA.Buffer, bufB.Buffer, bufOut.Buffer,
-                bufS.Buffer, batch, seqLen, modelDim, numHeads, headDim);
+            backend.Rwkv7Forward(bufR.Buffer, bufKap.Buffer, bufKt.Buffer, bufV.Buffer, bufD.Buffer,
+                bufA.Buffer, bufOut.Buffer, bufS.Buffer, batch, seqLen, modelDim, numHeads, headDim);
             var arr = FinishGpuOp<T>(backend, bufOut, total);
             return new Tensor<T>(arr, new[] { batch, seqLen, modelDim });
         }
         catch (Exception)
         {
-            return base.Rwkv7SequenceForward(rProj, kProj, vProj, aProj, bProj, numHeads);
+            return base.Rwkv7SequenceForward(rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads);
         }
     }
 

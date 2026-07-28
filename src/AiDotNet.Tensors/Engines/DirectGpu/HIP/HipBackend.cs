@@ -8312,14 +8312,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
-    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
         int __total = batch*numHeads; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
-        void** args = stackalloc void*[12];
-        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        IntPtr la0 = r.Handle; IntPtr la1 = kappa.Handle; IntPtr la2 = kTilde.Handle; IntPtr la3 = v.Handle; IntPtr la4 = decayLogit.Handle; IntPtr la5 = iclRate.Handle; IntPtr la6 = output.Handle; IntPtr la7 = sbuf.Handle; int la8 = batch; int la9 = seqLen; int la10 = modelDim; int la11 = numHeads; int la12 = headDim;
+        void** args = stackalloc void*[13];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11; args[12] = &la12;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }

@@ -411,29 +411,44 @@ __kernel void unfold(__global const float* src, __global float* dst, int outerSi
     int w = tmp % nWindows; int outer = tmp / nWindows;
     dst[idx] = src[(outer * dimSize + (w * step + s)) * innerSize + inner];
 }
-// RWKV-7 (WKV7 generalized delta rule) sequence forward. One thread per (batch, head); the sequence is
-// scanned sequentially while a per-(b,h) state matrix S[headDim,headDim] lives in global scratch Sbuf.
-// State: S[di,vi] = sig(A)*S[di,vi] + (sig(B[di])*K[di])*V[vi]; readout: out[di] = sig(R[di]) * sum_vi S[di,vi]*K[vi].
-__kernel void rwkv7_forward(__global const float* R, __global const float* K, __global const float* V,
-    __global const float* A, __global const float* B, __global float* outp, __global float* Sbuf,
+// RWKV-7 ""Goose"" generalized-delta-rule sequence forward (arXiv:2503.14456, Eq. 17). One thread per
+// (batch, head); the sequence is scanned sequentially while the per-(b,h) state S[d_v, d_k] plus the
+// kappaHat/w/a gate vectors live in global scratch Sbuf.
+//   S_t[vi,ki] = S_{t-1}[vi,ki]*w[ki] - (S_{t-1}[vi,:] . kappaHat)*a[ki]*kappaHat[ki] + v[vi]*kTilde[ki]
+//   out[vi]    = sum_ki S_t[vi,ki] * r[ki]
+// w = exp(-e^(-1/2)*sigmoid(D)) and kappaHat = kappa/||kappa||_2 are applied here; AR is post-sigmoid.
+__kernel void rwkv7_forward(__global const float* R, __global const float* KAP, __global const float* KT,
+    __global const float* V, __global const float* D, __global const float* AR,
+    __global float* outp, __global float* Sbuf,
     int batch, int seqLen, int modelDim, int numHeads, int headDim) {
     int bh = get_global_id(0); if (bh >= batch * numHeads) return;
     int b = bh / numHeads; int h = bh % numHeads;
     int hOff = h * headDim; int hh = headDim * headDim;
-    __global float* S = Sbuf + bh * hh;
+    __global float* S = Sbuf + bh * (hh + 3 * headDim);
+    __global float* kh = S + hh;
+    __global float* wv = S + hh + headDim;
+    __global float* av = S + hh + 2 * headDim;
     for (int i = 0; i < hh; i++) S[i] = 0.0f;
     for (int t = 0; t < seqLen; t++) {
         int baseOff = (b * seqLen + t) * modelDim + hOff;
-        for (int di = 0; di < headDim; di++) {
-            float ga = 1.0f / (1.0f + exp(-A[baseOff + di]));
-            float gbk = (1.0f / (1.0f + exp(-B[baseOff + di]))) * K[baseOff + di];
-            int srow = di * headDim;
-            for (int vi = 0; vi < headDim; vi++) S[srow + vi] = ga * S[srow + vi] + gbk * V[baseOff + vi];
+        float ss = 1e-12f;
+        for (int ki = 0; ki < headDim; ki++) { float kp = KAP[baseOff + ki]; ss += kp * kp; }
+        float invN = 1.0f / sqrt(ss);
+        for (int ki = 0; ki < headDim; ki++) {
+            kh[ki] = KAP[baseOff + ki] * invN;
+            wv[ki] = exp(-0.60653065971263342f / (1.0f + exp(-D[baseOff + ki])));
+            av[ki] = AR[baseOff + ki];
         }
-        for (int di = 0; di < headDim; di++) {
-            int srow = di * headDim; float sk = 0.0f;
-            for (int vi = 0; vi < headDim; vi++) sk += S[srow + vi] * K[baseOff + vi];
-            outp[baseOff + di] = (1.0f / (1.0f + exp(-R[baseOff + di]))) * sk;
+        for (int vi = 0; vi < headDim; vi++) {
+            int srow = vi * headDim; float p = 0.0f;
+            for (int ki = 0; ki < headDim; ki++) p += S[srow + ki] * kh[ki];
+            float vv = V[baseOff + vi]; float o = 0.0f;
+            for (int ki = 0; ki < headDim; ki++) {
+                float sv = S[srow + ki] * wv[ki] - p * av[ki] * kh[ki] + vv * KT[baseOff + ki];
+                S[srow + ki] = sv;
+                o += sv * R[baseOff + ki];
+            }
+            outp[baseOff + vi] = o;
         }
     }
 }

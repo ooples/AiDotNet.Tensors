@@ -72,6 +72,15 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         return new Tensor<float>(data, shape);
     }
 
+    /// <summary>Squashes a tensor elementwise into (0,1) — for gates the kernels expect post-sigmoid.</summary>
+    private static Tensor<float> Sigmoid01(Tensor<float> t)
+    {
+        var src = (float[])(object)t.GetDataArray()!;
+        var dst = new float[src.Length];
+        for (int i = 0; i < src.Length; i++) dst[i] = 1f / (1f + MathF.Exp(-src[i]));
+        return new Tensor<float>(dst, t.Shape.ToArray());
+    }
+
     private static void AssertMatch(Tensor<float> gpu, Tensor<float> cpu, string op, float tol = Tol)
     {
         Assert.Equal(cpu.Shape.ToArray(), gpu.Shape.ToArray());
@@ -538,13 +547,16 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     public void Rwkv7SequenceForward_GpuMatchesCpu(int batch, int seq, int modelDim, int numHeads)
     {
         if (!EnsureGpuReady()) return;
+        // (r, kappa, kTilde, v, decayLogit, iclRate) — see CpuEngine.Rwkv7SequenceForward.
         var r = Rand(260, batch, seq, modelDim);
-        var k = Rand(261, batch, seq, modelDim);
-        var v = Rand(262, batch, seq, modelDim);
-        var a = Rand(263, batch, seq, modelDim);
-        var b = Rand(264, batch, seq, modelDim);
-        var cpu = _cpu.Rwkv7SequenceForward(r, k, v, a, b, numHeads);
-        var gpu = _gpu.Rwkv7SequenceForward(r, k, v, a, b, numHeads);
+        var kappa = Rand(261, batch, seq, modelDim);
+        var kTilde = Rand(262, batch, seq, modelDim);
+        var v = Rand(263, batch, seq, modelDim);
+        var decayLogit = Rand(264, batch, seq, modelDim);
+        // The in-context learning rate a_t lives in (0,1); squash the random draw into range.
+        var iclRate = Sigmoid01(Rand(265, batch, seq, modelDim));
+        var cpu = _cpu.Rwkv7SequenceForward(r, kappa, kTilde, v, decayLogit, iclRate, numHeads);
+        var gpu = _gpu.Rwkv7SequenceForward(r, kappa, kTilde, v, decayLogit, iclRate, numHeads);
         AssertMatch(gpu, cpu, $"RWKV7[b{batch};s{seq};d{modelDim};h{numHeads}]");
     }
 

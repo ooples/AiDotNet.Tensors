@@ -1193,13 +1193,27 @@ extern ""C"" __global__ void parity210_zeta(const float* __restrict__ x, const f
 extern ""C"" __global__ void parity210_polygamma(const float* __restrict__ x, float* __restrict__ out, int n, int size) {
     int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=size) return; out[i]=p210_polygamma_scalar(n, x[i]);
 }
-extern ""C"" __global__ void parity210_rwkv7_forward(const float* __restrict__ R, const float* __restrict__ K, const float* __restrict__ V, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ outp, float* __restrict__ Sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) {
-    int bh = blockIdx.x*blockDim.x+threadIdx.x; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim; float* S=Sbuf+bh*hh;
+// RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17), one thread per (batch, head):
+//   S_t[vi,ki] = S_{t-1}[vi,ki]*w[ki] - (S_{t-1}[vi,:].kappaHat)*a[ki]*kappaHat[ki] + v[vi]*kTilde[ki]
+//   o[vi]      = sum_ki S_t[vi,ki]*r[ki]
+// w = exp(-e^(-1/2)*sigmoid(D)) and kappaHat = kappa/||kappa||_2 (per head) are applied here; AR is the
+// already-post-sigmoid in-context learning rate. Sbuf holds S then the kappaHat/w/a gate vectors.
+extern ""C"" __global__ void parity210_rwkv7_forward(const float* __restrict__ R, const float* __restrict__ KAP, const float* __restrict__ KT, const float* __restrict__ V, const float* __restrict__ D, const float* __restrict__ AR, float* __restrict__ outp, float* __restrict__ Sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) {
+    int bh = blockIdx.x*blockDim.x+threadIdx.x; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim;
+    float* S=Sbuf+bh*(hh+3*headDim); float* kh=S+hh; float* wv=S+hh+headDim; float* av=S+hh+2*headDim;
     for (int i=0;i<hh;i++) S[i]=0.0f;
     for (int t=0;t<seqLen;t++) {
         int baseOff=(b*seqLen+t)*modelDim+hOff;
-        for (int di=0;di<headDim;di++) { float ga=1.0f/(1.0f+expf(-A[baseOff+di])); float gbk=(1.0f/(1.0f+expf(-B[baseOff+di])))*K[baseOff+di]; int srow=di*headDim; for (int vi=0;vi<headDim;vi++) S[srow+vi]=ga*S[srow+vi]+gbk*V[baseOff+vi]; }
-        for (int di=0;di<headDim;di++) { int srow=di*headDim; float sk=0.0f; for (int vi=0;vi<headDim;vi++) sk+=S[srow+vi]*K[baseOff+vi]; outp[baseOff+di]=(1.0f/(1.0f+expf(-R[baseOff+di])))*sk; }
+        float ss=1e-12f; for (int ki=0;ki<headDim;ki++) { float kp=KAP[baseOff+ki]; ss+=kp*kp; }
+        float invN=1.0f/sqrtf(ss);
+        for (int ki=0;ki<headDim;ki++) { kh[ki]=KAP[baseOff+ki]*invN; wv[ki]=expf(-0.60653065971263342f/(1.0f+expf(-D[baseOff+ki]))); av[ki]=AR[baseOff+ki]; }
+        for (int vi=0;vi<headDim;vi++) {
+            int srow=vi*headDim; float p=0.0f;
+            for (int ki=0;ki<headDim;ki++) p+=S[srow+ki]*kh[ki];
+            float vv=V[baseOff+vi]; float o=0.0f;
+            for (int ki=0;ki<headDim;ki++) { float sv=S[srow+ki]*wv[ki]-p*av[ki]*kh[ki]+vv*KT[baseOff+ki]; S[srow+ki]=sv; o+=sv*R[baseOff+ki]; }
+            outp[baseOff+vi]=o;
+        }
     }
 }
 ";
