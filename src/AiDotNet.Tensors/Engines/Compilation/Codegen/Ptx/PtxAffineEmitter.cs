@@ -78,6 +78,9 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Bounds guards elided because interval analysis proved them unnecessary.</summary>
     public int ElidedGuards { get; private set; }
 
+    /// <summary>Stores emitted as one vector instruction covering several lanes.</summary>
+    public int VectorisedStores { get; private set; }
+
     /// <summary>Index loads emitted for data-dependent (gather/scatter) dimensions.</summary>
     public int IndirectIndexLoads { get; private set; }
 
@@ -1039,6 +1042,19 @@ public sealed partial class PtxAffineEmitter
         if (Coarsening > 1 && parallel.Length > 0)
             SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
 
+        // NOT COARSENED FOR STREAMING, AND THAT IS A MEASURED DECISION. SelectTile
+        // minimises loads-per-MAC, so a kernel with no reduction has no reuse to find and it
+        // declines to tile -- which leaves each thread with one element and blocks both
+        // vector paths. Forcing the contiguous tile at VectorWidth to unblock them was tried
+        // and made things WORSE:
+        //
+        //   elementwise copy 4M         94.3% -> 84.6% of ceiling
+        //   elementwise copy 4M, fp16   69.8% -> 40.2%
+        //
+        // So the one-element-per-thread layout is already the better one for pure streaming
+        // on this hardware, and the fp16 shortfall is NOT the coarsening decision. Reverted
+        // rather than kept, and recorded here so the next reader does not retry it.
+
         int lanes = 1;
         foreach (int f in tileFactors) lanes *= f;
         CoarsenedLanes = lanes;
@@ -1274,7 +1290,7 @@ public sealed partial class PtxAffineEmitter
         LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
-        IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0;
+        IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0; VectorisedStores = 0;
         _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
         // calls makes the SAME spec emit different text on a second Emit, and cubins
@@ -1803,6 +1819,25 @@ public sealed partial class PtxAffineEmitter
         // wrong values while their epilogue-free siblings stayed exact.
         var epilogueCache = new Dictionary<string, string>(StringComparer.Ordinal);
 
+        // A VECTORISED STORE NEEDS THE THREAD TO OWN CONTIGUOUS OUTPUTS. The load side was
+        // fixed first and did not move the fp16 streaming number at all, because a copy
+        // kernel's store is half its traffic and every store here was scalar: at fp16 that is
+        // 32 lanes at two bytes, a 64-byte request against a 128-byte line. fp32 never showed
+        // it, since 32 lanes at four bytes fills the line exactly.
+        //
+        // The conditions are deliberately narrow. Anything predicated, atomic, or writing more
+        // than one buffer keeps the per-lane path, because a vector store commits all four
+        // elements together and cannot honour a per-element guard.
+        bool vectorStore =
+            lanes == VectorWidth &&
+            contiguousFactor == VectorWidth &&
+            !spec.Output.NeedsAtomicStore &&
+            !spec.Output.NeedsBoundsCheck &&
+            spec.ExtraOutputs.Count == 0 &&
+            IsUnitStrideIn(spec.Output, coarsenAxis, axes);
+
+        var pendingStore = vectorStore ? new string[lanes] : null;
+
         for (int l = 0; l < lanes; l++)
         {
             string acc = accs[l];
@@ -1845,6 +1880,12 @@ public sealed partial class PtxAffineEmitter
                 acc = na;
             }
             acc = EmitActivation(spec.Activation, acc);
+
+            if (pendingStore is not null)
+            {
+                pendingStore[l] = acc;
+                continue;
+            }
 
             string laneOff = EmitOffset(spec.Output, laneAxisReg[l], reductionValues, reduction,
                                        out string? lanePred);
@@ -1942,6 +1983,45 @@ public sealed partial class PtxAffineEmitter
 
                 ExtraOutputStores++;
             }
+        }
+
+        if (pendingStore is not null)
+        {
+            string vecOff = EmitOffset(spec.Output, laneAxisReg[0], reductionValues, reduction,
+                                       out string? vecPred);
+            if (vecPred is not null)
+                throw new InvalidOperationException(
+                    "A vectorised store must be provably in range; " + spec.Output.Name +
+                    " produced a guard.");
+
+            string vecByte = NextRd(), vecAddr = NextRd();
+            L($"mul.wide.u32 {vecByte}, {vecOff}, {I(spec.Output.ElementBytes)};");
+            L($"add.u64 {vecAddr}, {basePtr[spec.Output.ParameterIndex]}, {vecByte};");
+
+            if (spec.Output.NeedsConversion)
+            {
+                // Four halves are two words. Each word carries a PAIR, so the second of each
+                // pair is shifted up before being or-ed in -- the mirror of the shift-down the
+                // narrow vector LOAD does when it unpacks.
+                var words = new string[2];
+                for (int w = 0; w < 2; w++)
+                {
+                    string lo = EmitNarrow(spec.Output.ElementType, pendingStore[w * 2]);
+                    string hi = EmitNarrow(spec.Output.ElementType, pendingStore[w * 2 + 1]);
+                    string shifted = NextR();
+                    words[w] = NextR();
+                    L($"shl.b32 {shifted}, {hi}, 16;");
+                    L($"or.b32 {words[w]}, {lo}, {shifted};");
+                }
+                L($"st.global.v2.u32 [{vecAddr}], {{{words[0]}, {words[1]}}};");
+            }
+            else
+            {
+                L($"st.global.v4.f32 [{vecAddr}], " +
+                  $"{{{pendingStore[0]}, {pendingStore[1]}, {pendingStore[2]}, {pendingStore[3]}}};");
+            }
+
+            VectorisedStores++;
         }
 
         // Loads before the loop run once, loads in its body run once per trip, loads
