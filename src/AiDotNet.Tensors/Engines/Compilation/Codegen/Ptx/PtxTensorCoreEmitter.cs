@@ -291,7 +291,12 @@ public sealed partial class PtxTensorCoreEmitter
         _sb.Clear();
         MmaInstructions = 0;
         Staged = false;
+        DoubleBuffered = false;
         SharedMemoryBytes = 0;
+        LoopBarriers = 0;
+        _reg = FixedRegisters;
+        _reg64 = FixedRegisters64;
+        _pred = FixedPredicates;
 
         // The staged lowering is preferred wherever it applies. It is not a tuning option:
         // the naive one moves O(M*N*K) operand bytes and collapses from 11.8 to 3.0 TFLOP/s

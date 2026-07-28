@@ -174,23 +174,81 @@ The justification here never rested on a throughput percentage. Throughput **fel
 when the working set outgrew L2, which is a locality statement no stall counter is needed to
 read. Same lever, different evidence, opposite outcome.
 
-### The next levers, named again
+### Double buffering — built, measured, and it under-delivered
 
-1. **Double-buffer the shared slabs.** Two `bar.sync`s per K step currently serialise the
-   global load against the mma work; a second slab would let step k+1's copy overlap step k's
-   arithmetic.
-2. **A larger block tile.** 128×128 quadruples reuse again; cuBLAS uses that scale.
+Single-buffered staging needs two `bar.sync`s per K step: one after the shared store, one
+after the reads, so a fast warp cannot overwrite a slab a slow one is still reading. Between
+them the global copy and the arithmetic cannot overlap. With two slabs the copy for step k+1
+targets the buffer nobody is reading, so it is *issued before* the mma work for step k. One
+barrier per step.
 
-Neither is measured yet, so neither is claimed.
+Measured as a **paired** A/B — both lowerings emitted, launched and timed in the same process
+and the same thermal window, three runs — because the effect turned out to be small enough
+that a cross-run comparison could not have told signal from drift:
 
-## Standing
+| shape | run 1 | run 2 | run 3 | ≈ |
+|---|---|---|---|---|
+| 1024³ | 1.046× | 1.114× | 1.045× | **1.07×** |
+| 2048³ | 1.170× | 1.126× | 1.055× | **1.12×** |
+| 4096³ | 1.031× | 1.036× | 1.001× | **1.02×** |
+
+The direction is consistent — every one of nine paired measurements is ≥ 1.0 — but the
+magnitude is 2–12%, and it *shrinks* at the largest shape, which is where the argument for it
+was strongest. It is kept because it is a real win at no correctness cost, but it is not the
+step change the reasoning implied.
+
+### Why it under-delivered: the profile
+
+`ncu` on the staged 4096³ kernel, which is what should have been read *before* building the
+lever rather than after:
+
+| metric | value |
+|---|---|
+| **l1tex throughput** | **87.14%** |
+| dram throughput | 52.85% |
+| sm throughput | 32.61% |
+| **tensor pipe active** | **25.29%** |
+
+| stall | value |
+|---|---|
+| `long_scoreboard` | 17.85 |
+| `short_scoreboard` | 10.22 |
+| `mio_throttle` | 7.36 |
+| **`barrier`** | **5.82** |
+| `wait` | 2.78 |
+| `no_instruction` | 0.02 |
+
+**`barrier` is 5.82.** Barriers were never the main cost, so removing one could only ever buy
+a few percent — which is exactly what it bought. The lever was justified by a structural
+argument ("the two barriers serialise the copy against the arithmetic") and never by a
+counter, and the blueprint's §2 rule exists precisely to stop that. The rule was written on
+this branch and then not followed on this branch.
+
+**L1TEX sits at 87.14% while the tensor cores idle at 25.29%.** Shared memory *is* L1TEX on
+this hardware, so the `wmma.load.*.shared` traffic feeding the fragments is at a roofline. The
+kernel is not waiting on global memory — DRAM is at 52.85% — it is waiting on shared-memory
+reads.
+
+### The next lever, derived rather than guessed
+
+A **larger per-warp register tile**, not a larger block tile. Each warp currently loads two A
+fragments and two B fragments to issue four mma instructions — one fragment load per mma. A
+4×4 warp tile loads four and four to issue sixteen: **half the shared traffic per unit of
+arithmetic**, aimed directly at the 87% L1TEX figure.
+
+Note this is *not* what the previous version of this document proposed. That said "a 128×128
+block tile, quadrupling reuse again", which targets global traffic — and DRAM is at 52.85%,
+not the limiter. The profile changed the answer.
+
+## Standing## Standing
 
 Expressiveness: **closed.** The generator can emit tensor-core kernels, with fused
 element-wise epilogues cuBLAS cannot fuse through its own call boundary.
 
-Performance: **improved and still a loss.** 0.80× / 0.60× / 0.57× against cuBLAS after
-staging, up from 0.35× / 0.23× / 0.05×, at ~53% of device peak against its 93%. The next two
-levers are named above and unmeasured.
+Performance: **improved and still a loss.** 0.84× / 0.63× / 0.57× against cuBLAS after staging
+and double buffering, up from 0.35× / 0.23× / 0.05%. Roughly 53% of device peak against its
+93%. The limiter is now measured rather than assumed: L1TEX at 87.14% with the tensor pipe at
+25.29%.
 
 Promotion: still **withheld everywhere**. At 0.57–0.80×, routing a caller who could reach
 cuBLAS to us is still a regression — smaller, but a regression. The capability ships; the
