@@ -164,10 +164,10 @@ public sealed partial class VulkanBackend
             new IGpuBuffer[] { idx },
             new uint[] { (uint)l, (uint)p, (uint)numRows });
     }
-    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         GlslDispatchN(VulkanAuditKernels.Rwkv7Forward, batch*numHeads,
-            new IGpuBuffer[] { r, k, v, a, b, output, sbuf },
+            new IGpuBuffer[] { r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf },
             new uint[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
     }
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)

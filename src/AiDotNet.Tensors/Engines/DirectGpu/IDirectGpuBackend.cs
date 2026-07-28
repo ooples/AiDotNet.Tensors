@@ -2011,10 +2011,17 @@ public interface IDirectGpuBackend : IDisposable
     void IotaPad(IGpuBuffer idx, int l, int p, int numRows);
 
     /// <summary>
-    /// RWKV-7 (WKV7 generalized delta rule) sequence forward, parallel over (batch, head) with a
-    /// per-(b,h) [headDim,headDim] state in the <paramref name="sbuf"/> scratch (size batch*numHeads*headDim^2).
+    /// RWKV-7 "Goose" generalized-delta-rule sequence forward (arXiv:2503.14456, Eq. 17), parallel over
+    /// (batch, head):
+    /// <c>S_t = S_{t-1}(diag(w_t) - kappaHat_t^T(a_t (*) kappaHat_t)) + v_t^T kTilde_t</c>,
+    /// <c>o_t = S_t . r_t</c>, with <c>w = exp(-e^(-1/2) sigmoid(decayLogit))</c> and
+    /// <c>kappaHat = kappa/||kappa||_2</c> per head, both applied internally. <paramref name="iclRate"/>
+    /// is already post-sigmoid.
     /// </summary>
-    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
+    /// <param name="sbuf">Per-(b,h) scratch of size <c>batch*numHeads*(headDim^2 + 3*headDim)</c>: the
+    /// <c>[headDim,headDim]</c> state followed by the kappaHat / w / a gate vectors.</param>
+    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v,
+        IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output,
         IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
     /// <summary>
