@@ -310,6 +310,27 @@ internal static class KernelOracleTool
             yield return ("  row sum, split x32 (partial)", chunked.Partial);
             yield return ("  row sum, split x32 (combine)", chunked.Combine);
 
+            // THE AUTOMATIC CHOICE, from the planner rather than from a hand-picked factor.
+            // If this does not match the manual split, the planner is the thing to fix -- a
+            // lever nobody can reach without knowing the factor is not a lever.
+            var planned = CodegenSplitReduction.TryPlan(rowSum);
+            if (planned is not null)
+            {
+                yield return ("  row sum, PLANNED (partial)", planned.Partial);
+                yield return ("  row sum, PLANNED (combine)", planned.Combine);
+            }
+
+            // The same question for the softmax denominator, which carries a transform inside
+            // the reduction: a split has to keep that transform in the PARTIAL pass only.
+            var softmax = new CodegenKernelSpec("orc_softden_src", space, new[] { x }, y,
+                new[] { 0 }, CodegenReduceKind.Sum, preReduce: CodegenPreReduceOp.Exp);
+            var softPlan = CodegenSplitReduction.TryPlan(softmax);
+            if (softPlan is not null)
+            {
+                yield return ("  softmax denom, PLANNED (partial)", softPlan.Partial);
+                yield return ("  softmax denom, PLANNED (combine)", softPlan.Combine);
+            }
+
             // A softmax denominator: a reduction with a transform inside it.
             yield return ("softmax denom 4096x1024",
                 new CodegenKernelSpec("orc_softden", space, new[] { x }, y,
