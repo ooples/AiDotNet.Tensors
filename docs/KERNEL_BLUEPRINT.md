@@ -181,6 +181,31 @@ the feature flag and the architecture predicate, and an unrecognised family defa
 withheld. Each exclusion carries its reason, and the dense-3×3 one names the balanced stall
 profile so nobody retries the tuning that has already failed twice.
 
+### Dispatch for the generated capabilities
+
+A capability being expressible is not the same as it being reachable, and neither is the same
+as it being worth reaching. The five emitter gaps closed on this branch — fp16/bf16, tensor
+cores, gather/scatter, complex, N outputs — are wired into NO dispatch site, and that is
+correct for now rather than an oversight:
+
+| capability | why not dispatched |
+|---|---|
+| tensor cores | 0.97×–1.04× against cuBLAS. Routing a caller who could reach cuBLAS to us is a coin flip, not a win |
+| gather / scatter | `embedding_forward`, `embedding_backward` and `embedding_backward_deterministic` **already exist** as hand-written kernels |
+| N outputs | the optimizer family already has `adam_update`, `sgd_momentum_update` and the rest |
+| split reductions | the backend already has reduction kernels |
+| complex | no existing consumer in the backend yet |
+
+**So the gating question is never "is it wired" — it is "is it faster than the kernel a caller
+would otherwise get".** That is §3's rule applied to ourselves: the competitor is the best
+thing a user could otherwise call, and on this repository it is frequently us. PR #874
+measured a hand-written fused SGD against the existing kernel and found a tie at 0.73–1.05×,
+because that kernel was already single-pass.
+
+The work that unblocks promotion is therefore a **head-to-head harness** — generated spec
+versus the existing backend kernel, on the same buffers, under the stability gate — not more
+wiring. Anything promoted without that number is promoted on hope.
+
 **A promotion nobody can reach is a note, not a speedup.** Depthwise and max-pool were
 promoted for a full session before either had a call site; their wins existed only inside
 the benchmark harness. Ship the dispatch with the promotion.
