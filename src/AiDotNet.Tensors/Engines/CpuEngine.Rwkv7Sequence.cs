@@ -219,7 +219,14 @@ public partial class CpuEngine
         // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            var Straj = new double[seqLen * hh]; // S_t (post-update) for every t, reused per (b,h)
+            // S_t (post-update) for every t, reused per (b,h). FOOTPRINT: seqLen * headDim^2 doubles
+            // PER PARALLEL CHUNK, so it scales with core count — ~33 MB per worker at seqLen 1024 /
+            // headDim 64. Stored rather than recomputed because the BPTT adjoint needs S_{t-1} at
+            // every step and the rank-1 removal makes the recurrence non-invertible, so S cannot be
+            // walked backwards. If longer-sequence coverage is added and this becomes a problem, the
+            // fix is checkpointed recomputation (store every sqrt(seqLen) steps and replay forward
+            // within a segment), which trades ~2x forward work for a sqrt(seqLen) memory reduction.
+            var Straj = new double[seqLen * hh];
             var S = new double[hh];
             var dS = new double[hh];
             var kh = new double[headDim];
