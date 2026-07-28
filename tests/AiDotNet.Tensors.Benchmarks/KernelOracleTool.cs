@@ -110,6 +110,22 @@ internal static class KernelOracleTool
                 var binding = spec.Inputs[i];
                 var buffer = runtime.AllocateBytes(
                     (nuint)(binding.ElementCount * binding.ElementBytes * spec.Algebra.Components()));
+
+                // INDEX TENSORS MUST BE FILLED. An uninitialised buffer is typically zeros, so
+                // every row of a gather would hit entry 0 and every scatter would contend on
+                // one destination -- which is not a workload, it is the worst case, and
+                // optimising against it would chase a number no caller produces. Spread with a
+                // stride coprime to the table so the accesses are neither sequential nor
+                // degenerate.
+                if (binding.IsIndexTensor)
+                {
+                    long count = binding.ElementCount;
+                    var indices = new int[count];
+                    int bound = IndexBoundFor(spec, binding);
+                    for (long e = 0; e < count; e++) indices[e] = (int)((e * 7919) % bound);
+                    buffer.Upload<int>(indices);
+                }
+
                 buffers.Add(buffer);
                 pointers[binding.ParameterIndex] = buffer.Pointer;
             }
@@ -155,6 +171,25 @@ internal static class KernelOracleTool
         {
             foreach (var b in buffers) b.Dispose();
         }
+    }
+
+    /// <summary>The extent an index tensor addresses, read from whichever binding consumes it.</summary>
+    private static int IndexBoundFor(CodegenKernelSpec spec, CodegenTensorBinding indexTensor)
+    {
+        foreach (var candidate in AllBindings(spec))
+            for (int d = 0; d < candidate.Indirect.Count; d++)
+                if (candidate.Indirect[d] is { } indirect
+                    && spec.Inputs[indirect.IndexInput] == indexTensor)
+                    return indirect.Bound;
+
+        return 1;
+    }
+
+    private static IEnumerable<CodegenTensorBinding> AllBindings(CodegenKernelSpec spec)
+    {
+        foreach (var input in spec.Inputs) yield return input;
+        yield return spec.Output;
+        foreach (var extra in spec.ExtraOutputs) yield return extra.Binding;
     }
 
     private static double Time(
