@@ -32,9 +32,24 @@ internal static class FusedOptimizer
     // serial loop (no cross-chunk state; bias corrections are step-global). Small
     // tensors (biases, norms) run inline on the caller thread with NO closure
     // allocation. Kill switch: AIDOTNET_FUSED_OPT_PARALLEL=0.
+    /// <summary>
+    /// Elements per SIMD register for <see cref="float"/> kernels: Vector256&lt;float&gt; holds
+    /// 8 lanes. Chunk boundaries are aligned to this so every non-final chunk's AVX region
+    /// tiles exactly and the scalar tail stays in the last chunk, keeping the parallel result
+    /// BIT-IDENTICAL to the serial loop.
+    /// </summary>
+    private const int FloatSimdWidth = 8;
+
+    /// <summary>
+    /// Minimum element count per worker before parallel dispatch pays for itself. Below this
+    /// the tensor runs inline on the caller thread with no closure allocation. Overridable via
+    /// AIDOTNET_FUSED_OPT_PARALLEL_MIN.
+    /// </summary>
+    private const int DefaultParallelThreshold = 1 << 18; // 262144 elements
+
     internal static int ParallelThreshold =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_FUSED_OPT_PARALLEL_MIN"), out var _mn) && _mn > 0
-            ? _mn : (1 << 18); // 262144 elements
+            ? _mn : DefaultParallelThreshold;
     internal static readonly int ParallelMaxDop =
         System.Environment.GetEnvironmentVariable("AIDOTNET_FUSED_OPT_PARALLEL") == "0"
             ? 1 : System.Environment.ProcessorCount;
@@ -795,9 +810,9 @@ internal static class FusedOptimizer
         float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
     {
         // Element-parallel dispatch: inline (no closure) for small tensors, else
-        // disjoint 8-aligned chunks across the pool. See ChunkPlan / the class
-        // header — bit-identical to the serial loop.
-        int nChunks = ChunkPlan(length, 8, out int chunk);
+        // disjoint FloatSimdWidth-aligned chunks across the pool. See ChunkPlan / the
+        // class header — bit-identical to the serial loop.
+        int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
         if (nChunks <= 1)
         {
             AdamWUpdateRangeF(param, grad, m, v, 0, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);

@@ -126,6 +126,9 @@ public sealed class TensorArena : IDisposable
     /// which already had to be resident during the step.</summary>
     private const int MaxPersistPerSize = 64;
 
+    /// <summary>Bytes per MiB, used to render byte counters in the diagnostic messages.</summary>
+    private const double BytesPerMiB = 1024.0 * 1024.0;
+
     private static Array? RentPersistent(Type type, int elementCount)
     {
         if (elementCount < PersistThresholdElems) return null;
@@ -363,16 +366,39 @@ public sealed class TensorArena : IDisposable
     {
         var saved = _current;
         _current = this;
-        return new ActivationScope(saved);
+        return new ActivationScope(this, saved);
     }
 
     /// <summary>Restores the thread's active arena to what it was before the paired
     /// <see cref="TensorArena.Activate"/>. Does not dispose the activated arena.</summary>
-    public readonly struct ActivationScope : IDisposable
+    /// <remarks>
+    /// Dispose is idempotent AND ownership-aware. An unconditional <c>_current = _saved</c> would
+    /// clobber a NEWER active arena on a repeated or out-of-order dispose, after which subsequent
+    /// rents target the wrong arena and can hand back buffers that are still live. The restore
+    /// therefore only happens while this scope's arena is still the active one.
+    /// </remarks>
+    public struct ActivationScope : IDisposable
     {
         private readonly TensorArena? _saved;
-        internal ActivationScope(TensorArena? saved) { _saved = saved; }
-        public void Dispose() { _current = _saved; }
+        private readonly TensorArena _activated;
+        private bool _disposed;
+
+        internal ActivationScope(TensorArena activated, TensorArena? saved)
+        {
+            _activated = activated;
+            _saved = saved;
+            _disposed = false;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // Only unwind if we are still the innermost activation; a nested scope activated
+            // after us owns _current until it disposes.
+            if (ReferenceEquals(_current, _activated))
+                _current = _saved;
+        }
     }
 
     /// <summary>
@@ -651,7 +677,7 @@ public sealed class TensorArena : IDisposable
     {
         if (TensorAllocator.AllocDiag)
         {
-            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={TensorAllocator.ArenaHit}({TensorAllocator.ArenaHitBytes / 1048576.0:F0}MB) arenaMiss={TensorAllocator.ArenaMiss}({TensorAllocator.ArenaMissBytes / 1048576.0:F0}MB) arenaNull={TensorAllocator.ArenaNull}({TensorAllocator.ArenaNullBytes / 1048576.0:F0}MB)");
+            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={TensorAllocator.ArenaHit}({TensorAllocator.ArenaHitBytes / BytesPerMiB:F0}MB) arenaMiss={TensorAllocator.ArenaMiss}({TensorAllocator.ArenaMissBytes / BytesPerMiB:F0}MB) arenaNull={TensorAllocator.ArenaNull}({TensorAllocator.ArenaNullBytes / BytesPerMiB:F0}MB)");
             TensorAllocator.ArenaHit = 0; TensorAllocator.ArenaMiss = 0; TensorAllocator.ArenaNull = 0;
             TensorAllocator.ArenaHitBytes = 0; TensorAllocator.ArenaMissBytes = 0; TensorAllocator.ArenaNullBytes = 0;
         }
@@ -748,7 +774,7 @@ public sealed class TensorArena : IDisposable
                 ReturnCarry(carry.type, carry.size, carry.arr);
         }
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_ARENA_DIAG") == "1")
-            System.Console.Error.WriteLine($"[ARENA-DISPOSE] pooled={( _previous is null || _poolWhenNested)} poolWhenNested={_poolWhenNested} prevNull={_previous is null} ringBackings={_ringBackingArrays.Count} poolBuckets={_pool.Count} peakMB={_peakBackingBytes / 1048576.0:F1} reuseHitsTotal={_persistentReuseHits}");
+            System.Console.Error.WriteLine($"[ARENA-DISPOSE] pooled={( _previous is null || _poolWhenNested)} poolWhenNested={_poolWhenNested} prevNull={_previous is null} ringBackings={_ringBackingArrays.Count} poolBuckets={_pool.Count} peakMB={_peakBackingBytes / BytesPerMiB:F1} reuseHitsTotal={_persistentReuseHits}");
         _pendingCarryReturn = null;
 
         _pool.Clear();
