@@ -412,7 +412,13 @@ public partial class CpuEngine
                         T kap = KAP[baseOff + ki];
                         sumSq = ops.Add(sumSq, ops.Multiply(kap, kap));
                     }
-                    T invN = ops.Divide(ops.One, ops.Sqrt(sumSq));
+                    // Guard the DIVISOR, do not rely on the seeded epsilon. Rwkv7NormEps (1e-12)
+                    // flushes to zero under Half/BFloat16, so a zero-kappa head would give
+                    // 1/sqrt(0) = +Inf and then kh = 0 * Inf = NaN. Falling back to invN = 0 yields
+                    // kappaHat = 0, i.e. the removal term vanishes and the transition degenerates to
+                    // diag(w) - the correct limit, since a zero removal key removes nothing.
+                    T normK = ops.Sqrt(sumSq);
+                    T invN = ops.GreaterThan(normK, ops.Zero) ? ops.Divide(ops.One, normK) : ops.Zero;
                     for (int ki = 0; ki < headDim; ki++)
                     {
                         kh[ki] = ops.Multiply(KAP[baseOff + ki], invN);
@@ -487,7 +493,10 @@ public partial class CpuEngine
                         T kap = KAP[baseOff + ki];
                         sumSq = ops.Add(sumSq, ops.Multiply(kap, kap));
                     }
-                    T invN0 = ops.Divide(one, ops.Sqrt(sumSq));
+                    // See the forward's normalisation guard: the seeded epsilon flushes to zero in
+                    // Half/BFloat16, so divide only when the norm is genuinely positive.
+                    T normK0 = ops.Sqrt(sumSq);
+                    T invN0 = ops.GreaterThan(normK0, ops.Zero) ? ops.Divide(one, normK0) : ops.Zero;
                     for (int ki = 0; ki < headDim; ki++)
                     {
                         kh[ki] = ops.Multiply(KAP[baseOff + ki], invN0);
@@ -523,7 +532,10 @@ public partial class CpuEngine
                         T kap = KAP[baseOff + ki];
                         sumSq = ops.Add(sumSq, ops.Multiply(kap, kap));
                     }
-                    T invN = ops.Divide(one, ops.Sqrt(sumSq));
+                    // See the forward's normalisation guard: the seeded epsilon flushes to zero in
+                    // Half/BFloat16, so divide only when the norm is genuinely positive.
+                    T normKb = ops.Sqrt(sumSq);
+                    T invN = ops.GreaterThan(normKb, ops.Zero) ? ops.Divide(one, normKb) : ops.Zero;
                     for (int ki = 0; ki < headDim; ki++)
                     {
                         kh[ki] = ops.Multiply(KAP[baseOff + ki], invN);
