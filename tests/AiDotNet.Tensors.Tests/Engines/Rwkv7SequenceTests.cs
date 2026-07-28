@@ -420,7 +420,13 @@ public class Rwkv7SequenceTests
         var shape = new[] { batch, seqLen, modelDim };
 
         var decay = new double[n];
-        for (int i = 0; i < n; i++) decay[i] = 30.0; // sigmoid ~ 1 -> w ~ exp(-e^-0.5) is still < 1
+        // NEGATIVE, deliberately: w = exp(-e^(-1/2) * sigmoid(D)), so sigmoid(D) -> 0 gives w -> 1,
+        // the LEAST contractive end of the paper's (0.5453, 1) range and the only configuration under
+        // which "diagonal decay + additive injection" grows without bound. A large POSITIVE decay
+        // logit does the opposite: sigmoid(D) -> 1 pins w at exp(-e^(-1/2)) ~ 0.5453, the MOST
+        // contractive endpoint, where even the old unbounded recurrence stays small - so the guard
+        // would have passed no matter how broken the transition was.
+        for (int i = 0; i < n; i++) decay[i] = -30.0;
         var icl = new double[n];
         for (int i = 0; i < n; i++) icl[i] = 0.9; // strong in-context learning rate
 

@@ -56,17 +56,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
                 "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but DirectGpu init failed or no GPU is available.",
                 _gpuInitException);
 
-        // KNOWN GAP (PR #895 review): returning false makes every caller `return` early, so xUnit
-        // reports these tests as PASSED even though neither the CPU nor the GPU recurrence ran — a
-        // false green on a suite whose whole purpose is proving the GPU kernels match the CPU base.
-        // All ~80 guarded tests in this class are affected, not just the RWKV-7 one.
+        // SKIP visibly instead of returning false. Returning false made every caller `return` early,
+        // so xUnit reported these tests as PASSED even though neither the CPU nor the GPU recurrence
+        // ever ran — a false green on a suite whose entire purpose is proving the GPU kernels match
+        // the CPU base. All 81 guarded tests in this class were affected, not just the RWKV-7 one.
         //
-        // The repo's convention for this is Skip.If from Xunit.SkippableFact (see
-        // GpuConvKernelCoverageTests.SkipIfUnavailable), but that requires the test methods to carry
-        // [SkippableFact] rather than [Fact] — with plain [Fact] a SkipException surfaces as a
-        // FAILURE, turning every non-GPU machine red. Converting all ~80 attributes is the correct
-        // fix and is deliberately NOT bundled into this PR.
-        return false;
+        // Uses Skip.If from Xunit.SkippableFact, the convention already established elsewhere in this
+        // suite (see GpuConvKernelCoverageTests.SkipIfUnavailable). Every [Fact]/[Theory] in this
+        // class was converted to [SkippableFact]/[SkippableTheory] in the same change — that is
+        // REQUIRED, because a SkipException thrown from a plain [Fact] surfaces as a FAILURE and
+        // would turn every machine without a GPU red.
+        Skip.If(true,
+            "DirectGpu is unavailable on this machine, so GPU/CPU parity was NOT verified. " +
+            "Set AIDOTNET_REQUIRE_GPU_TESTS=1 in a GPU-enabled job to make this a hard failure. " +
+            (_gpuInitException is null
+                ? "No GPU detected."
+                : $"Init failed: {_gpuInitException.GetType().Name}: {_gpuInitException.Message}"));
+        return false; // unreachable — Skip.If throws
     }
 
     // float32 GEMM at moderate K accumulates a few 1e-6 of abs error; 1e-3 cleanly
@@ -121,7 +127,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { 200, 50, 120 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AddMMSizes))]
     public void TensorAddMM_DefaultAlphaBeta_GpuMatchesCpu(int m, int k, int n)
     {
@@ -135,7 +141,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorAddMM[{m},{k},{n}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AddMMSizes))]
     public void TensorAddMM_AlphaBeta_GpuMatchesCpu(int m, int k, int n)
     {
@@ -150,7 +156,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorAddMM_ab[{m},{k},{n}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(1)]
     [InlineData(7)]
     [InlineData(64)]
@@ -171,7 +177,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.True(Math.Abs((double)gpu - cpu) < tol, $"VecDot[{n}]: GPU {gpu} vs CPU {cpu} (tol {tol:E3})");
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AddMMSizes))]
     public void TensorMatMul2DWithPrePackedB_GpuMatchesCpu(int m, int k, int n)
     {
@@ -196,7 +202,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 64, 64, 64, 64 } },       // square chain
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(ChainDims))]
     public void TensorMultiDot_GpuMatchesCpu(int[] dims)
     {
@@ -220,7 +226,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 2, 32, 5, 7 } },      // non-square spatial
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(BnShapes))]
     public void BatchNormInference_GpuMatchesCpu(int[] shape)
     {
@@ -252,7 +258,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { 7, 5, 11 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(InnerSizes))]
     public void TensorInner_GpuMatchesCpu(int mRows, int k, int nRows)
     {
@@ -275,7 +281,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 9 }, new[] { 3, 5, 9 } },           // 1-D ⋅ 3-D
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(InnerNdShapes))]
     public void TensorInner_HigherRank_GpuMatchesCpu(int[] shapeA, int[] shapeB)
     {
@@ -303,7 +309,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 3, 4, 2 }, new[] { 4, 3, 6 }, new[] { 0, 1 }, new[] { 1, 0 } },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(DotCases))]
     public void TensorDot_GpuMatchesCpu(int[] shapeA, int[] shapeB, int[] axesA, int[] axesB)
     {
@@ -327,7 +333,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 2, 3, 5 }, -1, 0 },     // negative axis
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(SwapAxesCases))]
     public void TensorSwapAxes_GpuMatchesCpu(int[] shape, int axis1, int axis2)
     {
@@ -347,7 +353,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 4, 6 }, 0, 1 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(MoveDimCases))]
     public void TensorMoveDim_GpuMatchesCpu(int[] shape, int source, int destination)
     {
@@ -374,7 +380,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 12 }, 4, 0 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(SplitCases))]
     public void TensorSplit_GpuMatchesCpu(int[] shape, int numSplits, int axis)
     {
@@ -392,7 +398,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 2, 9, 5 }, new[] { 3 }, 1 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(TensorSplitIdxCases))]
     public void TensorTensorSplit_Indices_GpuMatchesCpu(int[] shape, int[] indices, int dim)
     {
@@ -405,7 +411,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
 
     // ----- Category D -----
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0.0f)]
     [InlineData(0.25f)]
     [InlineData(-0.5f)]
@@ -418,7 +424,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorClampMin[{min}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0.0f)]
     [InlineData(0.25f)]
     [InlineData(-0.5f)]
@@ -441,7 +447,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 8 }, new[] { 7 } },                          // single
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(TakeCases))]
     public void TensorTake_GpuMatchesCpu(int[] shape, int[] flatIndices)
     {
@@ -464,7 +470,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { 100, null },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(ScatterAddCases))]
     public void TensorScatterAdd_1D_GpuMatchesCpu(int n, int[] explicitIdx)
     {
@@ -486,7 +492,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorScatterAdd_1D[n={n};m={idxArr.Length}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(ScatterAddCases))]
     public void TensorIndexAdd_1D_GpuMatchesCpu(int n, int[] explicitIdx)
     {
@@ -516,7 +522,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 8 }, 1 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(RepeatInterleaveCases))]
     public void TensorRepeatInterleave_LastDim_GpuMatchesCpu(int[] shape, int repeats)
     {
@@ -528,7 +534,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 8, 12, 2)]
     [InlineData(6, 16, 8, 4)]
     public void FusedLinearMaxout_GpuMatchesCpu(int rows, int inF, int outFull, int numPieces)
@@ -540,7 +546,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.FusedLinearMaxout(input, weights, bias, numPieces), _cpu.FusedLinearMaxout(input, weights, bias, numPieces), $"Maxout[{rows}x{inF};{outFull};p{numPieces}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 6, 5, 8)]
     [InlineData(3, 8, 4, 6)]
     public void FusedHierarchicalSoftmax_GpuMatchesCpu(int rows, int d, int treeDepth, int numClasses)
@@ -551,7 +557,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.FusedHierarchicalSoftmax(input, nodeWeights, numClasses), _cpu.FusedHierarchicalSoftmax(input, nodeWeights, numClasses), $"HSoftmax[{rows}x{d};td{treeDepth};nc{numClasses}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(1, 4, 8, 2)]
     [InlineData(2, 5, 12, 3)]
     [InlineData(2, 6, 16, 4)]
@@ -571,7 +577,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"RWKV7[b{batch};s{seq};d{modelDim};h{numHeads}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 5, 4, 6, false)]
     [InlineData(2, 5, 4, 6, true)]
     [InlineData(3, 7, 8, 5, true)]
@@ -591,7 +597,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     // BPTT parity: run the fused LSTM forward+backward through a GradientTape on the CPU and the GPU and
     // compare every gradient (dInput, dWih, dWhh, dBih, dBhh). Guards the GPU BPTT kernel + its autograd
     // wiring; the CPU fused backward is the trusted oracle.
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 5, 4, 6, false)]
     [InlineData(2, 5, 4, 6, true)]
     [InlineData(3, 7, 8, 5, true)]
@@ -624,7 +630,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         return (grads[input], grads[wIh], grads[wHh], grads[bIh], grads[bHh]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(1, 4, 8, 2)]
     [InlineData(2, 6, 12, 3)]
     [InlineData(1, 3, 16, 4)]
@@ -641,7 +647,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"MHA[b{batch};s{seq};d{dModel};h{numHeads}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData("Sum")]
     [InlineData("Prod")]
     [InlineData("AMax")]
@@ -660,7 +666,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
                     _cpu.TensorScatterReduce(t, 0, indices, src, mode, true), $"ScatterReduce[{modeName}]");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorBlockDiag_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -670,7 +676,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorBlockDiag(new[] { a, b, c }), _cpu.TensorBlockDiag(new[] { a, b, c }), "BlockDiag");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void TensorIsIn_GpuMatchesCpu(bool invert)
@@ -681,7 +687,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorIsIn(elements, test, invert), _cpu.TensorIsIn(elements, test, invert), "IsIn");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(new[] { 10 }, 0, 3, 2)]
     [InlineData(new[] { 4, 8 }, 1, 4, 2)]
     [InlineData(new[] { 3, 6, 5 }, 1, 3, 1)]
@@ -692,7 +698,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorUnfold(t, dim, size, step), _cpu.TensorUnfold(t, dim, size, step), $"Unfold[{string.Join("x", shape)};d{dim};sz{size};st{step}]");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorPut_MaskedScatter_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -709,7 +715,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorMaskedScatter(t, mask, source), _cpu.TensorMaskedScatter(t, mask, source), "MaskedScatter");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorCountNonzero_NanMedian_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -721,7 +727,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal((double)_cpu.TensorNanMedian(nt), (double)_gpu.TensorNanMedian(nt), 4);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(3, 4)]
     [InlineData(2, 3)]
     public void TensorCartesianProd_GpuMatchesCpu(int n0, int n1)
@@ -732,7 +738,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorCartesianProd(new[] { a, b }), _cpu.TensorCartesianProd(new[] { a, b }), "CartesianProd");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(10, 0f, 1f)]
     [InlineData(6, -2f, 4f)]
     public void TensorHistogram_GpuMatchesCpu(int bins, float mn, float mx)
@@ -745,7 +751,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.TensorHistogram(t, bins, mn, mx).ToArray(), _gpu.TensorHistogram(t, bins, mn, mx).ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void ArgsortToTakeAlongDim_ResidentChain_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -760,7 +766,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gSorted, cSorted, "argsort->takeAlongDim");
     }
 
-    [Fact]
+    [SkippableFact]
     public void PredicateToLogical_ResidentChain_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -772,7 +778,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(gpu, cpu, "predicate->logical chain");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorLogical_GpuMatchesCpu_AndResidentChain()
     {
         if (!EnsureGpuReady()) return;
@@ -790,7 +796,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(chainG, chainC, "chain");
     }
 
-    [Fact]
+    [SkippableFact]
     public void GridSampleBackward_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -806,7 +812,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
                     _cpu.GridSampleBackwardGrid(gradOut, input, grid, mode, pad, false), "GSBackwardGrid");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0.5)]
     [InlineData(0.3)]
     [InlineData(0.7)]
@@ -822,7 +828,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.Nms(boxes, scores, iou).ToArray(), _gpu.Nms(boxes, scores, iou).ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void Resample_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -831,7 +837,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.Resample(wave, 8, 4), _cpu.Resample(wave, 8, 4), "Resample-down2x");
     }
 
-    [Fact]
+    [SkippableFact]
     public void PitchShift_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -847,7 +853,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.PitchShift(wave, 16000, 3.0, 16, 4), _cpu.PitchShift(wave, 16000, 3.0, 16, 4), "PitchShift", 5e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TimeStretch_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -857,7 +863,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TimeStretch(wave, 0.8, nFft, hop), _cpu.TimeStretch(wave, 0.8, nFft, hop), "TimeStretch0.8");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Spectrogram_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -868,7 +874,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.Spectrogram(waveB, nFft, hop, nFft), _cpu.Spectrogram(waveB, nFft, hop, nFft), "SpectrogramBatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void BatchedNms_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -882,7 +888,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.BatchedNms(boxes, scores, classes, 0.5).ToArray(), _gpu.BatchedNms(boxes, scores, classes, 0.5).ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void MasksToBoxes_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -897,7 +903,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.MasksToBoxes(masks).ToArray(), _gpu.MasksToBoxes(masks).ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorHistogramDD_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -912,7 +918,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
                      _gpu.TensorHistogramDD(samples, bins, mins, maxs).ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorNonzero_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -923,7 +929,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.TensorNonzero(t).ToArray(), actual.ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorUniqueConsecutive_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -932,7 +938,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorUniqueConsecutive(t), _cpu.TensorUniqueConsecutive(t), "UniqueConsecutive");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorZeta_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -943,7 +949,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             Assert.True(Math.Abs((double)ga[i] - ca[i]) < 1e-3 * Math.Max(1.0, Math.Abs((double)ca[i])), $"Zeta[{i}]: gpu {ga[i]} vs cpu {ca[i]}");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(1)]
     [InlineData(2)]
     [InlineData(3)]
@@ -956,7 +962,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             Assert.True(Math.Abs((double)ga[i] - ca[i]) < 1e-3 * Math.Max(1.0, Math.Abs((double)ca[i])), $"Polygamma(n={n})[{i}]: gpu {ga[i]} vs cpu {ca[i]}");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorMaskedSelect_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -968,7 +974,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorMaskedSelect(t, mask), _cpu.TensorMaskedSelect(t, mask), "MaskedSelect");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorUnique_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -988,7 +994,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         return new Tensor<float>(vals, shape);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(new[] { 16 }, false)]
     [InlineData(new[] { 16 }, true)]
     [InlineData(new[] { 5 }, false)]      // non power-of-two row
@@ -1005,7 +1011,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.TensorArgsort(t, -1, descending).ToArray(), _gpu.TensorArgsort(t, -1, descending).ToArray());
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(15)]
     [InlineData(16)]
     [InlineData(100)]
@@ -1037,7 +1043,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             Assert.True(g[i].Equals(c[i]), $"{op}: mismatch at {i} (gpu {g[i]} vs cpu {c[i]})");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorEq_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1049,7 +1055,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData("ij")]
     [InlineData("xy")]
     public void TensorMeshgrid_GpuMatchesCpu(string indexing)
@@ -1066,7 +1072,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             AssertMatch(gpu[k], cpu[k], $"Meshgrid[{indexing}][{k}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(10, 0f, 1f)]
     [InlineData(8, -2f, 2f)]
     [InlineData(5, 0f, 10f)]
@@ -1080,7 +1086,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorHistc(t, bins, mn, mx), _cpu.TensorHistc(t, bins, mn, mx), $"Histc[bins={bins};{mn}..{mx}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(5, 3, 2.0)]
     [InlineData(8, 4, 1.0)]
     [InlineData(4, 6, 3.0)]
@@ -1091,7 +1097,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorPDist(x, p), _cpu.TensorPDist(x, p), $"PDist[{n}x{d};p={p}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 5, 3, 2.0)]
     [InlineData(6, 6, 8, 1.0)]
     [InlineData(3, 7, 4, 3.0)]
@@ -1103,7 +1109,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorCDist(x1, x2, p), _cpu.TensorCDist(x1, x2, p), $"CDist[{m}x{d},{n}x{d};p={p}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(new[] { 6, 4 }, 0, 1, 3)]
     [InlineData(new[] { 6, 4 }, 1, 0, 2)]
     [InlineData(new[] { 3, 5, 4 }, 1, 2, 2)]
@@ -1117,7 +1123,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             $"SliceScatter[{string.Join("x", shape)};dim={dim};{start}:{start + length}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(new[] { 6, 4 }, 0, 2)]
     [InlineData(new[] { 3, 5, 4 }, 1, 3)]
     public void TensorSelectScatter_GpuMatchesCpu(int[] shape, int dim, int index)
@@ -1131,7 +1137,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             $"SelectScatter[{string.Join("x", shape)};dim={dim};idx={index}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(new[] { 5, 4 }, 0)]
     [InlineData(new[] { 5, 4 }, 1)]
     [InlineData(new[] { 3, 4, 5 }, 1)]
@@ -1148,7 +1154,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorIndexFill(t, axis, idx, 9.5f), _cpu.TensorIndexFill(t, axis, idx, 9.5f), $"IndexFill[{string.Join("x", shape)};ax={axis}]");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorNextAfter_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1157,7 +1163,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorNextAfter(a, b), _cpu.TensorNextAfter(a, b), "NextAfter");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void TensorSearchSorted_Bucketize_GpuMatchesCpu(bool right)
@@ -1174,7 +1180,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(cB.ToArray(), gB.ToArray());
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 3, 2, 2)]
     [InlineData(3, 1, 2, 4)]
     [InlineData(4, 4, 3, 3)]
@@ -1186,7 +1192,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorKron(a, b), _cpu.TensorKron(a, b), $"Kron[{am}x{an} (x) {bp}x{bq}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(new[] { 3 }, -1)]
     [InlineData(new[] { 4, 3 }, 1)]
     [InlineData(new[] { 3, 5 }, 0)]
@@ -1199,7 +1205,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorCross(a, b, dim), _cpu.TensorCross(a, b, dim), $"Cross[{string.Join("x", shape)};dim={dim}]");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(1)]
     [InlineData(17)]
     [InlineData(256)]
@@ -1222,7 +1228,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 3, 4, 5 }, 1, 7 },  // 3-D, middle axis
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(TakeAlongDimCases))]
     public void TensorTakeAlongDim_GpuMatchesCpu(int[] shape, int dim, int axisOut)
     {
@@ -1240,7 +1246,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
             $"TakeAlongDim[{string.Join("x", shape)};dim={dim};out={axisOut}]");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorClampTensor_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1255,7 +1261,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(_gpu.TensorClampTensor(t, null, hiT), _cpu.TensorClampTensor(t, null, hiT), "ClampTensor maxonly");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorIsClose_AllClose_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1270,7 +1276,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(_cpu.TensorAllClose(a, bFar, 1e-5f, 1e-8f), _gpu.TensorAllClose(a, bFar, 1e-5f, 1e-8f));
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorEqual_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1283,7 +1289,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.False(_gpu.TensorEqual(a, bDiff));
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorIsNan_IsInf_IsFinite_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1294,7 +1300,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorIsFinite(t), _cpu.TensorIsFinite(t), "TensorIsFinite");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(3f)]
     [InlineData(0f)]
     public void TensorEqScalar_GpuMatchesCpu(float scalar)
@@ -1304,7 +1310,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEqScalar(a, scalar), _cpu.TensorEqScalar(a, scalar), "TensorEqScalar");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 2)]
     [InlineData(4, 4)]
     [InlineData(3, 5)]
@@ -1319,7 +1325,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.True(Math.Abs((double)gpu - cpu) < 1e-3, $"Trace[{rows}x{cols}]: gpu {gpu} vs cpu {cpu}");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(1)]
     [InlineData(33)]
     [InlineData(1024)]
@@ -1342,7 +1348,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { 8, new[] { 32, 64 } },           // single layer
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(MlpCases))]
     public void MlpForward_GpuMatchesCpu(int batch, int[] dims)
     {
@@ -1374,7 +1380,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 3, 1 }, new[] { 2, 3, 6 } },        // rank expansion + broadcast
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(BroadcastCases))]
     public void TensorBroadcastTo_GpuMatchesCpu(int[] shape, int[] target)
     {
@@ -1389,7 +1395,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     // TensorFlip (flip∘permute∘flip∘permute). Before the GetOrAllocateBuffer materialize-strided-views
     // fix, this diverged (~1.6) because a strided permute view of a deferred tensor read the source's
     // un-permuted cached buffer. Must now match CPU bit-for-bit.
-    [Fact]
+    [SkippableFact]
     public void InterleavedPermuteFlipChain_ViewPermute_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
@@ -1411,7 +1417,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 4, 4 }, -1, new[] { 0, 1 } },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Rot90Cases))]
     public void TensorRot90_GpuMatchesCpu(int[] shape, int k, int[] axes)
     {
@@ -1431,7 +1437,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         new object[] { new[] { 10, 64 } },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(CosSimShapes))]
     public void TensorCosineSimilarity_LastDim_GpuMatchesCpu(int[] shape)
     {
