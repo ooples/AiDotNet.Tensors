@@ -46,6 +46,22 @@ public sealed partial class PtxTensorCoreEmitter
     public const int StagedWarps = 4;
 
     /// <summary>
+    /// Warp rows in the staged block's 2x2 quadrant layout. The emitted addressing derives a
+    /// warp's row from <c>%r4 &gt;&gt; 1</c> and its column from <c>%r4 &amp; 1</c>, so this
+    /// arrangement is fixed at 2x2 and <see cref="StagedWarps"/> == WarpRows * WarpCols.
+    /// </summary>
+    private const int WarpRows = 2;
+
+    /// <summary>Warp columns in the staged block's 2x2 quadrant layout. See <see cref="WarpRows"/>.</summary>
+    private const int WarpCols = 2;
+
+    /// <summary>
+    /// Bytes per staged operand element. The slabs hold f16 (the wmma operand type), so every
+    /// shared-memory byte offset and row stride in the staged lowering scales by this.
+    /// </summary>
+    private const int HalfBytes = 2;
+
+    /// <summary>
     /// wmma tiles a warp owns along the M axis.
     /// </summary>
     /// <remarks>
@@ -62,22 +78,61 @@ public sealed partial class PtxTensorCoreEmitter
     /// a small-tiled one. Which side of that point a shape sits on is not something to
     /// predict -- see the two levers on this branch that were predicted and did not pay.
     /// </remarks>
-    public int WarpTilesM { get; set; } = 2;
+    public int WarpTilesM
+    {
+        get => _warpTilesM;
+        set => _warpTilesM = ValidateWarpTiles(value, nameof(WarpTilesM));
+    }
 
     /// <summary>wmma tiles a warp owns along the N axis. See <see cref="WarpTilesM"/>.</summary>
-    public int WarpTilesN { get; set; } = 2;
+    public int WarpTilesN
+    {
+        get => _warpTilesN;
+        set => _warpTilesN = ValidateWarpTiles(value, nameof(WarpTilesN));
+    }
+
+    private int _warpTilesM = 2;
+    private int _warpTilesN = 2;
+
+    /// <summary>
+    /// The only warp-tile extents the staged lowering supports, matching the ladder
+    /// SelectWarpTile chooses from: (4,4), (4,2), (2,4), (2,2).
+    /// </summary>
+    private static readonly int[] SupportedWarpTiles = { 2, 4 };
+
+    /// <summary>
+    /// Rejects warp-tile extents the staged geometry cannot express, at assignment time.
+    /// </summary>
+    /// <remarks>
+    /// Validating on the SETTER rather than at emission is deliberate: with
+    /// <see cref="PtxTensorCoreEmitter.PinWarpTile"/> set, the caller's value survives
+    /// SelectWarpTile untouched and flows straight into <c>BlockTileM</c>/<c>BlockTileN</c>,
+    /// which CanStage then uses as a DIVISOR (<c>plan.M % BlockTileM</c>). A zero therefore
+    /// surfaces as a DivideByZeroException from deep inside geometry evaluation rather than at
+    /// the point of misuse, and any other unsupported value silently produces a block tile the
+    /// emitted addressing cannot honour.
+    /// </remarks>
+    private static int ValidateWarpTiles(int value, string paramName)
+    {
+        if (System.Array.IndexOf(SupportedWarpTiles, value) < 0)
+            throw new ArgumentOutOfRangeException(
+                paramName, value,
+                $"Warp-tile extent must be one of {string.Join(", ", SupportedWarpTiles)} " +
+                "(the staged lowering's supported ladder is 4x4, 4x2, 2x4, 2x2).");
+        return value;
+    }
 
     /// <summary>Output rows a block computes: two warp rows of <see cref="WarpTilesM"/> tiles.</summary>
-    public int BlockTileM => WarpTilesM * 16 * 2;
+    public int BlockTileM => WarpTilesM * TileM * WarpRows;
 
     /// <summary>Output columns a block computes.</summary>
-    public int BlockTileN => WarpTilesN * 16 * 2;
+    public int BlockTileN => WarpTilesN * TileN * WarpCols;
 
     /// <summary>Bytes one staging buffer occupies: the A slab followed by the B slab.</summary>
-    public int StageBufferBytes => (BlockTileM * BlockTileK + BlockTileK * BlockTileN) * 2;
+    public int StageBufferBytes => (BlockTileM * BlockTileK + BlockTileK * BlockTileN) * HalfBytes;
 
     /// <summary>Byte offset of the B slab inside a buffer.</summary>
-    private int BSlabOffset => BlockTileM * BlockTileK * 2;
+    private int BSlabOffset => BlockTileM * BlockTileK * HalfBytes;
 
     /// <summary>Whether the last emission used the shared-memory staged lowering.</summary>
     public bool Staged { get; private set; }
@@ -307,9 +362,9 @@ public sealed partial class PtxTensorCoreEmitter
         string warpAOffset = NextRd(), warpBOffset = NextRd();
         {
             string aBytes = NextR(), bBytes = NextR();
-            L($"mul.lo.u32 {aBytes}, %r5, {I(WarpTilesM * 16 * BlockTileK * 2)};");
+            L($"mul.lo.u32 {aBytes}, %r5, {I(WarpTilesM * TileM * BlockTileK * HalfBytes)};");
             L($"mul.wide.u32 {warpAOffset}, {aBytes}, 1;");
-            L($"mul.lo.u32 {bBytes}, %r6, {I(WarpTilesN * 16 * 2)};");
+            L($"mul.lo.u32 {bBytes}, %r6, {I(WarpTilesN * TileN * HalfBytes)};");
             L($"mul.wide.u32 {warpBOffset}, {bBytes}, 1;");
         }
 
@@ -412,12 +467,12 @@ public sealed partial class PtxTensorCoreEmitter
                 string row = NextR(), col = NextR(), off = NextR();
 
                 L($"mul.lo.u32 {row}, %r2, {I(BlockTileM)};");
-                L($"mad.lo.u32 {row}, %r5, {I(WarpTilesM * 16)}, {row};");
-                L($"add.u32 {row}, {row}, {I(i * 16)};");
+                L($"mad.lo.u32 {row}, %r5, {I(WarpTilesM * TileM)}, {row};");
+                L($"add.u32 {row}, {row}, {I(i * TileM)};");
 
                 L($"mul.lo.u32 {col}, %r3, {I(BlockTileN)};");
-                L($"mad.lo.u32 {col}, %r6, {I(WarpTilesN * 16)}, {col};");
-                L($"add.u32 {col}, {col}, {I(j * 16)};");
+                L($"mad.lo.u32 {col}, %r6, {I(WarpTilesN * TileN)}, {col};");
+                L($"add.u32 {col}, {col}, {I(j * TileN)};");
 
                 L($"mad.lo.u32 {off}, {row}, {I(plan.N)}, {col};");
 
@@ -510,7 +565,7 @@ public sealed partial class PtxTensorCoreEmitter
             L($"add.u64 {addr}, %rd3, {warpAOffset};");
             L($"wmma.load.a.sync.aligned.row.m16n16k16.shared.f16 " +
               $"{Fragment("%fa", i * FragmentRegisters)}, " +
-              $"[{addr}+{I(bufferBase + i * 16 * BlockTileK * 2)}], {I(BlockTileK)};");
+              $"[{addr}+{I(bufferBase + i * TileM * BlockTileK * HalfBytes)}], {I(BlockTileK)};");
         }
 
         for (int j = 0; j < WarpTilesN; j++)
@@ -519,7 +574,7 @@ public sealed partial class PtxTensorCoreEmitter
             L($"add.u64 {addr}, %rd3, {warpBOffset};");
             L($"wmma.load.b.sync.aligned.row.m16n16k16.shared.f16 " +
               $"{Fragment("%fb", j * FragmentRegisters)}, " +
-              $"[{addr}+{I(bufferBase + BSlabOffset + j * 16 * 2)}], {I(BlockTileN)};");
+              $"[{addr}+{I(bufferBase + BSlabOffset + j * TileN * HalfBytes)}], {I(BlockTileN)};");
         }
 
         for (int i = 0; i < WarpTilesM; i++)
