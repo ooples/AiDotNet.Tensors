@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.120.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.119.0...v0.120.0) (2026-07-28)
+
+
+### Features
+
+* add direct PTX fused-kernel blueprint ([#832](https://github.com/ooples/AiDotNet.Tensors/issues/832)) ([2832eb2](https://github.com/ooples/AiDotNet.Tensors/commit/2832eb21d7dd749a139e245a95ba0285d83490c4))
+* **ptx:** compile and dispatch direct-PTX on net471 (all TFMs) ([#881](https://github.com/ooples/AiDotNet.Tensors/issues/881)) ([cc14666](https://github.com/ooples/AiDotNet.Tensors/commit/cc1466621664b53107033d8ce59742307aa55393))
+* **ptx:** direct-PTX kernel foundation - 5 emitter gaps closed + convolution family ([#886](https://github.com/ooples/AiDotNet.Tensors/issues/886)) ([3b21f7d](https://github.com/ooples/AiDotNet.Tensors/commit/3b21f7df74546a9d9c8525004ae451a89463906e))
+* **ptx:** fuse decode QKV, RoPE, and KV-cache update ([#858](https://github.com/ooples/AiDotNet.Tensors/issues/858)) ([51dace6](https://github.com/ooples/AiDotNet.Tensors/commit/51dace68e3e7d309ec2115555aa1a547648c08d1))
+* **ptx:** implement fused attention kernel family ([#857](https://github.com/ooples/AiDotNet.Tensors/issues/857)) ([8fb5e91](https://github.com/ooples/AiDotNet.Tensors/commit/8fb5e91ea0ae2b8841e749b74f44cc26be258144))
+
+
+### Bug Fixes
+
+* **autodiff:** gather backward must scatter-ADD, not reuse the gather-shaped helper ([#894](https://github.com/ooples/AiDotNet.Tensors/issues/894)) ([b541350](https://github.com/ooples/AiDotNet.Tensors/commit/b54135043a75b6d2d9426d5c3c4c62fd2bf91f4a))
+* **autodiff:** write fused-linear grads to live buffers ([#888](https://github.com/ooples/AiDotNet.Tensors/issues/888)) ([4ac1684](https://github.com/ooples/AiDotNet.Tensors/commit/4ac1684e7acb9064849997383b06eb50974e5b3b))
+* **gpu:** gate sparsemax on where-select availability ([#866](https://github.com/ooples/AiDotNet.Tensors/issues/866)) ([9b1a88a](https://github.com/ooples/AiDotNet.Tensors/commit/9b1a88a11c451f81a494ead92a5ba0607542222a))
+
+
+### Performance
+
+* **ptx:** staged + double-buffered tensor-core GEMM - 0.05x to 0.57x at 4096^3 ([#893](https://github.com/ooples/AiDotNet.Tensors/issues/893)) ([6d41166](https://github.com/ooples/AiDotNet.Tensors/commit/6d41166df0176b4ee885822df5c3d89c4bfca709))
+* **training:** element-parallel fused optimizer + reusable per-step arena ([#892](https://github.com/ooples/AiDotNet.Tensors/issues/892)) ([4d3c3ec](https://github.com/ooples/AiDotNet.Tensors/commit/4d3c3ecf83cbfadf41ab79557f9ae12c3c721e77))
+
 ## [0.119.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.118.0...v0.119.0) (2026-07-21)
 
 
