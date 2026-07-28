@@ -1832,7 +1832,7 @@ internal static class BackwardFunctions<T>
 
             if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
             {
-                var dense = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+                var dense = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
             }
             return;
@@ -1842,7 +1842,20 @@ internal static class BackwardFunctions<T>
         // Generalizing SparseEmbeddingGradient to N-D / arbitrary-axis gathers is a
         // forward-ledger surface change for a future PR. For now, the perf win we
         // care about (embedding-table lookups) is covered.
-        var grad = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+        //
+        // Uses ScatterAdd (output[indices[i]] += source[i]) and NOT ScatterAddBackward.
+        // Despite the name, ScatterAddBackward is the backward of a SCATTER-ADD forward with
+        // respect to that op's `src` input, which is a GATHER:
+        // gradSource[s] = gradOutput[indices[s]], with `indices` indexed by SOURCE position.
+        // Gather's backward is the opposite - it must ACCUMULATE gradOutput[i] into source slice
+        // indices[i], because gather indices routinely REPEAT (duplicate tokens in an embedding
+        // lookup; relative-position-bias tables where many (i, j) window positions share a
+        // bucket), so a slice selected k times must receive k contributions. Borrowing the
+        // gather-shaped helper here also read `indices` OUT OF RANGE whenever the source extent
+        // exceeded the index count, because it wrapped via `indices[d % indices.Length]`: a 4-row
+        // source gathered by 3 indices produced uniform garbage instead of per-occurrence sums,
+        // and never-selected slices came back nonzero when they must be exactly 0.
+        var grad = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
