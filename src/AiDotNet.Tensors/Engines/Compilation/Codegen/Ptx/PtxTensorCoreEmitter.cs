@@ -44,7 +44,7 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// accumulator fragment while it is still in registers.
 /// </para>
 /// </remarks>
-public sealed class PtxTensorCoreEmitter
+public sealed partial class PtxTensorCoreEmitter
 {
     /// <summary>The <c>wmma</c> tile this emitter uses. m16n16k16 is the shape every
     /// tensor-core generation from sm_70 onward supports for f16 multiplicands.</summary>
@@ -61,6 +61,15 @@ public sealed class PtxTensorCoreEmitter
 
     /// <summary>Warps per block. Four keeps a block at 128 threads.</summary>
     public int WarpsPerBlock { get; set; } = 4;
+
+    /// <summary>
+    /// Whether to use the shared-memory staged lowering where the shape allows it.
+    /// </summary>
+    /// <remarks>
+    /// Settable so the two lowerings can be measured against each other on the same shape.
+    /// Turning it off is a measurement device, not a supported configuration.
+    /// </remarks>
+    public bool EnableStaging { get; set; } = true;
 
     private readonly StringBuilder _sb = new();
 
@@ -256,10 +265,63 @@ public sealed class PtxTensorCoreEmitter
     /// <summary>Threads a block launches: one warp per output tile, <see cref="WarpsPerBlock"/> per block.</summary>
     public int BlockThreads => WarpsPerBlock * 32;
 
-    /// <summary>Blocks needed to cover a plan.</summary>
-    public int BlockCount(Plan plan) =>
-        plan is null ? throw new ArgumentNullException(nameof(plan))
-                     : (plan.TileCount + WarpsPerBlock - 1) / WarpsPerBlock;
+    /// <summary>
+    /// Picks the warp tile for a plan: the measured winner for that shape, else the fallback
+    /// ladder. Skipped when the caller pinned one.
+    /// </summary>
+    /// <remarks>
+    /// See <see cref="TensorCoreWarpTileCatalog"/>. The measured shapes are recorded rather
+    /// than re-derived, because the obvious rule -- largest tile that fits -- is right at
+    /// 2048^3 and 4096^3 and WRONG at 1024^3, where 4x2 measured 71.9us against 4x4's 75.0us.
+    /// A static model picked lowerings four times on this branch and lost to the hardware
+    /// every time it was checked.
+    /// </remarks>
+    private void SelectWarpTile(Plan plan)
+    {
+        if (PinWarpTile) return;
+
+        var choice = TensorCoreWarpTileCatalog.Select(plan.M, plan.N, plan.K, out bool measured);
+
+        WarpTilesM = choice.TileM;
+        WarpTilesN = choice.TileN;
+        EnableAsyncCopy = choice.AsyncCopy;
+        WarpTileWasMeasured = measured;
+    }
+
+    /// <summary>
+    /// Whether the warp tile came from a measurement rather than the fallback ladder.
+    /// </summary>
+    /// <remarks>
+    /// Reported because a cache miss is otherwise indistinguishable from "the modelled choice
+    /// already won" -- which is exactly how an earlier autotune cache on this campaign hid
+    /// that every depthwise kernel was running untuned.
+    /// </remarks>
+    public bool WarpTileWasMeasured { get; private set; }
+
+    /// <summary>
+    /// Keeps the caller's <see cref="WarpTilesM"/>/<see cref="WarpTilesN"/> instead of
+    /// selecting one. Used by the sweep, which is measuring the candidates.
+    /// </summary>
+    public bool PinWarpTile { get; set; }
+
+    /// <summary>Blocks needed to cover a plan, under the lowering this emitter will pick.</summary>
+    /// <remarks>
+    /// THE TWO LOWERINGS NEED DIFFERENT GRIDS and it is not a small difference: staged, four
+    /// warps cover sixteen 16x16 tiles rather than four, so a 64x64 output is ONE block
+    /// staged and FOUR naive. Launching the staged kernel on the naive grid would run it four
+    /// times over, each pass re-accumulating into the same output.
+    /// </remarks>
+    public int BlockCount(Plan plan)
+    {
+        if (plan is null) throw new ArgumentNullException(nameof(plan));
+
+        if (EnableStaging)
+        {
+            SelectWarpTile(plan);
+            if (CanStage(plan, out _)) return StagedBlockCount(plan);
+        }
+        return (plan.TileCount + WarpsPerBlock - 1) / WarpsPerBlock;
+    }
 
     /// <summary>Emits the tensor-core kernel for a spec <see cref="TryPlan"/> accepted.</summary>
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
@@ -271,6 +333,25 @@ public sealed class PtxTensorCoreEmitter
         var plan = planOrNull!;
         _sb.Clear();
         MmaInstructions = 0;
+        Staged = false;
+        DoubleBuffered = false;
+        AsyncCopy = false;
+        SharedMemoryBytes = 0;
+        LoopBarriers = 0;
+        _reg = FixedRegisters;
+        _reg64 = FixedRegisters64;
+        _pred = FixedPredicates;
+
+        // The staged lowering is preferred wherever it applies. It is not a tuning option:
+        // the naive one moves O(M*N*K) operand bytes and collapses from 11.8 to 3.0 TFLOP/s
+        // when the reused bands outgrow L2. Shapes it cannot cover fall back, and the naive
+        // path stays correct at every shape.
+        if (EnableStaging)
+        {
+            SelectWarpTile(plan);
+            if (CanStage(plan, out _))
+                return EmitStaged(spec, plan, computeMajor, computeMinor);
+        }
 
         int aIndex = spec.ProductInputs[0], bIndex = spec.ProductInputs[1];
         int outIndex = spec.Inputs.Count;

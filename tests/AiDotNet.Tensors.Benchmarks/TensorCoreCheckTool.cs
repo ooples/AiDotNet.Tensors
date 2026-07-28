@@ -43,9 +43,9 @@ internal static class TensorCoreCheckTool
         Console.WriteLine("device sm_{0}{1}", major, minor);
         Console.WriteLine();
         Console.WriteLine(
-            "{0,-40} {1,9} {2,12} {3,7} {4,10} {5,10} {6,8} {7,9}",
-            "kernel", "elements", "max rel dev", "result", "wmma", "scalar", "speedup",
-            "TFLOP/s");
+            "{0,-40} {1,9} {2,12} {3,7} {4,8} {5,10} {6,10} {7,8} {8,9} {9,8}",
+            "kernel", "elements", "max rel dev", "result", "lowering", "double", "single",
+            "dbl gain", "TFLOP/s", "scalar");
 
         int passed = 0, failed = 0;
         foreach (var (label, spec, verify) in Cases())
@@ -158,27 +158,30 @@ internal static class TensorCoreCheckTool
             bool ok = !verify || deviation <= tolerance;
 
             long macs = (long)plan.M * plan.N * plan.K;
-            double wmmaUs = 0, scalarUs = 0;
+            double wmmaUs = 0, scalarUs = 0, singleUs = 0;
             if (timed && ok)
             {
                 wmmaUs = TimeIt(runtime, module, fn, pointers, blocks, blockThreads, macs);
+                singleUs = TimeAlternate(runtime, spec, major, minor, pointers, macs, plan);
                 scalarUs = TimeScalar(runtime, spec, major, minor, pointers, macs);
             }
 
             Console.WriteLine(
-                "{0,-40} {1,9} {2,12} {3,7} {4,10} {5,10} {6,8} {7,9}",
+                "{0,-40} {1,9} {2,12} {3,7} {4,8} {5,10} {6,10} {7,8} {8,9} {9,8}",
                 label,
                 outCount.ToString("N0", CultureInfo.InvariantCulture),
                 verify ? deviation.ToString("0.000E+000", CultureInfo.InvariantCulture) : "timing",
                 ok ? (verify ? "PASS" : "-") : "FAIL",
+                emitter.Staged ? "staged" : "naive",
                 wmmaUs > 0 ? wmmaUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
-                scalarUs > 0 ? scalarUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
-                (wmmaUs > 0 && scalarUs > 0)
-                    ? (scalarUs / wmmaUs).ToString("0.00", CultureInfo.InvariantCulture) + "x"
+                singleUs > 0 ? singleUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
+                (wmmaUs > 0 && singleUs > 0)
+                    ? (singleUs / wmmaUs).ToString("0.000", CultureInfo.InvariantCulture) + "x"
                     : "-",
                 wmmaUs > 0
                     ? (2.0 * macs / wmmaUs / 1e6).ToString("0.0", CultureInfo.InvariantCulture)
-                    : "-");
+                    : "-",
+                scalarUs > 0 ? scalarUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-");
 
             return ok;
         }
@@ -191,6 +194,37 @@ internal static class TensorCoreCheckTool
         finally
         {
             foreach (var b in buffers) b.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Times the SAME spec through the OTHER staging form, in the same process and the same
+    /// thermal window.
+    /// </summary>
+    /// <remarks>
+    /// Paired, because the difference being measured is small. Comparing a double-buffered
+    /// run against a single-buffered one taken minutes earlier conflates the lowering with
+    /// whatever the clock and the driver were doing in between, and at a few percent that
+    /// difference decides whether there is a finding at all.
+    /// </remarks>
+    private static double TimeAlternate(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
+        IntPtr[] pointers, long macs, PtxTensorCoreEmitter.Plan plan)
+    {
+        if (!new PtxTensorCoreEmitter().CanDoubleBuffer(plan, out _)) return 0;
+
+        try
+        {
+            var single = new PtxTensorCoreEmitter { EnableDoubleBuffering = false };
+            string ptx = single.Emit(spec, major, minor);
+            using var module = runtime.LoadModule(ptx);
+            IntPtr fn = module.GetFunction(spec.Name, out _);
+            return TimeIt(runtime, module, fn, pointers,
+                (uint)single.BlockCount(plan), (uint)single.BlockThreads, macs);
+        }
+        catch
+        {
+            return 0;
         }
     }
 
