@@ -38,6 +38,7 @@ public sealed class CodegenDepthwiseConv2DWeightGradientPlan
 
     public const int BlockThreads = 256;
     public const int KernelSize = 3;
+    public const int Padding = 1;
     public const int WarpSize = 32;
 
     public int GradOutputInput { get; }
@@ -199,7 +200,7 @@ public sealed class CodegenDepthwiseConv2DWeightGradientPlan
 
     private static bool IsWindow(CodegenAffineExpr expression, int spatial, int tap)
     {
-        if (expression.Terms.Count != 2 || expression.Constant != -1 ||
+        if (expression.Terms.Count != 2 || expression.Constant != -Padding ||
             expression.Divisor != 1 || expression.RequiresExactDivision)
             return false;
 
