@@ -121,7 +121,8 @@ internal static class KernelAutotuneTool
 
         Console.WriteLine();
         Console.WriteLine("AUTOTUNE - measured candidate lowerings, protocol " + CodegenMeasurementProtocol.Tag);
-        Console.WriteLine("candidates: " + string.Join(", ", Candidates.Select(c => c.Name)));
+        Console.WriteLine("candidates: " + string.Join(", ", Candidates.Select(c => c.Name)) +
+                          ", split, tiled-split");
         Console.WriteLine();
         Console.WriteLine("kernel                          modelled   best      winner        gain");
 
@@ -236,26 +237,28 @@ internal static class KernelAutotuneTool
             }
         }
 
-        // The split is a candidate like any other lowering. It stays paired against the
-        // live modelled program, and its two launches are both inside the timed region.
-        using (CandidateProgram? split = TryCreateSplit(runtime, spec))
+        // Both split forms preserve the deterministic affine combine. The second changes
+        // only the expensive partial pass to a cooperative outer-product tile. Each stays
+        // paired against the live modelled program, with both launches in the timed region.
+        for (int splitKind = 0; splitKind < 2; splitKind++)
         {
-            if (split is not null)
+            using CandidateProgram? split = TryCreateSplit(
+                runtime, spec, tiledPartial: splitKind == 1);
+            if (split is null) continue;
+
+            split.Launch();
+            runtime.Synchronize();
+            if (!Agrees(split.ReadOutput(), reference, out double deviation))
             {
-                split.Launch();
-                runtime.Synchronize();
-                if (!Agrees(split.ReadOutput(), reference, out double deviation))
-                {
-                    Console.WriteLine("    candidate 'split' disagrees by " +
-                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
-                                      " relative; rejected");
-                }
-                else
-                {
-                    Consider(runtime, modelled, split, workUnits,
-                        ref hasStableTiming, ref bestName, ref bestUs,
-                        ref bestModelledUs, ref bestGain);
-                }
+                Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
+                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                  " relative; rejected");
+            }
+            else
+            {
+                Consider(runtime, modelled, split, workUnits,
+                    ref hasStableTiming, ref bestName, ref bestUs,
+                    ref bestModelledUs, ref bestGain);
             }
         }
 
@@ -385,7 +388,7 @@ internal static class KernelAutotuneTool
     }
 
     private static CandidateProgram? TryCreateSplit(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec)
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, bool tiledPartial = false)
     {
         CodegenSplitPlan? plan;
         try { plan = CodegenSplitReduction.TryPlan(spec); }
@@ -396,10 +399,27 @@ internal static class KernelAutotuneTool
         var resources = new List<IDisposable>();
         try
         {
-            var partialEmitter = new PtxAffineEmitter();
             var combineEmitter = new PtxAffineEmitter();
-            string partialPtx = partialEmitter.Emit(
-                plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            string partialPtx;
+            uint partialBlocks, partialBlockX, partialBlockY;
+            if (tiledPartial)
+            {
+                var partialEmitter = new PtxTiledOuterProductEmitter();
+                partialPtx = partialEmitter.Emit(
+                    plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                partialBlocks = partialEmitter.LaunchBlocks;
+                partialBlockX = checked((uint)partialEmitter.LaunchBlockThreads);
+                partialBlockY = 1;
+            }
+            else
+            {
+                var partialEmitter = new PtxAffineEmitter();
+                partialPtx = partialEmitter.Emit(
+                    plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                partialBlocks = partialEmitter.LaunchBlocks;
+                partialBlockX = checked((uint)partialEmitter.LaunchBlockX);
+                partialBlockY = checked((uint)partialEmitter.LaunchBlockY);
+            }
             string combinePtx = combineEmitter.Emit(
                 plan.Combine, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
             var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
@@ -443,13 +463,14 @@ internal static class KernelAutotuneTool
 
             void Launch()
             {
-                LaunchOne(partialModule, partialFn, partialArgs, partialEmitter.LaunchBlocks,
-                    (uint)partialEmitter.LaunchBlockX, (uint)partialEmitter.LaunchBlockY);
+                LaunchOne(partialModule, partialFn, partialArgs,
+                    partialBlocks, partialBlockX, partialBlockY);
                 LaunchOne(combineModule, combineFn, combineArgs, combineEmitter.LaunchBlocks,
                     (uint)combineEmitter.LaunchBlockX, (uint)combineEmitter.LaunchBlockY);
             }
 
-            string name = "split:" + string.Join("+", plan.PromotedAxes);
+            string name = (tiledPartial ? "tiled-split:" : "split:") +
+                string.Join("+", plan.PromotedAxes);
             return new CandidateProgram(
                 name, Launch, output, checked((int)spec.Output.ElementCount), resources);
         }

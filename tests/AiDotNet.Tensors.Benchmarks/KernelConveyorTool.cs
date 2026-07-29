@@ -349,6 +349,7 @@ internal static class KernelConveyorTool
             // point: silently falling through would report a kernel as tuned while running
             // the lowering the tuner measured as 17x slower.
             case not null when winner.StartsWith("split:", StringComparison.Ordinal):
+            case not null when winner.StartsWith("tiled-split:", StringComparison.Ordinal):
                 Console.WriteLine("    note: " + kernelName + " measured fastest as " + winner +
                                   ", a two-kernel split this stage cannot launch; " +
                                   "running the single-kernel lowering instead");
@@ -362,10 +363,9 @@ internal static class KernelConveyorTool
     //
     // A tuned lowering is usually a set of knobs, but it can also be a different PROGRAM:
     // the autotuner measures a two-kernel split against every single-kernel candidate and
-    // records "split:N" when it wins, which it does on all three weight gradients --
-    // 17.12x, 35.09x and 2.03x. The conveyor stages used to print a note and run the
-    // slower lowering, so the headline evidence for those kernels described a lowering the
-    // tuner had already rejected.
+    // records "split:N" or "tiled-split:N" when one wins. The conveyor stages used to
+    // print a note and run the slower lowering, so the headline evidence described a
+    // lowering the tuner had already rejected.
     //
     // This resolves the recorded winner into something all three stages can run, whether
     // it is one kernel or two.
@@ -392,7 +392,9 @@ internal static class KernelConveyorTool
 
         /// <summary>How the stages label this lowering in their tables.</summary>
         internal string Label() => IsSplit
-            ? "split x" + Kernels.Count.ToString(CultureInfo.InvariantCulture)
+            ? (Winner is not null && Winner.StartsWith("tiled-split:", StringComparison.Ordinal)
+                ? "tiled split x"
+                : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
             : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal)
                 ? "tiled contraction"
                 : Describe(Kernels[0].LoopedAxes);
@@ -432,7 +434,10 @@ internal static class KernelConveyorTool
             }
         }
 
-        if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
+        bool tiledSplit = winner is not null &&
+            winner.StartsWith("tiled-split:", StringComparison.Ordinal);
+        if (winner is not null &&
+            (winner.StartsWith("split:", StringComparison.Ordinal) || tiledSplit))
         {
             CodegenSplitPlan? plan = null;
             try { plan = CodegenSplitReduction.TryPlan(spec); }
@@ -442,17 +447,44 @@ internal static class KernelConveyorTool
             {
                 var halves = new List<ProgramKernel>(2);
                 bool emitted = true;
-                foreach (var half in new[] { plan.Partial, plan.Combine })
+                if (tiledSplit)
                 {
-                    var e = new PtxAffineEmitter();
                     try
                     {
-                        string text = e.Emit(half, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                        halves.Add(new ProgramKernel(half, text, e.LaunchBlocks,
-                            (uint)e.LaunchBlockX, (uint)e.LaunchBlockY,
-                            e.LoopedAxes, e.ElidedGuards, e.StagedOperands));
+                        var tiled = new PtxTiledOuterProductEmitter();
+                        string text = tiled.Emit(plan.Partial,
+                            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        halves.Add(new ProgramKernel(plan.Partial, text, tiled.LaunchBlocks,
+                            checked((uint)tiled.LaunchBlockThreads), 1,
+                            plan.Partial.Space.ReductionAxes.Length, 0, "left+right rows"));
                     }
-                    catch (NotSupportedException) { emitted = false; break; }
+                    catch (NotSupportedException) { emitted = false; }
+                }
+                else
+                {
+                    var partial = new PtxAffineEmitter();
+                    try
+                    {
+                        string text = partial.Emit(plan.Partial,
+                            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        halves.Add(new ProgramKernel(plan.Partial, text, partial.LaunchBlocks,
+                            (uint)partial.LaunchBlockX, (uint)partial.LaunchBlockY,
+                            partial.LoopedAxes, partial.ElidedGuards, partial.StagedOperands));
+                    }
+                    catch (NotSupportedException) { emitted = false; }
+                }
+                if (emitted)
+                {
+                    var combine = new PtxAffineEmitter();
+                    try
+                    {
+                        string text = combine.Emit(plan.Combine,
+                            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        halves.Add(new ProgramKernel(plan.Combine, text, combine.LaunchBlocks,
+                            (uint)combine.LaunchBlockX, (uint)combine.LaunchBlockY,
+                            combine.LoopedAxes, combine.ElidedGuards, combine.StagedOperands));
+                    }
+                    catch (NotSupportedException) { emitted = false; }
                 }
                 if (emitted) return new TunedProgram(spec, halves, plan, winner);
             }
@@ -901,7 +933,7 @@ internal static class KernelConveyorTool
                     var spec = entry.Bench;
 
                     // Bench the program the TUNER CHOSE, which for the weight gradients
-                    // is a two-kernel split measured at 17.12x, 35.09x and 2.03x. Timing
+                    // may be a two-kernel split. Timing
                     // the single-kernel lowering here would publish a number for a
                     // lowering the tuner had already rejected.
                     bool overridden = args.Contains("--no-coarsen", StringComparer.Ordinal)

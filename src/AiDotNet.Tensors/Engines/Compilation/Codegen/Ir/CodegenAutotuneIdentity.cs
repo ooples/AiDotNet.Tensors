@@ -76,6 +76,8 @@ public sealed record CodegenAutotuneIdentity(
                     computeMajor, computeMinor, static _ => { });
                 AppendCandidate(text, "split-combine", split.Combine,
                     computeMajor, computeMinor, static _ => { });
+                AppendTiledOuterProductCandidate(text, split.Partial,
+                    computeMajor, computeMinor);
             }
         }
         catch (NotSupportedException)
@@ -115,6 +117,22 @@ public sealed record CodegenAutotuneIdentity(
         try
         {
             text.Append(new PtxTiledContractionEmitter().Emit(
+                spec, computeMajor, computeMinor));
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
+    }
+
+    private static void AppendTiledOuterProductCandidate(
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
+    {
+        text.Append("candidate=tiled-split-partial;");
+        try
+        {
+            text.Append(new PtxTiledOuterProductEmitter().Emit(
                 spec, computeMajor, computeMinor));
         }
         catch (NotSupportedException ex)

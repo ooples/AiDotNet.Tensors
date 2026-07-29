@@ -201,7 +201,42 @@ internal static class KernelCatalogOracleTool
         double? predictedUs = 0.0;
         string shape;
 
-        if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
+        if (winner is not null && winner.StartsWith("tiled-split:", StringComparison.Ordinal))
+        {
+            CodegenSplitPlan? split = CodegenSplitReduction.TryPlan(entry.Bench);
+            if (split is null)
+                throw new InvalidOperationException(
+                    entry.Name + " records " + winner + " but no split can be rebuilt.");
+
+            var tiled = new PtxTiledOuterProductEmitter();
+            _ = tiled.Emit(split.Partial, major, minor);
+            var tiledPlan = tiled.Plan!;
+            long partialThreads = split.Partial.Space.TotalThreads;
+            var partialSemantic = CodegenPerformanceModel.Predict(
+                split.Partial, partialThreads, 0, machine, tiled.LaunchBlockThreads);
+            long scalarLoads = checked((long)tiledPlan.Blocks * tiledPlan.Steps *
+                tiledPlan.InnerReduction * (tiledPlan.TileM + tiledPlan.TileN));
+
+            var combineEmitter = new PtxAffineEmitter();
+            _ = combineEmitter.Emit(split.Combine, major, minor);
+            long combineThreads = split.Combine.Space.TotalThreads /
+                Math.Max(1, combineEmitter.CoarsenedLanes);
+            var combinePrediction = CodegenPerformanceModel.Predict(
+                split.Combine, combineThreads, combineEmitter.DynamicLoadsPerThread,
+                machine, combineEmitter.LaunchBlockThreads);
+
+            uniqueBytes = checked(partialSemantic.UniqueBytes + combinePrediction.UniqueBytes);
+            warpLoads = checked((scalarLoads + 31) / 32 +
+                combinePrediction.WarpLoadInstructions);
+            double? partialCeiling = Ceiling(partialSemantic);
+            predictedUs = partialCeiling is double partialUs &&
+                combinePrediction.HasComputeCeiling
+                    ? partialUs + combinePrediction.PredictedMicroseconds
+                    : null;
+            shape = "tiled split x2, " + tiledPlan.TileM + "x" + tiledPlan.TileN +
+                " over " + tiledPlan.InnerReduction;
+        }
+        else if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
         {
             CodegenSplitPlan? plan = CodegenSplitReduction.TryPlan(entry.Bench);
             if (plan is null)
