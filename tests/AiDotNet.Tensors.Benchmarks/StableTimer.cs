@@ -54,6 +54,30 @@ internal static class StableTimer
             : "UNSTABLE +-" + (RelativeSpread * 100).ToString("0", CultureInfo.InvariantCulture) + "%";
     }
 
+    /// <summary>
+    /// Two measurements sampled next to each other, plus the distribution of their
+    /// within-sample ratios.
+    /// </summary>
+    /// <param name="A">First timed operation.</param>
+    /// <param name="B">Second timed operation.</param>
+    /// <param name="Ratio">Median of A/B for each paired sample.</param>
+    /// <param name="RelativeSpread">Spread of the paired ratios.</param>
+    /// <param name="Samples">Number of paired samples.</param>
+    internal readonly record struct PairResult(
+        Result A, Result B, double Ratio, double RelativeSpread, int Samples)
+    {
+        /// <summary>
+        /// A comparison is actionable only when both timings and their paired ratio
+        /// independently converged.
+        /// </summary>
+        public bool Stable => A.Stable && B.Stable && RelativeSpread <= StableSpread;
+
+        /// <summary>Formats the paired ratio, or refuses to print an unstable number.</summary>
+        public string DescribeRatio() => Stable
+            ? Ratio.ToString("0.00", CultureInfo.InvariantCulture) + "x"
+            : "-";
+    }
+
     /// <summary>Spread at or below which a measurement is considered stable.</summary>
     /// <remarks>
     /// Five percent is loose enough that a well-behaved kernel passes on the first attempt and
@@ -102,7 +126,54 @@ internal static class StableTimer
         }
 
         double spread = SpreadOf(samples);
-        return new Result(Median(samples), spread, samples.Count, spread <= StableSpread);
+        return new Result(
+            Median(samples), spread, samples.Count,
+            samples.Count >= 3 && spread <= StableSpread);
+    }
+
+    /// <summary>
+    /// CUDA-event-times two launches as adjacent A/B batches and forms the ratio inside
+    /// each sample.
+    /// </summary>
+    internal static PairResult MeasurePair(
+        DirectPtxRuntime runtime,
+        Action launchA, Action launchB,
+        long workUnitsA, long workUnitsB,
+        int maxAttempts = 7)
+    {
+        if (runtime is null) throw new ArgumentNullException(nameof(runtime));
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+
+        int iterationsA = IterationsFor(workUnitsA);
+        int iterationsB = IterationsFor(workUnitsB);
+        int warmupA = Math.Max(3, iterationsA / 10);
+        int warmupB = Math.Max(3, iterationsB / 10);
+
+        var samplesA = new List<double>(maxAttempts);
+        var samplesB = new List<double>(maxAttempts);
+        var ratios = new List<double>(maxAttempts);
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            double a = runtime.MeasureKernelMilliseconds(
+                launchA, attempt == 0 ? warmupA : 0, iterationsA) * 1000.0;
+            double b = runtime.MeasureKernelMilliseconds(
+                launchB, attempt == 0 ? warmupB : 0, iterationsB) * 1000.0;
+            samplesA.Add(a);
+            samplesB.Add(b);
+            ratios.Add(a / b);
+
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios);
     }
 
     /// <summary>
@@ -143,7 +214,90 @@ internal static class StableTimer
         }
 
         double spread = SpreadOf(samples);
-        return new Result(Median(samples), spread, samples.Count, spread <= StableSpread);
+        return new Result(
+            Median(samples), spread, samples.Count,
+            samples.Count >= 3 && spread <= StableSpread);
+    }
+
+    /// <summary>
+    /// Host-times two operations as adjacent A/B batches and summarizes the ratios formed
+    /// inside each sample.
+    /// </summary>
+    /// <remarks>
+    /// Measuring every A sample and then every B sample lets clock and thermal drift become
+    /// part of the apparent speedup. The current protocol therefore pairs the operations:
+    /// A batch, synchronize A, B batch, synchronize B, then A/B for that sample. The two
+    /// runtimes may need different iteration counts (for example an O(VDN) deterministic
+    /// embedding backward against an O(ND) atomic form), so elapsed time is normalized per
+    /// launch before the ratio is formed.
+    /// </remarks>
+    internal static PairResult MeasureHostPair(
+        Action launchA, Action synchronizeA, long workUnitsA,
+        Action launchB, Action synchronizeB, long workUnitsB,
+        int maxAttempts = 7)
+    {
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (synchronizeA is null) throw new ArgumentNullException(nameof(synchronizeA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (synchronizeB is null) throw new ArgumentNullException(nameof(synchronizeB));
+
+        int iterationsA = IterationsFor(workUnitsA);
+        int iterationsB = IterationsFor(workUnitsB);
+
+        Warm(launchA, synchronizeA, iterationsA);
+        Warm(launchB, synchronizeB, iterationsB);
+
+        var samplesA = new List<double>(maxAttempts);
+        var samplesB = new List<double>(maxAttempts);
+        var ratios = new List<double>(maxAttempts);
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            double a = TimeHostBatch(launchA, synchronizeA, iterationsA);
+            double b = TimeHostBatch(launchB, synchronizeB, iterationsB);
+            samplesA.Add(a);
+            samplesB.Add(b);
+            ratios.Add(a / b);
+
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios);
+    }
+
+    private static PairResult Pair(
+        List<double> samplesA, List<double> samplesB, List<double> ratios)
+    {
+        double spreadA = SpreadOf(samplesA);
+        double spreadB = SpreadOf(samplesB);
+        double ratioSpread = SpreadOf(ratios);
+        return new PairResult(
+            new Result(Median(samplesA), spreadA, samplesA.Count,
+                samplesA.Count >= 3 && spreadA <= StableSpread),
+            new Result(Median(samplesB), spreadB, samplesB.Count,
+                samplesB.Count >= 3 && spreadB <= StableSpread),
+            Median(ratios), ratioSpread, ratios.Count);
+    }
+
+    private static void Warm(Action launch, Action synchronize, int iterations)
+    {
+        for (int i = 0; i < Math.Max(3, iterations / 10); i++) launch();
+        synchronize();
+    }
+
+    private static double TimeHostBatch(Action launch, Action synchronize, int iterations)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iterations; i++) launch();
+        synchronize();
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds * 1000.0 / iterations;
     }
 
     /// <summary>

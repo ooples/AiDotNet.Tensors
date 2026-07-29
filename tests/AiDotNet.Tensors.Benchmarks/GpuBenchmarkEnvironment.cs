@@ -29,7 +29,12 @@ internal static class GpuBenchmarkEnvironment
     internal static void RequireNoForeignCompute(string label)
     {
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
-        string[] conflicts = FindComputeWorkloadConflicts(processMonitor, Environment.ProcessId);
+        int trustedOrchestrator = 0;
+        _ = int.TryParse(
+            Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
+            out trustedOrchestrator);
+        string[] conflicts = FindComputeWorkloadConflicts(
+            processMonitor, Environment.ProcessId, trustedOrchestrator);
         if (conflicts.Length != 0)
             throw new InvalidOperationException(
                 $"[{label}] Foreign GPU workload detected; clean benchmark refused: {string.Join("; ", conflicts)}");
@@ -41,7 +46,8 @@ internal static class GpuBenchmarkEnvironment
                 $"[{label}] GPU temperature {temperatureCelsius} C exceeds the 75 C evidence ceiling.");
     }
 
-    internal static string[] FindComputeWorkloadConflicts(string processMonitor, int currentProcessId)
+    internal static string[] FindComputeWorkloadConflicts(
+        string processMonitor, int currentProcessId, int trustedOrchestratorId = 0)
     {
         var conflicts = new List<string>();
         foreach (string line in processMonitor.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -57,6 +63,19 @@ internal static class GpuBenchmarkEnvironment
 
             string processType = cells[2];
             string smUtilization = cells[3];
+            // --kernel-competitor is a parent .NET process orchestrating two child lanes.
+            // Merely loading CUDA-capable benchmark dependencies can make that parent appear
+            // in pmon as type C at 0% SM. Trust only the explicitly supplied parent PID and
+            // only while it reports no SM sample ('-') or remains below the same
+            // material-compute threshold used for C+G; if it starts doing work, it becomes
+            // a conflict like anything else.
+            if (processId == trustedOrchestratorId &&
+                (smUtilization == "-" ||
+                 (int.TryParse(smUtilization, out int orchestratorSm) &&
+                  orchestratorSm <= MixedComputeConflictThresholdPercent)))
+            {
+                continue;
+            }
             bool isComputeOnly = string.Equals(processType, "C", StringComparison.OrdinalIgnoreCase);
             // Under WDDM, ordinary desktop applications can be reported as C+G
             // with a 0-1% sample. Treat a mixed process as competing compute only

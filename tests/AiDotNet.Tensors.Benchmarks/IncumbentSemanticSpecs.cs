@@ -14,6 +14,39 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </remarks>
 internal static class IncumbentSemanticSpecs
 {
+    internal static CodegenKernelSpec Unary(
+        string name, int count, CodegenActivationKind activation)
+    {
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", count));
+        var map = new[] { CodegenAffineExpr.Axis(0) };
+        var input = new CodegenTensorBinding(0, "x", new[] { count }, map);
+        var output = new CodegenTensorBinding(1, "y", new[] { count }, map, isOutput: true);
+        return new CodegenKernelSpec(name, space, new[] { input }, output,
+            new[] { 0 }, CodegenReduceKind.None, activation: activation);
+    }
+
+    internal static CodegenKernelSpec Add(string name, int count)
+    {
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", count));
+        var map = new[] { CodegenAffineExpr.Axis(0) };
+        var left = new CodegenTensorBinding(0, "a", new[] { count }, map);
+        var right = new CodegenTensorBinding(1, "b", new[] { count }, map);
+        var output = new CodegenTensorBinding(2, "y", new[] { count }, map, isOutput: true);
+        return new CodegenKernelSpec(name, space, new[] { left, right }, output,
+            new[] { 0 }, CodegenReduceKind.None, biasInput: 1);
+    }
+
+    internal static CodegenKernelSpec Multiply(string name, int count)
+    {
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", count));
+        var map = new[] { CodegenAffineExpr.Axis(0) };
+        var left = new CodegenTensorBinding(0, "a", new[] { count }, map);
+        var right = new CodegenTensorBinding(1, "b", new[] { count }, map);
+        var output = new CodegenTensorBinding(2, "y", new[] { count }, map, isOutput: true);
+        return new CodegenKernelSpec(name, space, new[] { left, right }, output,
+            new[] { 0, 1 }, CodegenReduceKind.None);
+    }
+
     internal static CodegenKernelSpec Gather(
         string name, int tokens, int vocabulary, int width)
     {

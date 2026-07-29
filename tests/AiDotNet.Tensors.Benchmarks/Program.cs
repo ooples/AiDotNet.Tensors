@@ -139,6 +139,18 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-competitor")
+        {
+            KernelCompetitorTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-arch-validate")
+        {
+            KernelArchitectureTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--warp-tile-sweep")
         {
             WarpTileSweepTool.Run(args.Skip(1).ToArray());
@@ -1273,6 +1285,8 @@ class Program
         Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
         Console.WriteLine("  --kernel-oracle: generated-kernel performance vs spec-derived ceilings");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
+        Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
+        Console.WriteLine("  --kernel-arch-validate: assemble catalog PTX for SM80/86/89/90");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");

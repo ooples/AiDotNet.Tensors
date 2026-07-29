@@ -23,7 +23,14 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 public static class CodegenAutotuneCache
 {
     private static readonly object Sync = new();
-    private static Dictionary<string, string>? _winners;
+    private static Dictionary<CacheKey, string>? _winners;
+
+    private readonly record struct CacheKey(
+        string Kernel,
+        string Device,
+        string Target,
+        string Spec,
+        string Emitter);
 
     /// <summary>File the autotuner writes and this reads.</summary>
     public static string CachePath { get; set; } =
@@ -36,27 +43,35 @@ public static class CodegenAutotuneCache
     }
 
     /// <summary>
-    /// The winning candidate name for a kernel, or null when it has not been tuned.
+    /// The winning candidate name for a kernel and exact build identity, or null when it has
+    /// not been tuned under that identity.
     /// </summary>
     /// <remarks>
     /// Rows stamped with a superseded measurement protocol are ignored, exactly as the
     /// release gates ignore them: a lowering chosen under a protocol that let clock
     /// drift into the ratio is not a measured choice, it is a remembered guess.
     /// </remarks>
-    public static string? WinnerFor(string kernelName)
+    public static string? WinnerFor(string kernelName, CodegenAutotuneIdentity identity)
     {
         if (string.IsNullOrEmpty(kernelName)) return null;
+        if (identity is null) throw new ArgumentNullException(nameof(identity));
 
         lock (Sync)
         {
             _winners ??= Load();
-            return _winners.TryGetValue(kernelName, out string? winner) ? winner : null;
+            var key = new CacheKey(
+                kernelName,
+                identity.DeviceFingerprint,
+                identity.Target,
+                identity.SpecFingerprint,
+                identity.EmitterFingerprint);
+            return _winners.TryGetValue(key, out string? winner) ? winner : null;
         }
     }
 
-    private static Dictionary<string, string> Load()
+    private static Dictionary<CacheKey, string> Load()
     {
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var map = new Dictionary<CacheKey, string>();
         string path = CachePath;
         if (!File.Exists(path)) return map;
 
@@ -64,7 +79,10 @@ public static class CodegenAutotuneCache
         {
             if (line.Length == 0 || line[0] == '#') continue;
             string[] cells = line.Split('\t');
-            if (cells.Length < 6) continue;
+            // Legacy six-column rows have no device, target, spec or emitter identity. They
+            // are deliberately stale: accepting one would reinstall exactly the name-only
+            // cache this type exists to remove.
+            if (cells.Length < 10) continue;
             if (!string.Equals(cells[5], CodegenMeasurementProtocol.Tag, StringComparison.Ordinal))
                 continue;
 
@@ -75,7 +93,8 @@ public static class CodegenAutotuneCache
                 continue;
             if (gain <= 1.0105) continue;
 
-            map[cells[0]] = cells[1];
+            var key = new CacheKey(cells[0], cells[6], cells[7], cells[8], cells[9]);
+            map[key] = cells[1];
         }
         return map;
     }

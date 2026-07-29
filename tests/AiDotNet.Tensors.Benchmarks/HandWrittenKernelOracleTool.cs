@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
@@ -40,6 +41,12 @@ internal static class HandWrittenKernelOracleTool
         "sum_axis",
         "mean_axis",
         "max_axis",
+        "add_vectors_vec4",
+        "multiply_vectors_vec4",
+        "relu_vec4",
+        "sigmoid_vec4",
+        "tanh_activation_vec4",
+        "gelu_vec4",
     };
 
     internal static void Run(string[] args)
@@ -58,9 +65,9 @@ internal static class HandWrittenKernelOracleTool
         var machine = DeviceCalibration.ToMachineModel(
             rates, reference.Multiprocessors, reference.ClockHz);
 
-        var registered = RegisteredHandWrittenKernelNames();
+        var registered = RegisteredHandWrittenKernels();
         string[] staleMappings = MappedKernelNames
-            .Where(name => !registered.Contains(name))
+            .Where(name => !registered.ContainsKey(name))
             .ToArray();
         if (staleMappings.Length != 0)
         {
@@ -75,10 +82,32 @@ internal static class HandWrittenKernelOracleTool
         Console.WriteLine("semantic coverage: {0} / {1} registered hand-written CUDA kernels",
             MappedKernelNames.Length, registered.Count);
         Console.WriteLine("unmapped kernels receive no invented ceiling");
+
+        string coveragePath = ValueOf(args, "--coverage-out") ??
+            Path.Combine(Directory.GetCurrentDirectory(), "artifacts",
+                "handwritten-kernel-coverage.tsv");
+        WriteCoverageLedger(coveragePath, registered);
+        Console.WriteLine("coverage debt ledger: {0}", coveragePath);
         Console.WriteLine();
         Console.WriteLine("{0,-32} {1,14} {2,10} {3,9} {4,8}",
             "incumbent kernel", "measured", "ceiling", "% of max", "limiter");
 
+        ScoreBinary(backend, machine, major, minor,
+            "add_vectors_vec4", multiply: false);
+        ScoreBinary(backend, machine, major, minor,
+            "multiply_vectors_vec4", multiply: true);
+        ScoreUnary(backend, machine, major, minor,
+            "relu_vec4", CodegenActivationKind.ReLU,
+            static (b, input, output, count) => b.Relu(input, output, count));
+        ScoreUnary(backend, machine, major, minor,
+            "sigmoid_vec4", CodegenActivationKind.Sigmoid,
+            static (b, input, output, count) => b.Sigmoid(input, output, count));
+        ScoreUnary(backend, machine, major, minor,
+            "tanh_activation_vec4", CodegenActivationKind.Tanh,
+            static (b, input, output, count) => b.Tanh(input, output, count));
+        ScoreUnary(backend, machine, major, minor,
+            "gelu_vec4", CodegenActivationKind.Gelu,
+            static (b, input, output, count) => b.Gelu(input, output, count));
         ScoreEmbeddingForward(backend, machine, major, minor);
         ScoreSgdMomentum(backend, machine, major, minor);
         ScoreAxis(backend, machine, major, minor,
@@ -97,6 +126,39 @@ internal static class HandWrittenKernelOracleTool
         Console.WriteLine("cannot express grad^2, two independently-computed moments, and the parameter");
         Console.WriteLine("update in one iteration point. The oracle records that algebra gap instead");
         Console.WriteLine("of scoring a different operator under the Adam name.");
+    }
+
+    private static void ScoreUnary(
+        CudaBackend backend, CodegenMachineModel machine, int major, int minor,
+        string kernelName, CodegenActivationKind activation,
+        Action<CudaBackend, IGpuBuffer, IGpuBuffer, int> launch)
+    {
+        const int Count = 1 << 22;
+        using var input = backend.AllocateBuffer(Values(Count, 61, 0.03125f));
+        using var output = backend.AllocateBuffer(Count);
+        var spec = IncumbentSemanticSpecs.Unary(
+            kernelName + "_semantic", Count, activation);
+        Score(backend, machine, major, minor, kernelName, spec,
+            () => launch(backend, input, output, Count));
+    }
+
+    private static void ScoreBinary(
+        CudaBackend backend, CodegenMachineModel machine, int major, int minor,
+        string kernelName, bool multiply)
+    {
+        const int Count = 1 << 22;
+        using var left = backend.AllocateBuffer(Values(Count, 67, 0.03125f));
+        using var right = backend.AllocateBuffer(Values(Count, 71, 0.015625f));
+        using var output = backend.AllocateBuffer(Count);
+        CodegenKernelSpec spec = multiply
+            ? IncumbentSemanticSpecs.Multiply(kernelName + "_semantic", Count)
+            : IncumbentSemanticSpecs.Add(kernelName + "_semantic", Count);
+        Score(backend, machine, major, minor, kernelName, spec,
+            () =>
+            {
+                if (multiply) backend.Multiply(left, right, output, Count);
+                else backend.Add(left, right, output, Count);
+            });
     }
 
     private static void ScoreEmbeddingForward(
@@ -188,10 +250,10 @@ internal static class HandWrittenKernelOracleTool
         }
     }
 
-    /// <summary>All kernel names exposed by hand-written CUDA source registries.</summary>
-    private static HashSet<string> RegisteredHandWrittenKernelNames()
+    /// <summary>All kernel names exposed by hand-written CUDA source registries and owners.</summary>
+    private static Dictionary<string, HashSet<string>> RegisteredHandWrittenKernels()
     {
-        var names = new HashSet<string>(StringComparer.Ordinal);
+        var names = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         Assembly assembly = typeof(CudaOptimizerKernels).Assembly;
 
         foreach (Type type in assembly.GetTypes())
@@ -206,10 +268,63 @@ internal static class HandWrittenKernelOracleTool
                 continue;
 
             if (method.Invoke(null, null) is IEnumerable<string> typeNames)
-                foreach (string name in typeNames) names.Add(name);
+            {
+                foreach (string name in typeNames)
+                {
+                    if (!names.TryGetValue(name, out var owners))
+                    {
+                        owners = new HashSet<string>(StringComparer.Ordinal);
+                        names.Add(name, owners);
+                    }
+                    owners.Add(type.Name);
+                }
+            }
         }
 
         return names;
+    }
+
+    private static void WriteCoverageLedger(
+        string path, IReadOnlyDictionary<string, HashSet<string>> registered)
+    {
+        string? directory = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+        var mapped = new HashSet<string>(MappedKernelNames, StringComparer.Ordinal);
+        var lines = new List<string>
+        {
+            "kernel\towners\tsemantic_status\tsemantic_family\treason"
+        };
+
+        foreach (var pair in registered.OrderBy(p => p.Key, StringComparer.Ordinal))
+        {
+            bool isMapped = mapped.Contains(pair.Key);
+            lines.Add(string.Join("\t",
+                pair.Key,
+                string.Join(",", pair.Value.OrderBy(v => v, StringComparer.Ordinal)),
+                isMapped ? "mapped-and-timed" : "unmapped",
+                isMapped ? MappedFamily(pair.Key) : "-",
+                isMapped
+                    ? "reviewed equivalent spec and backend launch"
+                    : "no reviewed semantic spec plus launch binding; no ceiling assigned"));
+        }
+        File.WriteAllLines(path, lines);
+    }
+
+    private static string MappedFamily(string name) => name switch
+    {
+        "add_vectors_vec4" or "multiply_vectors_vec4" => "elementwise-binary",
+        "relu_vec4" or "sigmoid_vec4" or "tanh_activation_vec4" or "gelu_vec4"
+            => "elementwise-activation",
+        "embedding_forward" => "gather",
+        "sgd_momentum_update" => "optimizer",
+        _ => "axis-reduction",
+    };
+
+    private static string? ValueOf(string[] args, string flag)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+            if (string.Equals(args[i], flag, StringComparison.Ordinal)) return args[i + 1];
+        return null;
     }
 
     private static float[] Values(int count, int salt, float scale)

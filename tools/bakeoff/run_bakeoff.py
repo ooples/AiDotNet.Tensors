@@ -6,20 +6,20 @@ analysis. The roofline is the point: a ratio on its own says who is faster, whil
 achieved bandwidth and FLOP rate say WHY, and therefore what to do about it.
 
 Usage (from the repo root):
-    python tools/bakeoff/run_bakeoff.py
+    python tools/bakeoff/run_bakeoff.py --protocol p5
 
 Environment:
     BAKEOFF_PYTHON   interpreter with torch+cu13 (default: the aidotnet cache venv)
     BAKEOFF_DOTNET   path to the benchmarks dll
 """
 
+import argparse
 import os
 import re
 import subprocess
 import sys
 
-CARD_PEAK_BANDWIDTH = 760e9      # RTX 3080 spec, bytes/s
-CARD_PEAK_FP32 = 29.8e12         # non-tensor-core FP32, FLOP/s
+LANE_VERSION = "cudnn-graph-fp32-v2"
 
 HOME = os.path.expanduser("~")
 DEFAULT_PY = os.path.join(HOME, ".cache", "aidotnet-direct-ptx-py312", "Scripts", "python.exe")
@@ -58,13 +58,29 @@ WORK = {
 
 def run_ours(dll):
     """Parses --kernel-bench output into {kernel: (us, spread_pct)}."""
-    out = subprocess.run(["dotnet", dll, "--kernel-bench"],
-                         capture_output=True, text=True).stdout
+    completed = None
+    for attempt in range(1, 4):
+        completed = subprocess.run(["dotnet", dll, "--kernel-bench"],
+                                   capture_output=True, text=True)
+        if completed.returncode == 0:
+            break
+        diagnostic = completed.stderr
+        contaminated = ("Foreign GPU workload detected" in diagnostic or
+                        "GPU is not benchmark-ready" in diagnostic)
+        if not contaminated or attempt == 3:
+            raise RuntimeError("generated lane failed (%d): %s" %
+                               (completed.returncode, diagnostic.strip()))
+        print("  generated lane attempt %d contaminated; retrying clean attempt" % attempt,
+              flush=True)
+    assert completed is not None
+    out = completed.stdout
     got = {}
     for line in out.splitlines():
         m = re.match(r"^(\S+)\s+([\d,]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)%", line)
         if m:
             got[m.group(1)] = (float(m.group(3)), float(m.group(5)))
+    if not got:
+        raise RuntimeError("generated lane succeeded but produced no parseable kernel rows")
     return got
 
 
@@ -72,11 +88,19 @@ def run_torch(python, script):
     """Parses the competitor lane into {kernel: {'eager': us, 'graph': (us, spread)}}."""
     env = dict(os.environ)
     env["PATH"] = TORCH_LIB + os.pathsep + env.get("PATH", "")
-    out = subprocess.run([python, script], capture_output=True, text=True, env=env).stdout
+    completed = subprocess.run([python, script], capture_output=True, text=True, env=env)
+    if completed.returncode != 0:
+        raise RuntimeError("competitor lane failed (%d): %s" %
+                           (completed.returncode, completed.stderr.strip()))
+    out = completed.stdout
 
     got = {}
+    device = "unknown"
     for line in out.splitlines():
         parts = line.split("\t")
+        if parts and parts[0] == "DEVICE":
+            device = " | ".join(parts[1:])
+            continue
         if len(parts) < 5 or parts[0] not in ("RESULT", "GRAPH"):
             if parts and parts[0] in ("GRAPHWRONG", "GRAPHFAIL"):
                 print("  competitor lane problem: " + line)
@@ -86,10 +110,36 @@ def run_torch(python, script):
             entry["eager"] = float(parts[2])
         else:
             entry["graph"] = (float(parts[2]), float(parts[4]))
-    return got
+    return got, device
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Versioned generated-kernel vs PyTorch/cuDNN release lane")
+    parser.add_argument("--protocol", required=True,
+                        help="measurement protocol tag supplied by the .NET authority, e.g. p5")
+    parser.add_argument("--output", default=os.path.join("artifacts", "competitor-ratios.tsv"))
+    parser.add_argument("--max-spread-pct", type=float, default=5.0)
+    parser.add_argument("--peak-bandwidth-gbs", type=float, default=760.0,
+                        help="roofline display only; default is RTX 3080")
+    parser.add_argument("--peak-fp32-tflops", type=float, default=29.8,
+                        help="roofline display only; default is RTX 3080")
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+    if not re.fullmatch(r"p[1-9][0-9]*", args.protocol):
+        raise RuntimeError("--protocol must be an explicit version tag such as p5")
+    if args.max_spread_pct <= 0:
+        raise RuntimeError("--max-spread-pct must be positive")
+
+    # A failed refresh must not leave an older current-tag artifact available to the
+    # release reader. The requested output belongs to this run; invalidate it before
+    # measuring and recreate it only after at least one stable comparison exists.
+    if os.path.exists(args.output):
+        os.remove(args.output)
+
     python = os.environ.get("BAKEOFF_PYTHON", DEFAULT_PY)
     dll = os.environ.get("BAKEOFF_DOTNET", DEFAULT_DLL)
     script = os.path.join("tests", "AiDotNet.Tensors.Benchmarks", "BaselineRunners",
@@ -98,14 +148,15 @@ def main():
     print("measuring our generated kernels ...")
     ours = run_ours(dll)
     print("measuring PyTorch/cuDNN (eager and CUDA-graph) ...")
-    theirs = run_torch(python, script)
+    theirs, competitor_device = run_torch(python, script)
     print()
 
     header = ("kernel", "ours us", "spread", "cuDNN us", "spread", "ratio",
               "our GB/s", "%bw", "our TF/s", "bound")
     print("%-32s%9s%8s%10s%8s%8s%10s%6s%10s  %s" % header)
 
-    wins = losses = 0
+    wins = losses = refused = comparable = 0
+    accepted = []
     for name in sorted(ours):
         if name not in theirs or "graph" not in theirs[name]:
             print("%-32s  no comparable competitor measurement" % name)
@@ -113,16 +164,28 @@ def main():
 
         our_us, our_spread = ours[name]
         their_us, their_spread = theirs[name]["graph"]
-        ratio = their_us / our_us
+        stable = our_spread <= args.max_spread_pct and their_spread <= args.max_spread_pct
+        ratio = their_us / our_us if stable else None
 
         nbytes, nflops = WORK.get(name, (0, 0))
         gbs = nbytes / (our_us * 1e-6) if nbytes else 0.0
         tfs = nflops / (our_us * 1e-6) if nflops else 0.0
-        pct_bw = gbs / CARD_PEAK_BANDWIDTH * 100
+        pct_bw = gbs / (args.peak_bandwidth_gbs * 1e9) * 100
+        pct_fp32 = tfs / (args.peak_fp32_tflops * 1e12) * 100
 
         # A kernel at most of the bandwidth roofline is memory bound and cannot be
         # made much faster; one far from BOTH rooflines is losing to poor data reuse.
-        bound = "MEMORY (at roofline)" if pct_bw > 55 else "reuse-limited"
+        bound = ("MEMORY (at roofline)" if pct_bw > 55 else
+                 "COMPUTE (at roofline)" if pct_fp32 > 55 else "reuse-limited")
+        if not stable:
+            refused += 1
+            print("%-32s%9.1f%7.1f%%%10.1f%7.1f%%       -%10.0f%5.0f%%%10.2f  UNSTABLE -- refused"
+                  % (name, our_us, our_spread, their_us, their_spread,
+                     gbs / 1e9, pct_bw, tfs / 1e12))
+            continue
+
+        comparable += 1
+        accepted.append((name, our_us, their_us, ratio, our_spread, their_spread))
         if ratio >= 1.10:
             wins += 1
         elif ratio <= 0.91:
@@ -135,20 +198,27 @@ def main():
     # Write the ratios where the release gate can find them. A kernel without a
     # current-protocol competitor ratio is not releasable: every number before this
     # existed was ours-vs-ours, which cannot tell you whether a kernel is good.
-    out = os.path.join("artifacts", "competitor-ratios.tsv")
-    os.makedirs("artifacts", exist_ok=True)
+    if comparable == 0:
+        raise RuntimeError("no stable generated/cuDNN comparisons; evidence not written")
+
+    out = args.output
+    output_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(output_dir, exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
-        fh.write("# competitor: PyTorch/cuDNN, CUDA-graph lane, allow_tf32=False, locked clocks\n")
-        fh.write("kernel\tours_us\tcompetitor_us\tratio\tprotocol\n")
-        for name in sorted(ours):
-            if name not in theirs or "graph" not in theirs[name]:
-                continue
-            our_us, _ = ours[name]
-            their_us, _ = theirs[name]["graph"]
-            fh.write("%s\t%.3f\t%.3f\t%.4f\tp4\n" % (name, our_us, their_us, their_us / our_us))
+        fh.write("# competitor: PyTorch/cuDNN, CUDA-graph lane, allow_tf32=False\n")
+        fh.write("# device: %s\n" % competitor_device)
+        fh.write("# stability: each side spread <= %.3f%%\n" % args.max_spread_pct)
+        fh.write("kernel\tours_us\tcompetitor_us\tratio\tours_spread_pct\t"
+                 "competitor_spread_pct\tlane\tprotocol\n")
+        for name, our_us, their_us, ratio, our_spread, their_spread in accepted:
+            fh.write("%s\t%.3f\t%.3f\t%.4f\t%.3f\t%.3f\t%s\t%s\n" %
+                     (name, our_us, their_us, ratio, our_spread, their_spread,
+                      LANE_VERSION, args.protocol))
     print()
     print("  ratios written to " + out)
     print("  wins at >=1.10x: %d    losses at <=0.91x: %d" % (wins, losses))
+    print("  refused as unstable: %d (spread gate %.1f%%)" %
+          (refused, args.max_spread_pct))
     print("  Competitor is the CUDA-GRAPH lane -- the strongest form. Eager PyTorch")
     print("  allocates an output tensor per call and pays full launch overhead, which")
     print("  our fixed-buffer launch does not; graph replay removes both.")

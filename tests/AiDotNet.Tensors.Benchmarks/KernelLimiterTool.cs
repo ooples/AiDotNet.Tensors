@@ -99,6 +99,11 @@ internal static class KernelLimiterTool
         string outputPath = ValueOf(args, "--out") ??
             Path.Combine(Directory.GetCurrentDirectory(), "artifacts", "limiter.tsv");
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        // A failed refresh must not leave an older current-tag limiter table available
+        // to the release reader. Recreate the requested artifact only after every
+        // selected profile completes in a clean GPU environment.
+        if (File.Exists(outputPath)) File.Delete(outputPath);
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-limiter-start");
 
         Console.WriteLine();
         Console.WriteLine("LIMITER GATE - which unit is saturated, measured");
@@ -107,7 +112,7 @@ internal static class KernelLimiterTool
         Console.WriteLine("kernel                            L1%  DRAM%    SM%    wait% longSb%  mio%  status    next lever");
 
         var rows = new List<string>();
-        int satisfied = 0, unresolved = 0;
+        int satisfied = 0, unresolved = 0, failedProfiles = 0;
 
         foreach (var entry in entries)
         {
@@ -116,7 +121,7 @@ internal static class KernelLimiterTool
             if (counters is null)
             {
                 Console.WriteLine(entry.Name.PadRight(32) + "   profiling failed");
-                unresolved++;
+                failedProfiles++;
                 continue;
             }
 
@@ -163,6 +168,14 @@ internal static class KernelLimiterTool
                 noInst.ToString("F2", CultureInfo.InvariantCulture),
                 lever,
                 CodegenMeasurementProtocol.Tag));
+        }
+
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-limiter-end");
+        if (failedProfiles != 0)
+        {
+            throw new InvalidOperationException(
+                failedProfiles.ToString(CultureInfo.InvariantCulture) +
+                " selected kernel profile(s) failed; limiter evidence not written.");
         }
 
         var text = new StringBuilder();

@@ -14,11 +14,10 @@
 // The last one is decisive: a model cannot arbitrate lowering quality, because the
 // models do not contain whatever made that kernel faster. Measurement does. This emits
 // several lowerings of the SAME spec, checks they agree numerically, times them under
-// the p4 protocol, and keeps the winner.
+// the current protocol, and keeps the winner.
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -31,13 +30,46 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 internal static class KernelAutotuneTool
 {
-    private const int Warmup = 20;
-    private const int Samples = 31;
-    private const int LaunchesPerSample = 50;
-    private const int Runs = 3;
-
     /// <summary>One candidate lowering: a name and the knobs that produce it.</summary>
     private sealed record Candidate(string Name, Action<PtxAffineEmitter> Configure);
+
+    private sealed record TuneResult(
+        string Name, double BestUs, double ModelledUs, double Gain);
+
+    /// <summary>A loaded candidate kept alive while it is paired against the baseline.</summary>
+    private sealed class CandidateProgram : IDisposable
+    {
+        private readonly List<IDisposable> _resources;
+        private readonly DirectPtxBuffer _output;
+        private readonly int _outputElements;
+
+        internal CandidateProgram(
+            string name, Action launch, DirectPtxBuffer output, int outputElements,
+            List<IDisposable> resources)
+        {
+            Name = name;
+            Launch = launch;
+            _output = output;
+            _outputElements = outputElements;
+            _resources = resources;
+        }
+
+        internal string Name { get; }
+        internal Action Launch { get; }
+
+        internal float[] ReadOutput()
+        {
+            var values = new float[_outputElements];
+            _output.Download<float>(values);
+            return values;
+        }
+
+        public void Dispose()
+        {
+            for (int i = _resources.Count - 1; i >= 0; i--)
+                _resources[i].Dispose();
+        }
+    }
 
     private static readonly Candidate[] Candidates =
     {
@@ -94,24 +126,31 @@ internal static class KernelAutotuneTool
             {
                 try
                 {
-                    var (bestName, bestUs, modelledUs) = TuneOne(runtime, entry);
-                    if (bestUs <= 0) continue;
+                    TuneResult? result = TuneOne(runtime, entry);
+                    if (result is null) continue;
 
-                    double gain = modelledUs / bestUs;
-                    if (gain > 1.03) improved++;
-                    if (gain < 0.97) regressed++;
+                    double gain = result.Gain;
+                    if (gain > 1.0105) improved++;
+                    if (gain < 1.0 / 1.0105) regressed++;
 
                     Console.WriteLine(entry.Name.PadRight(30) +
-                        modelledUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
-                        bestUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
-                        "   " + bestName.PadRight(12) +
+                        result.ModelledUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
+                        result.BestUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
+                        "   " + result.Name.PadRight(12) +
                         gain.ToString("F3", CultureInfo.InvariantCulture).PadLeft(7) + "x");
 
-                    rows.Add(string.Join("\t", entry.Name, bestName,
-                        bestUs.ToString("F3", CultureInfo.InvariantCulture),
-                        modelledUs.ToString("F3", CultureInfo.InvariantCulture),
+                    var identity = CodegenAutotuneIdentity.Create(
+                        entry.Bench, runtime.DeviceFingerprint,
+                        runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                    rows.Add(string.Join("\t", entry.Name, result.Name,
+                        result.BestUs.ToString("F3", CultureInfo.InvariantCulture),
+                        result.ModelledUs.ToString("F3", CultureInfo.InvariantCulture),
                         gain.ToString("F4", CultureInfo.InvariantCulture),
-                        CodegenMeasurementProtocol.Tag));
+                        CodegenMeasurementProtocol.Tag,
+                        identity.DeviceFingerprint,
+                        identity.Target,
+                        identity.SpecFingerprint,
+                        identity.EmitterFingerprint));
                 }
                 catch (Exception ex)
                 {
@@ -124,7 +163,8 @@ internal static class KernelAutotuneTool
         var text = new StringBuilder();
         text.AppendLine("# autotune winners, " + CodegenMeasurementProtocol.Tag + ": " +
                         CodegenMeasurementProtocol.Description);
-        text.AppendLine("kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol");
+        text.AppendLine(
+            "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter");
         foreach (string row in rows) text.AppendLine(row);
         File.WriteAllText(outputPath, text.ToString());
 
@@ -132,165 +172,214 @@ internal static class KernelAutotuneTool
         Console.WriteLine(improved + " kernels improved past the 1.05% noise floor, " +
                           regressed + " regressed");
         Console.WriteLine("winners written to " + outputPath);
+        CodegenAutotuneCache.Invalidate();
     }
 
-    private static (string Name, double BestUs, double ModelledUs) TuneOne(
+    private static TuneResult? TuneOne(
         DirectPtxRuntime runtime, CodegenCatalogEntry entry)
     {
-        var spec = entry.Bench;
-        string bestName = "modelled";
-        double bestUs = double.MaxValue, modelledUs = 0;
-        float[]? reference = null;
+        CodegenKernelSpec spec = entry.Bench;
+        long workUnits = WorkUnits(spec);
 
-        foreach (var candidate in Candidates)
+        using CandidateProgram modelled = CreateSingle(runtime, spec, Candidates[0]);
+        modelled.Launch();
+        runtime.Synchronize();
+        float[] reference = modelled.ReadOutput();
+
+        StableTimer.Result baseline = StableTimer.Measure(runtime, modelled.Launch, workUnits);
+        if (!baseline.Stable)
         {
-            var emitter = new PtxAffineEmitter();
-            candidate.Configure(emitter);
+            Console.WriteLine("    modelled lowering " + baseline.Describe() +
+                              "; no winner recorded");
+            return null;
+        }
 
-            string ptx;
-            try { ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor); }
+        string bestName = "modelled";
+        double bestUs = baseline.Microseconds;
+        double bestModelledUs = baseline.Microseconds;
+        double bestGain = 1.0;
+
+        for (int i = 1; i < Candidates.Length; i++)
+        {
+            CandidateProgram? program = null;
+            try { program = CreateSingle(runtime, spec, Candidates[i]); }
             catch (NotSupportedException) { continue; }
-
-            var buffers = new List<DirectPtxBuffer>();
-            try
+            using (program)
             {
-                using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
-                IntPtr fn = module.GetFunction(spec.Name, out _);
-
-                var pointers = new IntPtr[spec.ParameterCount];
-                for (int i = 0; i < spec.Inputs.Count; i++)
-                {
-                    long count = Elements(spec.Inputs[i].Shape);
-                    var b = runtime.AllocateBytes((nuint)(count * sizeof(float)));
-                    var host = new float[count];
-                    for (long e = 0; e < count; e++)
-                        host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
-                    b.Upload<float>(host);
-                    buffers.Add(b);
-                    pointers[i] = b.Pointer;
-                }
-                long outCount = Elements(spec.Output.Shape);
-                var outBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
-                buffers.Add(outBuffer);
-                pointers[spec.Inputs.Count] = outBuffer.Pointer;
-
-                void Launch() => LaunchOne(module, fn, pointers,
-                    emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
-
-                // CORRECTNESS BEFORE SPEED. Every candidate lowers the SAME spec, so they
-                // must agree; a faster candidate that computes something else is not a
-                // faster candidate. The first one measured becomes the reference.
-                Launch();
+                program.Launch();
                 runtime.Synchronize();
-                var got = new float[outCount];
-                outBuffer.Download<float>(got);
-
-                if (reference is null) reference = got;
-                else if (!Agrees(got, reference, out double deviation))
+                if (!Agrees(program.ReadOutput(), reference, out double deviation))
                 {
-                    Console.WriteLine("    candidate '" + candidate.Name + "' disagrees by " +
+                    Console.WriteLine("    candidate '" + program.Name + "' disagrees by " +
                                       deviation.ToString("E3", CultureInfo.InvariantCulture) +
                                       " relative; rejected");
                     continue;
                 }
 
-                double us = Measure(runtime.Synchronize, Launch);
-                if (candidate.Name == "modelled") modelledUs = us;
-                if (us < bestUs) { bestUs = us; bestName = candidate.Name; }
+                Consider(runtime, modelled, program, workUnits,
+                    ref bestName, ref bestUs, ref bestModelledUs, ref bestGain);
             }
-            finally { foreach (var b in buffers) b.Dispose(); }
         }
 
-        if (modelledUs <= 0) modelledUs = bestUs;
-
-        // The split is a candidate like any other lowering, and for the same reason:
-        // whether it wins cannot be predicted. Block count says the opposite of the truth
-        // (a 64-block kernel won 2.05x while a 16-block one lost 1.89x) and arithmetic
-        // volume does not separate the cases -- the reduction that won and the linear
-        // layer that lost do the SAME 131,072 multiply-accumulates per block. See
-        // docs/SPLIT_K_REDUCTION.md.
-        //
-        // Run LAST, deliberately: `reference` now holds a single-kernel result, so the
-        // split is checked against the established answer. Running it first would let a
-        // wrong split become the reference and reject the correct kernels.
-        if (reference is not null &&
-            TrySplitCandidate(runtime, spec, reference) is { } split && split.Us < bestUs)
+        // The split is a candidate like any other lowering. It stays paired against the
+        // live modelled program, and its two launches are both inside the timed region.
+        using (CandidateProgram? split = TryCreateSplit(runtime, spec))
         {
-            bestUs = split.Us;
-            bestName = split.Name;
+            if (split is not null)
+            {
+                split.Launch();
+                runtime.Synchronize();
+                if (!Agrees(split.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate 'split' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                }
+                else
+                {
+                    Consider(runtime, modelled, split, workUnits,
+                        ref bestName, ref bestUs, ref bestModelledUs, ref bestGain);
+                }
+            }
         }
 
-        return (bestName, bestUs, modelledUs);
+        return new TuneResult(bestName, bestUs, bestModelledUs, bestGain);
     }
 
-    /// <summary>
-    /// Times the two-kernel split route, or null when there is no split or it disagrees.
-    /// </summary>
-    /// <remarks>
-    /// <paramref name="reference"/> is an established single-kernel result, so the split
-    /// is held to exactly the same numerical bar as every other lowering. A two-kernel
-    /// path through a temporary is the shape that produces a fast wrong answer, and a
-    /// tuner that preferred it on speed alone would install one.
-    /// </remarks>
-    private static (string Name, double Us)? TrySplitCandidate(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec, float[] reference)
+    private static void Consider(
+        DirectPtxRuntime runtime,
+        CandidateProgram modelled, CandidateProgram candidate, long workUnits,
+        ref string bestName, ref double bestUs, ref double bestModelledUs, ref double bestGain)
+    {
+        StableTimer.PairResult timing = StableTimer.MeasurePair(
+            runtime, modelled.Launch, candidate.Launch, workUnits, workUnits);
+        if (!timing.Stable)
+        {
+            Console.WriteLine("    candidate '" + candidate.Name +
+                              "' has unstable paired timing; rejected");
+            return;
+        }
+
+        // A winner must clear both the observed paired spread and the earned 1.05%
+        // noise floor. Merely having the smallest median is not a promotion criterion.
+        double required = Math.Max(1.0105, 1.0 + timing.RelativeSpread);
+        if (timing.Ratio <= required || timing.Ratio <= bestGain) return;
+
+        bestName = candidate.Name;
+        bestUs = timing.B.Microseconds;
+        bestModelledUs = timing.A.Microseconds;
+        bestGain = timing.Ratio;
+    }
+
+    private static CandidateProgram CreateSingle(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, Candidate candidate)
+    {
+        RequireFloat32(spec);
+        var resources = new List<IDisposable>();
+        try
+        {
+            var emitter = new PtxAffineEmitter();
+            candidate.Configure(emitter);
+            string ptx = emitter.Emit(
+                spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+            resources.Add(module);
+            IntPtr fn = module.GetFunction(spec.Name, out _);
+
+            var pointers = new IntPtr[spec.ParameterCount];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                var binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buffer.Upload<float>(host);
+                pointers[binding.ParameterIndex] = buffer.Pointer;
+            }
+
+            var output = runtime.AllocateBytes(
+                (nuint)(spec.Output.ElementCount * spec.Output.ElementBytes));
+            resources.Add(output);
+            pointers[spec.Output.ParameterIndex] = output.Pointer;
+            foreach (var extra in spec.ExtraOutputs)
+            {
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(extra.Binding.ElementCount * extra.Binding.ElementBytes));
+                resources.Add(buffer);
+                pointers[extra.Binding.ParameterIndex] = buffer.Pointer;
+            }
+
+            void Launch() => LaunchOne(module, fn, pointers,
+                emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
+            return new CandidateProgram(
+                candidate.Name, Launch, output, checked((int)spec.Output.ElementCount), resources);
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    private static CandidateProgram? TryCreateSplit(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec)
     {
         CodegenSplitPlan? plan;
         try { plan = CodegenSplitReduction.TryPlan(spec); }
         catch (NotSupportedException) { return null; }
         if (plan is null) return null;
+        RequireFloat32(spec);
 
-        var buffers = new List<DirectPtxBuffer>();
+        var resources = new List<IDisposable>();
         try
         {
             var partialEmitter = new PtxAffineEmitter();
             var combineEmitter = new PtxAffineEmitter();
-            string partialPtx, combinePtx;
-            try
-            {
-                partialPtx = partialEmitter.Emit(plan.Partial,
-                    runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                combinePtx = combineEmitter.Emit(plan.Combine,
-                    runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-            }
-            catch (NotSupportedException) { return null; }
-
-            using var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
-            using var combineModule = runtime.LoadModule(combinePtx, allowExperimentalJitFallback: true);
+            string partialPtx = partialEmitter.Emit(
+                plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            string combinePtx = combineEmitter.Emit(
+                plan.Combine, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
+            var combineModule = runtime.LoadModule(combinePtx, allowExperimentalJitFallback: true);
+            resources.Add(partialModule);
+            resources.Add(combineModule);
             IntPtr partialFn = partialModule.GetFunction(plan.Partial.Name, out _);
             IntPtr combineFn = combineModule.GetFunction(plan.Combine.Name, out _);
 
             var uploaded = new IntPtr[spec.Inputs.Count];
             for (int i = 0; i < spec.Inputs.Count; i++)
             {
-                long count = Elements(spec.Inputs[i].Shape);
-                var b = runtime.AllocateBytes((nuint)(count * sizeof(float)));
-                var host = new float[count];
-                for (long e = 0; e < count; e++)
+                var binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
                     host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
-                b.Upload<float>(host);
-                buffers.Add(b);
-                uploaded[i] = b.Pointer;
+                buffer.Upload<float>(host);
+                uploaded[i] = buffer.Pointer;
             }
 
-            var temp = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
-            buffers.Add(temp);
-            long outCount = Elements(spec.Output.Shape);
-            var outBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
-            buffers.Add(outBuffer);
+            var temporary = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
+            var output = runtime.AllocateBytes((nuint)(spec.Output.ElementCount * sizeof(float)));
+            resources.Add(temporary);
+            resources.Add(output);
 
-            // The partial pass reads only the product operands; the epilogue moved to the
-            // combine, so binding by position would hand it the bias.
             var partialArgs = new IntPtr[plan.Partial.ParameterCount];
             for (int i = 0; i < spec.ProductInputs.Count; i++)
                 partialArgs[i] = uploaded[spec.ProductInputs[i]];
-            partialArgs[partialArgs.Length - 1] = temp.Pointer;
+            partialArgs[partialArgs.Length - 1] = temporary.Pointer;
 
             var combineArgs = new IntPtr[plan.Combine.ParameterCount];
-            combineArgs[0] = temp.Pointer;
-            if (plan.Combine.BiasInput is { } bias) combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-            if (plan.Combine.ScaleInput is { } scaleAt) combineArgs[scaleAt] = uploaded[spec.ScaleInput!.Value];
-            combineArgs[combineArgs.Length - 1] = outBuffer.Pointer;
+            combineArgs[0] = temporary.Pointer;
+            if (plan.Combine.BiasInput is { } bias)
+                combineArgs[bias] = uploaded[spec.BiasInput!.Value];
+            if (plan.Combine.ScaleInput is { } scale)
+                combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
+            combineArgs[combineArgs.Length - 1] = output.Pointer;
 
             void Launch()
             {
@@ -300,23 +389,43 @@ internal static class KernelAutotuneTool
                     (uint)combineEmitter.LaunchBlockX, (uint)combineEmitter.LaunchBlockY);
             }
 
-            Launch();
-            runtime.Synchronize();
-            var got = new float[outCount];
-            outBuffer.Download<float>(got);
-
-            if (!Agrees(got, reference, out double deviation))
-            {
-                Console.WriteLine("    candidate 'split' disagrees by " +
-                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
-                                  " relative; rejected");
-                return null;
-            }
-
-            string axes = string.Join("+", plan.PromotedAxes);
-            return ("split:" + axes, Measure(runtime.Synchronize, Launch));
+            string name = "split:" + string.Join("+", plan.PromotedAxes);
+            return new CandidateProgram(
+                name, Launch, output, checked((int)spec.Output.ElementCount), resources);
         }
-        finally { foreach (var b in buffers) b.Dispose(); }
+        catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    private static void RequireFloat32(CodegenKernelSpec spec)
+    {
+        if (spec.Output.ElementType != CodegenElementType.Float32)
+            throw new NotSupportedException("Autotune correctness reads require an fp32 output.");
+        foreach (var input in spec.Inputs)
+            if (input.ElementType != CodegenElementType.Float32)
+                throw new NotSupportedException("Autotune input generation currently requires fp32.");
+        foreach (var extra in spec.ExtraOutputs)
+            if (extra.Binding.ElementType != CodegenElementType.Float32)
+                throw new NotSupportedException("Autotune extra outputs currently require fp32.");
+    }
+
+    private static long WorkUnits(CodegenKernelSpec spec)
+    {
+        long bytes = spec.Output.ElementCount * spec.Output.ElementBytes;
+        foreach (var input in spec.Inputs)
+            bytes = checked(bytes + input.ElementCount * input.ElementBytes);
+        foreach (var extra in spec.ExtraOutputs)
+            bytes = checked(bytes + extra.Binding.ElementCount * extra.Binding.ElementBytes);
+        long operations = checked(spec.Output.ElementCount * Math.Max(1, spec.Space.ReductionTripCount));
+        return Math.Max(bytes, operations);
     }
 
     /// <summary>
@@ -343,28 +452,6 @@ internal static class KernelAutotuneTool
         return deviation <= 2e-3;
     }
 
-    private static double Measure(Action synchronize, Action launch)
-    {
-        double best = double.MaxValue;
-        for (int run = 0; run < Runs; run++)
-        {
-            for (int i = 0; i < Warmup; i++) launch();
-            synchronize();
-
-            var samples = new double[Samples];
-            for (int i = 0; i < Samples; i++)
-            {
-                long start = Stopwatch.GetTimestamp();
-                for (int k = 0; k < LaunchesPerSample; k++) launch();
-                synchronize();
-                samples[i] = Stopwatch.GetElapsedTime(start).TotalMilliseconds / LaunchesPerSample * 1000.0;
-            }
-            Array.Sort(samples);
-            best = Math.Min(best, samples[samples.Length / 2]);
-        }
-        return best;
-    }
-
     private static unsafe void LaunchOne(
         DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)
     {
@@ -374,13 +461,6 @@ internal static class KernelAutotuneTool
             for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
             module.Launch(fn, blocks, 1, 1, blockX, blockY, 1, 0, argv);
         }
-    }
-
-    private static long Elements(IReadOnlyList<int> shape)
-    {
-        long total = 1;
-        for (int i = 0; i < shape.Count; i++) total *= shape[i];
-        return total;
     }
 
     private static string? ValueOf(string[] args, string flag)

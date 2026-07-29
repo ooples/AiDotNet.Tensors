@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // A version stamp for how a number was measured.
 //
-// The measurement protocol changed three times during this project, and each change
+// The measurement protocol changed four times during this project, and each change
 // silently invalidated every number recorded before it:
 //
 //   v1 -> v2  the estimator. median(A)/median(B) let clock drift during a run leak into
@@ -14,6 +14,11 @@
 //   v3 -> v4  true fp32. PyTorch defaults to allow_tf32=True, which routes dense
 //             convolution to tensor cores at a 10-bit mantissa -- a different operation
 //             from the exact fp32 our kernels verify against an fp64 oracle.
+//   v4 -> v5  conformance and stability. Head-to-head measured all A samples before B,
+//             autotune used an unpaired host-stopwatch best-of-three, and both still stamped
+//             the rows p4. Comparisons now form A/B inside each sample and refuse a result
+//             unless A, B and the ratio each converge within the 5% spread gate. Cross-process
+//             competitor rows carry and gate both spreads independently.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -31,15 +36,15 @@ public static class CodegenMeasurementProtocol
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 4;
+    public const int Version = 5;
 
-    /// <summary>Short tag for manifests and tables, e.g. <c>p4</c>.</summary>
+    /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     /// <summary>One-line description of what the current protocol requires.</summary>
     public const string Description =
-        "paired within-sample ratio; batched timed regions; clocks locked; " +
-        "competitor at true fp32 under CUDA graphs; best of 3 attempts at a steady clock";
+        "paired within-sample ratios; batched timed regions; clock-drift and <=5% spread gates; " +
+        "cross-process competitor separately gated at true fp32 under CUDA graphs";
 
     /// <summary>
     /// Human-readable stamp to put beside a number.

@@ -329,9 +329,9 @@ internal static class KernelConveyorTool
     /// looking up by the spec name silently found nothing, so those kernels ran the
     /// modelled lowering while the cache said they had been tuned.
     /// </param>
-    private static void ApplyTuned(PtxAffineEmitter emitter, string kernelName)
+    private static void ApplyTuned(
+        PtxAffineEmitter emitter, string kernelName, string? winner)
     {
-        string? winner = CodegenAutotuneCache.WinnerFor(kernelName);
         switch (winner)
         {
             case "no-tile": emitter.Coarsening = 1; break;
@@ -396,7 +396,10 @@ internal static class KernelConveyorTool
     private static TunedProgram ResolveTuned(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, string catalogName)
     {
-        string? winner = CodegenAutotuneCache.WinnerFor(catalogName);
+        var identity = CodegenAutotuneIdentity.Create(
+            spec, runtime.DeviceFingerprint,
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        string? winner = CodegenAutotuneCache.WinnerFor(catalogName, identity);
 
         if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
         {
@@ -431,7 +434,7 @@ internal static class KernelConveyorTool
         }
 
         var single = new PtxAffineEmitter();
-        ApplyTuned(single, catalogName);
+        ApplyTuned(single, catalogName, winner);
         if (_forceInputStaging) single.EnableInputStaging = true;
         string ptx = single.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         return new TunedProgram(
@@ -701,7 +704,7 @@ internal static class KernelConveyorTool
 
         string manifest = Path.Combine(outputDirectory, "codegen-cubins.tsv");
         var text = new StringBuilder();
-        text.AppendLine("kernel\tentry\tcubin_sha256\tsource_key\tregisters\tsass_instructions\tldg\tstg\tspill_ld\tspill_st");
+        text.AppendLine("kernel\tentry\tcubin_sha256\tsource_key\tregisters\tsass_instructions\tldg\tstg\tspill_ld\tspill_st\tprotocol");
         foreach (string row in rows) text.AppendLine(row);
         File.WriteAllText(manifest, text.ToString());
 
@@ -710,7 +713,7 @@ internal static class KernelConveyorTool
         Console.WriteLine("release: " + gated.ToString(CultureInfo.InvariantCulture) + " zero-spill, " +
                           spilled.ToString(CultureInfo.InvariantCulture) + " spilling");
 
-        ReportEvidenceGates(entries, outputDirectory);
+        EnforceEvidenceGates(entries);
     }
 
     /// <summary>
@@ -721,11 +724,11 @@ internal static class KernelConveyorTool
     ///   a competitor ratio  -- otherwise every number about it is ours-vs-ours;
     ///   a named limiter     -- otherwise nobody knows what its next lever is.
     ///
-    /// Both files are produced by other stages, so this reports rather than recomputes,
-    /// and a missing or stale file is itself the finding.
+    /// Both files are produced by other stages. A missing or stale file is a release
+    /// failure, not an informational line that still returns success.
     /// </summary>
-    private static void ReportEvidenceGates(
-        IReadOnlyList<CodegenCatalogEntry> entries, string outputDirectory)
+    private static void EnforceEvidenceGates(
+        IReadOnlyList<CodegenCatalogEntry> entries)
     {
         var ratios = ReadEvidence(Path.Combine("artifacts", "competitor-ratios.tsv"), 3);
         var limiters = ReadEvidence(Path.Combine("artifacts", "limiter.tsv"), 1);
@@ -751,8 +754,15 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine(releasable.ToString(CultureInfo.InvariantCulture) + " of " +
                           entries.Count.ToString(CultureInfo.InvariantCulture) +
-                          " carry both. Run --kernel-limiter and tools/bakeoff/run_bakeoff.py");
+                          " carry both. Run --kernel-limiter and --kernel-competitor");
         Console.WriteLine("to fill gaps; a kernel without both is well-formed but unproven.");
+
+        if (releasable != entries.Count)
+        {
+            throw new InvalidOperationException(
+                (entries.Count - releasable).ToString(CultureInfo.InvariantCulture) +
+                " kernel(s) lack current-protocol release evidence.");
+        }
     }
 
     /// <summary>Reads kernel -> column from a protocol-stamped evidence file.</summary>
