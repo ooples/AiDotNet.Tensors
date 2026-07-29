@@ -198,17 +198,12 @@ internal static class StableTimer
 
         int iterations = IterationsFor(workUnits);
 
-        for (int i = 0; i < Math.Max(3, iterations / 10); i++) launch();
-        synchronize();
+        Warm(launch, synchronize, iterations);
 
         var samples = new List<double>(maxAttempts);
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < iterations; i++) launch();
-            synchronize();
-            sw.Stop();
-            samples.Add(sw.Elapsed.TotalMilliseconds * 1000.0 / iterations);
+            samples.Add(TimeHostBatch(launch, synchronize, iterations));
 
             if (samples.Count >= 3 && SpreadOf(samples) <= StableSpread) break;
         }
