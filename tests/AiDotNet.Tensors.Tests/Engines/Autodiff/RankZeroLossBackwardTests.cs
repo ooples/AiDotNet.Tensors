@@ -62,7 +62,7 @@ public class RankZeroLossBackwardTests
         var ga = grads[a];
         for (int i = 0; i < ga.Length; i++)
         {
-            Assert.True(double.IsFinite(ga[i]), $"grad a[{i}] not finite: {ga[i]}");
+            Assert.True(!double.IsNaN(ga[i]) && !double.IsInfinity(ga[i]), $"grad a[{i}] not finite: {ga[i]}");
             Assert.True(Math.Abs(ga[i] - 0.25) < 1e-9, $"grad a[{i}]={ga[i]}, expected 0.25");
         }
 
@@ -70,7 +70,7 @@ public class RankZeroLossBackwardTests
         var gb = grads[b];
         for (int i = 0; i < gb.Length; i++)
         {
-            Assert.True(double.IsFinite(gb[i]), $"grad b[{i}] not finite: {gb[i]}");
+            Assert.True(!double.IsNaN(gb[i]) && !double.IsInfinity(gb[i]), $"grad b[{i}] not finite: {gb[i]}");
             Assert.True(Math.Abs(gb[i] + 0.375) < 1e-9, $"grad b[{i}]={gb[i]}, expected -0.375");
         }
     }
@@ -113,7 +113,7 @@ public class RankZeroLossBackwardTests
         var ga = grads[a];
         for (int i = 0; i < ga.Length; i++)
         {
-            Assert.True(double.IsFinite(ga[i]));
+            Assert.True(!double.IsNaN(ga[i]) && !double.IsInfinity(ga[i]));
             Assert.True(Math.Abs(ga[i] - 0.25) < 1e-9, $"grad a[{i}]={ga[i]}, expected 0.25");
         }
     }
@@ -135,7 +135,7 @@ public class RankZeroLossBackwardTests
         var ga = grads[a];
         for (int i = 0; i < ga.Length; i++)
         {
-            Assert.True(double.IsFinite(ga[i]));
+            Assert.True(!double.IsNaN(ga[i]) && !double.IsInfinity(ga[i]));
             // 1e-6 matches the tolerance the neighbouring AbsSoftplusGradientRepro tests use: the
             // engine evaluates exp at ~float32 precision (measured 2.117000102996826 against the
             // exact 2.117000016612675), which is a precision characteristic, not a gradient error.
@@ -168,7 +168,7 @@ public class RankZeroLossBackwardTests
         var ga = grads[a];
         for (int i = 0; i < ga.Length; i++)
         {
-            Assert.True(double.IsFinite(ga[i]));
+            Assert.True(!double.IsNaN(ga[i]) && !double.IsInfinity(ga[i]));
             Assert.True(Math.Abs(ga[i] - 2.0) < 1e-9, $"grad a[{i}]={ga[i]}, expected 2");
         }
     }
