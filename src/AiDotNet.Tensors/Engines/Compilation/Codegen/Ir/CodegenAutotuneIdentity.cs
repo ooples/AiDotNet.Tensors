@@ -139,8 +139,9 @@ public sealed record CodegenAutotuneIdentity(
                 text.Append(new PtxTiledOuterProductEmitter().Emit(
                     spec, computeMajor, computeMinor));
             }
-            catch (NotSupportedException)
+            catch (NotSupportedException first)
             {
+                text.Append("outer-unsupported=").Append(first.Message).Append(';');
                 text.Append(new PtxTiledConv2DOuterProductEmitter().Emit(
                     spec, computeMajor, computeMinor));
             }
