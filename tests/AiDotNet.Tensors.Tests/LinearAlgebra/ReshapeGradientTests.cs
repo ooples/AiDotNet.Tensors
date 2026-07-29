@@ -107,4 +107,62 @@ public class ReshapeGradientTests
         Assert.True(grads.ContainsKey(input),
             "Input gradient must flow through reshape");
     }
+
+    [Fact]
+    public void MetadataViewChain_ExpandSqueezeAndPermute_PropagatesGradient()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 2f, 3f }, new[] { 1, 2 });
+
+        using var tape = new GradientTape<float>();
+        var expanded = parameter.ExpandDims(0);       // [1,1,2]
+        var squeezed = expanded.Squeeze(0);          // [1,2]
+        var permuted = squeezed.Transpose(new[] { 1, 0 }); // [2,1]
+        var loss = engine.ReduceSum(permuted, null);
+
+        Assert.NotNull(expanded.GradFn);
+        Assert.NotNull(squeezed.GradFn);
+        Assert.NotNull(permuted.GradFn);
+
+        var gradients = tape.ComputeGradients(loss);
+
+        Assert.True(gradients.ContainsKey(parameter));
+        Assert.Equal(new[] { 1f, 1f }, gradients[parameter].ToArray());
+    }
+
+    [Fact]
+    public void SubTensorViewChain_ScattersGradientToFixedLeadingIndices()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f },
+            new[] { 2, 2, 2 });
+
+        using var tape = new GradientTape<float>();
+        var selected = parameter.SubTensor(1, 0);
+        var loss = engine.ReduceSum(selected, null);
+        var gradients = tape.ComputeGradients(loss);
+
+        Assert.Equal(
+            new[] { 0f, 0f, 0f, 0f, 1f, 1f, 0f, 0f },
+            gradients[parameter].ToArray());
+    }
+
+    [Fact]
+    public void NarrowView_ScattersGradientToSelectedRange()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+            new[] { 2, 3 });
+
+        using var tape = new GradientTape<float>();
+        var selected = parameter.Slice(axis: 1, start: 1, end: 3);
+        var loss = engine.ReduceSum(selected, null);
+        var gradients = tape.ComputeGradients(loss);
+
+        Assert.Equal(
+            new[] { 0f, 1f, 1f, 0f, 1f, 1f },
+            gradients[parameter].ToArray());
+    }
 }

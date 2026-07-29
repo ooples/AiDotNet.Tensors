@@ -92,6 +92,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool _graphStepEligible;
     private const int GraphWarmupSteps = 3;   // eager first so cuBLAS workspace / lazy buffers stabilize
     private readonly Tensor<T>[] _parameters;
+    // Present only when the caller registered tied weights more than once.
+    // Each original slot maps to its canonical physical parameter slot.
+    private readonly int[]? _originalParameterToUnique;
     private readonly Tensor<T>[] _gradients;
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
@@ -152,6 +155,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Tensor<T>[] preAllocatedGrads,
         Tensor<T>[] gradients,
         Tensor<T> lossGradSeed,
+        int[]? originalParameterToUnique = null,
         int[]? genericGradIndices = null,
         Tensor<T>? lossGradDest = null,
         List<GCHandle>? pinnedHandles = null,
@@ -173,6 +177,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossOutput = lossOutput;
         _engine = engine;
         _parameters = parameters;
+        _originalParameterToUnique = originalParameterToUnique;
         _preAllocatedGrads = preAllocatedGrads;
         _gradients = gradients;
         _lossGradSeed = lossGradSeed;
@@ -1074,6 +1079,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        using var graphModeSuspension = GraphMode.SuspendRecording();
+
         // Opt-in CUDA-graph replay of the whole compiled step. Narrowly gated:
         // float + CUDA backend + no grad-norm clip (a per-step host read) + no
         // checkpointing + an all-GPU-pure action set (_graphStepEligible — host-only
@@ -1536,6 +1543,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
+        // Some generic CPU backward primitives produce a deferred tensor and
+        // attach it to the plan's pre-allocated parameter-gradient slot. The
+        // optimizer owns raw backing-array references, so it must never run
+        // before that deferred producer has committed its values to live
+        // storage. Specialized delegates already write synchronously and pay
+        // only the null check here.
+        if (_optimizerUpdate is not null && _engine is not Engines.DirectGpuTensorEngine)
+        {
+            for (int p = 0; p < _gradients.Length; p++)
+            {
+                var gradient = _gradients[p];
+                if (gradient is not null && gradient.LazySource is not null)
+                    _ = gradient.AsSpan();
+            }
+        }
+
         // Global gradient L2-norm clipping. Applied between backward and the
         // fused optimizer update so the optimizer sees the clipped gradients.
         // Mirrors PyTorch's torch.nn.utils.clip_grad_norm_ semantics: one
@@ -1716,9 +1739,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (paramToGroup is null) throw new ArgumentNullException(nameof(paramToGroup));
         if (groupSchedules.Count == 0)
             throw new ArgumentException("groupSchedules must contain at least one schedule.", nameof(groupSchedules));
-        if (paramToGroup.Count != _parameters.Length)
+        bool suppliedCanonicalGroups = paramToGroup.Count == _parameters.Length;
+        bool suppliedOriginalGroups = _originalParameterToUnique is not null
+            && paramToGroup.Count == _originalParameterToUnique.Length;
+        if (!suppliedCanonicalGroups && !suppliedOriginalGroups)
             throw new ArgumentException(
-                $"paramToGroup.Count ({paramToGroup.Count}) must equal the compiled parameter count ({_parameters.Length}).",
+                $"paramToGroup.Count ({paramToGroup.Count}) must equal the canonical compiled parameter count " +
+                $"({_parameters.Length})" +
+                (_originalParameterToUnique is null
+                    ? "."
+                    : $" or the original registered parameter count ({_originalParameterToUnique.Length})."),
                 nameof(paramToGroup));
         // Validate every schedule slot up front — the grouped hot path
         // evaluates GetLr() on ALL of them per step, not just the ones
@@ -1736,6 +1766,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 throw new ArgumentOutOfRangeException(
                     nameof(paramToGroup),
                     $"paramToGroup[{i}]={g} is out of range [0, {groupSchedules.Count}).");
+        }
+
+        System.Collections.Generic.IReadOnlyList<int> canonicalParamToGroup = paramToGroup;
+        if (suppliedOriginalGroups && !suppliedCanonicalGroups)
+        {
+            var collapsed = new int[_parameters.Length];
+            for (int i = 0; i < collapsed.Length; i++) collapsed[i] = -1;
+
+            for (int originalIndex = 0; originalIndex < _originalParameterToUnique!.Length; originalIndex++)
+            {
+                int canonicalIndex = _originalParameterToUnique[originalIndex];
+                int group = paramToGroup[originalIndex];
+                int existing = collapsed[canonicalIndex];
+                if (existing >= 0 && existing != group)
+                {
+                    throw new ArgumentException(
+                        $"Tied parameter slots map to conflicting optimizer groups ({existing} and {group}). " +
+                        "Every registration of the same physical parameter must use the same group.",
+                        nameof(paramToGroup));
+                }
+                collapsed[canonicalIndex] = group;
+            }
+            canonicalParamToGroup = collapsed;
         }
         // GPU residency only matters for float (the GPU configure branch is
         // float-gated); detect any GPU-backed parameter so the gate can reject
@@ -1761,12 +1814,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ex.Validate();
         if (typeof(T) == typeof(float))
         {
-            ConfigureOptimizerFloatGrouped(optimizerType, groupSchedules, paramToGroup, beta1, beta2, eps, weightDecay, ex);
+            ConfigureOptimizerFloatGrouped(optimizerType, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, ex);
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            ConfigureOptimizerDoubleGrouped(optimizerType, groupSchedules, paramToGroup, beta1, beta2, eps, weightDecay);
+            ConfigureOptimizerDoubleGrouped(optimizerType, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -4098,6 +4151,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal static CompiledTrainingPlan<T> Compile(
         LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters, Tensor<T>? explicitLoss)
     {
+        int[]? originalParameterToUnique = null;
+
+        // Tied/shared weights may legitimately appear more than once while a
+        // model walks its layer graph. Canonicalize by object identity so the
+        // backward graph and optimizer own one slot and apply one update per
+        // physical parameter.
+        if (parameters.Length > 1)
+        {
+            var seenParameters = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            var uniqueParameters = new List<Tensor<T>>(parameters.Length);
+            var aliasMap = new int[parameters.Length];
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                if (!seenParameters.TryGetValue(parameters[i], out int uniqueIndex))
+                {
+                    uniqueIndex = uniqueParameters.Count;
+                    seenParameters.Add(parameters[i], uniqueIndex);
+                    uniqueParameters.Add(parameters[i]);
+                }
+                aliasMap[i] = uniqueIndex;
+            }
+
+            if (uniqueParameters.Count != parameters.Length)
+            {
+                originalParameterToUnique = aliasMap;
+                parameters = uniqueParameters.ToArray();
+            }
+        }
+
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
 
@@ -4741,6 +4823,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             allGrads.ToArray(),
             gradients,
             lossGradSeed,
+            originalParameterToUnique,
             genericGradIndices,
             gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null,
             pinnedHandles,
@@ -4847,9 +4930,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static float[] GetPinnableFloatBacking(Tensor<float> t)
         => t.GetLiveBackingArrayAllowingPaddingOrNull() ?? t.GetDataArray();
 
-    /// <summary>FP64 counterpart of <see cref="GetPinnableFloatBacking"/>.</summary>
-    private static double[] GetPinnableDoubleBacking(Tensor<double> t)
-        => t.GetLiveBackingArrayAllowingPaddingOrNull() ?? t.GetDataArray();
+    /// <summary>
+    /// Returns the live FP64 backing required by a specialized kernel, or
+    /// <see langword="null"/> when the tensor layout cannot be addressed as a
+    /// zero-offset dense array. Specialized writers must never fall back to
+    /// <c>GetDataArray()</c>, which may intentionally materialize a copy.
+    /// </summary>
+    private static double[]? TryGetLiveDoubleBacking(Tensor<T> tensor)
+        => ((Tensor<double>)(object)tensor).GetLiveBackingArrayAllowingPaddingOrNull();
 
     internal static unsafe Action<IEngine>? TryBuildSpecializedForward(
         CompiledStep<T> step,
@@ -4881,10 +4969,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
 
-            // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
-            var cA = (double[])(object)inputA.GetDataArray();
-            var cB = (double[])(object)inputB.GetDataArray();
-            var cOut = (double[])(object)output.GetDataArray();
+            // Bind only verified live storage. A copied output would make the
+            // kernel appear successful while leaving the tensor unchanged.
+            var cA = TryGetLiveDoubleBacking(inputA);
+            var cB = TryGetLiveDoubleBacking(inputB);
+            var cOut = TryGetLiveDoubleBacking(output);
+            if (cA is null || cB is null || cOut is null)
+                return null;
 
             // Note: no Path-A pre-pack cache for double yet (SimdGemm has no
             // DgemmWithCachedB), so the inference vs training distinction
@@ -6580,16 +6671,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             int Md = inputAd._shape[0], Kd = inputAd._shape[1], Nd = inputBd._shape[1];
 
-            double[]? cdDC = null, cdA = null, cdB = null, cdDestA = null, cdDestB = null;
+            var cdDC = TryGetLiveDoubleBacking(gradOutD);
+            var cdA = TryGetLiveDoubleBacking(inputAd);
+            var cdB = TryGetLiveDoubleBacking(inputBd);
+            var cdDestA = TryGetLiveDoubleBacking(gradAd);
+            var cdDestB = TryGetLiveDoubleBacking(gradBd);
+            if (cdDC is null || cdA is null || cdB is null || cdDestA is null || cdDestB is null)
+                return null;
 
             return eng =>
             {
-                cdDC ??= (double[])(object)gradOutD.GetDataArray();
-                cdA ??= (double[])(object)inputAd.GetDataArray();
-                cdB ??= (double[])(object)inputBd.GetDataArray();
-                cdDestA ??= (double[])(object)gradAd.GetDataArray();
-                cdDestB ??= (double[])(object)gradBd.GetDataArray();
-
                 // dA = dC @ B^T — double-precision BLAS with engine fallback
                 if (!BlasProvider.TryGemmEx(Md, Kd, Nd, cdDC, 0, Nd, false, cdB, 0, Nd, true, cdDestA, 0, Kd))
                 {
@@ -7893,7 +7984,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the kernels that depend on it.
             if (typeof(T) == typeof(double))
             {
-                if (!BlasProvider.HasNativeDgemm)
+                // The FP64 fusion below implements ReLU. GELU requires its
+                // pre-activation for the exact backward derivative, so retain
+                // the ordinary compiled GELU steps instead of silently applying
+                // ReLU semantics to a GELU graph.
+                if (!isReluPattern || !BlasProvider.HasNativeDgemm)
                 {
                     TensorAllocator.Return(activatedBuffer);
                     continue;
@@ -7907,85 +8002,91 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 int cmD = m, ckD = k, chD = h, cnD = n;
                 var capturedGradMapD = gradMap;
 
+                capturedGradMapD.TryGetValue(capturedOutputD, out var gradOutD);
+                capturedGradMapD.TryGetValue(capturedW1D, out var gW1TensorD);
+                capturedGradMapD.TryGetValue(capturedW2D, out var gW2TensorD);
+                capturedGradMapD.TryGetValue(capturedInputD, out var gInTensorD);
+
+                var inArrayD = TryGetLiveDoubleBacking(capturedInputD);
+                var w1ArrayD = TryGetLiveDoubleBacking(capturedW1D);
+                var w2ArrayD = TryGetLiveDoubleBacking(capturedW2D);
+                var outArrayD = TryGetLiveDoubleBacking(capturedOutputD);
+                var activatedArrayD = TryGetLiveDoubleBacking(capturedActivatedD);
+                var gradOutArrayD = gradOutD is null ? null : TryGetLiveDoubleBacking(gradOutD);
+                var gW1ArrayD = gW1TensorD is null ? null : TryGetLiveDoubleBacking(gW1TensorD);
+                var gW2ArrayD = gW2TensorD is null ? null : TryGetLiveDoubleBacking(gW2TensorD);
+                var gInArrayD = gInTensorD is null ? null : TryGetLiveDoubleBacking(gInTensorD);
+
+                if (inArrayD is null || w1ArrayD is null || w2ArrayD is null
+                    || outArrayD is null || activatedArrayD is null || gradOutArrayD is null
+                    || (gW1TensorD is not null && gW1ArrayD is null)
+                    || (gW2TensorD is not null && gW2ArrayD is null)
+                    || (gInTensorD is not null && gInArrayD is null))
+                {
+                    TensorAllocator.Return(activatedBuffer);
+                    continue;
+                }
+
                 fusedForward.Add(eng =>
                 {
-                    var inA = (double[])(object)capturedInputD.GetDataArray();
-                    var w1A = (double[])(object)capturedW1D.GetDataArray();
-                    var w2A = (double[])(object)capturedW2D.GetDataArray();
-                    var outA = (double[])(object)capturedOutputD.GetDataArray();
-                    var actA = (double[])(object)capturedActivatedD.GetDataArray();
-
-                    BlasProvider.TryGemm(cmD, chD, ckD, inA, 0, ckD, w1A, 0, chD, actA, 0, chD);
+                    BlasProvider.TryGemm(cmD, chD, ckD,
+                        inArrayD, 0, ckD, w1ArrayD, 0, chD, activatedArrayD, 0, chD);
 
                     int activatedLen = cmD * chD;
                     for (int idx = 0; idx < activatedLen; idx++)
-                        if (actA[idx] < 0.0) actA[idx] = 0.0;
+                        if (activatedArrayD[idx] < 0.0) activatedArrayD[idx] = 0.0;
 
-                    BlasProvider.TryGemm(cmD, cnD, chD, actA, 0, chD, w2A, 0, cnD, outA, 0, cnD);
+                    BlasProvider.TryGemm(cmD, cnD, chD,
+                        activatedArrayD, 0, chD, w2ArrayD, 0, cnD, outArrayD, 0, cnD);
                 });
 
                 fusedBackward.Add(eng =>
                 {
-                    if (!capturedGradMapD.TryGetValue(capturedOutputD, out var gradOut)) return;
-
-                    var gOutArr = (double[])(object)gradOut.GetDataArray();
-                    var inA = (double[])(object)capturedInputD.GetDataArray();
-                    var w1A = (double[])(object)capturedW1D.GetDataArray();
-                    var w2A = (double[])(object)capturedW2D.GetDataArray();
-                    var actA = (double[])(object)capturedActivatedD.GetDataArray();
-
-                    capturedGradMapD.TryGetValue(capturedW1D, out var gW1Tensor);
-                    capturedGradMapD.TryGetValue(capturedW2D, out var gW2Tensor);
-                    capturedGradMapD.TryGetValue(capturedInputD, out var gInTensor);
-
                     // dW2 = activated^T @ gradOut → [h, n]
-                    if (gW2Tensor is not null)
+                    if (gW2ArrayD is not null)
                     {
-                        var gW2 = (double[])(object)gW2Tensor.GetDataArray();
                         BlasProvider.TryGemmEx(chD, cnD, cmD,
-                            actA, 0, chD, transA: true,
-                            gOutArr, 0, cnD, transB: false,
-                            gW2, 0, cnD);
+                            activatedArrayD, 0, chD, transA: true,
+                            gradOutArrayD, 0, cnD, transB: false,
+                            gW2ArrayD, 0, cnD);
                     }
 
                     // gradH = gradOut @ w2^T → [m, h]
                     var gradH = ArrayPool<double>.Shared.Rent(cmD * chD);
                     Array.Clear(gradH, 0, cmD * chD);
                     BlasProvider.TryGemmEx(cmD, chD, cnD,
-                        gOutArr, 0, cnD, transA: false,
-                        w2A, 0, cnD, transB: true,
+                        gradOutArrayD, 0, cnD, transA: false,
+                        w2ArrayD, 0, cnD, transB: true,
                         gradH, 0, chD);
 
                     // ReLU backward: gradH *= (activated > 0 ? 1 : 0)
                     int gradHLen = cmD * chD;
                     for (int idx = 0; idx < gradHLen; idx++)
-                        if (actA[idx] <= 0.0) gradH[idx] = 0.0;
+                        if (activatedArrayD[idx] <= 0.0) gradH[idx] = 0.0;
 
                     // dW1 = input^T @ gradH → [k, h]
-                    if (gW1Tensor is not null)
+                    if (gW1ArrayD is not null)
                     {
-                        var gW1 = (double[])(object)gW1Tensor.GetDataArray();
                         BlasProvider.TryGemmEx(ckD, chD, cmD,
-                            inA, 0, ckD, transA: true,
+                            inArrayD, 0, ckD, transA: true,
                             gradH, 0, chD, transB: false,
-                            gW1, 0, chD);
+                            gW1ArrayD, 0, chD);
                     }
 
                     // dInput = gradH @ w1^T → [m, k]
-                    if (gInTensor is not null)
+                    if (gInArrayD is not null)
                     {
-                        var gIn = (double[])(object)gInTensor.GetDataArray();
                         BlasProvider.TryGemmEx(cmD, ckD, chD,
                             gradH, 0, chD, transA: false,
-                            w1A, 0, chD, transB: true,
-                            gIn, 0, ckD);
+                            w1ArrayD, 0, chD, transB: true,
+                            gInArrayD, 0, ckD);
                     }
 
                     ArrayPool<double>.Shared.Return(gradH);
 
-                    capturedW1D.Grad = gW1Tensor;
-                    capturedW2D.Grad = gW2Tensor;
-                    capturedInputD.Grad = gInTensor;
+                    capturedW1D.Grad = gW1TensorD;
+                    capturedW2D.Grad = gW2TensorD;
+                    capturedInputD.Grad = gInTensorD;
                 });
 
                 consumedIndices.Add(i);

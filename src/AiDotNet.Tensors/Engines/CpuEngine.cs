@@ -43723,7 +43723,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Narrow", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        var result = tensor.Slice(dim, start, start + length);
+        var result = tensor.CreateNarrowView(dim, start, start + length, recordAutodiff: false);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
         AutoTracer.RecordOp("Narrow", result, eng => eng.TensorNarrow(tensor, dim, start, length));
