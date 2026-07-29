@@ -1,7 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
-using System.Diagnostics;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -100,11 +99,17 @@ internal static class DeviceCalibration
         using var dst = runtime.AllocateBytes((nuint)((long)Elements * sizeof(float)));
         var pointers = new[] { src.Pointer, dst.Pointer };
 
-        double us = Time(runtime, module, fn, pointers,
-            (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, iterations: 20);
-
         // Read plus write.
-        return 2.0 * Elements * sizeof(float) / (us * 1e-6);
+        long bytes = 2L * Elements * sizeof(float);
+        var timing = StableTimer.Measure(
+            runtime,
+            () => Launch(module, fn, pointers,
+                (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX),
+            bytes);
+        if (!timing.Stable)
+            throw new InvalidOperationException("DRAM calibration " + timing.Describe());
+
+        return bytes / (timing.Microseconds * 1e-6);
     }
 
     /// <summary>
@@ -152,29 +157,15 @@ internal static class DeviceCalibration
         using var oBuf = runtime.AllocateBytes((nuint)((long)Size * Size * sizeof(float)));
         var pointers = new[] { aBuf.Pointer, bBuf.Pointer, oBuf.Pointer };
 
-        double us = Time(runtime, module, fn, pointers,
-            (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads, iterations: 30);
-
-        return (double)Size * Size * Size / (us * 1e-6);
-    }
-
-    private static double Time(
-        DirectPtxRuntime runtime, DirectPtxModule module, IntPtr fn, IntPtr[] pointers,
-        uint blocks, uint threads, int iterations)
-    {
-        for (int i = 0; i < Math.Max(2, iterations / 5); i++) Launch(module, fn, pointers, blocks, threads);
-        runtime.Synchronize();
-
-        double best = double.MaxValue;
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iterations; i++) Launch(module, fn, pointers, blocks, threads);
-            runtime.Synchronize();
-            sw.Stop();
-            best = Math.Min(best, sw.Elapsed.TotalMilliseconds * 1000.0 / iterations);
-        }
-        return best;
+        long macs = (long)Size * Size * Size;
+        var timing = StableTimer.Measure(
+            runtime,
+            () => Launch(module, fn, pointers,
+                (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads),
+            macs);
+        return timing.Stable
+            ? macs / (timing.Microseconds * 1e-6)
+            : null;
     }
 
     private static unsafe void Launch(

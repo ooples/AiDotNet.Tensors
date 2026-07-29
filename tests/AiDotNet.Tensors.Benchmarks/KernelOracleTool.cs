@@ -2,7 +2,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
@@ -215,25 +214,6 @@ internal static class KernelOracleTool
         foreach (var input in spec.Inputs) yield return input;
         yield return spec.Output;
         foreach (var extra in spec.ExtraOutputs) yield return extra.Binding;
-    }
-
-    private static double Time(
-        DirectPtxRuntime runtime, DirectPtxModule module, IntPtr fn, IntPtr[] pointers,
-        uint blocks, uint threads)
-    {
-        for (int i = 0; i < 5; i++) Launch(module, fn, pointers, blocks, threads);
-        runtime.Synchronize();
-
-        double best = double.MaxValue;
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < 50; i++) Launch(module, fn, pointers, blocks, threads);
-            runtime.Synchronize();
-            sw.Stop();
-            best = Math.Min(best, sw.Elapsed.TotalMilliseconds * 1000.0 / 50);
-        }
-        return best;
     }
 
     private static unsafe void Launch(
