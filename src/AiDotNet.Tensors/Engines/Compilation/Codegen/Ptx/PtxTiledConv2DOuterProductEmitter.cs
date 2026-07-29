@@ -12,6 +12,8 @@ public sealed class PtxTiledConv2DOuterProductEmitter
 {
     // PTX ISA 7.5 introduced the ignore-source predicate used by the window cp.async.
     private const string PredicatedAsyncCopyPtxIsaVersion = "7.5";
+    private const int ValuesPerCopy = 4;
+    private const int BytesPerCopy = ValuesPerCopy * sizeof(float);
     private const int FixedR = 20;
     private const int FixedRd = 8;
     private const int FixedP = 4;
@@ -137,7 +139,6 @@ public sealed class PtxTiledConv2DOuterProductEmitter
     private void EmitDirectStage(
         CodegenTiledConv2DOuterProductPlan plan, string step, string bufferBase)
     {
-        const int ValuesPerCopy = 4;
         int chunksPerRow = plan.InnerReduction / ValuesPerCopy;
         int chunks = plan.TileM * chunksPerRow;
         int passes = (chunks + plan.BlockThreads - 1) / plan.BlockThreads;
@@ -159,18 +160,18 @@ public sealed class PtxTiledConv2DOuterProductEmitter
             L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
             L($"mul.wide.u32 {bytes}, {element}, 4;");
             L($"add.u64 {source}, %rd0, {bytes};");
-            L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
+            L($"mul.wide.u32 {sharedBytes}, {index}, {I(BytesPerCopy)};");
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
             L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
             L($"add.u64 {destination}, {destination}, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global [{destination}], [{source}], 16;");
+            L($"@{valid} cp.async.ca.shared.global " +
+              $"[{destination}], [{source}], {I(BytesPerCopy)};");
         }
     }
 
     private void EmitWindowStage(
         CodegenTiledConv2DOuterProductPlan plan, string step, string bufferBase)
     {
-        const int ValuesPerCopy = 4;
         int sharedBase = plan.DirectStageElements * sizeof(float);
         int chunksPerRow = plan.InputWidth / ValuesPerCopy;
         int chunks = plan.TileN * chunksPerRow;
@@ -201,12 +202,12 @@ public sealed class PtxTiledConv2DOuterProductEmitter
             L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
             L($"mul.wide.u32 {bytes}, {element}, 4;");
             L($"add.u64 {source}, %rd1, {bytes};");
-            L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
+            L($"mul.wide.u32 {sharedBytes}, {index}, {I(BytesPerCopy)};");
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
             L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
             L($"add.u64 {destination}, {destination}, {sharedBytes};");
             L($"@{valid} cp.async.ca.shared.global " +
-              $"[{destination}+{I(sharedBase)}], [{source}], 16, {ignore};");
+              $"[{destination}+{I(sharedBase)}], [{source}], {I(BytesPerCopy)}, {ignore};");
         }
     }
 
