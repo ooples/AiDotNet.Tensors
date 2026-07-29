@@ -133,8 +133,16 @@ public sealed record CodegenAutotuneIdentity(
         text.Append("candidate=tiled-split-partial;");
         try
         {
-            text.Append(new PtxTiledOuterProductEmitter().Emit(
-                spec, computeMajor, computeMinor));
+            try
+            {
+                text.Append(new PtxTiledOuterProductEmitter().Emit(
+                    spec, computeMajor, computeMinor));
+            }
+            catch (NotSupportedException)
+            {
+                text.Append(new PtxTiledConv2DOuterProductEmitter().Emit(
+                    spec, computeMajor, computeMinor));
+            }
         }
         catch (NotSupportedException ex)
         {

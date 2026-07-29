@@ -208,14 +208,37 @@ internal static class KernelCatalogOracleTool
                 throw new InvalidOperationException(
                     entry.Name + " records " + winner + " but no split can be rebuilt.");
 
-            var tiled = new PtxTiledOuterProductEmitter();
-            _ = tiled.Emit(split.Partial, major, minor);
-            var tiledPlan = tiled.Plan!;
+            int tiledBlocks, tiledSteps, tiledInnerReduction, tiledM, tiledN;
+            int tiledBlockThreads;
+            try
+            {
+                var tiled = new PtxTiledOuterProductEmitter();
+                _ = tiled.Emit(split.Partial, major, minor);
+                var tiledPlan = tiled.Plan!;
+                tiledBlocks = tiledPlan.Blocks;
+                tiledSteps = tiledPlan.Steps;
+                tiledInnerReduction = tiledPlan.InnerReduction;
+                tiledM = tiledPlan.TileM;
+                tiledN = tiledPlan.TileN;
+                tiledBlockThreads = tiled.LaunchBlockThreads;
+            }
+            catch (NotSupportedException)
+            {
+                var tiled = new PtxTiledConv2DOuterProductEmitter();
+                _ = tiled.Emit(split.Partial, major, minor);
+                var tiledPlan = tiled.Plan!;
+                tiledBlocks = tiledPlan.Blocks;
+                tiledSteps = tiledPlan.Steps;
+                tiledInnerReduction = tiledPlan.InnerReduction;
+                tiledM = tiledPlan.TileM;
+                tiledN = tiledPlan.TileN;
+                tiledBlockThreads = tiled.LaunchBlockThreads;
+            }
             long partialThreads = split.Partial.Space.TotalThreads;
             var partialSemantic = CodegenPerformanceModel.Predict(
-                split.Partial, partialThreads, 0, machine, tiled.LaunchBlockThreads);
-            long scalarLoads = checked((long)tiledPlan.Blocks * tiledPlan.Steps *
-                tiledPlan.InnerReduction * (tiledPlan.TileM + tiledPlan.TileN));
+                split.Partial, partialThreads, 0, machine, tiledBlockThreads);
+            long scalarLoads = checked((long)tiledBlocks * tiledSteps *
+                tiledInnerReduction * (tiledM + tiledN));
 
             var combineEmitter = new PtxAffineEmitter();
             _ = combineEmitter.Emit(split.Combine, major, minor);
@@ -233,8 +256,8 @@ internal static class KernelCatalogOracleTool
                 combinePrediction.HasComputeCeiling
                     ? partialUs + combinePrediction.PredictedMicroseconds
                     : null;
-            shape = "tiled split x2, " + tiledPlan.TileM + "x" + tiledPlan.TileN +
-                " over " + tiledPlan.InnerReduction;
+            shape = "tiled split x2, " + tiledM + "x" + tiledN +
+                " over " + tiledInnerReduction;
         }
         else if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
         {

@@ -478,12 +478,31 @@ internal static class KernelConveyorTool
                 {
                     try
                     {
-                        var tiled = new PtxTiledOuterProductEmitter();
-                        string text = tiled.Emit(plan.Partial,
-                            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                        halves.Add(new ProgramKernel(plan.Partial, text, tiled.LaunchBlocks,
-                            checked((uint)tiled.LaunchBlockThreads), 1,
-                            plan.Partial.Space.ReductionAxes.Length, 0, "left+right rows"));
+                        string text;
+                        uint blocks;
+                        int blockThreads;
+                        string stagedOperands;
+                        try
+                        {
+                            var tiled = new PtxTiledOuterProductEmitter();
+                            text = tiled.Emit(plan.Partial,
+                                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                            blocks = tiled.LaunchBlocks;
+                            blockThreads = tiled.LaunchBlockThreads;
+                            stagedOperands = "left+right rows";
+                        }
+                        catch (NotSupportedException)
+                        {
+                            var tiled = new PtxTiledConv2DOuterProductEmitter();
+                            text = tiled.Emit(plan.Partial,
+                                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                            blocks = tiled.LaunchBlocks;
+                            blockThreads = tiled.LaunchBlockThreads;
+                            stagedOperands = "output+input rows";
+                        }
+                        halves.Add(new ProgramKernel(plan.Partial, text, blocks,
+                            checked((uint)blockThreads), 1,
+                            plan.Partial.Space.ReductionAxes.Length, 0, stagedOperands));
                     }
                     catch (NotSupportedException) { emitted = false; }
                 }
