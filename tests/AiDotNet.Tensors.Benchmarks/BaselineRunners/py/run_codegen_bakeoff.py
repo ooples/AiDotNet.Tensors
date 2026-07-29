@@ -37,6 +37,9 @@ def conv_transpose_contract():
         raise RuntimeError("invalid BAKEOFF_CONV_TRANSPOSE_CONTRACT") from exc
     if len(values) != 7:
         raise RuntimeError("BAKEOFF_CONV_TRANSPOSE_CONTRACT must contain 7 integers")
+    n, c, ih, iw, oh, ow, output_padding = values
+    if min(n, c, ih, iw, oh, ow) <= 0 or output_padding not in (0, 1):
+        raise RuntimeError("invalid transposed-convolution catalog contract")
     return values
 
 
