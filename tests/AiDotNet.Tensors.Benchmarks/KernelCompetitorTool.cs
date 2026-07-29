@@ -31,6 +31,9 @@ internal static class KernelCompetitorTool
             throw new ArgumentException("--max-spread-pct must be a positive number.");
         }
         string dispatch = KernelEvidenceIdentity.CurrentDispatch();
+        // A failed refresh must not leave an older current-tag artifact available to the
+        // release reader, and the child may create a partial replacement before failing.
+        if (File.Exists(output)) File.Delete(output);
 
         var start = new ProcessStartInfo
         {
@@ -98,11 +101,14 @@ internal static class KernelCompetitorTool
                 terminationDiagnostic + " " + FirstDiagnostic(errorText, outputText));
         }
         if (process.ExitCode != 0)
+        {
+            if (File.Exists(output)) File.Delete(output);
             throw new InvalidOperationException(
                 "Competitor lane failed with exit code " +
                 process.ExitCode.ToString(CultureInfo.InvariantCulture) +
                 "; no release evidence accepted. " +
                 FirstDiagnostic(errorText, outputText));
+        }
 
         string dispatchAfter = KernelEvidenceIdentity.CurrentDispatch();
         if (!string.Equals(dispatch, dispatchAfter, StringComparison.Ordinal))
