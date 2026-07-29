@@ -172,7 +172,7 @@ public sealed class CodegenTiledContractionPlan
         bool reductionMajor = false;
         foreach (int input in spec.ProductInputs)
         {
-            if (!TryMatrix(spec.Inputs[input], reduction, out int candidateM,
+            if (!TryMatrix(spec, spec.Inputs[input], reduction, out int candidateM,
                     out bool candidateReductionMajor))
                 continue;
             if (matrixInput >= 0)
@@ -200,7 +200,8 @@ public sealed class CodegenTiledContractionPlan
         int streamInput = spec.ProductInputs[0] == matrixInput
             ? spec.ProductInputs[1]
             : spec.ProductInputs[0];
-        if (!IsStreamedBinding(spec.Inputs[streamInput], outputAxes, mDimension, reduction))
+        if (!IsStreamedBinding(
+                spec, spec.Inputs[streamInput], outputAxes, mDimension, reduction))
         {
             reason = "the other operand is not the output layout with M replaced by K";
             return false;
@@ -262,7 +263,7 @@ public sealed class CodegenTiledContractionPlan
     }
 
     private static bool TryMatrix(
-        CodegenTensorBinding binding, int reduction, out int mAxis,
+        CodegenKernelSpec spec, CodegenTensorBinding binding, int reduction, out int mAxis,
         out bool reductionMajor)
     {
         mAxis = -1;
@@ -270,6 +271,9 @@ public sealed class CodegenTiledContractionPlan
         if (binding.Shape.Count != 2 || binding.Map.Count != 2) return false;
         if (!TryPlainAxis(binding.Map[0], out int first) ||
             !TryPlainAxis(binding.Map[1], out int second)) return false;
+        if (binding.Shape[0] != spec.Space.Axes[first].Extent ||
+            binding.Shape[1] != spec.Space.Axes[second].Extent)
+            return false;
         if (first == reduction && second != reduction)
         {
             mAxis = second;
@@ -286,14 +290,17 @@ public sealed class CodegenTiledContractionPlan
     }
 
     private static bool IsStreamedBinding(
-        CodegenTensorBinding binding, int[] outputAxes, int mDimension, int reduction)
+        CodegenKernelSpec spec, CodegenTensorBinding binding,
+        int[] outputAxes, int mDimension, int reduction)
     {
         if (binding.Shape.Count != outputAxes.Length || binding.Map.Count != outputAxes.Length)
             return false;
         for (int d = 0; d < outputAxes.Length; d++)
         {
             int expected = d == mDimension ? reduction : outputAxes[d];
-            if (!TryPlainAxis(binding.Map[d], out int actual) || actual != expected) return false;
+            if (!TryPlainAxis(binding.Map[d], out int actual) || actual != expected ||
+                binding.Shape[d] != spec.Space.Axes[actual].Extent)
+                return false;
         }
         return true;
     }

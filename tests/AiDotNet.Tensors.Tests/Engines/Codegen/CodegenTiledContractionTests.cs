@@ -1,5 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System.Linq;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -65,6 +66,23 @@ public sealed class CodegenTiledContractionTests
             entry.Bench, out var plan, out string reason));
         Assert.Null(plan);
         Assert.Contains("one contraction axis", reason);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BindingShapeThatDisagreesWithMappedAxis_IsRefused(bool matrix)
+    {
+        var original = CodegenKernelCatalog.Find("conv2d_1x1_bwd_data")!.Verify;
+        Assert.True(CodegenTiledContractionPlan.TryCreate(
+            original, out var valid, out string validReason), validReason);
+        int input = matrix ? valid!.MatrixInput : valid!.StreamInput;
+        var malformed = WithShortenedInput(original, input);
+
+        Assert.False(CodegenTiledContractionPlan.TryCreate(
+            malformed, out var plan, out string reason));
+        Assert.Null(plan);
+        Assert.Contains(matrix ? "plain rank-2 matrix" : "output layout", reason);
     }
 
     /// <summary>The emitted candidate stages both operands and uses only SIMT FP32 FMA.</summary>
@@ -342,6 +360,24 @@ public sealed class CodegenTiledContractionTests
         Assert.True(worst < 2e-5,
             $"double-buffered forward differs by {worst:E3} relative at {at}: " +
             $"affine {expected[at]}, tiled {actual[at]}");
+    }
+
+    private static CodegenKernelSpec WithShortenedInput(
+        CodegenKernelSpec spec, int inputIndex)
+    {
+        var inputs = spec.Inputs.ToArray();
+        CodegenTensorBinding original = inputs[inputIndex];
+        int[] shape = original.Shape.ToArray();
+        shape[0]--;
+        inputs[inputIndex] = new CodegenTensorBinding(
+            original.ParameterIndex, original.Name, shape, original.Map.ToArray(),
+            elementType: original.ElementType, indirect: original.Indirect.ToArray());
+        return new CodegenKernelSpec(
+            spec.Name + "_malformed", spec.Space, inputs, spec.Output,
+            spec.ProductInputs.ToArray(), spec.Reduce,
+            spec.BiasInput, spec.ScaleInput, spec.Activation, spec.ReduceScale,
+            spec.PreReduce, spec.PreBiasInput, spec.PreBiasScale, spec.Algebra,
+            spec.ExtraOutputs.ToArray());
     }
 
     private static unsafe void LaunchThree(
