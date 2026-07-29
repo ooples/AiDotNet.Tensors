@@ -141,7 +141,7 @@ public class TensorCowCloneTests
         var src = MakeTensor();
         var clone = (Tensor<float>)src.Clone();
 
-        // O(1) proof: CloneShared only flags _cowShared when it actually shared storage (the eager
+        // O(1) proof: CloneShared only attaches a COW family when it actually shared storage (the eager
         // CloneDeepCopy fallback never does), so IsCowShared==true means no full-buffer copy happened.
         Assert.True(clone.IsCowShared, "Clone() must share storage (O(1)) by default");
         Assert.True(src.IsCowShared, "the source is flagged COW too");
@@ -211,12 +211,17 @@ public class TensorCowCloneTests
         var source = MakeTensor();
         var clone = (Tensor<float>)source.CloneShared();
 
-        // Creating a retained alias is an alias-exposure barrier. It must
-        // privatize source before the view captures storage.
+        // Metadata view creation remains O(1): source and view form one alias family while the
+        // independent clone is a second family over the same storage.
         var sourceView = source.Reshape(6);
 
-        Assert.False(source.IsCowShared);
+        Assert.True(source.IsCowShared);
+        Assert.True(sourceView.IsCowShared);
+        Assert.Same(source._storage, sourceView._storage);
+        Assert.Same(source._storage, clone._storage);
         sourceView[2] = 52f;
+        Assert.False(source.IsCowShared);
+        Assert.False(sourceView.IsCowShared);
         Assert.Equal(52f, source[2]);
         Assert.Equal(Original[2], clone[2]);
 
@@ -231,10 +236,59 @@ public class TensorCowCloneTests
         var clone = (Tensor<float>)source.CloneShared();
 
         var cloneView = clone.Transpose(new[] { 1, 0 });
+        Assert.True(clone.IsCowShared);
+        Assert.True(cloneView.IsCowShared);
         cloneView[0] = 84f;
 
         Assert.Equal(84f, clone[0]);
         Assert.Equal(Original[0], source[0]);
+    }
+
+    [Fact]
+    public void SourceWrite_AfterCowViewCreation_MovesWholeAliasFamily()
+    {
+        var source = MakeTensor();
+        var peer = (Tensor<float>)source.CloneShared();
+        var sourceView = source.Reshape(6);
+
+        source[4] = 95f;
+
+        Assert.Equal(95f, sourceView[4]);
+        Assert.Equal(Original[4], peer[4]);
+        Assert.False(source.IsCowShared);
+        Assert.False(sourceView.IsCowShared);
+    }
+
+    [Fact]
+    public async Task ViewCreation_ConcurrentWithFirstWrite_RemainsInSourceAliasFamily()
+    {
+        for (int iteration = 0; iteration < 32; iteration++)
+        {
+            var source = MakeTensor();
+            var peer = (Tensor<float>)source.CloneShared();
+            using var start = new System.Threading.ManualResetEventSlim(false);
+            Tensor<float> sourceView = null!;
+
+            var createView = Task.Run(() =>
+            {
+                start.Wait();
+                sourceView = source.Reshape(6);
+            });
+            var firstWrite = Task.Run(() =>
+            {
+                start.Wait();
+                source[0] = 100f + iteration;
+            });
+
+            start.Set();
+            await Task.WhenAll(createView, firstWrite);
+
+            var retainedView = Assert.IsType<Tensor<float>>(sourceView);
+            source[1] = 200f + iteration;
+            Assert.Equal(source[1], retainedView[1]);
+            Assert.Equal(Original[0], peer[0]);
+            Assert.Equal(Original[1], peer[1]);
+        }
     }
 
     [Fact]
@@ -287,6 +341,8 @@ public class TensorCowCloneTests
         var peer = (Tensor<float>)source.CloneShared();
 
         var view = createView(source);
+        Assert.True(source.IsCowShared);
+        Assert.True(view.IsCowShared);
         view[0] = 123f;
 
         Assert.False(source.IsCowShared);

@@ -112,6 +112,180 @@ public class PoolPaddedLossReadoutTests
     }
 
     [Fact]
+    public void SpecializedReduceMax_PoolPaddedOutput_WritesLiveBacking()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { -3.0f, 7.0f, 2.0f }, new[] { 3 });
+        var pooled = ArrayPool<float>.Shared.Rent(1);
+        var output = Tensor<float>.FromPooledMemory(
+            new Memory<float>(pooled, 0, 1), new[] { 1 }, pooled);
+
+        try
+        {
+            Array.Clear(pooled, 0, pooled.Length);
+            Assert.True(pooled.Length > output.Length);
+            var step = new CompiledStep<float>(
+                "ReduceMax", (eng, destination) => { }, output, new[] { input });
+
+            var specialized = CompiledTrainingPlan<float>.TryBuildSpecializedForward(step);
+            Assert.NotNull(specialized);
+            specialized!(engine);
+
+            Assert.Equal(7.0f, output[0]);
+            Assert.Equal(7.0f, pooled[0]);
+        }
+        finally
+        {
+            TensorAllocator.Return(output);
+        }
+    }
+
+    [Fact]
+    public void SpecializedMseLoss_PoolPaddedOutput_WritesLiveBacking()
+    {
+        var engine = new CpuEngine();
+        var predicted = new Tensor<float>(new[] { 1.0f, 4.0f }, new[] { 2 });
+        var target = new Tensor<float>(new[] { 3.0f, 2.0f }, new[] { 2 });
+        var pooled = ArrayPool<float>.Shared.Rent(1);
+        var output = Tensor<float>.FromPooledMemory(
+            new Memory<float>(pooled, 0, 1), new[] { 1 }, pooled);
+
+        try
+        {
+            Array.Clear(pooled, 0, pooled.Length);
+            Assert.True(pooled.Length > output.Length);
+            var step = new CompiledStep<float>(
+                "MSELoss", (eng, destination) => { }, output, new[] { predicted, target });
+
+            var specialized = CompiledTrainingPlan<float>.TryBuildSpecializedForward(step);
+            Assert.NotNull(specialized);
+            specialized!(engine);
+
+            Assert.Equal(4.0f, output[0]);
+            Assert.Equal(4.0f, pooled[0]);
+        }
+        finally
+        {
+            TensorAllocator.Return(output);
+        }
+    }
+
+    [Fact]
+    public void SpecializedBroadcastAdd_PoolPaddedInputAndOutput_StayLiveAcrossReplay()
+    {
+        var engine = new CpuEngine();
+        var inputBacking = ArrayPool<float>.Shared.Rent(2);
+        var outputBacking = ArrayPool<float>.Shared.Rent(2);
+        var input = Tensor<float>.FromPooledMemory(
+            new Memory<float>(inputBacking, 0, 2), new[] { 1, 2 }, inputBacking);
+        var addend = new Tensor<float>(new[] { 10.0f, 20.0f }, new[] { 2 });
+        var output = Tensor<float>.FromPooledMemory(
+            new Memory<float>(outputBacking, 0, 2), new[] { 1, 2 }, outputBacking);
+
+        try
+        {
+            Assert.True(inputBacking.Length > input.Length);
+            Assert.True(outputBacking.Length > output.Length);
+            input[0] = 1.0f;
+            input[1] = 2.0f;
+            Array.Clear(outputBacking, 0, outputBacking.Length);
+
+            var step = new CompiledStep<float>(
+                "TensorBroadcastAdd", (eng, destination) => { }, output, new[] { input, addend });
+            var specialized = CompiledTrainingPlan<float>.TryBuildSpecializedForward(step);
+            Assert.NotNull(specialized);
+
+            // Mutate after closure creation. A cached GetDataArray() copy would
+            // keep reading 1,2 instead of the live 3,4 values.
+            input[0] = 3.0f;
+            input[1] = 4.0f;
+            specialized!(engine);
+
+            Assert.Equal(new[] { 13.0f, 24.0f }, output.AsSpan().ToArray());
+            Assert.Equal(13.0f, outputBacking[0]);
+            Assert.Equal(24.0f, outputBacking[1]);
+        }
+        finally
+        {
+            TensorAllocator.Return(output);
+            TensorAllocator.Return(input);
+        }
+    }
+
+    [Fact]
+    public void SpecializedNdMatMul_PoolPaddedWeightAndOutput_StayLiveAcrossReplay()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1.0f, 2.0f, 3.0f, 4.0f }, new[] { 1, 2, 2 });
+        var weightBacking = ArrayPool<float>.Shared.Rent(2);
+        var outputBacking = ArrayPool<float>.Shared.Rent(2);
+        var weight = Tensor<float>.FromPooledMemory(
+            new Memory<float>(weightBacking, 0, 2), new[] { 2, 1 }, weightBacking);
+        var output = Tensor<float>.FromPooledMemory(
+            new Memory<float>(outputBacking, 0, 2), new[] { 1, 2, 1 }, outputBacking);
+
+        try
+        {
+            Assert.True(weightBacking.Length > weight.Length);
+            Assert.True(outputBacking.Length > output.Length);
+            weight[0] = 1.0f;
+            weight[1] = 1.0f;
+            var step = new CompiledStep<float>(
+                "TensorMatMul", (eng, destination) => { }, output, new[] { input, weight });
+            var specialized = CompiledTrainingPlan<float>.TryBuildSpecializedForward(step);
+            Assert.NotNull(specialized);
+
+            weight[0] = 2.0f;
+            weight[1] = 3.0f;
+            specialized!(engine);
+
+            Assert.Equal(new[] { 8.0f, 18.0f }, output.AsSpan().ToArray());
+            Assert.Equal(8.0f, outputBacking[0]);
+            Assert.Equal(18.0f, outputBacking[1]);
+        }
+        finally
+        {
+            TensorAllocator.Return(output);
+            TensorAllocator.Return(weight);
+        }
+    }
+
+    [Fact]
+    public void SpecializedConcat_PoolPaddedInputAndOutput_StayLiveAcrossReplay()
+    {
+        var engine = new CpuEngine();
+        var leftBacking = ArrayPool<float>.Shared.Rent(1);
+        var outputBacking = ArrayPool<float>.Shared.Rent(2);
+        var left = Tensor<float>.FromPooledMemory(
+            new Memory<float>(leftBacking, 0, 1), new[] { 1 }, leftBacking);
+        var right = new Tensor<float>(new[] { 5.0f }, new[] { 1 });
+        var output = Tensor<float>.FromPooledMemory(
+            new Memory<float>(outputBacking, 0, 2), new[] { 2 }, outputBacking);
+
+        try
+        {
+            left[0] = 1.0f;
+            var step = new CompiledStep<float>(
+                "Concatenate", (eng, destination) => { }, output, new[] { left, right },
+                savedState: new object[] { 0 });
+            var specialized = CompiledTrainingPlan<float>.TryBuildSpecializedForward(step);
+            Assert.NotNull(specialized);
+
+            left[0] = 9.0f;
+            specialized!(engine);
+
+            Assert.Equal(new[] { 9.0f, 5.0f }, output.AsSpan().ToArray());
+            Assert.Equal(9.0f, outputBacking[0]);
+            Assert.Equal(5.0f, outputBacking[1]);
+        }
+        finally
+        {
+            TensorAllocator.Return(output);
+            TensorAllocator.Return(left);
+        }
+    }
+
+    [Fact]
     public void OffsetBackedParameterView_RejectsRawArraySpecialization_AndFallbackReadsCorrectSlice()
     {
         var engine = new CpuEngine();

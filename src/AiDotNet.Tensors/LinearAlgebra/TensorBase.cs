@@ -2159,9 +2159,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal void ScaleLogicalInPlace(T scale)
     {
         EnsureMaterialized();
-        EnsureOwnedForWrite();
         if (Length == 0)
             return;
+        EnsureNonOverlappingWritableLayout();
+        EnsureOwnedForWrite();
 
         var destination = _storage.AsWritableSpan();
         if (IsContiguous)
@@ -2180,6 +2181,105 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         }
 
         IncrementVersion();
+    }
+
+    /// <summary>
+    /// Clamps every logical element in place while preserving strided-view and
+    /// copy-on-write semantics. The operation touches only the tensor's logical
+    /// region; storage padding and unrelated elements surrounding a view are left
+    /// unchanged.
+    /// </summary>
+    internal void ClampLogicalInPlace(T min, T max)
+    {
+        EnsureMaterialized();
+        if (Length == 0)
+            return;
+        EnsureNonOverlappingWritableLayout();
+        EnsureOwnedForWrite();
+
+        var destination = _storage.AsWritableSpan();
+        if (IsContiguous)
+        {
+            ClampSpan(destination.Slice(_storageOffset, Length), min, max);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+            {
+                int storageIndex = FlatIndexToStorageIndex(i);
+                T value = destination[storageIndex];
+                destination[storageIndex] = _numOps.GreaterThan(value, max)
+                    ? max
+                    : _numOps.LessThan(value, min) ? min : value;
+            }
+        }
+
+        IncrementVersion();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void ClampSpan(Span<T> destination, T min, T max)
+    {
+        for (int i = 0; i < destination.Length; i++)
+        {
+            T value = destination[i];
+            destination[i] = _numOps.GreaterThan(value, max)
+                ? max
+                : _numOps.LessThan(value, min) ? min : value;
+        }
+    }
+
+    /// <summary>
+    /// Rejects in-place logical operations on layouts where multiple logical
+    /// coordinates address the same storage element. Applying a scale or clamp
+    /// once per logical coordinate would otherwise mutate zero-stride/broadcast
+    /// storage repeatedly and make the result traversal-order dependent.
+    /// </summary>
+    private void EnsureNonOverlappingWritableLayout()
+    {
+        if (IsContiguous || Length <= 1 || Rank == 0)
+            return;
+
+        Span<int> dimensions = Rank <= 16 ? stackalloc int[Rank] : new int[Rank];
+        int dimensionCount = 0;
+        for (int d = 0; d < Rank; d++)
+        {
+            if (_shape[d] <= 1)
+                continue;
+            if (_strides[d] == 0)
+                throw new InvalidOperationException(
+                    "In-place logical mutation is not defined for overlapping tensor views " +
+                    "(a non-singleton dimension has stride zero). Materialize the view first.");
+            dimensions[dimensionCount++] = d;
+        }
+
+        // Sort active dimensions by absolute stride. A dimension is safely
+        // non-overlapping only when its stride begins at or beyond the complete
+        // storage span covered by every faster-varying dimension.
+        for (int i = 1; i < dimensionCount; i++)
+        {
+            int value = dimensions[i];
+            long stride = Math.Abs((long)_strides[value]);
+            int j = i - 1;
+            while (j >= 0 && Math.Abs((long)_strides[dimensions[j]]) > stride)
+            {
+                dimensions[j + 1] = dimensions[j];
+                j--;
+            }
+            dimensions[j + 1] = value;
+        }
+
+        long coveredSpan = 1;
+        for (int i = 0; i < dimensionCount; i++)
+        {
+            int dimension = dimensions[i];
+            long stride = Math.Abs((long)_strides[dimension]);
+            if (stride < coveredSpan)
+                throw new InvalidOperationException(
+                    "In-place logical mutation is not defined for overlapping tensor views. " +
+                    "Materialize the view first.");
+            coveredSpan = checked(coveredSpan + ((long)_shape[dimension] - 1L) * stride);
+        }
     }
 
     // ================================================================
@@ -2308,44 +2408,160 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     // ================================================================
-    // Copy-on-write clone (issue #624 — Stage 1: primitive + write-gate)
+    // Copy-on-write clone (issue #624 — alias-family ownership + write gate)
     // ================================================================
 
     /// <summary>
-    /// True when this tensor shares its backing storage with a copy-on-write peer (see
-    /// <see cref="CloneShared"/>). While set, the next in-place write privatizes this tensor's
-    /// storage (<see cref="EnsureOwnedForWrite"/>) so neither side observes the other's mutation.
-    /// Normal tensors never set it — so the write-path guards are a single predictable branch.
+    /// The alias family this tensor belongs to while its storage is shared with an independent
+    /// copy-on-write peer. Metadata views join their creator's family so ordinary source/view
+    /// aliasing survives the family-level detach. Normal tensors leave this null, keeping the
+    /// write-path guard to one predictable branch.
     /// </summary>
-    private bool _cowShared;
+    private CowAliasFamily? _cowFamily;
 
     /// <summary>Diagnostic: whether this tensor is currently a live COW storage sharer.</summary>
-    internal bool IsCowShared => _cowShared;
-
-    /// <summary>Marks this tensor as a COW sharer. Called only by <see cref="CloneShared"/>.</summary>
-    internal void MarkCowShared() => _cowShared = true;
+    internal bool IsCowShared => _cowFamily?.RequiresDetach == true;
 
     /// <summary>
-    /// Privatizes copy-on-write storage before an in-place write. No-op unless this tensor was
-    /// produced by (or is the source of) a <see cref="CloneShared"/> and still shares storage.
-    /// When storage is still shared (<c>RefCount &gt; 1</c>) the backing buffer is deep-copied into
-    /// fresh sole-owned storage; when we are already the only ref we just clear the flag. Must be
-    /// called at the top of every in-place write path — the isolation test is the completeness guard.
+    /// Starts an independent COW alias family for this tensor. The source and clone each receive
+    /// their own family; views created from either side subsequently join that side's family.
+    /// </summary>
+    internal void MarkCowShared()
+    {
+        var family = new CowAliasFamily();
+        family.Add(this);
+    }
+
+    /// <summary>True when view construction must coordinate with a pending COW detach.</summary>
+    protected bool HasCowAliasFamily => _cowFamily is not null;
+
+    /// <summary>
+    /// Constructs and registers a metadata view while holding this tensor's alias-family lock.
+    /// This makes the creator's vector/storage pair an atomic snapshot relative to first-write
+    /// detach. Callers should use their direct allocation path when <see cref="HasCowAliasFamily"/>
+    /// is false so ordinary view construction does not allocate a delegate.
+    /// </summary>
+    protected TView CreateViewInCowAliasFamily<TView>(Func<TView> factory)
+        where TView : TensorBase<T>
+    {
+        var family = _cowFamily;
+        return family is null ? factory() : family.CreateView(this, factory);
+    }
+
+    /// <summary>
+    /// Privatizes a complete copy-on-write alias family before an in-place write. No-op unless
+    /// this tensor was produced by (or is the source of) a <see cref="CloneShared"/> and still
+    /// shares storage with an independent family. Moving the whole family preserves the normal
+    /// rule that writes through a source or any of its metadata views remain mutually visible.
     /// </summary>
     protected void EnsureOwnedForWrite()
     {
-        if (!_cowShared) return;
-        if (_storage.RefCount > 1)
+        var family = _cowFamily;
+        if (family is null) return;
+        family.DetachForWrite(this);
+    }
+
+    /// <summary>
+    /// Tracks one logical alias family using weak members so discarded views do
+    /// not stay alive. A family-level detach preserves ordinary source/view
+    /// aliasing while isolating the independent family created for a COW peer.
+    /// </summary>
+    private sealed class CowAliasFamily
+    {
+        private readonly object _sync = new object();
+        private readonly System.Collections.Generic.List<WeakReference<TensorBase<T>>> _members =
+            new System.Collections.Generic.List<WeakReference<TensorBase<T>>>();
+        private int _requiresDetach = 1;
+
+        internal bool RequiresDetach => Volatile.Read(ref _requiresDetach) != 0;
+
+        internal void Add(TensorBase<T> member)
         {
-            EnsureMaterialized();
-            var fresh = _data.Clone();                  // independent copy of the shared buffer
-            var oldStorage = _storage;
-            _data = fresh;
-            _storage = new TensorStorage<T>(fresh);     // sole owner (RefCount 1)
-            oldStorage.Release();                       // drop our shared ref; peer keeps theirs
-            IncrementVersion();
+            lock (_sync)
+            {
+                if (_requiresDetach == 0)
+                    return;
+                member._cowFamily = this;
+                _members.Add(new WeakReference<TensorBase<T>>(member));
+            }
         }
-        _cowShared = false;
+
+        /// <summary>
+        /// Atomically captures the creator's current vector/storage pair and attaches the new
+        /// metadata view to this family when a detach is still pending.
+        /// </summary>
+        internal TView CreateView<TView>(TensorBase<T> creator, Func<TView> factory)
+            where TView : TensorBase<T>
+        {
+            lock (_sync)
+            {
+                var view = factory();
+                if (_requiresDetach != 0 && ReferenceEquals(creator._cowFamily, this))
+                {
+                    view._cowFamily = this;
+                    _members.Add(new WeakReference<TensorBase<T>>(view));
+                    return view;
+                }
+                return view;
+            }
+        }
+
+        internal void DetachForWrite(TensorBase<T> requester)
+        {
+            lock (_sync)
+            {
+                if (_requiresDetach == 0)
+                {
+                    requester._cowFamily = null;
+                    return;
+                }
+
+                requester.EnsureMaterialized();
+                var liveMembers = new System.Collections.Generic.List<TensorBase<T>>(_members.Count);
+                for (int i = 0; i < _members.Count; i++)
+                {
+                    if (_members[i].TryGetTarget(out var member)
+                        && !member._disposed
+                        && ReferenceEquals(member._cowFamily, this)
+                        && ReferenceEquals(member._storage, requester._storage))
+                    {
+                        liveMembers.Add(member);
+                    }
+                }
+                if (!liveMembers.Contains(requester))
+                    liveMembers.Add(requester);
+
+                // When every remaining storage reference belongs to this family,
+                // no independent peer remains. Clear the pending COW state without
+                // copying, matching the former sole-owner fast path.
+                if (requester._storage.RefCount == liveMembers.Count)
+                {
+                    for (int i = 0; i < liveMembers.Count; i++)
+                        liveMembers[i]._cowFamily = null;
+                    Volatile.Write(ref _requiresDetach, 0);
+                    _members.Clear();
+                    return;
+                }
+
+                var fresh = requester._data.Clone();
+                var privateStorage = new TensorStorage<T>(fresh);
+                for (int i = 0; i < liveMembers.Count; i++)
+                {
+                    var member = liveMembers[i];
+                    if (i > 0)
+                        privateStorage.AddRef();
+                    var oldStorage = member._storage;
+                    member._data = fresh;
+                    member._storage = privateStorage;
+                    member._cowFamily = null;
+                    oldStorage.Release();
+                    member.IncrementVersion();
+                }
+
+                Volatile.Write(ref _requiresDetach, 0);
+                _members.Clear();
+            }
+        }
     }
 
     /// <summary>

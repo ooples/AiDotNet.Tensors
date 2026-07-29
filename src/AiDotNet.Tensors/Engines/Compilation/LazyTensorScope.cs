@@ -176,6 +176,27 @@ internal sealed class LazyTensorScope : IDisposable
     }
 
     /// <summary>
+    /// Records a unary operation whose caller has already materialized the output tensor during
+    /// tracing. Replay still executes <paramref name="execute"/> because the output owns storage
+    /// independent of the input. This is the materializing counterpart to <see cref="RecordView"/>.
+    /// </summary>
+    internal Tensor<T> RecordMaterializedUnary<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T> input,
+        Tensor<T> output,
+        Action<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backwardFn = null,
+        object[]? savedState = null)
+    {
+        var node = new LazyNode<T>(
+            opType, opName, input, output, execute, backwardFn, savedState);
+        output.LazySource = node;
+        _nodes.Add(node);
+        return output;
+    }
+
+    /// <summary>
     /// Records an IN-PLACE operation that mutates an already-existing tensor.
     /// Unlike <see cref="RecordUnary"/> / <see cref="RecordBinary"/> /
     /// <see cref="RecordVariadic"/>, the "output" of the lazy node IS the
@@ -384,7 +405,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </remarks>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
-        ValidateTrainingParametersWerePrepared(parameters);
+        EnsureTrainingParametersPrepared(parameters);
         MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null);
     }
@@ -395,7 +416,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters, Tensor<T> explicitLoss)
     {
-        ValidateTrainingParametersWerePrepared(parameters);
+        EnsureTrainingParametersPrepared(parameters);
         MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss);
     }
@@ -405,7 +426,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// optimizer retains their live backing arrays. Lazy/off-loss-path parameters are included:
     /// they are valid registered parameters even when this trace does not produce a gradient.
     /// </summary>
-    private void ValidateTrainingParametersWerePrepared<T>(Tensor<T>[] parameters)
+    private void EnsureTrainingParametersPrepared<T>(Tensor<T>[] parameters)
     {
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         for (int i = 0; i < parameters.Length; i++)

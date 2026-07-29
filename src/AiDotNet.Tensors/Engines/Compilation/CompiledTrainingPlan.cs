@@ -485,7 +485,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var tRowSum = new System.Collections.Generic.Dictionary<int, float[]>();
             if (!engine.SupportsGpu)
                 DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, tempGrad,
-                    tAnalytic, decidedSkippableReduceSum, tAnalyticFwd, tSkipFwd, tRowSum);
+                    tAnalytic, decidedSkippableReduceSum, tAnalyticFwd, tSkipFwd, tRowSum,
+                    decidedFusedSteps);
         }
 
         // ---- Action-space liveness over the decided action stream.
@@ -3543,7 +3544,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool multiTensorEligible = true;
         for (int p = 0; p < paramCount; p++)
         {
-            if (paramOffsets[p] != 0 || gradOffsets[p] != 0 || stagedParams[p] || stagedGrads[p])
+            if (paramArrays[p].Length == 0 || gradArrays[p].Length == 0
+                || paramOffsets[p] != 0 || gradOffsets[p] != 0
+                || stagedParams[p] || stagedGrads[p])
             {
                 multiTensorEligible = false;
                 break;
@@ -4546,7 +4549,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // for it, incl. its skippable-ReduceSum, in the action coverage).
         if (typeof(T) == typeof(float) && !preferGenericForGpu)
         {
-            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
+            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap,
+                analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs,
+                skippableReduceSumForwardIndices, sharedRowSumCache, fusedStepIndices);
         }
 
         // Phase G.9: detect MatMul → Slice-prefix-of-last-dim chains where
@@ -5200,10 +5205,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int K = inputA._shape[aRank - 1];
             int N = inputB._shape[1];
 
-            // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
-            var cA = (float[])(object)inputA.GetDataArray();
-            var cB = (float[])(object)inputB.GetDataArray();
-            var cOut = (float[])(object)output.GetDataArray();
+            // Bind the verified live arrays. GetDataArray() is not safe for a
+            // cached closure: pool-padded tensors return a detached logical
+            // copy, which would stale-read updated weights or orphan writes.
+            var cA = TryGetLiveFloatBacking(inputA)!;
+            var cB = TryGetLiveFloatBacking(inputB)!;
+            var cOut = TryGetLiveFloatBacking(output)!;
 
             if (N == 1)
             {
@@ -5489,10 +5496,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var inputLengths = new int[step.Inputs.Length];
                     for (int j = 0; j < step.Inputs.Length; j++)
                     {
-                        inputArrays[j] = (float[])(object)step.Inputs[j].GetDataArray();
+                        inputArrays[j] = TryGetLiveFloatBacking(step.Inputs[j])!;
                         inputLengths[j] = step.Inputs[j].Length;
                     }
-                    var outArr = (float[])(object)step.OutputBuffer.GetDataArray();
+                    var outArr = TryGetLiveFloatBacking(step.OutputBuffer)!;
                     var capturedInputArrays = inputArrays;
                     var capturedLengths = inputLengths;
 
@@ -5518,11 +5525,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
             int len = input.Length;
-            float[]? cOut = null;
+            var cOut = TryGetLiveFloatBacking(output)!;
 
             return eng =>
             {
-                cOut ??= (float[])(object)output.GetDataArray();
                 unsafe
                 {
                     float* p = (float*)inH.AddrOfPinnedObject();
@@ -6500,9 +6506,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
             if (cols == bCols)
             {
-                var aArr = (float[])(object)a.GetDataArray();
-                var bArr = (float[])(object)b.GetDataArray();
-                var oArr = (float[])(object)o.GetDataArray();
+                var aArr = TryGetLiveFloatBacking(a)!;
+                var bArr = TryGetLiveFloatBacking(b)!;
+                var oArr = TryGetLiveFloatBacking(o)!;
                 if (step.OpType == OpType.TensorBroadcastAdd)
                     return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] + bArr[c]; } };
                 else if (step.OpType == OpType.TensorBroadcastSubtract)
@@ -6518,9 +6524,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var pred = step.Inputs[0]; var target = step.Inputs[1]; var o = step.OutputBuffer;
-            var pArr = (float[])(object)pred.GetDataArray();
-            var tArr = (float[])(object)target.GetDataArray();
-            var oArr = (float[])(object)o.GetDataArray();
+            var pArr = TryGetLiveFloatBacking(pred)!;
+            var tArr = TryGetLiveFloatBacking(target)!;
+            var oArr = TryGetLiveFloatBacking(o)!;
             int len = pred.Length;
             return eng =>
             {
@@ -7147,8 +7153,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                var gOutArr = (float[])(object)gradOut.GetDataArray();
-                var gInArr = (float[])(object)gradIn.GetDataArray();
+                var gOutArr = TryGetLiveFloatBacking(gradOut)!;
+                var gInArr = TryGetLiveFloatBacking(gradIn)!;
                 float seed = gOutArr[0];
                 if (seed == 1.0f)
                 {
@@ -7185,9 +7191,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                var gOutArr = (float[])(object)gradOut.GetDataArray();
-                var inArr = (float[])(object)input.GetDataArray();
-                var gInArr = (float[])(object)gradIn.GetDataArray();
+                var gOutArr = TryGetLiveFloatBacking(gradOut)!;
+                var inArr = TryGetLiveFloatBacking(input)!;
+                var gInArr = TryGetLiveFloatBacking(gradIn)!;
                 int len = input.Length;
                 unsafe
                 {
@@ -7250,8 +7256,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             return eng =>
             {
-                var gOutArr = (float[])(object)gradOut.GetDataArray();
-                var gInArr = (float[])(object)gradIn.GetDataArray();
+                var gOutArr = TryGetLiveFloatBacking(gradOut)!;
+                var gInArr = TryGetLiveFloatBacking(gradIn)!;
 
                 // Zero-fill the full input grad. The fused-spec backward
                 // for upstream MatMul writes its result via the same
@@ -7304,14 +7310,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // killing ReLU gradient flow. The FillReluBitmask overload
                 // writes into the pre-allocated buffer, preserving the
                 // intended allocation-free replay semantics.
-                var outputData = (float[])(object)output.GetDataArray();
+                var outputData = TryGetLiveFloatBacking(output)!;
                 int len = output.Length;
                 reluBitmask ??= new byte[(len + 7) / 8];
                 ActivationCheckpoint.FillReluBitmask(outputData, reluBitmask, len);
 
                 // Apply backward using bitmask
-                var gradOutData = (float[])(object)gradOut.GetDataArray();
-                var gradInData = (float[])(object)gradIn.GetDataArray();
+                var gradOutData = TryGetLiveFloatBacking(gradOut)!;
+                var gradInData = TryGetLiveFloatBacking(gradIn)!;
                 ActivationCheckpoint.ApplyReluBackwardFromBitmask(gradOutData, reluBitmask, gradInData, len);
                 input.Grad = gradIn;
             };
@@ -8364,71 +8370,91 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool capturedIsGelu = isGeluPattern;
             var capturedPreAct = preActivationBuffer;
 
+            capturedGradMap.TryGetValue(capturedOutput, out var gradOutTensor);
+            capturedGradMap.TryGetValue(capturedW1, out var gradW1Tensor);
+            capturedGradMap.TryGetValue(capturedW2, out var gradW2Tensor);
+            capturedGradMap.TryGetValue(capturedInput, out var gradInputTensor);
+
+            // A fused closure may retain only proven live backing arrays. Pool-padded
+            // tensors intentionally return a detached logical copy from GetDataArray(),
+            // while views require offset/stride-aware addressing. In either case the
+            // ordinary compiled steps are the correct fallback.
+            var inputArray = TryGetLiveFloatBacking(capturedInput);
+            var w1Array = TryGetLiveFloatBacking(capturedW1);
+            var w2Array = TryGetLiveFloatBacking(capturedW2);
+            var outputArray = TryGetLiveFloatBacking(capturedOutput);
+            var activatedArray = TryGetLiveFloatBacking(capturedActivated);
+            var preActivationArray = capturedPreAct is null ? null : TryGetLiveFloatBacking(capturedPreAct);
+            var gradOutArray = gradOutTensor is null ? null : TryGetLiveFloatBacking(gradOutTensor);
+            var gradW1Array = gradW1Tensor is null ? null : TryGetLiveFloatBacking(gradW1Tensor);
+            var gradW2Array = gradW2Tensor is null ? null : TryGetLiveFloatBacking(gradW2Tensor);
+            var gradInputArray = gradInputTensor is null ? null : TryGetLiveFloatBacking(gradInputTensor);
+
+            if (inputArray is null || w1Array is null || w2Array is null
+                || outputArray is null || activatedArray is null
+                || (capturedPreAct is not null && preActivationArray is null)
+                || (gradOutTensor is not null && gradOutArray is null)
+                || (gradW1Tensor is not null && gradW1Array is null)
+                || (gradW2Tensor is not null && gradW2Array is null)
+                || (gradInputTensor is not null && gradInputArray is null))
+            {
+                TensorAllocator.Return(activatedBuffer);
+                if (preActivationBuffer is not null) TensorAllocator.Return(preActivationBuffer);
+                continue;
+            }
+
+            // The fused backward computes every operand gradient. Keep reusable
+            // scratch for operands the caller does not track instead of allocating
+            // a throwaway array on every replay.
+            gradW1Array ??= new float[ck * ch];
+            gradW2Array ??= new float[ch * cn];
+            gradInputArray ??= new float[cm * ck];
+
             // Fused forward: single kernel call replaces 3 steps.
             // GELU path uses SIMD GELU (FusedGemmGeluGemm); ReLU path uses
             // the scalar-Func variant — ReLU is cheap enough that the
             // delegate dispatch isn't a bottleneck.
             fusedForward.Add(eng =>
             {
-                var inA = (float[])(object)capturedInput.GetDataArray();
-                var w1A = (float[])(object)capturedW1.GetDataArray();
-                var w2A = (float[])(object)capturedW2.GetDataArray();
-                var outA = (float[])(object)capturedOutput.GetDataArray();
-                var actA = (float[])(object)capturedActivated.GetDataArray();
                 if (capturedIsGelu)
                 {
-                    var preA = (float[])(object)capturedPreAct!.GetDataArray();
-                    FusedMultiLayerGemm.FusedGemmGeluGemm(inA, w1A, w2A, outA, actA, preA, cm, ck, ch, cn);
+                    FusedMultiLayerGemm.FusedGemmGeluGemm(inputArray, w1Array, w2Array,
+                        outputArray, activatedArray, preActivationArray!, cm, ck, ch, cn);
                 }
                 else
                 {
-                    FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, activation);
+                    FusedMultiLayerGemm.FusedGemmActivationGemm(inputArray, w1Array, w2Array,
+                        outputArray, activatedArray, cm, ck, ch, cn, activation);
                 }
             });
 
             // Fused backward: pre-allocated workspace, zero alloc during replay
             fusedBackward.Add(eng =>
             {
-                var gradOut = capturedGradMap.ContainsKey(capturedOutput)
-                    ? capturedGradMap[capturedOutput] : null;
-                if (gradOut == null) return;
-
-                var gOutArr = (float[])(object)gradOut.GetDataArray();
-                var inA = (float[])(object)capturedInput.GetDataArray();
-                var w1A = (float[])(object)capturedW1.GetDataArray();
-                var w2A = (float[])(object)capturedW2.GetDataArray();
-                var actA = (float[])(object)capturedActivated.GetDataArray();
-
-                var gW1 = capturedGradMap.ContainsKey(capturedW1)
-                    ? (float[])(object)capturedGradMap[capturedW1].GetDataArray() : new float[ck * ch];
-                var gW2 = capturedGradMap.ContainsKey(capturedW2)
-                    ? (float[])(object)capturedGradMap[capturedW2].GetDataArray() : new float[ch * cn];
-                var gIn = capturedGradMap.ContainsKey(capturedInput)
-                    ? (float[])(object)capturedGradMap[capturedInput].GetDataArray() : new float[cm * ck];
+                if (gradOutArray is null) return;
 
                 Array.Clear(backwardWorkspace, 0, backwardWorkspace.Length);
 
                 if (capturedIsGelu)
                 {
-                    var preA = (float[])(object)capturedPreAct!.GetDataArray();
                     FusedMultiLayerBackward.ComputeGradients(
-                        gOutArr, inA, w1A, w2A, actA, preA,
-                        gW1, gW2, emptyBias, emptyBias, gIn,
+                        gradOutArray, inputArray, w1Array, w2Array, activatedArray, preActivationArray!,
+                        gradW1Array, gradW2Array, emptyBias, emptyBias, gradInputArray,
                         cm, ck, ch, cn, FusedMultiLayerBackward.GELUDerivative,
                         backwardWorkspace);
                 }
                 else
                 {
                     FusedMultiLayerBackward.ComputeGradients(
-                        gOutArr, inA, w1A, w2A, actA,
-                        gW1, gW2, emptyBias, emptyBias, gIn,
+                        gradOutArray, inputArray, w1Array, w2Array, activatedArray,
+                        gradW1Array, gradW2Array, emptyBias, emptyBias, gradInputArray,
                         cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
                         backwardWorkspace);
                 }
 
-                capturedW1.Grad = capturedGradMap.ContainsKey(capturedW1) ? capturedGradMap[capturedW1] : null;
-                capturedW2.Grad = capturedGradMap.ContainsKey(capturedW2) ? capturedGradMap[capturedW2] : null;
-                capturedInput.Grad = capturedGradMap.ContainsKey(capturedInput) ? capturedGradMap[capturedInput] : null;
+                capturedW1.Grad = gradW1Tensor;
+                capturedW2.Grad = gradW2Tensor;
+                capturedInput.Grad = gradInputTensor;
             });
 
             consumedIndices.Add(i);
@@ -8489,7 +8515,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         HashSet<int> skippableReduceSumIndices,
         Dictionary<int, Action<IEngine>> analyticForwardSpecs,
         HashSet<int> skippableReduceSumForwardIndices,
-        Dictionary<int, float[]> sharedRowSumCache)
+        Dictionary<int, float[]> sharedRowSumCache,
+        ISet<int>? excludedStepIndices = null)
     {
         if (typeof(T) != typeof(float)) return;
         if (forwardSteps.Count < 2) return;
@@ -8497,6 +8524,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Walk pairs (matmul, reducesum) and check the link.
         for (int i = 0; i + 1 < forwardSteps.Count; i++)
         {
+            // A prior pass owns these actions. Analytic loss replacement cannot
+            // claim a MatMul already consumed by dataflow/cross-layer fusion:
+            // doing so marks its ReduceSum backward skippable and removes the
+            // upstream seed the fused backward requires.
+            if (excludedStepIndices?.Contains(i) == true
+                || excludedStepIndices?.Contains(i + 1) == true)
+                continue;
+
             var matmul = forwardSteps[i];
             var reduce = forwardSteps[i + 1];
 
@@ -8549,6 +8584,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!gradMap.ContainsKey(reduce.OutputBuffer)) continue;
             var lossGradTensor = gradMap[reduce.OutputBuffer];
 
+            bool enableAnalyticForward = Environment.GetEnvironmentVariable("AIDOTNET_ANALYTIC_FORWARD") == "1";
+            var inputAArray = TryGetLiveFloatBacking(inputA);
+            var inputWArray = TryGetLiveFloatBacking(inputW);
+            var gradAArray = TryGetLiveFloatBacking(gradA);
+            var gradWArray = TryGetLiveFloatBacking(gradW);
+            var lossGradArray = TryGetLiveFloatBacking(lossGradTensor);
+            var lossOutputArray = enableAnalyticForward
+                ? TryGetLiveFloatBacking(reduce.OutputBuffer)
+                : null;
+
+            // The analytic kernels flatten every operand and write gradients/loss
+            // directly. Decline the optimization for views or non-addressable
+            // storage rather than caching a detached materialization.
+            if (inputAArray is null || inputWArray is null
+                || gradAArray is null || gradWArray is null || lossGradArray is null
+                || (enableAnalyticForward && lossOutputArray is null))
+                continue;
+
             // Build the analytic backward closure.
             int cM = M, cK = K, cV = V;
             var capA = inputA;
@@ -8579,7 +8632,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // benefits the downstream backward MatMuls. Keep the
             // infrastructure for future SimdGemm-only environments
             // where MKL isn't available.
-            bool enableAnalyticForward = Environment.GetEnvironmentVariable("AIDOTNET_ANALYTIC_FORWARD") == "1";
             int matmulStepIndex = i;
             int reduceStepIndex = i + 1;
             var capLoss = gradMap.ContainsKey(reduce.OutputBuffer)
@@ -8602,10 +8654,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             if (enableAnalyticForward) analyticForwardSpecs[matmulStepIndex] = eng =>
             {
-                var wArr = (float[])(object)gW.GetDataArray();
-                var aArr = (float[])(object)gA.GetDataArray();
-                var lossArr = (float[])(object)gLoss.GetDataArray();
-
                 // Compute row_sum_W on first call and whenever weights
                 // change (detected via gW.Version increment from the
                 // optimizer's in-place mutators). Frozen-weights workloads
@@ -8618,7 +8666,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     {
                         float s = 0f;
                         int baseIdx = k * gV;
-                        for (int v = 0; v < gV; v++) s += wArr[baseIdx + v];
+                        for (int v = 0; v < gV; v++) s += inputWArray[baseIdx + v];
                         capRowSum[k] = s;
                     }
                     rowSumWVersion = wVersion;
@@ -8631,11 +8679,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 for (int m = 0; m < gM; m++)
                 {
                     int baseIdx = m * gK;
-                    for (int k = 0; k < gK; k++) colSum[k] += aArr[baseIdx + k];
+                    for (int k = 0; k < gK; k++) colSum[k] += inputAArray[baseIdx + k];
                 }
                 float loss = 0f;
                 for (int k = 0; k < gK; k++) loss += capRowSum[k] * colSum[k];
-                lossArr[0] = loss;
+                lossOutputArray![0] = loss;
             };
             // The ReduceSum forward becomes a no-op — its result has
             // already been computed and written by the analytic forward.
@@ -8644,12 +8692,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             analyticBackwardSpecs[i] = eng =>
             {
-                var aArr = (float[])(object)capA.GetDataArray();
-                var wArr = (float[])(object)capW.GetDataArray();
-                var gA = (float[])(object)capGradA.GetDataArray();
-                var gW = (float[])(object)capGradW.GetDataArray();
-                var lossArr = (float[])(object)capLossGrad.GetDataArray();
-                float alpha = lossArr[0];
+                float alpha = lossGradArray[0];
 
                 // Compute row_sums(W): for each row k, sum across all v.
                 //   row_sum_W[k] = sum_v W[k, v]
@@ -8662,7 +8705,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         float s = 0f;
                         int baseIdx = k * cV;
                         // Loop unroll-friendly stride-1 read pattern
-                        for (int v = 0; v < cV; v++) s += wArr[baseIdx + v];
+                        for (int v = 0; v < cV; v++) s += inputWArray[baseIdx + v];
                         rowSumW[k] = alpha * s;
                     }
 
@@ -8671,7 +8714,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     for (int m = 0; m < cM; m++)
                     {
                         int baseIdx = m * cK;
-                        for (int k = 0; k < cK; k++) gA[baseIdx + k] = rowSumW[k];
+                        for (int k = 0; k < cK; k++) gradAArray[baseIdx + k] = rowSumW[k];
                     }
                 }
                 finally
@@ -8690,7 +8733,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     for (int m = 0; m < cM; m++)
                     {
                         int baseIdx = m * cK;
-                        for (int k = 0; k < cK; k++) colSumA[k] += aArr[baseIdx + k];
+                        for (int k = 0; k < cK; k++) colSumA[k] += inputAArray[baseIdx + k];
                     }
                     for (int k = 0; k < cK; k++) colSumA[k] *= alpha;
 
@@ -8699,7 +8742,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     {
                         float c = colSumA[k];
                         int baseIdx = k * cV;
-                        for (int v = 0; v < cV; v++) gW[baseIdx + v] = c;
+                        for (int v = 0; v < cV; v++) gradWArray[baseIdx + v] = c;
                     }
                 }
                 finally
@@ -8785,13 +8828,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradW = gradMap[inputW];
             var gradSliceOut = gradMap[sliceOut];
 
-            // Capture for closures
-            var capA = inputA;
-            var capW = inputW;
-            var capSliceOut = sliceOut;
-            var capGradA = gradA;
-            var capGradW = gradW;
-            var capGradSliceOut = gradSliceOut;
+            var inputAArray = TryGetLiveFloatBacking(inputA);
+            var inputWArray = TryGetLiveFloatBacking(inputW);
+            var sliceOutputArray = TryGetLiveFloatBacking(sliceOut);
+            var gradAArray = TryGetLiveFloatBacking(gradA);
+            var gradWArray = TryGetLiveFloatBacking(gradW);
+            var gradSliceOutputArray = TryGetLiveFloatBacking(gradSliceOut);
+            if (inputAArray is null || inputWArray is null || sliceOutputArray is null
+                || gradAArray is null || gradWArray is null || gradSliceOutputArray is null)
+                continue;
+
             int cM = M, cK = K, cNfull = N_full, cNused = N_used;
 
             // Phase G.11: pre-copy W[:, 0:N_used] into a CONTIGUOUS
@@ -8816,13 +8862,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             slicePrefixForwardSpecs[i] = eng =>
             {
-                var aArr = (float[])(object)capA.GetDataArray();
-                var wArr = (float[])(object)capW.GetDataArray();
-                var outArr = (float[])(object)capSliceOut.GetDataArray();
-
                 // Re-copy W[:, 0:N_used] into the contiguous buffer.
                 for (int k = 0; k < cK; k++)
-                    Buffer.BlockCopy(wArr,
+                    Buffer.BlockCopy(inputWArray,
                         (k * cNfull) * sizeof(float),
                         wPacked,
                         (k * cNused) * sizeof(float),
@@ -8830,12 +8872,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 // M, N_used, K; lda=K, ldb=N_used (CONTIGUOUS), ldc=N_used.
                 if (!BlasProvider.TryGemm(cM, cNused, cK,
-                        aArr, 0, cK,
+                        inputAArray, 0, cK,
                         wPacked, 0, cNused,
-                        outArr, 0, cNused))
+                        sliceOutputArray, 0, cNused))
                 {
-                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), wPacked.AsSpan(0, cK * cNused),
-                        outArr.AsSpan(0, cM * cNused), cM, cK, cNused);
+                    SimdGemm.Sgemm(inputAArray.AsSpan(0, cM * cK), wPacked.AsSpan(0, cK * cNused),
+                        sliceOutputArray.AsSpan(0, cM * cNused), cM, cK, cNused);
                 }
             };
 
@@ -8845,41 +8887,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var dWPackedScratch = new float[cK * cNused];
             slicePrefixBackwardSpecs[i] = eng =>
             {
-                var aArr = (float[])(object)capA.GetDataArray();
-                var dSliceArr = (float[])(object)capGradSliceOut.GetDataArray();
-                var dA = (float[])(object)capGradA.GetDataArray();
-                var dW = (float[])(object)capGradW.GetDataArray();
-
                 // dA = dSliceOut [M, N_used] @ W_q^T [N_used, K]
                 // lda=N_used (compact), ldb=N_used (compact W_q), ldc=K
                 if (!BlasProvider.TryGemmEx(cM, cK, cNused,
-                        dSliceArr, 0, cNused, false,
+                        gradSliceOutputArray, 0, cNused, false,
                         wPacked, 0, cNused, true,
-                        dA, 0, cK))
+                        gradAArray, 0, cK))
                 {
-                    SimdGemm.Sgemm(dSliceArr.AsSpan(0, cM * cNused), cNused, false,
+                    SimdGemm.Sgemm(gradSliceOutputArray.AsSpan(0, cM * cNused), cNused, false,
                         wPacked.AsSpan(0, cK * cNused), cNused, true,
-                        dA.AsSpan(0, cM * cK), cM, cNused, cK);
+                        gradAArray.AsSpan(0, cM * cK), cM, cNused, cK);
                 }
 
                 // dW_packed [K, N_used] = A^T [K, M] @ dSliceOut [M, N_used]
                 // Compute into the contiguous scratch, then scatter into full dW.
                 if (!BlasProvider.TryGemmEx(cK, cNused, cM,
-                        aArr, 0, cK, true,
-                        dSliceArr, 0, cNused, false,
+                        inputAArray, 0, cK, true,
+                        gradSliceOutputArray, 0, cNused, false,
                         dWPackedScratch, 0, cNused))
                 {
-                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), cK, true,
-                        dSliceArr.AsSpan(0, cM * cNused), cNused, false,
+                    SimdGemm.Sgemm(inputAArray.AsSpan(0, cM * cK), cK, true,
+                        gradSliceOutputArray.AsSpan(0, cM * cNused), cNused, false,
                         dWPackedScratch.AsSpan(0, cK * cNused), cK, cM, cNused);
                 }
 
                 // Scatter scratch into dW[:, 0:N_used], zero dW[:, N_used:N_full]
-                Array.Clear(dW, 0, dW.Length);
+                Array.Clear(gradWArray, 0, gradWArray.Length);
                 for (int k = 0; k < cK; k++)
                     Buffer.BlockCopy(dWPackedScratch,
                         (k * cNused) * sizeof(float),
-                        dW,
+                        gradWArray,
                         (k * cNfull) * sizeof(float),
                         cNused * sizeof(float));
             };
@@ -8906,8 +8943,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public int AOffset;
         public int DyOffset;
         public int DwOffset;
-        public Tensor<T> AStorage;   // source for A^T (use .GetDataArray())
-        public Tensor<T> DyStorage;  // source for dY
+        public float[] AArray;       // live source for A^T
+        public float[] DyArray;      // live source for dY
+        public float[] DwArray;      // live dW destination
         public Tensor<T> DwTensor;   // dW destination (whose Grad we set)
         public Tensor<T> WTensor;    // the weight tensor (for .Grad assignment)
     }
@@ -8985,6 +9023,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradW = gradMap[inputW];
 
+            var aBacking = inputA.GetCpuBackingForStridedRead(out int aOffset);
+            var dyBacking = gradOut.GetCpuBackingForStridedRead(out int dyOffset);
+            var dwBacking = gradW.GetCpuBackingForContiguousWrite(out int dwOffset);
+            if (aBacking is null || dyBacking is null || dwBacking is null)
+                continue;
+
             // dW = A^T @ dY → C[K, N].
             // lda_plain=K (A in [M, K] row-major), ldb_dy=N (dY in [M, N]),
             // ldc_dw=N (dW dest [K, N]).
@@ -8992,11 +9036,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 M = M, N = N, K = K,
                 LdaPlain = K, LdaDy = N, LdcDw = N,
-                AOffset = inputA._storageOffset,
-                DyOffset = gradOut._storageOffset,
-                DwOffset = gradW._storageOffset,
-                AStorage = inputA,
-                DyStorage = gradOut,
+                AOffset = aOffset,
+                DyOffset = dyOffset,
+                DwOffset = dwOffset,
+                AArray = (float[])(object)aBacking,
+                DyArray = (float[])(object)dyBacking,
+                DwArray = (float[])(object)dwBacking,
                 DwTensor = gradW,
                 WTensor = inputW,
             });
@@ -9038,28 +9083,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var aOffs = new int[batchSize];
             var bOffs = new int[batchSize];
             var cOffs = new int[batchSize];
+            var aArrs = new float[batchSize][];
+            var bArrs = new float[batchSize][];
+            var cArrs = new float[batchSize][];
             for (int i = 0; i < batchSize; i++)
             {
                 aOffs[i] = captured[i].AOffset;
                 bOffs[i] = captured[i].DyOffset;
                 cOffs[i] = captured[i].DwOffset;
+                aArrs[i] = captured[i].AArray;
+                bArrs[i] = captured[i].DyArray;
+                cArrs[i] = captured[i].DwArray;
             }
 
             backwardActions.Add(eng =>
             {
-                // Resolve underlying float[] for each batch element.
-                // Use storage-based GetDataArray() so views and slices
-                // see the live shape-stable buffer.
-                var aArrs = new float[batchSize][];
-                var bArrs = new float[batchSize][];
-                var cArrs = new float[batchSize][];
-                for (int i = 0; i < batchSize; i++)
-                {
-                    aArrs[i] = (float[])(object)captured[i].AStorage.GetDataArray();
-                    bArrs[i] = (float[])(object)captured[i].DyStorage.GetDataArray();
-                    cArrs[i] = (float[])(object)captured[i].DwTensor.GetDataArray();
-                }
-
                 if (!BlasProvider.TryGemmBatchSameShapeArrays(
                     K, N, M,
                     transA: true, transB: false,
@@ -9127,6 +9165,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int M = 1;
             for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
 
+            gradMap.TryGetValue(output, out var gradOutTensor);
+            gradMap.TryGetValue(W1, out var gradW1Tensor);
+            gradMap.TryGetValue(W2, out var gradW2Tensor);
+            gradMap.TryGetValue(inputA, out var gradInputTensor);
+
+            var inputArray = TryGetLiveFloatBacking(inputA);
+            var w1Data = TryGetLiveFloatBacking(W1);
+            var w2Data = TryGetLiveFloatBacking(W2);
+            var outputArray = TryGetLiveFloatBacking(output);
+            var gradOutArray = gradOutTensor is null ? null : TryGetLiveFloatBacking(gradOutTensor);
+            var gradW1Array = gradW1Tensor is null ? null : TryGetLiveFloatBacking(gradW1Tensor);
+            var gradW2Array = gradW2Tensor is null ? null : TryGetLiveFloatBacking(gradW2Tensor);
+            var gradInputArray = gradInputTensor is null ? null : TryGetLiveFloatBacking(gradInputTensor);
+
+            if (inputArray is null || w1Data is null || w2Data is null || outputArray is null
+                || (gradOutTensor is not null && gradOutArray is null)
+                || (gradW1Tensor is not null && gradW1Array is null)
+                || (gradW2Tensor is not null && gradW2Array is null)
+                || (gradInputTensor is not null && gradInputArray is null))
+                continue;
+
             // Allocate W_fused buffer at compile time. Population is
             // deferred to the first forward call and refreshed whenever
             // W1.Version or W2.Version changes (training loops mutate
@@ -9134,8 +9193,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // stale fused weights and silently produce wrong forward
             // outputs). For frozen-weights workloads, the GEMM only runs
             // once and is then reused forever.
-            var w1Data = (float[])(object)W1.GetDataArray();
-            var w2Data = (float[])(object)W2.GetDataArray();
             var wFused = new float[K * N];
 
             // Forward: single MatMul input @ W_fused → output. Skip
@@ -9163,11 +9220,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     wFusedW1Version = v1;
                     wFusedW2Version = v2;
                 }
-                var inArr = (float[])(object)capturedInput.GetDataArray();
-                var outArr = (float[])(object)capturedOutput.GetDataArray();
-                if (!BlasProvider.TryGemm(cM, cN, cK, inArr, 0, cK, cWFused, 0, cN, outArr, 0, cN))
-                    SimdGemm.Sgemm(inArr.AsSpan(0, cM * cK), cWFused.AsSpan(0, cK * cN),
-                        outArr.AsSpan(0, cM * cN), cM, cK, cN);
+                if (!BlasProvider.TryGemm(cM, cN, cK, inputArray, 0, cK, cWFused, 0, cN, outputArray, 0, cN))
+                    SimdGemm.Sgemm(inputArray.AsSpan(0, cM * cK), cWFused.AsSpan(0, cK * cN),
+                        outputArray.AsSpan(0, cM * cN), cM, cK, cN);
             });
 
             // Pre-allocate dW_fused scratch (compile-time, reused per call).
@@ -9175,69 +9230,62 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             fusedBackward.Add(eng =>
             {
-                if (!capturedGradMap.TryGetValue(capturedOutput, out var gradOut)) return;
-                var gOutArr = (float[])(object)gradOut.GetDataArray();
-                var inArr = (float[])(object)capturedInput.GetDataArray();
-                var w1Arr = (float[])(object)capturedW1.GetDataArray();
-                var w2Arr = (float[])(object)capturedW2.GetDataArray();
+                if (gradOutArray is null) return;
 
                 // dW_fused = input^T @ gradOut  [K, N]
                 if (!BlasProvider.TryGemmEx(cK, cN, cM,
-                        inArr, 0, cK, true,
-                        gOutArr, 0, cN, false,
+                        inputArray, 0, cK, true,
+                        gradOutArray, 0, cN, false,
                         dWFused, 0, cN))
                 {
-                    SimdGemm.Sgemm(inArr.AsSpan(0, cM * cK), cK, true,
-                        gOutArr.AsSpan(0, cM * cN), cN, false,
+                    SimdGemm.Sgemm(inputArray.AsSpan(0, cM * cK), cK, true,
+                        gradOutArray.AsSpan(0, cM * cN), cN, false,
                         dWFused.AsSpan(0, cK * cN), cK, cM, cN);
                 }
 
                 // dW1 = dW_fused @ W2^T  [K, H]  (chain rule on W_fused = W1 @ W2)
-                if (capturedGradMap.TryGetValue(capturedW1, out var gW1Tensor))
+                if (gradW1Array is not null)
                 {
-                    var gW1 = (float[])(object)gW1Tensor.GetDataArray();
                     if (!BlasProvider.TryGemmEx(cK, cH, cN,
                             dWFused, 0, cN, false,
-                            w2Arr, 0, cN, true,
-                            gW1, 0, cH))
+                            w2Data, 0, cN, true,
+                            gradW1Array, 0, cH))
                     {
                         SimdGemm.Sgemm(dWFused.AsSpan(0, cK * cN), cN, false,
-                            w2Arr.AsSpan(0, cH * cN), cN, true,
-                            gW1.AsSpan(0, cK * cH), cK, cN, cH);
+                            w2Data.AsSpan(0, cH * cN), cN, true,
+                            gradW1Array.AsSpan(0, cK * cH), cK, cN, cH);
                     }
-                    capturedW1.Grad = gW1Tensor;
+                    capturedW1.Grad = gradW1Tensor;
                 }
 
                 // dW2 = W1^T @ dW_fused  [H, N]
-                if (capturedGradMap.TryGetValue(capturedW2, out var gW2Tensor))
+                if (gradW2Array is not null)
                 {
-                    var gW2 = (float[])(object)gW2Tensor.GetDataArray();
                     if (!BlasProvider.TryGemmEx(cH, cN, cK,
-                            w1Arr, 0, cH, true,
+                            w1Data, 0, cH, true,
                             dWFused, 0, cN, false,
-                            gW2, 0, cN))
+                            gradW2Array, 0, cN))
                     {
-                        SimdGemm.Sgemm(w1Arr.AsSpan(0, cK * cH), cH, true,
+                        SimdGemm.Sgemm(w1Data.AsSpan(0, cK * cH), cH, true,
                             dWFused.AsSpan(0, cK * cN), cN, false,
-                            gW2.AsSpan(0, cH * cN), cH, cK, cN);
+                            gradW2Array.AsSpan(0, cH * cN), cH, cK, cN);
                     }
-                    capturedW2.Grad = gW2Tensor;
+                    capturedW2.Grad = gradW2Tensor;
                 }
 
                 // dInput = gradOut @ W_fused^T  [M, K]
-                if (capturedGradMap.TryGetValue(capturedInput, out var gInTensor))
+                if (gradInputArray is not null)
                 {
-                    var gIn = (float[])(object)gInTensor.GetDataArray();
                     if (!BlasProvider.TryGemmEx(cM, cK, cN,
-                            gOutArr, 0, cN, false,
+                            gradOutArray, 0, cN, false,
                             cWFused, 0, cN, true,
-                            gIn, 0, cK))
+                            gradInputArray, 0, cK))
                     {
-                        SimdGemm.Sgemm(gOutArr.AsSpan(0, cM * cN), cN, false,
+                        SimdGemm.Sgemm(gradOutArray.AsSpan(0, cM * cN), cN, false,
                             cWFused.AsSpan(0, cK * cN), cN, true,
-                            gIn.AsSpan(0, cM * cK), cM, cN, cK);
+                            gradInputArray.AsSpan(0, cM * cK), cM, cN, cK);
                     }
-                    capturedInput.Grad = gInTensor;
+                    capturedInput.Grad = gradInputTensor;
                 }
             });
 

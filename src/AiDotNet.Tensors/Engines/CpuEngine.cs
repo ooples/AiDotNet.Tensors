@@ -30798,6 +30798,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Match ReduceSum and the eager reduction contract: null means reduce
+        // every axis. Normalize before graph-shape construction so tracing does
+        // not enumerate a null array even though the eager path supports it.
+        axes ??= Enumerable.Range(0, input.Rank).ToArray();
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;

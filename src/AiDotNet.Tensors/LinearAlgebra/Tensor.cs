@@ -156,12 +156,13 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> CreateStorageView(int[] shape, int[] strides, int storageOffset)
     {
-        // Exposing a retained alias is semantically a write-capability escape:
-        // future writes through either tensor bypass the other's COW gate. Make
-        // this tensor private first so the new view can never remain attached
-        // to an unrelated COW peer after either peer detaches.
-        EnsureOwnedForWrite();
-        var view = new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
+        // vector/storage snapshot and family registration under the detach lock; otherwise a
+        // concurrent writer could swap storage between evaluation of the two constructor args.
+        var view = HasCowAliasFamily
+            ? CreateViewInCowAliasFamily(
+                () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
+            : new Tensor<T>(_data, shape, strides, storageOffset, _storage);
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
 
@@ -188,7 +189,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> FinalizeReshapeLikeView(Tensor<T> view, string opName)
     {
-        var originalShape = _shape.ToArray();
+        if (!IsDifferentiableRecordingActive)
+            return view;
+
+        var originalShape = (int[])_shape.Clone();
         return FinalizeDifferentiableView(
             view,
             Engines.Compilation.LazyNodeType.Reshape,
@@ -200,6 +204,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
     private Tensor<T> FinalizePermuteView(Tensor<T> view, int[] permutation)
     {
+        if (!IsDifferentiableRecordingActive)
+            return view;
+
         var savedPermutation = (int[])permutation.Clone();
         return FinalizeDifferentiableView(
             view,
@@ -207,6 +214,59 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             "Transpose",
             Engines.Autodiff.BackwardFunctions<T>.PermuteBackward,
             new object[] { savedPermutation });
+    }
+
+    /// <summary>
+    /// True only while eager or compiled autodiff is recording. Keeping this check ahead of
+    /// saved-state construction makes ordinary metadata views allocation-free beyond their
+    /// required shape/stride descriptors.
+    /// </summary>
+    private static bool IsDifferentiableRecordingActive =>
+        Engines.Autodiff.GradientTape<T>.Current is not null ||
+        Engines.Compilation.GraphMode.Current is not null;
+
+    /// <summary>
+    /// Records a storage-materializing contiguous copy as a real unary edge. Unlike a metadata
+    /// view, replay must copy the input's current logical values into the independent output.
+    /// </summary>
+    private Tensor<T> FinalizeContiguousCopy(Tensor<T> result)
+    {
+        if (!IsDifferentiableRecordingActive)
+            return result;
+
+        var savedState = new object[] { (int[])_shape.Clone() };
+        Engines.Autodiff.BackwardFunction<T> backward =
+            Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward;
+        if (Engines.Autodiff.GradientTape<T>.Current is { } tape)
+        {
+            var node = Engines.Autodiff.GradNodePool<T>.Rent();
+            node.OwningTape = tape;
+            node.Backward = backward;
+            node.Output = result;
+            node.Input0 = this;
+            node.InputCount = 1;
+            node.SavedState = savedState;
+            result.GradFn = node;
+        }
+
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordMaterializedUnary(
+                Engines.Compilation.LazyNodeType.Custom,
+                "Contiguous",
+                this,
+                result,
+                (_, output) =>
+                {
+                    CopyTo(output.AsWritableSpan());
+                    output.IncrementVersion();
+                },
+                backward,
+                savedState);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -336,7 +396,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         {
             // Contiguous with offset — simple bulk copy
             _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstSpan);
-            return result;
+            return FinalizeContiguousCopy(result);
         }
 
         // Non-contiguous materialization — "odometer" stride walk.
@@ -351,7 +411,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var srcSpan = _data.AsSpan();
         int rank = Rank;
         int length = Length;
-        if (rank == 0 || length == 0) return result;
+        if (rank == 0 || length == 0) return FinalizeContiguousCopy(result);
 
         Span<int> counter = stackalloc int[rank];
         int srcIdx = _storageOffset;
@@ -372,7 +432,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return result;
+        return FinalizeContiguousCopy(result);
     }
 
     /// <summary>
@@ -894,15 +954,22 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (indices.Length > Rank)
             throw new ArgumentException("Number of indices exceeds tensor dimensions.");
 
+        // Validate against the original leading dimensions before constructing any view. This
+        // keeps failures atomic: a later invalid index cannot leave a partially-built view chain
+        // (and its storage refcounts / graph nodes) behind.
+        for (int i = 0; i < indices.Length; i++)
+        {
+            if (indices[i] < 0 || indices[i] >= _shape[i])
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {indices[i]} is out of range for dimension {i} with size {_shape[i]}.");
+        }
+
         // Express a leading-dimension sub-tensor as a chain of axis-zero views.
         // Besides sharing storage, this gives each removed dimension the exact
         // slice-scatter backward in eager and compiled training.
         Tensor<T> result = this;
         for (int i = 0; i < indices.Length; i++)
         {
-            if (indices[i] < 0 || indices[i] >= result._shape[0])
-                throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {indices[i]} is out of range for dimension {i} with size {_shape[i]}.");
             result = result.GetSliceAlongDimension(indices[i], 0);
         }
 
@@ -1780,21 +1847,20 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentException(
                 $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
 
-        Tensor<T> result;
         if (IsContiguous)
         {
             // O(1) view: same storage, new shape, row-major strides, same offset.
             // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
             var newStrides = ComputeRowMajorStrides(newShape);
-            result = CreateStorageView(newShape, newStrides, _storageOffset);
-        }
-        else
-        {
-            // Non-contiguous view: must materialize first, then reshape the contiguous result
-            result = Contiguous().Reshape(newShape);
+            return FinalizeReshapeLikeView(
+                CreateStorageView(newShape, newStrides, _storageOffset),
+                "Reshape");
         }
 
-        return FinalizeReshapeLikeView(result, "Reshape");
+        // Non-contiguous input: Contiguous() records the storage-materialization edge and the
+        // recursive call records exactly one metadata reshape. Do not finalize again here—the
+        // former double-finalization replaced the inner GradFn and duplicated the lazy graph.
+        return Contiguous().Reshape(newShape);
     }
 
     /// <summary>

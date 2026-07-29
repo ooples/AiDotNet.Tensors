@@ -187,27 +187,67 @@ public class CompiledTrainingCowIsolationTests
     [Fact]
     public async Task ConcurrentCowPeers_CompileAndTrainWithoutCrossMutation()
     {
-        var untouched = new Tensor<double>(new[] { 1.0 }, new[] { 1 });
-        var first = (Tensor<double>)untouched.CloneShared();
-        var second = (Tensor<double>)untouched.CloneShared();
+        var first = new Tensor<double>(new[] { 1.0 }, new[] { 1 });
+        var second = (Tensor<double>)first.CloneShared();
+        using var bothPlansReady = new System.Threading.Barrier(2);
 
-        async Task TrainAsync(Tensor<double> parameter, double learningRate)
+        Task TrainAsync(Tensor<double> parameter, double learningRate)
         {
-            await Task.Yield();
-            var engine = new CpuEngine();
-            var input = new Tensor<double>(new[] { 2.0 }, new[] { 1, 1 });
-            var target = new Tensor<double>(new[] { 0.0 }, new[] { 1, 1 });
-            using var plan = CompileSquaredError(engine, input, target, parameter, new[] { parameter });
-            plan.ConfigureOptimizer(OptimizerType.SGD, (float)learningRate, 0.9f, 0.999f, 1e-8f, 0f);
-            plan.Step();
+            return Task.Run(() =>
+            {
+                var engine = new CpuEngine();
+                var input = new Tensor<double>(new[] { 2.0 }, new[] { 1, 1 });
+                var target = new Tensor<double>(new[] { 0.0 }, new[] { 1, 1 });
+                var parameters = new[] { parameter };
+
+                // GraphMode is thread-static. Each concurrent worker owns and disposes its scope
+                // entirely on that worker rather than relying on an async continuation's thread.
+                using var scope = GraphMode.EnableTraining(parameters);
+                var parameterView = parameter.Reshape(1, 1);
+                var prediction = engine.TensorMatMul(input, parameterView);
+                var error = engine.TensorSubtract(prediction, target);
+                var loss = engine.ReduceSum(engine.TensorMultiply(error, error), null);
+                using var plan = scope.CompileTraining(parameters, loss);
+                plan.ConfigureOptimizer(
+                    OptimizerType.SGD, (float)learningRate, 0.9f, 0.999f, 1e-8f, 0f);
+
+                Assert.True(
+                    bothPlansReady.SignalAndWait(TimeSpan.FromSeconds(30)),
+                    "Both concurrent training plans should reach the step barrier.");
+                plan.Step();
+            });
         }
 
         await Task.WhenAll(TrainAsync(first, 0.1), TrainAsync(second, 0.05));
 
-        Assert.Equal(1.0, untouched[0]);
         Assert.NotEqual(1.0, first[0]);
         Assert.NotEqual(1.0, second[0]);
         Assert.NotEqual(first[0], second[0]);
+    }
+
+    [Theory]
+    [InlineData(OptimizerType.Adam)]
+    [InlineData(OptimizerType.AdamW)]
+    public void MultiTensorOptimizer_SkipsMissingAndEmptyGradients(OptimizerType optimizerType)
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 2.0 }, new[] { 1, 1 });
+        var target = new Tensor<double>(new[] { 0.0 }, new[] { 1, 1 });
+        var active = new Tensor<double>(new[] { 1.0 }, new[] { 1 });
+        var unused = new Tensor<double>(new[] { 7.0 }, new[] { 1 });
+        var empty = new Tensor<double>(Array.Empty<double>(), new[] { 0 });
+
+        using var plan = CompileSquaredError(
+            engine, input, target, active, new[] { active, unused, empty });
+        // Keep weight decay at zero so this test isolates missing/empty-gradient routing. AdamW
+        // legitimately decays a registered zero-gradient parameter when decay is nonzero.
+        plan.ConfigureOptimizer(optimizerType, 0.01f, 0.9f, 0.999f, 1e-8f, 0f);
+
+        plan.Step();
+
+        Assert.NotEqual(1.0, active[0]);
+        Assert.Equal(7.0, unused[0]);
+        Assert.Equal(0, empty.Length);
     }
 
     [Fact]
