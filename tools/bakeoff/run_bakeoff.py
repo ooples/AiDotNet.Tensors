@@ -84,7 +84,7 @@ def work_for_run():
     work["conv_transpose2d_3x3_stride2"] = (
         (transpose[0] * transpose[1] *
          (transpose[2] * transpose[3] + transpose[4] * transpose[5])) * 4,
-        transpose[0] * transpose[1] * transpose[4] * transpose[5] * 9 * 2,
+        transpose[0] * transpose[1] * transpose[2] * transpose[3] * 9 * 2,
     )
     return work
 
