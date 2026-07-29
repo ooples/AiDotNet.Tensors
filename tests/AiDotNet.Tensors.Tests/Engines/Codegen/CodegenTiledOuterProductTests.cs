@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
+using static AiDotNet.Tensors.Tests.Engines.Codegen.TiledPtxTestHelper;
 
 namespace AiDotNet.Tensors.Tests.Engines.Codegen;
 
@@ -122,18 +123,7 @@ public sealed class CodegenTiledOuterProductTests
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
         var original = CodegenKernelCatalog.Find("conv2d_1x1_bwd_weights")!.Verify;
         var spec = CodegenSplitReduction.TryPlan(original)!.Partial;
-        var inputs = new double[spec.Inputs.Count][];
-        var host = new float[spec.Inputs.Count][];
-        for (int i = 0; i < spec.Inputs.Count; i++)
-        {
-            host[i] = new float[spec.Inputs[i].ElementCount];
-            inputs[i] = new double[host[i].Length];
-            for (int e = 0; e < host[i].Length; e++)
-            {
-                host[i][e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
-                inputs[i][e] = host[i][e];
-            }
-        }
+        double[][] inputs = CreateInputs(spec, out var host);
         double[] expected = spec.Interpret(inputs);
 
         using var runtime = new DirectPtxRuntime();
@@ -165,13 +155,7 @@ public sealed class CodegenTiledOuterProductTests
         using var runtime = new DirectPtxRuntime();
         Skip.IfNot(runtime.ComputeCapabilityMajor >= 8, "cp.async requires sm_80 or later.");
 
-        var host = new float[spec.Inputs.Count][];
-        for (int i = 0; i < spec.Inputs.Count; i++)
-        {
-            host[i] = new float[spec.Inputs[i].ElementCount];
-            for (int e = 0; e < host[i].Length; e++)
-                host[i][e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
-        }
+        _ = CreateInputs(spec, out var host);
         using var left = runtime.AllocateBytes((nuint)(host[0].Length * sizeof(float)));
         using var right = runtime.AllocateBytes((nuint)(host[1].Length * sizeof(float)));
         using var tiledOutput = runtime.AllocateBytes(
@@ -204,37 +188,7 @@ public sealed class CodegenTiledOuterProductTests
         var actual = new float[spec.Output.ElementCount];
         affineOutput.Download<float>(expected);
         tiledOutput.Download<float>(actual);
-        var expectedDouble = new double[expected.Length];
-        for (int i = 0; i < expected.Length; i++) expectedDouble[i] = expected[i];
-        AssertClose(expectedDouble, actual, 2e-5, "benchmark tiled split partial", relative: true);
-    }
-
-    private static void AssertClose(
-        double[] expected, float[] actual, double tolerance, string label, bool relative = false)
-    {
-        double worst = 0;
-        int at = 0;
-        for (int i = 0; i < actual.Length; i++)
-        {
-            double difference = System.Math.Abs(expected[i] - actual[i]);
-            if (relative)
-                difference /= System.Math.Max(1.0, System.Math.Abs(expected[i]));
-            if (difference > worst) { worst = difference; at = i; }
-        }
-        Assert.True(worst < tolerance,
-            $"{label} differs by {worst:E3} at {at}: expected {expected[at]}, actual {actual[at]}");
-    }
-
-    private static unsafe void LaunchThree(
-        DirectPtxModule module, IntPtr function,
-        IntPtr first, IntPtr second, IntPtr output,
-        uint blocks, uint blockX, uint blockY)
-    {
-        IntPtr p0 = first, p1 = second, p2 = output;
-        void** arguments = stackalloc void*[3];
-        arguments[0] = &p0;
-        arguments[1] = &p1;
-        arguments[2] = &p2;
-        module.Launch(function, blocks, 1, 1, blockX, blockY, 1, 0, arguments);
+        AssertClose(expected, actual, 2e-5,
+            "benchmark tiled split partial", relative: true);
     }
 }
