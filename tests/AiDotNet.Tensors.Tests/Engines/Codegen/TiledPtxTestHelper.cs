@@ -78,4 +78,40 @@ internal static class TiledPtxTestHelper
         arguments[3] = &p3;
         module.Launch(function, blocks, 1, 1, blockX, blockY, 1, 0, arguments);
     }
+
+    internal static CodegenAxis[] CopyAxes(CodegenKernelSpec spec)
+    {
+        var axes = new CodegenAxis[spec.Space.Axes.Count];
+        for (int i = 0; i < axes.Length; i++) axes[i] = spec.Space.Axes[i];
+        return axes;
+    }
+
+    internal static CodegenTensorBinding[] CopyInputs(CodegenKernelSpec spec)
+    {
+        var inputs = new CodegenTensorBinding[spec.Inputs.Count];
+        for (int i = 0; i < inputs.Length; i++) inputs[i] = spec.Inputs[i];
+        return inputs;
+    }
+
+    internal static int[] CopyProductInputs(CodegenKernelSpec spec)
+    {
+        var inputs = new int[spec.ProductInputs.Count];
+        for (int i = 0; i < inputs.Length; i++) inputs[i] = spec.ProductInputs[i];
+        return inputs;
+    }
+
+    internal static CodegenTensorBinding WithShapeDimension(
+        CodegenTensorBinding binding, int dimension, int extent)
+    {
+        var shape = new int[binding.Shape.Count];
+        var map = new CodegenAffineExpr[binding.Map.Count];
+        var indirect = new CodegenIndirectIndex?[binding.Indirect.Count];
+        for (int i = 0; i < shape.Length; i++) shape[i] = binding.Shape[i];
+        for (int i = 0; i < map.Length; i++) map[i] = binding.Map[i];
+        for (int i = 0; i < indirect.Length; i++) indirect[i] = binding.Indirect[i];
+        shape[dimension] = extent;
+        return new CodegenTensorBinding(
+            binding.ParameterIndex, binding.Name, shape, map,
+            binding.IsOutput, binding.ElementType, indirect);
+    }
 }
