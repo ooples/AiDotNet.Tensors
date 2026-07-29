@@ -303,7 +303,11 @@ internal static class WarpTileSweepTool
             var pointers = new IntPtr[spec.ParameterCount];
             for (int i = 0; i < 2; i++)
             {
-                var buffer = runtime.AllocateBytes((nuint)(spec.Inputs[i].ElementCount * sizeof(ushort)));
+                long count = spec.Inputs[i].ElementCount;
+                var buffer = runtime.AllocateBytes((nuint)(count * sizeof(ushort)));
+                var bits = new ushort[count];
+                Array.Fill(bits, BitConverter.HalfToUInt16Bits((Half)1.0f));
+                buffer.Upload<ushort>(bits);
                 buffers.Add(buffer);
                 pointers[i] = buffer.Pointer;
             }
