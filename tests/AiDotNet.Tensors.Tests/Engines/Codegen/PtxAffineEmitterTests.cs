@@ -119,19 +119,19 @@ public class PtxAffineEmitterTests
     /// The generated PTX, executed on the device, against the same fp64 oracle the
     /// hand-written kernel is tested against.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void GeneratedPtx_MatchesFp64Oracle_OnDevice()
     {
-        if (!DirectPtxRuntime.IsAvailable) return;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
 
         var (input, weights, bias) = MakeData();
         var expected = Oracle(input, weights, bias);
         var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(N, C, H, W);
 
         using var runtime = new DirectPtxRuntime();
-        if (!DirectPtxArchitecture.HasExperimentalConvolution(
-                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
-            return;
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Experimental generated convolution is unavailable on this GPU architecture.");
 
         string ptx = new PtxAffineEmitter().Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
@@ -166,24 +166,6 @@ public class PtxAffineEmitterTests
                             $"(expected {expected[at]}, actual {actual[at]})");
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
-    }
-
-    /// <summary>
-    /// Writes the generated PTX so ptxas/nvdisasm can measure it against the
-    /// hand-written baseline. Static metrics need no GPU, which is what lets the
-    /// bake-off run while the device is busy.
-    /// </summary>
-    [Fact]
-    public void DumpGeneratedPtxForBakeOff()
-    {
-        var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(N, C, H, W);
-        string ptx = new PtxAffineEmitter().Emit(spec, 8, 6);
-        string dir = System.IO.Path.Combine(
-            System.IO.Path.GetTempPath(), "aidotnet-bakeoff");
-        System.IO.Directory.CreateDirectory(dir);
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "generated_dwconv2d3x3.ptx"), ptx);
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "spec.txt"), spec.Describe());
-        Assert.Contains(".visible .entry", ptx);
     }
 
     private static unsafe void LaunchFour(

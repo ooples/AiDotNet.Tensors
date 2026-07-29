@@ -12,7 +12,7 @@ most of the arithmetic in a real model.
 
 The exclusion was not a missing feature in the spec. `CodegenKernelSpec` already expresses
 
-```
+```text
 out = activation( reduce(product of operands) + bias ) * scale
 ```
 
@@ -63,7 +63,7 @@ linear layer, and both reduction kinds. This is what catches a swapped axis.
 **`--frontend-check`** — graph → PTX → device, compared against a reference. The `ref`
 column says which reference, and the distinction is load-bearing:
 
-```
+```text
 graph                                  elements       rel dev   ref   result
 relu (LowerUnaryPointwise)                16,384    0.000E+000  cpu     PASS
 mul (LowerBinaryPointwise)                16,384    0.000E+000  cpu     PASS
@@ -75,7 +75,7 @@ linear: matmul+bias+relu 256x128x64       16,384    0.000E+000  fp64    PASS
 reduce-sum [512,256] over axis 1             512    0.000E+000  fp64    PASS
 reduce-max [512,256] over axis 1             512    0.000E+000  fp64    PASS
 
-front end: 9 passed, 0 failed
+front end: 13 passed, 0 failed
 ```
 
 - `cpu` — the CPU emitter on the *same graph*. It shares nothing with the PTX translator,
@@ -87,7 +87,7 @@ front end: 9 passed, 0 failed
 The tool prints the reason the stronger reference was unavailable rather than falling back
 silently:
 
-```
+```text
     no CPU reference from CpuAvx512: AVX-512F is not available on this CPU.
     no CPU reference from CpuDotNetJit: Phase B CPU emitter does not yet handle Matmul ops (found MatMul).
 ```
@@ -99,11 +99,6 @@ on any machine, AVX-512 or not.
 
 ## Still not done
 
-- **Convolution has no op kind in this IR.** `CodegenOpKind` has no `Conv2D`; convolutions
-  arrive as `Opaque` or not at all. So the 13 catalog kernels — which carry the measured
-  wins — remain hand-built specs that no graph can produce. Reaching them needs a
-  convolution op in the IR and `CodegenLowering` producing it, not another case in this
-  translator.
 - **The split's benefit at front-end sizes is unmeasured.** The route is built, emitted
   and executed (see below), but whether it is *faster* on graphs this small is an open
   question — the one attempt to measure it was contaminated. Tracked as FE-6.
@@ -149,7 +144,7 @@ Those numbers are discarded, not reported.
 The tool now separates the two concerns — correctness runs on a busy box, timings are
 suppressed with a printed reason:
 
-```
+```text
 TIMINGS SUPPRESSED - [frontend-check] Foreign GPU workload detected: pid=... sm=98%
 Correctness still runs; contention changes speed, not answers.
 ```

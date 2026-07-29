@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Text;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
+using static AiDotNet.Tensors.Benchmarks.KernelToolArgs;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -18,7 +19,7 @@ internal static class KernelArchitectureTool
 {
     private static readonly (int Major, int Minor)[] Targets =
     {
-        (8, 0), (8, 6), (8, 9), (9, 0),
+        (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0),
     };
 
     internal static void Run(string[] args)
@@ -111,9 +112,16 @@ internal static class KernelArchitectureTool
 
         using Process? process = Process.Start(start);
         if (process is null) throw new InvalidOperationException("Could not start ptxas.");
-        string stdout = process.StandardOutput.ReadToEnd();
-        string stderr = process.StandardError.ReadToEnd();
-        process.WaitForExit();
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit((int)TimeSpan.FromMinutes(5).TotalMilliseconds))
+        {
+            process.Kill(entireProcessTree: true);
+            throw new TimeoutException(
+                TargetName(target) + " ptxas timed out for " + Path.GetFileName(ptxPath) + ".");
+        }
+        string stdout = stdoutTask.GetAwaiter().GetResult();
+        string stderr = stderrTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0)
         {
             throw new InvalidOperationException(
@@ -172,10 +180,4 @@ internal static class KernelArchitectureTool
         return null;
     }
 
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal)) return args[i + 1];
-        return null;
-    }
 }

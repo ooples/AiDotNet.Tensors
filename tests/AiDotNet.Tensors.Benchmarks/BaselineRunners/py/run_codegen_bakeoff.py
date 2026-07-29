@@ -16,6 +16,7 @@
 # actually executes", and the unfused conv-only time is printed alongside so the
 # fusion component of any win is visible rather than hidden.
 
+import os
 import sys
 import time
 
@@ -25,6 +26,18 @@ WARMUP = 20
 SAMPLES = 51
 LAUNCHES_PER_SAMPLE = 50
 RUNS = 3
+
+
+def conv_transpose_contract():
+    """Returns N,C,IH,IW,OH,OW,output_padding from the .NET catalog authority."""
+    raw = os.environ.get("BAKEOFF_CONV_TRANSPOSE_CONTRACT", "")
+    try:
+        values = tuple(int(value) for value in raw.split(","))
+    except ValueError as exc:
+        raise RuntimeError("invalid BAKEOFF_CONV_TRANSPOSE_CONTRACT") from exc
+    if len(values) != 7:
+        raise RuntimeError("BAKEOFF_CONV_TRANSPOSE_CONTRACT must contain 7 integers")
+    return values
 
 
 def time_op(fn):
@@ -130,7 +143,17 @@ def main():
         print("ERROR\tno CUDA device", flush=True)
         return 1
 
-    torch.backends.cudnn.benchmark = True   # let cuDNN pick its best algorithm
+    search = os.environ.get("BAKEOFF_CUDNN_SEARCH", "")
+    if search == "default":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark_limit = 10
+    elif search == "exhaustive":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark_limit = 0
+    elif search == "heuristic":
+        torch.backends.cudnn.benchmark = False
+    else:
+        raise RuntimeError("BAKEOFF_CUDNN_SEARCH must be default, exhaustive, or heuristic")
 
     # TRUE FP32, NOT TF32. PyTorch defaults allow_tf32=True, which routes dense
     # convolution to tensor cores at 10-bit mantissa -- a DIFFERENT operation from the
@@ -201,12 +224,20 @@ def main():
     xp = torch.randn(32, 64, 112, 112, device=dev)
     emit_both("maxpool2d_2x2", lambda: torch.nn.functional.max_pool2d(xp, 2, 2))
 
-    # ---- transposed depthwise 3x3 stride 2, N16/C64, 28x28 -> 56x56
-    xt = torch.randn(16, 64, 28, 28, device=dev)
-    wt = torch.randn(64, 1, 3, 3, device=dev)
+    # ---- transposed depthwise 3x3 stride 2; shape comes from the .NET catalog
+    tn, tc, tih, tiw, toh, tow, output_padding = conv_transpose_contract()
+    xt = torch.randn(tn, tc, tih, tiw, device=dev)
+    wt = torch.randn(tc, 1, 3, 3, device=dev)
+    probe = torch.nn.functional.conv_transpose2d(
+        xt, wt, None, stride=2, padding=1,
+        output_padding=output_padding, groups=tc)
+    if tuple(probe.shape) != (tn, tc, toh, tow):
+        raise RuntimeError("cuDNN transposed-convolution result disagrees with catalog contract")
+    del probe
     emit_both("conv_transpose2d_3x3_stride2",
          lambda: torch.nn.functional.conv_transpose2d(
-             xt, wt, None, stride=2, padding=1, output_padding=1, groups=64))
+             xt, wt, None, stride=2, padding=1,
+             output_padding=output_padding, groups=tc))
 
     # ---- gradient with respect to the data, matching the derived adjoint kernels
     from torch.nn.grad import conv2d_input

@@ -4,6 +4,7 @@ using System;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
@@ -33,16 +34,77 @@ public sealed record CodegenAutotuneIdentity(
         if (computeMajor <= 0 || computeMinor < 0)
             throw new ArgumentOutOfRangeException(nameof(computeMajor));
 
-        // SDK deterministic builds derive the module MVID from assembly contents. It changes
-        // when the emitter implementation changes, without requiring a hand-maintained
-        // version constant that somebody can forget to bump.
-        string emitter = "mvid-" + typeof(CodegenAutotuneIdentity).Module.ModuleVersionId.ToString("N");
+        // Fingerprint what the tuner can ACTUALLY emit for this spec. An assembly MVID is
+        // too broad and too unstable: repository/build metadata changed it after a benchmark-
+        // only commit, silently invalidating every winner even though no emitted instruction
+        // changed. Conversely, a hand-maintained version is easy to forget. Hashing the PTX
+        // search space invalidates exactly when one of the candidate programs changes.
+        string emitter = FingerprintEmitterSearchSpace(spec, computeMajor, computeMinor);
         return new CodegenAutotuneIdentity(
             deviceFingerprint,
             "sm" + computeMajor.ToString(CultureInfo.InvariantCulture) +
                 computeMinor.ToString(CultureInfo.InvariantCulture),
             Hash(CanonicalSpec(spec)),
             emitter);
+    }
+
+    private static string FingerprintEmitterSearchSpace(
+        CodegenKernelSpec spec, int computeMajor, int computeMinor)
+    {
+        var text = new StringBuilder();
+        AppendCandidate(text, "modelled", spec, computeMajor, computeMinor, static _ => { });
+        AppendCandidate(text, "no-tile", spec, computeMajor, computeMinor,
+            static e => e.Coarsening = 1);
+        AppendCandidate(text, "tile2", spec, computeMajor, computeMinor,
+            static e => e.Coarsening = 2);
+        AppendCandidate(text, "lanes4", spec, computeMajor, computeMinor,
+            static e => e.MaxTileLanes = 4);
+        AppendCandidate(text, "no-staging", spec, computeMajor, computeMinor,
+            static e => e.EnableSharedStaging = false);
+        AppendCandidate(text, "no-vector", spec, computeMajor, computeMinor,
+            static e => e.EnableVectorLoads = false);
+        AppendCandidate(text, "input-staging", spec, computeMajor, computeMinor,
+            static e => e.EnableInputStaging = true);
+
+        try
+        {
+            CodegenSplitPlan? split = CodegenSplitReduction.TryPlan(spec);
+            if (split is not null)
+            {
+                AppendCandidate(text, "split-partial", split.Partial,
+                    computeMajor, computeMinor, static _ => { });
+                AppendCandidate(text, "split-combine", split.Combine,
+                    computeMajor, computeMinor, static _ => { });
+            }
+        }
+        catch (NotSupportedException)
+        {
+            text.Append("split=unsupported;");
+        }
+
+        return "ptxset-" + Hash(text.ToString());
+    }
+
+    private static void AppendCandidate(
+        StringBuilder text,
+        string name,
+        CodegenKernelSpec spec,
+        int computeMajor,
+        int computeMinor,
+        Action<PtxAffineEmitter> configure)
+    {
+        text.Append("candidate=").Append(name).Append(';');
+        try
+        {
+            var emitter = new PtxAffineEmitter();
+            configure(emitter);
+            text.Append(emitter.Emit(spec, computeMajor, computeMinor));
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
     }
 
     private static string CanonicalSpec(CodegenKernelSpec spec)

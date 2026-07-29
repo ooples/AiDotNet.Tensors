@@ -19,12 +19,19 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
+using static AiDotNet.Tensors.Benchmarks.KernelToolArgs;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
 internal static class KernelLimiterTool
 {
+    private sealed record ProfileResult(
+        string Phase,
+        IReadOnlyDictionary<string, double> Counters,
+        int PhaseCount,
+        double ProgramDurationNs);
+
     /// <summary>A kernel at or above this fraction of a roofline is done with that lever.</summary>
     private const double SaturatedAt = 70.0;
 
@@ -54,6 +61,16 @@ internal static class KernelLimiterTool
         "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
         "smsp__warp_issue_stalled_wait_per_warp_active.pct",
         "smsp__warp_issue_stalled_no_instruction_per_warp_active.pct",
+
+        // Instruction mix distinguishes an arithmetic kernel from one that merely has
+        // high aggregate SM throughput. This matters for transposed convolution: its
+        // exact-division guards can saturate integer/control issue while useful FMA work
+        // remains modest. Calling that "compute bound" without the pipe mix points at
+        // the wrong lever.
+        "smsp__inst_executed_pipe_alu.sum",
+        "smsp__inst_executed_pipe_fma.sum",
+        "smsp__inst_executed_pipe_lsu.sum",
+        "smsp__inst_executed_pipe_cbu.sum",
     };
 
     /// <summary>
@@ -104,6 +121,7 @@ internal static class KernelLimiterTool
         // selected profile completes in a clean GPU environment.
         if (File.Exists(outputPath)) File.Delete(outputPath);
         GpuBenchmarkEnvironment.RequireIdleGpu("kernel-limiter-start");
+        string dispatch = KernelEvidenceIdentity.CurrentDispatch();
 
         Console.WriteLine();
         Console.WriteLine("LIMITER GATE - which unit is saturated, measured");
@@ -117,10 +135,20 @@ internal static class KernelLimiterTool
         foreach (var entry in entries)
         {
             // The launched kernel carries the SPEC name, not the catalog name.
-            var counters = Profile(ncu, entry.Name, entry.Bench.Name);
-            if (counters is null)
+            ProfileResult? profile = Profile(ncu, entry.Name, entry.Bench.Name);
+            if (profile is null)
             {
                 Console.WriteLine(entry.Name.PadRight(32) + "   profiling failed");
+                failedProfiles++;
+                continue;
+            }
+            IReadOnlyDictionary<string, double> counters = profile.Counters;
+
+            string[] missing = Metrics.Where(metric => !counters.ContainsKey(metric)).ToArray();
+            if (missing.Length != 0)
+            {
+                Console.WriteLine(entry.Name.PadRight(32) + "   profiling incomplete: missing " +
+                                  string.Join(", ", missing));
                 failedProfiles++;
                 continue;
             }
@@ -143,6 +171,15 @@ internal static class KernelLimiterTool
             double mio = counters.GetValueOrDefault(Metrics[8]);
             double wait = counters.GetValueOrDefault(Metrics[9]);
             double noInst = counters.GetValueOrDefault(Metrics[10]);
+            double globalLoads = counters.GetValueOrDefault(Metrics[4]);
+            double duration = counters.GetValueOrDefault(Metrics[5]);
+            double pipeAlu = counters.GetValueOrDefault(Metrics[11]);
+            double pipeFma = counters.GetValueOrDefault(Metrics[12]);
+            double pipeLsu = counters.GetValueOrDefault(Metrics[13]);
+            double pipeCbu = counters.GetValueOrDefault(Metrics[14]);
+            double phaseShare = profile.ProgramDurationNs > 0
+                ? duration / profile.ProgramDurationNs * 100.0
+                : 0.0;
             string lever = LeverFor(mio, longSb, shortSb, wait, noInst);
 
             Console.WriteLine(entry.Name.PadRight(32) +
@@ -166,7 +203,18 @@ internal static class KernelLimiterTool
                 shortSb.ToString("F2", CultureInfo.InvariantCulture),
                 mio.ToString("F2", CultureInfo.InvariantCulture),
                 noInst.ToString("F2", CultureInfo.InvariantCulture),
+                globalLoads.ToString("F0", CultureInfo.InvariantCulture),
+                duration.ToString("F0", CultureInfo.InvariantCulture),
+                pipeAlu.ToString("F0", CultureInfo.InvariantCulture),
+                pipeFma.ToString("F0", CultureInfo.InvariantCulture),
+                pipeLsu.ToString("F0", CultureInfo.InvariantCulture),
+                pipeCbu.ToString("F0", CultureInfo.InvariantCulture),
+                profile.Phase,
+                profile.PhaseCount.ToString(CultureInfo.InvariantCulture),
+                profile.ProgramDurationNs.ToString("F0", CultureInfo.InvariantCulture),
+                phaseShare.ToString("F2", CultureInfo.InvariantCulture),
                 lever,
+                dispatch,
                 CodegenMeasurementProtocol.Tag));
         }
 
@@ -177,12 +225,20 @@ internal static class KernelLimiterTool
                 failedProfiles.ToString(CultureInfo.InvariantCulture) +
                 " selected kernel profile(s) failed; limiter evidence not written.");
         }
+        string dispatchAfter = KernelEvidenceIdentity.CurrentDispatch();
+        if (!string.Equals(dispatch, dispatchAfter, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Generated dispatch changed during limiter profiling; evidence discarded.");
+        }
 
         var text = new StringBuilder();
         text.AppendLine("# protocol " + CodegenMeasurementProtocol.Tag + ": " + CodegenMeasurementProtocol.Description);
         text.AppendLine("kernel\tlimiter\tpct_of_peak\tl1\tdram\tl2\tsm\tstatus" +
                         "\tstall_wait\tstall_long_sb\tstall_short_sb\tstall_mio\tstall_no_inst" +
-                        "\tlever\tprotocol");
+                        "\tglobal_ld_inst\tduration_ns\tpipe_alu\tpipe_fma\tpipe_lsu\tpipe_cbu" +
+                        "\tphase\tphase_count\tprogram_duration_ns\tphase_share_pct" +
+                        "\tlever\tdispatch\tprotocol");
         foreach (string row in rows) text.AppendLine(row);
         File.WriteAllText(outputPath, text.ToString());
 
@@ -195,7 +251,7 @@ internal static class KernelLimiterTool
         Console.WriteLine("the code generator, only by changing what the kernel has to move.");
     }
 
-    private static Dictionary<string, double>? Profile(string ncu, string catalogName, string specName)
+    private static ProfileResult? Profile(string ncu, string catalogName, string specName)
     {
         string dll = Path.Combine(AppContext.BaseDirectory, "AiDotNet.Tensors.Benchmarks.dll");
         var start = new ProcessStartInfo
@@ -220,26 +276,63 @@ internal static class KernelLimiterTool
 
         using var process = Process.Start(start);
         if (process is null) return null;
-        string stdout = process.StandardOutput.ReadToEnd();
-        process.StandardError.ReadToEnd();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
         if (!process.WaitForExit((int)TimeSpan.FromMinutes(5).TotalMilliseconds))
         {
             process.Kill(entireProcessTree: true);
             return null;
         }
+        string stdout = outputTask.GetAwaiter().GetResult();
+        errorTask.GetAwaiter().GetResult();
+        if (process.ExitCode != 0) return null;
 
-        var values = new Dictionary<string, double>(StringComparer.Ordinal);
+        var phases = new Dictionary<string, Dictionary<string, double>>(StringComparer.Ordinal);
+        int kernelNameColumn = -1, metricNameColumn = -1, metricValueColumn = -1;
         foreach (string line in stdout.Split('\n'))
         {
             var cells = SplitCsv(line);
-            if (cells.Count < 15) continue;
-            string metric = cells[12];
+            if (kernelNameColumn < 0 || metricNameColumn < 0 || metricValueColumn < 0)
+            {
+                kernelNameColumn = cells.FindIndex(c =>
+                    c.Equals("Kernel Name", StringComparison.Ordinal));
+                metricNameColumn = cells.FindIndex(c =>
+                    c.Equals("Metric Name", StringComparison.Ordinal));
+                metricValueColumn = cells.FindIndex(c =>
+                    c.Equals("Metric Value", StringComparison.Ordinal));
+                continue;
+            }
+            int lastColumn = Math.Max(kernelNameColumn, Math.Max(metricNameColumn, metricValueColumn));
+            if (cells.Count <= lastColumn) continue;
+            string metric = cells[metricNameColumn];
             if (!Metrics.Contains(metric)) continue;
-            if (double.TryParse(cells[14].Replace(",", ""), NumberStyles.Any,
+            if (double.TryParse(cells[metricValueColumn].Replace(",", ""), NumberStyles.Any,
                                 CultureInfo.InvariantCulture, out double v))
+            {
+                string phase = cells[kernelNameColumn];
+                if (!phases.TryGetValue(phase, out Dictionary<string, double>? values))
+                {
+                    values = new Dictionary<string, double>(StringComparer.Ordinal);
+                    phases.Add(phase, values);
+                }
                 values[metric] = Math.Max(values.GetValueOrDefault(metric), v);
+            }
         }
-        return values.Count > 0 ? values : null;
+        if (kernelNameColumn < 0 || metricNameColumn < 0 || metricValueColumn < 0 ||
+            phases.Count == 0)
+            return null;
+
+        // A split program has a partial and a combine launch. Never synthesize a profile
+        // by taking each metric's maximum across different kernels: that creates a set of
+        // counters no launch actually produced. Require both phases to be complete, then
+        // attribute the diagnosis to the phase that consumes the most wall-clock time.
+        foreach (IReadOnlyDictionary<string, double> values in phases.Values)
+            if (Metrics.Any(metric => !values.ContainsKey(metric))) return null;
+
+        var dominant = phases.OrderByDescending(pair => pair.Value[Metrics[5]]).First();
+        double programDuration = phases.Values.Sum(values => values[Metrics[5]]);
+        return new ProfileResult(
+            dominant.Key, dominant.Value, phases.Count, programDuration);
     }
 
     private static List<string> SplitCsv(string line)
@@ -271,11 +364,4 @@ internal static class KernelLimiterTool
         return null;
     }
 
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal))
-                return args[i + 1];
-        return null;
-    }
 }

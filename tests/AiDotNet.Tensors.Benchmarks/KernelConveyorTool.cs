@@ -31,6 +31,7 @@ using System.Text;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using static AiDotNet.Tensors.Benchmarks.KernelToolArgs;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -102,6 +103,7 @@ internal static class KernelConveyorTool
             string ptx = emitter.Emit(entry.Bench, 8, 6);
             string path = Path.Combine(dir, entry.Name + ".ptx");
             File.WriteAllText(path, ptx);
+            File.WriteAllText(Path.Combine(dir, entry.Name + ".spec.txt"), entry.Bench.Describe());
             Console.WriteLine(path + "  lanes=" + emitter.CoarsenedLanes +
                               " blocks=" + emitter.LaunchBlocks);
         }
@@ -186,9 +188,14 @@ internal static class KernelConveyorTool
                           " G warp-inst/s | dram " + (machine.DramBytesPerSecond / 1e9).ToString("F0", CultureInfo.InvariantCulture) +
                           " GB/s | compute " + (machine.MacsPerSecond * 2 / 1e12).ToString("F1", CultureInfo.InvariantCulture) + " TFLOP/s");
         Console.WriteLine();
-        Console.WriteLine("measured column recorded under protocol " + CodegenMeasurementProtocol.Tag);
+        Console.WriteLine("measured column loaded from competitor evidence under protocol " +
+                          CodegenMeasurementProtocol.Tag);
         Console.WriteLine();
-        Console.WriteLine("kernel                        tile            block  ld/MAC  staged");
+        Console.WriteLine("kernel                        tile            block  ld/MAC  staged" +
+                          "                 predicted  measured  pred/meas");
+
+        var measuredEvidence = ReadEvidence(
+            Path.Combine("artifacts", "competitor-ratios.tsv"), 1);
 
         foreach (var entry in entries)
         {
@@ -202,11 +209,17 @@ internal static class KernelConveyorTool
             long threads = spec.Space.TotalThreads / Math.Max(1, emitter.CoarsenedLanes);
             var p = CodegenPerformanceModel.Predict(spec, threads, emitter.DynamicLoadsPerThread, machine);
 
-            double measured = MeasuredMicroseconds(entry.Name);
-            string measuredText = measured > 0 ? measured.ToString("F1", CultureInfo.InvariantCulture) : "-";
+            double measured = measuredEvidence.TryGetValue(entry.Name, out string? cell) &&
+                              double.TryParse(cell, NumberStyles.Any,
+                                  CultureInfo.InvariantCulture, out double parsed)
+                ? parsed
+                : 0.0;
+            string measuredText = measured > 0
+                ? measured.ToString("F1", CultureInfo.InvariantCulture)
+                : "MISSING";
             string ratioText = measured > 0
                 ? (p.PredictedMicroseconds / measured).ToString("F2", CultureInfo.InvariantCulture) + "x"
-                : "-";
+                : "MISSING";
 
             Console.WriteLine(entry.Name.PadRight(30) +
                 emitter.TileDescription.PadRight(16) +
@@ -214,7 +227,9 @@ internal static class KernelConveyorTool
                 p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(8) +
                 "  " + (emitter.UsedTwoDimensionalBlock
                     ? "2D " + emitter.LaunchBlockX + "x" + emitter.LaunchBlockY + " "
-                    : "flat ") + emitter.StagedOperands);
+                    : "flat ") + emitter.StagedOperands.PadRight(16) +
+                p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                measuredText.PadLeft(10) + ratioText.PadLeft(11));
         }
 
         Console.WriteLine();
@@ -228,24 +243,6 @@ internal static class KernelConveyorTool
                                       "invariant in {" + string.Join(", ", pair.Value) + "}");
         }
     }
-
-    /// <summary>
-    /// Measured times from the locked-clock true-fp32 bake-off, so the prediction can
-    /// be checked against reality in the same table.
-    /// </summary>
-    private static double MeasuredMicroseconds(string kernel) => kernel switch
-    {
-        "depthwise_conv2d_3x3_bias_relu" => 81.0,
-        "depthwise_conv2d_3x3" => 78.8,
-        "depthwise_conv2d_3x3_bwd_data" => 78.1,
-        "conv2d_1x1_bias_relu" => 38.6,
-        "conv2d_1x1_bwd_data" => 42.9,
-        "conv2d_3x3_bias_relu" => 75.0,
-        "conv2d_3x3_bwd_data" => 87.6,
-        "maxpool2d_2x2" => 171.6,
-        "conv_transpose2d_3x3_stride2" => 109.0,
-        _ => 0.0,
-    };
 
     // ---------------------------------------------------------------- verify
 
@@ -329,7 +326,7 @@ internal static class KernelConveyorTool
     /// looking up by the spec name silently found nothing, so those kernels ran the
     /// modelled lowering while the cache said they had been tuned.
     /// </param>
-    private static void ApplyTuned(
+    internal static void ApplyTuned(
         PtxAffineEmitter emitter, string kernelName, string? winner)
     {
         switch (winner)
@@ -339,6 +336,7 @@ internal static class KernelConveyorTool
             case "lanes4": emitter.MaxTileLanes = 4; break;
             case "no-staging": emitter.EnableSharedStaging = false; break;
             case "no-vector": emitter.EnableVectorLoads = false; break;
+            case "input-staging": emitter.EnableInputStaging = true; break;
 
             // A split winner is not a knob -- it is a different PROGRAM, two kernels and a
             // temporary, which this single-kernel path cannot launch. Saying so is the
@@ -560,14 +558,6 @@ internal static class KernelConveyorTool
         }
     }
 
-    /// <summary>Number of reduction axes a spec lowers to runtime loops.</summary>
-    private static int LoweringOf(DirectPtxRuntime runtime, CodegenKernelSpec spec)
-    {
-        var emitter = new PtxAffineEmitter();
-        emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        return emitter.LoopedAxes;
-    }
-
     private static string Describe(int loopedAxes) =>
         loopedAxes == 0 ? "unroll" : "loop x" + loopedAxes.ToString(CultureInfo.InvariantCulture);
 
@@ -713,7 +703,7 @@ internal static class KernelConveyorTool
         Console.WriteLine("release: " + gated.ToString(CultureInfo.InvariantCulture) + " zero-spill, " +
                           spilled.ToString(CultureInfo.InvariantCulture) + " spilling");
 
-        EnforceEvidenceGates(entries);
+        EnforceEvidenceGates(entries, runtime);
     }
 
     /// <summary>
@@ -728,10 +718,13 @@ internal static class KernelConveyorTool
     /// failure, not an informational line that still returns success.
     /// </summary>
     private static void EnforceEvidenceGates(
-        IReadOnlyList<CodegenCatalogEntry> entries)
+        IReadOnlyList<CodegenCatalogEntry> entries, DirectPtxRuntime runtime)
     {
-        var ratios = ReadEvidence(Path.Combine("artifacts", "competitor-ratios.tsv"), 3);
-        var limiters = ReadEvidence(Path.Combine("artifacts", "limiter.tsv"), 1);
+        string dispatch = KernelEvidenceIdentity.CurrentDispatch(runtime);
+        var ratios = ReadEvidence(
+            Path.Combine("artifacts", "competitor-ratios.tsv"), 3, dispatch);
+        var limiters = ReadEvidence(
+            Path.Combine("artifacts", "limiter.tsv"), 1, dispatch);
 
         Console.WriteLine();
         Console.WriteLine("EVIDENCE GATES (protocol " + CodegenMeasurementProtocol.Tag + ")");
@@ -766,7 +759,8 @@ internal static class KernelConveyorTool
     }
 
     /// <summary>Reads kernel -> column from a protocol-stamped evidence file.</summary>
-    private static Dictionary<string, string> ReadEvidence(string path, int column)
+    private static Dictionary<string, string> ReadEvidence(
+        string path, int column, string? expectedDispatch = null)
     {
         var found = new Dictionary<string, string>(StringComparer.Ordinal);
         if (!File.Exists(path)) return found;
@@ -778,6 +772,10 @@ internal static class KernelConveyorTool
             if (cells.Length <= column) continue;
             if (!cells[cells.Length - 1].Equals(CodegenMeasurementProtocol.Tag, StringComparison.Ordinal))
                 continue;   // stale protocol is the same as absent
+            if (expectedDispatch is not null &&
+                (cells.Length < 9 || !cells[cells.Length - 2].Equals(
+                    expectedDispatch, StringComparison.Ordinal)))
+                continue;   // another tuned program is another benchmark
             found[cells[0]] = cells[column];
         }
         return found;
@@ -799,9 +797,15 @@ internal static class KernelConveyorTool
         start.ArgumentList.Add(cubinPath);
         using Process? process = Process.Start(start);
         if (process is null) return null;
-        string output = process.StandardOutput.ReadToEnd();
-        process.StandardError.ReadToEnd();
-        process.WaitForExit();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit((int)TimeSpan.FromMinutes(5).TotalMilliseconds))
+        {
+            process.Kill(entireProcessTree: true);
+            return null;
+        }
+        string output = outputTask.GetAwaiter().GetResult();
+        errorTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0) return null;
 
         int instructions = 0, ldg = 0, stg = 0, spillLd = 0, spillSt = 0;
@@ -901,10 +905,7 @@ internal static class KernelConveyorTool
 
                     uint blocks = program.Kernels[0].Blocks;
 
-                    var buffers = new List<DirectPtxBuffer>();
-                    try
-                    {
-                        using var launchable = TunedLaunchable.Create(runtime, program);
+                    using var launchable = TunedLaunchable.Create(runtime, program);
                         void Launch() => launchable.Launch();
                         int bestClockBefore = 0, bestClockAfter = 0;
 
@@ -937,7 +938,7 @@ internal static class KernelConveyorTool
                             double drift = clockBefore > 0
                                 ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
                                 : double.MaxValue;
-                            if (drift < bestDrift)
+                            if (attempt == 0 || drift < bestDrift)
                             {
                                 bestDrift = drift;
                                 Array.Copy(medians, bestMedians, Runs);
@@ -958,8 +959,6 @@ internal static class KernelConveyorTool
                             worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
                             ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
                             GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
-                    }
-                    finally { foreach (var b in buffers) b.Dispose(); }
                 }
                 catch (Exception ex)
                 {
@@ -1215,14 +1214,6 @@ internal static class KernelConveyorTool
         long total = 1;
         for (int i = 0; i < shape.Count; i++) total *= shape[i];
         return total;
-    }
-
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal))
-                return args[i + 1];
-        return null;
     }
 
     private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)

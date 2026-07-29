@@ -90,14 +90,6 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Extra-output stores emitted beyond the primary and any argmax.</summary>
     public int ExtraOutputStores { get; private set; }
 
-    /// <summary>
-    /// Emits PTX for <paramref name="spec"/>.
-    /// </summary>
-    /// <exception cref="NotSupportedException">
-    /// Thrown for specs this layer deliberately cannot express (data-dependent
-    /// indexing). Declining loudly is required -- silently mis-lowering an index
-    /// map is exactly the failure this layer exists to prevent.
-    /// </exception>
     /// <summary>Number of reduction axes lowered to runtime loops rather than unrolled.</summary>
     public int LoopedAxes { get; private set; }
 
@@ -119,7 +111,8 @@ public sealed partial class PtxAffineEmitter
     internal static string PtxIsaVersionFor(int computeMajor, int computeMinor)
     {
         int capability = computeMajor * 10 + computeMinor;
-        if (capability >= 90) return "7.8";
+        if (capability >= 120) return "8.7";
+        if (capability >= 100) return "8.6";
         if (capability >= 89) return "7.8";
         if (capability >= 87) return "7.4";
         return "7.1";   // sm_70 through sm_86
@@ -651,6 +644,12 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Largest grid the CUDA launch API accepts in the X dimension.</summary>
     private const long MaxGridBlocksX = 2147483647L;
 
+    /// <summary>Largest thread count representable by the emitted u32 gid arithmetic.</summary>
+    private const long MaxU32ThreadCount = uint.MaxValue;
+
+    /// <summary>Smallest tensor rank treated as an activation by input staging.</summary>
+    private const int MinimumActivationRankForInputStaging = 3;
+
     /// <summary>Bytes of kernel parameter space PTX guarantees.</summary>
     private const int MaxParameterBytes = 4096;
 
@@ -689,6 +688,13 @@ public sealed partial class PtxAffineEmitter
             throw new NotSupportedException(
                 "Kernel '" + spec.Name + "' resolved to " + I(threadCount) + " threads. " +
                 "A tile factor larger than an axis extent would do this.");
+
+        if (threadCount > MaxU32ThreadCount)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' needs " + I(threadCount) +
+                " threads, past the " + I(MaxU32ThreadCount) +
+                " values representable by its u32 gid and bounds guard. Add a grid-stride " +
+                "loop or split the iteration space before emission.");
 
         int parameterBytes = spec.ParameterCount * sizeof(long);
         if (parameterBytes > MaxParameterBytes)
@@ -770,7 +776,7 @@ public sealed partial class PtxAffineEmitter
         foreach (int tw in factors)
         {
             if (tw > 1 && axes[contiguous].Extent % tw != 0) continue;
-            if (tw > laneCeiling) continue;
+            if (tw > laneCeiling || tw > factor) continue;
 
             // One-dimensional candidate: only the contiguous axis.
             double solo = PredictedRelativeTime(spec, axes, new[] { contiguous }, new[] { tw });
@@ -931,6 +937,11 @@ public sealed partial class PtxAffineEmitter
         CodegenTensorBinding binding, string basePointer, string[] axisReg,
         int[] reductionValues, int[] reductionAxes, int width)
     {
+        if (width != VectorWidth)
+            throw new InvalidOperationException(
+                "Only a " + I(VectorWidth) + "-wide vector load is supported; got " +
+                I(width) + ".");
+
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out string? pred);
         if (pred != null)
             throw new InvalidOperationException(
@@ -981,6 +992,12 @@ public sealed partial class PtxAffineEmitter
         return regs;
     }
 
+    /// <summary>Emits PTX for <paramref name="spec"/>.</summary>
+    /// <exception cref="NotSupportedException">
+    /// Thrown for specs this layer deliberately cannot express. Declining loudly is
+    /// required; silently mis-lowering an index map is exactly the failure this layer
+    /// exists to prevent.
+    /// </exception>
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
@@ -1160,7 +1177,9 @@ public sealed partial class PtxAffineEmitter
         // stores coalesced; y over the reuse axis makes a staged row serve the column.
         int dataOperand = -1;
         foreach (int inputIdx in spec.ProductInputs)
-            if (inputIdx != stagedInput && spec.Inputs[inputIdx].Map.Count > 2) dataOperand = inputIdx;
+            if (inputIdx != stagedInput &&
+                spec.Inputs[inputIdx].Map.Count >= MinimumActivationRankForInputStaging)
+                dataOperand = inputIdx;
 
         bool twoDimensional = false;
         int blockX = blockThreads, blockY = 1;
@@ -1273,6 +1292,11 @@ public sealed partial class PtxAffineEmitter
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
         long threadCount = total / lanes;
+        if (stagedSlices.Count > 0 && threadCount % blockThreads != 0)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' stages shared memory with " + I(blockThreads) +
+                " threads per block, which does not divide its " + I(threadCount) +
+                " threads. The tail block would reach bar.sync with missing threads.");
         long blocks;
         if (twoDimensional)
         {

@@ -37,6 +37,12 @@ internal static class KernelOracleTool
 {
     internal static void Run(string[] args)
     {
+        if (args.Contains("--catalog", StringComparer.Ordinal))
+        {
+            KernelCatalogOracleTool.Run(args);
+            return;
+        }
+
         using var runtime = new DirectPtxRuntime();
         int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
 

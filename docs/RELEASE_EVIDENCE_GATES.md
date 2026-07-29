@@ -13,6 +13,11 @@ protocol**:
 | competitor ratio | is it good? | every number is ours-vs-ours |
 | named limiter | what is stopping it? | nobody knows the next lever |
 
+Both artifacts are bound to a SHA-256 identity of the exact generated dispatch: device,
+target, semantic spec, emitted candidate set, and selected autotune winner for every
+catalog row. A same-protocol ratio or counter profile from another tuned program is
+treated as missing rather than silently reused.
+
 A row stamped with an older protocol is treated exactly like a missing one, because a
 number measured under a superseded protocol is not comparable — verified by stamping a
 row `p3` and watching it read MISSING.
@@ -20,52 +25,52 @@ row `p3` and watching it read MISSING.
 ## The limiter gate, measured
 
 `--kernel-limiter` profiles each kernel with Nsight Compute and records which unit is
-closest to its roofline. The table below is the p5 run at a steady 1770 MHz; the
+closest to its roofline. The table below is the p9 dispatch-bound run; the
 measurement tools reject foreign GPU work and unstable rows instead of treating the
 clock setting as sufficient evidence by itself.
 
 | kernel | L1% | DRAM% | L2% | SM% | limiter | status |
 |---|---|---|---|---|---|---|
-| depthwise_conv2d_3x3_bwd_data | **92.9** | 84.8 | 32.7 | 52.6 | L1 | at roofline |
-| depthwise_conv2d_3x3_bias_relu | **93.7** | 85.0 | 32.6 | 53.8 | L1 | at roofline |
-| depthwise_conv2d_3x3 | **93.4** | 82.9 | 32.6 | 52.5 | L1 | at roofline |
-| maxpool2d_2x2 | 17.6 | **94.5** | 33.3 | 19.8 | DRAM | at roofline |
-| conv_transpose2d_3x3_stride2 | 19.8 | 17.6 | 6.8 | **82.9** | SM | at roofline |
-| depthwise_conv2d_3x3_bwd_weights | **74.5** | 26.7 | 24.3 | 16.0 | L1 | at roofline |
-| conv2d_1x1_bwd_weights | **76.9** | 18.4 | 41.4 | 23.1 | L1 | at roofline |
-| conv2d_3x3_bwd_weights | **77.0** | 44.8 | 26.4 | 21.7 | L1 | at roofline |
-| conv2d_1x1_bias_relu | 39.5 | 24.2 | **66.7** | 29.4 | L2 | headroom |
-| conv2d_3x3_bias_relu | **59.4** | 2.8 | 13.2 | 53.5 | L1 | headroom |
-| conv2d_1x1_bwd_data | 32.8 | 19.7 | **53.6** | 28.3 | L2 | headroom |
-| conv2d_3x3_bwd_data | **38.3** | 2.4 | 6.3 | 33.4 | L1 | headroom |
-| conv2d_1x1_deep_epilogue | 33.0 | 20.2 | **54.2** | 24.0 | L2 | headroom |
+| depthwise_conv2d_3x3_bias_relu | 65.4 | **88.9** | 46.2 | 65.4 | DRAM | at roofline |
+| depthwise_conv2d_3x3 | **93.8** | 85.2 | 32.7 | 52.7 | L1 | at roofline |
+| conv2d_1x1_bias_relu | 39.4 | 21.5 | **65.9** | 29.3 | L2 | headroom |
+| conv2d_3x3_bias_relu | **59.1** | 4.6 | 13.1 | 53.2 | L1 | headroom |
+| maxpool2d_2x2 | 17.6 | **94.6** | 33.5 | 19.8 | DRAM | at roofline |
+| conv_transpose2d_3x3_stride2 | 21.8 | 17.3 | 7.6 | **81.1** | SM | at roofline |
+| depthwise_conv2d_3x3_bwd_data | **93.5** | 85.3 | 32.7 | 53.0 | L1 | at roofline |
+| conv2d_1x1_bwd_data | 32.5 | 19.5 | **54.0** | 28.0 | L2 | headroom |
+| conv2d_3x3_bwd_data | **36.6** | 2.6 | 6.8 | 33.1 | L1 | headroom |
+| depthwise_conv2d_3x3_bwd_weights partial | **74.7** | 26.8 | 24.4 | 16.0 | L1 | at roofline |
+| conv2d_1x1_bwd_weights partial | **77.1** | 18.2 | 41.3 | 23.3 | L1 | at roofline |
+| conv2d_3x3_bwd_weights partial | **76.9** | 3.9 | 20.7 | 21.7 | L1 | at roofline |
+| conv2d_1x1_deep_epilogue | 39.1 | 26.4 | **46.6** | 35.5 | L2 | headroom |
 
 Eight at a named roofline, five with headroom. **A kernel with headroom is not a failure —
 it is a kernel whose next lever is known.**
 
-## It corrected three conclusions I had reached without counters
+## It corrected four conclusions I had reached without counters
 
-1. **The depthwise family is L1-bound at 93%, not DRAM-bound.** I had classified it as "at
-   the DRAM roofline" from computed GB/s (93% of 760 GB/s). The counters say DRAM is 79%
-   and L1 is 93%, so L1 is the tighter constraint. Both are near saturation, which is why
-   the conclusion "no headroom" survived — but the *named* unit was wrong, and the name is
-   what tells you what to try.
-2. **conv2d_3x3's L1 pressure fell from 89.99% to 59.4%** after reuse tiling. That is the
-   tiling working exactly as designed, and it means nothing is saturated now (max 53%) —
-   the kernel is latency- or occupancy-bound, which matches the model going from 1.02x to
-   0.68x accurate on it. Fixing the bottleneck moved the bottleneck, and the gate says
-   where it moved to.
-3. **conv2d_1x1 is now L2-bound at 66%**, not load-issue bound as the static model
-   predicts. Its next lever is L2 traffic, not fewer load instructions.
-4. **conv_transpose is SM-bound at 82.5%** — issue-limited, not memory-limited at all.
-   That explains why the static model was 3x optimistic about it: the model has no
-   issue-rate term, and this kernel is the one kernel where that term dominates.
+1. **The depthwise rows do not all share one bottleneck.** Plain forward and backward-data
+   reach about 93% of L1, while the tuned fused bias+ReLU row reaches 89% of DRAM. The
+   selected schedule changes which named unit is exhausted.
+2. **Dense 3x3 forward and backward-data are under-filled, not bandwidth-bound.** Their
+   largest measured units are only 59% and 37%. More tuning of one load instruction cannot
+   close a 2.3x or 4.4x cuDNN gap; these rows need an implicit-GEMM or larger output/reduction
+   schedule.
+3. **The 1x1 rows expose memory latency without filling the load pipe.** Fused forward and
+   backward-data spend about 71% and 69% on long scoreboards while their largest unit is
+   only 66% and 54%. The next experiment is prefetch plus independent accumulators, not a
+   claim that L2 bandwidth is already exhausted.
+4. **conv_transpose is SM-bound at 81.1%.** Its instruction mix is dominated by integer
+   address work around exact division and parity guards, so the oracle points to specialized
+   output residue classes rather than another memory micro-optimization.
 
 ## The competitor gate
 
 `--kernel-competitor` runs the versioned `tools/bakeoff/run_bakeoff.py` lane and writes
 `artifacts/competitor-ratios.tsv`. It passes the current protocol tag from the .NET
-authority, pins the generated lane to the currently-running benchmark assembly, and
+authority, pins the generated lane to the currently-running benchmark assembly, binds
+every row to the exact device/spec/emitter/autotune-winner dispatch fingerprint, and
 refuses to write evidence when either side exceeds the 5% stability gate. `--kernel-release`
 now exits non-zero when any selected kernel lacks a current-protocol competitor or limiter
 row. The competitor configuration is pinned in the script rather than remembered:
@@ -79,18 +84,45 @@ row. The competitor configuration is pinned in the script rather than remembered
   the exact fp32 our kernels verify against an fp64 oracle.
 * **Clock-drift and spread gates**, because the SM clock was measured moving 12.6% inside
   a single kernel's measurement. A run that does not settle is refused.
+* **Multi-strategy cuDNN plan search**, because even stable measurements selected materially
+  different plans between fresh processes. The lane tries four default, two exhaustive, and
+  one heuristic search process, accepts only internally stable measurements, chooses the
+  fastest plan per shape, and records both the strategy and cross-plan spread.
+* **Geometry supplied by the .NET catalog authority**, including the transposed-convolution
+  output padding and expected output extent. The Python lane asserts the cuDNN output shape
+  before timing, so a 28-to-56 incumbent cannot be compared with a 28-to-55 generated row.
 
-The Python entry point remains directly runnable for diagnostics, but the protocol is
-mandatory rather than hardcoded: pass the current tag printed by `--kernel-competitor`
-(for example, `python tools/bakeoff/run_bakeoff.py --protocol p5`).
+The Python entry point remains directly runnable for diagnostics, but both the protocol
+and exact dispatch fingerprint are mandatory rather than hardcoded. The normal
+`--kernel-competitor` entry point supplies and validates both.
 
-Each of those three moved the answer materially. None of them is obvious from the
+Each of those controls moved the answer materially. None of them is obvious from the
 numbers alone, which is exactly why they are enforced by the tooling instead of being
 remembered by whoever runs it.
 
-The p5 tuned-dispatch run produced 13 stable rows: six wins at or above 1.10x, six
-losses at or below 0.91x, and one tie. In particular, autotuned split reductions moved
-the three weight-gradient ratios from 0.02x/0.17x/0.05x before tuning to
-0.77x/0.77x/0.82x against cuDNN. They remain competitor losses, and the gate records
-them as such rather than confusing a large improvement over our prior lowering with
-market leadership.
+The p9 tuned-dispatch run produced 13 stable rows: five wins above 1.10x, six losses
+below 0.91x, and two ties. The plan search changed the apparent result from the earlier
+seven non-wins to eight: a heuristic plan moved 1x1 backward-data from a tie to a 0.64x
+loss, and a faster default plan moved fused 1x1 forward from a win to a 1.08x tie. The
+cross-plan spread is recorded because it ranges from 0.7% to 229% across this catalog.
+
+## The catalog loss oracle
+
+`--kernel-oracle --catalog` joins each current competitor row to the exact autotune
+winner, its semantic roofline, reuse map, and the matching limiter profile. It reports
+only non-wins by default. Split programs are grouped by phase; every phase must contain
+the full metric set, and the diagnosis uses the longest phase instead of mixing maxima
+from different launches.
+
+The p9 run explains all eight non-wins:
+
+| kernel | ratio | cuDNN plan (spread) | measured cause | next schedule |
+|---|---:|---|---|---|
+| conv2d_1x1_bias_relu | 1.08x | default (25%) | 71% long-scoreboard, 0.3% LSU throttle | prefetch/stage and add independent work |
+| conv2d_3x3_bias_relu | 0.44x | default (61%) | balanced but under-filled direct schedule | implicit-GEMM/output tile |
+| conv_transpose2d_3x3_stride2 | 1.08x | default (0.7%) | 81% SM issue, 59% ALU pipe from exact div/rem addressing | specialize residue/parity classes |
+| conv2d_1x1_bwd_data | 0.64x | heuristic (57%) | 69% long-scoreboard, 0.2% LSU throttle | prefetch/stage and add independent work |
+| conv2d_3x3_bwd_data | 0.23x | exhaustive (229%) | balanced but under-filled direct schedule | implicit-GEMM/output tile |
+| depthwise_conv2d_3x3_bwd_weights | 0.82x | default (2.7%) | partial is 98% of time; L1 75%, long-scoreboard 84% | tile/prefetch the partial |
+| conv2d_1x1_bwd_weights | 0.75x | default (43%) | partial is 95% of time; L1 77%, long-scoreboard 76% | GEMM-style reuse in the partial |
+| conv2d_3x3_bwd_weights | 0.35x | default (118%) | partial is 96% of time; L1 77%, 2.7x minimum traffic | GEMM-style reuse in the partial |

@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
+using static AiDotNet.Tensors.Benchmarks.KernelToolArgs;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -29,6 +30,7 @@ internal static class KernelCompetitorTool
         {
             throw new ArgumentException("--max-spread-pct must be a positive number.");
         }
+        string dispatch = KernelEvidenceIdentity.CurrentDispatch();
 
         var start = new ProcessStartInfo
         {
@@ -42,6 +44,8 @@ internal static class KernelCompetitorTool
         start.ArgumentList.Add(script);
         start.ArgumentList.Add("--protocol");
         start.ArgumentList.Add(CodegenMeasurementProtocol.Tag);
+        start.ArgumentList.Add("--dispatch");
+        start.ArgumentList.Add(dispatch);
         start.ArgumentList.Add("--output");
         start.ArgumentList.Add(output);
         start.ArgumentList.Add("--max-spread-pct");
@@ -52,6 +56,7 @@ internal static class KernelCompetitorTool
         start.Environment["BAKEOFF_DOTNET"] = Assembly.GetExecutingAssembly().Location;
         start.Environment["AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"] =
             Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
+        start.Environment["BAKEOFF_CONV_TRANSPOSE_CONTRACT"] = ConvTransposeContract();
         string? competitorPython = ValueOf(args, "--competitor-python");
         if (!string.IsNullOrEmpty(competitorPython))
             start.Environment["BAKEOFF_PYTHON"] = Path.GetFullPath(competitorPython);
@@ -73,8 +78,54 @@ internal static class KernelCompetitorTool
                 "; no release evidence accepted. " +
                 FirstDiagnostic(errorText, outputText));
 
-        ValidateEvidence(output);
+        string dispatchAfter = KernelEvidenceIdentity.CurrentDispatch();
+        if (!string.Equals(dispatch, dispatchAfter, StringComparison.Ordinal))
+        {
+            if (File.Exists(output)) File.Delete(output);
+            throw new InvalidOperationException(
+                "Generated dispatch changed during the competitor run; evidence discarded.");
+        }
+        ValidateEvidence(output, dispatch);
         Console.WriteLine("validated competitor evidence: " + output);
+    }
+
+    /// <summary>
+    /// Supplies the transposed-convolution shape from the catalog authority. Keeping this
+    /// in Python as an independent literal once compared our corrected 28 -> 55 program
+    /// with cuDNN output_padding=1 (28 -> 56), i.e. two different operators.
+    /// </summary>
+    private static string ConvTransposeContract()
+    {
+        CodegenCatalogEntry entry = CodegenKernelCatalog.Find(
+            "conv_transpose2d_3x3_stride2") ??
+            throw new InvalidOperationException("Transposed-convolution catalog entry is missing.");
+        CodegenKernelSpec spec = entry.Bench;
+        if (spec.Inputs.Count < 2 || spec.Inputs[0].Shape.Count != 4 ||
+            spec.Output.Shape.Count != 4)
+            throw new InvalidOperationException("Unexpected transposed-convolution catalog shape.");
+
+        int n = spec.Inputs[0].Shape[0];
+        int c = spec.Inputs[0].Shape[1];
+        int ih = spec.Inputs[0].Shape[2];
+        int iw = spec.Inputs[0].Shape[3];
+        int oh = spec.Output.Shape[2];
+        int ow = spec.Output.Shape[3];
+        const int stride = 2, padding = 1, kernel = 3;
+        int outputPaddingH = oh - ((ih - 1) * stride - 2 * padding + kernel);
+        int outputPaddingW = ow - ((iw - 1) * stride - 2 * padding + kernel);
+        if (outputPaddingH != outputPaddingW || outputPaddingH < 0 ||
+            outputPaddingH >= stride)
+            throw new InvalidOperationException(
+                "Catalog transposed extent cannot be represented by cuDNN output_padding.");
+
+        return string.Join(",",
+            n.ToString(CultureInfo.InvariantCulture),
+            c.ToString(CultureInfo.InvariantCulture),
+            ih.ToString(CultureInfo.InvariantCulture),
+            iw.ToString(CultureInfo.InvariantCulture),
+            oh.ToString(CultureInfo.InvariantCulture),
+            ow.ToString(CultureInfo.InvariantCulture),
+            outputPaddingH.ToString(CultureInfo.InvariantCulture));
     }
 
     private static string FirstDiagnostic(string stderr, string stdout)
@@ -86,7 +137,7 @@ internal static class KernelCompetitorTool
         return "No subprocess diagnostic was produced.";
     }
 
-    private static void ValidateEvidence(string path)
+    private static void ValidateEvidence(string path, string expectedDispatch)
     {
         if (!File.Exists(path))
             throw new InvalidOperationException("Competitor lane completed without evidence: " + path);
@@ -96,12 +147,18 @@ internal static class KernelCompetitorTool
         {
             if (line.Length == 0 || line[0] == '#') continue;
             string[] cells = line.Split('\t');
-            if (cells.Length < 8 || cells[0] == "kernel") continue;
+            if (cells.Length < 9 || cells[0] == "kernel") continue;
             if (!string.Equals(cells[cells.Length - 1], CodegenMeasurementProtocol.Tag,
                     StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
                     "Competitor evidence contains a stale protocol row for " + cells[0] + ".");
+            }
+            if (!string.Equals(cells[cells.Length - 2], expectedDispatch,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Competitor evidence contains a stale dispatch row for " + cells[0] + ".");
             }
             accepted++;
         }
@@ -110,10 +167,4 @@ internal static class KernelCompetitorTool
             throw new InvalidOperationException("Competitor evidence contains no stable rows.");
     }
 
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal)) return args[i + 1];
-        return null;
-    }
 }

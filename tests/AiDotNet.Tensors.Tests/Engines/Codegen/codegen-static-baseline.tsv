@@ -4,7 +4,7 @@ depthwise_conv2d_3x3	692	45	0	127	0
 conv2d_1x1_bias_relu	3168	132	128	452	0
 conv2d_3x3_bias_relu	1337	41	0	168	1
 maxpool2d_2x2	90	4	0	20	0
-conv_transpose2d_3x3_stride2	1076	45	0	103	0
+conv_transpose2d_3x3_stride2	1098	45	0	115	0
 depthwise_conv2d_3x3_bwd_data	692	45	0	127	0
 conv2d_1x1_bwd_data	4273	320	64	832	0
 conv2d_3x3_bwd_data	1290	37	0	164	1

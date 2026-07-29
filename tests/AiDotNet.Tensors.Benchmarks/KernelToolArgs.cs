@@ -35,6 +35,8 @@ internal static class KernelToolArgs
     private static readonly HashSet<string> ValueFlags = new(StringComparer.Ordinal)
     {
         "--ncu", "--out", "--nvdisasm", "--coarsen", "--max-lanes",
+        "--competitor", "--limiter", "--runner-python", "--max-spread-pct",
+        "--competitor-python", "--ptxas",
     };
 
     /// <summary>The kernel selector, or "all" when none was given.</summary>
@@ -56,6 +58,10 @@ internal static class KernelToolArgs
     /// <summary>The value of a flag, or null when it was not given.</summary>
     public static string? ValueOf(string[] args, string flag)
     {
+        if (!ValueFlags.Contains(flag))
+            throw new ArgumentException(
+                "Value flag '" + flag + "' is not registered in KernelToolArgs.ValueFlags.",
+                nameof(flag));
         if (args is null) return null;
         for (int i = 0; i < args.Length - 1; i++)
             if (string.Equals(args[i], flag, StringComparison.Ordinal)) return args[i + 1];

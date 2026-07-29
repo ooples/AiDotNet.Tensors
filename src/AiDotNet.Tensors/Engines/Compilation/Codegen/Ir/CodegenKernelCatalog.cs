@@ -182,8 +182,13 @@ public static class CodegenKernelCatalog
     private static CodegenKernelSpec Conv2D1x1Linear(int n, int c, int k, int h, int w)
     {
         var full = Conv2D1x1(n, c, k, h, w);
+        var output = new CodegenTensorBinding(2, "output", [n, k, h, w],
+        [
+            CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1),
+            CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(3)
+        ], isOutput: true);
         return new CodegenKernelSpec("conv2d_1x1", full.Space,
-            new[] { full.Inputs[0], full.Inputs[1] }, full.Output,
+            new[] { full.Inputs[0], full.Inputs[1] }, output,
             new[] { 0, 1 }, CodegenReduceKind.Sum);
     }
 
@@ -191,8 +196,13 @@ public static class CodegenKernelCatalog
     private static CodegenKernelSpec Conv2D3x3Linear(int n, int c, int k, int h, int w)
     {
         var full = Conv2D3x3(n, c, k, h, w);
+        var output = new CodegenTensorBinding(2, "output", [n, k, h, w],
+        [
+            CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1),
+            CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(3)
+        ], isOutput: true);
         return new CodegenKernelSpec("conv2d_3x3", full.Space,
-            new[] { full.Inputs[0], full.Inputs[1] }, full.Output,
+            new[] { full.Inputs[0], full.Inputs[1] }, output,
             new[] { 0, 1 }, CodegenReduceKind.Sum);
     }
 
@@ -318,7 +328,8 @@ public static class CodegenKernelCatalog
     /// </summary>
     private static CodegenKernelSpec ConvTranspose2D3x3Stride2(int n, int c, int inH, int inW)
     {
-        int oh = inH * 2, ow = inW * 2;
+        int oh = CodegenConvAttributes.TransposedExtent(inH, 3, 2, 1);
+        int ow = CodegenConvAttributes.TransposedExtent(inW, 3, 2, 1);
         var space = new CodegenIterationSpace(
             CodegenAxis.Parallel("n", n), CodegenAxis.Parallel("c", c),
             CodegenAxis.Parallel("oh", oh), CodegenAxis.Parallel("ow", ow),

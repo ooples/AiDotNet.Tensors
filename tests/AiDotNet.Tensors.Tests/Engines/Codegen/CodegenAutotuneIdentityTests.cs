@@ -23,7 +23,7 @@ public class CodegenAutotuneIdentityTests
         Assert.NotEqual(a.SpecFingerprint, c.SpecFingerprint);
         Assert.Equal("sm86", a.Target);
         Assert.StartsWith("sha256-", a.SpecFingerprint);
-        Assert.StartsWith("mvid-", a.EmitterFingerprint);
+        Assert.StartsWith("ptxset-sha256-", a.EmitterFingerprint);
     }
 
     [Fact]
@@ -32,6 +32,8 @@ public class CodegenAutotuneIdentityTests
         string previous = CodegenAutotuneCache.CachePath;
         string directory = Path.Combine(Path.GetTempPath(), "aidotnet-autotune-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(directory, "autotune.tsv");
+        string secondPath = Path.Combine(directory, "autotune-second.tsv");
+        string lockedPath = Path.Combine(directory, "autotune-locked.tsv");
         Directory.CreateDirectory(directory);
 
         try
@@ -47,6 +49,9 @@ public class CodegenAutotuneIdentityTests
                 "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\n" +
                 "legacy\tno-tile\t10.0\t20.0\t2.0\t" + CodegenMeasurementProtocol.Tag + "\n" +
                 row + "\n");
+            File.WriteAllText(secondPath,
+                "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\n" +
+                row.Replace("\tno-tile\t", "\tlanes4\t") + "\n");
 
             CodegenAutotuneCache.CachePath = path;
             CodegenAutotuneCache.Invalidate();
@@ -55,6 +60,19 @@ public class CodegenAutotuneIdentityTests
             Assert.Null(CodegenAutotuneCache.WinnerFor(
                 "depthwise", identity with { Target = "sm90" }));
             Assert.Null(CodegenAutotuneCache.WinnerFor("legacy", identity));
+
+            // Assigning another path must invalidate automatically; requiring callers to
+            // remember Invalidate made tests and tools silently serve the previous file.
+            CodegenAutotuneCache.CachePath = secondPath;
+            Assert.Equal("lanes4", CodegenAutotuneCache.WinnerFor("depthwise", identity));
+
+            File.WriteAllText(lockedPath, row);
+            using (var locked = new FileStream(
+                       lockedPath, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                CodegenAutotuneCache.CachePath = lockedPath;
+                Assert.Null(CodegenAutotuneCache.WinnerFor("depthwise", identity));
+            }
         }
         finally
         {

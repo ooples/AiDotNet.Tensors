@@ -22,8 +22,11 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// <summary>Lowering choices that were measured rather than modelled.</summary>
 public static class CodegenAutotuneCache
 {
+    private const double HarnessGainNoiseFloor =
+        CodegenMeasurementProtocol.AutotuneGainNoiseFloor;
     private static readonly object Sync = new();
     private static Dictionary<CacheKey, string>? _winners;
+    private static string _cachePath = Path.Combine("artifacts", "autotune.tsv");
 
     private readonly record struct CacheKey(
         string Kernel,
@@ -33,8 +36,20 @@ public static class CodegenAutotuneCache
         string Emitter);
 
     /// <summary>File the autotuner writes and this reads.</summary>
-    public static string CachePath { get; set; } =
-        Path.Combine("artifacts", "autotune.tsv");
+    public static string CachePath
+    {
+        get { lock (Sync) return _cachePath; }
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException("Autotune cache path cannot be empty.", nameof(value));
+            lock (Sync)
+            {
+                _cachePath = value;
+                _winners = null;
+            }
+        }
+    }
 
     /// <summary>Forgets the loaded cache, so a fresh autotune run is picked up.</summary>
     public static void Invalidate()
@@ -73,9 +88,21 @@ public static class CodegenAutotuneCache
     {
         var map = new Dictionary<CacheKey, string>();
         string path = CachePath;
-        if (!File.Exists(path)) return map;
+        string[] lines;
+        try
+        {
+            lines = File.ReadAllLines(path);
+        }
+        catch (IOException)
+        {
+            return map;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return map;
+        }
 
-        foreach (string line in File.ReadAllLines(path))
+        foreach (string line in lines)
         {
             if (line.Length == 0 || line[0] == '#') continue;
             string[] cells = line.Split('\t');
@@ -91,7 +118,7 @@ public static class CodegenAutotuneCache
             // switching lowerings on noise is how a tuner becomes a random walk.
             if (!double.TryParse(cells[4], NumberStyles.Any, CultureInfo.InvariantCulture, out double gain))
                 continue;
-            if (gain <= 1.0105) continue;
+            if (gain <= HarnessGainNoiseFloor) continue;
 
             var key = new CacheKey(cells[0], cells[6], cells[7], cells[8], cells[9]);
             map[key] = cells[1];

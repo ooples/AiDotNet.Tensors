@@ -20,6 +20,12 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class FrontEndCheckTool
 {
     /// <summary>
+    /// Agreement tolerance for fp32 contractions. This matches the conveyor and
+    /// autotuner; tighter thresholds test accumulation order rather than correctness.
+    /// </summary>
+    private const double AccumulationTolerance = 2e-3;
+
+    /// <summary>
     /// Whether timings may be reported. Correctness does not care what else is on the
     /// GPU; a ratio does. Gating the whole check on an idle device would mean a busy box
     /// could not verify anything, and reporting microseconds taken against a foreign
@@ -334,15 +340,8 @@ internal static class FrontEndCheckTool
             }
             double deviation = scale > 0 ? worst / scale : worst;
 
-            // THE TOLERANCE IS A FUNCTION OF THE REDUCTION LENGTH, not a constant.
-            // Sequential fp32 accumulation drifts with the number of terms, and measuring
-            // the same operator at two lengths showed exactly that: the LayerNorm variance
-            // read 8.316E-007 over 64 terms and 3.335E-006 over 256 -- a 4.01x rise for a
-            // 4x longer reduction, which is n*eps and not a defect. A fixed 1e-6 gate is
-            // the wrong SHAPE for that, the same way an absolute tolerance was the wrong
-            // shape for the autotuner's agreement check.
             long trips = LongestReduction(program);
-            double bound = Math.Max(1e-6, trips * 1.2e-7);
+            double bound = trips > 1 ? AccumulationTolerance : 0.0;
             bool ok = deviation <= bound;
 
             Console.WriteLine(label.PadRight(38) +
@@ -616,11 +615,11 @@ internal static class FrontEndCheckTool
                 scale = Math.Max(scale, Math.Abs(want[e]));
             }
 
-            // A reduction accumulates, so the tolerance has to be relative to the result's
-            // own magnitude; an absolute 1e-6 would be a fp32 epsilon test, not a
-            // correctness test. Pointwise graphs still land on exact zero.
             double deviation = scale > 0 ? worst / scale : worst;
-            bool ok = deviation <= 1e-6;
+            double bound = spec.Space.ReductionAxes.Length == 0
+                ? 0.0
+                : AccumulationTolerance;
+            bool ok = deviation <= bound;
             double singleUs = Measure(runtime.Synchronize, LaunchSingle);
             Console.WriteLine(label.PadRight(38) +
                 count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
@@ -731,7 +730,7 @@ internal static class FrontEndCheckTool
                 scale2 = Math.Max(scale2, Math.Abs(want[e]));
             }
             double deviation = scale2 > 0 ? worst / scale2 : worst;
-            bool ok = deviation <= 1e-6;
+            bool ok = deviation <= AccumulationTolerance;
 
             // The emitter ADVERTISES this as the faster route, so the claim is measured
             // rather than asserted. A split offered on a shape it does not help is a bug

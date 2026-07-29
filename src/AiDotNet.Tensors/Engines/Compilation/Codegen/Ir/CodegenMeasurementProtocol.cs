@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // A version stamp for how a number was measured.
 //
-// The measurement protocol changed four times during this project, and each change
+// The measurement protocol changed eight times during this project, and each change
 // silently invalidated every number recorded before it:
 //
 //   v1 -> v2  the estimator. median(A)/median(B) let clock drift during a run leak into
@@ -19,6 +19,30 @@
 //             the rows p4. Comparisons now form A/B inside each sample and refuse a result
 //             unless A, B and the ratio each converge within the 5% spread gate. Cross-process
 //             competitor rows carry and gate both spreads independently.
+//   v5 -> v6  exact dispatch identity. The autotune cache was keyed by assembly MVID, so a
+//             benchmark-only rebuild invalidated every winner, while competitor evidence
+//             was only protocol-keyed and could still be accepted for the now-untuned
+//             program. Candidate PTX sets now identify autotune rows, competitor evidence
+//             binds the complete selected dispatch, and limiter evidence requires every
+//             requested counter before it can name a bottleneck.
+//   v6 -> v7  exact competitor geometry and phase-scoped counters. The generated
+//             transposed convolution was corrected to the declared 28 -> 55 extent, but
+//             the cuDNN lane still requested output_padding=1 and measured 28 -> 56.
+//             Split-program profiles also mixed per-metric maxima from their partial and
+//             combine launches. The competitor now measures the same operator, and every
+//             split phase must have a complete counter set before the longest phase is
+//             used for diagnosis.
+//   v7 -> v8  reproducible cuDNN plan search. Fresh but individually stable processes
+//             selected materially different cuDNN convolution plans (28.7 vs 38.6 us
+//             for the same 1x1 shape). The competitor lane now runs three fresh plan
+//             searches per shape, records their spread, and compares against the
+//             strongest stable plan rather than whichever one a single process chose.
+//   v8 -> v9  multi-strategy cuDNN search. Exhaustive benchmark_limit=0 unexpectedly
+//             chose a 90 us weight-gradient plan where the default search repeatedly
+//             found 41 us, so no single framework selector is treated as an oracle.
+//             Four default, two exhaustive, and one deterministic-heuristic fresh
+//             processes are searched; the fastest stable plan and its strategy are
+//             recorded per shape.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -32,11 +56,14 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// <summary>Identifies how a performance number was obtained.</summary>
 public static class CodegenMeasurementProtocol
 {
+    /// <summary>Smallest measured gain distinguishable from the harness noise floor.</summary>
+    public const double AutotuneGainNoiseFloor = 1.0105;
+
     /// <summary>
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 5;
+    public const int Version = 9;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -44,7 +71,9 @@ public static class CodegenMeasurementProtocol
     /// <summary>One-line description of what the current protocol requires.</summary>
     public const string Description =
         "paired within-sample ratios; batched timed regions; clock-drift and <=5% spread gates; " +
-        "cross-process competitor separately gated at true fp32 under CUDA graphs";
+        "true-fp32 CUDA-graph competitor; exact PTX-set autotune and dispatch-bound evidence; " +
+        "exact competitor geometry; multi-strategy cuDNN plan search; " +
+        "phase-scoped counter profiles";
 
     /// <summary>
     /// Human-readable stamp to put beside a number.

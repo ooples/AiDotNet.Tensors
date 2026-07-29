@@ -245,8 +245,8 @@ public static class CodegenLowering
     /// </param>
     /// <param name="inputShape">Input in NCHW order.</param>
     /// <param name="weightShape">
-    /// <c>[K,C,kh,kw]</c> for a dense or transposed convolution, <c>[C,kh,kw]</c> for a
-    /// depthwise one.
+    /// <c>[K,C,kh,kw]</c> for a dense convolution, or <c>[C,kh,kw]</c> for a depthwise
+    /// convolution. Transposed convolution accepts either form.
     /// </param>
     /// <param name="attributes">Stride and padding.</param>
     /// <param name="withBias">Adds a per-output-channel bias.</param>
@@ -272,8 +272,9 @@ public static class CodegenLowering
         if (inputShape.Length != 4)
             throw new ArgumentException("Convolution input must be NCHW.", nameof(inputShape));
 
-        bool depthwise = opKind == CodegenOpKind.DepthwiseConv2D;
         bool transposed = opKind == CodegenOpKind.ConvTranspose2D;
+        bool depthwise = opKind == CodegenOpKind.DepthwiseConv2D ||
+                         (transposed && weightShape.Length == 3);
         if (weightShape.Length != (depthwise ? 3 : 4))
             throw new ArgumentException(
                 $"{opKind} expects a rank-{(depthwise ? 3 : 4)} weight tensor.", nameof(weightShape));

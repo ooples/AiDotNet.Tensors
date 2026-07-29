@@ -25,6 +25,7 @@ using System.Text;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using static AiDotNet.Tensors.Benchmarks.KernelToolArgs;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -127,11 +128,14 @@ internal static class KernelAutotuneTool
                 try
                 {
                     TuneResult? result = TuneOne(runtime, entry);
-                    if (result is null) continue;
+                    if (result is null || !double.IsFinite(result.BestUs) ||
+                        result.BestUs == double.MaxValue ||
+                        !double.IsFinite(result.ModelledUs) || result.ModelledUs == double.MaxValue)
+                        continue;
 
                     double gain = result.Gain;
-                    if (gain > 1.0105) improved++;
-                    if (gain < 1.0 / 1.0105) regressed++;
+                    if (gain > CodegenMeasurementProtocol.AutotuneGainNoiseFloor) improved++;
+                    if (gain < 1.0 / CodegenMeasurementProtocol.AutotuneGainNoiseFloor) regressed++;
 
                     Console.WriteLine(entry.Name.PadRight(30) +
                         result.ModelledUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
@@ -262,7 +266,9 @@ internal static class KernelAutotuneTool
 
         // A winner must clear both the observed paired spread and the earned 1.05%
         // noise floor. Merely having the smallest median is not a promotion criterion.
-        double required = Math.Max(1.0105, 1.0 + timing.RelativeSpread);
+        double required = Math.Max(
+            CodegenMeasurementProtocol.AutotuneGainNoiseFloor,
+            1.0 + timing.RelativeSpread);
         if (timing.Ratio <= required || timing.Ratio <= bestGain) return;
 
         bestName = candidate.Name;
@@ -463,10 +469,4 @@ internal static class KernelAutotuneTool
         }
     }
 
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal)) return args[i + 1];
-        return null;
-    }
 }

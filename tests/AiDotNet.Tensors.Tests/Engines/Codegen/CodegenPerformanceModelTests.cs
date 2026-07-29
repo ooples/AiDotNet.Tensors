@@ -182,4 +182,19 @@ public class CodegenPerformanceModelTests
         depthwise.Emit(CodegenKernelCatalog.Find("depthwise_conv2d_3x3")!.Bench, 8, 6);
         Assert.Equal(4, depthwise.CoarsenedLanes);
     }
+
+    /// <summary>Coarsening is a factor, not an on/off switch.</summary>
+    [Fact]
+    public void Coarsening_BoundsTheContiguousTileFactor()
+    {
+        var spec = CodegenKernelCatalog.Find("depthwise_conv2d_3x3")!.Bench;
+        var two = new PtxAffineEmitter { Coarsening = 2 };
+        two.Emit(spec, 8, 6);
+        var four = new PtxAffineEmitter { Coarsening = 4 };
+        four.Emit(spec, 8, 6);
+
+        Assert.Contains("ow x2", two.TileDescription, StringComparison.Ordinal);
+        Assert.Contains("ow x4", four.TileDescription, StringComparison.Ordinal);
+        Assert.NotEqual(two.TileDescription, four.TileDescription);
+    }
 }

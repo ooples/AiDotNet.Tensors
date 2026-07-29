@@ -388,7 +388,7 @@ public static class CodegenPerformanceModel
     }
 
     /// <summary>Human-readable one-kernel report.</summary>
-    public static string Describe(CodegenPerformancePrediction p, CodegenKernelSpec spec)
+    public static string Describe(CodegenPerformancePrediction p, CodegenKernelSpec? spec)
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
 
