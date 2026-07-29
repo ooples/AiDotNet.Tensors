@@ -400,6 +400,22 @@ public class CodegenSplitReductionTests
         return new CodegenKernelSpec("rowreduce", space, new[] { x }, y, new[] { 0 }, reduce);
     }
 
+    private static CodegenKernelSpec RowMaxWithIndices(int rows, int inner)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("k", inner));
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, inner },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var values = new CodegenTensorBinding(1, "values", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var indices = new CodegenTensorBinding(2, "indices", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+
+        return new CodegenKernelSpec(
+            "rowmax_indices", space, new[] { x }, values, new[] { 0 }, CodegenReduceKind.Max,
+            secondaryOutput: indices, secondaryIndexExpr: CodegenAffineExpr.Axis(1));
+    }
+
     private static double[] MaxSplitValues(int count)
     {
         var data = new double[count];
@@ -414,6 +430,25 @@ public class CodegenSplitReductionTests
         Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Max));
         Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Sum));
         Assert.False(CodegenSplitReduction.IsSplittable(CodegenReduceKind.None));
+    }
+
+    /// <summary>Argmax metadata stays single-pass until split temporaries carry positions.</summary>
+    [Fact]
+    public void MaxWithArgmaxOutput_IsRefusedByEverySplitEntryPoint()
+    {
+        var spec = RowMaxWithIndices(64, 128);
+
+        Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Max));
+        Assert.False(CodegenSplitReduction.IsSplittable(spec));
+        Assert.Empty(CodegenSplitReduction.ChooseAxes(spec));
+        Assert.Null(CodegenSplitReduction.TryPlan(spec));
+
+        var whole = Assert.Throws<NotSupportedException>(
+            () => CodegenSplitReduction.Split(spec, 1));
+        var chunked = Assert.Throws<NotSupportedException>(
+            () => CodegenSplitReduction.SplitChunked(spec, 1, 8));
+        Assert.Contains("argmax secondary output", whole.Message, StringComparison.Ordinal);
+        Assert.Contains("argmax secondary output", chunked.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

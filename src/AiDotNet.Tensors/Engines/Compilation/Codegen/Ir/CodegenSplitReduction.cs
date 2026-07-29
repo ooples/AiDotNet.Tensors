@@ -81,10 +81,30 @@ public static class CodegenSplitReduction
     public static bool IsSplittable(CodegenReduceKind reduce) =>
         reduce is CodegenReduceKind.Sum or CodegenReduceKind.Max;
 
+    /// <summary>
+    /// Whether a complete spec can be split without dropping output semantics.
+    /// </summary>
+    /// <remarks>
+    /// A maximum with an argmax output needs both the winning value and its position to
+    /// survive the partial and combine passes. The current split carries only values, so
+    /// such a spec must remain single-pass until the temporary also stores positions.
+    /// </remarks>
+    public static bool IsSplittable(CodegenKernelSpec spec)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        return IsSplittable(spec.Reduce) &&
+            spec.SecondaryOutput is null && spec.SecondaryIndexExpr is null;
+    }
+
     /// <summary>Throws with the reason when a spec's reduction cannot be split.</summary>
     private static void RequireSplittable(CodegenKernelSpec spec)
     {
-        if (IsSplittable(spec.Reduce)) return;
+        if (IsSplittable(spec)) return;
+
+        if (spec.SecondaryOutput is not null || spec.SecondaryIndexExpr is not null)
+            throw new NotSupportedException(
+                "A split maximum cannot preserve its argmax secondary output yet; the " +
+                "partial and combine temporaries currently carry values only.");
 
         throw new NotSupportedException(
             "A split needs an ASSOCIATIVE reduction, so the combine can apply the same " +
@@ -198,7 +218,7 @@ public static class CodegenSplitReduction
         if (spec is null) throw new ArgumentNullException(nameof(spec));
 
         var chosen = new List<int>();
-        if (!IsSplittable(spec.Reduce)) return chosen;
+        if (!IsSplittable(spec)) return chosen;
 
         // Four blocks per SM is the point past which latency is hidden; a kernel already
         // there does not need the extra launch or the temporary.
