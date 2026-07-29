@@ -74,6 +74,10 @@ matmul B-transposed 128x96x64              8,192    0.000E+000  fp64    PASS
 linear: matmul+bias+relu 256x128x64       16,384    0.000E+000  fp64    PASS
 reduce-sum [512,256] over axis 1             512    0.000E+000  fp64    PASS
 reduce-max [512,256] over axis 1             512    0.000E+000  fp64    PASS
+depthwise 3x3 + bias + relu             100,352    0.000E+000  fp64    PASS
+dense 1x1 + bias + relu                 100,352    0.000E+000  fp64    PASS
+dense 3x3 + bias + relu                  25,088    0.000E+000  fp64    PASS
+conv-transpose 3x3 stride 2              30,752    0.000E+000  fp64    PASS
 
 front end: 13 passed, 0 failed
 ```
