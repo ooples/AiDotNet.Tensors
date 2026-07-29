@@ -208,32 +208,14 @@ internal static class KernelCatalogOracleTool
                 throw new InvalidOperationException(
                     entry.Name + " records " + winner + " but no split can be rebuilt.");
 
-            int tiledBlocks, tiledSteps, tiledInnerReduction, tiledM, tiledN;
-            int tiledBlockThreads;
-            try
-            {
-                var tiled = new PtxTiledOuterProductEmitter();
-                _ = tiled.Emit(split.Partial, major, minor);
-                var tiledPlan = tiled.Plan!;
-                tiledBlocks = tiledPlan.Blocks;
-                tiledSteps = tiledPlan.Steps;
-                tiledInnerReduction = tiledPlan.InnerReduction;
-                tiledM = tiledPlan.TileM;
-                tiledN = tiledPlan.TileN;
-                tiledBlockThreads = tiled.LaunchBlockThreads;
-            }
-            catch (NotSupportedException)
-            {
-                var tiled = new PtxTiledConv2DOuterProductEmitter();
-                _ = tiled.Emit(split.Partial, major, minor);
-                var tiledPlan = tiled.Plan!;
-                tiledBlocks = tiledPlan.Blocks;
-                tiledSteps = tiledPlan.Steps;
-                tiledInnerReduction = tiledPlan.InnerReduction;
-                tiledM = tiledPlan.TileM;
-                tiledN = tiledPlan.TileN;
-                tiledBlockThreads = tiled.LaunchBlockThreads;
-            }
+            PtxTiledOuterProductProgram tiled = PtxTiledOuterProductDispatcher.Emit(
+                split.Partial, major, minor);
+            int tiledBlocks = tiled.Blocks;
+            int tiledSteps = tiled.Steps;
+            int tiledInnerReduction = tiled.InnerReduction;
+            int tiledM = tiled.TileM;
+            int tiledN = tiled.TileN;
+            int tiledBlockThreads = tiled.BlockThreads;
             long partialThreads = split.Partial.Space.TotalThreads;
             var partialSemantic = CodegenPerformanceModel.Predict(
                 split.Partial, partialThreads, 0, machine, tiledBlockThreads);

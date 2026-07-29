@@ -134,17 +134,17 @@ public sealed record CodegenAutotuneIdentity(
         text.Append("candidate=tiled-split-partial;");
         try
         {
-            try
-            {
-                text.Append(new PtxTiledOuterProductEmitter().Emit(
-                    spec, computeMajor, computeMinor));
-            }
-            catch (NotSupportedException first)
-            {
-                text.Append("outer-unsupported=").Append(first.Message).Append(';');
-                text.Append(new PtxTiledConv2DOuterProductEmitter().Emit(
-                    spec, computeMajor, computeMinor));
-            }
+            PtxTiledOuterProductProgram program = PtxTiledOuterProductDispatcher.Emit(
+                spec, computeMajor, computeMinor);
+            if (program.OuterProductRefusal is not null)
+                text.Append("outer-unsupported=")
+                    .Append(program.OuterProductRefusal).Append(';');
+            text.Append(program.Text);
+        }
+        catch (PtxTiledOuterProductDispatchException ex)
+        {
+            text.Append("outer-unsupported=").Append(ex.OuterProductRefusal).Append(';');
+            text.Append("unsupported=").Append(ex.Message);
         }
         catch (NotSupportedException ex)
         {

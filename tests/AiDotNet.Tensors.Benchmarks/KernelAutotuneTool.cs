@@ -433,24 +433,14 @@ internal static class KernelAutotuneTool
             uint partialBlocks, partialBlockX, partialBlockY;
             if (tiledPartial)
             {
-                try
-                {
-                    var partialEmitter = new PtxTiledOuterProductEmitter();
-                    partialPtx = partialEmitter.Emit(plan.Partial,
-                        runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                    partialBlocks = partialEmitter.LaunchBlocks;
-                    partialBlockX = checked((uint)partialEmitter.LaunchBlockThreads);
-                    partialBlockY = 1;
-                }
-                catch (NotSupportedException)
-                {
-                    var partialEmitter = new PtxTiledConv2DOuterProductEmitter();
-                    partialPtx = partialEmitter.Emit(plan.Partial,
-                        runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                    partialBlocks = partialEmitter.LaunchBlocks;
-                    partialBlockX = checked((uint)partialEmitter.LaunchBlockThreads);
-                    partialBlockY = 1;
-                }
+                PtxTiledOuterProductProgram partial =
+                    PtxTiledOuterProductDispatcher.Emit(
+                        plan.Partial, runtime.ComputeCapabilityMajor,
+                        runtime.ComputeCapabilityMinor);
+                partialPtx = partial.Text;
+                partialBlocks = partial.LaunchBlocks;
+                partialBlockX = checked((uint)partial.BlockThreads);
+                partialBlockY = 1;
             }
             else
             {
