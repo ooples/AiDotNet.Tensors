@@ -1445,14 +1445,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // the first Step() of any double-precision compiled plan
                 // whose parameters happen to round-up the bucket (e.g.
                 // GraFPrint's 53-layer BN pyramid).
-                gradArrays[i] = _preAllocatedGrads[i].GetLiveBackingArrayAllowingPaddingOrNull()
-                    ?? _preAllocatedGrads[i].GetDataArray();
+                gradArrays[i] = BindInternalStepBuffer(
+                    _preAllocatedGrads[i], $"preallocated gradient {i}");
             }
             _cachedGradArrays = gradArrays;
-            _cachedLossGradSeedArray = _lossGradSeed.GetLiveBackingArrayAllowingPaddingOrNull()
-                ?? _lossGradSeed.GetDataArray();
-            _cachedLossGradDestArray = _lossGradDest?.GetLiveBackingArrayAllowingPaddingOrNull()
-                ?? _lossGradDest?.GetDataArray();
+            _cachedLossGradSeedArray = BindInternalStepBuffer(_lossGradSeed, "loss gradient seed");
+            _cachedLossGradDestArray = _lossGradDest is null
+                ? null
+                : BindInternalStepBuffer(_lossGradDest, "loss gradient destination");
         }
 
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
@@ -1902,6 +1902,93 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    /// <summary>
+    /// Binds an internal compiled-step buffer whose generated delegates require
+    /// zero-based live storage. These tensors are allocated by the plan itself;
+    /// accepting a detached copy here would silently discard backward writes.
+    /// </summary>
+    private static T[] BindInternalStepBuffer(Tensor<T> tensor, string role)
+    {
+        var backing = tensor.GetCpuBackingForContiguousWrite(out int offset);
+        if (backing is null || offset != 0 || backing.Length < tensor.Length)
+            throw new InvalidOperationException(
+                $"Compiled {role} must expose zero-offset writable CPU storage; " +
+                $"shape=[{string.Join(",", tensor.Shape)}], offset={offset}, " +
+                $"backingLength={backing?.Length ?? 0}.");
+        return backing;
+    }
+
+    /// <summary>
+    /// Binds a CPU optimizer operand without losing view addressing. Contiguous
+    /// managed storage stays zero-copy and carries an explicit base offset;
+    /// non-contiguous or non-array storage uses a persistent logical staging
+    /// buffer that is refreshed/committed around each optimizer step.
+    /// </summary>
+    private static T[] BindCpuOptimizerTensor(
+        Tensor<T> tensor, out int offset, out bool requiresStaging)
+    {
+        if (tensor.Device != TensorDevice.CPU)
+            throw new InvalidOperationException(
+                $"A fused CPU optimizer cannot stage tensor shape [{string.Join(",", tensor.Shape)}] " +
+                $"from device {tensor.Device} without an attached backend buffer.");
+        if (tensor.IsSparse)
+            throw new NotSupportedException(
+                "Compiled fused optimizers do not support sparse parameter or gradient storage.");
+        if (tensor.IsReadOnlyOptimizerStorage)
+            throw new InvalidOperationException(
+                "Compiled fused optimizers cannot update read-only memory-mapped storage.");
+
+        var backing = tensor.GetCpuBackingForContiguousWrite(out offset);
+        if (backing is not null)
+        {
+            // Preserve the existing lazy/streaming convention: an empty live
+            // backing means the parameter was not materialized/exercised and
+            // the fused updater skips it without forcing residency.
+            if (backing.Length == 0)
+            {
+                offset = 0;
+                requiresStaging = false;
+                return backing;
+            }
+
+            if (offset < 0 || offset > backing.Length - tensor.Length)
+                throw new InvalidOperationException(
+                    $"Tensor shape [{string.Join(",", tensor.Shape)}] exposes invalid optimizer backing " +
+                    $"bounds: offset={offset}, logicalLength={tensor.Length}, backingLength={backing.Length}.");
+
+            requiresStaging = false;
+            return backing;
+        }
+
+        var staged = new T[tensor.Length];
+        tensor.CopyLogicalTo(staged);
+        offset = 0;
+        requiresStaging = true;
+        return staged;
+    }
+
+    private static void RefreshOptimizerStaging(
+        Tensor<T>[] tensors, T[][] buffers, bool[] requiresStaging)
+    {
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            if (!requiresStaging[i] || buffers[i].Length == 0)
+                continue;
+            tensors[i].CopyLogicalTo(buffers[i]);
+        }
+    }
+
+    private static void CommitOptimizerStaging(
+        Tensor<T>[] tensors, T[][] buffers, bool[] requiresStaging)
+    {
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            if (!requiresStaging[i] || buffers[i].Length == 0)
+                continue;
+            tensors[i].CopyFromArray(buffers[i]);
+        }
+    }
+
     private unsafe void ConfigureOptimizerFloat(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
         FusedOptimizerExtras extras)
@@ -1924,6 +2011,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int paramCount = _parameters.Length;
         var paramArrays = new float[paramCount][];
         var gradArrays = new float[paramCount][];
+        var paramOffsets = new int[paramCount];
+        var gradOffsets = new int[paramCount];
+        var stagedParams = new bool[paramCount];
+        var stagedGrads = new bool[paramCount];
         var lengths = new int[paramCount];
 
         // Momentum / first moment buffers (Adam, SGD+momentum, etc.)
@@ -1969,6 +2060,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuVScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
+        var gpuGradUploadScratch = new float[paramCount][];
 
         // Issue #350: GetDataArray() returns a COPY when the parameter tensor's
         // backing storage is pool-padded (e.g. logical length 6 on a 16-slot
@@ -2034,11 +2126,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // Gradient is CPU-resident — bind its live CPU
                         // backing as gradArrays[p]; the per-step closure
                         // will upload it to a GPU staging buffer.
-                        var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                        if (liveGrad is not null)
-                            gradArrays[p] = (float[])(object)liveGrad;
-                        else
-                            gradArrays[p] = Array.Empty<float>();
+                        var boundGrad = BindCpuOptimizerTensor(
+                            _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                        gradArrays[p] = (float[])(object)boundGrad;
                     }
                 }
                 else
@@ -2107,32 +2197,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
                 paramArrays[p] = Array.Empty<float>();
+                paramOffsets[p] = 0;
                 continue;
             }
 
-            // CPU path. For non-trivial layouts (views, non-zero offset)
-            // the live-backing accessor returns null and we throw — that's
-            // a "should never happen for params registered with
-            // CompileTraining" condition and a silent fallback to a copy
-            // would just resurrect the Issue #350 stale-buffer bug.
-            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
-            if (liveParam is null)
-                throw new InvalidOperationException(
-                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
-                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset). " +
-                    $"ConfigureOptimizer requires either a contiguous CPU tensor or a GPU-resident tensor with " +
-                    $"a backend-attached buffer (TryGetGpuBuffer() returns non-null). For non-contiguous views, " +
-                    $"call .Contiguous() before registering with CompileTraining.");
-            paramArrays[p] = (float[])(object)liveParam;
+            // CPU path. Preserve view semantics: contiguous views bind their
+            // real backing plus an explicit offset; non-contiguous/native-memory
+            // views use a persistent gather/update/scatter staging buffer.
+            var boundParam = BindCpuOptimizerTensor(
+                _parameters[p], out paramOffsets[p], out stagedParams[p]);
+            paramArrays[p] = (float[])(object)boundParam;
             if (_gradients[p] is not null)
             {
-                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                if (liveGrad is null)
-                    throw new InvalidOperationException(
-                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
-                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage so the fused " +
-                        $"optimizer step reads the current gradient values produced by each plan.Step()'s backward pass.");
-                gradArrays[p] = (float[])(object)liveGrad;
+                var boundGrad = BindCpuOptimizerTensor(
+                    _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                gradArrays[p] = (float[])(object)boundGrad;
             }
             else
             {
@@ -2212,22 +2291,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int p = 0; p < paramCount; p++)
             {
                 if (paramArrays[p].Length == 0) continue; // GPU-resident: gate rejects this combo
-                Array.Copy(paramArrays[p], m[p], lengths[p]); // z ← param₀
-                Array.Copy(paramArrays[p], v[p], lengths[p]); // x ← param₀
+                Array.Copy(paramArrays[p], paramOffsets[p], m[p], 0, lengths[p]); // z ← param₀
+                Array.Copy(paramArrays[p], paramOffsets[p], v[p], 0, lengths[p]); // x ← param₀
             }
             float sfBeta = extras.SfBeta;
             _preForwardParamTransform = () =>
             {
+                RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
                 for (int p = 0; p < paramCount; p++)
                 {
                     int lenY = lengths[p];
                     if (paramArrays[p].Length == 0) continue;
-                    fixed (float* pY = paramArrays[p], pZ = m[p], pX = v[p])
+                    fixed (float* pY = &paramArrays[p][paramOffsets[p]], pZ = m[p], pX = v[p])
                         FusedOptimizer.ScheduleFreeYUpdateSimd(pY, pZ, pX, lenY, sfBeta);
                     // Pre-forward y-write also mutates the live backing → keep the resident GPU
                     // buffer coherent so the forward reads y, not stale pre-step weights (#739 review).
                     MarkHostWeightMutated(p);
                 }
+                CommitOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
             };
         }
         _optimizerRuntimeState = new FusedOptimizerRuntimeState
@@ -2265,6 +2346,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _optimizerUpdate = () =>
         {
+            RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+            RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
+            try
+            {
             _optimizerStep++;
             float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
             float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
@@ -2293,7 +2378,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
-                    fixed (float* pGrad = gradArrays[p], pPrev = m[p])
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]], pPrev = m[p])
                         for (int i = 0; i < len2; i++) inner += (double)pGrad[i] * pPrev[i];
                 }
                 scalarState.HypergradientAdjustment += exHyperLr * (float)inner;
@@ -2303,7 +2388,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Skip params with no gradient OR no materialized weight backing (#1738).
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
-                    fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
+                    fixed (float* pParam = &paramArrays[p][paramOffsets[p]],
+                           pGrad = &gradArrays[p][gradOffsets[p]], pPrev = m[p])
                         for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
                     MarkHostWeightMutated(p);
                 }
@@ -2318,7 +2404,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
-                    fixed (float* pGrad = gradArrays[p], pS = m[p])
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]], pS = m[p])
                         for (int i = 0; i < len2; i++)
                         {
                             pS[i] += gamma * pGrad[i];
@@ -2336,7 +2422,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Skip params with no gradient OR no materialized weight backing (#1738).
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
-                    fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
+                    fixed (float* pParam = &paramArrays[p][paramOffsets[p]],
+                           pGrad = &gradArrays[p][gradOffsets[p]])
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
                     MarkHostWeightMutated(p);
                 }
@@ -2357,10 +2444,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
-                    fixed (float* pZ = m[p], pX = v[p], pGrad = gradArrays[p])
+                    fixed (float* pZ = m[p], pX = v[p],
+                           pGrad = &gradArrays[p][gradOffsets[p]])
                         wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
                             pZ, pX, pGrad, len2, lr, scalarState.ScheduleFreeWeightSum);
-                    Array.Copy(v[p], paramArrays[p], len2); // live backing ← x (eval copy)
+                    Array.Copy(v[p], 0, paramArrays[p], paramOffsets[p], len2); // live backing ← x (eval copy)
                     MarkHostWeightMutated(p);
                 }
                 scalarState.ScheduleFreeWeightSum = wsNext;
@@ -2485,11 +2573,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         float[] hostGrad = gradArrays[p];
                         if (hostGrad.Length == 0)
                         {
-                            var liveGrad = _gradients[p]?.GetLiveBackingArrayAllowingPaddingOrNull();
-                            hostGrad = liveGrad is not null ? (float[])(object)liveGrad : Array.Empty<float>();
+                            if (_gradients[p] is not null)
+                            {
+                                var rebound = BindCpuOptimizerTensor(
+                                    _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                                hostGrad = (float[])(object)rebound;
+                                gradArrays[p] = hostGrad;
+                                if (stagedGrads[p] && hostGrad.Length != 0)
+                                    _gradients[p].CopyLogicalTo((T[])(object)hostGrad);
+                            }
                         }
                         if (hostGrad.Length == 0) continue; // no grad recorded
-                        gradBuf = gpuBe.AllocateBuffer(hostGrad);
+                        float[] uploadGrad = hostGrad;
+                        if (gradOffsets[p] != 0)
+                        {
+                            uploadGrad = gpuGradUploadScratch[p] ??= new float[len];
+                            hostGrad.AsSpan(gradOffsets[p], len).CopyTo(uploadGrad);
+                        }
+                        gradBuf = gpuBe.AllocateBuffer(uploadGrad);
                         gradTransient = true;
                     }
                     bool diagAU = p == 0 && _optimizerStep == 6 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1";
@@ -2625,7 +2726,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // ~17× slower eager autograd tape — the exact UnifiedMultimodal regression.
                 if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
-                fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
+                fixed (float* pParam = &paramArrays[p][paramOffsets[p]],
+                       pGrad = &gradArrays[p][gradOffsets[p]],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
@@ -2783,6 +2885,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // resident buffer makes the next forward re-upload the updated host weights.
                 MarkHostWeightMutated(p);
             }
+            }
+            finally
+            {
+                CommitOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+                CommitOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
+            }
         };
     }
 
@@ -2808,6 +2916,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int groupCount = groupSchedules.Count;
         var paramArrays = new float[paramCount][];
         var gradArrays = new float[paramCount][];
+        var paramOffsets = new int[paramCount];
+        var gradOffsets = new int[paramCount];
+        var stagedParams = new bool[paramCount];
+        var stagedGrads = new bool[paramCount];
         var lengths = new int[paramCount];
         var m = new float[paramCount][];
         var v = new float[paramCount][];
@@ -2845,6 +2957,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuVScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
+        var gpuGradUploadScratch = new float[paramCount][];
 
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
@@ -2885,8 +2998,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     else
                     {
-                        var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                        gradArrays[p] = liveGrad is not null ? (float[])(object)liveGrad : Array.Empty<float>();
+                        var boundGrad = BindCpuOptimizerTensor(
+                            _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                        gradArrays[p] = (float[])(object)boundGrad;
                     }
                 }
                 else
@@ -2954,25 +3068,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
                 paramArrays[p] = Array.Empty<float>();
+                paramOffsets[p] = 0;
                 continue;
             }
 
-            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
-            if (liveParam is null)
-                throw new InvalidOperationException(
-                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
-                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset). " +
-                    $"ConfigureOptimizerGrouped requires either a contiguous CPU tensor or a GPU-resident tensor with " +
-                    $"a backend-attached buffer (TryGetGpuBuffer() returns non-null).");
-            paramArrays[p] = (float[])(object)liveParam;
+            var boundParam = BindCpuOptimizerTensor(
+                _parameters[p], out paramOffsets[p], out stagedParams[p]);
+            paramArrays[p] = (float[])(object)boundParam;
             if (_gradients[p] is not null)
             {
-                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                if (liveGrad is null)
-                    throw new InvalidOperationException(
-                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
-                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage.");
-                gradArrays[p] = (float[])(object)liveGrad;
+                var boundGrad = BindCpuOptimizerTensor(
+                    _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                gradArrays[p] = (float[])(object)boundGrad;
             }
             else
             {
@@ -3060,6 +3167,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _optimizerUpdate = () =>
         {
+            RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+            RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
+            try
+            {
             _optimizerStep++;
             float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
             float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
@@ -3097,7 +3208,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (gradBuf is null)
                     {
                         if (gradArrays[p].Length == 0) continue;
-                        gradBuf = gpuBe.AllocateBuffer(gradArrays[p]);
+                        float[] hostGrad = gradArrays[p];
+                        if (gradOffsets[p] != 0)
+                        {
+                            float[] scratch = gpuGradUploadScratch[p] ??= new float[len];
+                            hostGrad.AsSpan(gradOffsets[p], len).CopyTo(scratch);
+                            hostGrad = scratch;
+                        }
+                        gradBuf = gpuBe.AllocateBuffer(hostGrad);
                         gradTransient = true;
                     }
                     try
@@ -3206,7 +3324,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // unexercised layers; see the same guard in ConfigureOptimizerFloat). #1738.
                 if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
 
-                fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
+                fixed (float* pParam = &paramArrays[p][paramOffsets[p]],
+                       pGrad = &gradArrays[p][gradOffsets[p]],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
@@ -3342,6 +3461,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // bypassed under a resident/capture scope, so the bump alone is insufficient).
                 MarkHostWeightMutated(p);
             }
+            }
+            finally
+            {
+                CommitOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+                CommitOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
+            }
         };
     }
 
@@ -3365,6 +3490,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int paramCount = _parameters.Length;
         var paramArrays = new double[paramCount][];
         var gradArrays = new double[paramCount][];
+        var paramOffsets = new int[paramCount];
+        var gradOffsets = new int[paramCount];
+        var stagedParams = new bool[paramCount];
+        var stagedGrads = new bool[paramCount];
         var lengths = new int[paramCount];
         var m = new double[paramCount][];
         var v = new double[paramCount][];
@@ -3379,23 +3508,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // straight through to _parameters[p].
         for (int p = 0; p < paramCount; p++)
         {
-            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
-            if (liveParam is null)
-                throw new InvalidOperationException(
-                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
-                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
-                    $"ConfigureOptimizer requires every registered parameter to be a contiguous CPU tensor so " +
-                    $"the fused optimizer step can mutate the caller's tensor in place.");
-            paramArrays[p] = (double[])(object)liveParam;
+            var boundParam = BindCpuOptimizerTensor(
+                _parameters[p], out paramOffsets[p], out stagedParams[p]);
+            paramArrays[p] = (double[])(object)boundParam;
             if (_gradients[p] is not null)
             {
-                // Fail fast on copy-fallback (see ConfigureOptimizerFloat for full rationale).
-                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                if (liveGrad is null)
-                    throw new InvalidOperationException(
-                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
-                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage.");
-                gradArrays[p] = (double[])(object)liveGrad;
+                var boundGrad = BindCpuOptimizerTensor(
+                    _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                gradArrays[p] = (double[])(object)boundGrad;
             }
             else
             {
@@ -3418,6 +3538,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
             v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+        }
+
+        bool multiTensorEligible = true;
+        for (int p = 0; p < paramCount; p++)
+        {
+            if (paramOffsets[p] != 0 || gradOffsets[p] != 0 || stagedParams[p] || stagedGrads[p])
+            {
+                multiTensorEligible = false;
+                break;
+            }
         }
 
         _optimizerStep = 0;
@@ -3447,6 +3577,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _optimizerUpdate = () =>
         {
+            RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+            RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
+            try
+            {
             _optimizerStep++;
             // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
             // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
@@ -3461,16 +3595,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // loop below (same math, same per-tensor SIMD/scalar-tail split). This
             // (non-grouped double) path is pure CPU fp32-moment AdamW — no GPU-resident
             // or bf16/int8 branch to preserve — so the fast path is unconditional here.
-            if (optType == OptimizerType.AdamW)
+            if (multiTensorEligible && optType == OptimizerType.AdamW)
             {
                 FusedOptimizer.AdamWUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
                     lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                for (int p = 0; p < paramCount; p++) MarkHostWeightMutated(p);
                 return;
             }
-            if (optType == OptimizerType.Adam)
+            if (multiTensorEligible && optType == OptimizerType.Adam)
             {
                 FusedOptimizer.AdamUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
                     lr, b1, b2, epsVal, stepBc1, stepBc2);
+                for (int p = 0; p < paramCount; p++) MarkHostWeightMutated(p);
                 return;
             }
             for (int p = 0; p < paramCount; p++)
@@ -3478,7 +3614,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Skip params with no gradient OR no materialized weight backing (#1738).
                 if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
-                fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
+                fixed (double* pParam = &paramArrays[p][paramOffsets[p]],
+                       pGrad = &gradArrays[p][gradOffsets[p]],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
@@ -3513,6 +3650,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
                     }
                 }
+                MarkHostWeightMutated(p);
+            }
+            }
+            finally
+            {
+                CommitOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+                CommitOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             }
         };
     }
@@ -3535,6 +3679,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int groupCount = groupSchedules.Count;
         var paramArrays = new double[paramCount][];
         var gradArrays = new double[paramCount][];
+        var paramOffsets = new int[paramCount];
+        var gradOffsets = new int[paramCount];
+        var stagedParams = new bool[paramCount];
+        var stagedGrads = new bool[paramCount];
         var lengths = new int[paramCount];
         var m = new double[paramCount][];
         var v = new double[paramCount][];
@@ -3549,22 +3697,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
         {
-            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
-            if (liveParam is null)
-                throw new InvalidOperationException(
-                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
-                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
-                    $"ConfigureOptimizerGrouped requires every registered parameter to be a contiguous CPU tensor.");
-            paramArrays[p] = (double[])(object)liveParam;
+            var boundParam = BindCpuOptimizerTensor(
+                _parameters[p], out paramOffsets[p], out stagedParams[p]);
+            paramArrays[p] = (double[])(object)boundParam;
             if (_gradients[p] is not null)
             {
-                // Fail fast on copy-fallback (see ConfigureOptimizerFloat for full rationale).
-                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                if (liveGrad is null)
-                    throw new InvalidOperationException(
-                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
-                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage.");
-                gradArrays[p] = (double[])(object)liveGrad;
+                var boundGrad = BindCpuOptimizerTensor(
+                    _gradients[p], out gradOffsets[p], out stagedGrads[p]);
+                gradArrays[p] = (double[])(object)boundGrad;
             }
             else
             {
@@ -3617,6 +3757,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _optimizerUpdate = () =>
         {
+            RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+            RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
+            try
+            {
             _optimizerStep++;
             // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
             // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
@@ -3633,7 +3777,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 int len = lengths[p];
                 double lr = groupLrs[paramGroup[p]];
 
-                fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
+                fixed (double* pParam = &paramArrays[p][paramOffsets[p]],
+                       pGrad = &gradArrays[p][gradOffsets[p]],
                        pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
@@ -3668,6 +3813,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 $"Supported: SGD, Adam, AdamW.");
                     }
                 }
+                MarkHostWeightMutated(p);
+            }
+            }
+            finally
+            {
+                CommitOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
+                CommitOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             }
         };
     }
@@ -4912,10 +5064,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <see cref="LinearAlgebra.TensorBase{T}.GetLiveBackingArrayAllowingPaddingOrNull"/>
     /// which returns the actual pool-padded backing array, so pins point at the live
     /// storage and writes through the pin are visible to subsequent
-    /// <c>tensor.AsSpan()</c> / <c>tensor[i]</c> reads. Falls back to
-    /// <c>GetDataArray()</c> for non-contiguous / non-zero-offset / non-CPU tensors
-    /// (where GetDataArray returns a COPY) — those are filtered out by callers'
-    /// <c>IsContiguous</c> gates, so the fallback should never fire in practice.
+    /// <c>tensor.AsSpan()</c> / <c>tensor[i]</c> reads. Non-contiguous,
+    /// non-zero-offset, or non-CPU tensors are rejected: callers must select
+    /// the stride-aware engine fallback instead of pinning a detached copy.
     /// <para>
     /// The bug was: <c>GetDataArray()</c> returns a COPY when the tensor is
     /// ArrayPool-padded (logical Length=1 on a 16-slot bucket, for instance).
@@ -4928,7 +5079,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </para>
     /// </summary>
     private static float[] GetPinnableFloatBacking(Tensor<float> t)
-        => t.GetLiveBackingArrayAllowingPaddingOrNull() ?? t.GetDataArray();
+        => t.GetLiveBackingArrayAllowingPaddingOrNull()
+            ?? throw new InvalidOperationException(
+                "A compiled specialization attempted to bind a tensor without zero-offset live FP32 storage.");
+
+    /// <summary>
+    /// Returns the live FP32 backing required by a specialized kernel, or
+    /// <see langword="null"/> when the tensor layout cannot be addressed as a
+    /// zero-offset dense array. A specialized writer must fall back to the
+    /// stride-aware engine path instead of binding a materialized copy.
+    /// </summary>
+    private static float[]? TryGetLiveFloatBacking(Tensor<T> tensor)
+        => ((Tensor<float>)(object)tensor).GetLiveBackingArrayAllowingPaddingOrNull();
 
     /// <summary>
     /// Returns the live FP64 backing required by a specialized kernel, or
@@ -4954,6 +5116,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (the consumer ViT-Base in PR #1224) hit the compiled-replay fast
         // path on their hottest op.
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // Every specialization below captures raw arrays or pins them for later
+        // replay. Enforce that contract once, centrally: views, sliced Memory<T>
+        // instances with a nonzero underlying array offset, GPU tensors, and
+        // other non-addressable layouts must use the stride-aware engine path.
+        // Falling back is both correct and intentionally preferable to binding
+        // a materialized copy that can stale-read a parameter or orphan writes.
+        if (typeof(T) == typeof(float))
+        {
+            if (TryGetLiveFloatBacking(step.OutputBuffer) is null)
+                return null;
+            for (int i = 0; i < step.Inputs.Length; i++)
+                if (TryGetLiveFloatBacking(step.Inputs[i]) is null)
+                    return null;
+        }
+        else
+        {
+            if (TryGetLiveDoubleBacking(step.OutputBuffer) is null)
+                return null;
+            for (int i = 0; i < step.Inputs.Length; i++)
+                if (TryGetLiveDoubleBacking(step.Inputs[i]) is null)
+                    return null;
+        }
 
         // MatMul forward (double): direct BLAS into output buffer.
         // Mirrors the float branch below but with double[] arrays and
@@ -5228,10 +5413,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
-            float[]? cOut = null;
-
             if (typeof(T) == typeof(float) && input.IsContiguous)
             {
+                var cOut = TryGetLiveFloatBacking(output);
+                if (cOut is null)
+                    return null;
                 // Pinned path: GCHandle once at compile time
                 var inH = PinAndTrack(
                     GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
@@ -5245,7 +5431,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var partials = new float[numChunks];
                     return eng =>
                     {
-                        cOut ??= (float[])(object)output.GetDataArray();
                         unsafe
                         {
                             float* p = (float*)inH.AddrOfPinnedObject();
@@ -5265,7 +5450,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 return eng =>
                 {
-                    cOut ??= (float[])(object)output.GetDataArray();
                     unsafe { cOut[0] = SimdKernels.SumUnsafe((float*)inH.AddrOfPinnedObject(), len); }
                 };
             }
@@ -5527,11 +5711,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 ? act : FusedActivationType.None;
             int M = input._shape[0], K = input._shape[1], N = weights._shape[1];
 
-            // Pre-fetch arrays at compile time — bypass EnsureMaterialized at replay
-            var inArr = (float[])(object)input.GetDataArray();
-            var wArr = (float[])(object)weights.GetDataArray();
-            var bArr = (float[])(object)bias.GetDataArray();
-            var oArr = (float[])(object)o.GetDataArray();
+            // Bind only live zero-offset storage. GetDataArray() may materialize a
+            // copy for pool-padded tensors and views. A copied output silently drops
+            // every replay write (AiDotNet#1346/Tensors#396); copied inputs also go
+            // stale after the trace. Unsupported layouts use the generic engine path.
+            var inArr = TryGetLiveFloatBacking(input);
+            var wArr = TryGetLiveFloatBacking(weights);
+            var bArr = TryGetLiveFloatBacking(bias);
+            var oArr = TryGetLiveFloatBacking(o);
+            if (inArr is null || wArr is null || bArr is null || oArr is null)
+                return null;
 
             var fusedAllowCachedB = allowCachedB;
             return eng =>
@@ -6087,13 +6276,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && step.OutputBuffer.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var cOut = TryGetLiveFloatBacking(o);
+            if (cOut is null)
+                return null;
             var inHandle = PinAndTrack(
                 GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
-            float[]? cOut = null;
             int len = inp.Length;
             return eng =>
             {
-                cOut ??= (float[])(object)o.GetDataArray();
                 unsafe
                 {
                     float* pIn = (float*)inHandle.AddrOfPinnedObject();
@@ -6372,8 +6562,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (ps is null || ps.Length != gradients.Length) return false;
             var pt = ps[p];
             if (pt is null) return true;
-            var pa = pt.GetLiveBackingArrayAllowingPaddingOrNull();
-            return pa is null || pa.Length == 0;
+            return !pt.HasMaterializedOptimizerStorage;
         }
 
         // CodeRabbit #425 review: detect GPU-resident gradients before the CPU
@@ -6421,19 +6610,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var tensor = gradients[p];
             if (tensor == null || SkipUnexercised(p)) continue;
-            var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
+            var arr = tensor.GetCpuBackingForStridedRead(out int offset);
             // SIMD fast path for the two dominant element types (float/double): the
             // norm is a per-step, full-gradient pass over the ENTIRE parameter set,
             // and the previous scalar loop with a per-element numOps.ToDouble virtual
             // call was ~19% of a large-model fused training step (PerfView). Only the
             // logical [0,len) region is read, so the pool-padding tail never leaks.
-            if (arr is double[] dNorm) totalNormSq += SumSquaresVectorized(dNorm, len);
-            else if (arr is float[] fNorm) totalNormSq += SumSquaresVectorized(fNorm, len);
+            if (tensor.IsContiguous && offset == 0 && arr is double[] dNorm)
+                totalNormSq += SumSquaresVectorized(dNorm, len);
+            else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
+                totalNormSq += SumSquaresVectorized(fNorm, len);
+            else if (tensor.IsContiguous && arr is not null)
+                for (int i = 0; i < len; i++)
+                {
+                    double v = numOps.ToDouble(arr[offset + i]);
+                    totalNormSq += v * v;
+                }
             else
                 for (int i = 0; i < len; i++)
                 {
-                    double v = numOps.ToDouble(arr[i]);
+                    double v = numOps.ToDouble(tensor.GetFlat(i));
                     totalNormSq += v * v;
                 }
         }
@@ -6447,13 +6644,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var tensor = gradients[p];
             if (tensor == null || SkipUnexercised(p)) continue;
-            var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
             int len = tensor.Length;
-            if (arr is double[] dScale) ScaleInPlaceVectorized(dScale, len, maxNorm / (totalNorm + 1e-6));
-            else if (arr is float[] fScale) ScaleInPlaceVectorized(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
+            var arr = tensor.GetCpuBackingForContiguousWrite(out int offset);
+            if (offset == 0 && arr is double[] dScale)
+            {
+                ScaleInPlaceVectorized(dScale, len, maxNorm / (totalNorm + 1e-6));
+                tensor.IncrementVersion();
+            }
+            else if (offset == 0 && arr is float[] fScale)
+            {
+                ScaleInPlaceVectorized(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
+                tensor.IncrementVersion();
+            }
             else
-                for (int i = 0; i < len; i++)
-                    arr[i] = numOps.Multiply(arr[i], scale);
+                tensor.ScaleLogicalInPlace(scale);
         }
     }
 
@@ -6649,6 +6853,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // Specialized backward delegates capture raw zero-based arrays. Apply
+        // the same centralized eligibility contract as specialized forward:
+        // parameter views, Memory<T> slices with a base offset, and native/GPU
+        // storage remain fully supported through the stride-aware compiled
+        // fallback, but must never be rebound to detached GetDataArray copies.
+        bool HasSpecializedBacking(Tensor<T> tensor) => typeof(T) == typeof(float)
+            ? TryGetLiveFloatBacking(tensor) is not null
+            : TryGetLiveDoubleBacking(tensor) is not null;
+
+        if (!HasSpecializedBacking(step.OutputBuffer))
+            return null;
+        for (int i = 0; i < step.Inputs.Length; i++)
+            if (!HasSpecializedBacking(step.Inputs[i]))
+                return null;
+
+        if (gradMap.TryGetValue(step.OutputBuffer, out var outputGrad)
+            && !HasSpecializedBacking(outputGrad))
+            return null;
+        for (int i = 0; i < step.Inputs.Length; i++)
+            if (gradMap.TryGetValue(step.Inputs[i], out var inputGrad)
+                && !HasSpecializedBacking(inputGrad))
+                return null;
 
         // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
         // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;

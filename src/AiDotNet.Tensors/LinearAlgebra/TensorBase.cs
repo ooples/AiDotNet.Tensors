@@ -2002,7 +2002,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // before the caller touches the buffer.
         if (_device != TensorDevice.CPU)
             return null;
-        return _storage.GetDataArray();
+        return _storage.TryGetBackingArraySegment(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
     }
 
     /// <summary>
@@ -2015,10 +2018,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// MUST NOT read or write past index <c>Length - 1</c> (the tail
     /// is pool padding and may alias another tensor's storage).
     ///
-    /// <para>Returns <c>null</c> only for views (non-contiguous, non-zero
-    /// offset) and non-CPU tensors — the cases where there is no single
-    /// CPU-side backing array that mutating the tensor through would be
-    /// well-defined. For pooled-padded layouts the live backing IS
+    /// <para>Returns <c>null</c> for views (non-contiguous or non-zero tensor
+    /// offset), non-CPU tensors, non-array memory managers, and sliced
+    /// <see cref="Memory{T}"/> instances whose underlying array begins at a
+    /// non-zero base offset. In those cases a zero-offset array-only kernel
+    /// cannot address the tensor correctly. For pooled-padded layouts whose
+    /// underlying array begins at zero, the live backing IS
     /// well-defined as "first Length elements", which is what the fused
     /// optimizer's per-parameter <c>fixed (T* p = …)</c> + <c>length</c>
     /// pin contract has always relied on.</para>
@@ -2038,8 +2043,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             return null;
         if (_device != TensorDevice.CPU)
             return null;
-        return _storage.GetDataArray();
+        return _storage.TryGetBackingArraySegment(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
     }
+
+    /// <summary>
+    /// Reports whether logical optimizer storage is currently materialized
+    /// without rehydrating a streaming weight. Unlike live-array accessors,
+    /// this remains true for views and native/memory-mapped CPU storage.
+    /// </summary>
+    internal bool HasMaterializedOptimizerStorage => Length == 0 || _storage.Length != 0;
+
+    /// <summary>Whether optimizer writes are prohibited by mapped storage.</summary>
+    internal bool IsReadOnlyOptimizerStorage => _storage.IsReadOnlyMapped;
 
     /// <summary>
     /// Returns the raw CPU backing array together with this view's storage offset,
@@ -2048,8 +2066,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// returned array is the shared backing store: the caller MUST only read, and
     /// MUST honour <see cref="Strides"/> + <paramref name="storageOffset"/> when
     /// addressing elements (the view may be permuted/sliced). Returns <c>null</c>
-    /// for GPU-resident tensors (no authoritative CPU array) — the caller should
-    /// then fall back to <see cref="Contiguous"/>. Triggers the same materialization
+    /// for GPU-resident tensors (no authoritative CPU array) and CPU storage
+    /// not backed by a managed array — the caller should then fall back to
+    /// <see cref="Contiguous"/>. The returned offset includes both the tensor
+    /// view offset and any underlying <see cref="Memory{T}"/> slice offset.
+    /// Triggers the same materialization
     /// guard as the span accessors so a lazy node is realized and a paged-out
     /// streaming weight rehydrated first. This is a READ-ONLY accessor (it does NOT
     /// privatize a copy-on-write clone): routing a write through the returned array
@@ -2063,8 +2084,102 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             storageOffset = 0;
             return null;
         }
-        storageOffset = _storageOffset;
-        return _storage.GetDataArray();
+        if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
+        {
+            storageOffset = checked(baseOffset + _storageOffset);
+            return array;
+        }
+
+        storageOffset = 0;
+        return null;
+    }
+
+    /// <summary>
+    /// Returns writable managed-array storage for a contiguous CPU tensor and
+    /// the absolute offset of its first logical element. Unlike the legacy
+    /// array-only live accessors, this preserves both tensor-view offsets and
+    /// the base offset of sliced <see cref="Memory{T}"/> storage.
+    /// </summary>
+    /// <remarks>
+    /// The accessor does not force streaming materialization. A dropped or
+    /// unmaterialized parameter therefore continues to expose its current
+    /// (possibly empty) storage and can retain the existing skip semantics.
+    /// Copy-on-write peers are privatized before a writable alias escapes.
+    /// </remarks>
+    internal T[]? GetCpuBackingForContiguousWrite(out int storageOffset)
+    {
+        EnsureOwnedForWrite();
+        if (_device != TensorDevice.CPU || !IsContiguous || _storage.IsReadOnlyMapped)
+        {
+            storageOffset = 0;
+            return null;
+        }
+
+        if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
+        {
+            storageOffset = checked(baseOffset + _storageOffset);
+            return array;
+        }
+
+        storageOffset = 0;
+        return null;
+    }
+
+    /// <summary>
+    /// Copies logical tensor elements into caller-owned contiguous storage
+    /// without allocating. Supports non-contiguous views.
+    /// </summary>
+    internal void CopyLogicalTo(Span<T> destination)
+    {
+        EnsureMaterialized();
+        if (destination.Length != Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must match tensor length ({Length}).",
+                nameof(destination));
+
+        if (Length == 0)
+            return;
+
+        var source = _storage.AsSpan();
+        if (IsContiguous)
+        {
+            source.Slice(_storageOffset, Length).CopyTo(destination);
+            return;
+        }
+
+        for (int i = 0; i < Length; i++)
+            destination[i] = source[FlatIndexToStorageIndex(i)];
+    }
+
+    /// <summary>
+    /// Scales every logical element in place while preserving strided-view and
+    /// copy-on-write semantics. This is the allocation-free fallback used when
+    /// a caller cannot safely obtain a contiguous managed-array alias.
+    /// </summary>
+    internal void ScaleLogicalInPlace(T scale)
+    {
+        EnsureMaterialized();
+        EnsureOwnedForWrite();
+        if (Length == 0)
+            return;
+
+        var destination = _storage.AsWritableSpan();
+        if (IsContiguous)
+        {
+            var logical = destination.Slice(_storageOffset, Length);
+            for (int i = 0; i < logical.Length; i++)
+                logical[i] = _numOps.Multiply(logical[i], scale);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+            {
+                int storageIndex = FlatIndexToStorageIndex(i);
+                destination[storageIndex] = _numOps.Multiply(destination[storageIndex], scale);
+            }
+        }
+
+        IncrementVersion();
     }
 
     // ================================================================
