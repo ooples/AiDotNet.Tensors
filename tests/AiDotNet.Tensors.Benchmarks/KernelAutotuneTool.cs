@@ -34,7 +34,8 @@ internal static class KernelAutotuneTool
     /// <summary>One candidate lowering: a name and the knobs that produce it.</summary>
     private sealed record Candidate(
         string Name, Action<PtxAffineEmitter>? Configure,
-        bool TiledContraction = false, bool TiledConv2D = false);
+        bool TiledContraction = false, bool TiledConv2D = false,
+        bool DepthwiseWeightGradient = false);
 
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
@@ -88,6 +89,11 @@ internal static class KernelAutotuneTool
         // A dense 3x3 row tile: stage three activation rows and all nine weights for a
         // channel slice, then reuse them across output channels and adjacent columns.
         new("tiled-conv2d", null, TiledConv2D: true),
+
+        // A cooperative reduction over contiguous NCHW positions. One block owns a
+        // (channel,kh) row, so all three kw accumulators share each dOut load instead
+        // of independently replaying the same reduction.
+        new("depthwise-weight-gradient", null, DepthwiseWeightGradient: true),
 
         new("no-tile", e => e.Coarsening = 1),
         new("tile2", e => { e.Coarsening = 2; }),
@@ -348,6 +354,15 @@ internal static class KernelAutotuneTool
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 blocks = tiled.LaunchBlocks;
                 blockX = checked((uint)tiled.LaunchBlockThreads);
+                blockY = 1;
+            }
+            else if (candidate.DepthwiseWeightGradient)
+            {
+                var cooperative = new PtxDepthwiseConv2DWeightGradientEmitter();
+                ptx = cooperative.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                blocks = cooperative.LaunchBlocks;
+                blockX = checked((uint)cooperative.LaunchBlockThreads);
                 blockY = 1;
             }
             else

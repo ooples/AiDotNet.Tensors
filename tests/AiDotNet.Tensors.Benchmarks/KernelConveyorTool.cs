@@ -399,6 +399,8 @@ internal static class KernelConveyorTool
                 ? "tiled contraction"
                 : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal)
                     ? "tiled conv2d"
+                : string.Equals(Winner, "depthwise-weight-gradient", StringComparison.Ordinal)
+                    ? "coop dW"
                 : Describe(Kernels[0].LoopedAxes);
     }
 
@@ -458,6 +460,31 @@ internal static class KernelConveyorTool
                 Console.WriteLine("    note: " + catalogName + " recorded tiled-conv2d " +
                                   "but it could not be rebuilt (" + ex.Message +
                                   "); using the affine kernel");
+            }
+        }
+
+        if (string.Equals(winner, "depthwise-weight-gradient", StringComparison.Ordinal))
+        {
+            try
+            {
+                var cooperative = new PtxDepthwiseConv2DWeightGradientEmitter();
+                string text = cooperative.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, cooperative.LaunchBlocks,
+                            checked((uint)cooperative.LaunchBlockThreads), 1,
+                            spec.Space.ReductionAxes.Length, 0, "dOut/kw"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName +
+                                  " recorded depthwise-weight-gradient but it could not " +
+                                  "be rebuilt (" + ex.Message + "); using the affine kernel");
             }
         }
 

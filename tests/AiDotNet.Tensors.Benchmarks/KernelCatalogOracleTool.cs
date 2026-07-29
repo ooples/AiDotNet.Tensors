@@ -300,6 +300,22 @@ internal static class KernelCatalogOracleTool
             shape = plan.TileM + "x" + plan.TileN + "x" + plan.TileK +
                 ", matrix+stream";
         }
+        else if (string.Equals(
+            winner, "depthwise-weight-gradient", StringComparison.Ordinal))
+        {
+            var emitter = new PtxDepthwiseConv2DWeightGradientEmitter();
+            _ = emitter.Emit(entry.Bench, major, minor);
+            var plan = emitter.Plan!;
+
+            // Every warp executes one dOut load and three neighbouring input loads per
+            // reduction step. The three outputs therefore share the dOut instruction;
+            // the affine split issued it independently for each tap.
+            long reductionWarps = (plan.ReductionElements + 31L) / 32L;
+            warpLoads = checked((long)plan.Blocks * reductionWarps * 4L);
+            uniqueBytes = semantic.UniqueBytes;
+            predictedUs = Ceiling(semantic);
+            shape = "cooperative (channel,kh), three kw, 256-thread tree";
+        }
         else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
         {
             var emitter = new PtxTiledConv2DEmitter();

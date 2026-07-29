@@ -67,6 +67,7 @@ public sealed record CodegenAutotuneIdentity(
             static e => e.EnableInputStaging = true);
         AppendTiledCandidate(text, spec, computeMajor, computeMinor);
         AppendTiledConv2DCandidate(text, spec, computeMajor, computeMinor);
+        AppendDepthwiseWeightGradientCandidate(text, spec, computeMajor, computeMinor);
 
         try
         {
@@ -158,6 +159,22 @@ public sealed record CodegenAutotuneIdentity(
         try
         {
             text.Append(new PtxTiledConv2DEmitter().Emit(
+                spec, computeMajor, computeMinor));
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
+    }
+
+    private static void AppendDepthwiseWeightGradientCandidate(
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
+    {
+        text.Append("candidate=depthwise-weight-gradient;");
+        try
+        {
+            text.Append(new PtxDepthwiseConv2DWeightGradientEmitter().Emit(
                 spec, computeMajor, computeMinor));
         }
         catch (NotSupportedException ex)
