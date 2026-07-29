@@ -35,14 +35,38 @@ internal static class KernelLimiterTool
     /// <summary>A kernel at or above this fraction of a roofline is done with that lever.</summary>
     private const double SaturatedAt = 70.0;
 
+    private const string L1Throughput =
+        "l1tex__throughput.avg.pct_of_peak_sustained_elapsed";
+    private const string DramThroughput =
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed";
+    private const string L2Throughput =
+        "lts__throughput.avg.pct_of_peak_sustained_elapsed";
+    private const string SmThroughput =
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed";
+    private const string GlobalLoads = "smsp__inst_executed_op_global_ld.sum";
+    private const string Duration = "gpu__time_duration.sum";
+    private const string LongScoreboard =
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct";
+    private const string ShortScoreboard =
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct";
+    private const string MioThrottle =
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct";
+    private const string Wait = "smsp__warp_issue_stalled_wait_per_warp_active.pct";
+    private const string NoInstruction =
+        "smsp__warp_issue_stalled_no_instruction_per_warp_active.pct";
+    private const string PipeAlu = "smsp__inst_executed_pipe_alu.sum";
+    private const string PipeFma = "smsp__inst_executed_pipe_fma.sum";
+    private const string PipeLsu = "smsp__inst_executed_pipe_lsu.sum";
+    private const string PipeCbu = "smsp__inst_executed_pipe_cbu.sum";
+
     private static readonly string[] Metrics =
     {
-        "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
-        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
-        "lts__throughput.avg.pct_of_peak_sustained_elapsed",
-        "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-        "smsp__inst_executed_op_global_ld.sum",
-        "gpu__time_duration.sum",
+        L1Throughput,
+        DramThroughput,
+        L2Throughput,
+        SmThroughput,
+        GlobalLoads,
+        Duration,
 
         // WHY A WARP IS NOT ISSUING. The throughput percentages above say which unit is
         // busiest; they do not say what the kernel is waiting on, and reading them as if
@@ -56,21 +80,21 @@ internal static class KernelLimiterTool
         // The stall breakdown said what neither could: mio_throttle 3.03%, so the load
         // pipe was never the bottleneck and no amount of load reduction could have helped.
         // These counters exist so that is visible BEFORE the work, not after it.
-        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
-        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
-        "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
-        "smsp__warp_issue_stalled_wait_per_warp_active.pct",
-        "smsp__warp_issue_stalled_no_instruction_per_warp_active.pct",
+        LongScoreboard,
+        ShortScoreboard,
+        MioThrottle,
+        Wait,
+        NoInstruction,
 
         // Instruction mix distinguishes an arithmetic kernel from one that merely has
         // high aggregate SM throughput. This matters for transposed convolution: its
         // exact-division guards can saturate integer/control issue while useful FMA work
         // remains modest. Calling that "compute bound" without the pipe mix points at
         // the wrong lever.
-        "smsp__inst_executed_pipe_alu.sum",
-        "smsp__inst_executed_pipe_fma.sum",
-        "smsp__inst_executed_pipe_lsu.sum",
-        "smsp__inst_executed_pipe_cbu.sum",
+        PipeAlu,
+        PipeFma,
+        PipeLsu,
+        PipeCbu,
     };
 
     /// <summary>
@@ -153,10 +177,10 @@ internal static class KernelLimiterTool
                 continue;
             }
 
-            double l1 = counters.GetValueOrDefault(Metrics[0]);
-            double dram = counters.GetValueOrDefault(Metrics[1]);
-            double l2 = counters.GetValueOrDefault(Metrics[2]);
-            double sm = counters.GetValueOrDefault(Metrics[3]);
+            double l1 = counters.GetValueOrDefault(L1Throughput);
+            double dram = counters.GetValueOrDefault(DramThroughput);
+            double l2 = counters.GetValueOrDefault(L2Throughput);
+            double sm = counters.GetValueOrDefault(SmThroughput);
 
             (string unit, double value) = new[]
             {
@@ -166,17 +190,17 @@ internal static class KernelLimiterTool
             bool saturated = value >= SaturatedAt;
             if (saturated) satisfied++; else unresolved++;
 
-            double longSb = counters.GetValueOrDefault(Metrics[6]);
-            double shortSb = counters.GetValueOrDefault(Metrics[7]);
-            double mio = counters.GetValueOrDefault(Metrics[8]);
-            double wait = counters.GetValueOrDefault(Metrics[9]);
-            double noInst = counters.GetValueOrDefault(Metrics[10]);
-            double globalLoads = counters.GetValueOrDefault(Metrics[4]);
-            double duration = counters.GetValueOrDefault(Metrics[5]);
-            double pipeAlu = counters.GetValueOrDefault(Metrics[11]);
-            double pipeFma = counters.GetValueOrDefault(Metrics[12]);
-            double pipeLsu = counters.GetValueOrDefault(Metrics[13]);
-            double pipeCbu = counters.GetValueOrDefault(Metrics[14]);
+            double longSb = counters.GetValueOrDefault(LongScoreboard);
+            double shortSb = counters.GetValueOrDefault(ShortScoreboard);
+            double mio = counters.GetValueOrDefault(MioThrottle);
+            double wait = counters.GetValueOrDefault(Wait);
+            double noInst = counters.GetValueOrDefault(NoInstruction);
+            double globalLoads = counters.GetValueOrDefault(GlobalLoads);
+            double duration = counters.GetValueOrDefault(Duration);
+            double pipeAlu = counters.GetValueOrDefault(PipeAlu);
+            double pipeFma = counters.GetValueOrDefault(PipeFma);
+            double pipeLsu = counters.GetValueOrDefault(PipeLsu);
+            double pipeCbu = counters.GetValueOrDefault(PipeCbu);
             double phaseShare = profile.ProgramDurationNs > 0
                 ? duration / profile.ProgramDurationNs * 100.0
                 : 0.0;
@@ -329,8 +353,8 @@ internal static class KernelLimiterTool
         foreach (IReadOnlyDictionary<string, double> values in phases.Values)
             if (Metrics.Any(metric => !values.ContainsKey(metric))) return null;
 
-        var dominant = phases.OrderByDescending(pair => pair.Value[Metrics[5]]).First();
-        double programDuration = phases.Values.Sum(values => values[Metrics[5]]);
+        var dominant = phases.OrderByDescending(pair => pair.Value[Duration]).First();
+        double programDuration = phases.Values.Sum(values => values[Duration]);
         return new ProfileResult(
             dominant.Key, dominant.Value, phases.Count, programDuration);
     }
