@@ -204,9 +204,16 @@ internal static class KernelOracleTool
             for (int d = 0; d < candidate.Indirect.Count; d++)
                 if (candidate.Indirect[d] is { } indirect
                     && spec.Inputs[indirect.IndexInput] == indexTensor)
-                    return indirect.Bound;
+                {
+                    if (indirect.Bound > 0) return indirect.Bound;
+                    throw new InvalidOperationException(
+                        "Index tensor '" + indexTensor.Name +
+                        "' has a consuming dimension with a non-positive bound.");
+                }
 
-        return 1;
+        throw new InvalidOperationException(
+            "Index tensor '" + indexTensor.Name +
+            "' is not consumed by any indirect binding.");
     }
 
     private static IEnumerable<CodegenTensorBinding> AllBindings(CodegenKernelSpec spec)
