@@ -88,6 +88,8 @@ public sealed class CodegenDepthwiseConv2DWeightGradientTests
         double[] expected = spec.Interpret(inputs);
 
         using var runtime = new DirectPtxRuntime();
+        Skip.If(runtime.ComputeCapabilityMajor < 7,
+            "The cooperative depthwise weight gradient requires sm_70+.");
         var emitter = new PtxDepthwiseConv2DWeightGradientEmitter();
         string ptx = emitter.Emit(
             spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
@@ -115,6 +117,8 @@ public sealed class CodegenDepthwiseConv2DWeightGradientTests
         _ = CreateInputs(spec, out var host);
 
         using var runtime = new DirectPtxRuntime();
+        Skip.If(runtime.ComputeCapabilityMajor < 7,
+            "The cooperative depthwise weight gradient requires sm_70+.");
         using var first = runtime.AllocateBytes((nuint)(host[0].Length * sizeof(float)));
         using var second = runtime.AllocateBytes((nuint)(host[1].Length * sizeof(float)));
         using var cooperativeOutput = runtime.AllocateBytes(
