@@ -7,6 +7,13 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Codegen;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class CodegenAutotuneCacheCollection
+{
+    public const string Name = nameof(CodegenAutotuneCacheCollection);
+}
+
+[Collection(CodegenAutotuneCacheCollection.Name)]
 public class CodegenAutotuneIdentityTests
 {
     [Fact]
