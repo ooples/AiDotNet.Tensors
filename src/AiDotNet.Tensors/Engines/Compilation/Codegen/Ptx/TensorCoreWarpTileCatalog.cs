@@ -102,7 +102,7 @@ public static class TensorCoreWarpTileCatalog
         // conflicts gone there is no shared-traffic saving to offset a big tile's occupancy
         // cost, and 2x2 or 2x4 won at three of the four measured shapes. cp.async is kept as
         // the default staging form because it won at the two large shapes, where it matters.
-        foreach (var (tileM, tileN) in new[] { (2, 4), (2, 2), (4, 2), (4, 4) })
+        foreach (var (tileM, tileN) in new[] { (2, 2), (2, 4), (4, 2), (4, 4) })
             if (m % (tileM * 32) == 0 && n % (tileN * 32) == 0)
                 return new Choice(tileM, tileN, AsyncCopy: true);
 

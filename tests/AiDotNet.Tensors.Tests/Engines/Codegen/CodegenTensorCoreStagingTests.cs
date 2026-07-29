@@ -29,10 +29,10 @@ public class CodegenTensorCoreStagingTests
     /// An emitter pinned to the 2x2 warp tile.
     /// </summary>
     /// <remarks>
-    /// The emitter now SELECTS the largest warp tile the shape allows, so a test about the
-    /// structure a particular tile produces -- how many mma instructions, how much shared
-    /// memory, how many stores -- has to pin one. See WarpTileSelection_PicksTheLargestThatFits
-    /// for the selector itself.
+    /// The emitter selects a measured tile or the smallest-first fallback, so a test about
+    /// the structure a particular tile produces -- how many mma instructions, how much shared
+    /// memory, how many stores -- has to pin one. See WarpTileSelection_FollowsTheLadder for
+    /// the selector itself.
     /// </remarks>
     private static PtxTensorCoreEmitter Tile2x2() =>
         new() { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
@@ -397,19 +397,16 @@ public class CodegenTensorCoreStagingTests
         Assert.Equal(4, CountOccurrences(ptx, "wmma.store.d.sync"));
     }
 
-    /// <summary>
-    /// The emitter picks the LARGEST warp tile whose block tile divides the output.
-    /// </summary>
+    /// <summary>The unmeasured fallback prefers the smallest tile that fits.</summary>
     /// <remarks>
-    /// Derived from `--warp-tile-sweep`, which verified and timed every candidate at four
-    /// shapes: the bigger tile won wherever it fits, by 1.28x at 2048^3 and 1.32x at 4096^3.
-    /// The mechanism is the one the profile named -- L1TEX falls from 92.34% to 61.38% and
-    /// the tensor pipe rises from 26.79% to 35.74%.
+    /// Derived from the post-padding `--warp-tile-sweep`: 2x2 won two of four measured shapes,
+    /// including 2048^3, while 2x4 and 4x2 won one each. Exact measured shapes bypass this
+    /// ladder through <see cref="TensorCoreWarpTileCatalog"/>.
     /// </remarks>
     [Theory]
-    [InlineData(128, 128, 2, 4)]      // 2x4 leads the ladder AFTER the padding fix
+    [InlineData(128, 128, 2, 2)]
     [InlineData(128, 64, 2, 2)]
-    [InlineData(64, 128, 2, 4)]
+    [InlineData(64, 128, 2, 2)]
     [InlineData(64, 64, 2, 2)]
     public void WarpTileSelection_FollowsTheLadder(int m, int n, int tileM, int tileN)
     {
