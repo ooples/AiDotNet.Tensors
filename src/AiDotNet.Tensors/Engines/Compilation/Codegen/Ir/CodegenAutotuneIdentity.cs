@@ -116,17 +116,9 @@ public sealed record CodegenAutotuneIdentity(
     private static void AppendTiledCandidate(
         StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        text.Append("candidate=tiled-contraction;");
-        try
-        {
-            text.Append(new PtxTiledContractionEmitter().Emit(
-                spec, computeMajor, computeMinor));
-        }
-        catch (NotSupportedException ex)
-        {
-            text.Append("unsupported=").Append(ex.Message);
-        }
-        text.Append(";end-candidate;");
+        AppendEmitterCandidate(text, "tiled-contraction", spec, computeMajor, computeMinor,
+            static (candidate, major, minor) =>
+                new PtxTiledContractionEmitter().Emit(candidate, major, minor));
     }
 
     private static void AppendTiledOuterProductCandidate(
@@ -157,43 +149,40 @@ public sealed record CodegenAutotuneIdentity(
     private static void AppendTiledConv2DCandidate(
         StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        text.Append("candidate=tiled-conv2d;");
-        try
-        {
-            text.Append(new PtxTiledConv2DEmitter().Emit(
-                spec, computeMajor, computeMinor));
-        }
-        catch (NotSupportedException ex)
-        {
-            text.Append("unsupported=").Append(ex.Message);
-        }
-        text.Append(";end-candidate;");
+        AppendEmitterCandidate(text, "tiled-conv2d", spec, computeMajor, computeMinor,
+            static (candidate, major, minor) =>
+                new PtxTiledConv2DEmitter().Emit(candidate, major, minor));
     }
 
     private static void AppendDepthwiseWeightGradientCandidate(
         StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        text.Append("candidate=depthwise-weight-gradient;");
-        try
-        {
-            text.Append(new PtxDepthwiseConv2DWeightGradientEmitter().Emit(
-                spec, computeMajor, computeMinor));
-        }
-        catch (NotSupportedException ex)
-        {
-            text.Append("unsupported=").Append(ex.Message);
-        }
-        text.Append(";end-candidate;");
+        AppendEmitterCandidate(text, "depthwise-weight-gradient", spec,
+            computeMajor, computeMinor,
+            static (candidate, major, minor) =>
+                new PtxDepthwiseConv2DWeightGradientEmitter().Emit(candidate, major, minor));
     }
 
     private static void AppendParityTransposedConv2DCandidate(
         StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        text.Append("candidate=parity-transposed;");
+        AppendEmitterCandidate(text, "parity-transposed", spec, computeMajor, computeMinor,
+            static (candidate, major, minor) =>
+                new PtxParityTransposedConv2DEmitter().Emit(candidate, major, minor));
+    }
+
+    private static void AppendEmitterCandidate(
+        StringBuilder text,
+        string name,
+        CodegenKernelSpec spec,
+        int computeMajor,
+        int computeMinor,
+        Func<CodegenKernelSpec, int, int, string> emit)
+    {
+        text.Append("candidate=").Append(name).Append(';');
         try
         {
-            text.Append(new PtxParityTransposedConv2DEmitter().Emit(
-                spec, computeMajor, computeMinor));
+            text.Append(emit(spec, computeMajor, computeMinor));
         }
         catch (NotSupportedException ex)
         {
