@@ -29,10 +29,11 @@ internal static class GpuBenchmarkEnvironment
     internal static void RequireNoForeignCompute(string label)
     {
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
-        int trustedOrchestrator = 0;
-        _ = int.TryParse(
+        int? trustedOrchestrator = int.TryParse(
             Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
-            out trustedOrchestrator);
+            out int orchestratorId) && orchestratorId > 0
+                ? orchestratorId
+                : null;
         string[] conflicts = FindComputeWorkloadConflicts(
             processMonitor, Environment.ProcessId, trustedOrchestrator);
         if (conflicts.Length != 0)
@@ -47,7 +48,7 @@ internal static class GpuBenchmarkEnvironment
     }
 
     internal static string[] FindComputeWorkloadConflicts(
-        string processMonitor, int currentProcessId, int trustedOrchestratorId = 0)
+        string processMonitor, int currentProcessId, int? trustedOrchestratorId = null)
     {
         var conflicts = new List<string>();
         foreach (string line in processMonitor.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -69,7 +70,7 @@ internal static class GpuBenchmarkEnvironment
             // only while it reports no SM sample ('-') or remains below the same
             // material-compute threshold used for C+G; if it starts doing work, it becomes
             // a conflict like anything else.
-            if (processId == trustedOrchestratorId &&
+            if (trustedOrchestratorId is > 0 && processId == trustedOrchestratorId &&
                 (smUtilization == "-" ||
                  (int.TryParse(smUtilization, out int orchestratorSm) &&
                   orchestratorSm <= MixedComputeConflictThresholdPercent)))
