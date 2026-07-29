@@ -86,43 +86,54 @@ internal static class HandWrittenKernelOracleTool
             MappedKernelNames.Length, registered.Count);
         Console.WriteLine("unmapped kernels receive no invented ceiling");
 
+        Console.WriteLine();
+        Console.WriteLine("{0,-32} {1,14} {2,10} {3,9} {4,8}",
+            "incumbent kernel", "measured", "ceiling", "% of max", "limiter");
+
+        int failures = 0;
+        void Record(bool succeeded)
+        {
+            if (!succeeded) failures++;
+        }
+
+        Record(ScoreBinary(backend, machine, major, minor,
+            "add_vectors_vec4", multiply: false));
+        Record(ScoreBinary(backend, machine, major, minor,
+            "multiply_vectors_vec4", multiply: true));
+        Record(ScoreUnary(backend, machine, major, minor,
+            "relu_vec4", CodegenActivationKind.ReLU,
+            static (b, input, output, count) => b.Relu(input, output, count)));
+        Record(ScoreUnary(backend, machine, major, minor,
+            "sigmoid_vec4", CodegenActivationKind.Sigmoid,
+            static (b, input, output, count) => b.Sigmoid(input, output, count)));
+        Record(ScoreUnary(backend, machine, major, minor,
+            "tanh_activation_vec4", CodegenActivationKind.Tanh,
+            static (b, input, output, count) => b.Tanh(input, output, count)));
+        Record(ScoreUnary(backend, machine, major, minor,
+            "gelu_vec4", CodegenActivationKind.Gelu,
+            static (b, input, output, count) => b.Gelu(input, output, count)));
+        Record(ScoreEmbeddingForward(backend, machine, major, minor));
+        Record(ScoreSgdMomentum(backend, machine, major, minor));
+        Record(ScoreAxis(backend, machine, major, minor,
+            "sum_axis", CodegenReduceKind.Sum,
+            static (b, input, output, rows, inner) => b.SumAxis(input, output, rows, inner)));
+        Record(ScoreAxis(backend, machine, major, minor,
+            "mean_axis", CodegenReduceKind.Sum,
+            static (b, input, output, rows, inner) => b.MeanAxis(input, output, rows, inner),
+            mean: true));
+        Record(ScoreAxis(backend, machine, major, minor,
+            "max_axis", CodegenReduceKind.Max,
+            static (b, input, output, rows, inner) => b.MaxAxis(input, output, rows, inner)));
+
+        if (failures != 0)
+            throw new InvalidOperationException(
+                failures + " mapped hand-written kernel(s) failed; coverage ledger not written.");
+
         string coveragePath = ValueOf(args, "--coverage-out") ??
             Path.Combine(Directory.GetCurrentDirectory(), "artifacts",
                 "handwritten-kernel-coverage.tsv");
         WriteCoverageLedger(coveragePath, registered);
         Console.WriteLine("coverage debt ledger: {0}", coveragePath);
-        Console.WriteLine();
-        Console.WriteLine("{0,-32} {1,14} {2,10} {3,9} {4,8}",
-            "incumbent kernel", "measured", "ceiling", "% of max", "limiter");
-
-        ScoreBinary(backend, machine, major, minor,
-            "add_vectors_vec4", multiply: false);
-        ScoreBinary(backend, machine, major, minor,
-            "multiply_vectors_vec4", multiply: true);
-        ScoreUnary(backend, machine, major, minor,
-            "relu_vec4", CodegenActivationKind.ReLU,
-            static (b, input, output, count) => b.Relu(input, output, count));
-        ScoreUnary(backend, machine, major, minor,
-            "sigmoid_vec4", CodegenActivationKind.Sigmoid,
-            static (b, input, output, count) => b.Sigmoid(input, output, count));
-        ScoreUnary(backend, machine, major, minor,
-            "tanh_activation_vec4", CodegenActivationKind.Tanh,
-            static (b, input, output, count) => b.Tanh(input, output, count));
-        ScoreUnary(backend, machine, major, minor,
-            "gelu_vec4", CodegenActivationKind.Gelu,
-            static (b, input, output, count) => b.Gelu(input, output, count));
-        ScoreEmbeddingForward(backend, machine, major, minor);
-        ScoreSgdMomentum(backend, machine, major, minor);
-        ScoreAxis(backend, machine, major, minor,
-            "sum_axis", CodegenReduceKind.Sum,
-            static (b, input, output, rows, inner) => b.SumAxis(input, output, rows, inner));
-        ScoreAxis(backend, machine, major, minor,
-            "mean_axis", CodegenReduceKind.Sum,
-            static (b, input, output, rows, inner) => b.MeanAxis(input, output, rows, inner),
-            mean: true);
-        ScoreAxis(backend, machine, major, minor,
-            "max_axis", CodegenReduceKind.Max,
-            static (b, input, output, rows, inner) => b.MaxAxis(input, output, rows, inner));
 
         Console.WriteLine();
         Console.WriteLine("Adam/AdamW are registered incumbents but remain unmapped: the current spec");
@@ -131,7 +142,7 @@ internal static class HandWrittenKernelOracleTool
         Console.WriteLine("of scoring a different operator under the Adam name.");
     }
 
-    private static void ScoreUnary(
+    private static bool ScoreUnary(
         CudaBackend backend, CodegenMachineModel machine, int major, int minor,
         string kernelName, CodegenActivationKind activation,
         Action<CudaBackend, IGpuBuffer, IGpuBuffer, int> launch)
@@ -141,11 +152,11 @@ internal static class HandWrittenKernelOracleTool
         using var output = backend.AllocateBuffer(Count);
         var spec = IncumbentSemanticSpecs.Unary(
             kernelName + "_semantic", Count, activation);
-        Score(backend, machine, major, minor, kernelName, spec,
+        return Score(backend, machine, major, minor, kernelName, spec,
             () => launch(backend, input, output, Count));
     }
 
-    private static void ScoreBinary(
+    private static bool ScoreBinary(
         CudaBackend backend, CodegenMachineModel machine, int major, int minor,
         string kernelName, bool multiply)
     {
@@ -156,7 +167,7 @@ internal static class HandWrittenKernelOracleTool
         CodegenKernelSpec spec = multiply
             ? IncumbentSemanticSpecs.Multiply(kernelName + "_semantic", Count)
             : IncumbentSemanticSpecs.Add(kernelName + "_semantic", Count);
-        Score(backend, machine, major, minor, kernelName, spec,
+        return Score(backend, machine, major, minor, kernelName, spec,
             () =>
             {
                 if (multiply) backend.Multiply(left, right, output, Count);
@@ -164,7 +175,7 @@ internal static class HandWrittenKernelOracleTool
             });
     }
 
-    private static void ScoreEmbeddingForward(
+    private static bool ScoreEmbeddingForward(
         CudaBackend backend, CodegenMachineModel machine, int major, int minor)
     {
         const int Tokens = 1 << 20, Vocabulary = 4096, Width = 64;
@@ -179,11 +190,11 @@ internal static class HandWrittenKernelOracleTool
 
         var spec = IncumbentSemanticSpecs.Gather(
             "oracle_inc_embedding", Tokens, Vocabulary, Width);
-        Score(backend, machine, major, minor, "embedding_forward", spec,
+        return Score(backend, machine, major, minor, "embedding_forward", spec,
             () => backend.Embedding(idsBuffer, tableBuffer, outputBuffer, Tokens, Width));
     }
 
-    private static void ScoreSgdMomentum(
+    private static bool ScoreSgdMomentum(
         CudaBackend backend, CodegenMachineModel machine, int major, int minor)
     {
         const int Count = 1 << 22;
@@ -194,13 +205,13 @@ internal static class HandWrittenKernelOracleTool
 
         var spec = IncumbentSemanticSpecs.Momentum(
             "oracle_inc_momentum", Count, Momentum, LearningRate);
-        Score(backend, machine, major, minor, "sgd_momentum_update", spec,
+        return Score(backend, machine, major, minor, "sgd_momentum_update", spec,
             () => backend.SgdMomentumUpdate(
                 parameter, gradient, velocity,
                 LearningRate, Momentum, weightDecay: 0f, size: Count));
     }
 
-    private static void ScoreAxis(
+    private static bool ScoreAxis(
         CudaBackend backend, CodegenMachineModel machine, int major, int minor,
         string kernelName, CodegenReduceKind reduce,
         Action<CudaBackend, IGpuBuffer, IGpuBuffer, int, int> launch,
@@ -213,11 +224,11 @@ internal static class HandWrittenKernelOracleTool
         var spec = IncumbentSemanticSpecs.RowReduction(
             kernelName + "_semantic", AxisRows, AxisInner, reduce, reduceScale);
 
-        Score(backend, machine, major, minor, kernelName, spec,
+        return Score(backend, machine, major, minor, kernelName, spec,
             () => launch(backend, input, output, AxisRows, AxisInner));
     }
 
-    private static void Score(
+    private static bool Score(
         CudaBackend backend, CodegenMachineModel machine, int major, int minor,
         string kernelName, CodegenKernelSpec spec, Action launch)
     {
@@ -250,10 +261,12 @@ internal static class HandWrittenKernelOracleTool
                 prediction.HasComputeCeiling
                     ? prediction.Limiter.ToString().ToLowerInvariant()
                     : "-");
+            return true;
         }
         catch (Exception ex)
         {
             Console.WriteLine("{0,-32} {1}", kernelName, ex.Message.Replace('\n', ' '));
+            return false;
         }
     }
 
