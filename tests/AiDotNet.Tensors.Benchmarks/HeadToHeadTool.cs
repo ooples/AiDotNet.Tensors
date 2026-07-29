@@ -420,6 +420,14 @@ internal static class HeadToHeadTool
 
                 if (binding.IsIndexTensor)
                 {
+                    if (indexData.Length != binding.ElementCount)
+                    {
+                        throw new ArgumentException(
+                            $"Missing {binding.ElementCount}-element int32 input for " +
+                            $"parameter {binding.ParameterIndex} ({binding.Name}).",
+                            nameof(indexData));
+                    }
+
                     var indices = new int[binding.ElementCount];
                     Array.Copy(indexData, indices, indices.Length);
                     buffer = runtime.AllocateBytes((nuint)(indices.Length * sizeof(int)));
