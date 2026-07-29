@@ -38,6 +38,7 @@ internal static class KernelArchitectureTool
             Path.GetTempPath(), "aidotnet-codegen-arch-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temporary);
         var rows = new List<string>();
+        var unsupportedPtxasTargets = new HashSet<(int Major, int Minor)>();
         int assembled = 0;
 
         Console.WriteLine();
@@ -58,13 +59,27 @@ internal static class KernelArchitectureTool
 
                     if (ptxas is not null)
                     {
-                        string stem = Safe(entry.Name) + "-" + TargetName(target);
-                        string ptxPath = Path.Combine(temporary, stem + ".ptx");
-                        string cubinPath = Path.Combine(temporary, stem + ".cubin");
-                        File.WriteAllText(ptxPath, ptx, new UTF8Encoding(false));
-                        Assemble(ptxas, target, ptxPath, cubinPath);
-                        status = "ptxas-pass";
-                        assembled++;
+                        if (unsupportedPtxasTargets.Contains(target))
+                        {
+                            status = "ptxas-unsupported-target";
+                        }
+                        else
+                        {
+                            string stem = Safe(entry.Name) + "-" + TargetName(target);
+                            string ptxPath = Path.Combine(temporary, stem + ".ptx");
+                            string cubinPath = Path.Combine(temporary, stem + ".cubin");
+                            File.WriteAllText(ptxPath, ptx, new UTF8Encoding(false));
+                            if (Assemble(ptxas, target, ptxPath, cubinPath))
+                            {
+                                status = "ptxas-pass";
+                                assembled++;
+                            }
+                            else
+                            {
+                                unsupportedPtxasTargets.Add(target);
+                                status = "ptxas-unsupported-target";
+                            }
+                        }
                     }
 
                     rows.Add(string.Join("\t",
@@ -94,7 +109,7 @@ internal static class KernelArchitectureTool
         Console.WriteLine("release still requires the physical second-architecture lane.");
     }
 
-    private static void Assemble(
+    private static bool Assemble(
         string ptxas, (int Major, int Minor) target, string ptxPath, string cubinPath)
     {
         var start = new ProcessStartInfo
@@ -124,11 +139,22 @@ internal static class KernelArchitectureTool
         string stderr = stderrTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0)
         {
+            string diagnostic = stderr.Length != 0 ? stderr : stdout;
+            if (IsUnsupportedTarget(diagnostic, target)) return false;
+
             throw new InvalidOperationException(
                 TargetName(target) + " ptxas failed for " + Path.GetFileName(ptxPath) +
-                ": " + (stderr.Length != 0 ? stderr : stdout).Replace('\n', ' ').Trim());
+                ": " + diagnostic.Replace('\n', ' ').Trim());
         }
+        return true;
     }
+
+    private static bool IsUnsupportedTarget(
+        string diagnostic, (int Major, int Minor) target) =>
+        diagnostic.Contains(TargetName(target), StringComparison.OrdinalIgnoreCase) &&
+        diagnostic.Contains("gpu-name", StringComparison.OrdinalIgnoreCase) &&
+        (diagnostic.Contains("not defined", StringComparison.OrdinalIgnoreCase) ||
+         diagnostic.Contains("unsupported", StringComparison.OrdinalIgnoreCase));
 
     private static string TargetName((int Major, int Minor) target) =>
         "sm_" + target.Major.ToString(CultureInfo.InvariantCulture) +
