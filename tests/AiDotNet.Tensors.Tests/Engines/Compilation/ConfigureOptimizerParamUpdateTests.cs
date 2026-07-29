@@ -73,8 +73,8 @@ public class ConfigureOptimizerParamUpdateTests
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
             var loss1 = plan.Step()[0];
             var loss2 = plan.Step()[0];
-            Assert.True(float.IsFinite(loss1));
-            Assert.True(float.IsFinite(loss2));
+            Assert.False(float.IsNaN(loss1) || float.IsInfinity(loss1));
+            Assert.False(float.IsNaN(loss2) || float.IsInfinity(loss2));
             Assert.NotEqual(loss1, loss2);
         }
 
@@ -128,8 +128,8 @@ public class ConfigureOptimizerParamUpdateTests
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
             var loss1 = plan.Step()[0];
             var loss2 = plan.Step()[0];
-            Assert.True(double.IsFinite(loss1));
-            Assert.True(double.IsFinite(loss2));
+            Assert.False(double.IsNaN(loss1) || double.IsInfinity(loss1));
+            Assert.False(double.IsNaN(loss2) || double.IsInfinity(loss2));
             Assert.NotEqual(loss1, loss2);
         }
 
