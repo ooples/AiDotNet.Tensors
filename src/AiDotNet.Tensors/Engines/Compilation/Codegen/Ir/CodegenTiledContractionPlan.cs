@@ -20,6 +20,10 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// </remarks>
 public sealed class CodegenTiledContractionPlan
 {
+    private const int DefaultMaximumTileM = 32;
+    private const int ReductionMajorMaximumTileM = 64;
+    private const int WideMThreadTile = 8;
+
     private CodegenTiledContractionPlan(
         int matrixInput, int streamInput, int? biasInput, int mAxis, int reductionAxis,
         int batch, int m, int n, int k, bool matrixReductionMajor,
@@ -220,7 +224,11 @@ public sealed class CodegenTiledContractionPlan
         int m = spec.Space.Axes[mAxis].Extent;
         int k = spec.Space.Axes[reduction].Extent;
 
-        int tileM = LargestDivisorAtMost(m, 32, 4);
+        // A [K,M] matrix exposes a contiguous M row to each async copy. Owning the full
+        // 64-wide row halves the CTA count and amortizes each streamed value across twice
+        // as many outputs; [M,K] retains the smaller tile because its copies run along K.
+        int tileM = LargestDivisorAtMost(m,
+            reductionMajor ? ReductionMajorMaximumTileM : DefaultMaximumTileM, 4);
         int tileN = LargestDivisorAtMost(n, 64, 4);
         // A physically [M,K] matrix is copied along K, so each async copy needs four
         // adjacent values.  [K,M] copies along M and has no corresponding K constraint.
@@ -231,7 +239,9 @@ public sealed class CodegenTiledContractionPlan
             return false;
         }
 
-        int threadTileM = tileM >= 16 ? 4 : tileM >= 4 ? 2 : 1;
+        int threadTileM = tileM >= ReductionMajorMaximumTileM
+            ? WideMThreadTile
+            : tileM >= 16 ? 4 : tileM >= 4 ? 2 : 1;
         int threadTileN = tileN >= 8 ? 2 : 1;
         int threads = (tileM / threadTileM) * (tileN / threadTileN);
         if (threads < 32 || threads > 256)

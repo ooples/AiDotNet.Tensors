@@ -28,11 +28,11 @@ public sealed class CodegenTiledContractionTests
             entry.Bench, out var bench, out string benchReason), benchReason);
         Assert.NotNull(bench);
         Assert.Equal((16, 64, 784, 64), (bench!.Batch, bench.M, bench.N, bench.K));
-        Assert.Equal((32, 56, 8), (bench.TileM, bench.TileN, bench.TileK));
-        Assert.Equal((4, 2), (bench.ThreadTileM, bench.ThreadTileN));
+        Assert.Equal((64, 56, 8), (bench.TileM, bench.TileN, bench.TileK));
+        Assert.Equal((8, 2), (bench.ThreadTileM, bench.ThreadTileN));
         Assert.Equal(224, bench.BlockThreads);
-        Assert.Equal(16 * 2 * 14, bench.Blocks);
-        Assert.Equal(2 * 8 * (32 + 56) * sizeof(float), bench.SharedMemoryBytes);
+        Assert.Equal(16 * 1 * 14, bench.Blocks);
+        Assert.Equal(2 * 8 * (64 + 56) * sizeof(float), bench.SharedMemoryBytes);
     }
 
     /// <summary>Forward is recovered from [M,K] weights and its exact fused epilogue.</summary>
@@ -136,7 +136,7 @@ public sealed class CodegenTiledContractionTests
 
         string ptx = emitter.Emit(spec, 8, 6);
 
-        Assert.Equal(448u, emitter.LaunchBlocks);
+        Assert.Equal(224u, emitter.LaunchBlocks);
         Assert.Equal(224, emitter.LaunchBlockThreads);
         Assert.Contains("cp.async.ca.shared.global", ptx);
         Assert.Contains("cp.async.wait_group 0", ptx);
