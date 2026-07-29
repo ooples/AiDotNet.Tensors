@@ -754,7 +754,7 @@ internal static class KernelConveyorTool
         Console.WriteLine(releasable.ToString(CultureInfo.InvariantCulture) + " of " +
                           entries.Count.ToString(CultureInfo.InvariantCulture) +
                           " carry both. Run --kernel-limiter and --kernel-competitor");
-        Console.WriteLine("to fill gaps; a kernel without both is well-formed but unproven.");
+        Console.WriteLine("to fill gaps; any kernel without both aborts the release as unproven.");
 
         if (releasable != entries.Count)
         {
