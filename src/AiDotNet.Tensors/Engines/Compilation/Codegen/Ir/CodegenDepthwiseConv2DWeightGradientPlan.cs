@@ -240,6 +240,6 @@ public sealed class CodegenDepthwiseConv2DWeightGradientPlan
             if (spec.Space.Axes[axes[d]].IsReduction || !seen.Add(axes[d])) return false;
             if (spec.Output.Shape[d] != spec.Space.Axes[axes[d]].Extent) return false;
         }
-        return true;
+        return seen.Count == spec.Space.ParallelAxes.Length;
     }
 }
