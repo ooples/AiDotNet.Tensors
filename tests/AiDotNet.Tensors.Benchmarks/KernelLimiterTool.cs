@@ -30,7 +30,8 @@ internal static class KernelLimiterTool
         string Phase,
         IReadOnlyDictionary<string, double> Counters,
         int PhaseCount,
-        double ProgramDurationNs);
+        double ProgramDurationNs,
+        IReadOnlyList<string> MissingMetrics);
 
     /// <summary>A kernel at or above this fraction of a roofline is done with that lever.</summary>
     private const double SaturatedAt = 70.0;
@@ -166,16 +167,14 @@ internal static class KernelLimiterTool
                 failedProfiles++;
                 continue;
             }
-            IReadOnlyDictionary<string, double> counters = profile.Counters;
-
-            string[] missing = Metrics.Where(metric => !counters.ContainsKey(metric)).ToArray();
-            if (missing.Length != 0)
+            if (profile.MissingMetrics.Count != 0)
             {
                 Console.WriteLine(entry.Name.PadRight(32) + "   profiling incomplete: missing " +
-                                  string.Join(", ", missing));
+                                  string.Join(", ", profile.MissingMetrics));
                 failedProfiles++;
                 continue;
             }
+            IReadOnlyDictionary<string, double> counters = profile.Counters;
 
             double l1 = counters.GetValueOrDefault(L1Throughput);
             double dram = counters.GetValueOrDefault(DramThroughput);
@@ -348,15 +347,26 @@ internal static class KernelLimiterTool
 
         // A split program has a partial and a combine launch. Never synthesize a profile
         // by taking each metric's maximum across different kernels: that creates a set of
-        // counters no launch actually produced. Require both phases to be complete, then
-        // attribute the diagnosis to the phase that consumes the most wall-clock time.
-        foreach (IReadOnlyDictionary<string, double> values in phases.Values)
-            if (Metrics.Any(metric => !values.ContainsKey(metric))) return null;
+        // counters no launch actually produced. Report an incomplete phase set to the
+        // caller so it can name the missing metrics and count the profile as failed.
+        string[] missing = Metrics
+            .Where(metric => phases.Values.Any(values => !values.ContainsKey(metric)))
+            .ToArray();
+        if (missing.Length != 0)
+        {
+            return new ProfileResult(
+                string.Empty,
+                new Dictionary<string, double>(StringComparer.Ordinal),
+                phases.Count,
+                0.0,
+                missing);
+        }
 
         var dominant = phases.OrderByDescending(pair => pair.Value[Duration]).First();
         double programDuration = phases.Values.Sum(values => values[Duration]);
         return new ProfileResult(
-            dominant.Key, dominant.Value, phases.Count, programDuration);
+            dominant.Key, dominant.Value, phases.Count, programDuration,
+            Array.Empty<string>());
     }
 
     private static List<string> SplitCsv(string line)
