@@ -2234,6 +2234,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     /// <summary>
+    /// Declares that an internal subsystem will retain a writable reference to this tensor's
+    /// backing storage. Copy-on-write tensors must be privatized before that reference is
+    /// captured, because a later write through the retained reference cannot pass through the
+    /// normal tensor write guards.
+    /// </summary>
+    internal void PrepareForInPlaceWrite() => EnsureOwnedForWrite();
+
+    /// <summary>
     /// Copy-on-write clone: shares the backing storage at O(1) for the plain dense case and
     /// privatizes on the first write to either side, preserving full deep-copy semantics. Falls
     /// back to an eager <see cref="Clone"/> for any layout that cannot be shared safely. The base

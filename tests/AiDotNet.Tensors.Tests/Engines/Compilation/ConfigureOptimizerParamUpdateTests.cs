@@ -24,6 +24,121 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 public class ConfigureOptimizerParamUpdateTests
 {
     /// <summary>
+    /// Issue #624 follow-up: compiled training is a write-intent use of every registered
+    /// parameter. The parameter must therefore leave COW-shared storage before the plan
+    /// captures live backing arrays; otherwise the fused optimizer mutates the clone too.
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizer_AdamFloat_CowSharedParameterIsPrivatizedBeforePlanCapture()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 4, 3 });
+        var weight = new Tensor<float>(new[] { 3, 2 });
+        var lazyWeight = new Tensor<float>(new[] { 2, 2 });
+        var rng = new System.Random(701);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < weight.Length; i++) weight[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < lazyWeight.Length; i++) lazyWeight[i] = (float)(rng.NextDouble() - 0.5);
+
+        var peer = (Tensor<float>)weight.CloneShared();
+        var lazyPeer = (Tensor<float>)lazyWeight.CloneShared();
+        var peerBefore = peer.ToArray();
+        var lazyPeerBefore = lazyPeer.ToArray();
+        var weightBefore = weight.ToArray();
+        Assert.True(weight.IsCowShared);
+        Assert.True(peer.IsCowShared);
+        Assert.True(lazyWeight.IsCowShared);
+        Assert.True(lazyPeer.IsCowShared);
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var output = engine.TensorMatMul(input, weight);
+            var squared = engine.TensorMultiply(output, output);
+            var loss = engine.ReduceSum(squared, null);
+            // Lazy/off-loss-path parameters are deliberately accepted by the compiled
+            // optimizer. They still need private storage before its raw-array capture.
+            plan = scope.CompileTraining(new[] { weight, lazyWeight }, loss);
+        }
+
+        // This timing is part of the contract: detaching in ConfigureOptimizer would be too late,
+        // because specialized forward actions may already have pinned the shared backing array.
+        Assert.False(weight.IsCowShared,
+            "CompileTraining must privatize registered COW parameters before plan buffer capture.");
+        Assert.False(lazyWeight.IsCowShared,
+            "CompileTraining must also privatize lazy/off-loss-path registered parameters.");
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
+            var loss1 = plan.Step()[0];
+            var loss2 = plan.Step()[0];
+            Assert.True(float.IsFinite(loss1));
+            Assert.True(float.IsFinite(loss2));
+            Assert.NotEqual(loss1, loss2);
+        }
+
+        Assert.Equal(peerBefore, peer.ToArray());
+        Assert.Equal(lazyPeerBefore, lazyPeer.ToArray());
+        Assert.NotEqual(weightBefore, weight.ToArray());
+    }
+
+    /// <summary>
+    /// Double-precision coverage for the same COW/compiled-optimizer boundary. The double
+    /// optimizer has a separate live-backing binding implementation and must obey the same rule.
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizer_AdamDouble_CowSharedParameterIsPrivatizedBeforePlanCapture()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 4, 3 });
+        var weight = new Tensor<double>(new[] { 3, 2 });
+        var lazyWeight = new Tensor<double>(new[] { 2, 2 });
+        var rng = new System.Random(702);
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < weight.Length; i++) weight[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < lazyWeight.Length; i++) lazyWeight[i] = rng.NextDouble() - 0.5;
+
+        var peer = (Tensor<double>)weight.CloneShared();
+        var lazyPeer = (Tensor<double>)lazyWeight.CloneShared();
+        var peerBefore = peer.ToArray();
+        var lazyPeerBefore = lazyPeer.ToArray();
+        var weightBefore = weight.ToArray();
+        Assert.True(weight.IsCowShared);
+        Assert.True(peer.IsCowShared);
+        Assert.True(lazyWeight.IsCowShared);
+        Assert.True(lazyPeer.IsCowShared);
+
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var output = engine.TensorMatMul(input, weight);
+            var squared = engine.TensorMultiply(output, output);
+            engine.ReduceSum(squared, null);
+            plan = scope.CompileTraining(new[] { weight, lazyWeight });
+        }
+
+        Assert.False(weight.IsCowShared,
+            "CompileTraining must privatize registered COW parameters before plan buffer capture.");
+        Assert.False(lazyWeight.IsCowShared,
+            "CompileTraining must also privatize lazy/off-loss-path registered parameters.");
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
+            var loss1 = plan.Step()[0];
+            var loss2 = plan.Step()[0];
+            Assert.True(double.IsFinite(loss1));
+            Assert.True(double.IsFinite(loss2));
+            Assert.NotEqual(loss1, loss2);
+        }
+
+        Assert.Equal(peerBefore, peer.ToArray());
+        Assert.Equal(lazyPeerBefore, lazyPeer.ToArray());
+        Assert.NotEqual(weightBefore, weight.ToArray());
+    }
+
+    /// <summary>
     /// Issue #350 second-order bug: the AiDotNet consumer's DenseLayer routes
     /// through <c>Engine.FusedLinear(input, weights, bias, FusedActivationType.None)</c>
     /// — a single fused op. After compile + Step + Adam update, the weights
