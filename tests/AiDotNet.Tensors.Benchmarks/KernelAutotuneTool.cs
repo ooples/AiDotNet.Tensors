@@ -120,7 +120,7 @@ internal static class KernelAutotuneTool
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
         var rows = new List<string>();
-        int improved = 0, regressed = 0;
+        int improved = 0;
         try
         {
             foreach (var entry in entries)
@@ -135,7 +135,6 @@ internal static class KernelAutotuneTool
 
                     double gain = result.Gain;
                     if (gain > CodegenMeasurementProtocol.AutotuneGainNoiseFloor) improved++;
-                    if (gain < 1.0 / CodegenMeasurementProtocol.AutotuneGainNoiseFloor) regressed++;
 
                     Console.WriteLine(entry.Name.PadRight(30) +
                         result.ModelledUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
@@ -173,8 +172,11 @@ internal static class KernelAutotuneTool
         File.WriteAllText(outputPath, text.ToString());
 
         Console.WriteLine();
-        Console.WriteLine(improved + " kernels improved past the 1.05% noise floor, " +
-                          regressed + " regressed");
+        double noiseFloorPercent =
+            (CodegenMeasurementProtocol.AutotuneGainNoiseFloor - 1.0) * 100.0;
+        Console.WriteLine(improved + " kernels improved past the " +
+                          noiseFloorPercent.ToString("0.##", CultureInfo.InvariantCulture) +
+                          "% noise floor");
         Console.WriteLine("winners written to " + outputPath);
         CodegenAutotuneCache.Invalidate();
     }
@@ -264,8 +266,8 @@ internal static class KernelAutotuneTool
             return;
         }
 
-        // A winner must clear both the observed paired spread and the earned 1.05%
-        // noise floor. Merely having the smallest median is not a promotion criterion.
+        // A winner must clear both the observed paired spread and the protocol noise floor.
+        // Merely having the smallest median is not a promotion criterion.
         double required = Math.Max(
             CodegenMeasurementProtocol.AutotuneGainNoiseFloor,
             1.0 + timing.RelativeSpread);
