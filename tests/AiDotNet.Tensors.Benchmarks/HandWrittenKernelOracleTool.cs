@@ -337,7 +337,9 @@ internal static class HandWrittenKernelOracleTool
             => "elementwise-activation",
         "embedding_forward" => "gather",
         "sgd_momentum_update" => "optimizer",
-        _ => "axis-reduction",
+        "sum_axis" or "mean_axis" or "max_axis" => "axis-reduction",
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(name), name, "Mapped kernel has no semantic family."),
     };
 
     private static string? ValueOf(string[] args, string flag)
