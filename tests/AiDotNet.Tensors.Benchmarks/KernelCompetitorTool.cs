@@ -66,11 +66,37 @@ internal static class KernelCompetitorTool
         if (process is null) throw new InvalidOperationException("Could not start competitor lane.");
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
-        string outputText = stdout.GetAwaiter().GetResult();
-        string errorText = stderr.GetAwaiter().GetResult();
+        bool timedOut = !process.WaitForExit(
+            (int)TimeSpan.FromMinutes(30).TotalMilliseconds);
+        string terminationDiagnostic = string.Empty;
+        if (timedOut)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                _ = process.WaitForExit(5000);
+            }
+            catch (Exception ex)
+            {
+                terminationDiagnostic = " Termination also failed: " + ex.Message;
+            }
+        }
+
+        string outputText = timedOut && !stdout.IsCompletedSuccessfully
+            ? string.Empty
+            : stdout.GetAwaiter().GetResult();
+        string errorText = timedOut && !stderr.IsCompletedSuccessfully
+            ? string.Empty
+            : stderr.GetAwaiter().GetResult();
         if (outputText.Length != 0) Console.Write(outputText);
         if (errorText.Length != 0) Console.Error.Write(errorText);
+        if (timedOut)
+        {
+            if (File.Exists(output)) File.Delete(output);
+            throw new TimeoutException(
+                "Competitor lane did not finish within thirty minutes; evidence discarded." +
+                terminationDiagnostic + " " + FirstDiagnostic(errorText, outputText));
+        }
         if (process.ExitCode != 0)
             throw new InvalidOperationException(
                 "Competitor lane failed with exit code " +
