@@ -34,6 +34,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </remarks>
 internal static class HandWrittenKernelOracleTool
 {
+    private const int AxisRows = 4096;
+    private const int AxisInner = 1024;
+
     private static readonly string[] MappedKernelNames =
     {
         "embedding_forward",
@@ -116,7 +119,7 @@ internal static class HandWrittenKernelOracleTool
         ScoreAxis(backend, machine, major, minor,
             "mean_axis", CodegenReduceKind.Sum,
             static (b, input, output, rows, inner) => b.MeanAxis(input, output, rows, inner),
-            reduceScale: 1.0 / 1024.0);
+            mean: true);
         ScoreAxis(backend, machine, major, minor,
             "max_axis", CodegenReduceKind.Max,
             static (b, input, output, rows, inner) => b.MaxAxis(input, output, rows, inner));
@@ -201,16 +204,17 @@ internal static class HandWrittenKernelOracleTool
         CudaBackend backend, CodegenMachineModel machine, int major, int minor,
         string kernelName, CodegenReduceKind reduce,
         Action<CudaBackend, IGpuBuffer, IGpuBuffer, int, int> launch,
-        double reduceScale = 1.0)
+        bool mean = false)
     {
-        const int Rows = 4096, Inner = 1024;
-        using var input = backend.AllocateBuffer(Values(Rows * Inner, 53, 0.015625f));
-        using var output = backend.AllocateBuffer(Rows);
+        double reduceScale = mean ? 1.0 / AxisInner : 1.0;
+        using var input = backend.AllocateBuffer(
+            Values(AxisRows * AxisInner, 53, 0.015625f));
+        using var output = backend.AllocateBuffer(AxisRows);
         var spec = IncumbentSemanticSpecs.RowReduction(
-            kernelName + "_semantic", Rows, Inner, reduce, reduceScale);
+            kernelName + "_semantic", AxisRows, AxisInner, reduce, reduceScale);
 
         Score(backend, machine, major, minor, kernelName, spec,
-            () => launch(backend, input, output, Rows, Inner));
+            () => launch(backend, input, output, AxisRows, AxisInner));
     }
 
     private static void Score(
