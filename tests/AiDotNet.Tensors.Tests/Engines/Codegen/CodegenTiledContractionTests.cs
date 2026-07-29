@@ -105,6 +105,28 @@ public sealed class CodegenTiledContractionTests
         }
     }
 
+    [Fact]
+    public void UnsupportedActivation_IsRefused()
+    {
+        var spec = SimpleContraction(8, CodegenActivationKind.Sigmoid);
+
+        Assert.False(CodegenTiledContractionPlan.TryCreate(
+            spec, out var plan, out string reason));
+        Assert.Null(plan);
+        Assert.Contains("optional M bias and ReLU", reason);
+    }
+
+    [Fact]
+    public void ExtentWithoutFourWideWholeTile_IsRefused()
+    {
+        var spec = SimpleContraction(6, CodegenActivationKind.None);
+
+        Assert.False(CodegenTiledContractionPlan.TryCreate(
+            spec, out var plan, out string reason));
+        Assert.Null(plan);
+        Assert.Contains("no supported whole tile", reason);
+    }
+
     /// <summary>The emitted candidate stages both operands and uses only SIMT FP32 FMA.</summary>
     [Fact]
     public void BackwardDataPointwise_EmitsDoubleBufferedTrueFp32Ptx()
@@ -398,6 +420,33 @@ public sealed class CodegenTiledContractionTests
             spec.BiasInput, spec.ScaleInput, spec.Activation, spec.ReduceScale,
             spec.PreReduce, spec.PreBiasInput, spec.PreBiasScale, spec.Algebra,
             spec.ExtraOutputs.ToArray());
+    }
+
+    private static CodegenKernelSpec SimpleContraction(
+        int m, CodegenActivationKind activation)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("batch", 2),
+            CodegenAxis.Parallel("m", m),
+            CodegenAxis.Parallel("n", 8),
+            CodegenAxis.Reduce("k", 4));
+        var matrix = new CodegenTensorBinding(0, "matrix", new[] { m, 4 },
+            new[] { CodegenAffineExpr.Axis(1), CodegenAffineExpr.Axis(3) });
+        var stream = new CodegenTensorBinding(1, "stream", new[] { 2, 4, 8 },
+            new[]
+            {
+                CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(3),
+                CodegenAffineExpr.Axis(2),
+            });
+        var output = new CodegenTensorBinding(2, "output", new[] { 2, m, 8 },
+            new[]
+            {
+                CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1),
+                CodegenAffineExpr.Axis(2),
+            }, isOutput: true);
+        return new CodegenKernelSpec(
+            "simple_contraction", space, new[] { matrix, stream }, output,
+            new[] { 0, 1 }, CodegenReduceKind.Sum, activation: activation);
     }
 
     private static unsafe void LaunchThree(
