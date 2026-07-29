@@ -195,8 +195,7 @@ internal static class KernelConveyorTool
                           "                 predicted  measured  pred/meas");
 
         var measuredEvidence = ReadEvidence(
-            Path.Combine("artifacts", "competitor-ratios.tsv"), 1,
-            KernelEvidenceIdentity.CurrentDispatch(runtime));
+            Path.Combine("artifacts", "competitor-ratios.tsv"), 1);
 
         foreach (var entry in entries)
         {
