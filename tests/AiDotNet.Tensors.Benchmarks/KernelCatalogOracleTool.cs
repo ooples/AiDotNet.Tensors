@@ -174,8 +174,13 @@ internal static class KernelCatalogOracleTool
         }
 
         GpuBenchmarkEnvironment.RequireNoForeignCompute("catalog-oracle-end");
+        if (results.Count == 0 && !includeWins)
+        {
+            Console.WriteLine("All selected catalog kernels are wins; nothing to diagnose.");
+            return;
+        }
         if (results.Count == 0)
-            throw new InvalidOperationException("No non-winning catalog rows were found.");
+            throw new InvalidOperationException("No catalog evidence could be joined.");
 
         Print(results, rates);
         Write(outputPath, results);
