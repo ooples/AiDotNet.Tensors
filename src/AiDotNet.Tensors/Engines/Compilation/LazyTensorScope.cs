@@ -21,10 +21,12 @@ internal sealed class LazyTensorScope : IDisposable
     private bool _engineExplicitlyBound;
     private bool _disposed;
     private bool _realized;
+    private readonly bool _trainingParametersPreparedBeforeTrace;
 
-    internal LazyTensorScope(LazyTensorScope? parent)
+    internal LazyTensorScope(LazyTensorScope? parent, bool trainingParametersPreparedBeforeTrace = false)
     {
         _parent = parent;
+        _trainingParametersPreparedBeforeTrace = trainingParametersPreparedBeforeTrace;
         // Default to AiDotNetEngine.Current; the first op recorded into the
         // scope will rebind via BindEngineIfUnset to the engine instance the
         // user actually invoked the op on. This matters because the global
@@ -158,15 +160,40 @@ internal sealed class LazyTensorScope : IDisposable
         LazyNodeType opType,
         string opName,
         Tensor<T> input,
-        Tensor<T> view)
+        Tensor<T> view,
+        BackwardFunction<T>? backwardFn = null,
+        object[]? savedState = null)
     {
         // The caller already built the view with shared storage — we just
         // attach it to the graph so the compile step sees a producing node.
         var node = new LazyNode<T>(opType, opName, input, view,
-            execute: (_, _) => { /* storage is shared; nothing to compute */ });
+            execute: (_, _) => { /* storage is shared; nothing to compute */ },
+            backwardFn,
+            savedState);
         view.LazySource = node;
         _nodes.Add(node);
         return view;
+    }
+
+    /// <summary>
+    /// Records a unary operation whose caller has already materialized the output tensor during
+    /// tracing. Replay still executes <paramref name="execute"/> because the output owns storage
+    /// independent of the input. This is the materializing counterpart to <see cref="RecordView"/>.
+    /// </summary>
+    internal Tensor<T> RecordMaterializedUnary<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T> input,
+        Tensor<T> output,
+        Action<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backwardFn = null,
+        object[]? savedState = null)
+    {
+        var node = new LazyNode<T>(
+            opType, opName, input, output, execute, backwardFn, savedState);
+        output.LazySource = node;
+        _nodes.Add(node);
+        return output;
     }
 
     /// <summary>
@@ -378,7 +405,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </remarks>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
-        PrepareParametersForTraining(parameters);
+        EnsureTrainingParametersPrepared(parameters);
         MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null);
     }
@@ -389,7 +416,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters, Tensor<T> explicitLoss)
     {
-        PrepareParametersForTraining(parameters);
+        EnsureTrainingParametersPrepared(parameters);
         MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss);
     }
@@ -399,10 +426,30 @@ internal sealed class LazyTensorScope : IDisposable
     /// optimizer retains their live backing arrays. Lazy/off-loss-path parameters are included:
     /// they are valid registered parameters even when this trace does not produce a gradient.
     /// </summary>
-    private static void PrepareParametersForTraining<T>(Tensor<T>[] parameters)
+    private void EnsureTrainingParametersPrepared<T>(Tensor<T>[] parameters)
     {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         for (int i = 0; i < parameters.Length; i++)
+        {
+            if (parameters[i] is null)
+                throw new ArgumentException("Training parameters cannot contain null tensors.", nameof(parameters));
+
+            // A plain graph scope remains valid for unshared tensors (including
+            // existing internal tests). A COW parameter, however, must have
+            // detached before tracing: doing it here is too late because graph
+            // nodes may already retain parameter-derived storage views.
+            if (!_trainingParametersPreparedBeforeTrace && parameters[i].IsCowShared)
+            {
+                throw new InvalidOperationException(
+                    "Copy-on-write parameters must be prepared before a training graph is traced. " +
+                    "Create the scope with GraphMode.EnableTraining(parameters), not GraphMode.Enable().");
+            }
+
+            // Defensive idempotent guard for unshared tensors and callers that
+            // entered through EnableTraining. This also protects future backing
+            // capture added during compilation itself.
             parameters[i].PrepareForInPlaceWrite();
+        }
     }
 
     /// <summary>

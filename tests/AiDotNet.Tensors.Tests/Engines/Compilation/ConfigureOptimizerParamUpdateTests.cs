@@ -50,23 +50,24 @@ public class ConfigureOptimizerParamUpdateTests
         Assert.True(lazyWeight.IsCowShared);
         Assert.True(lazyPeer.IsCowShared);
 
+        var parameters = new[] { weight, lazyWeight };
         ICompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(parameters))
         {
             var output = engine.TensorMatMul(input, weight);
             var squared = engine.TensorMultiply(output, output);
             var loss = engine.ReduceSum(squared, null);
             // Lazy/off-loss-path parameters are deliberately accepted by the compiled
             // optimizer. They still need private storage before its raw-array capture.
-            plan = scope.CompileTraining(new[] { weight, lazyWeight }, loss);
+            plan = scope.CompileTraining(parameters, loss);
         }
 
         // This timing is part of the contract: detaching in ConfigureOptimizer would be too late,
         // because specialized forward actions may already have pinned the shared backing array.
         Assert.False(weight.IsCowShared,
-            "CompileTraining must privatize registered COW parameters before plan buffer capture.");
+            "EnableTraining must privatize registered COW parameters before graph tracing.");
         Assert.False(lazyWeight.IsCowShared,
-            "CompileTraining must also privatize lazy/off-loss-path registered parameters.");
+            "EnableTraining must also privatize lazy/off-loss-path registered parameters.");
 
         using (plan)
         {
@@ -109,19 +110,20 @@ public class ConfigureOptimizerParamUpdateTests
         Assert.True(lazyWeight.IsCowShared);
         Assert.True(lazyPeer.IsCowShared);
 
+        var parameters = new[] { weight, lazyWeight };
         ICompiledTrainingPlan<double> plan;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(parameters))
         {
             var output = engine.TensorMatMul(input, weight);
             var squared = engine.TensorMultiply(output, output);
             engine.ReduceSum(squared, null);
-            plan = scope.CompileTraining(new[] { weight, lazyWeight });
+            plan = scope.CompileTraining(parameters);
         }
 
         Assert.False(weight.IsCowShared,
-            "CompileTraining must privatize registered COW parameters before plan buffer capture.");
+            "EnableTraining must privatize registered COW parameters before graph tracing.");
         Assert.False(lazyWeight.IsCowShared,
-            "CompileTraining must also privatize lazy/off-loss-path registered parameters.");
+            "EnableTraining must also privatize lazy/off-loss-path registered parameters.");
 
         using (plan)
         {

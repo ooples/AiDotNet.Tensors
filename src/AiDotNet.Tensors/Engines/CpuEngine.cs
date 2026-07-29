@@ -30798,6 +30798,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Match ReduceSum and the eager reduction contract: null means reduce
+        // every axis. Normalize before graph-shape construction so tracing does
+        // not enumerate a null array even though the eager path supports it.
+        axes ??= Enumerable.Range(0, input.Rank).ToArray();
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -43723,7 +43728,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Narrow", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        var result = tensor.Slice(dim, start, start + length);
+        var result = tensor.CreateNarrowView(dim, start, start + length, recordAutodiff: false);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
         AutoTracer.RecordOp("Narrow", result, eng => eng.TensorNarrow(tensor, dim, start, length));
