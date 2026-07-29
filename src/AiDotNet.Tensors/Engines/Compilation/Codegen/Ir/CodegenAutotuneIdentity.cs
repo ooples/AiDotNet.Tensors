@@ -66,6 +66,7 @@ public sealed record CodegenAutotuneIdentity(
         AppendCandidate(text, "input-staging", spec, computeMajor, computeMinor,
             static e => e.EnableInputStaging = true);
         AppendTiledCandidate(text, spec, computeMajor, computeMinor);
+        AppendTiledConv2DCandidate(text, spec, computeMajor, computeMinor);
 
         try
         {
@@ -133,6 +134,22 @@ public sealed record CodegenAutotuneIdentity(
         try
         {
             text.Append(new PtxTiledOuterProductEmitter().Emit(
+                spec, computeMajor, computeMinor));
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
+    }
+
+    private static void AppendTiledConv2DCandidate(
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
+    {
+        text.Append("candidate=tiled-conv2d;");
+        try
+        {
+            text.Append(new PtxTiledConv2DEmitter().Emit(
                 spec, computeMajor, computeMinor));
         }
         catch (NotSupportedException ex)

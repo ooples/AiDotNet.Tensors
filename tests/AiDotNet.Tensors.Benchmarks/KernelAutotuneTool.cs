@@ -33,7 +33,8 @@ internal static class KernelAutotuneTool
 {
     /// <summary>One candidate lowering: a name and the knobs that produce it.</summary>
     private sealed record Candidate(
-        string Name, Action<PtxAffineEmitter>? Configure, bool TiledContraction = false);
+        string Name, Action<PtxAffineEmitter>? Configure,
+        bool TiledContraction = false, bool TiledConv2D = false);
 
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
@@ -83,6 +84,10 @@ internal static class KernelAutotuneTool
         // to the baseline so a targeted schedule investigation gets its paired window before
         // the legacy knob sweep; it remains subject to the same numerical and noise gates.
         new("tiled-contraction", null, TiledContraction: true),
+
+        // A dense 3x3 row tile: stage three activation rows and all nine weights for a
+        // channel slice, then reuse them across output channels and adjacent columns.
+        new("tiled-conv2d", null, TiledConv2D: true),
 
         new("no-tile", e => e.Coarsening = 1),
         new("tile2", e => { e.Coarsening = 2; }),
@@ -330,6 +335,15 @@ internal static class KernelAutotuneTool
             if (candidate.TiledContraction)
             {
                 var tiled = new PtxTiledContractionEmitter();
+                ptx = tiled.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                blocks = tiled.LaunchBlocks;
+                blockX = checked((uint)tiled.LaunchBlockThreads);
+                blockY = 1;
+            }
+            else if (candidate.TiledConv2D)
+            {
+                var tiled = new PtxTiledConv2DEmitter();
                 ptx = tiled.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 blocks = tiled.LaunchBlocks;

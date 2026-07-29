@@ -277,6 +277,20 @@ internal static class KernelCatalogOracleTool
             shape = plan.TileM + "x" + plan.TileN + "x" + plan.TileK +
                 ", matrix+stream";
         }
+        else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
+        {
+            var emitter = new PtxTiledConv2DEmitter();
+            _ = emitter.Emit(entry.Bench, major, minor);
+            var plan = emitter.Plan!;
+
+            long scalarLoads = checked((long)plan.Blocks * plan.Steps *
+                (plan.MatrixStageElements + plan.StreamStageElements));
+            uniqueBytes = semantic.UniqueBytes;
+            warpLoads = (scalarLoads + 31) / 32;
+            predictedUs = Ceiling(semantic);
+            shape = plan.TileM + "x" + plan.OutputWidth + "x" + plan.TileChannels +
+                ", weights+three input rows";
+        }
         else
         {
             var emitter = new PtxAffineEmitter();

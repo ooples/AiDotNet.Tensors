@@ -397,6 +397,8 @@ internal static class KernelConveyorTool
                 : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
             : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal)
                 ? "tiled contraction"
+                : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal)
+                    ? "tiled conv2d"
                 : Describe(Kernels[0].LoopedAxes);
     }
 
@@ -429,6 +431,31 @@ internal static class KernelConveyorTool
             catch (NotSupportedException ex)
             {
                 Console.WriteLine("    note: " + catalogName + " recorded tiled-contraction " +
+                                  "but it could not be rebuilt (" + ex.Message +
+                                  "); using the affine kernel");
+            }
+        }
+
+        if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
+        {
+            try
+            {
+                var tiled = new PtxTiledConv2DEmitter();
+                string text = tiled.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, tiled.LaunchBlocks,
+                            checked((uint)tiled.LaunchBlockThreads), 1,
+                            0, 0, "weights+three input rows"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName + " recorded tiled-conv2d " +
                                   "but it could not be rebuilt (" + ex.Message +
                                   "); using the affine kernel");
             }
