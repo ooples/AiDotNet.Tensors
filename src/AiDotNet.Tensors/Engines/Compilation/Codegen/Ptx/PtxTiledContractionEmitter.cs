@@ -42,9 +42,6 @@ public sealed class PtxTiledContractionEmitter
         if (!CodegenTiledContractionPlan.TryCreate(spec, out var possible, out string reason))
             throw new NotSupportedException("This spec cannot use the tiled contraction: " + reason);
         var plan = possible!;
-        if (!plan.MatrixReductionMajor)
-            throw new NotSupportedException(
-                "The first cooperative copy needs a physically [K,M] matrix; [M,K] is a later candidate.");
 
         Plan = plan;
         _body.Clear();
@@ -63,6 +60,11 @@ public sealed class PtxTiledContractionEmitter
         L($"ld.param.u64 %rd1, [p{I(streamParam)}];");
         L($"ld.param.u64 %rd2, [p{I(outputParam)}];");
         L("mov.u64 %rd3, stage;");
+        if (plan.BiasInput.HasValue)
+        {
+            int biasParam = spec.Inputs[plan.BiasInput.Value].ParameterIndex;
+            L($"ld.param.u64 %rd4, [p{I(biasParam)}];");
+        }
         L("mov.u32 %r0, %ctaid.x;");
         L("mov.u32 %r1, %tid.x;");
         L($"rem.u32 %r2, %r0, {I(tilesN)};             // N tile");
@@ -119,7 +121,7 @@ public sealed class PtxTiledContractionEmitter
             }
         }
 
-        EmitStores(plan, accumulators);
+        EmitStores(plan, spec.Activation, accumulators);
         L("ret;");
 
         var text = new StringBuilder();
@@ -154,7 +156,8 @@ public sealed class PtxTiledContractionEmitter
         const int ValuesPerCopy = 4;
         int matrixChunks = plan.TileK * plan.TileM / ValuesPerCopy;
         int streamChunks = plan.TileK * plan.TileN / ValuesPerCopy;
-        int matrixChunksPerRow = plan.TileM / ValuesPerCopy;
+        int matrixChunksPerRow = (plan.MatrixReductionMajor ? plan.TileM : plan.TileK) /
+            ValuesPerCopy;
         int streamChunksPerRow = plan.TileN / ValuesPerCopy;
         int matrixPasses = (matrixChunks + plan.BlockThreads - 1) / plan.BlockThreads;
         int streamPasses = (streamChunks + plan.BlockThreads - 1) / plan.BlockThreads;
@@ -170,9 +173,18 @@ public sealed class PtxTiledContractionEmitter
             L($"setp.lt.u32 {valid}, {index}, {I(matrixChunks)};");
             L($"div.u32 {row}, {index}, {I(matrixChunksPerRow)};");
             L($"rem.u32 {column}, {index}, {I(matrixChunksPerRow)};");
-            L($"add.u32 {row}, {row}, {I(step * plan.TileK)};");
-            L($"mad.lo.u32 {element}, {row}, {I(plan.M)}, %r8;");
-            L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
+            if (plan.MatrixReductionMajor)
+            {
+                L($"add.u32 {row}, {row}, {I(step * plan.TileK)};");
+                L($"mad.lo.u32 {element}, {row}, {I(plan.M)}, %r8;");
+                L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
+            }
+            else
+            {
+                L($"add.u32 {row}, {row}, %r8;");
+                L($"mad.lo.u32 {element}, {row}, {I(plan.K)}, {I(step * plan.TileK)};");
+                L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
+            }
             L($"mul.wide.u32 {bytes}, {element}, 4;");
             L($"add.u64 {source}, %rd0, {bytes};");
             L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
@@ -212,10 +224,15 @@ public sealed class PtxTiledContractionEmitter
             for (int i = 0; i < matrix.Length; i++)
             {
                 matrix[i] = NextF();
-                int constant = bufferBase + k * plan.TileM * sizeof(float) + i * sizeof(float);
+                int constant = plan.MatrixReductionMajor
+                    ? bufferBase + k * plan.TileM * sizeof(float) + i * sizeof(float)
+                    : bufferBase + i * plan.TileK * sizeof(float) + k * sizeof(float);
+                int threadStride = plan.MatrixReductionMajor
+                    ? plan.ThreadTileM * sizeof(float)
+                    : plan.ThreadTileM * plan.TileK * sizeof(float);
                 string local = NextR();
                 string local64 = NextRd(), address = NextRd();
-                L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * sizeof(float))}, {I(constant)};");
+                L($"mad.lo.u32 {local}, %r7, {I(threadStride)}, {I(constant)};");
                 L($"cvt.u64.u32 {local64}, {local};");
                 L($"add.u64 {address}, %rd3, {local64};");
                 L($"ld.shared.f32 {matrix[i]}, [{address}];");
@@ -237,13 +254,32 @@ public sealed class PtxTiledContractionEmitter
         }
     }
 
-    private void EmitStores(CodegenTiledContractionPlan plan, string[,] accumulators)
+    private void EmitStores(
+        CodegenTiledContractionPlan plan, CodegenActivationKind activation,
+        string[,] accumulators)
     {
         for (int i = 0; i < plan.ThreadTileM; i++)
+        {
+            string? bias = null;
+            if (plan.BiasInput.HasValue)
+            {
+                string localM = NextR(), globalM = NextR();
+                string biasBytes = NextRd(), biasAddress = NextRd();
+                bias = NextF();
+                L($"mad.lo.u32 {localM}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
+                L($"add.u32 {globalM}, %r8, {localM};");
+                L($"mul.wide.u32 {biasBytes}, {globalM}, 4;");
+                L($"add.u64 {biasAddress}, %rd4, {biasBytes};");
+                L($"ld.global.f32 {bias}, [{biasAddress}];");
+            }
             for (int j = 0; j < plan.ThreadTileN; j++)
             {
                 string m = NextR(), n = NextR(), element = NextR();
                 string bytes = NextRd(), address = NextRd();
+                if (bias is not null)
+                    L($"add.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {bias};");
+                if (activation == CodegenActivationKind.ReLU)
+                    L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
                 L($"mad.lo.u32 {m}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
                 L($"mad.lo.u32 {n}, %r6, {I(plan.ThreadTileN)}, {I(j)};");
                 L($"mad.lo.u32 {element}, {m}, {I(plan.N)}, %r11;");
@@ -252,6 +288,7 @@ public sealed class PtxTiledContractionEmitter
                 L($"add.u64 {address}, %rd2, {bytes};");
                 L($"st.global.f32 [{address}], {accumulators[i, j]};");
             }
+        }
     }
 
     private string NextR() => "%r" + I(_r++);

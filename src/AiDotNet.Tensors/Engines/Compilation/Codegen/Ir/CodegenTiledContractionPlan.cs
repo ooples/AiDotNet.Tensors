@@ -10,22 +10,25 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// </summary>
 /// <remarks>
 /// The first accepted form is the pointwise-convolution family
-/// <c>out[batch,m,n] = sum(k) matrix[k,m] * stream[batch,k,n]</c>. The batch and
+/// <c>out[batch,m,n] = sum(k) matrix[m,k] * stream[batch,k,n]</c>, also accepting
+/// the transposed physical matrix layout. The batch and
 /// spatial coordinates may each be several physical dimensions; they are flattened only
 /// when all participating bindings preserve the same row-major order. Keeping this as an IR
 /// plan, instead of recognizing catalog names in the PTX emitter, lets forward and adjoint
 /// specs reach the same schedule without maintaining a second description of the operator.
+/// An optional exact bias over M and ReLU remain fused in the output epilogue.
 /// </remarks>
 public sealed class CodegenTiledContractionPlan
 {
     private CodegenTiledContractionPlan(
-        int matrixInput, int streamInput, int mAxis, int reductionAxis,
+        int matrixInput, int streamInput, int? biasInput, int mAxis, int reductionAxis,
         int batch, int m, int n, int k, bool matrixReductionMajor,
         int tileM, int tileN, int tileK, int threadTileM, int threadTileN,
         int stages)
     {
         MatrixInput = matrixInput;
         StreamInput = streamInput;
+        BiasInput = biasInput;
         MAxis = mAxis;
         ReductionAxis = reductionAxis;
         Batch = batch;
@@ -46,6 +49,9 @@ public sealed class CodegenTiledContractionPlan
 
     /// <summary>Product operand containing batch, K and the flattened N axes.</summary>
     public int StreamInput { get; }
+
+    /// <summary>Optional one-dimensional fp32 bias broadcast over M.</summary>
+    public int? BiasInput { get; }
 
     /// <summary>The spec axis represented by M.</summary>
     public int MAxis { get; }
@@ -125,11 +131,13 @@ public sealed class CodegenTiledContractionPlan
             return false;
         }
 
-        if (spec.BiasInput.HasValue || spec.ScaleInput.HasValue ||
-            spec.Activation != CodegenActivationKind.None ||
+        if (spec.PreBiasInput.HasValue || spec.ReduceScale != 1.0 ||
+            spec.ScaleInput.HasValue ||
+            (spec.Activation != CodegenActivationKind.None &&
+             spec.Activation != CodegenActivationKind.ReLU) ||
             spec.SecondaryOutput is not null || spec.ExtraOutputs.Count != 0)
         {
-            reason = "the first tiled path accepts a plain output with no epilogue or side output";
+            reason = "the tiled path accepts only an optional M bias and ReLU epilogue";
             return false;
         }
 
@@ -197,6 +205,12 @@ public sealed class CodegenTiledContractionPlan
             reason = "the other operand is not the output layout with M replaced by K";
             return false;
         }
+        if (spec.BiasInput.HasValue &&
+            !IsMBias(spec.Inputs[spec.BiasInput.Value], mAxis, spec.Space.Axes[mAxis].Extent))
+        {
+            reason = "the tiled epilogue bias must be a one-dimensional fp32 broadcast over M";
+            return false;
+        }
 
         int batch = 1, n = 1;
         for (int d = 0; d < mDimension; d++) batch = checked(batch * spec.Output.Shape[d]);
@@ -207,7 +221,9 @@ public sealed class CodegenTiledContractionPlan
 
         int tileM = LargestDivisorAtMost(m, 32, 4);
         int tileN = LargestDivisorAtMost(n, 64, 4);
-        int tileK = LargestDivisorAtMost(k, 8, 1);
+        // A physically [M,K] matrix is copied along K, so each async copy needs four
+        // adjacent values.  [K,M] copies along M and has no corresponding K constraint.
+        int tileK = LargestDivisorAtMost(k, 8, reductionMajor ? 1 : 4);
         if (tileM == 0 || tileN == 0 || tileK == 0)
         {
             reason = "the output or contraction extent has no supported whole tile";
@@ -224,7 +240,7 @@ public sealed class CodegenTiledContractionPlan
         }
 
         plan = new CodegenTiledContractionPlan(
-            matrixInput, streamInput, mAxis, reduction, batch, m, n, k,
+            matrixInput, streamInput, spec.BiasInput, mAxis, reduction, batch, m, n, k,
             reductionMajor, tileM, tileN, tileK, threadTileM, threadTileN,
             stages: 2);
         reason = "eligible";
@@ -280,6 +296,14 @@ public sealed class CodegenTiledContractionPlan
             if (!TryPlainAxis(binding.Map[d], out int actual) || actual != expected) return false;
         }
         return true;
+    }
+
+    private static bool IsMBias(CodegenTensorBinding binding, int mAxis, int m)
+    {
+        return binding.ElementType == CodegenElementType.Float32 &&
+            binding.Shape.Count == 1 && binding.Map.Count == 1 &&
+            binding.Shape[0] == m && TryPlainAxis(binding.Map[0], out int axis) &&
+            axis == mAxis;
     }
 
     private static bool TryPlainAxis(CodegenAffineExpr expression, out int axis)
