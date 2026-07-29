@@ -47,14 +47,15 @@ public sealed class CompiledOptimizerParameterViewTests
         var slicedBacking = new[] { 71f, 10f, 20f, 72f };
         var slicedParameter = Tensor<float>.FromMemory(
             new Memory<float>(slicedBacking, 1, 2), new[] { 2 });
+        var parameters = new[] { transposedParameter, slicedParameter };
 
         ICompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(parameters))
         {
             var viewLoss = engine.ReduceSum(transposedParameter, null);
             var sliceLoss = engine.ReduceSum(slicedParameter, null);
             engine.TensorAdd(viewLoss, sliceLoss);
-            plan = scope.CompileTraining(new[] { transposedParameter, slicedParameter });
+            plan = scope.CompileTraining(parameters);
         }
 
         using (plan)
