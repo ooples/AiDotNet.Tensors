@@ -133,6 +133,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-oracle-incumbents")
+        {
+            HandWrittenKernelOracleTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--warp-tile-sweep")
         {
             WarpTileSweepTool.Run(args.Skip(1).ToArray());
@@ -1264,6 +1270,9 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
         Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
+        Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
+        Console.WriteLine("  --kernel-oracle: generated-kernel performance vs spec-derived ceilings");
+        Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");

@@ -2,10 +2,10 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -53,11 +53,25 @@ internal static class HeadToHeadTool
         Console.WriteLine("HEAD TO HEAD - generated kernel against the kernel a caller gets today");
         Console.WriteLine("device: {0}", backend.DeviceName);
         Console.WriteLine();
-        Console.WriteLine("{0,-38} {1,15} {2,15} {3,9}  {4}",
+        Console.WriteLine("{0,-44} {1,15} {2,15} {3,9}  {4}",
             "operator", "existing", "generated", "ratio", "verdict");
 
         EmbeddingForward(backend, runtime, major, minor);
         EmbeddingBackward(backend, runtime, major, minor);
+        SgdMomentum(backend, runtime, major, minor);
+        RowReduction(backend, runtime, major, minor,
+            "row sum 4096x1024", "h2h_rowsum", CodegenReduceKind.Sum,
+            static (b, input, output, rows, inner) => b.SumAxis(input, output, rows, inner));
+        RowReduction(backend, runtime, major, minor,
+            "row mean 4096x1024", "h2h_rowmean", CodegenReduceKind.Sum,
+            static (b, input, output, rows, inner) => b.MeanAxis(input, output, rows, inner),
+            reduceScale: 1.0 / 1024.0);
+        RowReduction(backend, runtime, major, minor,
+            "row max 4096x1024", "h2h_rowmax", CodegenReduceKind.Max,
+            static (b, input, output, rows, inner) => b.MaxAxis(input, output, rows, inner));
+
+        ReportUnavailable("Adam / AdamW",
+            "generator cannot express grad^2 plus m/v/param updates yet");
 
         Console.WriteLine();
         Console.WriteLine("ratio > 1 means the generated kernel is faster. A promotion needs BOTH");
@@ -77,7 +91,8 @@ internal static class HeadToHeadTool
         // into huge or negative offsets that read outside the table. The first run of this
         // harness did exactly that and tripped a sticky CUDA-700.
         var ids = new int[Tokens];
-        for (int t = 0; t < Tokens; t++) ids[t] = (t * 7919) % Vocabulary;
+        // The long multiply is also load-bearing: int overflow here creates negative IDs.
+        for (int t = 0; t < Tokens; t++) ids[t] = (int)((t * 7919L) % Vocabulary);
         var table = new float[(long)Vocabulary * Width];
         for (int e = 0; e < table.Length; e++) table[e] = ((e * 37) % 97 - 48) / 16.0f;
 
@@ -85,16 +100,34 @@ internal static class HeadToHeadTool
         using var tableBuffer = backend.AllocateBuffer(table);
         using var outBuffer = backend.AllocateBuffer(Tokens * Width);
 
+        void LaunchExisting() => backend.Embedding(
+            idsBuffer, tableBuffer, outBuffer, Tokens, Width);
+
+        // A fast kernel that reads uninitialised memory proves nothing. Check one full-size
+        // invocation before timing, then time the same initialized inputs on both sides.
+        LaunchExisting();
+        backend.Synchronize();
+        var existingOnce = backend.DownloadBuffer(outBuffer);
+
+        long workUnits = ((long)Tokens * Width * 2 + Tokens) * sizeof(float);
         var existing = StableTimer.MeasureHost(
-            () => backend.Embedding(idsBuffer, tableBuffer, outBuffer, Tokens, Width),
-            backend.Synchronize,
-            workUnits: (long)Tokens * Width);
+            LaunchExisting, backend.Synchronize, workUnits);
 
         var generated = MeasureGenerated(
-            runtime, major, minor, GatherSpec(Tokens, Vocabulary, Width),
-            indexData: ids, workUnits: (long)Tokens * Width);
+            runtime, major, minor,
+            IncumbentSemanticSpecs.Gather("h2h_gather", Tokens, Vocabulary, Width),
+            indexData: ids,
+            floatInputs: new Dictionary<int, float[]> { [1] = table },
+            workUnits,
+            zeroOutput: false,
+            out var generatedOnce);
 
-        Report("embedding forward 1M x 64", existing, generated);
+        double error = RelativeError(existingOnce, generatedOnce);
+        Report("embedding forward 1M x 64", existing, generated,
+            qualification: error <= 1e-7
+                ? null
+                : "NOT EQUIVALENT -- relative error "
+                  + error.ToString("E2", CultureInfo.InvariantCulture));
     }
 
     /// <summary>The backward: the generated scatter against <c>embedding_backward</c>.</summary>
@@ -109,7 +142,8 @@ internal static class HeadToHeadTool
         // into huge or negative offsets that read outside the table. The first run of this
         // harness did exactly that and tripped a sticky CUDA-700.
         var ids = new int[Tokens];
-        for (int t = 0; t < Tokens; t++) ids[t] = (t * 7919) % Vocabulary;
+        // The long multiply is also load-bearing: int overflow here creates negative IDs.
+        for (int t = 0; t < Tokens; t++) ids[t] = (int)((t * 7919L) % Vocabulary);
         var grad = new float[(long)Tokens * Width];
         for (int e = 0; e < grad.Length; e++) grad[e] = ((e * 37) % 97 - 48) / 16.0f;
 
@@ -117,15 +151,32 @@ internal static class HeadToHeadTool
         using var gradBuffer = backend.AllocateBuffer(grad);
         using var tableBuffer = backend.AllocateBuffer(Vocabulary * Width);
 
-        var existing = StableTimer.MeasureHost(
-            () => backend.EmbeddingBackward(
-                gradBuffer, idsBuffer, tableBuffer, Tokens, Width, Vocabulary),
-            backend.Synchronize,
-            workUnits: (long)Tokens * Width);
+        void LaunchExisting() => backend.EmbeddingBackward(
+            gradBuffer, idsBuffer, tableBuffer, Tokens, Width, Vocabulary);
 
+        LaunchExisting();
+        backend.Synchronize();
+        var existingOnce = backend.DownloadBuffer(tableBuffer);
+
+        // The deterministic incumbent performs V*D*N predicate checks. Use that actual work
+        // to select its batch size; pretending it is O(ND) made a single harness run spend
+        // five minutes repeating a 320 ms kernel almost 300 times per sample.
+        long existingWorkUnits = (long)Vocabulary * Width * Tokens;
+        var existing = StableTimer.MeasureHost(
+            LaunchExisting, backend.Synchronize, existingWorkUnits);
+
+        long generatedWorkUnits =
+            ((long)Tokens * Width * 2 + Tokens + (long)Vocabulary * Width) * sizeof(float);
         var generated = MeasureGenerated(
-            runtime, major, minor, ScatterSpec(Tokens, Vocabulary, Width),
-            indexData: ids, workUnits: (long)Tokens * Width);
+            runtime, major, minor,
+            IncumbentSemanticSpecs.Scatter("h2h_scatter", Tokens, Vocabulary, Width),
+            indexData: ids,
+            floatInputs: new Dictionary<int, float[]> { [1] = grad },
+            generatedWorkUnits,
+            zeroOutput: true,
+            out var generatedOnce);
+
+        double error = RelativeError(existingOnce, generatedOnce);
 
         // NOT THE SAME OPERATOR, and the ratio must say so. CudaBackend.EmbeddingBackward
         // dispatches to embedding_backward_DETERMINISTIC, which scans every one of the
@@ -146,13 +197,113 @@ internal static class HeadToHeadTool
         // algorithmically expensive and that a faster form exists at a stated cost -- which is
         // a decision about determinism, not about kernels.
         Report("embedding backward (vs DETERMINISTIC scan)", existing, generated,
-               qualification: "different guarantees -- see source");
+               qualification: error <= 2e-5
+                   ? "different guarantees; atomic timing excludes required clear"
+                   : "NOT EQUIVALENT -- relative error "
+                     + error.ToString("E2", CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// SGD with momentum: the smallest optimizer whose entire state transition the current
+    /// spec algebra can express. Weight decay is zero because the spec currently has one bias
+    /// input, while momentum with L2 decay needs both gradient and parameter in the velocity
+    /// update.
+    /// </summary>
+    private static void SgdMomentum(
+        CudaBackend backend, DirectPtxRuntime runtime, int major, int minor)
+    {
+        const int Count = 1 << 22;
+        const float LearningRate = 0.01f, Momentum = 0.9f;
+
+        var parameter = Values(Count, 11, 0.25f);
+        var gradient = Values(Count, 23, 0.03125f);
+        var velocity = Values(Count, 37, 0.015625f);
+
+        using var existingParameter = backend.AllocateBuffer(parameter);
+        using var existingGradient = backend.AllocateBuffer(gradient);
+        using var existingVelocity = backend.AllocateBuffer(velocity);
+
+        void LaunchExisting() => backend.SgdMomentumUpdate(
+            existingParameter, existingGradient, existingVelocity,
+            LearningRate, Momentum, weightDecay: 0f, Count);
+
+        // Agreement is checked on exactly one step. Timing runs mutate optimizer state, and
+        // the two stability loops can take different sample counts; comparing their final
+        // buffers would therefore compare different numbers of optimizer steps.
+        LaunchExisting();
+        backend.Synchronize();
+        var existingParameterOnce = backend.DownloadBuffer(existingParameter);
+        var existingVelocityOnce = backend.DownloadBuffer(existingVelocity);
+
+        backend.UploadBufferInPlace(parameter, existingParameter);
+        backend.UploadBufferInPlace(velocity, existingVelocity);
+
+        long workUnits = (long)Count * sizeof(float) * 5; // 3 reads + 2 writes
+        var existing = StableTimer.MeasureHost(
+            LaunchExisting, backend.Synchronize, workUnits);
+
+        var generated = MeasureGeneratedMomentum(
+            runtime, major, minor, parameter, gradient, velocity,
+            LearningRate, Momentum, workUnits,
+            out var generatedParameterOnce, out var generatedVelocityOnce);
+
+        double error = Math.Max(
+            RelativeError(existingParameterOnce, generatedParameterOnce),
+            RelativeError(existingVelocityOnce, generatedVelocityOnce));
+
+        Report("SGD momentum 4M (weight decay 0)", existing, generated,
+            qualification: error <= 2e-6
+                ? null
+                : "NOT EQUIVALENT -- relative error "
+                  + error.ToString("E2", CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// A hand-written axis reduction against the generated planner's complete program. When
+    /// the planner chooses split-K, the generated timing includes both partial and combine
+    /// launches; timing only the partial would move cost out of the row and manufacture a win.
+    /// </summary>
+    private static void RowReduction(
+        CudaBackend backend, DirectPtxRuntime runtime, int major, int minor,
+        string label, string kernelName, CodegenReduceKind reduce,
+        Action<CudaBackend, IGpuBuffer, IGpuBuffer, int, int> launchExisting,
+        double reduceScale = 1.0)
+    {
+        const int Rows = 4096, Inner = 1024;
+        var input = Values(Rows * Inner, 53, 0.015625f);
+
+        using var existingInput = backend.AllocateBuffer(input);
+        using var existingOutput = backend.AllocateBuffer(Rows);
+
+        void Existing() => launchExisting(backend, existingInput, existingOutput, Rows, Inner);
+
+        Existing();
+        backend.Synchronize();
+        var existingValues = backend.DownloadBuffer(existingOutput);
+
+        long workUnits = (long)input.Length * sizeof(float) + (long)Rows * sizeof(float);
+        var existing = StableTimer.MeasureHost(Existing, backend.Synchronize, workUnits);
+
+        var spec = IncumbentSemanticSpecs.RowReduction(
+            kernelName, Rows, Inner, reduce, reduceScale);
+        var generated = MeasureGeneratedReduction(
+            runtime, major, minor, spec, input, workUnits,
+            out var generatedValues, out bool usedSplit);
+
+        double error = RelativeError(existingValues, generatedValues);
+        string measuredLabel = usedSplit ? label + " (planned split)" : label + " (direct)";
+        Report(measuredLabel, existing, generated,
+            qualification: error <= 2e-5
+                ? null
+                : "NOT EQUIVALENT -- relative error "
+                  + error.ToString("E2", CultureInfo.InvariantCulture));
     }
 
     /// <summary>Emits and times a generated spec on its own buffers.</summary>
     private static StableTimer.Result MeasureGenerated(
         DirectPtxRuntime runtime, int major, int minor, CodegenKernelSpec spec,
-        int[] indexData, long workUnits)
+        int[] indexData, IReadOnlyDictionary<int, float[]> floatInputs,
+        long workUnits, bool zeroOutput, out float[] outputOnce)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -177,8 +328,18 @@ internal static class HeadToHeadTool
                 }
                 else
                 {
+                    if (!floatInputs.TryGetValue(binding.ParameterIndex, out var values)
+                        || values.Length != binding.ElementCount)
+                    {
+                        throw new ArgumentException(
+                            $"Missing {binding.ElementCount}-element fp32 input for " +
+                            $"parameter {binding.ParameterIndex} ({binding.Name}).",
+                            nameof(floatInputs));
+                    }
+
                     buffer = runtime.AllocateBytes(
                         (nuint)(binding.ElementCount * binding.ElementBytes));
+                    buffer.Upload<float>(values);
                 }
 
                 buffers.Add(buffer);
@@ -190,10 +351,28 @@ internal static class HeadToHeadTool
             buffers.Add(output);
             pointers[spec.Output.ParameterIndex] = output.Pointer;
 
-            return StableTimer.Measure(
-                runtime,
-                () => Launch(module, fn, pointers,
-                             (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX),
+            float[]? zeros = zeroOutput ? new float[spec.Output.ElementCount] : null;
+            if (zeros is not null) output.Upload<float>(zeros);
+
+            void LaunchGenerated() => Launch(
+                module, fn, pointers, (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
+
+            LaunchGenerated();
+            runtime.Synchronize();
+            outputOnce = new float[spec.Output.ElementCount];
+            output.Download<float>(outputOnce);
+
+            // Scatter uses atomic add, so reset once after the agreement check. Deliberately
+            // do not hide a memset inside every timed launch: this row is the atomic kernel's
+            // wall clock, not an equivalent self-contained operator, and Report says so.
+            if (zeros is not null) output.Upload<float>(zeros);
+
+            // SAME TIMING METHOD AS THE INCUMBENT. The first version used CUDA events here
+            // and a host Stopwatch for CudaBackend. That compared timing protocols as well as
+            // kernels while the class-level comment claimed otherwise.
+            return StableTimer.MeasureHost(
+                LaunchGenerated,
+                runtime.Synchronize,
                 workUnits);
         }
         finally
@@ -213,7 +392,7 @@ internal static class HeadToHeadTool
         if (!existing.Stable || !generated.Stable)
         {
             ratio = "-";
-            verdict = "NOT MEASURABLE at this size";
+            verdict = qualification ?? "NOT MEASURABLE at this size";
         }
         else
         {
@@ -231,51 +410,135 @@ internal static class HeadToHeadTool
             if (qualification is not null) verdict = qualification;
         }
 
-        Console.WriteLine("{0,-38} {1,15} {2,15} {3,9}  {4}",
+        Console.WriteLine("{0,-44} {1,15} {2,15} {3,9}  {4}",
             label, existing.Describe(), generated.Describe(), ratio, verdict);
     }
 
-    private static CodegenKernelSpec GatherSpec(int tokens, int vocabulary, int width)
+    private static void ReportUnavailable(string label, string reason)
     {
-        var space = new CodegenIterationSpace(
-            CodegenAxis.Parallel("t", tokens), CodegenAxis.Parallel("e", width));
-
-        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens },
-            new[] { CodegenAffineExpr.Axis(0) }, elementType: CodegenElementType.Int32);
-        var table = new CodegenTensorBinding(1, "table", new[] { vocabulary, width },
-            new[] { CodegenAffineExpr.Const(0), CodegenAffineExpr.Axis(1) },
-            indirect: new CodegenIndirectIndex?[]
-            {
-                new CodegenIndirectIndex(0, CodegenAffineExpr.Axis(0), vocabulary),
-                null,
-            });
-        var output = new CodegenTensorBinding(2, "out", new[] { tokens, width },
-            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
-
-        return new CodegenKernelSpec("h2h_gather", space, new[] { ids, table }, output,
-            new[] { 1 }, CodegenReduceKind.None);
+        Console.WriteLine("{0,-44} {1,15} {2,15} {3,9}  {4}",
+            label, "existing", "-", "-", "NOT EXPRESSIBLE -- " + reason);
     }
 
-    private static CodegenKernelSpec ScatterSpec(int tokens, int vocabulary, int width)
+    private static StableTimer.Result MeasureGeneratedMomentum(
+        DirectPtxRuntime runtime, int major, int minor,
+        float[] parameter, float[] gradient, float[] velocity,
+        float learningRate, float momentum, long workUnits,
+        out float[] parameterOnce, out float[] velocityOnce)
     {
-        var space = new CodegenIterationSpace(
-            CodegenAxis.Parallel("t", tokens), CodegenAxis.Parallel("e", width));
+        var spec = IncumbentSemanticSpecs.Momentum(
+            "h2h_momentum", parameter.Length, momentum, learningRate);
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.Emit(spec, major, minor);
+        using var module = runtime.LoadModule(ptx);
+        IntPtr fn = module.GetFunction(spec.Name, out _);
 
-        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens },
-            new[] { CodegenAffineExpr.Axis(0) }, elementType: CodegenElementType.Int32);
-        var grad = new CodegenTensorBinding(1, "grad", new[] { tokens, width },
-            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
-        var table = new CodegenTensorBinding(2, "grad_table", new[] { vocabulary, width },
-            new[] { CodegenAffineExpr.Const(0), CodegenAffineExpr.Axis(1) },
-            isOutput: true,
-            indirect: new CodegenIndirectIndex?[]
-            {
-                new CodegenIndirectIndex(0, CodegenAffineExpr.Axis(0), vocabulary),
-                null,
-            });
+        using var v = runtime.AllocateBytes((nuint)(velocity.Length * sizeof(float)));
+        using var g = runtime.AllocateBytes((nuint)(gradient.Length * sizeof(float)));
+        using var p = runtime.AllocateBytes((nuint)(parameter.Length * sizeof(float)));
+        v.Upload<float>(velocity);
+        g.Upload<float>(gradient);
+        p.Upload<float>(parameter);
 
-        return new CodegenKernelSpec("h2h_scatter", space, new[] { ids, grad }, table,
-            new[] { 1 }, CodegenReduceKind.None);
+        // Inputs and outputs intentionally alias. The incumbent updates p and v in place, and
+        // each generated thread loads its own element before storing it, so this is the same
+        // memory contract rather than a separate-output approximation.
+        var pointers = new[] { v.Pointer, g.Pointer, p.Pointer, v.Pointer, p.Pointer };
+        void LaunchMomentum() => Launch(
+            module, fn, pointers, (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
+
+        LaunchMomentum();
+        runtime.Synchronize();
+        parameterOnce = new float[parameter.Length];
+        velocityOnce = new float[velocity.Length];
+        p.Download<float>(parameterOnce);
+        v.Download<float>(velocityOnce);
+
+        p.Upload<float>(parameter);
+        v.Upload<float>(velocity);
+        return StableTimer.MeasureHost(LaunchMomentum, runtime.Synchronize, workUnits);
+    }
+
+    private static StableTimer.Result MeasureGeneratedReduction(
+        DirectPtxRuntime runtime, int major, int minor, CodegenKernelSpec spec,
+        float[] input, long workUnits, out float[] output, out bool usedSplit)
+    {
+        var plan = CodegenSplitReduction.TryPlan(spec);
+        usedSplit = plan is not null;
+
+        if (plan is null)
+        {
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(spec, major, minor);
+            using var module = runtime.LoadModule(ptx);
+            IntPtr fn = module.GetFunction(spec.Name, out _);
+            using var inputBuffer = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
+            using var outputBuffer = runtime.AllocateBytes(
+                (nuint)(spec.Output.ElementCount * sizeof(float)));
+            inputBuffer.Upload<float>(input);
+            var pointers = new[] { inputBuffer.Pointer, outputBuffer.Pointer };
+            void LaunchDirect() => Launch(
+                module, fn, pointers, (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
+
+            LaunchDirect();
+            runtime.Synchronize();
+            output = new float[spec.Output.ElementCount];
+            outputBuffer.Download<float>(output);
+            return StableTimer.MeasureHost(LaunchDirect, runtime.Synchronize, workUnits);
+        }
+
+        var partialEmitter = new PtxAffineEmitter();
+        var combineEmitter = new PtxAffineEmitter();
+        string partialPtx = partialEmitter.Emit(plan.Partial, major, minor);
+        string combinePtx = combineEmitter.Emit(plan.Combine, major, minor);
+        using var partialModule = runtime.LoadModule(partialPtx);
+        using var combineModule = runtime.LoadModule(combinePtx);
+        IntPtr partialFn = partialModule.GetFunction(plan.Partial.Name, out _);
+        IntPtr combineFn = combineModule.GetFunction(plan.Combine.Name, out _);
+
+        using var inputGpu = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
+        using var temporary = runtime.AllocateBytes(
+            (nuint)(plan.Partial.Output.ElementCount * sizeof(float)));
+        using var outputGpu = runtime.AllocateBytes(
+            (nuint)(spec.Output.ElementCount * sizeof(float)));
+        inputGpu.Upload<float>(input);
+
+        var partialArgs = new[] { inputGpu.Pointer, temporary.Pointer };
+        var combineArgs = new[] { temporary.Pointer, outputGpu.Pointer };
+        void LaunchSplit()
+        {
+            Launch(partialModule, partialFn, partialArgs,
+                (uint)partialEmitter.LaunchBlocks, (uint)partialEmitter.LaunchBlockX);
+            Launch(combineModule, combineFn, combineArgs,
+                (uint)combineEmitter.LaunchBlocks, (uint)combineEmitter.LaunchBlockX);
+        }
+
+        LaunchSplit();
+        runtime.Synchronize();
+        output = new float[spec.Output.ElementCount];
+        outputGpu.Download<float>(output);
+        return StableTimer.MeasureHost(LaunchSplit, runtime.Synchronize, workUnits);
+    }
+
+    private static float[] Values(int count, int salt, float scale)
+    {
+        var values = new float[count];
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (((i * 37L + salt) % 97) - 48) * scale;
+        return values;
+    }
+
+    private static double RelativeError(float[] expected, float[] actual)
+    {
+        if (expected.Length != actual.Length) return double.PositiveInfinity;
+
+        double worst = 0.0, scale = 0.0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            worst = Math.Max(worst, Math.Abs((double)expected[i] - actual[i]));
+            scale = Math.Max(scale, Math.Abs(expected[i]));
+        }
+        return worst / Math.Max(1.0, scale);
     }
 
     private static unsafe void Launch(
