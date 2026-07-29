@@ -165,7 +165,7 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         }
         int threadTileM = tileM >= 16 ? 2 : 1;
         int threadTileN = tileN >= 16 ? 2 : 1;
-        long sharedBytes = 2L *
+        long sharedBytes = CodegenSharedMemoryBudget.DoubleBufferStages *
             (tileM * (long)innerReduction + tileN * (long)inputWidth) * sizeof(float);
         if (!CodegenSharedMemoryBudget.Fits(sharedBytes, out reason))
             return false;
@@ -185,7 +185,8 @@ public sealed class CodegenTiledConv2DOuterProductPlan
             m, n, spec.Output.Shape[2], spec.Output.Shape[3],
             batch, outerReduction, innerReduction,
             inputHeight, inputWidth,
-            tileM, tileN, threadTileM, threadTileN, stages: 2);
+            tileM, tileN, threadTileM, threadTileN,
+            stages: CodegenSharedMemoryBudget.DoubleBufferStages);
         reason = "eligible";
         return true;
     }

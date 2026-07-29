@@ -7,6 +7,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// <summary>The portable static shared-memory contract for generated CUDA kernels.</summary>
 internal static class CodegenSharedMemoryBudget
 {
+    internal const int DoubleBufferStages = 2;
+
     /// <summary>
     /// Static shared memory available without a device-specific opt-in attribute.
     /// </summary>
