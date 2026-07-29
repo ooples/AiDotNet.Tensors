@@ -298,6 +298,21 @@ internal static class KernelCatalogOracleTool
             predictedUs = Ceiling(semantic);
             shape = "cooperative (channel,kh), three kw, 256-thread tree";
         }
+        else if (string.Equals(winner, "parity-transposed", StringComparison.Ordinal))
+        {
+            var emitter = new PtxParityTransposedConv2DEmitter();
+            _ = emitter.Emit(entry.Bench, major, minor);
+            var plan = emitter.Plan!;
+
+            // Each launched thread issues nine weight loads plus four predicated
+            // activation-load instructions. Boundary predicates reduce traffic but not
+            // the instruction stream, so retain all thirteen in schedule evidence.
+            long warps = (plan.InputElements + 31L) / 32L;
+            warpLoads = checked(warps * 13L);
+            uniqueBytes = semantic.UniqueBytes;
+            predictedUs = Ceiling(semantic);
+            shape = "one input per thread, deterministic 2x2 output parity tile";
+        }
         else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
         {
             var emitter = new PtxTiledConv2DEmitter();

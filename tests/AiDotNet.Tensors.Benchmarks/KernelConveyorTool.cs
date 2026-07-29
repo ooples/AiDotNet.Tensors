@@ -401,6 +401,8 @@ internal static class KernelConveyorTool
                     ? "tiled conv2d"
                 : string.Equals(Winner, "depthwise-weight-gradient", StringComparison.Ordinal)
                     ? "coop dW"
+                : string.Equals(Winner, "parity-transposed", StringComparison.Ordinal)
+                    ? "parity transpose"
                 : Describe(Kernels[0].LoopedAxes);
     }
 
@@ -485,6 +487,31 @@ internal static class KernelConveyorTool
                 Console.WriteLine("    note: " + catalogName +
                                   " recorded depthwise-weight-gradient but it could not " +
                                   "be rebuilt (" + ex.Message + "); using the affine kernel");
+            }
+        }
+
+        if (string.Equals(winner, "parity-transposed", StringComparison.Ordinal))
+        {
+            try
+            {
+                var parity = new PtxParityTransposedConv2DEmitter();
+                string text = parity.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, parity.LaunchBlocks,
+                            checked((uint)parity.LaunchBlockThreads), 1,
+                            spec.Space.ReductionAxes.Length, 2, "input parity tile+weights"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName +
+                                  " recorded parity-transposed but it could not be " +
+                                  "rebuilt (" + ex.Message + "); using the affine kernel");
             }
         }
 

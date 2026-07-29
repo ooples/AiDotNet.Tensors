@@ -89,10 +89,12 @@ def work_for_run():
     return work
 
 
-def run_ours(dll):
+def run_ours(dll, selector):
     """Parses --kernel-bench output into {kernel: (us, spread_pct)}."""
     completed = None
     command = ["dotnet", dll, "--kernel-bench"]
+    if selector != "all":
+        command.append(selector)
     for attempt in range(1, 4):
         completed = subprocess.run(command, capture_output=True, text=True)
         if completed.returncode == 0:
@@ -117,11 +119,12 @@ def run_ours(dll):
     return got
 
 
-def run_torch_once(python, script, strategy):
+def run_torch_once(python, script, strategy, selector):
     """Parses the competitor lane into {kernel: {'eager': us, 'graph': (us, spread)}}."""
     env = dict(os.environ)
     env["PATH"] = TORCH_LIB + os.pathsep + env.get("PATH", "")
     env["BAKEOFF_CUDNN_SEARCH"] = strategy
+    env["BAKEOFF_SELECTOR"] = selector
     command = [python, script]
     completed = subprocess.run(command, capture_output=True, text=True, env=env)
     if completed.returncode != 0:
@@ -148,14 +151,14 @@ def run_torch_once(python, script, strategy):
     return got, device
 
 
-def run_torch(python, script, max_spread_pct):
+def run_torch(python, script, max_spread_pct, selector):
     """Selects the fastest stable cuDNN plan seen across fresh-process searches."""
     attempts = []
     expected_device = None
     for attempt, strategy in enumerate(COMPETITOR_PLAN_STRATEGIES, 1):
         print("  cuDNN plan-search attempt %d/%d (%s)" %
               (attempt, len(COMPETITOR_PLAN_STRATEGIES), strategy), flush=True)
-        got, device = run_torch_once(python, script, strategy)
+        got, device = run_torch_once(python, script, strategy, selector)
         if expected_device is None:
             expected_device = device
         elif device != expected_device:
@@ -192,6 +195,8 @@ def parse_args():
                         help="exact generated-dispatch fingerprint supplied by the .NET authority")
     parser.add_argument("--output", default=os.path.join("artifacts", "competitor-ratios.tsv"))
     parser.add_argument("--max-spread-pct", type=float, default=5.0)
+    parser.add_argument("--selector", default="all",
+                        help="one catalog kernel, or all")
     parser.add_argument("--peak-bandwidth-gbs", type=float, default=760.0,
                         help="roofline display only; default is RTX 3080")
     parser.add_argument("--peak-fp32-tflops", type=float, default=29.8,
@@ -208,6 +213,8 @@ def main():
     if args.max_spread_pct <= 0:
         raise RuntimeError("--max-spread-pct must be positive")
     work = work_for_run()
+    if args.selector != "all" and args.selector not in work:
+        raise RuntimeError("--selector does not name a competitor kernel: " + args.selector)
 
     # A failed refresh must not leave an older current-tag artifact available to the
     # release reader. The requested output belongs to this run; invalidate it before
@@ -221,9 +228,10 @@ def main():
                           "py", "run_codegen_bakeoff.py")
 
     print("measuring our generated kernels ...")
-    ours = run_ours(dll)
+    ours = run_ours(dll, args.selector)
     print("measuring PyTorch/cuDNN (eager and CUDA-graph) ...")
-    theirs, competitor_device = run_torch(python, script, args.max_spread_pct)
+    theirs, competitor_device = run_torch(
+        python, script, args.max_spread_pct, args.selector)
     print()
 
     header = ("kernel", "ours us", "spread", "cuDNN us", "spread", "ratio",

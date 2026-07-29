@@ -24,6 +24,11 @@ internal static class KernelCompetitorTool
         string runnerPython = ValueOf(args, "--runner-python") ?? "python";
         string output = Path.GetFullPath(ValueOf(args, "--out") ??
             Path.Combine("artifacts", "competitor-ratios.tsv"));
+        string selector = KernelToolArgs.Selector(args);
+        int selected = string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase)
+            ? CodegenKernelCatalog.All.Count
+            : CodegenKernelCatalog.Find(selector) is null ? 0 : 1;
+        KernelToolArgs.RequireNonEmptySelection(selector, selected, "kernel-competitor");
         string maxSpread = ValueOf(args, "--max-spread-pct") ?? "5.0";
         if (!double.TryParse(maxSpread, NumberStyles.Float, CultureInfo.InvariantCulture,
                 out double spread) || spread <= 0)
@@ -53,6 +58,8 @@ internal static class KernelCompetitorTool
         start.ArgumentList.Add(output);
         start.ArgumentList.Add("--max-spread-pct");
         start.ArgumentList.Add(spread.ToString("R", CultureInfo.InvariantCulture));
+        start.ArgumentList.Add("--selector");
+        start.ArgumentList.Add(selector);
 
         // The outer Python script launches both lanes. Pin our lane to this exact assembly,
         // rather than relying on a default path that may name a stale build.

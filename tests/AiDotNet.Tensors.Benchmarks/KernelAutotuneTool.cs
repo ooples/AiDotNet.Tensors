@@ -35,7 +35,8 @@ internal static class KernelAutotuneTool
     private sealed record Candidate(
         string Name, Action<PtxAffineEmitter>? Configure,
         bool TiledContraction = false, bool TiledConv2D = false,
-        bool DepthwiseWeightGradient = false);
+        bool DepthwiseWeightGradient = false,
+        bool ParityTransposedConv2D = false);
 
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
@@ -94,6 +95,11 @@ internal static class KernelAutotuneTool
         // (channel,kh) row, so all three kw accumulators share each dOut load instead
         // of independently replaying the same reduction.
         new("depthwise-weight-gradient", null, DepthwiseWeightGradient: true),
+
+        // One input coordinate owns the complete stride-2 output parity tile. This
+        // removes the affine lowering's exact-division and remainder predicates while
+        // preserving deterministic assignment: no output is shared between threads.
+        new("parity-transposed", null, ParityTransposedConv2D: true),
 
         new("no-tile", e => e.Coarsening = 1),
         new("tile2", e => { e.Coarsening = 2; }),
@@ -363,6 +369,15 @@ internal static class KernelAutotuneTool
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 blocks = cooperative.LaunchBlocks;
                 blockX = checked((uint)cooperative.LaunchBlockThreads);
+                blockY = 1;
+            }
+            else if (candidate.ParityTransposedConv2D)
+            {
+                var parity = new PtxParityTransposedConv2DEmitter();
+                ptx = parity.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                blocks = parity.LaunchBlocks;
+                blockX = checked((uint)parity.LaunchBlockThreads);
                 blockY = 1;
             }
             else

@@ -68,6 +68,7 @@ public sealed record CodegenAutotuneIdentity(
         AppendTiledCandidate(text, spec, computeMajor, computeMinor);
         AppendTiledConv2DCandidate(text, spec, computeMajor, computeMinor);
         AppendDepthwiseWeightGradientCandidate(text, spec, computeMajor, computeMinor);
+        AppendParityTransposedConv2DCandidate(text, spec, computeMajor, computeMinor);
 
         try
         {
@@ -176,6 +177,22 @@ public sealed record CodegenAutotuneIdentity(
         try
         {
             text.Append(new PtxDepthwiseConv2DWeightGradientEmitter().Emit(
+                spec, computeMajor, computeMinor));
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
+    }
+
+    private static void AppendParityTransposedConv2DCandidate(
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
+    {
+        text.Append("candidate=parity-transposed;");
+        try
+        {
+            text.Append(new PtxParityTransposedConv2DEmitter().Emit(
                 spec, computeMajor, computeMinor));
         }
         catch (NotSupportedException ex)
