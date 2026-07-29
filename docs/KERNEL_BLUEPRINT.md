@@ -191,9 +191,9 @@ correct for now rather than an oversight:
 | capability | why not dispatched |
 |---|---|
 | tensor cores | 0.97×–1.04× against cuBLAS. Routing a caller who could reach cuBLAS to us is a coin flip, not a win |
+| fp16 / bf16 | no generated mixed-precision operator has head-to-head evidence against the path its caller uses today |
 | gather / scatter | `embedding_forward`, `embedding_backward` and `embedding_backward_deterministic` **already exist** as hand-written kernels |
 | N outputs | the optimizer family already has `adam_update`, `sgd_momentum_update` and the rest |
-| split reductions | the backend already has reduction kernels |
 | complex | no existing consumer in the backend yet |
 
 **So the gating question is never "is it wired" — it is "is it faster than the kernel a caller
