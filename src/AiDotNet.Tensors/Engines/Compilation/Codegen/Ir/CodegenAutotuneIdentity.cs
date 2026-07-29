@@ -65,6 +65,7 @@ public sealed record CodegenAutotuneIdentity(
             static e => e.EnableVectorLoads = false);
         AppendCandidate(text, "input-staging", spec, computeMajor, computeMinor,
             static e => e.EnableInputStaging = true);
+        AppendTiledCandidate(text, spec, computeMajor, computeMinor);
 
         try
         {
@@ -99,6 +100,22 @@ public sealed record CodegenAutotuneIdentity(
             var emitter = new PtxAffineEmitter();
             configure(emitter);
             text.Append(emitter.Emit(spec, computeMajor, computeMinor));
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
+    }
+
+    private static void AppendTiledCandidate(
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
+    {
+        text.Append("candidate=tiled-contraction;");
+        try
+        {
+            text.Append(new PtxTiledContractionEmitter().Emit(
+                spec, computeMajor, computeMinor));
         }
         catch (NotSupportedException ex)
         {

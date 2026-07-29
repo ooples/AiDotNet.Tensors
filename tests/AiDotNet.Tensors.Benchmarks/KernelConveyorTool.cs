@@ -393,7 +393,9 @@ internal static class KernelConveyorTool
         /// <summary>How the stages label this lowering in their tables.</summary>
         internal string Label() => IsSplit
             ? "split x" + Kernels.Count.ToString(CultureInfo.InvariantCulture)
-            : Describe(Kernels[0].LoopedAxes);
+            : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal)
+                ? "tiled contraction"
+                : Describe(Kernels[0].LoopedAxes);
     }
 
     /// <summary>Emits the program the tuner recorded for this entry.</summary>
@@ -404,6 +406,31 @@ internal static class KernelConveyorTool
             spec, runtime.DeviceFingerprint,
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         string? winner = CodegenAutotuneCache.WinnerFor(catalogName, identity);
+
+        if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal))
+        {
+            try
+            {
+                var tiled = new PtxTiledContractionEmitter();
+                string text = tiled.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, tiled.LaunchBlocks,
+                            checked((uint)tiled.LaunchBlockThreads), 1,
+                            0, 0, "matrix+stream"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName + " recorded tiled-contraction " +
+                                  "but it could not be rebuilt (" + ex.Message +
+                                  "); using the affine kernel");
+            }
+        }
 
         if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
         {

@@ -32,7 +32,8 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class KernelAutotuneTool
 {
     /// <summary>One candidate lowering: a name and the knobs that produce it.</summary>
-    private sealed record Candidate(string Name, Action<PtxAffineEmitter> Configure);
+    private sealed record Candidate(
+        string Name, Action<PtxAffineEmitter>? Configure, bool TiledContraction = false);
 
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
@@ -76,6 +77,13 @@ internal static class KernelAutotuneTool
     {
         // The modelled choice, first so it is the reference every other is compared to.
         new("modelled", _ => { }),
+
+        // A different execution model rather than another scalar-emitter knob: one CTA
+        // cooperatively stages both operands and owns an FP32 output tile. Keep it adjacent
+        // to the baseline so a targeted schedule investigation gets its paired window before
+        // the legacy knob sweep; it remains subject to the same numerical and noise gates.
+        new("tiled-contraction", null, TiledContraction: true),
+
         new("no-tile", e => e.Coarsening = 1),
         new("tile2", e => { e.Coarsening = 2; }),
         new("lanes4", e => { e.MaxTileLanes = 4; }),
@@ -193,16 +201,16 @@ internal static class KernelAutotuneTool
         float[] reference = modelled.ReadOutput();
 
         StableTimer.Result baseline = StableTimer.Measure(runtime, modelled.Launch, workUnits);
+        bool hasStableTiming = baseline.Stable;
         if (!baseline.Stable)
         {
             Console.WriteLine("    modelled lowering " + baseline.Describe() +
-                              "; no winner recorded");
-            return null;
+                              "; trying independently gated paired windows");
         }
 
         string bestName = "modelled";
-        double bestUs = baseline.Microseconds;
-        double bestModelledUs = baseline.Microseconds;
+        double bestUs = baseline.Stable ? baseline.Microseconds : double.MaxValue;
+        double bestModelledUs = bestUs;
         double bestGain = 1.0;
 
         for (int i = 1; i < Candidates.Length; i++)
@@ -223,7 +231,8 @@ internal static class KernelAutotuneTool
                 }
 
                 Consider(runtime, modelled, program, workUnits,
-                    ref bestName, ref bestUs, ref bestModelledUs, ref bestGain);
+                    ref hasStableTiming, ref bestName, ref bestUs,
+                    ref bestModelledUs, ref bestGain);
             }
         }
 
@@ -244,17 +253,25 @@ internal static class KernelAutotuneTool
                 else
                 {
                     Consider(runtime, modelled, split, workUnits,
-                        ref bestName, ref bestUs, ref bestModelledUs, ref bestGain);
+                        ref hasStableTiming, ref bestName, ref bestUs,
+                        ref bestModelledUs, ref bestGain);
                 }
             }
         }
 
+        if (!hasStableTiming)
+        {
+            Console.WriteLine("    no standalone or paired timing window stabilized; " +
+                              "no winner recorded");
+            return null;
+        }
         return new TuneResult(bestName, bestUs, bestModelledUs, bestGain);
     }
 
     private static void Consider(
         DirectPtxRuntime runtime,
         CandidateProgram modelled, CandidateProgram candidate, long workUnits,
+        ref bool hasStableTiming,
         ref string bestName, ref double bestUs, ref double bestModelledUs, ref double bestGain)
     {
         StableTimer.PairResult timing = StableTimer.MeasurePair(
@@ -262,8 +279,27 @@ internal static class KernelAutotuneTool
         if (!timing.Stable)
         {
             Console.WriteLine("    candidate '" + candidate.Name +
-                              "' has unstable paired timing; rejected");
+                              "' has unstable paired timing (modelled " +
+                              timing.A.Describe() + ", candidate " + timing.B.Describe() +
+                              ", ratio +-" +
+                              (timing.RelativeSpread * 100).ToString(
+                                  "0.0", CultureInfo.InvariantCulture) + "%); rejected");
             return;
+        }
+
+        Console.WriteLine("    candidate '" + candidate.Name + "': modelled " +
+                          timing.A.Describe() + ", candidate " + timing.B.Describe() +
+                          ", paired " + timing.DescribeRatio() + " +-" +
+                          (timing.RelativeSpread * 100).ToString("0.0", CultureInfo.InvariantCulture) +
+                          "%");
+
+        // A stable pair is also valid baseline evidence. This lets an interrupted standalone
+        // window recover without accepting a candidate whose own time or ratio was unstable.
+        if (!hasStableTiming)
+        {
+            hasStableTiming = true;
+            bestUs = timing.A.Microseconds;
+            bestModelledUs = timing.A.Microseconds;
         }
 
         // A winner must clear both the observed paired spread and the protocol noise floor.
@@ -286,10 +322,27 @@ internal static class KernelAutotuneTool
         var resources = new List<IDisposable>();
         try
         {
-            var emitter = new PtxAffineEmitter();
-            candidate.Configure(emitter);
-            string ptx = emitter.Emit(
-                spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            string ptx;
+            uint blocks, blockX, blockY;
+            if (candidate.TiledContraction)
+            {
+                var tiled = new PtxTiledContractionEmitter();
+                ptx = tiled.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                blocks = tiled.LaunchBlocks;
+                blockX = checked((uint)tiled.LaunchBlockThreads);
+                blockY = 1;
+            }
+            else
+            {
+                var emitter = new PtxAffineEmitter();
+                candidate.Configure!(emitter);
+                ptx = emitter.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                blocks = emitter.LaunchBlocks;
+                blockX = checked((uint)emitter.LaunchBlockX);
+                blockY = checked((uint)emitter.LaunchBlockY);
+            }
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             resources.Add(module);
             IntPtr fn = module.GetFunction(spec.Name, out _);
@@ -320,8 +373,7 @@ internal static class KernelAutotuneTool
                 pointers[extra.Binding.ParameterIndex] = buffer.Pointer;
             }
 
-            void Launch() => LaunchOne(module, fn, pointers,
-                emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
+            void Launch() => LaunchOne(module, fn, pointers, blocks, blockX, blockY);
             return new CandidateProgram(
                 candidate.Name, Launch, output, checked((int)spec.Output.ElementCount), resources);
         }

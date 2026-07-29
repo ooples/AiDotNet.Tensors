@@ -224,6 +224,24 @@ internal static class KernelCatalogOracleTool
             }
             shape = "split x2";
         }
+        else if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal))
+        {
+            var emitter = new PtxTiledContractionEmitter();
+            _ = emitter.Emit(entry.Bench, major, minor);
+            var plan = emitter.Plan!;
+
+            // The plan stages every distinct operand tile once per K step. Count those
+            // scalar values, convert to warp-level issue equivalents, and keep semantic
+            // unique bytes as the traffic floor. This is schedule evidence, not a runtime
+            // prediction: the hardware timing remains the promotion authority.
+            long scalarLoads = checked((long)plan.Blocks * plan.Steps * plan.TileK *
+                (plan.TileM + plan.TileN));
+            uniqueBytes = semantic.UniqueBytes;
+            warpLoads = (scalarLoads + 31) / 32;
+            predictedUs = Ceiling(semantic);
+            shape = plan.TileM + "x" + plan.TileN + "x" + plan.TileK +
+                ", matrix+stream";
+        }
         else
         {
             var emitter = new PtxAffineEmitter();
