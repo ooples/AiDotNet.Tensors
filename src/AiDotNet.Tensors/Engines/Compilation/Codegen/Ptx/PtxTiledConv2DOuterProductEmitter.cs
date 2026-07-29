@@ -10,6 +10,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>Emits a double-buffered FP32 dense 3x3 weight-gradient partial.</summary>
 public sealed class PtxTiledConv2DOuterProductEmitter
 {
+    // PTX ISA 7.5 introduced the ignore-source predicate used by the window cp.async.
+    private const string PredicatedAsyncCopyPtxIsaVersion = "7.5";
     private const int FixedR = 20;
     private const int FixedRd = 8;
     private const int FixedP = 4;
@@ -99,7 +101,7 @@ public sealed class PtxTiledConv2DOuterProductEmitter
         L("ret;");
 
         string isaVersion = computeMajor == 8 && computeMinor < 9
-            ? "7.5"
+            ? PredicatedAsyncCopyPtxIsaVersion
             : PtxAffineEmitter.PtxIsaVersionFor(computeMajor, computeMinor);
         var text = new StringBuilder();
         text.Append(".version ").Append(isaVersion).Append('\n')
