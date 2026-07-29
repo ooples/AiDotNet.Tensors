@@ -467,7 +467,12 @@ public sealed class CodegenKernelSpec
         ValidateAxes(output, "output");
         for (int i = 0; i < _inputs.Length; i++) ValidateAxes(_inputs[i], "input " + i);
         for (int i = 0; i < _extraOutputs.Length; i++)
+        {
             ValidateAxes(_extraOutputs[i].Binding, "extra output " + i);
+            if (_extraOutputs[i].IndexExpr is not null)
+                ValidateExpressionAxes(_extraOutputs[i].IndexExpr!,
+                    "extra output " + i + " index expression");
+        }
 
         if (double.IsNaN(preBiasScale) || double.IsInfinity(preBiasScale))
             throw new ArgumentException(
@@ -504,12 +509,17 @@ public sealed class CodegenKernelSpec
         void ValidateAxes(CodegenTensorBinding binding, string role)
         {
             for (int d = 0; d < binding.Map.Count; d++)
-                foreach (var term in binding.Map[d].Terms)
-                    if (term.Axis < 0 || term.Axis >= space.Axes.Count)
-                        throw new ArgumentException(
-                            role + " '" + binding.Name + "' dimension " + d +
-                            " references affine axis " + term.Axis + " but the iteration " +
-                            "space has " + space.Axes.Count + " axes.");
+                ValidateExpressionAxes(binding.Map[d],
+                    role + " '" + binding.Name + "' dimension " + d);
+        }
+
+        void ValidateExpressionAxes(CodegenAffineExpr expression, string role)
+        {
+            foreach (var term in expression.Terms)
+                if (term.Axis < 0 || term.Axis >= space.Axes.Count)
+                    throw new ArgumentException(
+                        role + " references affine axis " + term.Axis + " but the iteration " +
+                        "space has " + space.Axes.Count + " axes.");
         }
     }
 
