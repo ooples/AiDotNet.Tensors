@@ -52,8 +52,6 @@ def conv_transpose_contract():
     return values
 
 
-TRANSPOSE = conv_transpose_contract()
-
 # name -> (bytes moved, flops). Used only for the roofline columns.
 WORK = {
     "depthwise_conv2d_3x3":            (2 * 32 * 64 * 56 * 56 * 4, 32 * 64 * 56 * 56 * 9 * 2),
@@ -67,12 +65,6 @@ WORK = {
     "conv2d_3x3_bwd_data":             ((8 * 64 * 28 * 28 + 8 * 32 * 28 * 28) * 4,
                                         8 * 64 * 28 * 28 * 32 * 9 * 2),
     "maxpool2d_2x2":                   ((32 * 64 * 112 * 112 + 32 * 64 * 56 * 56) * 4, 0),
-    "conv_transpose2d_3x3_stride2":    ((TRANSPOSE[0] * TRANSPOSE[1] *
-                                         (TRANSPOSE[2] * TRANSPOSE[3] +
-                                          TRANSPOSE[4] * TRANSPOSE[5])) * 4,
-                                        TRANSPOSE[0] * TRANSPOSE[1] *
-                                        TRANSPOSE[4] * TRANSPOSE[5] * 9 * 2),
-
     # Weight gradients. Bytes are the two large operands read (activations and the
     # incoming gradient); the OUTPUT is negligible -- 576 floats for the depthwise case --
     # which is precisely the shape that left the device idle and made split-K necessary.
@@ -83,6 +75,18 @@ WORK = {
     "conv2d_3x3_bwd_weights":           ((8 * 32 * 28 * 28 + 8 * 64 * 28 * 28) * 4,
                                          8 * 64 * 28 * 28 * 32 * 9 * 2),
 }
+
+
+def work_for_run():
+    """Adds contract-dependent roofline work without parsing it during import."""
+    transpose = conv_transpose_contract()
+    work = dict(WORK)
+    work["conv_transpose2d_3x3_stride2"] = (
+        (transpose[0] * transpose[1] *
+         (transpose[2] * transpose[3] + transpose[4] * transpose[5])) * 4,
+        transpose[0] * transpose[1] * transpose[4] * transpose[5] * 9 * 2,
+    )
+    return work
 
 
 def run_ours(dll):
@@ -203,6 +207,7 @@ def main():
         raise RuntimeError("--dispatch must be an exact sha256 dispatch fingerprint")
     if args.max_spread_pct <= 0:
         raise RuntimeError("--max-spread-pct must be positive")
+    work = work_for_run()
 
     # A failed refresh must not leave an older current-tag artifact available to the
     # release reader. The requested output belongs to this run; invalidate it before
@@ -238,7 +243,7 @@ def main():
         stable = our_spread <= args.max_spread_pct and their_spread <= args.max_spread_pct
         ratio = their_us / our_us if stable else None
 
-        nbytes, nflops = WORK.get(name, (0, 0))
+        nbytes, nflops = work.get(name, (0, 0))
         gbs = nbytes / (our_us * 1e-6) if nbytes else 0.0
         tfs = nflops / (our_us * 1e-6) if nflops else 0.0
         pct_bw = gbs / (args.peak_bandwidth_gbs * 1e9) * 100
