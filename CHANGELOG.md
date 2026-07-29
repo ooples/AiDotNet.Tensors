@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.120.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.1...v0.120.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **autodiff:** elementwise backwards threw on a rank-0 operand vs a rank-1 seed gradient ([#898](https://github.com/ooples/AiDotNet.Tensors/issues/898)) ([ff15edc](https://github.com/ooples/AiDotNet.Tensors/commit/ff15edcc0eca4e44cf101a262421d0a33e03b67d))
+* preserve COW isolation in compiled training ([#899](https://github.com/ooples/AiDotNet.Tensors/issues/899)) ([f74c0eb](https://github.com/ooples/AiDotNet.Tensors/commit/f74c0eb91bbf1c507815962a81b662c07ffa2d36))
+
 ## [0.120.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.0...v0.120.1) (2026-07-28)
 
 
