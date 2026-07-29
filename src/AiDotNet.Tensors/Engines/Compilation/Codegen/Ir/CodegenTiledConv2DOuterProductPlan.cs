@@ -165,6 +165,11 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         }
         int threadTileM = tileM >= 16 ? 2 : 1;
         int threadTileN = tileN >= 16 ? 2 : 1;
+        long sharedBytes = 2L *
+            (tileM * (long)innerReduction + tileN * (long)inputWidth) * sizeof(float);
+        if (!CodegenSharedMemoryBudget.Fits(sharedBytes, out reason))
+            return false;
+
         int threads = (tileM / threadTileM) * (tileN / threadTileN);
         if (threads < 32 || threads > 256)
         {

@@ -70,6 +70,41 @@ public sealed class CodegenTiledConv2DTests
     }
 
     [Fact]
+    public void DenseForward_RefusesStaticSharedMemoryOverBudget()
+    {
+        var source = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench;
+        Assert.True(CodegenTiledConv2DPlan.TryCreate(
+            source, out var sourcePlan, out string sourceReason), sourceReason);
+
+        const int width = 512;
+        var axes = CopyAxes(source);
+        axes[sourcePlan!.ColumnAxis] = CodegenAxis.Parallel(
+            axes[sourcePlan.ColumnAxis].Name, width);
+        var inputs = CopyInputs(source);
+        inputs[sourcePlan.StreamInput] = WithShapeDimension(
+            inputs[sourcePlan.StreamInput], 3, width);
+        CodegenTensorBinding output = WithShapeDimension(source.Output, 3, width);
+        var widened = new CodegenKernelSpec(
+            source.Name, new CodegenIterationSpace(axes), inputs, output,
+            CopyProductInputs(source), source.Reduce,
+            biasInput: source.BiasInput,
+            scaleInput: source.ScaleInput,
+            activation: source.Activation,
+            reduceScale: source.ReduceScale,
+            preReduce: source.PreReduce,
+            preBiasInput: source.PreBiasInput,
+            preBiasScale: source.PreBiasScale,
+            algebra: source.Algebra);
+
+        Assert.False(CodegenTiledConv2DPlan.TryCreate(
+            widened, out var plan, out string reason));
+        Assert.Null(plan);
+        Assert.Equal(
+            "58368 bytes of static shared memory exceed the 49152-byte budget",
+            reason);
+    }
+
+    [Fact]
     public void DenseForward_EmitsAsyncZeroFillAndExactEpilogue()
     {
         var spec = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench;
@@ -212,6 +247,42 @@ public sealed class CodegenTiledConv2DTests
             }
         }
         return inputs;
+    }
+
+    private static CodegenAxis[] CopyAxes(CodegenKernelSpec spec)
+    {
+        var axes = new CodegenAxis[spec.Space.Axes.Count];
+        for (int i = 0; i < axes.Length; i++) axes[i] = spec.Space.Axes[i];
+        return axes;
+    }
+
+    private static CodegenTensorBinding[] CopyInputs(CodegenKernelSpec spec)
+    {
+        var inputs = new CodegenTensorBinding[spec.Inputs.Count];
+        for (int i = 0; i < inputs.Length; i++) inputs[i] = spec.Inputs[i];
+        return inputs;
+    }
+
+    private static int[] CopyProductInputs(CodegenKernelSpec spec)
+    {
+        var inputs = new int[spec.ProductInputs.Count];
+        for (int i = 0; i < inputs.Length; i++) inputs[i] = spec.ProductInputs[i];
+        return inputs;
+    }
+
+    private static CodegenTensorBinding WithShapeDimension(
+        CodegenTensorBinding binding, int dimension, int extent)
+    {
+        var shape = new int[binding.Shape.Count];
+        var map = new CodegenAffineExpr[binding.Map.Count];
+        var indirect = new CodegenIndirectIndex?[binding.Indirect.Count];
+        for (int i = 0; i < shape.Length; i++) shape[i] = binding.Shape[i];
+        for (int i = 0; i < map.Length; i++) map[i] = binding.Map[i];
+        for (int i = 0; i < indirect.Length; i++) indirect[i] = binding.Indirect[i];
+        shape[dimension] = extent;
+        return new CodegenTensorBinding(
+            binding.ParameterIndex, binding.Name, shape, map,
+            binding.IsOutput, binding.ElementType, indirect);
     }
 
     private static void AssertClose(
