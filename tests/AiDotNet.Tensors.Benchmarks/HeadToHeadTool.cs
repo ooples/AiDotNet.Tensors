@@ -655,7 +655,7 @@ internal static class HeadToHeadTool
             worst = Math.Max(worst, Math.Abs((double)expected[i] - actual[i]));
             scale = Math.Max(scale, Math.Abs(expected[i]));
         }
-        return worst / Math.Max(1.0, scale);
+        return scale > 0 ? worst / scale : worst;
     }
 
     private static unsafe void Launch(
