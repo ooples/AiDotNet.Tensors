@@ -145,6 +145,10 @@ public class CodegenTensorCoreStagingTests
         string ptx = emitter.Emit(spec, Sm86Major, Sm86Minor);
 
         Assert.Equal(spec.Name + "_ceiling_probe", emitter.EmittedEntryName);
+        Assert.False(emitter.DoubleBuffered);
+        Assert.Equal(emitter.StageBufferBytes, emitter.SharedMemoryBytes);
+        Assert.Contains($".shared .align 16 .b8 stage[{emitter.StageBufferBytes}];", ptx,
+            StringComparison.Ordinal);
         Assert.Contains("// MMA CEILING PROBE: BENCHMARK ONLY; OUTPUT IS INTENTIONALLY INCORRECT", ptx,
             StringComparison.Ordinal);
         Assert.Contains(".visible .entry " + emitter.EmittedEntryName + "(", ptx,

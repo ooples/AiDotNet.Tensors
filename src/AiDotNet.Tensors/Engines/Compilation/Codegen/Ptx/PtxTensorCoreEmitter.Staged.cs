@@ -295,7 +295,8 @@ public sealed partial class PtxTensorCoreEmitter
         int outIndex = spec.Inputs.Count;
         EmittedEntryName = MmaCeilingProbe ? spec.Name + "_ceiling_probe" : spec.Name;
 
-        bool doubleBuffer = EnableDoubleBuffering && CanDoubleBuffer(plan, out _);
+        bool doubleBuffer = !MmaCeilingProbe
+            && EnableDoubleBuffering && CanDoubleBuffer(plan, out _);
 
         // cp.async is sm_80+. It also needs the per-thread share to be a whole number of
         // 16-byte chunks, which every supported block tile satisfies -- but it is checked
