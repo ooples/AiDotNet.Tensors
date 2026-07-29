@@ -235,11 +235,6 @@ internal static class KernelOracleTool
     }
 
     /// <summary>
-    /// One kernel per family the generator can emit. Deliberately spans both roofline sides,
-    /// because a report that only covers compute-bound kernels cannot show that the limiter
-    /// column is doing any work.
-    /// </summary>
-    /// <summary>
     /// One kernel per family the generator can emit, spanning both roofline sides.
     /// </summary>
     /// <remarks>
