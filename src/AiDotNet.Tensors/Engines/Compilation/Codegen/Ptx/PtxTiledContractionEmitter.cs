@@ -42,6 +42,7 @@ public sealed class PtxTiledContractionEmitter
         if (!CodegenTiledContractionPlan.TryCreate(spec, out var possible, out string reason))
             throw new NotSupportedException("This spec cannot use the tiled contraction: " + reason);
         var plan = possible!;
+        AssertAsyncCopyInvariants(plan);
 
         Plan = plan;
         _body.Clear();
@@ -297,4 +298,21 @@ public sealed class PtxTiledContractionEmitter
     private string NextF() => "%f" + I(_f++);
     private void L(string line) => _body.Append("    ").Append(line).Append('\n');
     private static string I(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    private static void AssertAsyncCopyInvariants(CodegenTiledContractionPlan plan)
+    {
+        // TryCreate selects divisors, rather than merely bounded tile sizes. These checks
+        // make that contract explicit at the boundary that truncates the tile counts and
+        // emits 16-byte copies. A failure is an internal planner bug, never a partial tile.
+        bool matrixCopyAligned = plan.MatrixReductionMajor
+            ? plan.TileM % 4 == 0
+            : plan.TileK % 4 == 0;
+        if (plan.M % plan.TileM != 0 || plan.N % plan.TileN != 0 ||
+            plan.K % plan.TileK != 0 || plan.TileN % 4 != 0 ||
+            !matrixCopyAligned || plan.StageBytes % 16 != 0)
+        {
+            throw new InvalidOperationException(
+                "The tiled contraction plan must contain whole, 16-byte-aligned slabs.");
+        }
+    }
 }

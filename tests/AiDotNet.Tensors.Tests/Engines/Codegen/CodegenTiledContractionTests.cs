@@ -85,6 +85,26 @@ public sealed class CodegenTiledContractionTests
         Assert.Contains(matrix ? "plain rank-2 matrix" : "output layout", reason);
     }
 
+    [Theory]
+    [InlineData("conv2d_1x1_bias_relu")]
+    [InlineData("conv2d_1x1_bwd_data")]
+    public void SelectedTiles_AreWholeAndCpAsyncAligned(string kernel)
+    {
+        var entry = CodegenKernelCatalog.Find(kernel)!;
+        foreach (var spec in new[] { entry.Verify, entry.Bench })
+        {
+            Assert.True(CodegenTiledContractionPlan.TryCreate(
+                spec, out var plan, out string reason), reason);
+            Assert.Equal(0, plan!.M % plan.TileM);
+            Assert.Equal(0, plan.N % plan.TileN);
+            Assert.Equal(0, plan.K % plan.TileK);
+            Assert.Equal(0, plan.TileN % 4);
+            Assert.Equal(0,
+                (plan.MatrixReductionMajor ? plan.TileM : plan.TileK) % 4);
+            Assert.Equal(0, plan.StageBytes % 16);
+        }
+    }
+
     /// <summary>The emitted candidate stages both operands and uses only SIMT FP32 FMA.</summary>
     [Fact]
     public void BackwardDataPointwise_EmitsDoubleBufferedTrueFp32Ptx()
