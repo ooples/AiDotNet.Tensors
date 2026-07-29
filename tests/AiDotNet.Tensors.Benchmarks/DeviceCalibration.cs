@@ -32,7 +32,7 @@ internal static class DeviceCalibration
     /// <summary>Rates measured on a device.</summary>
     internal sealed record Rates(
         double DramBytesPerSecond,
-        double TensorCoreMacsPerSecond);
+        double? TensorCoreMacsPerSecond);
 
     /// <summary>Measures all three rates and builds a machine model from them.</summary>
     internal static Rates Measure(DirectPtxRuntime runtime, int major, int minor)
@@ -66,7 +66,9 @@ internal static class DeviceCalibration
             // which the ceiling probe answers directly by running that mix with memory removed.
             fmaLanesPerSm: reference.FmaLanesPerSm,
             dramBytesPerSecond: rates.DramBytesPerSecond,
-            tensorCoreMacsPerSmPerCycle: rates.TensorCoreMacsPerSecond / multiprocessors / clockHz);
+            tensorCoreMacsPerSmPerCycle: rates.TensorCoreMacsPerSecond is double tensorRate
+                ? tensorRate / multiprocessors / clockHz
+                : double.NaN);
     }
 
     /// <summary>
@@ -115,9 +117,9 @@ internal static class DeviceCalibration
     /// would not tell us whether our instruction mix can reach it -- and the whole reason to
     /// have this number is to separate "the mix is short" from "the memory is short".
     /// </remarks>
-    private static double MeasureTensorCore(DirectPtxRuntime runtime, int major, int minor)
+    private static double? MeasureTensorCore(DirectPtxRuntime runtime, int major, int minor)
     {
-        if (major < 7) return 0;
+        if (major < 7) return null;
 
         const int Size = 2048;
 
@@ -138,8 +140,8 @@ internal static class DeviceCalibration
             new[] { 0, 1 }, CodegenReduceKind.Sum);
 
         var emitter = new PtxTensorCoreEmitter { MmaCeilingProbe = true };
-        if (!PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _)) return 0;
-        if (plan is null || !emitter.CanStage(plan, out _)) return 0;
+        if (!PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _)) return null;
+        if (plan is null || !emitter.CanStage(plan, out _)) return null;
 
         string ptx = emitter.Emit(spec, major, minor);
         using var module = runtime.LoadModule(ptx);

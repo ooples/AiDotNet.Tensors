@@ -217,9 +217,15 @@ internal static class KernelConveyorTool
             string measuredText = measured > 0
                 ? measured.ToString("F1", CultureInfo.InvariantCulture)
                 : "MISSING";
-            string ratioText = measured > 0
-                ? (p.PredictedMicroseconds / measured).ToString("F2", CultureInfo.InvariantCulture) + "x"
-                : "MISSING";
+            string predictedText = p.HasComputeCeiling
+                ? p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture)
+                : "-";
+            string ratioText = measured <= 0
+                ? "MISSING"
+                : p.HasComputeCeiling
+                    ? (p.PredictedMicroseconds / measured)
+                        .ToString("F2", CultureInfo.InvariantCulture) + "x"
+                    : "-";
 
             Console.WriteLine(entry.Name.PadRight(30) +
                 emitter.TileDescription.PadRight(16) +
@@ -228,7 +234,7 @@ internal static class KernelConveyorTool
                 "  " + (emitter.UsedTwoDimensionalBlock
                     ? "2D " + emitter.LaunchBlockX + "x" + emitter.LaunchBlockY + " "
                     : "flat ") + emitter.StagedOperands.PadRight(16) +
-                p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                predictedText.PadLeft(10) +
                 measuredText.PadLeft(10) + ratioText.PadLeft(11));
         }
 

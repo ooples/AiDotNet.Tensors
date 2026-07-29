@@ -83,16 +83,19 @@ internal static class KernelOracleTool
         Console.WriteLine("instruction schedule, and a compute-bound one is not helped by staging.");
     }
 
-    private static void Report(string name, double measured, double hardcoded)
+    private static void Report(string name, double? measured, double? hardcoded)
     {
-        double delta = hardcoded > 0 ? (measured / hardcoded - 1.0) * 100.0 : 0.0;
+        double? delta = measured is double measuredValue && hardcoded is > 0
+            ? (measuredValue / hardcoded.Value - 1.0) * 100.0
+            : null;
         Console.WriteLine("{0,-26} {1,16} {2,16}  {3}",
             name,
-            measured.ToString("0.0", CultureInfo.InvariantCulture),
-            hardcoded > 0 ? hardcoded.ToString("0.0", CultureInfo.InvariantCulture) : "-",
-            hardcoded > 0
-                ? (delta >= 0 ? "+" : "") + delta.ToString("0.0", CultureInfo.InvariantCulture) + "%"
-                : "(none in the hardcoded model)");
+            measured?.ToString("0.0", CultureInfo.InvariantCulture) ?? "-",
+            hardcoded?.ToString("0.0", CultureInfo.InvariantCulture) ?? "-",
+            delta is double deltaValue
+                ? (deltaValue >= 0 ? "+" : "") +
+                  deltaValue.ToString("0.0", CultureInfo.InvariantCulture) + "%"
+                : "(unavailable)");
     }
 
     private static void Score(
@@ -159,7 +162,9 @@ internal static class KernelOracleTool
             // prediction includes issue and occupancy penalties, which are properties of the
             // schedule we chose rather than of the hardware. A ceiling has to be something no
             // schedule can beat.
-            double ceiling = Math.Max(prediction.DramMicroseconds, prediction.ComputeMicroseconds);
+            double? ceiling = prediction.HasComputeCeiling
+                ? Math.Max(prediction.DramMicroseconds, prediction.ComputeMicroseconds)
+                : null;
             double flops = prediction.Macs * 2.0;
             double intensity = prediction.UniqueBytes > 0
                 ? flops / prediction.UniqueBytes : double.PositiveInfinity;
@@ -173,11 +178,15 @@ internal static class KernelOracleTool
                 (flops / 1e9).ToString("0.00", CultureInfo.InvariantCulture),
                 intensity.ToString("0.0", CultureInfo.InvariantCulture),
                 timing.Describe(),
-                ceiling.ToString("0.0", CultureInfo.InvariantCulture) + " us",
-                timing.Stable
-                    ? (ceiling / measured * 100.0).ToString("0.0", CultureInfo.InvariantCulture) + "%"
+                ceiling?.ToString("0.0", CultureInfo.InvariantCulture) +
+                    (ceiling.HasValue ? " us" : "-"),
+                timing.Stable && ceiling is double ceilingValue
+                    ? (ceilingValue / measured * 100.0)
+                        .ToString("0.0", CultureInfo.InvariantCulture) + "%"
                     : "-",
-                prediction.ComputeMicroseconds >= prediction.DramMicroseconds ? "compute" : "memory");
+                prediction.HasComputeCeiling
+                    ? prediction.Limiter.ToString().ToLowerInvariant()
+                    : "-");
         }
         catch (Exception ex)
         {

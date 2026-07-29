@@ -39,7 +39,7 @@ internal static class KernelCatalogOracleTool
         string Shape,
         double MinimumTrafficAmplification,
         double WarpLoadsPerMac,
-        double PredictedMicroseconds,
+        double? PredictedMicroseconds,
         string Reuse);
 
     private sealed record Diagnosis(string Cause, string Action);
@@ -52,8 +52,8 @@ internal static class KernelCatalogOracleTool
         double CompetitorUs,
         string CompetitorPlanStrategy,
         double CompetitorPlanSpread,
-        double CeilingUs,
-        double SemanticEfficiency,
+        double? CeilingUs,
+        double? SemanticEfficiency,
         ScheduleEvidence Schedule,
         string Limiter,
         double LimiterPct,
@@ -130,7 +130,7 @@ internal static class KernelCatalogOracleTool
             CodegenKernelSpec spec = entry.Bench;
             var semantic = CodegenPerformanceModel.Predict(
                 spec, spec.Space.TotalThreads, dynamicLoadsPerThread: 0, machine);
-            double ceiling = Math.Max(semantic.DramMicroseconds, semantic.ComputeMicroseconds);
+            double? ceiling = Ceiling(semantic);
             double ours = competitorRow.Number("ours_us");
 
             var identity = CodegenAutotuneIdentity.Create(
@@ -155,7 +155,7 @@ internal static class KernelCatalogOracleTool
             double mio = limiterRow.Number("stall_mio");
             int phaseCount = (int)limiterRow.Number("phase_count");
             double phaseShare = limiterRow.Number("phase_share_pct");
-            double efficiency = ceiling / ours * 100.0;
+            double? efficiency = ceiling / ours * 100.0;
 
             Diagnosis diagnosis = Diagnose(
                 spec, outcome, limiterName, limiterRow["status"], limiterPct,
@@ -193,7 +193,7 @@ internal static class KernelCatalogOracleTool
     {
         long uniqueBytes = 0;
         long warpLoads = 0;
-        double predictedUs = 0.0;
+        double? predictedUs = 0.0;
         string shape;
 
         if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
@@ -213,7 +213,9 @@ internal static class KernelCatalogOracleTool
                     machine, emitter.LaunchBlockThreads);
                 uniqueBytes = checked(uniqueBytes + prediction.UniqueBytes);
                 warpLoads = checked(warpLoads + prediction.WarpLoadInstructions);
-                predictedUs += prediction.PredictedMicroseconds;
+                predictedUs = predictedUs is double total && prediction.HasComputeCeiling
+                    ? total + prediction.PredictedMicroseconds
+                    : null;
             }
             shape = "split x2";
         }
@@ -249,7 +251,7 @@ internal static class KernelCatalogOracleTool
         string limiter,
         string limiterStatus,
         double limiterPct,
-        double semanticEfficiency,
+        double? semanticEfficiency,
         ScheduleEvidence schedule,
         double longSb,
         double wait,
@@ -357,8 +359,10 @@ internal static class KernelCatalogOracleTool
                 row.Outcome,
                 row.Ratio.ToString("0.00x", CultureInfo.InvariantCulture),
                 row.OursUs.ToString("0.0", CultureInfo.InvariantCulture),
-                row.CeilingUs.ToString("0.0", CultureInfo.InvariantCulture),
-                row.SemanticEfficiency.ToString("0.0", CultureInfo.InvariantCulture) + "%",
+                F(row.CeilingUs),
+                row.SemanticEfficiency is double efficiency
+                    ? F(efficiency) + "%"
+                    : "-",
                 row.Limiter + " " + row.LimiterPct.ToString("0", CultureInfo.InvariantCulture) + "%");
         }
 
@@ -479,11 +483,22 @@ internal static class KernelCatalogOracleTool
         return parts.Count == 0 ? "no cross-output reuse axis" : string.Join("; ", parts);
     }
 
+    private static double? Ceiling(CodegenPerformancePrediction prediction) =>
+        prediction.HasComputeCeiling
+            ? Math.Max(prediction.DramMicroseconds, prediction.ComputeMicroseconds)
+            : null;
+
     private static string F(double value) =>
         value.ToString("0.0", CultureInfo.InvariantCulture);
 
+    private static string F(double? value) =>
+        value?.ToString("0.0", CultureInfo.InvariantCulture) ?? "-";
+
     private static string N(double value) =>
         value.ToString("0.####", CultureInfo.InvariantCulture);
+
+    private static string N(double? value) =>
+        value?.ToString("0.####", CultureInfo.InvariantCulture) ?? "-";
 
     private static string Clean(string value) =>
         value.Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');

@@ -227,8 +227,9 @@ internal static class HandWrittenKernelOracleTool
                 spec, spec.Space.TotalThreads, emitter.DynamicLoadsPerThread,
                 machine, emitter.LaunchBlockX);
 
-            double ceiling = Math.Max(
-                prediction.DramMicroseconds, prediction.ComputeMicroseconds);
+            double? ceiling = prediction.HasComputeCeiling
+                ? Math.Max(prediction.DramMicroseconds, prediction.ComputeMicroseconds)
+                : null;
             long workUnits = (long)Math.Max(1.0,
                 Math.Max(prediction.Macs, prediction.UniqueBytes));
             var timing = StableTimer.MeasureHost(launch, backend.Synchronize, workUnits);
@@ -236,13 +237,15 @@ internal static class HandWrittenKernelOracleTool
             Console.WriteLine("{0,-32} {1,14} {2,10} {3,9} {4,8}",
                 kernelName,
                 timing.Describe(),
-                ceiling.ToString("0.0", CultureInfo.InvariantCulture) + " us",
-                timing.Stable
-                    ? (ceiling / timing.Microseconds * 100.0)
+                ceiling?.ToString("0.0", CultureInfo.InvariantCulture) +
+                    (ceiling.HasValue ? " us" : "-"),
+                timing.Stable && ceiling is double ceilingValue
+                    ? (ceilingValue / timing.Microseconds * 100.0)
                         .ToString("0.0", CultureInfo.InvariantCulture) + "%"
                     : "-",
-                prediction.ComputeMicroseconds >= prediction.DramMicroseconds
-                    ? "compute" : "memory");
+                prediction.HasComputeCeiling
+                    ? prediction.Limiter.ToString().ToLowerInvariant()
+                    : "-");
         }
         catch (Exception ex)
         {

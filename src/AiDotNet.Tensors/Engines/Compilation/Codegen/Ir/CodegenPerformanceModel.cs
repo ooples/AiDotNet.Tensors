@@ -107,13 +107,16 @@ public sealed class CodegenMachineModel
         TensorCoreMacsPerSmPerCycle * Multiprocessors * ClockHz;
 
     /// <summary>True when this model can bound a tensor-core kernel.</summary>
-    public bool HasTensorCores => TensorCoreMacsPerSmPerCycle > 0;
+    public bool HasTensorCores =>
+        double.IsFinite(TensorCoreMacsPerSmPerCycle) && TensorCoreMacsPerSmPerCycle > 0;
 
     /// <summary>
     /// The arithmetic rate for a kernel, picking the tensor-core pipe when the kernel uses it.
     /// </summary>
     public double MacsPerSecondFor(bool usesTensorCores) =>
-        usesTensorCores && HasTensorCores ? TensorCoreMacsPerSecond : MacsPerSecond;
+        usesTensorCores
+            ? HasTensorCores ? TensorCoreMacsPerSecond : double.NaN
+            : MacsPerSecond;
 
     /// <summary>
     /// Coefficient of the occupancy penalty <c>1 + c / blocksPerSm</c>.
@@ -199,8 +202,11 @@ public sealed class CodegenPerformancePrediction
     /// <summary>Microseconds if device-memory bandwidth is the only constraint.</summary>
     public double DramMicroseconds { get; }
 
-    /// <summary>Microseconds if FMA throughput is the only constraint.</summary>
+    /// <summary>Microseconds if compute throughput is the only constraint.</summary>
     public double ComputeMicroseconds { get; }
+
+    /// <summary>Whether the compute rate needed by this kernel was available.</summary>
+    public bool HasComputeCeiling => double.IsFinite(ComputeMicroseconds);
 
     /// <summary>The resource predicted to bind first.</summary>
     public CodegenLimiter Limiter =>
@@ -313,7 +319,8 @@ public static class CodegenPerformanceModel
         // makes a finished kernel read as 180%+ of peak, which is a category error rather
         // than a headroom figure.
         bool tensorCore = UsesTensorCores(spec);
-        double computeUs = macs / machine.MacsPerSecondFor(tensorCore) * 1e6;
+        double computeRate = machine.MacsPerSecondFor(tensorCore);
+        double computeUs = computeRate > 0 ? macs / computeRate * 1e6 : double.NaN;
 
         var prediction = new CodegenPerformancePrediction(
             spec.Name, outputs, macs, uniqueBytes, warpLoads, loadsPerMac,
@@ -402,11 +409,16 @@ public static class CodegenPerformanceModel
           .Append("   loads/MAC ").Append(p.LoadsPerMac.ToString("F3", ic)).Append('\n');
         sb.Append("  load-issue ").Append(p.LoadIssueMicroseconds.ToString("F1", ic))
           .Append(" us | dram ").Append(p.DramMicroseconds.ToString("F1", ic))
-          .Append(" us | compute ").Append(p.ComputeMicroseconds.ToString("F1", ic)).Append(" us\n");
-        sb.Append("  PREDICTED ").Append(p.Limiter.ToString().ToUpperInvariant())
-          .Append(" at ").Append(p.PredictedMicroseconds.ToString("F1", ic))
+          .Append(" us | compute ")
+          .Append(p.HasComputeCeiling ? p.ComputeMicroseconds.ToString("F1", ic) : "-")
+          .Append(" us\n");
+        sb.Append("  PREDICTED ")
+          .Append(p.HasComputeCeiling ? p.Limiter.ToString().ToUpperInvariant() : "-")
+          .Append(" at ")
+          .Append(p.HasComputeCeiling ? p.PredictedMicroseconds.ToString("F1", ic) : "-")
           .Append(" us; headroom if loads were free ")
-          .Append(p.HeadroomIfLoadsWereFree.ToString("F2", ic)).Append("x\n");
+          .Append(p.HasComputeCeiling ? p.HeadroomIfLoadsWereFree.ToString("F2", ic) : "-")
+          .Append("x\n");
 
         if (spec != null)
         {

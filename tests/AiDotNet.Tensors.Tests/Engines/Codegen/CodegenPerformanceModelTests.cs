@@ -52,6 +52,70 @@ public class CodegenPerformanceModelTests
             entry.Bench, threads, emitter.DynamicLoadsPerThread, CodegenMachineModel.Rtx3080Locked);
     }
 
+    private static CodegenKernelSpec Gemm(CodegenElementType elementType)
+    {
+        const int Size = 16;
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("m", Size), CodegenAxis.Parallel("n", Size),
+            CodegenAxis.Reduce("k", Size));
+        var a = new CodegenTensorBinding(0, "a", new[] { Size, Size },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) },
+            elementType: elementType);
+        var b = new CodegenTensorBinding(1, "b", new[] { Size, Size },
+            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) },
+            elementType: elementType);
+        var output = new CodegenTensorBinding(2, "out", new[] { Size, Size },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
+        return new CodegenKernelSpec("gemm", space, new[] { a, b }, output,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+    }
+
+    /// <summary>An absent tensor-core calibration stays unavailable instead of using fp32.</summary>
+    [Fact]
+    public void MissingTensorCoreRate_ProducesNoComputeCeiling()
+    {
+        var machine = new CodegenMachineModel(
+            "without tensor calibration", multiprocessors: 1, clockHz: 1e9,
+            loadInstructionsPerSmPerCycle: 1, fmaLanesPerSm: 32,
+            dramBytesPerSecond: 100e9);
+
+        Assert.Equal(0, machine.TensorCoreMacsPerSmPerCycle);
+        Assert.Equal(0, machine.TensorCoreMacsPerSecond);
+        Assert.False(machine.HasTensorCores);
+
+        var tensor = CodegenPerformanceModel.Predict(
+            Gemm(CodegenElementType.Float16), threads: 256,
+            dynamicLoadsPerThread: 2, machine);
+        Assert.False(tensor.HasComputeCeiling);
+        Assert.True(double.IsNaN(tensor.ComputeMicroseconds));
+        Assert.True(double.IsNaN(tensor.PredictedMicroseconds));
+        Assert.Contains("compute - us", CodegenPerformanceModel.Describe(tensor, null),
+            StringComparison.Ordinal);
+
+        var scalar = CodegenPerformanceModel.Predict(
+            Gemm(CodegenElementType.Float32), threads: 256,
+            dynamicLoadsPerThread: 2, machine);
+        Assert.True(scalar.HasComputeCeiling);
+        Assert.True(double.IsFinite(scalar.ComputeMicroseconds));
+        Assert.True(double.IsFinite(scalar.PredictedMicroseconds));
+    }
+
+    /// <summary>A measured tensor-core rate still produces the ordinary numeric ceiling.</summary>
+    [Fact]
+    public void MeasuredTensorCoreRate_ProducesComputeCeiling()
+    {
+        var prediction = CodegenPerformanceModel.Predict(
+            Gemm(CodegenElementType.Float16), threads: 256,
+            dynamicLoadsPerThread: 2, CodegenMachineModel.Rtx3080Locked);
+
+        Assert.True(CodegenMachineModel.Rtx3080Locked.HasTensorCores);
+        Assert.True(prediction.HasComputeCeiling);
+        Assert.True(prediction.ComputeMicroseconds > 0);
+        Assert.True(prediction.PredictedMicroseconds > 0);
+        Assert.DoesNotContain("compute -", CodegenPerformanceModel.Describe(prediction, null),
+            StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// The limiter is the actionable output: it says WHICH lever to pull. Check it
     /// against the kernels where hardware evidence exists.
