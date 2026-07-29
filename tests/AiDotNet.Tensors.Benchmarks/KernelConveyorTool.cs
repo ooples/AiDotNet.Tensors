@@ -503,7 +503,7 @@ internal static class KernelConveyorTool
                     {
                         new ProgramKernel(spec, text, parity.LaunchBlocks,
                             checked((uint)parity.LaunchBlockThreads), 1,
-                            spec.Space.ReductionAxes.Length, 2, "input parity tile+weights"),
+                            spec.Space.ReductionAxes.Length, 0, "input parity tile+weights"),
                     },
                     null, winner);
             }
