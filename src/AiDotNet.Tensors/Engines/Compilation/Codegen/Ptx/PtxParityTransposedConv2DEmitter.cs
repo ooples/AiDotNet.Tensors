@@ -70,6 +70,8 @@ public sealed class PtxParityTransposedConv2DEmitter
         L("mul.wide.u32 %rd5, %r8, 4;");
         L("add.u64 %rd6, %rd1, %rd5;");
 
+        // Hoisting all nine loads measured 24 -> 30 registers with no claimable speedup
+        // (23.2 -> 23.0 us), so retain the lower-pressure load/FMA schedule.
         EmitWeightFma(body, tap: 0, input: 3, accumulator: 7);
         EmitWeightFma(body, tap: 1, input: 2, accumulator: 6);
         EmitWeightFma(body, tap: 2, input: 2, accumulator: 7);
