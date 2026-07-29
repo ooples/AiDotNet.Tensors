@@ -378,6 +378,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </remarks>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
+        PrepareParametersForTraining(parameters);
         MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null);
     }
@@ -388,8 +389,20 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters, Tensor<T> explicitLoss)
     {
+        PrepareParametersForTraining(parameters);
         MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss);
+    }
+
+    /// <summary>
+    /// Privatizes COW-shared parameters before compilation specializes graph actions or an
+    /// optimizer retains their live backing arrays. Lazy/off-loss-path parameters are included:
+    /// they are valid registered parameters even when this trace does not produce a gradient.
+    /// </summary>
+    private static void PrepareParametersForTraining<T>(Tensor<T>[] parameters)
+    {
+        for (int i = 0; i < parameters.Length; i++)
+            parameters[i].PrepareForInPlaceWrite();
     }
 
     /// <summary>
