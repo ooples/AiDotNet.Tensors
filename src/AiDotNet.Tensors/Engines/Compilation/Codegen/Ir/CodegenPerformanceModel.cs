@@ -108,7 +108,9 @@ public sealed class CodegenMachineModel
 
     /// <summary>True when this model can bound a tensor-core kernel.</summary>
     public bool HasTensorCores =>
-        double.IsFinite(TensorCoreMacsPerSmPerCycle) && TensorCoreMacsPerSmPerCycle > 0;
+        !double.IsNaN(TensorCoreMacsPerSmPerCycle) &&
+        !double.IsInfinity(TensorCoreMacsPerSmPerCycle) &&
+        TensorCoreMacsPerSmPerCycle > 0;
 
     /// <summary>
     /// The arithmetic rate for a kernel, picking the tensor-core pipe when the kernel uses it.
@@ -206,7 +208,8 @@ public sealed class CodegenPerformancePrediction
     public double ComputeMicroseconds { get; }
 
     /// <summary>Whether the compute rate needed by this kernel was available.</summary>
-    public bool HasComputeCeiling => double.IsFinite(ComputeMicroseconds);
+    public bool HasComputeCeiling =>
+        !double.IsNaN(ComputeMicroseconds) && !double.IsInfinity(ComputeMicroseconds);
 
     /// <summary>The resource predicted to bind first.</summary>
     public CodegenLimiter Limiter =>

@@ -55,7 +55,8 @@ public sealed class CodegenParityTransposedConv2DTests
         Assert.Contains("@%p3 st.global.f32", ptx);
         Assert.DoesNotContain("rem.s32", ptx);
         Assert.DoesNotContain("div.s32", ptx);
-        Assert.Equal(9, ptx.Split("fma.rn.f32").Length - 1);
+        Assert.Equal(9,
+            ptx.Split(new[] { "fma.rn.f32" }, StringSplitOptions.None).Length - 1);
     }
 
     [SkippableFact]

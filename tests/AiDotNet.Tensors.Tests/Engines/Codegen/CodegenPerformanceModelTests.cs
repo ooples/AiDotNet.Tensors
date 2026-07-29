@@ -96,8 +96,10 @@ public class CodegenPerformanceModelTests
             Gemm(CodegenElementType.Float32), threads: 256,
             dynamicLoadsPerThread: 2, machine);
         Assert.True(scalar.HasComputeCeiling);
-        Assert.True(double.IsFinite(scalar.ComputeMicroseconds));
-        Assert.True(double.IsFinite(scalar.PredictedMicroseconds));
+        Assert.False(double.IsNaN(scalar.ComputeMicroseconds) ||
+                     double.IsInfinity(scalar.ComputeMicroseconds));
+        Assert.False(double.IsNaN(scalar.PredictedMicroseconds) ||
+                     double.IsInfinity(scalar.PredictedMicroseconds));
     }
 
     /// <summary>A measured tensor-core rate still produces the ordinary numeric ceiling.</summary>
