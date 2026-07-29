@@ -129,7 +129,7 @@ internal static class HandWrittenKernelOracleTool
             throw new InvalidOperationException(
                 failures + " mapped hand-written kernel(s) failed; coverage ledger not written.");
 
-        string coveragePath = ValueOf(args, "--coverage-out") ??
+        string coveragePath = KernelToolArgs.ValueOf(args, "--coverage-out") ??
             Path.Combine(Directory.GetCurrentDirectory(), "artifacts",
                 "handwritten-kernel-coverage.tsv");
         WriteCoverageLedger(coveragePath, registered);
@@ -341,13 +341,6 @@ internal static class HandWrittenKernelOracleTool
         _ => throw new ArgumentOutOfRangeException(
             nameof(name), name, "Mapped kernel has no semantic family."),
     };
-
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal)) return args[i + 1];
-        return null;
-    }
 
     private static float[] Values(int count, int salt, float scale)
     {
