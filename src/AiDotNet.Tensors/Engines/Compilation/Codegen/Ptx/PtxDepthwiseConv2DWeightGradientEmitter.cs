@@ -36,6 +36,8 @@ public sealed class PtxDepthwiseConv2DWeightGradientEmitter
         int outputParam = spec.Output.ParameterIndex;
         int spatial = checked(plan.Height * plan.Width);
         int channelSpatial = checked(plan.Channels * spatial);
+        int warpSize = CodegenDepthwiseConv2DWeightGradientPlan.WarpSize;
+        int warpShift = PowerOfTwoShift(warpSize);
 
         var body = new StringBuilder(16384);
         void L(string line) => body.Append("    ").Append(line).Append('\n');
@@ -48,8 +50,8 @@ public sealed class PtxDepthwiseConv2DWeightGradientEmitter
         L("mov.u32 %r1, %ctaid.x;");
         L($"div.u32 %r2, %r1, {I(CodegenDepthwiseConv2DWeightGradientPlan.KernelSize)}; // channel");
         L($"rem.u32 %r3, %r1, {I(CodegenDepthwiseConv2DWeightGradientPlan.KernelSize)}; // kh");
-        L("and.b32 %r15, %r0, 31;                 // lane");
-        L("shr.u32 %r16, %r0, 5;                  // warp");
+        L($"and.b32 %r15, %r0, {I(warpSize - 1)};                 // lane");
+        L($"shr.u32 %r16, %r0, {I(warpShift)};                  // warp");
         L("mov.f32 %f4, 0f00000000;");
         L("mov.f32 %f5, 0f00000000;");
         L("mov.f32 %f6, 0f00000000;");
@@ -203,13 +205,23 @@ public sealed class PtxDepthwiseConv2DWeightGradientEmitter
     private static void EmitWarpReduce(StringBuilder body, int accumulator, int scratch)
     {
         void L(string line) => body.Append("    ").Append(line).Append('\n');
-        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+        int warpSize = CodegenDepthwiseConv2DWeightGradientPlan.WarpSize;
+        for (int offset = warpSize / 2; offset >= 1; offset >>= 1)
         {
             L($"mov.b32 %r19, %f{I(accumulator)};");
-            L($"shfl.sync.down.b32 %r20, %r19, {I(offset)}, 31, 0xffffffff;");
+            L($"shfl.sync.down.b32 %r20, %r19, {I(offset)}, {I(warpSize - 1)}, 0xffffffff;");
             L($"mov.b32 %f{I(scratch)}, %r20;");
             L($"add.rn.f32 %f{I(accumulator)}, %f{I(accumulator)}, %f{I(scratch)};");
         }
+    }
+
+    private static int PowerOfTwoShift(int value)
+    {
+        if (value <= 0 || (value & (value - 1)) != 0)
+            throw new InvalidOperationException("WarpSize must be a positive power of two.");
+        int shift = 0;
+        while ((value >>= 1) != 0) shift++;
+        return shift;
     }
 
     private static string I(int value) => value.ToString(CultureInfo.InvariantCulture);
