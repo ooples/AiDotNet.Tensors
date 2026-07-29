@@ -134,6 +134,39 @@ public class CodegenTensorCoreStagingTests
         Assert.DoesNotContain("wmma.load.a.sync.aligned.row.m16n16k16.global.f16", ptx, StringComparison.Ordinal);
     }
 
+    /// <summary>A wrong-answer ceiling probe cannot masquerade as the real kernel.</summary>
+    [Fact]
+    public void MmaCeilingProbe_UsesMarkedDistinctEntry()
+    {
+        var spec = MatMul(512, 512, 512);
+        var emitter = Tile2x2();
+        emitter.MmaCeilingProbe = true;
+
+        string ptx = emitter.Emit(spec, Sm86Major, Sm86Minor);
+
+        Assert.Equal(spec.Name + "_ceiling_probe", emitter.EmittedEntryName);
+        Assert.Contains("// MMA CEILING PROBE: BENCHMARK ONLY; OUTPUT IS INTENTIONALLY INCORRECT", ptx,
+            StringComparison.Ordinal);
+        Assert.Contains(".visible .entry " + emitter.EmittedEntryName + "(", ptx,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(".visible .entry " + spec.Name + "(", ptx,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>Normal staged emission retains the source spec's kernel name.</summary>
+    [Fact]
+    public void NormalEmission_KeepsSpecEntryName()
+    {
+        var spec = MatMul(512, 512, 512);
+        var emitter = Tile2x2();
+
+        string ptx = emitter.Emit(spec, Sm86Major, Sm86Minor);
+
+        Assert.Equal(spec.Name, emitter.EmittedEntryName);
+        Assert.Contains(".visible .entry " + spec.Name + "(", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("MMA CEILING PROBE", ptx, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// FOUR mma instructions per K step from FOUR fragment loads. That two-to-one ratio is
     /// half the win: the naive lowering issues two fragment loads per single mma.

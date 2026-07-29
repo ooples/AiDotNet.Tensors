@@ -143,7 +143,7 @@ internal static class DeviceCalibration
 
         string ptx = emitter.Emit(spec, major, minor);
         using var module = runtime.LoadModule(ptx);
-        IntPtr fn = module.GetFunction(spec.Name, out _);
+        IntPtr fn = module.GetFunction(emitter.EmittedEntryName, out _);
 
         using var aBuf = runtime.AllocateBytes((nuint)((long)Size * Size * sizeof(ushort)));
         using var bBuf = runtime.AllocateBytes((nuint)((long)Size * Size * sizeof(ushort)));

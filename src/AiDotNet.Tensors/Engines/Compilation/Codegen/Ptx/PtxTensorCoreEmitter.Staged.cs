@@ -173,6 +173,13 @@ public sealed partial class PtxTensorCoreEmitter
     /// </remarks>
     public bool MmaCeilingProbe { get; set; }
 
+    /// <summary>Name of the entry produced by the most recent emission.</summary>
+    /// <remarks>
+    /// Ceiling probes deliberately use a distinct name because their arithmetic is not a
+    /// correct implementation of the source spec and must never be cached as the real kernel.
+    /// </remarks>
+    public string EmittedEntryName { get; private set; } = string.Empty;
+
     /// <summary>
     /// Whether to double-buffer the staging slabs when the shape allows it.
     /// </summary>
@@ -286,6 +293,7 @@ public sealed partial class PtxTensorCoreEmitter
     {
         int aIndex = spec.ProductInputs[0], bIndex = spec.ProductInputs[1];
         int outIndex = spec.Inputs.Count;
+        EmittedEntryName = MmaCeilingProbe ? spec.Name + "_ceiling_probe" : spec.Name;
 
         bool doubleBuffer = EnableDoubleBuffering && CanDoubleBuffer(plan, out _);
 
@@ -315,8 +323,10 @@ public sealed partial class PtxTensorCoreEmitter
               .Append(I(BlockTileM)).Append('x').Append(I(BlockTileN)).Append('x')
               .Append(I(BlockTileK)).Append(" block tile, ").Append(I(StagedWarps)).Append(" warps, ")
               .Append(doubleBuffer ? "double-buffered" : "single-buffered").Append('\n')
-              .Append("// ").Append(spec.Describe().Replace("\n", "\n// ")).Append('\n')
-              .Append(".visible .entry ").Append(spec.Name).Append("(\n");
+              .Append("// ").Append(spec.Describe().Replace("\n", "\n// ")).Append('\n');
+        if (MmaCeilingProbe)
+            header.Append("// MMA CEILING PROBE: BENCHMARK ONLY; OUTPUT IS INTENTIONALLY INCORRECT\n");
+        header.Append(".visible .entry ").Append(EmittedEntryName).Append("(\n");
 
         int paramCount = spec.ParameterCount;
         for (int i = 0; i < paramCount; i++)

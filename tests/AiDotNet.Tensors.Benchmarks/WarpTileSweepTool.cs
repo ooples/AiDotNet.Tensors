@@ -298,7 +298,7 @@ internal static class WarpTileSweepTool
 
             string ptx = emitter.Emit(spec, major, minor);
             using var module = runtime.LoadModule(ptx);
-            IntPtr fn = module.GetFunction(spec.Name, out _);
+            IntPtr fn = module.GetFunction(emitter.EmittedEntryName, out _);
 
             var pointers = new IntPtr[spec.ParameterCount];
             for (int i = 0; i < 2; i++)
