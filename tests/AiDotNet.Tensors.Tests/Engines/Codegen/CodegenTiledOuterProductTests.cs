@@ -22,7 +22,7 @@ public sealed class CodegenTiledOuterProductTests
         Assert.NotNull(verify);
         Assert.Equal((8, 8, 16, 2, 16),
             (verify!.M, verify.N, verify.Batch, verify.OuterReduction, verify.InnerReduction));
-        Assert.Equal((8, 8, 2, 1, 32),
+        Assert.Equal((8, 8, 1, 1, 64),
             (verify.TileM, verify.TileN, verify.ThreadTileM,
              verify.ThreadTileN, verify.BlockThreads));
         Assert.Equal(16, verify.Blocks);

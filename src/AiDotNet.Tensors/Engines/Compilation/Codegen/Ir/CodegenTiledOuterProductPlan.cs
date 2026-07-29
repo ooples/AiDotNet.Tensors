@@ -145,7 +145,7 @@ public sealed class CodegenTiledOuterProductPlan
             reason = "the M or N extent has no supported whole tile";
             return false;
         }
-        int threadTileM = tileM >= 8 ? 2 : 1;
+        int threadTileM = tileM >= 16 ? 2 : 1;
         int threadTileN = tileN >= 16 ? 2 : 1;
         int threads = (tileM / threadTileM) * (tileN / threadTileN);
         if (threads < 32 || threads > 256)
