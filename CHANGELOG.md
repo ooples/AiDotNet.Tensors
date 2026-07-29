@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.120.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.2...v0.120.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* **compilation:** preserve COW parameter views and FP64 training ([#901](https://github.com/ooples/AiDotNet.Tensors/issues/901)) ([da337a4](https://github.com/ooples/AiDotNet.Tensors/commit/da337a469278100b72f79817ec1e5046cdb53522))
+
 ## [0.120.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.1...v0.120.2) (2026-07-29)
 
 
