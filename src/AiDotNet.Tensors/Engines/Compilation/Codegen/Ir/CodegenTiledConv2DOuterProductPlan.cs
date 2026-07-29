@@ -182,7 +182,8 @@ public sealed class CodegenTiledConv2DOuterProductPlan
             first, second,
             outputAxes[0], outputAxes[1], outputAxes[2], outputAxes[3], outputAxes[4],
             outerReductionAxis, innerReductionAxis,
-            m, n, 3, 3, batch, outerReduction, innerReduction,
+            m, n, spec.Output.Shape[2], spec.Output.Shape[3],
+            batch, outerReduction, innerReduction,
             inputHeight, inputWidth,
             tileM, tileN, threadTileM, threadTileN, stages: 2);
         reason = "eligible";
