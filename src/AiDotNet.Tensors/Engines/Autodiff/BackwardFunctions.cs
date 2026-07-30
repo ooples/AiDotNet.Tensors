@@ -2972,6 +2972,82 @@ internal static class BackwardFunctions<T>
     /// in-process callers), or a byte[] (0/1-encoded — the only of the three
     /// that round-trips through SavedStateSerializer for tape checkpointing).
     /// </summary>
+    /// <summary>
+    /// ClampTensor backward: the output equals exactly one of {tensor, min, max} per element, so the
+    /// incoming gradient is routed wholly to whichever operand supplied that element.
+    /// </summary>
+    /// <remarks>
+    /// Re-derives the clamp decision using the same comparison ORDER as the forward
+    /// (CpuEngine.TensorClampTensor): min is applied first, then max, so a max bound that lies below
+    /// the min bound wins. Gradient for a broadcast bound is SUM-reduced over every element that read
+    /// the same bound entry, which is the correct adjoint of the broadcast.
+    /// </remarks>
+    internal static void ClampTensorBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        bool hasMin = SavedBool(nameof(ClampTensorBackward), savedState, 0, "hasMin");
+        bool hasMax = SavedBool(nameof(ClampTensorBackward), savedState, 1, "hasMax");
+        var minStrides = savedState[2] as int[];
+        var maxStrides = savedState[3] as int[];
+        var shape = (int[])savedState[4];
+
+        var tensor = inputs[0];
+        // Bounds occupy the following slots in the order (min, max), skipping absent ones.
+        var min = hasMin ? inputs[1] : null;
+        var max = hasMax ? inputs[hasMin ? 2 : 1] : null;
+
+        var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
+        var gradMin = min is not null ? TensorPool<T>.RentZeroed(min._shape) : null;
+        var gradMax = max is not null ? TensorPool<T>.RentZeroed(max._shape) : null;
+
+        int rank = shape.Length;
+        var idx = new int[rank];
+        int n = tensor.Length;
+        for (int i = 0; i < n; i++)
+        {
+            T v = tensor[i];
+            int target = 0;                 // 0 = tensor, 1 = min, 2 = max
+            int mIdx = 0, xIdx = 0;
+
+            if (min is not null)
+            {
+                mIdx = minStrides == null ? i : BroadcastLookupLocal(idx, minStrides);
+                if (numOps.LessThan(v, min[mIdx])) { v = min[mIdx]; target = 1; }
+            }
+            if (max is not null)
+            {
+                xIdx = maxStrides == null ? i : BroadcastLookupLocal(idx, maxStrides);
+                if (numOps.GreaterThan(v, max[xIdx])) { target = 2; }
+            }
+
+            T g = gradOutput[i];
+            if (target == 0) gradTensor[i] = numOps.Add(gradTensor[i], g);
+            else if (target == 1) gradMin![mIdx] = numOps.Add(gradMin[mIdx], g);
+            else gradMax![xIdx] = numOps.Add(gradMax[xIdx], g);
+
+            for (int k = rank - 1; k >= 0; k--)
+            {
+                idx[k]++;
+                if (idx[k] < shape[k]) break;
+                idx[k] = 0;
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
+        if (min is not null) DifferentiableOps.AccumulateGrad(grads, min, gradMin!, engine);
+        if (max is not null) DifferentiableOps.AccumulateGrad(grads, max, gradMax!, engine);
+    }
+
+    /// <summary>Flat-index lookup into a broadcast-strided bounds tensor (mirrors CpuEngine.BroadcastLookup).</summary>
+    private static int BroadcastLookupLocal(int[] idx, int[] strides)
+    {
+        int pos = 0;
+        for (int k = 0; k < idx.Length; k++) pos += idx[k] * strides[k];
+        return pos;
+    }
+
     internal static void WhereBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)

@@ -1818,6 +1818,29 @@ public partial class CpuEngine
                 idx[k] = 0;
             }
         }
+
+        // Tape registration. This op previously recorded NOTHING while its
+        // TensorClampMin / TensorClampMax siblings above both record, so
+        // TensorClampTensor silently produced no gradient for the tensor OR for
+        // tensor-valued bounds despite being classified differentiable.
+        //
+        // Gradient routing follows PyTorch's clamp: the output equals exactly one
+        // of {tensor, min, max} per element, so the incoming gradient goes wholly
+        // to whichever operand supplied it. The backward re-derives that choice
+        // with the SAME comparison order used above (min first, then max, so a max
+        // bound below the min bound wins — matching this loop), which is why the
+        // broadcast strides are saved rather than recomputed from shapes.
+        var clampInputs = min is null
+            ? (max is null ? new[] { tensor } : new[] { tensor, max })
+            : (max is null ? new[] { tensor, min } : new[] { tensor, min, max });
+        DifferentiableOps.RecordIfActive(
+            "TensorClampTensor", result, clampInputs,
+            BackwardFunctions<T>.ClampTensorBackward,
+            savedState: new object[]
+            {
+                min is not null, max is not null,
+                minStrides!, maxStrides!, tensor._shape,
+            });
         return result;
     }
 
