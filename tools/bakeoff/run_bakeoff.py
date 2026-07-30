@@ -93,33 +93,36 @@ def work_for_run():
 
 def run_ours_once(dll, selector):
     """Runs one generated-lane selector with contamination retries."""
-    completed = None
     command = ["dotnet", dll, "--kernel-bench"]
     command.append(selector)
     for attempt in range(1, GENERATED_LANE_ATTEMPTS + 1):
         completed = subprocess.run(command, capture_output=True, text=True)
-        if completed.returncode == 0:
-            break
-        diagnostic = completed.stderr
+        got = {}
+        for line in completed.stdout.splitlines():
+            m = re.match(r"^(\S+)\s+([\d,]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)%", line)
+            if m:
+                got[m.group(1)] = (float(m.group(3)), float(m.group(5)))
+        if completed.returncode == 0 and got:
+            return got
+
+        diagnostic = completed.stderr + "\n" + completed.stdout
         contaminated = ("Foreign GPU workload detected" in diagnostic or
                         "GPU is not benchmark-ready" in diagnostic)
-        if not contaminated or attempt == GENERATED_LANE_ATTEMPTS:
+        unstable = "UNSTABLE" in completed.stdout
+        retriable = contaminated or unstable
+        if not retriable or attempt == GENERATED_LANE_ATTEMPTS:
+            if completed.returncode == 0:
+                raise RuntimeError(
+                    "generated lane succeeded but produced no parseable kernel rows: %s" %
+                    completed.stdout.strip())
             raise RuntimeError("generated lane command %r failed (%d): %s" %
                                (command, completed.returncode, diagnostic.strip()))
         delay = min(attempt, 5)
-        print("  generated lane attempt %d contaminated; retrying after %ds" %
-              (attempt, delay), flush=True)
+        reason = "contaminated" if contaminated else "unstable"
+        print("  generated lane attempt %d %s; retrying after %ds" %
+              (attempt, reason, delay), flush=True)
         time.sleep(delay)
-    assert completed is not None
-    out = completed.stdout
-    got = {}
-    for line in out.splitlines():
-        m = re.match(r"^(\S+)\s+([\d,]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)%", line)
-        if m:
-            got[m.group(1)] = (float(m.group(3)), float(m.group(5)))
-    if not got:
-        raise RuntimeError("generated lane succeeded but produced no parseable kernel rows")
-    return got
+    raise RuntimeError("generated lane exhausted retries without a stable row")
 
 
 def run_ours(dll, selector, kernel_names):

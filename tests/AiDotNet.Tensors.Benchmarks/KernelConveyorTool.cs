@@ -1129,6 +1129,7 @@ internal static class KernelConveyorTool
         GpuBenchmarkEnvironment.RequireIdleGpu("kernel-bench-start");
         using var runtime = OpenRuntime();
         if (runtime is null) return;
+        var failures = new List<string>();
 
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
@@ -1227,6 +1228,10 @@ internal static class KernelConveyorTool
                     double lo = medians.Min(), hi = medians.Max();
                     double reported = medians.OrderBy(value => value).ElementAt(medians.Count / 2);
                     double worstTail = tails.Max();
+                    if (!converged)
+                        failures.Add(entry.Name + ": timing did not converge within " +
+                                     StabilityAttempts.ToString(CultureInfo.InvariantCulture) +
+                                     " attempts");
                     Console.WriteLine(entry.Name.PadRight(36) +
                         blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
                         (converged
@@ -1238,6 +1243,7 @@ internal static class KernelConveyorTool
                 }
                 catch (Exception ex)
                 {
+                    failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
                     Console.WriteLine(entry.Name.PadRight(36) + "  ERROR  " + ex.Message.Split('\n')[0]);
                 }
             }
@@ -1245,6 +1251,11 @@ internal static class KernelConveyorTool
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
         GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected kernel(s) produced no stable benchmark row. " +
+                string.Join("; ", failures));
     }
 
     /// <summary>
