@@ -1054,6 +1054,12 @@ public partial class CpuEngine
                 idx[k] = 0;
             }
         }
+
+        // Tape registration — recorded nothing, so no input received a gradient despite
+        // OpRegistry classifying TensorCartesianProd as differentiable.
+        DifferentiableOps.RecordIfActive(
+            "TensorCartesianProd", result, tensors,
+            BackwardFunctions<T>.CartesianProdBackward);
         return result;
     }
 
@@ -2240,6 +2246,12 @@ public partial class CpuEngine
             rowOffset += r;
             colOffset += c;
         }
+
+        // Tape registration — recorded nothing, so no input matrix received a gradient despite
+        // OpRegistry classifying TensorBlockDiag as differentiable.
+        DifferentiableOps.RecordIfActive(
+            "TensorBlockDiag", result, matrices,
+            BackwardFunctions<T>.BlockDiagBackward);
         return result;
     }
 
@@ -3544,7 +3556,16 @@ public partial class CpuEngine
         // Bit-level next-after. We dispatch on typeof(T) so fp32 stays in fp32
         // (avoids the trap where "next after 1.0 toward 2.0" in fp64 rounds
         // straight back to 1.0f when cast through T=float).
-        return ElementwiseBinary(a, b, (av, bv) => NextAfterDispatch(av, bv), "TensorNextAfter");
+        var lazy = TryRecordLazyBinary("TensorNextAfter", a, b,
+            eng => eng.TensorNextAfter(a, b), BackwardFunctions<T>.NextAfterBackward);
+        if (lazy != null) return lazy;
+        var result = ElementwiseBinary(a, b, (av, bv) => NextAfterDispatch(av, bv), "TensorNextAfter");
+        // This op alone among the ElementwiseBinary family returned its result without recording
+        // (its siblings — TensorHypot, TensorLogAddExp, TensorXlogy, … — all wrap the helper with a
+        // RecordBinary call), so it produced no gradient despite being classified differentiable.
+        DifferentiableOps.RecordBinary("TensorNextAfter", result, a, b,
+            BackwardFunctions<T>.NextAfterBackward);
+        return result;
     }
 
     private static T NextAfterDispatch<T>(T av, T bv)

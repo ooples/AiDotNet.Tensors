@@ -294,20 +294,23 @@ public class DifferentiableOpsGradCheckSweep
                 // ops whose leading tensor is not a differentiable input — TensorWhere's leading
                 // argument is the condition mask, which correctly receives no gradient. Only flag
                 // an op when NO tensor input receives one.
-                // Flatten array-typed tensor arguments too. The variadic ops (TensorAddMany,
-                // TensorConcatenate, TensorStack, TensorBlockDiag and friends) pass their tensors
-                // wrapped in a single Tensor<double>[], which OfType<Tensor<double>>() does not
-                // match -- leaving tensorInputs empty, so `got` is always null and the sweep
-                // reports "no gradient" for them the moment any is classified differentiable.
-                // That is a false accusation against a working op, not a caught regression.
-                var tensorInputs = args
-                    .SelectMany(arg => arg switch
-                    {
-                        Tensor<double> t => new[] { t },
-                        Tensor<double>[] arr => arr,
-                        _ => Array.Empty<Tensor<double>>()
-                    })
-                    .ToArray();
+                // FLATTEN Tensor<double>[] parameters. OfType<Tensor<double>>() sees only
+                // directly-typed arguments, so every variadic op (TensorStack, Concat,
+                // TensorHStack/VStack, TensorBlockDiag, TensorAddMany, …) reported
+                // "no gradient for ANY of its 0 tensor input(s)" — a harness blind spot that read
+                // exactly like a real missing backward and hid whether one existed. That is a false
+                // accusation against a working op, not a caught regression.
+                //
+                // The IEnumerable case is deliberate and covers more than Tensor<double>[]: an op
+                // declaring IReadOnlyList<Tensor<double>> would otherwise slip back into the blind
+                // spot the array case was added to close.
+                var tensorInputs = args.SelectMany(a => a switch
+                {
+                    Tensor<double> t => new[] { t },
+                    Tensor<double>[] arr => arr,
+                    IEnumerable<Tensor<double>> seq => seq.ToArray(),
+                    _ => Array.Empty<Tensor<double>>(),
+                }).ToArray();
                 Tensor<double> input;
                 Tensor<double> analytical;
                 try

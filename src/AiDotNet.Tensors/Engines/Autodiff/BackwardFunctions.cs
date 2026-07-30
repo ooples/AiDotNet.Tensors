@@ -2765,6 +2765,104 @@ internal static class BackwardFunctions<T>
 
     /// <summary>Cosine similarity backward</summary>
     /// <summary>
+    /// BlockDiag backward: each input matrix is copied verbatim into its own diagonal block, so its
+    /// gradient is exactly that block of the incoming gradient.
+    /// </summary>
+    /// <remarks>
+    /// Row and column offsets advance together, matching the forward's placement. The off-block zeros
+    /// of the output are constants and contribute nothing.
+    /// </remarks>
+    internal static void BlockDiagBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int totalCols = output._shape[1];
+        int rowOffset = 0, colOffset = 0;
+        foreach (var m in inputs)
+        {
+            int r = m._shape[0], c = m._shape[1];
+            var gradM = TensorPool<T>.RentZeroed(m._shape);
+            for (int i = 0; i < r; i++)
+                for (int j = 0; j < c; j++)
+                    gradM[i * c + j] = gradOutput[(rowOffset + i) * totalCols + (colOffset + j)];
+            DifferentiableOps.AccumulateGrad(grads, m, gradM, engine);
+            rowOffset += r;
+            colOffset += c;
+        }
+    }
+
+    /// <summary>
+    /// CartesianProd backward: output[row, k] is a copy of inputs[k][idx_k(row)], so each input element
+    /// accumulates the gradient of every output row that read it.
+    /// </summary>
+    /// <remarks>
+    /// Each input value is reused across many rows (total / size_k of them), so this is a scatter-add,
+    /// not a reshape — walking the same row-major multi-index the forward walks keeps the mapping
+    /// identical.
+    /// </remarks>
+    internal static void CartesianProdBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int d = inputs.Length;
+        var sizes = new int[d];
+        int total = 1;
+        for (int k = 0; k < d; k++) { sizes[k] = inputs[k]._shape[0]; total *= sizes[k]; }
+
+        var gradIn = new Tensor<T>[d];
+        for (int k = 0; k < d; k++) gradIn[k] = TensorPool<T>.RentZeroed(inputs[k]._shape);
+
+        var idx = new int[d];
+        for (int row = 0; row < total; row++)
+        {
+            for (int k = 0; k < d; k++)
+            {
+                int j = idx[k];
+                gradIn[k][j] = numOps.Add(gradIn[k][j], gradOutput[row * d + k]);
+            }
+            for (int k = d - 1; k >= 0; k--)
+            {
+                idx[k]++;
+                if (idx[k] < sizes[k]) break;
+                idx[k] = 0;
+            }
+        }
+
+        for (int k = 0; k < d; k++)
+            DifferentiableOps.AccumulateGrad(grads, inputs[k], gradIn[k], engine);
+    }
+
+    /// <summary>
+    /// NextAfter backward: gradient passes straight through to <c>a</c>; <c>b</c> gets zero.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>nextafter(a, b)</c> returns the representable value one ULP from <c>a</c> in the direction of
+    /// <c>b</c>. As a real-valued function of <c>a</c> it is a staircase, so its pointwise derivative is
+    /// 0 almost everywhere — but every step is a single ULP, so at any measurable scale it IS the
+    /// identity, and central finite differences at h=1e-6 measure exactly 1. A 0 gradient would make
+    /// the op a gradient sink that permanently disagrees with finite differences, so the tape treats it
+    /// as an identity-plus-1-ULP pass-through.
+    /// </para>
+    /// <para>
+    /// <c>b</c> only selects the DIRECTION of the step. Its influence is piecewise constant (changing b
+    /// changes nothing until it crosses a, which flips the step's sign), so its derivative is genuinely
+    /// 0 — recorded explicitly rather than omitted, so callers requesting a gradient for b receive a
+    /// defined zero instead of a missing entry.
+    /// </para>
+    /// </remarks>
+    internal static void NextAfterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var a = inputs[0];
+        var b = inputs[1];
+        DifferentiableOps.AccumulateGrad(grads, a, gradOutput, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, TensorPool<T>.RentZeroed(b._shape), engine);
+    }
+
+    /// <summary>
     /// Per-term derivative of a p-norm distance with respect to one coordinate of the FIRST operand.
     /// </summary>
     /// <remarks>
