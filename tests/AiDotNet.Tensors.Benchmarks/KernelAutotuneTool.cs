@@ -599,8 +599,7 @@ internal static class KernelAutotuneTool
             }
         }
 
-        int[] chunkFactors = { 2, 4, 7, 14 };
-        foreach (int chunkFactor in chunkFactors)
+        foreach (int chunkFactor in CodegenAutotuneIdentity.ChunkedSplitFactors)
         {
             using CandidateProgram? split = TryCreateSplit(
                 runtime, spec, tiledPartial: true, chunkFactor: chunkFactor);

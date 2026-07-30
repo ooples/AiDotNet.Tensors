@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -23,6 +24,22 @@ public sealed record CodegenAutotuneIdentity(
     string SpecFingerprint,
     string EmitterFingerprint)
 {
+    private static readonly IReadOnlyList<int> _chunkedSplitFactors =
+        Array.AsReadOnly(new[] { 2, 4, 7, 14 });
+
+    /// <summary>
+    /// Deterministic chunk factors shared by candidate fingerprinting, measurement and replay.
+    /// </summary>
+    internal static IReadOnlyList<int> ChunkedSplitFactors => _chunkedSplitFactors;
+
+    /// <summary>Returns whether a factor belongs to the fingerprinted search space.</summary>
+    internal static bool IsChunkedSplitFactor(int value)
+    {
+        foreach (int factor in _chunkedSplitFactors)
+            if (factor == value) return true;
+        return false;
+    }
+
     /// <summary>Builds the identity for one concrete spec and CUDA target.</summary>
     public static CodegenAutotuneIdentity Create(
         CodegenKernelSpec spec, string deviceFingerprint, int computeMajor, int computeMinor)
@@ -107,8 +124,7 @@ public sealed record CodegenAutotuneIdentity(
                     computeMajor, computeMinor);
             }
 
-            int[] chunkFactors = { 2, 4, 7, 14 };
-            foreach (int chunkFactor in chunkFactors)
+            foreach (int chunkFactor in ChunkedSplitFactors)
             {
                 CodegenSplitPlan? chunked =
                     CodegenSplitReduction.TryPlanChunked(spec, chunkFactor);

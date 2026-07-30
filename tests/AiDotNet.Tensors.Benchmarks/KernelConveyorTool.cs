@@ -701,7 +701,8 @@ internal static class KernelConveyorTool
         int marker = winner.LastIndexOf('x');
         return marker >= 0 && marker + 1 < winner.Length &&
             int.TryParse(winner.Substring(marker + 1), NumberStyles.None,
-                CultureInfo.InvariantCulture, out chunkFactor) && chunkFactor > 1;
+                CultureInfo.InvariantCulture, out chunkFactor) &&
+            CodegenAutotuneIdentity.IsChunkedSplitFactor(chunkFactor);
     }
 
     /// <summary>A loaded, bound tuned program: one launch call whatever its shape.</summary>

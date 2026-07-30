@@ -17,6 +17,14 @@ public sealed class CodegenAutotuneCacheCollection
 public class CodegenAutotuneIdentityTests
 {
     [Fact]
+    public void ChunkedSplitFactors_AreOrderedAndShared()
+    {
+        Assert.Equal(new[] { 2, 4, 7, 14 }, CodegenAutotuneIdentity.ChunkedSplitFactors);
+        Assert.True(CodegenAutotuneIdentity.IsChunkedSplitFactor(7));
+        Assert.False(CodegenAutotuneIdentity.IsChunkedSplitFactor(8));
+    }
+
+    [Fact]
     public void Identity_IsStableForTheSameInputs_AndChangesWithTheSpec()
     {
         var first = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(1, 32, 16, 16);
