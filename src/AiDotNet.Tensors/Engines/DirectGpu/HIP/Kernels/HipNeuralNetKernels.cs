@@ -988,9 +988,12 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
     float vMaxVal = fmaxf(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)safe_step));
+    float beta1Pow = powf(beta1, (float)safe_step);
+    float beta2Pow = powf(beta2, (float)safe_step);
+    float mHat = mVal / (1.0f - beta1Pow);
+    float vMaxHat = vMaxVal / (1.0f - beta2Pow);
 
-    param[idx] -= learningRate * mHat / (sqrtf(vMaxVal) + epsilon);
+    param[idx] -= learningRate * mHat / (sqrtf(vMaxHat) + epsilon);
 }
 
 // AdaMax optimizer update
@@ -1068,11 +1071,12 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
     v[idx] = vVal;
 
     float beta1Pow = powf(beta1, (float)safe_step);
+    float beta1PowNext = powf(beta1, (float)(safe_step + 1));
     float beta2Pow = powf(beta2, (float)safe_step);
     float mHat = mVal / (1.0f - beta1Pow);
     float vHat = vVal / (1.0f - beta2Pow);
 
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1PowNext);
 
     param[idx] -= learningRate * mNesterov / (sqrtf(vHat) + epsilon);
 }
@@ -1405,6 +1409,20 @@ extern ""C"" __global__ __launch_bounds__(256) void coordinate_descent_step(
 // DROPOUT AND EMBEDDING KERNELS
 // ===========================================================================
 
+extern ""C"" __global__ __launch_bounds__(256) void dropout_dotnet_random_serial(
+    const float* input, float* output, float* mask, int size, float rate, int seed, int training)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (!training || rate <= 0.0f) { for (int i = 0; i < size; ++i) { mask[i] = 1.0f; output[i] = input[i]; } return; }
+    if (rate >= 1.0f) { for (int i = 0; i < size; ++i) { mask[i] = 0.0f; output[i] = 0.0f; } return; }
+    int seedArray[56]; for (int i = 0; i < 56; ++i) seedArray[i] = 0;
+    int mj = 161803398 - seed, mk = 1; seedArray[55] = mj;
+    for (int i = 1; i < 55; ++i) { int ii = (21 * i) % 55; seedArray[ii] = mk; mk = mj - mk; if (mk < 0) mk += 2147483647; mj = seedArray[ii]; }
+    for (int pass = 1; pass < 5; ++pass) for (int i = 1; i < 56; ++i) { seedArray[i] -= seedArray[1 + (i + 30) % 55]; if (seedArray[i] < 0) seedArray[i] += 2147483647; }
+    int inext = 0, inextp = 21; float scale = 1.0f / (1.0f - rate);
+    for (int i = 0; i < size; ++i) { if (++inext >= 56) inext = 1; if (++inextp >= 56) inextp = 1; int sample = seedArray[inext] - seedArray[inextp]; if (sample == 2147483647) --sample; if (sample < 0) sample += 2147483647; seedArray[inext] = sample; bool keep = ((double)sample / 2147483647.0) > (double)rate; mask[i] = keep ? 1.0f : 0.0f; output[i] = keep ? input[i] * scale : 0.0f; }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void dropout_forward(
     const float* input, float* output, const float* mask,
     float scale, int size)
@@ -1426,7 +1444,7 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_backward(
 // IMPORTANT: Caller MUST ensure indices[i] >= 0 and < vocabSize to avoid undefined behavior.
 // Negative indices will wrap around; out-of-bounds access causes memory corruption.
 extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
-    const float* indices, const float* embeddingTable, float* output,
+    const int* indices, const float* embeddingTable, float* output,
     int numIndices, int embeddingDim)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1434,7 +1452,7 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
 
     // Note: idx must be validated by caller to be within [0, vocabSize)
     // We clamp negative values to 0 as a defensive measure
-    int idx = (int)indices[i];
+    int idx = indices[i];
     if (idx < 0) idx = 0;  // Defensive: prevent negative index wrapping
     for (int d = 0; d < embeddingDim; d++) {
         output[i * embeddingDim + d] = embeddingTable[idx * embeddingDim + d];
@@ -2503,7 +2521,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
             "lbfgs_copy_vector", "lbfgs_dot_product_reduce", "lbfgs_reduce_partials", "lbfgs_axpy",
             "lbfgs_scale_vector", "lbfgs_apply_direction", "lbfgs_compute_rho", "lbfgs_update_history",
             "bfgs_step", "levenberg_marquardt_step", "trust_region_step", "admm_step", "newton_method_step", "dfp_step", "coordinate_descent_step",
-            "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
+            "dropout_dotnet_random_serial", "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
             "embedding_backward_deterministic",
             "transpose_2d", "batched_transpose", "permute_general",
             // LSTM kernels

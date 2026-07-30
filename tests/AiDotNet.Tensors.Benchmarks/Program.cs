@@ -13,6 +13,291 @@ class Program
 
     static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention")
+        {
+            DirectPtxAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-attention")
+        {
+            DirectPtxFusedAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-online-attention")
+        {
+            DirectPtxOnlineAttentionExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-gpu-matrix")
+        {
+            DirectPtxGpuMatrixExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention-family")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxAttentionFamilyExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-decode")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxDecodeExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-paged-prefill")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxPagedPrefillExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-attention-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxAttentionBackwardExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-flash-attention-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFlashAttentionBackwardExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-qkv-rope-cache")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxQkvRopeCacheExperiment.Run(runs, includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
+        {
+            DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "normalization", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--resident-spike")
+        {
+            ResidentProgramSpike.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-vector-ab")
+        {
+            KernelConveyorTool.Run("vector-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-coarsen-ab")
+        {
+            KernelConveyorTool.Run("coarsen-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-autotune")
+        {
+            KernelAutotuneTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-splitk")
+        {
+            KernelSplitTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--warp-tile-sweep")
+        {
+            WarpTileSweepTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--multiout-check")
+        {
+            MultiOutputCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--algebra-check")
+        {
+            AlgebraCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--gather-check")
+        {
+            GatherScatterCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--tensorcore-check")
+        {
+            TensorCoreCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--frontend-check")
+        {
+            FrontEndCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-limiter")
+        {
+            KernelLimiterTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-predict")
+        {
+            KernelConveyorTool.Run("predict", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-once")
+        {
+            KernelConveyorTool.Run("once", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-dump")
+        {
+            KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-verify")
+        {
+            KernelConveyorTool.Run("verify", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-release")
+        {
+            KernelConveyorTool.Run("release", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-bench")
+        {
+            KernelConveyorTool.Run("bench", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--bench-calibrate")
+        {
+            BenchmarkCalibrationExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--codegen-bakeoff")
+        {
+            CodegenBakeOffExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-convolution")
+        {
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxConvolutionExperiment.Run(includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-convolution-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            DirectPtxConvolutionArtifactTool.Run(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-convolution-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            DirectPtxConvolutionArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-convolution-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "convolution", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory,
+                "convolution-cubins.tsv", "convolution-sass-audit.tsv", "convolution");
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
+        {
+            DirectPtxExternalBaselines.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-attention")
+        {
+            DirectPtxProfileTarget.RunAttention();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
+        {
+            DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
+        {
+            DirectPtxProfileTarget.RunDecode();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-paged-prefill")
+        {
+            DirectPtxProfileTarget.RunPagedPrefill();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-attention-backward")
+        {
+            DirectPtxProfileTarget.RunAttentionBackward();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-flash-attention-backward")
+        {
+            DirectPtxProfileTarget.RunFlashAttentionBackward();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
+        {
+            DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")
+        {
+            DirectPtxProfileTarget.RunConvolution();
+            return;
+        }
+        if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
+        {
+            DirectPtxProfileTarget.VerifyNcuCsv(args[1]);
+            return;
+        }
+
         // Run quick performance test first for immediate feedback
         if (args.Length == 0 || args[0] == "--quick")
         {
@@ -26,6 +311,21 @@ class Program
         if (args[0] == "--ab-conv2d")
         {
             Conv2DAbBench.Run();
+            return;
+        }
+
+        // Head-to-head of the CPU parallel-dispatch primitives (Parallel.For vs
+        // LightweightParallel vs ParallelForOrSerial) to pick the superior one
+        // for replacing bare Parallel.For at layer call sites.
+        if (args[0] == "--ab-parallel")
+        {
+            ParallelPrimitiveBench.Run();
+            return;
+        }
+
+        if (args[0] == "--ab-parallel-cpu")
+        {
+            ParallelPrimitiveBench.CpuBurn();
             return;
         }
 
@@ -56,15 +356,204 @@ class Program
             return;
         }
 
+        // #475 medium-axis routing A/B — forced M/N/2D vs the live heuristic vs OpenBLAS
+        // on the diffusion FP32 shapes, full DOP, deterministic. (--ab-axis-routing)
+        if (args[0] == "--ab-axis-routing")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.Run();
+            return;
+        }
+
+        // Single-thread GEMM profile repro for PerfView CPU-counter sampling.
+        // --profile-gemm-st [seconds=25] [shape=ffn-up|ffn-big|square|attn|medium]
+        if (args[0] == "--profile-gemm-st")
+        {
+            int secs = args.Length > 1 && int.TryParse(args[1], out var s) ? s : 25;
+            string shape = args.Length > 2 ? args[2] : "ffn-up";
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ProfileSingleThread(secs, shape);
+            return;
+        }
+
+        // Multi-thread GEMM profile (GF/s + busy-core utilization) + PerfView PMU repro.
+        // --profile-gemm-mt [seconds=20] [shape=ffn-up|ffn-big|square|attn|medium]
+        if (args[0] == "--profile-gemm-mt")
+        {
+            int secs = args.Length > 1 && int.TryParse(args[1], out var s) ? s : 20;
+            string shape = args.Length > 2 ? args[2] : "ffn-up";
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ProfileMultiThread(secs, shape);
+            return;
+        }
+
+        // #475 machine-code macro-kernel A/B (RyuJIT off the hot path). (--ab-macro)
+        if (args[0] == "--ab-macro")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.MacroAb();
+            return;
+        }
+
+        // #475 Phase 0a: FP32 panel K-unroll sweep (4/8/2/6). (--ab-kunroll)
+        if (args[0] == "--ab-kunroll")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.KUnrollSweep();
+            return;
+        }
+
+        // #475 Phase 1: JIT specialized FP32 GEMM A/B vs OpenBLAS (small/medium). (--ab-jit)
+        if (args[0] == "--ab-jit")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.JitAb();
+            return;
+        }
+
+        // #475 medium/large blocking sweep vs OpenBLAS P/Q/R. (--ab-blocking)
+        if (args[0] == "--ab-blocking")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.BlockingSweep();
+            return;
+        }
+
+        // #475 thread-scaling curve (DOP 1..32) vs OpenBLAS. (--ab-scaling)
+        if (args[0] == "--ab-scaling")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.ScalingSweep();
+            return;
+        }
+
+        // #85 GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B. (--ab-goto-vs-naxis)
+        if (args[0] == "--ab-goto-vs-naxis")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.GotoVsNaxisSweep();
+            return;
+        }
+
+        // #90 N-axis shared-A + M-tail (m%6!=0 DiT shapes) vs per-tile GotoGemm. (--ab-naxis-mtail)
+        if (args[0] == "--ab-naxis-mtail")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.NaxisMTailSweep();
+            return;
+        }
+
+        // #85 CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes. (--ab-ccx-vs-rp)
+        if (args[0] == "--ab-ccx-vs-rp")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.CcxVsRunParallelSweep();
+            return;
+        }
+
+        // #85 CCX spin-barrier vs .NET Barrier (forced CCX, bit-exact + perf). (--ab-spinbar)
+        if (args[0] == "--ab-spinbar")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.SpinBarrierSweep();
+            return;
+        }
+
+        // #85 CCX 2D kc blocking sweep (forced CCX). (--ab-ccx-block)
+        if (args[0] == "--ab-ccx-block")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.CcxBlockingSweep();
+            return;
+        }
+
+        // #85 N-axis macro-kernel (asm Mr-sweep) vs managed loop, multi-thread. (--ab-macro-mt)
+        if (args[0] == "--ab-macro-mt")
+        {
+            AiDotNet.Tensors.Benchmarks.AxisRoutingAbBench.MacroMtSweep();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
             return;
         }
 
-        if (args[0] == "--ab-aiseval-poolstats")
+        if (args[0] == "--ab-gemm-dop")
         {
-            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmDopSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-block")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmBlockingSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-dopfine")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmDopFine();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-pack")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmPackProfile();
+            return;
+        }
+
+        if (args[0] == "--ab-gemm-tile")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GemmTileBakeoff();
+            return;
+        }
+
+        if (args[0] == "--ab-goto-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoGemmBench();
+            return;
+        }
+
+        if (args[0] == "--ab-goto-par")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoGemmParBench();
+            return;
+        }
+
+        if (args[0] == "--cpu-topology")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.CpuTopologyProbe();
+            return;
+        }
+
+        if (args[0] == "--ab-ccx")
+        {
+            AiDotNet.Tensors.Benchmarks.CcxGemmBench.Bench();
+            return;
+        }
+
+        if (args[0] == "--ab-prod")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoProductionBench();
+            return;
+        }
+
+        if (args[0] == "--ab-bf16")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoBf16Bench();
+            return;
+        }
+
+        if (args[0] == "--ab-strassen")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.GotoStrassenBench();
+            return;
+        }
+
+        if (args[0] == "--ab-mlp-block")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.MlpBlockBench();
+            return;
+        }
+
+        if (args[0] == "--ab-shortm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ShortMBench();
+            return;
+        }
+
+        if (args[0] == "--profile-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();
             return;
         }
 
@@ -185,6 +674,11 @@ class Program
         if (args[0] == "--selectstrategy-hotpath")
         {
             PyTorchComparison.GapInvestigationBench.SelectStrategyHotPath();
+            return;
+        }
+        if (args[0] == "--decide-hotpath")
+        {
+            PyTorchComparison.GapInvestigationBench.DecideHotPath();
             return;
         }
         if (args[0] == "--hybrid-win")
@@ -735,6 +1229,29 @@ class Program
         Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");
         Console.WriteLine("  --verify-bf16gemm: Verify the BF16 GEMM microkernel end to end (run under Intel SDE); exits non-zero on mismatch (#378)");
 #if !NET462
+        Console.WriteLine("  --direct-ptx-attention: Driver-only emitted-PTX Q*K^T vs cuBLAS/current CUDA path");
+        Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
+        Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
+        Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
+        Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
+        Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
+        Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
+        Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
+        Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
+        Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
+        Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
+        Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-convolution-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
+        Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
+        Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
+        Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
+        Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
+        Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
+        Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
+        Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
+        Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");
@@ -786,6 +1303,8 @@ class Program
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
         Console.WriteLine();
         Console.WriteLine("A/B microkernel + dispatch benchmarks:");
+        Console.WriteLine("  --ab-parallel          : head-to-head of CPU parallel-dispatch primitives (Parallel.For vs LightweightParallel)");
+        Console.WriteLine("  --ab-parallel-cpu      : idle-CPU / warm-window simulation for LightweightParallel (AIDOTNET_PPE_WARMWINDOW_US)");
         Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
         Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
         Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");
@@ -794,6 +1313,32 @@ class Program
         Console.WriteLine("  --ab-softmax-double    : A/B softmax (FP64)");
         Console.WriteLine("  --ab-layernorm         : A/B LayerNorm");
         Console.WriteLine("  --ab-binary-ops        : A/B elementwise binary ops");
+        Console.WriteLine();
+        Console.WriteLine("Managed FP32 GEMM (GotoGemm / CCX) A/B + diagnostics:");
+        Console.WriteLine("  --ab-prod              : production engine GEMM — per-tile/CCX-1D/CCX-2D vs MKL (warm, interleaved)");
+        Console.WriteLine("  --ab-shortm            : short-M GEMM diagnosis (M-sweep, blocking/wrapper/routing/split-K A/B)");
+        Console.WriteLine("  --ab-mlp-block         : DiT MLP block (fused+cached) vs torch MKL sequence");
+        Console.WriteLine("  --ab-bf16              : bf16-B vs fp32 GEMM (bandwidth experiment)");
+        Console.WriteLine("  --ab-strassen          : one-level Strassen vs fp32 vs MKL (large squares)");
+        Console.WriteLine("  --ab-gemm-dop          : managed GEMM scaling vs MKL (gap decomposition)");
+        Console.WriteLine("  --ab-ccx               : CCX-pinned-pool GEMM prototype (1D/2D)");
+        Console.WriteLine("  --profile-gemm         : tight engine.TensorMatMul loop for an external profiler");
+        Console.WriteLine("  --cpu-topology         : L3/CCX + NUMA topology (Windows-only)");
+        Console.WriteLine();
+        Console.WriteLine("#475 medium-axis routing + GEMM-profile A/B (managed BLAS):");
+        Console.WriteLine("  --ab-axis-routing      : forced M/N/2D vs the live heuristic vs OpenBLAS (diffusion shapes)");
+        Console.WriteLine("  --profile-gemm-st      : single-thread GEMM profile repro (--profile-gemm-st [seconds] [shape])");
+        Console.WriteLine("  --profile-gemm-mt      : multi-thread GEMM profile, GF/s + busy-core util (--profile-gemm-mt [seconds] [shape])");
+        Console.WriteLine("                           shape = ffn-up|ffn-big|square|attn|medium");
+        Console.WriteLine("  --ab-macro             : machine-code macro-kernel A/B (RyuJIT off the hot path)");
+        Console.WriteLine("  --ab-kunroll           : FP32 panel K-unroll sweep (4/8/2/6)");
+        Console.WriteLine("  --ab-jit               : JIT-specialized FP32 GEMM A/B vs OpenBLAS (small/medium)");
+        Console.WriteLine("  --ab-blocking          : medium/large blocking sweep vs OpenBLAS P/Q/R");
+        Console.WriteLine("  --ab-scaling           : thread-scaling curve (DOP 1..32) vs OpenBLAS");
+        Console.WriteLine("  --ab-goto-vs-naxis     : GotoGemm RunParallel vs N-axis (thin-M shared-A) routing A/B");
+        Console.WriteLine("  --ab-ccx-vs-rp         : CCX pool (barriers) vs RunParallel (barrier-free) on balanced shapes");
+        Console.WriteLine("  --ab-spinbar           : CCX spin-barrier vs .NET Barrier (forced CCX, bit-exact + perf)");
+        Console.WriteLine("  --ab-ccx-block         : CCX 2D kc blocking sweep (forced CCX)");
         Console.WriteLine();
         Console.WriteLine("PyTorch-comparison diagnostics:");
         Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");

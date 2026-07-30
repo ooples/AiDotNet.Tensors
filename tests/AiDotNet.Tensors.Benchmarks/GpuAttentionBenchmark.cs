@@ -147,13 +147,13 @@ public static class GpuAttentionBenchmark
 
         // Warmup
         for (int i = 0; i < 3; i++)
-            backend.ScaledDotProductAttention(bufQ, bufK, bufV, bufOut, bufAttnWeights, null, batch, numHeads, seqLen, headDim, scale, false);
+            backend.ScaledDotProductAttention(bufQ, bufK, bufV, bufOut, bufAttnWeights, null, batch, numHeads, seqLen, seqLen, headDim, scale, false);
         backend.Synchronize();
 
         int runs = 20;
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < runs; i++)
-            backend.ScaledDotProductAttention(bufQ, bufK, bufV, bufOut, bufAttnWeights, null, batch, numHeads, seqLen, headDim, scale, false);
+            backend.ScaledDotProductAttention(bufQ, bufK, bufV, bufOut, bufAttnWeights, null, batch, numHeads, seqLen, seqLen, headDim, scale, false);
         backend.Synchronize();
         sw.Stop();
 

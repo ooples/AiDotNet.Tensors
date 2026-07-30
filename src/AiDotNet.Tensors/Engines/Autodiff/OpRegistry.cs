@@ -49,24 +49,26 @@ internal static class OpRegistry
         "TensorTile", "TensorDiagonal",
 
         // Reduction
-        "ReduceSum", "ReduceMean", "ReduceMax", "ReduceLogVariance",
+        "ReduceSum", "ReduceMean", "ReduceMax", "ReduceMaxWithTensorIndices", "ReduceLogVariance",
         "TensorMean", "Std", "Var",
 
         // Pooling
-        "MaxPool2D", "AvgPool2D", "MaxPool2DWithIndices",
-        "MaxPool3DWithIndices", "AvgPool3D",
+        "MaxPool2D", "AvgPool2D", "MaxPool2DWithIndices", "MaxPool2DWithTensorIndices",
+        "MaxPool3DWithIndices", "MaxPool3DWithTensorIndices", "AvgPool3D",
         "MaxPool1D", "AvgPool1D",
         "AdaptiveAvgPool2D", "AdaptiveMaxPool2D",
 
         // Convolution
         "Conv2D", "Conv1D", "Conv3D",
-        "DepthwiseConv2D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
+        "DepthwiseConv2D", "DepthwiseConv1D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
 
         // Normalization
         "BatchNorm", "BatchNormAffine", "LayerNorm", "GroupNorm", "RMSNorm", "InstanceNorm",
 
         // Attention/Embedding
         "Embedding", "Dropout",
+        // Interleaved RoPE: orthogonal rotation, records with ApplyRoPEInterleavedBackward (inverse rotation).
+        "ApplyRoPEInterleaved",
         "GridSample", "Unfold", "Fold",
 
         // Spatial
@@ -200,7 +202,7 @@ internal static class OpRegistry
         // BackwardFunctions<T>.{InterpolateBackward, PadNdBackward,
         // AffineGrid3DBackward}. InterpolateByScale is a delegator to
         // Interpolate.
-        "Interpolate", "PadNd", "AffineGrid3D",
+        "Interpolate", "PadNd", "AffineGrid3D", "AffineGrid",
 
         // Vision RoI family (Issue #217 tail) — backward wired
         // in BackwardFunctions<T>.{RoIAlign,RoIPool,PsRoIAlign,PsRoIPool}Backward.
@@ -262,9 +264,6 @@ internal static class OpRegistry
         // non-differentiable at the tape level.
         "TensorTensorSplit",
 
-        // Grid/geometry (non-learnable)
-        "AffineGrid",
-
         // NeRF/3D ops (typically not differentiated through in training)
         "VolumeRendering", "ImportanceSampling", "RasterizeGaussians",
         "EvaluateSphericalHarmonics", "ComputeGaussianCovariance",
@@ -279,13 +278,15 @@ internal static class OpRegistry
         "GLUBackward", "GeGLUBackward", "SwiGLUBackward", "ReGLUBackward",
         "SparsemaxBackward", "TaylorSoftmaxBackward", "SphericalSoftmaxBackward",
         "GumbelSoftmaxBackward",
-        "MaxPool2DBackward", "AvgPool2DBackward", "MaxPool3DBackward", "AvgPool3DBackward",
+        "MaxPool2DBackward", "MaxPool2DBackwardWithTensorIndices", "AvgPool2DBackward",
+        "MaxPool3DBackward", "MaxPool3DBackwardWithTensorIndices", "AvgPool3DBackward",
         "Conv1DBackwardInput", "Conv1DBackwardKernel",
         "Conv2DBackwardInput", "Conv2DBackwardKernel",
         "Conv3DBackwardInput", "Conv3DBackwardKernel",
         "ConvTranspose2DBackwardInput", "ConvTranspose2DBackwardKernel",
         "ConvTranspose3DBackwardInput", "ConvTranspose3DBackwardKernel",
         "DepthwiseConv2DBackwardInput", "DepthwiseConv2DBackwardKernel",
+        "DepthwiseConv1DBackwardInput", "DepthwiseConv1DBackwardKernel",
         "LocallyConnectedConv2DBackwardInput", "LocallyConnectedConv2DBackwardWeights", "LocallyConnectedConv2DBackwardBias",
         "DeformableConv2DBackwardInput", "DeformableConv2DBackwardKernel",
         "DeformableConv2DBackwardOffset", "DeformableConv2DBackwardMask",
@@ -294,7 +295,8 @@ internal static class OpRegistry
         "GridSampleBackwardInput", "GridSampleBackwardGrid",
         "BatchNormBackward", "LayerNormBackward", "GroupNormBackward", "RMSNormBackward", "InstanceNormBackward",
         "DropoutBackward", "EmbeddingBackward",
-        "ReduceMaxBackward", "ReduceMeanBackward", "ReduceVarianceBackward", "ReduceLogVarianceBackward",
+        "ReduceMaxBackward", "ReduceMaxBackwardWithTensorIndices", "ReduceMeanBackward",
+        "ReduceVarianceBackward", "ReduceLogVarianceBackward",
         "UpsampleBackward", "Upsample3DBackward",
         "CropBackward", "PadBackward", "PixelShuffleBackward",
         "ScatterAddBackward", "ScatterMeanBackward", "ScatterMaxBackward", "ScatterSoftmaxBackward",
@@ -472,6 +474,7 @@ internal static class OpRegistry
         // Attention ops (composed from recorded sub-ops)
         "TensorScaledDotProductAttention", // TensorMatMul + TensorMultiplyScalar + Softmax
         "ScaledDotProductAttention",       // composed
+        "ScaledDotProductAttentionGqa",    // delegates to ScaledDotProductAttention (records)
         "FlashAttention",                  // composed
         "GroupedQueryAttention",           // composed
         "GraphAttention",                  // composed

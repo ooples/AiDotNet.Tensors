@@ -395,12 +395,8 @@ public static class GaussianSplattingOperations
             .OrderBy(i => numOps.ToDouble(depths.GetFlat(i)))
             .ToArray();
 
-        // Simplified backward pass - accumulate gradients per Gaussian
-        var lockObjects = new object[numGaussians];
-        for (int i = 0; i < numGaussians; i++)
-        {
-            lockObjects[i] = new object();
-        }
+        // Simplified backward pass - accumulate gradients per Gaussian via the shared striped lock
+        // pool (no per-call lock allocation — see ScatterLockPool).
 
         // Tiled gradient computation
         int numTilesX = (imageWidth + tileSize - 1) / tileSize;
@@ -477,7 +473,7 @@ public static class GaussianSplattingOperations
                         }
 
                         // Gradient w.r.t. color
-                        lock (lockObjects[idx])
+                        lock (ScatterLockPool.For(idx))
                         {
                             for (int ch = 0; ch < numChannels; ch++)
                             {

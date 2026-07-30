@@ -18,6 +18,16 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+// Joined to the BlasManaged-Stats-Serial collection. The native-BLAS test below asserts the
+// OpenBLAS GEMM output is bit-identical to a single-thread reference — which only holds while
+// the OpenBLAS internal thread count stays constant (a changed count gives a different, equally
+// valid reduction order, i.e. a ~1-ULP difference). Tests that mutate the PROCESS-GLOBAL thread
+// count (CpuInferenceConfig.PinBlasThreadsForLatency, ManagedVsNativeGemmAudit, the FlashAttention
+// #411 guard) live in this collection; xUnit runs distinct collections in PARALLEL, so leaving
+// this class uncollected let one of those flip the count mid-test and drift the bit-match under
+// the parallel CI pool (the #519 / #513 contamination class — passes in isolation, flakes on CI).
+// Membership in the one serial collection serializes against every such mutator.
+[Collection("BlasManaged-Stats-Serial")]
 public class PaddedBufferConcurrencyStressTests
 {
     private static Tensor<float> RentWithGarbagePadding(int[] shape, float[] logical, float pad)

@@ -17,6 +17,11 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class MachineCodeFmaKernel
 {
+    // #475 Phase-0 A/B knob: K-unroll factor for the FP32 6×16 panel loop. OpenBLAS's Zen sgemm
+    // kernel unrolls 8; ours shipped 4. Baked at emit time — change requires re-emitting the
+    // panel/macro kernels (MachineKernelGemm.ResetFp32Kernels). Default 4 until A/B confirms 8.
+    internal static int PanelKUnroll = 4;
+
     /// <summary>Emit the Windows-x64 12-accumulator FP64 FMA loop. Returns the machine-code bytes.</summary>
     internal static byte[] EmitFp64x12Windows()
     {
@@ -63,6 +68,267 @@ internal static class MachineCodeFmaKernel
     /// 12 accumulators (ymm0–11) + bLo/bHi (ymm12/13) + 2 A-broadcasts (ymm14/15) —
     /// all 16 YMM, our allocation, which RyuJIT can't sustain. Row r: lo=ymm(2r), hi=ymm(2r+1).
     /// </summary>
+    /// <summary>
+    /// Generic single-tile FP32 GEMM microkernel (Windows x64) for A/B-ing register blockings on Zen2.
+    /// Computes C[mr, nr] += packedA[kc, mr]·packedB[kc, nr] (nr = nrYmm*8), C ROW-MAJOR (row stride =
+    /// ldc bytes). Pack layout: A[k*mr+row] = A_rowmajor[row,k]; B[k*nr+col] = B_rowmajor[k,col].
+    /// Signature: void(float* packedA, float* packedB, float* c, long ldcBytes, long kc).
+    /// Win-x64: rcx=packedA, rdx=packedB, r8=c, r9=ldcBytes, [rsp+0x28]=kc.
+    /// Uses mr*nrYmm YMM accumulators (≤12) + nrYmm B regs + 1 A-broadcast. The 4x24 blocking issues
+    /// 4 vbroadcastss + 3 vmovups = 7 load-port ops / 12 FMAs vs 6x16's 8 — fewer broadcasts (the Zen2
+    /// load-port bottleneck). First-party, RyuJIT-free (12 accumulators exceed RyuJIT's ~8 ceiling).
+    /// </summary>
+    internal static byte[] EmitFp32TileWindows(int mr, int nrYmm) => EmitFp32TileWindows(mr, nrYmm, false);
+
+    /// <summary>When <paramref name="overwrite"/> the SAVE writes C = acc (store only, no load+add) — used
+    /// for the FIRST K-panel so the caller can skip the ZeroCBlock zero-pass + the panel-0 C read-back.
+    /// (True non-temporal stores don't fit: C is L2-resident and RMW'd across K-panels.)</summary>
+    internal static byte[] EmitFp32TileWindows(int mr, int nrYmm, bool overwrite)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
+        int accN = mr * nrYmm;          // must be <= 12
+        int bBase = 12;                 // B vectors: ymm12 .. ymm(12+nrYmm-1)
+        int aReg = 12 + nrYmm;          // A-broadcast reg (ymm14 for 6x16, ymm15 for 4x24)
+        var asm = new X64Assembler();
+
+        asm.MovRegFromRsp(R10, 0x28);   // r10 = kc (5th arg) — read before rsp moves
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i); // save xmm6-15 (D32: offsets 0x80/0x90 don't fit sbyte)
+
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);   // zero accumulators
+
+        // kc==0 guard (mirror the FP64 emitter): without it the loop runs once, DecReg underflows R10 to
+        // ulong.MaxValue, and it spins reading past the panels. Skip straight to SAVE (acc is 0).
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++) asm.VmovupsLoad(bBase + j, RDX, (sbyte)(j * 32));
+        // (SW prefetch of the packed panels was measured NO-OP: the HW prefetcher already covers the
+        // sequential access; the wall is aggregate L2/L3/DRAM bandwidth across cores, not L1 latency.)
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, RCX, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(RCX, (sbyte)(mr * 4));
+        asm.AddRegImm8(RDX, (sbyte)(nrYmm * 32));
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        // SAVE C (row-major). r11 walks c by r9 (ldc bytes). ymm12 free after the K-loop.
+        // overwrite: C = acc (first K-panel, no read). else: C += acc (accumulate across panels).
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                if (!overwrite)
+                {
+                    asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32));
+                    asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp);
+                }
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, R9);
+        }
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10); // D32: offsets 0x80/0x90 don't fit sbyte
+        asm.AddRsp(0xA0);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>System V AMD64 (Linux/macOS) ABI variant of <see cref="EmitFp32TileWindows(int,int,bool)"/>.
+    /// `delegate* unmanaged` uses the platform-default convention, which is SysV off Windows, so the
+    /// Win-x64 kernel (shadow-space kc read + RCX/RDX/R8/R9 args) segfaults there. SysV args:
+    /// rdi=packedA, rsi=packedB, rdx=c, rcx=ldcBytes, r8=kc — and ALL xmm are caller-saved, so there is no
+    /// save/restore frame (no SubRsp/xmm6-15 spill). Body (FMA loop + SAVE) is otherwise identical to the
+    /// Win-x64 kernel, so it produces bit-identical results.</summary>
+    internal static byte[] EmitFp32TileSysV(int mr, int nrYmm, bool overwrite)
+    {
+        const int RCX = 1, RDX = 2, RSI = 6, RDI = 7, R8 = 8, R10 = 10, R11 = 11;
+        int regA = RDI, regB = RSI, regC = RDX, regLdc = RCX; // SysV arg registers
+        int accN = mr * nrYmm;
+        int bBase = 12;
+        int aReg = 12 + nrYmm;
+        var asm = new X64Assembler();
+
+        asm.MovRegReg(R10, R8);                         // r10 = kc (5th arg in r8; no shadow space on SysV)
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);   // zero accumulators
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);                           // kc==0 guard (mirror the Win kernel)
+        asm.JzLabel32(store);
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++) asm.VmovupsLoad(bBase + j, regB, (sbyte)(j * 32));
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, regA, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(regA, (sbyte)(mr * 4));
+        asm.AddRegImm8(regB, (sbyte)(nrYmm * 32));
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, regC);                       // r11 walks c (rdx) by ldcBytes (rcx)
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                if (!overwrite) { asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32)); asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp); }
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, regLdc);
+        }
+
+        asm.Vzeroupper();                               // no xmm restore / AddRsp on SysV (caller-saved, no frame)
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Emit the FP32 tile kernel for the CURRENT OS's ABI (Win-x64 vs SysV) — the GEMM driver uses
+    /// this so the kernel matches the platform-default <c>delegate* unmanaged</c> convention.</summary>
+    internal static byte[] EmitFp32TileAbi(int mr, int nrYmm, bool overwrite)
+        => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)
+            ? EmitFp32TileWindows(mr, nrYmm, overwrite)
+            : EmitFp32TileSysV(mr, nrYmm, overwrite);
+
+    /// <summary>bf16-B microkernel: C[mr,nr] += packedA(fp32)·packedB(bf16), fp32 accumulate. B is stored
+    /// bf16 (half the bytes → 2× the L2/L3/DRAM bandwidth headroom for the re-read operand); each K-iter
+    /// loads 8 bf16 per nr-YMM (vpmovzxwd m128→8×u32) and widens to fp32 in-register (vpslld 16 — bf16 is
+    /// the high 16 bits of fp32). A stays fp32 (broadcast). Same signature/SAVE as the fp32 kernel; the only
+    /// change is the B load+widen and B advancing nrYmm*16 bytes/iter (half of fp32's nrYmm*32).</summary>
+    internal static byte[] EmitBf16BTileWindows(int mr, int nrYmm, bool overwrite)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
+        int accN = mr * nrYmm;
+        int bBase = 12;
+        int aReg = 12 + nrYmm;
+        var asm = new X64Assembler();
+
+        asm.MovRegFromRsp(R10, 0x28);
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i); // D32: offsets 0x80/0x90 don't fit sbyte
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);
+
+        // kc==0 guard (mirror the FP64 emitter): else DecReg underflows R10 and the loop spins.
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++)
+        {
+            asm.VpmovzxwdLoad(bBase + j, RDX, (sbyte)(j * 16)); // 8 bf16 → 8×u32 (bf16 in low 16)
+            asm.Vpslld(bBase + j, bBase + j, 16);               // → fp32 (bf16 in high 16)
+        }
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, RCX, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(RCX, (sbyte)(mr * 4));
+        asm.AddRegImm8(RDX, (sbyte)(nrYmm * 16)); // bf16 B: half the bytes/iter vs fp32's nrYmm*32
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                if (!overwrite)
+                {
+                    asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32));
+                    asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp);
+                }
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, R9);
+        }
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10); // D32: offsets 0x80/0x90 don't fit sbyte
+        asm.AddRsp(0xA0);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>System V AMD64 (Linux/macOS) ABI variant of <see cref="EmitBf16BTileWindows(int,int,bool)"/>.
+    /// `delegate* unmanaged` uses the platform-default convention (SysV off Windows), so the Win-x64 bf16
+    /// kernel — which reads kc from the [rsp+0x28] shadow space SysV lacks — segfaults on Linux/macOS. SysV
+    /// args: rdi=packedA, rsi=packedB(bf16), rdx=c, rcx=ldcBytes, r8=kc; all xmm caller-saved ⇒ no
+    /// save/restore frame. ABI handling mirrors <see cref="EmitFp32TileSysV"/>; the bf16 B load+widen body
+    /// is identical to the Win-x64 bf16 kernel, so it produces bit-identical results to it.</summary>
+    internal static byte[] EmitBf16BTileSysV(int mr, int nrYmm, bool overwrite)
+    {
+        const int RCX = 1, RDX = 2, RSI = 6, RDI = 7, R8 = 8, R10 = 10, R11 = 11;
+        int regA = RDI, regB = RSI, regC = RDX, regLdc = RCX; // SysV arg registers
+        int accN = mr * nrYmm;
+        int bBase = 12;
+        int aReg = 12 + nrYmm;
+        var asm = new X64Assembler();
+
+        asm.MovRegReg(R10, R8);                         // r10 = kc (5th arg in r8; no shadow space on SysV)
+        for (int i = 0; i < accN; i++) asm.Vxorps(i);   // zero accumulators
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);                           // kc==0 guard (mirror the Win kernel)
+        asm.JzLabel32(store);
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        for (int j = 0; j < nrYmm; j++)
+        {
+            asm.VpmovzxwdLoad(bBase + j, regB, (sbyte)(j * 16)); // 8 bf16 → 8×u32 (bf16 in low 16)
+            asm.Vpslld(bBase + j, bBase + j, 16);                // → fp32 (bf16 in high 16)
+        }
+        for (int r = 0; r < mr; r++)
+        {
+            asm.VbroadcastSs(aReg, regA, (sbyte)(r * 4));
+            for (int j = 0; j < nrYmm; j++) asm.Vfmadd231ps(r * nrYmm + j, aReg, bBase + j);
+        }
+        asm.AddRegImm8(regA, (sbyte)(mr * 4));
+        asm.AddRegImm8(regB, (sbyte)(nrYmm * 16));      // bf16 B: half the bytes/iter vs fp32's nrYmm*32
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, regC);                       // r11 walks c (rdx) by ldcBytes (rcx)
+        int cTmp = bBase;
+        for (int r = 0; r < mr; r++)
+        {
+            for (int j = 0; j < nrYmm; j++)
+            {
+                if (!overwrite) { asm.VmovupsLoad(cTmp, R11, (sbyte)(j * 32)); asm.Vaddps(r * nrYmm + j, r * nrYmm + j, cTmp); }
+                asm.VmovupsStore(R11, (sbyte)(j * 32), r * nrYmm + j);
+            }
+            if (r < mr - 1) asm.AddRegReg(R11, regLdc);
+        }
+
+        asm.Vzeroupper();                               // no xmm restore / AddRsp on SysV (caller-saved, no frame)
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Emit the bf16-B tile kernel for the CURRENT OS's ABI (Win-x64 vs SysV) — callers use this so
+    /// the kernel matches the platform-default <c>delegate* unmanaged</c> convention (Win-only emit segfaults
+    /// on Linux/macOS, the #706 CI crash).</summary>
+    internal static byte[] EmitBf16BTileAbi(int mr, int nrYmm, bool overwrite)
+        => System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows)
+            ? EmitBf16BTileWindows(mr, nrYmm, overwrite)
+            : EmitBf16BTileSysV(mr, nrYmm, overwrite);
+
     internal static byte[] EmitFp64_6x8_PackedWindows()
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;
@@ -230,6 +496,99 @@ internal static class MachineCodeFmaKernel
         return asm.ToArray();
     }
 
+    // ── #475 macro-kernel: the whole Mr-sweep in machine code ──────────────────
+    // Takes RyuJIT off the hot path. One call does numMr Mr-blocks × njr N-tiles × kc K-steps
+    // for one K-panel, reusing the same packed-B across Mr-blocks (B stays hot, no managed
+    // per-Mr-block call / span construction). Signature (both ABIs, via delegate* unmanaged):
+    //   (float* aBase, float* bBase, float* cBase, long ldc, long kc, long njr,
+    //    long numMr, long aStrideBytes)
+    // where aStrideBytes = effKc*Mr*4 (the byte gap between packed-A Mr-stripes), and cBase
+    // advances by Mr*ldc*4 (6 rows) per Mr-block. Bit-identical to the per-Mr-block panel path
+    // (same per-tile FMA order; C tiles disjoint; K accumulates ascending).
+    internal static byte[] EmitFp32_6x16_MacroWindows()
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0,
+                  RSI = 6, RDI = 7, RBX = 3, RBP = 5, R12 = 12, R13 = 13, R14 = 14, R15 = 15, RSP = 4;
+        var asm = new X64Assembler();
+        // Read stack args BEFORE growing rsp (Windows: arg5 @ +0x28 .. arg8 @ +0x40).
+        asm.MovRegFromRsp(R10, 0x28);  // r10 = kc
+        asm.MovRegFromRsp(RAX, 0x30);  // rax = njr
+        asm.MovRegFromRsp(R11, 0x38);  // r11 = numMr
+        // Preserve nonvolatiles used by the macro wrapper + panel body.
+        asm.PushReg(RSI); asm.PushReg(RDI); asm.PushReg(RBX); asm.PushReg(RBP);
+        asm.PushReg(R12); asm.PushReg(R13); asm.PushReg(R14); asm.PushReg(R15);
+        asm.SubRsp(0xA0); // frame to save xmm6–15 (panel body uses ymm6–15)
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i);
+        // arg8 aStrideBytes: entry [rsp+0x40] shifted by 8 pushes (0x40) + 0xA0 frame → [rsp+0x120].
+        asm.MovRegFromRspD32(RDI, 0x40 + 0x40 + 0xA0); // rdi = aStrideBytes
+        // Masters.
+        asm.MovRegReg(RSI, RCX);   // rsi = A-base master
+        asm.MovRegReg(R14, RDX);   // r14 = B-base master
+        asm.MovRegReg(R15, R8);    // r15 = C-base master
+        asm.MovRegReg(RBX, R11);   // rbx = numMr counter
+        asm.MovRegReg(RBP, RAX);   // rbp = njr master
+        asm.MovRegReg(R12, R10);   // r12 = kc
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4 (row stride); r9 = ldc preserved
+
+        EmitMacroPanelLoop_Fp32_6x16(asm);
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10);
+        asm.AddRsp(0xA0);
+        asm.PopReg(R15); asm.PopReg(R14); asm.PopReg(R13); asm.PopReg(R12);
+        asm.PopReg(RBP); asm.PopReg(RBX); asm.PopReg(RDI); asm.PopReg(RSI);
+        asm.Vzeroupper(); asm.Ret();
+        return asm.ToArray();
+    }
+
+    internal static byte[] EmitFp32_6x16_MacroSysV()
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11,
+                  RSI = 6, RDI = 7, RBX = 3, RBP = 5, R12 = 12, R13 = 13, R14 = 14, R15 = 15;
+        var asm = new X64Assembler();
+        // SysV args: rdi=A, rsi=B, rdx=C, rcx=ldc, r8=kc, r9=njr, [rsp+8]=numMr, [rsp+0x10]=aStrideBytes.
+        asm.MovRegFromRsp(R10, 0x08);  // r10 = numMr
+        asm.MovRegFromRsp(R11, 0x10);  // r11 = aStrideBytes
+        asm.PushReg(RBX); asm.PushReg(RBP); asm.PushReg(R12); asm.PushReg(R13); asm.PushReg(R14); asm.PushReg(R15);
+        // Shuffle into the canonical layout (rsi/rdi/rax are volatile on SysV).
+        asm.MovRegReg(R14, RSI);   // r14 = B   (rsi held B)
+        asm.MovRegReg(RSI, RDI);   // rsi = A   (rdi held A)
+        asm.MovRegReg(R15, RDX);   // r15 = C
+        asm.MovRegReg(RDI, R11);   // rdi = aStrideBytes
+        asm.MovRegReg(RBX, R10);   // rbx = numMr
+        asm.MovRegReg(RBP, R9);    // rbp = njr
+        asm.MovRegReg(R12, R8);    // r12 = kc
+        asm.MovRegReg(R9, RCX);    // r9 = ldc
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4
+
+        EmitMacroPanelLoop_Fp32_6x16(asm);
+
+        asm.PopReg(R15); asm.PopReg(R14); asm.PopReg(R13); asm.PopReg(R12); asm.PopReg(RBP); asm.PopReg(RBX);
+        asm.Vzeroupper(); asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Outer Mr-loop wrapping the panel tile-loop. Assumes rsi=A-base, r14=B-base,
+    /// r15=C-base, rbx=numMr, rbp=njr, r12=kc, rdi=aStrideBytes, rax=ldc*4, r9=ldc. EmitPanelLoop
+    /// touches none of rsi/r14/r15/rbx/rbp/rdi/r9, so the masters survive each tile sweep.</summary>
+    private static void EmitMacroPanelLoop_Fp32_6x16(X64Assembler asm)
+    {
+        const int RDX = 2, R8 = 8, R13 = 13, RSI = 6, RDI = 7, RBX = 3, RBP = 5, R14 = 14, R15 = 15, RAX = 0;
+        int macroDone = asm.NewLabel();
+        asm.TestRegSelf(RBX);          // numMr == 0 → nothing to do
+        asm.JzLabel32(macroDone);
+        int mrLoop = asm.NewLabel();
+        asm.MarkLabel(mrLoop);
+        asm.MovRegReg(RDX, R14);       // B = base (panel advances rdx through the tiles)
+        asm.MovRegReg(R8, R15);        // C = this Mr-block's base (panel advances r8)
+        asm.MovRegReg(R13, RBP);       // njr counter = master (panel decrements r13)
+        EmitPanelLoop_Fp32_6x16(asm);  // numMr-th Mr-block: njr tiles × kc K-steps
+        asm.AddRegReg(RSI, RDI);       // A-base += aStrideBytes (next packed-A Mr-stripe)
+        for (int r = 0; r < 6; r++) asm.AddRegReg(R15, RAX); // C-base += Mr(6) × ldc*4 rows
+        asm.DecReg(RBX);
+        asm.JnzLabel32(mrLoop);
+        asm.MarkLabel(macroDone);
+    }
+
     /// <summary>Register-level FP32 6×16 panel loop. Assumes rsi=A-base, r12=kc, r13=njr,
     /// rax=ldc*4 (row stride bytes), r8=C, r9=ldc; clobbers ymm0–15, rcx, rdx, r10, r11,
     /// advances r8/r13/rdx; rsi/r12/rax preserved across iterations. ABI-agnostic.</summary>
@@ -264,7 +623,7 @@ internal static class MachineCodeFmaKernel
 
         int store = asm.NewLabel();
         int ktail = asm.NewLabel();
-        const int U = 4; // K-unroll factor
+        int U = Math.Max(1, PanelKUnroll); // K-unroll factor (#475 A/B knob; OpenBLAS uses 8)
 
         // Tuned prefetch distance for the next packed-B stripe (bytes ahead of rdx). 512 B = 8
         // cache lines ≈ one Nr=16 tile's worth of K-steps ahead — far enough to hide the L2→L1
@@ -285,7 +644,7 @@ internal static class MachineCodeFmaKernel
         // prefetching A is pure redundant load-port traffic (PR #656: A+B −14%, B-only −2% in
         // the single-tile kernel). Here B is cold for the NEXT tile in the panel macro-loop, so
         // it's a real win. Pure hint, bit-exact.
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(ktail);          // kc < U → straight to the 1-step tail
         int kmain = asm.NewLabel();
         asm.MarkLabel(kmain);
@@ -300,15 +659,17 @@ internal static class MachineCodeFmaKernel
             for (int r = 0; r < Mr; r++)
             {
                 int areg = (r % 2 == 0) ? A0 : A1;
-                asm.VbroadcastSs(areg, RCX, (sbyte)(ku * Mr * 4 + r * 4)); // max 3*24+20=92 → disp8
+                int aOff = ku * Mr * 4 + r * 4;   // U=4 max 92 → disp8; U=8 max 188 → disp32
+                if (aOff <= 127) asm.VbroadcastSs(areg, RCX, (sbyte)aOff);
+                else asm.VbroadcastSsD32(areg, RCX, aOff);
                 asm.Vfmadd231ps(2 * r, areg, BLO);
                 asm.Vfmadd231ps(2 * r + 1, areg, BHI);
             }
         }
-        asm.AddRegImm32(RCX, U * Mr * 4);  // A += 24 floats
-        asm.AddRegImm32(RDX, U * Nr * 4);  // B += 64 floats
+        asm.AddRegImm32(RCX, U * Mr * 4);  // A += U*6 floats
+        asm.AddRegImm32(RDX, U * Nr * 4);  // B += U*16 floats
         asm.SubRegImm8(R10, (sbyte)U);
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(ktail);          // remaining < U → tail
         asm.JmpLabel32(kmain);         // else another unrolled round
 
@@ -499,7 +860,7 @@ internal static class MachineCodeFmaKernel
         int rem = asm.NewLabel();
         int store = asm.NewLabel();
         asm.MarkLabel(cond);
-        asm.CmpRegImm8(R10, U);
+        asm.CmpRegImm8(R10, (sbyte)U);
         asm.JlLabel32(rem);
         for (int s = 0; s < U; s++)
         {

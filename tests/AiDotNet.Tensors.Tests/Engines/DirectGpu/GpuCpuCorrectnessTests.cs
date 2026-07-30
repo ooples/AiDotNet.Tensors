@@ -112,6 +112,143 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         Assert.True(err < Tol, $"{op}: GPU vs CPU max_abs_err {err:E3} exceeded tolerance {Tol:E3}");
     }
 
+    // Dedicated coverage for TensorWhere(Tensor<Bit>, x, y): the boolean-mask overload can't be driven by
+    // the generic float-fuzzer (EveryGpuKernel_IsAutoTestedOrAllowlisted), so it's exercised here and listed
+    // in that test's DedicatedlyCovered allowlist. Verifies the GPU where-select picks x where the mask is
+    // true and y where false, matching CpuEngine bit-for-bit.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(64)]
+    [InlineData(129)]
+    public void TensorWhere_BitMask_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var rng = new Random(20 + n);
+        var cond = new Bit[n];
+        for (int i = 0; i < n; i++) cond[i] = rng.Next(2) == 0 ? Bit.False : Bit.True;
+        var condition = new Tensor<Bit>(cond, new[] { n });
+        var x = Rand(21, n);
+        var y = Rand(22, n);
+
+        var cpu = _cpu.TensorWhere(condition, x, y);
+        var gpu = _gpu.TensorWhere(condition, x, y);
+        AssertGpuMatchesCpu(gpu, cpu, $"TensorWhere(Bit)[{n}]");
+    }
+
+    // Regression: LayerNorm must normalize over the trailing (gamma-length) dims for EVERY rank,
+    // not just rank-2. The GPU path previously took outerSize = shape[0] / normSize = Length/shape[0],
+    // which for a transformer's rank-3 [B, S, D] input normalized over S*D and read gamma/beta
+    // (length D) out of bounds → garbage (measured CPU-vs-GPU max_abs_err ~70 on [2,8,48]). rank-2
+    // happened to work because shape[0] equals the row count. This drove a transformer trained through
+    // the AiDotNet facade to chance accuracy on the GPU engine (its [B,S,D] activations were corrupted).
+    public static IEnumerable<object[]> LayerNormShapes() => new List<object[]>
+    {
+        new object[] { new[] { 16, 48 } },       // rank-2 (always worked)
+        new object[] { new[] { 1, 8, 48 } },     // rank-3, batch 1 (the Predict shape)
+        new object[] { new[] { 2, 8, 48 } },     // rank-3 [B,S,D]
+        new object[] { new[] { 4, 3, 32 } },     // rank-3, non-square
+        new object[] { new[] { 2, 2, 4, 16 } },  // rank-4
+    };
+
+    [Theory]
+    [MemberData(nameof(LayerNormShapes))]
+    public void LayerNorm_RankGe2_GpuMatchesCpu(int[] shape)
+    {
+        if (!EnsureGpuReady()) return;
+        int d = shape[shape.Length - 1];
+        var input = Rand(101, shape);
+        var gamma = Rand(102, d);
+        var beta = Rand(103, d);
+
+        var cpu = _cpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        var gpu = _gpu.TensorLayerNorm(input, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpu, cpu, $"TensorLayerNorm[{string.Join(",", shape)}]");
+
+        // The GPU-resident forward path (LayerNormGpu, used by Predict/TryForwardGpuOptimized)
+        // must normalize identically for rank >= 3. It requires a GPU-resident input.
+        var gpuInput = input.Gpu();
+        var (gpuResident, gpuMean, gpuInvVar) = _gpu.LayerNormGpu(gpuInput, gamma, beta, 1e-5);
+        AssertGpuMatchesCpu(gpuResident, cpu, $"LayerNormGpu[{string.Join(",", shape)}]");
+
+        // Close the loop on the full tuple: the saved per-sample mean / inverse-variance (consumed by the
+        // backward pass) must be correct too, not just the normalized output. Recompute them the way LayerNorm
+        // does over each gamma-spanning sample — population mean and inverse std 1 / sqrt(var + eps).
+        int normSize = d;
+        int samples = input.Length / normSize;
+        var flat = input.ToArray();
+        var expMean = new float[samples];
+        var expInvVar = new float[samples];
+        for (int s = 0; s < samples; s++)
+        {
+            double sum = 0;
+            for (int j = 0; j < normSize; j++) sum += flat[s * normSize + j];
+            double mean = sum / normSize;
+            double varAcc = 0;
+            for (int j = 0; j < normSize; j++) { double diff = flat[s * normSize + j] - mean; varAcc += diff * diff; }
+            expMean[s] = (float)mean;
+            expInvVar[s] = (float)(1.0 / Math.Sqrt(varAcc / normSize + 1e-5));
+        }
+        AssertGpuMatchesCpu(gpuMean, new Tensor<float>(expMean, new[] { samples }), $"LayerNormGpu.SaveMean[{string.Join(",", shape)}]");
+        AssertGpuMatchesCpu(gpuInvVar, new Tensor<float>(expInvVar, new[] { samples }), $"LayerNormGpu.SaveInvVar[{string.Join(",", shape)}]");
+    }
+
+    // Regression: the GPU training-mode Dropout must actually generate an inverted-dropout mask.
+    // The CUDA path launched dropout_forward (which only APPLIES a pre-generated mask) without ever
+    // filling the mask buffer and with mismatched launch args, so the mask was all-zero and 100% of
+    // activations were dropped (output identically 0). That zeroed every dropout layer during training,
+    // so any model with dropout > 0 could not learn on the GPU. Assert the mask actually keeps roughly
+    // (1 - rate) of the units, applies the 1/keepProb inverted-dropout scale, is finite, and that
+    // forward/backward are consistent (backward passes the same units through, at the same scale).
+    [Theory]
+    [InlineData(0.1)]
+    [InlineData(0.3)]
+    [InlineData(0.5)]
+    public void Dropout_Training_GpuGeneratesMaskLikeCpu(double rate)
+    {
+        if (!EnsureGpuReady()) return;
+        const int n = 8192;
+        var ones = new Tensor<float>(Enumerable.Repeat(1.0f, n).ToArray(), new[] { n });
+
+        var gpuOut = _gpu.Dropout(ones, rate, training: true, out var gpuMask);
+        var og = gpuOut.ToArray();
+        var mg = gpuMask.ToArray();
+
+        int zeros = 0; double keptSum = 0; int kept = 0;
+        for (int i = 0; i < n; i++)
+        {
+            Assert.False(float.IsNaN(og[i]) || float.IsInfinity(og[i]), $"GPU dropout produced non-finite {og[i]}");
+            Assert.Equal(og[i] == 0f, mg[i] == 0f); // mask and output agree on which units are dropped
+            if (og[i] == 0f) zeros++; else { keptSum += og[i]; kept++; }
+        }
+        double fracDropped = (double)zeros / n;
+        // The previous bug dropped 100%; a correct kernel drops ~rate. Wide band tolerates RNG variance
+        // but firmly excludes the all-dropped (1.0) and no-dropped (0.0) failure modes.
+        Assert.True(Math.Abs(fracDropped - rate) < 0.06,
+            $"GPU dropout fraction {fracDropped:F3} not ~{rate:F3} (100%-drop bug regression?)");
+        Assert.True(kept > 0, "GPU dropout dropped everything (mask never generated)");
+        double invKeep = 1.0 / (1.0 - rate);
+        double meanKept = keptSum / kept;
+        Assert.True(Math.Abs(meanKept - invKeep) < 1e-3,
+            $"GPU dropout kept-value {meanKept:F4} not the inverted-dropout scale {invKeep:F4}");
+
+        // Backward must pass gradients through the SAME kept units at the SAME scale (gradInput = gradOut * mask).
+        var gradOut = Rand(202, n);
+        var gradIn = ((AiDotNet.Tensors.Engines.IEngine)_gpu).DropoutBackward(gradOut, gpuMask, rate);
+        var gi = gradIn.ToArray(); var go = gradOut.ToArray();
+        for (int i = 0; i < n; i++)
+        {
+            float expected = go[i] * mg[i];
+            Assert.True(Math.Abs(gi[i] - expected) < 1e-3f,
+                $"GPU dropout backward {gi[i]} != gradOut*mask {expected} at {i}");
+        }
+
+        // Inference (training: false) must be identity.
+        var infer = _gpu.Dropout(ones, rate, training: false, out _);
+        foreach (var v in infer.ToArray())
+            Assert.True(Math.Abs(v - 1.0f) < 1e-4f, "GPU dropout in inference mode must be identity");
+    }
+
     // Shapes span: <128 (the #364 hot zone), tile boundaries around WGD=32,
     // exact/off-by-one multiples, non-square, degenerate 1-dims, and >=128.
     public static IEnumerable<object[]> GemmSizes() => new List<object[]>
@@ -286,6 +423,56 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [Theory] [MemberData(nameof(UnarySizes))] public void Softplus_Gpu_Matches_Cpu(int[] s) => AssertUnary((e, a) => e.Softplus(a), s, "Softplus", TolTranscendental);
     [Theory] [MemberData(nameof(UnarySizes))] public void TensorExp_Gpu_Matches_Cpu(int[] s) => AssertUnary((e, a) => e.TensorExp(a), s, "TensorExp", TolTranscendental);
     [Theory] [MemberData(nameof(UnarySizes))] public void TensorDivideScalar_Gpu_Matches_Cpu(int[] s) => AssertUnary((e, a) => e.TensorDivideScalar(a, 3f), s, "TensorDivideScalar", Tol);
+
+    public static IEnumerable<object[]> NegativeBasePowerExponents() => new List<object[]>
+    {
+        new object[] { 3.0f },
+        new object[] { 4.0f },
+        new object[] { -3.0f },
+        new object[] { -4.0f },
+        new object[] { 0.5f },
+    };
+
+    // PR #827 fixed CUDA fast-math pow for negative bases. Keep every backend aligned with the CPU
+    // reference for odd, even, negative-integral, and genuinely undefined fractional exponents.
+    // Exponent 2 is intentionally absent: TensorPower optimizes x^2 to Multiply before Power is called.
+    [Theory]
+    [MemberData(nameof(NegativeBasePowerExponents))]
+    public void TensorPower_NegativeBases_GpuMatchesCpu(float exponent)
+    {
+        if (!EnsureGpuReady()) return;
+
+        var input = new Tensor<float>(new[] { -8.0f, -2.0f, -0.5f, 0.5f, 2.0f, 8.0f }, new[] { 6 });
+        float[] expected = _cpu.TensorPower(input, exponent).ToArray();
+        float[] actual;
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            // This diagnostic mode turns every TensorPower fallback into a test failure, proving that
+            // backend.Power dispatched successfully before the numerical comparison can pass.
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            actual = _gpu.TensorPower(input, exponent).ToArray();
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (float.IsNaN(expected[i]))
+            {
+                Assert.True(float.IsNaN(actual[i]),
+                    $"TensorPower exponent {exponent}: expected NaN at index {i}, got {actual[i]}");
+                continue;
+            }
+
+            double tolerance = 5e-4 * Math.Max(1.0, Math.Abs(expected[i]));
+            Assert.True(Math.Abs((double)actual[i] - expected[i]) <= tolerance,
+                $"TensorPower exponent {exponent}: expected {expected[i]} at index {i}, got {actual[i]}");
+        }
+    }
 
     [Theory]
     [MemberData(nameof(ElementwiseShapes))]

@@ -163,14 +163,14 @@ public static class SimdHrrKernels
     /// discrete-phase cycles (4-PSK, 8-PSK, 16-PSK). <paramref name="k"/>
     /// must be positive when <paramref name="kPsk"/> is set.</para>
     ///
-    /// <para>Uses a deterministic Xoroshiro-style PRNG keyed by
-    /// <paramref name="seed"/> so the same seed reproduces the same
-    /// codebook across runs — critical for HRR experiments' reproducibility.</para>
+    /// <para>Uses the same stateless 32-bit hash as the GPU backends, keyed by
+    /// <paramref name="seed"/> and the cell index, so the same seed reproduces
+    /// the same phase sequence independently of execution scheduling.</para>
     /// </summary>
     /// <summary>
     /// Float overload of <see cref="UnitPhaseCodebookDouble"/>. Same
-    /// deterministic xorshift64* PRNG; sin/cos use <see cref="MathF"/>
-    /// for the single-precision path.
+    /// deterministic per-cell hash; sin/cos use <see cref="MathF"/> for the
+    /// single-precision path.
     /// </summary>
     /// <inheritdoc cref="UnitPhaseCodebookDouble"/>
     public static void UnitPhaseCodebookFloat(
@@ -191,24 +191,11 @@ public static class SimdHrrKernels
             throw new ArgumentOutOfRangeException(nameof(k),
                 "k must be positive when kPsk is true.");
 
-        ulong state = unchecked((ulong)seed * 0x9E3779B97F4A7C15UL | 1);
-        const float TwoPi = 2f * MathF.PI;
-        float kPskStep = kPsk ? TwoPi / k : 0f;
-
         for (int i = 0; i < n; i++)
         {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            ulong r = state * 0x2545F4914F6CDD1DUL;
-            float u01 = (float)((r >> 11) * (1.0 / (1UL << 53)));
-            float phase = u01 * TwoPi;
-            if (kPsk)
-            {
-                phase = MathF.Floor(phase / kPskStep + 0.5f) * kPskStep;
-            }
-            outR[i] = MathF.Cos(phase);
-            outI[i] = MathF.Sin(phase);
+            uint turn = HrrHash(seed, i) & 0xFFFFFF00u;
+            if (kPsk) turn = QuantizeHrrTurn(turn, (uint)k);
+            HrrSinCos(turn, out outR[i], out outI[i]);
         }
     }
 
@@ -230,20 +217,12 @@ public static class SimdHrrKernels
             throw new ArgumentOutOfRangeException(nameof(k),
                 "k must be positive when kPsk is true.");
 
-        // xorshift64* — deterministic, fast enough that Sin/Cos dominate.
-        ulong state = unchecked((ulong)seed * 0x9E3779B97F4A7C15UL | 1);
         const double TwoPi = 2.0 * Math.PI;
         double kPskStep = kPsk ? TwoPi / k : 0.0;
 
         for (int i = 0; i < n; i++)
         {
-            // xorshift64* step
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            ulong r = state * 0x2545F4914F6CDD1DUL;
-            // Upper 53 bits → double in [0, 1).
-            double u01 = (r >> 11) * (1.0 / (1UL << 53));
+            double u01 = (HrrHash(seed, i) >> 8) * (1.0 / 16777216.0);
             double phase = u01 * TwoPi;
             if (kPsk)
             {
@@ -253,6 +232,79 @@ public static class SimdHrrKernels
             outR[i] = Math.Cos(phase);
             outI[i] = Math.Sin(phase);
         }
+    }
+
+    private static uint HrrHash(int seed, int cellIndex)
+    {
+        unchecked
+        {
+            uint z = (uint)seed * 0x9E3779B9u + (uint)cellIndex * 0x85EBCA6Bu;
+            z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+            z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+            return z ^ (z >> 16);
+        }
+    }
+
+    private static uint QuantizeHrrTurn(uint turn, uint k)
+    {
+        uint latticeIndex = (uint)(((ulong)turn * k) >> 32);
+        if (unchecked(turn * k) >= 0x80000000u) latticeIndex++;
+        if (latticeIndex == k) latticeIndex = 0;
+
+        uint quotient = 0;
+        uint remainder = latticeIndex;
+        for (int i = 0; i < 32; i++)
+        {
+            remainder <<= 1;
+            quotient <<= 1;
+            if (remainder >= k)
+            {
+                remainder -= k;
+                quotient |= 1;
+            }
+        }
+        return quotient;
+    }
+
+    private static readonly int[] HrrCordicAngles =
+    [
+        536870912, 316933406, 167458907, 85004756, 42667331,
+        21354465, 10679838, 5340245, 2670163, 1335087,
+        667544, 333772, 166886, 83443, 41722,
+        20861, 10430, 5215, 2608, 1304,
+        652, 326, 163, 81, 41, 20, 10, 5, 3, 1
+    ];
+
+    private static void HrrSinCos(uint turn, out float cosine, out float sine)
+    {
+        uint quadrant = turn >> 30;
+        uint offset = turn & 0x3FFFFFFFu;
+        int z = (int)((quadrant == 1 || quadrant == 3) ? 0x40000000u - offset : offset);
+        int x = 652032874;
+        int y = 0;
+
+        for (int i = 0; i < HrrCordicAngles.Length; i++)
+        {
+            int oldX = x;
+            if (z >= 0)
+            {
+                x -= y >> i;
+                y += oldX >> i;
+                z -= HrrCordicAngles[i];
+            }
+            else
+            {
+                x += y >> i;
+                y -= oldX >> i;
+                z += HrrCordicAngles[i];
+            }
+        }
+
+        if (quadrant == 1 || quadrant == 2) x = -x;
+        if (quadrant >= 2) y = -y;
+        const float Q30Scale = 1f / 1073741824f;
+        cosine = x * Q30Scale;
+        sine = y * Q30Scale;
     }
 
     /// <summary>

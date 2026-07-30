@@ -19,8 +19,11 @@ internal static class PlanFormatConstants
     /// Version 2 added an explicit final-output tensor ID (written after the
     /// op sequence, before the footer) so view-ending forwards serialize
     /// correctly — see issue #228.
+    /// Version 3 added fused compiled optimizer configuration and transient
+    /// state to training plans so saved plans resume Adam-family moments and
+    /// optimizer-specific scalar state instead of restarting fresh.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 2;
+    internal const ushort CurrentFormatVersion = 3;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:

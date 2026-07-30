@@ -56,6 +56,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
+        if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
@@ -67,7 +68,6 @@ internal static class Program
         int outC = ArgI(args, "--outc", 256);
         int sp = ArgI(args, "--sp", 16);
         int reps = ArgI(args, "--reps", 12);
-        bool util = HasFlag(args, "--util");
 
         if (maxdop < 1 || inC < 1 || outC < 1 || sp < 1 || reps < 1)
         {
@@ -87,7 +87,6 @@ internal static class Program
         double warm = sw.Elapsed.TotalMilliseconds;
 
         var times = new double[reps];
-        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -95,7 +94,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = StopMeter(meter, maxdop);
+        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
         Array.Sort(times);
         Console.WriteLine(
             $"CONV inC={inC} outC={outC} sp={sp}x{sp} out.len={o.Length} maxdop={maxdop} " +
@@ -117,7 +116,6 @@ internal static class Program
         int H = ArgI(a, "--h", 12);     // heads
         int blocks = ArgI(a, "--blocks", 6);
         int reps = ArgI(a, "--reps", 10);
-        bool util = HasFlag(a, "--util");
 
         if (maxdop < 1 || S < 1 || D < 1 || H < 1 || blocks < 1 || reps < 1)
         {
@@ -195,7 +193,6 @@ internal static class Program
         bool useArena = HasFlag(a, "--arena");
         TensorArena? arena = useArena ? TensorArena.Create() : null;
         var times = new double[reps];
-        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         // Warm the arena (first rep allocates; subsequent reps reuse) before the alloc window.
         if (arena is not null) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
@@ -211,7 +208,7 @@ internal static class Program
         }
         arena?.Dispose();
         long allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocStart;
-        string u = StopMeter(meter, maxdop);
+        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -528,7 +525,6 @@ internal static class Program
         int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
         int n = ArgI(a, "--n", 8 * 1024 * 1024);  // 8M floats ~= S=2048 x 4D=4096 FFN intermediate
         int reps = ArgI(a, "--reps", 40);
-        bool util = HasFlag(a, "--util");
         string op = a.Length > 1 && !a[1].StartsWith("--") ? a[1] : "gelu";
 
         if (maxdop < 1 || n < 1 || reps < 1)
@@ -557,7 +553,6 @@ internal static class Program
         double sink = dst[0];
 
         var times = new double[reps];
-        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -565,7 +560,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = StopMeter(meter, maxdop);
+        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
         Array.Sort(times);
         Console.WriteLine(
             $"ACT op={op} n={n} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -643,7 +638,6 @@ internal static class Program
         int K = ArgI(a, "--k", 1024);
         int N = ArgI(a, "--n", 4096);
         int reps = ArgI(a, "--reps", 30);
-        bool util = HasFlag(a, "--util");
 
         if (maxdop < 1 || M < 1 || K < 1 || N < 1 || reps < 1)
         {
@@ -661,7 +655,6 @@ internal static class Program
         float sink = o[0];
 
         var times = new double[reps];
-        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -669,12 +662,45 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = StopMeter(meter, maxdop);
+        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
         Array.Sort(times);
         Console.WriteLine(
             $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (sink={sink:E1}){u}");
         return 0;
+    }
+
+    // Correctness check: GotoGemm (the machine-code kernel — SysV on Linux) vs PackBoth (the cross-platform
+    // managed reference), same inputs. They must agree to fp-reassociation noise (~1e-6). A wrong-ABI kernel
+    // would produce garbage / NaN here, not a ~1e-6 match.
+    private static int RunGemmVerify(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 256), K = ArgI(a, "--k", 512), N = ArgI(a, "--n", 1024);
+        var rng = new Random(1);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var bm = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.BlasManaged.BlasManaged");
+        var fld = bm?.GetField("s_disableGotoGemm", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        if (fld is null) { Console.Error.WriteLine("[verify] s_disableGotoGemm not found"); return 2; }
+        fld.SetValue(null, false);                       // GotoGemm (SysV kernel on Linux)
+        var cGoto = eng.BatchMatMul(lhs, rhs);
+        fld.SetValue(null, true);                        // PackBoth reference
+        var cRef = eng.BatchMatMul(lhs, rhs);
+        fld.SetValue(null, false);
+        // Frobenius-relative ||cGoto - cRef|| / ||cRef|| — robust to the near-zero cancellation that makes
+        // per-element relative error meaningless (random A,B → many ~0 dot products). True fp32 reassociation
+        // noise between two reduction orders is ~1e-6..1e-5; a wrong-ABI kernel would be O(1) or NaN.
+        int total = M * N;
+        double sumD2 = 0, sumR2 = 0;
+        for (int i = 0; i < total; i++)
+        {
+            double g = cGoto[i], r = cRef[i];
+            double d = g - r; sumD2 += d * d; sumR2 += r * r;
+        }
+        double frob = sumR2 > 0 ? Math.Sqrt(sumD2 / sumR2) : 0;
+        bool ok = frob < 1e-4 && !double.IsNaN(frob);
+        Console.WriteLine($"GEMM-VERIFY {M}x{K}x{N} Frobenius||GotoGemm-PackBoth||/||PackBoth|| = {frob:E2} -> {(ok ? "OK" : "MISMATCH")}");
+        return ok ? 0 : 1;
     }
 
     // P4 (#653): single-thread pack-vs-kernel attribution via PackBothProfiler (reflection,
@@ -762,7 +788,6 @@ internal static class Program
         double warm = sw.Elapsed.TotalMilliseconds;
 
         var times = new double[reps];
-        var meter = HasFlag(a, "--util") ? ParallelUtilizationMeter.Start() : null;
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -771,7 +796,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = StopMeter(meter, maxdop);
+        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
         Array.Sort(times);
         Console.WriteLine(
             $"RESBLOCK C={C} sp={sp}x{sp} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -1076,20 +1101,6 @@ internal static class Program
     {
         int i = Array.IndexOf(a, f);
         return i >= 0 && i + 1 < a.Length ? a[i + 1] : d;
-    }
-
-    // Stop a utilization meter (if any) and format its reading.
-    //  busyCores = mean busy CPU cores over the window (process CPU-time / wall) — pool-agnostic.
-    //  cpuUtil%  = busyCores / maxdop (how much of the requested parallelism was actually used).
-    //  coopActive/coopPeak = cooperative-pool-specific fan-out (0 reveals work parallelizing
-    //                        through a DIFFERENT pool than CooperativeGemmScheduler).
-    private static string StopMeter(ParallelUtilizationMeter meter, int maxdop)
-    {
-        if (meter is null) return string.Empty;
-        meter.Dispose();
-        double busy = meter.MeanBusyCores;
-        double cpuUtil = maxdop > 0 ? busy / maxdop * 100.0 : 0.0;
-        return $" busyCores={busy:F2} cpuUtil={cpuUtil:F0}% coopActive={meter.MeanActiveWorkers:F2} coopPeak={meter.PeakActiveWorkers}";
     }
 
     private static Tensor<float> Rand(int[] s, Random r)

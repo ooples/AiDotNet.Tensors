@@ -28,6 +28,13 @@ internal interface IStreamingDroppable
     /// when the storage is still shared (refcount &gt; 1) — e.g. an autodiff
     /// tape capture during training — leaving the data resident for the peer.</summary>
     bool TryDropStorageForStreaming(bool throwOnSharedRefcount);
+
+    /// <summary>Re-serializes this tensor's CURRENT resident data into its streaming-pool entry
+    /// under the same handle, so a later drop + rehydrate returns the current (possibly mutated)
+    /// values rather than the stale snapshot taken at register time (#1715). Returns <c>false</c>
+    /// (no-op) when the weight isn't a resident, full-precision streaming weight. Call BEFORE
+    /// dropping a mutated streaming weight so the mutation is not lost.</summary>
+    bool TryWriteBackResidentForStreaming();
 }
 
 /// <summary>
@@ -296,7 +303,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// <para>READ-ONLY: the mapping is read-only; the caller guarantees nothing writes to
     /// this tensor while aliased (inference / forward-read only). A write would fault.</para>
     /// </summary>
-    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner)
+    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner, bool writable = false)
     {
         if (aliased is null) throw new ArgumentNullException(nameof(aliased));
         if (owner is null) throw new ArgumentNullException(nameof(owner));
@@ -316,10 +323,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         var oldStorage = _storage;
         _data = aliased;
         var newStorage = new TensorStorage<T>(_data);
-        newStorage.AttachMmapOwner(owner); // attach BEFORE making the storage visible to anyone else
+        newStorage.AttachMmapOwner(owner, writable); // attach BEFORE making the storage visible to anyone else
         _storage = newStorage;
         oldStorage.Release();
     }
+
+    /// <summary>True when this tensor's storage aliases a WRITABLE memory-mapped slice (#1715 param-IO):
+    /// the mapped file is the canonical storage (mutations persist), so WeightRegistry must not
+    /// re-materialize it from the pool nor drop it on ReleaseToPool.</summary>
+    internal bool IsWritableMmapAliased => _storage.IsWritableMmapped;
 
     /// <summary>
     /// Physical memory layout of this tensor's data. Default
@@ -535,6 +547,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         => TryDropStorageForStreaming(throwOnSharedRefcount);
 
     long IStreamingDroppable.StreamingPoolHandle => StreamingPoolHandle;
+
+    bool IStreamingDroppable.TryWriteBackResidentForStreaming() => TryWriteBackResidentForStreaming();
+
+    /// <summary>
+    /// Re-serializes this tensor's current resident data into its streaming-pool entry (#1715).
+    /// Native (full-precision) streaming weights only: a lossy store (bf16/int8/int4) is taken by
+    /// read-only inference and its owner is never mutated, so skip it; a non-resident / view / quant
+    /// tensor has nothing to write back. The new bytes overwrite the pool entry under the same handle
+    /// (marked dirty), so the next eviction persists them to disk and a later <c>Materialize</c>
+    /// rehydrates the mutation instead of the stale register-time snapshot.
+    /// </summary>
+    internal bool TryWriteBackResidentForStreaming()
+    {
+        if (StreamingPoolHandle < 0) return false;
+        if (StreamingStoreEncoding != StreamingEncoding.Native) return false;
+        if (DataVector.Length != Length) return false;            // already dropped / no-upcast quant
+        if (!IsContiguous || _storageOffset != 0 || IsView) return false;
+        // Streaming weights are concrete Tensor<T>; serialization needs the concrete type.
+        return this is Tensor<T> concrete && WeightRegistry.WriteBackResidentNative(concrete);
+    }
 
     /// <summary>
     /// Restores this tensor's data from a serialized byte buffer (produced
@@ -770,20 +802,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
     /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
     /// </summary>
-    internal readonly int[] _shape;
+    internal int[] _shape;
 
     /// <summary>
     /// Pre-computed strides for each dimension, following PyTorch's stride convention.
     /// For row-major order: strides[i] = product of shape[i+1..end].
     /// For transposed views: strides are permuted without copying data.
     /// </summary>
-    internal readonly int[] _strides;
+    internal int[] _strides;
 
     /// <summary>
     /// Offset into the underlying storage where this tensor's data begins.
     /// Zero for non-view tensors. Non-zero for sliced views.
     /// </summary>
-    internal readonly int _storageOffset;
+    internal int _storageOffset;
 
     /// <summary>
     /// Tracks the device where this tensor's data currently resides.
@@ -813,6 +845,22 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
     /// </summary>
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer;
+
+    /// <summary>
+    /// True when <see cref="_gpuBuffer"/> stores a logical <c>Tensor&lt;Complex&lt;T&gt;&gt;</c>
+    /// as two contiguous float32 planes: all real values followed by all imaginary
+    /// values. The physical buffer therefore contains twice <see cref="Length"/>
+    /// elements. Direct GPU complex operations use this marker to split the planes
+    /// with device-to-device copies instead of materializing the tensor on the host.
+    /// </summary>
+    internal bool _gpuBufferIsSplitComplex;
+
+    /// <summary>
+    /// True when a logical <c>Tensor&lt;int&gt;</c> is backed by raw int32 device storage rather
+    /// than the numeric-float index representation used by general index-producing kernels.
+    /// Pooling kernels use raw int32 because their backward kernels consume the same buffer.
+    /// </summary>
+    internal bool _gpuBufferContainsRawInt32;
 
     /// <summary>
     /// Backend that owns the GPU buffer. Required for downloading data to CPU.
@@ -1114,7 +1162,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// When true, raw span/array access is safe. When false, Contiguous() must be called
     /// before passing to BLAS/SIMD operations.
     /// </summary>
-    public bool IsContiguous { get; }
+    public bool IsContiguous { get; private set; }
 
     /// <summary>
     /// Lifetime / placement hint for the issue-#276 large-model memory paths.
@@ -1259,7 +1307,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Gets the shape (dimensions) of the tensor as an immutable wrapper.
     /// Use Shape[i] for element access, Shape.Span for zero-copy iteration.
     /// </summary>
-    public TensorShape Shape { get; }
+    public TensorShape Shape { get; private set; }
 
     /// <summary>
     /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
@@ -1371,6 +1419,29 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         Length = totalSize;
         _data = new Vector<T>(totalSize);
         _storage = new TensorStorage<T>(_data);
+    }
+
+    /// <summary>
+    /// Zero-copy, NON-tape-recording in-place reshape used ONLY by the
+    /// <see cref="AiDotNet.Tensors.Helpers.TensorArena"/> reuse path (AiDotNet #1804).
+    /// The arena's tensor ring buckets pooled buffers by element COUNT, so a buffer
+    /// first handed out as e.g. [B,L] can be re-issued for an [L,B] request of the same
+    /// count on the post-Reset reuse path; the caller fully overwrites the buffer, so only
+    /// the shape / stride metadata must be swapped to the requested shape. Requires a
+    /// contiguous, offset-0 buffer with a MATCHING element count (always true for arena
+    /// scratch). Unlike the public <c>Reshape</c>, this does NOT allocate a new wrapper and
+    /// does NOT record a Reshape node on the active gradient tape, so it is safe to call
+    /// mid-forward without corrupting autodiff. Element count is asserted by the caller
+    /// (same ring bucket) so no re-validation is done here.
+    /// </summary>
+    internal void ArenaReshapeInPlace(int[] newShape)
+    {
+        _shape = (int[])newShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(_shape);
+        _rowMajorStridesCache = null;
+        _storageOffset = 0;
+        IsContiguous = true;
     }
 
     /// <summary>
@@ -1585,7 +1656,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             ThrowIfSparse();
             ValidateIndices(indices);
             EnsureOwnedForWrite();
-            _data[GetFlatIndex(indices)] = value;
+            // Route through _storage so a read-only mmap alias throws rather than faulting on write
+            // (transparent for normal tensors — _storage wraps the same Vector as _data).
+            _storage.AsWritableSpan()[GetFlatIndex(indices)] = value;
             // Element-level CPU mutation: bump the version counter so cached
             // GPU buffers (DirectGpuTensorEngine activation cache,
             // _gpuBufferVersion) detect the change and re-upload. Public
@@ -1651,17 +1724,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
         if (Length == 0) return;
         EnsureOwnedForWrite();
+        // Route through _storage so a read-only mmap alias throws (ThrowIfReadOnlyMapped) rather than
+        // faulting the mapped pages; transparent for normal tensors (_storage wraps the same Vector).
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
-            source.AsSpan().CopyTo(_data.AsWritableSpan());
+            source.AsSpan().CopyTo(_storage.AsWritableSpan());
         }
         else if (IsContiguous)
         {
-            source.AsSpan().CopyTo(_data.AsWritableSpan().Slice(_storageOffset, Length));
+            source.AsSpan().CopyTo(_storage.AsWritableSpan().Slice(_storageOffset, Length));
         }
         else
         {
-            var dstData = _data.AsWritableSpan();
+            var dstData = _storage.AsWritableSpan();
             for (int i = 0; i < Length; i++)
                 dstData[FlatIndexToStorageIndex(i)] = source[i];
         }
@@ -1697,10 +1772,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         EnsureOwnedForWrite();
+        // Route through _storage so a read-only mmap alias throws rather than faulting on write
+        // (transparent for normal tensors — _storage wraps the same Vector as _data).
+        var writable = _storage.AsWritableSpan();
         if (IsContiguous)
-            _data[flatIndex + _storageOffset] = value;
+            writable[flatIndex + _storageOffset] = value;
         else
-            _data[FlatIndexToStorageIndex(flatIndex)] = value;
+            writable[FlatIndexToStorageIndex(flatIndex)] = value;
         // Element-level CPU mutation: bump the version counter so cached GPU
         // buffers (DirectGpuTensorEngine activation cache, _gpuBufferVersion)
         // detect the change and re-upload. Without this, the GPU snapshot is
@@ -1831,9 +1909,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (!IsContiguous)
             throw new InvalidOperationException(
                 "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
+        // Route through _storage (not _data) so a read-only mmap alias fails loud via
+        // ThrowIfReadOnlyMapped instead of faulting the mapped pages on write. _storage wraps the same
+        // Vector as _data, so this is transparent for normal tensors; a writable mmap alias is allowed.
         if (_storageOffset == 0 && _storage.Length == Length)
-            return _data.AsWritableSpan();
-        return _data.AsWritableSpan().Slice(_storageOffset, Length);
+            return _storage.AsWritableSpan();
+        return _storage.AsWritableSpan().Slice(_storageOffset, Length);
     }
 
     /// <summary>
@@ -1921,7 +2002,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // before the caller touches the buffer.
         if (_device != TensorDevice.CPU)
             return null;
-        return _storage.GetDataArray();
+        return _storage.TryGetBackingArraySegment(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
     }
 
     /// <summary>
@@ -1934,10 +2018,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// MUST NOT read or write past index <c>Length - 1</c> (the tail
     /// is pool padding and may alias another tensor's storage).
     ///
-    /// <para>Returns <c>null</c> only for views (non-contiguous, non-zero
-    /// offset) and non-CPU tensors — the cases where there is no single
-    /// CPU-side backing array that mutating the tensor through would be
-    /// well-defined. For pooled-padded layouts the live backing IS
+    /// <para>Returns <c>null</c> for views (non-contiguous or non-zero tensor
+    /// offset), non-CPU tensors, non-array memory managers, and sliced
+    /// <see cref="Memory{T}"/> instances whose underlying array begins at a
+    /// non-zero base offset. In those cases a zero-offset array-only kernel
+    /// cannot address the tensor correctly. For pooled-padded layouts whose
+    /// underlying array begins at zero, the live backing IS
     /// well-defined as "first Length elements", which is what the fused
     /// optimizer's per-parameter <c>fixed (T* p = …)</c> + <c>length</c>
     /// pin contract has always relied on.</para>
@@ -1957,7 +2043,243 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             return null;
         if (_device != TensorDevice.CPU)
             return null;
-        return _storage.GetDataArray();
+        return _storage.TryGetBackingArraySegment(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
+    }
+
+    /// <summary>
+    /// Reports whether logical optimizer storage is currently materialized
+    /// without rehydrating a streaming weight. Unlike live-array accessors,
+    /// this remains true for views and native/memory-mapped CPU storage.
+    /// </summary>
+    internal bool HasMaterializedOptimizerStorage => Length == 0 || _storage.Length != 0;
+
+    /// <summary>Whether optimizer writes are prohibited by mapped storage.</summary>
+    internal bool IsReadOnlyOptimizerStorage => _storage.IsReadOnlyMapped;
+
+    /// <summary>
+    /// Returns the raw CPU backing array together with this view's storage offset,
+    /// so a stride-aware reader can index logical elements directly through
+    /// <see cref="Strides"/> WITHOUT first materializing a contiguous copy. The
+    /// returned array is the shared backing store: the caller MUST only read, and
+    /// MUST honour <see cref="Strides"/> + <paramref name="storageOffset"/> when
+    /// addressing elements (the view may be permuted/sliced). Returns <c>null</c>
+    /// for GPU-resident tensors (no authoritative CPU array) and CPU storage
+    /// not backed by a managed array — the caller should then fall back to
+    /// <see cref="Contiguous"/>. The returned offset includes both the tensor
+    /// view offset and any underlying <see cref="Memory{T}"/> slice offset.
+    /// Triggers the same materialization
+    /// guard as the span accessors so a lazy node is realized and a paged-out
+    /// streaming weight rehydrated first. This is a READ-ONLY accessor (it does NOT
+    /// privatize a copy-on-write clone): routing a write through the returned array
+    /// would corrupt a COW peer.
+    /// </summary>
+    internal T[]? GetCpuBackingForStridedRead(out int storageOffset)
+    {
+        EnsureMaterialized();
+        if (_device != TensorDevice.CPU)
+        {
+            storageOffset = 0;
+            return null;
+        }
+        if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
+        {
+            storageOffset = checked(baseOffset + _storageOffset);
+            return array;
+        }
+
+        storageOffset = 0;
+        return null;
+    }
+
+    /// <summary>
+    /// Returns writable managed-array storage for a contiguous CPU tensor and
+    /// the absolute offset of its first logical element. Unlike the legacy
+    /// array-only live accessors, this preserves both tensor-view offsets and
+    /// the base offset of sliced <see cref="Memory{T}"/> storage.
+    /// </summary>
+    /// <remarks>
+    /// The accessor does not force streaming materialization. A dropped or
+    /// unmaterialized parameter therefore continues to expose its current
+    /// (possibly empty) storage and can retain the existing skip semantics.
+    /// Copy-on-write peers are privatized before a writable alias escapes.
+    /// </remarks>
+    internal T[]? GetCpuBackingForContiguousWrite(out int storageOffset)
+    {
+        EnsureOwnedForWrite();
+        if (_device != TensorDevice.CPU || !IsContiguous || _storage.IsReadOnlyMapped)
+        {
+            storageOffset = 0;
+            return null;
+        }
+
+        if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
+        {
+            storageOffset = checked(baseOffset + _storageOffset);
+            return array;
+        }
+
+        storageOffset = 0;
+        return null;
+    }
+
+    /// <summary>
+    /// Copies logical tensor elements into caller-owned contiguous storage
+    /// without allocating. Supports non-contiguous views.
+    /// </summary>
+    internal void CopyLogicalTo(Span<T> destination)
+    {
+        EnsureMaterialized();
+        if (destination.Length != Length)
+            throw new ArgumentException(
+                $"Destination length ({destination.Length}) must match tensor length ({Length}).",
+                nameof(destination));
+
+        if (Length == 0)
+            return;
+
+        var source = _storage.AsSpan();
+        if (IsContiguous)
+        {
+            source.Slice(_storageOffset, Length).CopyTo(destination);
+            return;
+        }
+
+        for (int i = 0; i < Length; i++)
+            destination[i] = source[FlatIndexToStorageIndex(i)];
+    }
+
+    /// <summary>
+    /// Scales every logical element in place while preserving strided-view and
+    /// copy-on-write semantics. This is the allocation-free fallback used when
+    /// a caller cannot safely obtain a contiguous managed-array alias.
+    /// </summary>
+    internal void ScaleLogicalInPlace(T scale)
+    {
+        EnsureMaterialized();
+        if (Length == 0)
+            return;
+        EnsureNonOverlappingWritableLayout();
+        EnsureOwnedForWrite();
+
+        var destination = _storage.AsWritableSpan();
+        if (IsContiguous)
+        {
+            var logical = destination.Slice(_storageOffset, Length);
+            for (int i = 0; i < logical.Length; i++)
+                logical[i] = _numOps.Multiply(logical[i], scale);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+            {
+                int storageIndex = FlatIndexToStorageIndex(i);
+                destination[storageIndex] = _numOps.Multiply(destination[storageIndex], scale);
+            }
+        }
+
+        IncrementVersion();
+    }
+
+    /// <summary>
+    /// Clamps every logical element in place while preserving strided-view and
+    /// copy-on-write semantics. The operation touches only the tensor's logical
+    /// region; storage padding and unrelated elements surrounding a view are left
+    /// unchanged.
+    /// </summary>
+    internal void ClampLogicalInPlace(T min, T max)
+    {
+        EnsureMaterialized();
+        if (Length == 0)
+            return;
+        EnsureNonOverlappingWritableLayout();
+        EnsureOwnedForWrite();
+
+        var destination = _storage.AsWritableSpan();
+        if (IsContiguous)
+        {
+            ClampSpan(destination.Slice(_storageOffset, Length), min, max);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+            {
+                int storageIndex = FlatIndexToStorageIndex(i);
+                T value = destination[storageIndex];
+                destination[storageIndex] = _numOps.GreaterThan(value, max)
+                    ? max
+                    : _numOps.LessThan(value, min) ? min : value;
+            }
+        }
+
+        IncrementVersion();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void ClampSpan(Span<T> destination, T min, T max)
+    {
+        for (int i = 0; i < destination.Length; i++)
+        {
+            T value = destination[i];
+            destination[i] = _numOps.GreaterThan(value, max)
+                ? max
+                : _numOps.LessThan(value, min) ? min : value;
+        }
+    }
+
+    /// <summary>
+    /// Rejects in-place logical operations on layouts where multiple logical
+    /// coordinates address the same storage element. Applying a scale or clamp
+    /// once per logical coordinate would otherwise mutate zero-stride/broadcast
+    /// storage repeatedly and make the result traversal-order dependent.
+    /// </summary>
+    private void EnsureNonOverlappingWritableLayout()
+    {
+        if (IsContiguous || Length <= 1 || Rank == 0)
+            return;
+
+        Span<int> dimensions = Rank <= 16 ? stackalloc int[Rank] : new int[Rank];
+        int dimensionCount = 0;
+        for (int d = 0; d < Rank; d++)
+        {
+            if (_shape[d] <= 1)
+                continue;
+            if (_strides[d] == 0)
+                throw new InvalidOperationException(
+                    "In-place logical mutation is not defined for overlapping tensor views " +
+                    "(a non-singleton dimension has stride zero). Materialize the view first.");
+            dimensions[dimensionCount++] = d;
+        }
+
+        // Sort active dimensions by absolute stride. A dimension is safely
+        // non-overlapping only when its stride begins at or beyond the complete
+        // storage span covered by every faster-varying dimension.
+        for (int i = 1; i < dimensionCount; i++)
+        {
+            int value = dimensions[i];
+            long stride = Math.Abs((long)_strides[value]);
+            int j = i - 1;
+            while (j >= 0 && Math.Abs((long)_strides[dimensions[j]]) > stride)
+            {
+                dimensions[j + 1] = dimensions[j];
+                j--;
+            }
+            dimensions[j + 1] = value;
+        }
+
+        long coveredSpan = 1;
+        for (int i = 0; i < dimensionCount; i++)
+        {
+            int dimension = dimensions[i];
+            long stride = Math.Abs((long)_strides[dimension]);
+            if (stride < coveredSpan)
+                throw new InvalidOperationException(
+                    "In-place logical mutation is not defined for overlapping tensor views. " +
+                    "Materialize the view first.");
+            coveredSpan = checked(coveredSpan + ((long)_shape[dimension] - 1L) * stride);
+        }
     }
 
     // ================================================================
@@ -2086,45 +2408,169 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     // ================================================================
-    // Copy-on-write clone (issue #624 — Stage 1: primitive + write-gate)
+    // Copy-on-write clone (issue #624 — alias-family ownership + write gate)
     // ================================================================
 
     /// <summary>
-    /// True when this tensor shares its backing storage with a copy-on-write peer (see
-    /// <see cref="CloneShared"/>). While set, the next in-place write privatizes this tensor's
-    /// storage (<see cref="EnsureOwnedForWrite"/>) so neither side observes the other's mutation.
-    /// Normal tensors never set it — so the write-path guards are a single predictable branch.
+    /// The alias family this tensor belongs to while its storage is shared with an independent
+    /// copy-on-write peer. Metadata views join their creator's family so ordinary source/view
+    /// aliasing survives the family-level detach. Normal tensors leave this null, keeping the
+    /// write-path guard to one predictable branch.
     /// </summary>
-    private bool _cowShared;
+    private CowAliasFamily? _cowFamily;
 
     /// <summary>Diagnostic: whether this tensor is currently a live COW storage sharer.</summary>
-    internal bool IsCowShared => _cowShared;
-
-    /// <summary>Marks this tensor as a COW sharer. Called only by <see cref="CloneShared"/>.</summary>
-    internal void MarkCowShared() => _cowShared = true;
+    internal bool IsCowShared => _cowFamily?.RequiresDetach == true;
 
     /// <summary>
-    /// Privatizes copy-on-write storage before an in-place write. No-op unless this tensor was
-    /// produced by (or is the source of) a <see cref="CloneShared"/> and still shares storage.
-    /// When storage is still shared (<c>RefCount &gt; 1</c>) the backing buffer is deep-copied into
-    /// fresh sole-owned storage; when we are already the only ref we just clear the flag. Must be
-    /// called at the top of every in-place write path — the isolation test is the completeness guard.
+    /// Starts an independent COW alias family for this tensor. The source and clone each receive
+    /// their own family; views created from either side subsequently join that side's family.
+    /// </summary>
+    internal void MarkCowShared()
+    {
+        var family = new CowAliasFamily();
+        family.Add(this);
+    }
+
+    /// <summary>True when view construction must coordinate with a pending COW detach.</summary>
+    protected bool HasCowAliasFamily => _cowFamily is not null;
+
+    /// <summary>
+    /// Constructs and registers a metadata view while holding this tensor's alias-family lock.
+    /// This makes the creator's vector/storage pair an atomic snapshot relative to first-write
+    /// detach. Callers should use their direct allocation path when <see cref="HasCowAliasFamily"/>
+    /// is false so ordinary view construction does not allocate a delegate.
+    /// </summary>
+    protected TView CreateViewInCowAliasFamily<TView>(Func<TView> factory)
+        where TView : TensorBase<T>
+    {
+        var family = _cowFamily;
+        return family is null ? factory() : family.CreateView(this, factory);
+    }
+
+    /// <summary>
+    /// Privatizes a complete copy-on-write alias family before an in-place write. No-op unless
+    /// this tensor was produced by (or is the source of) a <see cref="CloneShared"/> and still
+    /// shares storage with an independent family. Moving the whole family preserves the normal
+    /// rule that writes through a source or any of its metadata views remain mutually visible.
     /// </summary>
     protected void EnsureOwnedForWrite()
     {
-        if (!_cowShared) return;
-        if (_storage.RefCount > 1)
-        {
-            EnsureMaterialized();
-            var fresh = _data.Clone();                  // independent copy of the shared buffer
-            var oldStorage = _storage;
-            _data = fresh;
-            _storage = new TensorStorage<T>(fresh);     // sole owner (RefCount 1)
-            oldStorage.Release();                       // drop our shared ref; peer keeps theirs
-            IncrementVersion();
-        }
-        _cowShared = false;
+        var family = _cowFamily;
+        if (family is null) return;
+        family.DetachForWrite(this);
     }
+
+    /// <summary>
+    /// Tracks one logical alias family using weak members so discarded views do
+    /// not stay alive. A family-level detach preserves ordinary source/view
+    /// aliasing while isolating the independent family created for a COW peer.
+    /// </summary>
+    private sealed class CowAliasFamily
+    {
+        private readonly object _sync = new object();
+        private readonly System.Collections.Generic.List<WeakReference<TensorBase<T>>> _members =
+            new System.Collections.Generic.List<WeakReference<TensorBase<T>>>();
+        private int _requiresDetach = 1;
+
+        internal bool RequiresDetach => Volatile.Read(ref _requiresDetach) != 0;
+
+        internal void Add(TensorBase<T> member)
+        {
+            lock (_sync)
+            {
+                if (_requiresDetach == 0)
+                    return;
+                member._cowFamily = this;
+                _members.Add(new WeakReference<TensorBase<T>>(member));
+            }
+        }
+
+        /// <summary>
+        /// Atomically captures the creator's current vector/storage pair and attaches the new
+        /// metadata view to this family when a detach is still pending.
+        /// </summary>
+        internal TView CreateView<TView>(TensorBase<T> creator, Func<TView> factory)
+            where TView : TensorBase<T>
+        {
+            lock (_sync)
+            {
+                var view = factory();
+                if (_requiresDetach != 0 && ReferenceEquals(creator._cowFamily, this))
+                {
+                    view._cowFamily = this;
+                    _members.Add(new WeakReference<TensorBase<T>>(view));
+                    return view;
+                }
+                return view;
+            }
+        }
+
+        internal void DetachForWrite(TensorBase<T> requester)
+        {
+            lock (_sync)
+            {
+                if (_requiresDetach == 0)
+                {
+                    requester._cowFamily = null;
+                    return;
+                }
+
+                requester.EnsureMaterialized();
+                var liveMembers = new System.Collections.Generic.List<TensorBase<T>>(_members.Count);
+                for (int i = 0; i < _members.Count; i++)
+                {
+                    if (_members[i].TryGetTarget(out var member)
+                        && !member._disposed
+                        && ReferenceEquals(member._cowFamily, this)
+                        && ReferenceEquals(member._storage, requester._storage))
+                    {
+                        liveMembers.Add(member);
+                    }
+                }
+                if (!liveMembers.Contains(requester))
+                    liveMembers.Add(requester);
+
+                // When every remaining storage reference belongs to this family,
+                // no independent peer remains. Clear the pending COW state without
+                // copying, matching the former sole-owner fast path.
+                if (requester._storage.RefCount == liveMembers.Count)
+                {
+                    for (int i = 0; i < liveMembers.Count; i++)
+                        liveMembers[i]._cowFamily = null;
+                    Volatile.Write(ref _requiresDetach, 0);
+                    _members.Clear();
+                    return;
+                }
+
+                var fresh = requester._data.Clone();
+                var privateStorage = new TensorStorage<T>(fresh);
+                for (int i = 0; i < liveMembers.Count; i++)
+                {
+                    var member = liveMembers[i];
+                    if (i > 0)
+                        privateStorage.AddRef();
+                    var oldStorage = member._storage;
+                    member._data = fresh;
+                    member._storage = privateStorage;
+                    member._cowFamily = null;
+                    oldStorage.Release();
+                    member.IncrementVersion();
+                }
+
+                Volatile.Write(ref _requiresDetach, 0);
+                _members.Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Declares that an internal subsystem will retain a writable reference to this tensor's
+    /// backing storage. Copy-on-write tensors must be privatized before that reference is
+    /// captured, because a later write through the retained reference cannot pass through the
+    /// normal tensor write guards.
+    /// </summary>
+    internal void PrepareForInPlaceWrite() => EnsureOwnedForWrite();
 
     /// <summary>
     /// Copy-on-write clone: shares the backing storage at O(1) for the plain dense case and
@@ -2476,7 +2922,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         get
         {
             EnsureOwnedForWrite();
-            return _data.AsWritableSpan();
+            // Route through _storage so a read-only mmap alias throws rather than faulting on write
+            // (transparent for normal tensors — _storage wraps the same Vector as _data).
+            return _storage.AsWritableSpan();
         }
     }
 
@@ -2575,7 +3023,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         }
 
         // Remove pending deferred materializer to prevent callback on disposed tensor
-        if (_gpuMaterializerKey is not null)
+        if (_gpuMaterializerKey is not null && _storage.RefCount == 1)
         {
             Helpers.DeferredArrayMaterializer.Remove(_gpuMaterializerKey);
             _gpuMaterializerKey = null;

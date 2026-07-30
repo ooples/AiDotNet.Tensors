@@ -4,11 +4,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClAudioKernels
 {
-    public static string[] GetKernelNames() => new[]
-    {
+    public static string[] GetKernelNames() =>
+    [
         "audio_amplitude_to_db", "audio_mulaw_encoding", "audio_mulaw_decoding",
         "audio_compute_deltas", "audio_resample",
-    };
+        .. OpenClInstantNgpKernels.GetKernelNames(),
+    ];
 
     public static string GetSource() => @"
 __kernel void audio_amplitude_to_db(
@@ -41,13 +42,13 @@ __kernel void audio_mulaw_encoding(
 }
 
 __kernel void audio_mulaw_decoding(
-    __global const float* input, __global float* output,
+    __global const int* input, __global float* output,
     const int length, const int quantizationChannels)
 {
     int gid = get_global_id(0);
     if (gid >= length) return;
     float mu = (float)(quantizationChannels - 1);
-    float q = input[gid];
+    float q = (float)input[gid];
     float y = (q / mu) * 2.0f - 1.0f;
     float sgn = (y > 0.0f) - (y < 0.0f);
     float x = sgn * (pow(1.0f + mu, fabs(y)) - 1.0f) / mu;
@@ -108,6 +109,6 @@ __kernel void audio_resample(
     }
     output[gid] = wSum > 0.0f ? acc / wSum : 0.0f;
 }
-";
+" + OpenClInstantNgpKernels.GetSource();
 }
 #endif

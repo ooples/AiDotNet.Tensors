@@ -1,8 +1,10 @@
+using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
@@ -118,15 +120,15 @@ public class TapePerformanceTests
             $"Recording overhead {overheadPct:F1}% exceeds 200% budget for 1K element tensors");
     }
 
-    // Category=Performance so the coverage-instrumented CI correctness run (filter
-    // Category!=Performance) excludes this wall-clock gate. Under coverlet on a shared
-    // CI runner this measured 178ms/step while it passes locally well under the 100ms
-    // budget — instrumentation + runner contention, not a real regression. Budget
-    // unchanged; the gate just runs where wall-clock time is meaningful.
+    // Absolute wall-clock budgets are machine/load dependent and should not run in
+    // the default correctness suite. Keep the benchmark body for manual/dedicated
+    // performance runs where the 100ms budget is meaningful.
     [Trait("Category", "Performance")]
-    [Fact]
+    [SkippableFact]
     public void FullForwardBackward_MLP_Performance()
     {
+        PerformanceGate.SkipUnlessEnabled();
+
         // Measure a realistic training step: 3-layer MLP forward + backward
         var input = Tensor<float>.CreateRandom([32, 128]); // batch=32, features=128
         var w1 = Tensor<float>.CreateRandom([128, 64]);

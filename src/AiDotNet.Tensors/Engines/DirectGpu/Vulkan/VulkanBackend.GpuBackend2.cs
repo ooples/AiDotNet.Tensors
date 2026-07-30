@@ -9,14 +9,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 public sealed unsafe partial class VulkanBackend
 {
     // Shared dispatch for the conv/pool GLSL kernels (issue #646): compile-or-cache the pipeline, bind the SSBOs,
-    // push the int params, and launch a 1D grid over `threads` output elements. Returns false when the pipeline
-    // could not be built (no libshaderc at runtime) so the caller falls back to the CPU reference. Mirrors the
-    // DispatchUnary pattern. NOTE: validated only on a Vulkan runner — the dev box has no libshaderc.
+    // push the int params, and launch a 1D grid over `threads` output elements.
     private bool TryDispatchConvPoolGlsl(string glsl, uint[] pushInts, int threads, params IGpuBuffer[] buffers)
     {
-        if (threads <= 0) return false;
+        if (threads <= 0) return true;
         var pipeline = GetOrCreateGlslPipeline(glsl, buffers.Length, (uint)(pushInts.Length * sizeof(uint)));
-        if (pipeline is null) return false;
+        if (pipeline is null)
+            throw new InvalidOperationException("Vulkan convolution/pooling pipeline creation failed.");
         var storages = new VulkanBuffer[buffers.Length];
         for (int i = 0; i < buffers.Length; i++) storages[i] = AsVulkan(buffers[i]).Storage;
         var threadRes = _device.AcquireThreadResources();
@@ -46,30 +45,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(kernel);
-        var outp = new float[batch * outChannels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float sum = 0;
-                        for (int ic = 0; ic < inChannels; ic++)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int ih = oh * strideH - padH + kh * dilationH;
-                                    int iw = ow * strideW - padW + kw * dilationW;
-                                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                        sum += inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
-                                            * ker[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                                }
-                        outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
-                    }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -88,29 +64,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, pc, total, gradOutput, kernel, gradInput)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var ker = DownloadBuffer(kernel);
-        var gi = new float[batch * inChannels * inHeight * inWidth];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float g = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                        for (int ic = 0; ic < inChannels; ic++)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int ih = oh * strideH - padH + kh * dilationH;
-                                    int iw = ow * strideW - padW + kw * dilationW;
-                                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                        gi[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
-                                            += g * ker[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                                }
-                    }
-        UploadToBuffer(gi, gradInput);
+        catch { throw; }
     }
 
     public void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -129,30 +83,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, pc, total, input, gradOutput, gradKernel)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var go = DownloadBuffer(gradOutput);
-        var gk = new float[outChannels * inChannels * kernelH * kernelW];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int ic = 0; ic < inChannels; ic++)
-                    for (int kh = 0; kh < kernelH; kh++)
-                        for (int kw = 0; kw < kernelW; kw++)
-                        {
-                            float sum = 0;
-                            for (int oh = 0; oh < outHeight; oh++)
-                                for (int ow = 0; ow < outWidth; ow++)
-                                {
-                                    int ih = oh * strideH - padH + kh * dilationH;
-                                    int iw = ow * strideW - padW + kw * dilationW;
-                                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                        sum += go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
-                                            * inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                                }
-                            gk[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw] += sum;
-                        }
-        UploadToBuffer(gk, gradKernel);
+        catch { throw; }
     }
 
     public void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -196,32 +127,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Unfold, pc, total, input, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        int outH = (height + 2 * padH - kernelH) / strideH + 1;
-        int outW = (width + 2 * padW - kernelW) / strideW + 1;
-        int colLen = outH * outW;
-        int colCh = channels * kernelH * kernelW;
-        var outp = new float[batch * colCh * colLen];
-
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int ki = 0; ki < kernelH; ki++)
-                    for (int kj = 0; kj < kernelW; kj++)
-                    {
-                        int colRow = (c * kernelH + ki) * kernelW + kj;
-                        for (int oh = 0; oh < outH; oh++)
-                            for (int ow = 0; ow < outW; ow++)
-                            {
-                                int ih = oh * strideH + ki - padH;
-                                int iw = ow * strideW + kj - padW;
-                                int colIdx = b * colCh * colLen + colRow * colLen + oh * outW + ow;
-                                outp[colIdx] = (ih >= 0 && ih < height && iw >= 0 && iw < width)
-                                    ? inp[(b * channels + c) * height * width + ih * width + iw] : 0f;
-                            }
-                    }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void Fold(IGpuBuffer input, IGpuBuffer output,
@@ -236,32 +142,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Fold, pc, total, input, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
-        int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;
-        int colLen = unfoldH * unfoldW;
-        int colCh = channels * kernelH * kernelW;
-        var outp = new float[batch * channels * outputH * outputW];
-
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int ki = 0; ki < kernelH; ki++)
-                    for (int kj = 0; kj < kernelW; kj++)
-                    {
-                        int colRow = (c * kernelH + ki) * kernelW + kj;
-                        for (int oh = 0; oh < unfoldH; oh++)
-                            for (int ow = 0; ow < unfoldW; ow++)
-                            {
-                                int ih = oh * strideH + ki - padH;
-                                int iw = ow * strideW + kj - padW;
-                                if (ih >= 0 && ih < outputH && iw >= 0 && iw < outputW)
-                                    outp[b * channels * outputH * outputW + c * outputH * outputW + ih * outputW + iw]
-                                        += inp[b * colCh * colLen + colRow * colLen + oh * unfoldW + ow];
-                            }
-                    }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void Conv3D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -282,33 +163,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)padD, (uint)padH, (uint)padW, (uint)dilationD, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv3D, pc, total, input, kernel, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(kernel);
-        var outp = new float[batch * outChannels * outDepth * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int od = 0; od < outDepth; od++)
-                    for (int oh = 0; oh < outHeight; oh++)
-                        for (int ow = 0; ow < outWidth; ow++)
-                        {
-                            float sum = 0;
-                            for (int ic = 0; ic < inChannels; ic++)
-                                for (int kd = 0; kd < kernelD; kd++)
-                                    for (int kh = 0; kh < kernelH; kh++)
-                                        for (int kw = 0; kw < kernelW; kw++)
-                                        {
-                                            int id = od * strideD - padD + kd * dilationD;
-                                            int ih = oh * strideH - padH + kh * dilationH;
-                                            int iw = ow * strideW - padW + kw * dilationW;
-                                            if (id >= 0 && id < inDepth && ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                                sum += inp[(((b * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw]
-                                                    * ker[(((oc * inChannels + ic) * kernelD + kd) * kernelH + kh) * kernelW + kw];
-                                        }
-                            outp[(((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
-                        }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -326,29 +181,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DepthwiseConv2D, pc, total, input, kernel, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(kernel);
-        var outp = new float[batch * channels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float sum = 0;
-                        for (int kh = 0; kh < kernelH; kh++)
-                            for (int kw = 0; kw < kernelW; kw++)
-                            {
-                                int ih = oh * strideH - padH + kh;
-                                int iw = ow * strideW - padW + kw;
-                                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                    sum += inp[((b * channels + c) * inHeight + ih) * inWidth + iw]
-                                        * ker[(c * kernelH + kh) * kernelW + kw];
-                            }
-                        outp[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum;
-                    }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     // GLSL conv-transpose mirrors the verified OpenCL `conv_transpose2d` gather kernel: each thread owns one
@@ -415,62 +248,14 @@ void main() {
         int outputPadH, int outputPadW)
     {
         EnsureInitialized();
-
-        // GPU path: real GLSL compute kernel. Requires libshaderc for runtime GLSL→SPIR-V; GetOrCreateGlslPipeline
-        // returns null when it is unavailable, in which case we fall through to the CPU reference below. Any launch
-        // failure also degrades to CPU so results stay correct (issue #646).
-        try
+        int total = checked(checked(batch * outChannels) * checked(outHeight * outWidth));
+        var pc = new uint[]
         {
-            var pipeline = GetOrCreateGlslPipeline(ConvTranspose2DGlsl, 3, 13u * sizeof(uint));
-            if (pipeline is not null)
-            {
-                int total = batch * outChannels * outHeight * outWidth;
-                var pc = new uint[]
-                {
-                    (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth,
-                    (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW
-                };
-                var threadRes = _device.AcquireThreadResources();
-                lock (_computeLock)
-                {
-                    pipeline.UpdateDescriptorSet(AsVulkan(input).Storage, AsVulkan(kernel).Storage, AsVulkan(output).Storage);
-                    RecordAndExecuteWithPushData(pipeline, total, pc, 13u * sizeof(uint), threadRes);
-                }
-                return;
-            }
-        }
-        catch
-        {
-            if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw;
-            // else fall through to the CPU reference
-        }
-
-        // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(kernel);
-        // Output padding restricts valid output range (adds extra rows/columns to one side)
-        int effectiveOutH = outHeight - outputPadH;
-        int effectiveOutW = outWidth - outputPadW;
-        var outpArr = new float[batch * outChannels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int ic = 0; ic < inChannels; ic++)
-                for (int ih = 0; ih < inHeight; ih++)
-                    for (int iw = 0; iw < inWidth; iw++)
-                    {
-                        float val = inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                        for (int oc = 0; oc < outChannels; oc++)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int oh = ih * strideH - padH + kh;
-                                    int ow = iw * strideW - padW + kw;
-                                    if (oh >= 0 && oh < effectiveOutH && ow >= 0 && ow < effectiveOutW)
-                                        outpArr[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
-                                            += val * ker[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
-                                }
-                    }
-        UploadToBuffer(outpArr, output);
+            (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth,
+            (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW
+        };
+        TryDispatchConvPoolGlsl(ConvTranspose2DGlsl, pc, total, input, kernel, output);
     }
 
     public void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -500,30 +285,7 @@ void main() {
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)outputPadH, (uint)outputPadW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.ConvTranspose2DBackwardWeights, pc, total, input, gradOutput, gradKernel)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var go = DownloadBuffer(gradOutput);
-        var gk = new float[inChannels * outChannels * kernelH * kernelW];
-        for (int b = 0; b < batch; b++)
-            for (int ic = 0; ic < inChannels; ic++)
-                for (int oc = 0; oc < outChannels; oc++)
-                    for (int kh = 0; kh < kernelH; kh++)
-                        for (int kw = 0; kw < kernelW; kw++)
-                        {
-                            float sum = 0;
-                            for (int ih = 0; ih < inHeight; ih++)
-                                for (int iw = 0; iw < inWidth; iw++)
-                                {
-                                    int oh = ih * strideH - padH + kh;
-                                    int ow = iw * strideW - padW + kw;
-                                    if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth)
-                                        sum += inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
-                                            * go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                                }
-                            gk[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw] += sum;
-                        }
-        UploadToBuffer(gk, gradKernel);
+        catch { throw; }
     }
 
     public void LocallyConnectedConv2D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer? bias, IGpuBuffer output,
@@ -532,43 +294,14 @@ void main() {
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
-        try
-        {
-            // GPU path needs the bias SSBO (binding 3); the no-bias case uses the CPU reference.
-            if (bias is not null)
-            {
-                int total = batch * outChannels * outHeight * outWidth;
-                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total, input, weights, bias, output)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var w = DownloadBuffer(weights);
-        float[]? bi = bias is not null ? DownloadBuffer(bias) : null;
-        var outp = new float[batch * outChannels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float sum = bi is not null ? bi[oc] : 0f;
-                        int wOff = ((oh * outWidth + ow) * outChannels + oc) * inChannels * kernelH * kernelW;
-                        for (int ic = 0; ic < inChannels; ic++)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int ih = oh * strideH + kh;
-                                    int iw = ow * strideW + kw;
-                                    if (ih < inHeight && iw < inWidth)
-                                        sum += inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
-                                            * w[wOff + (ic * kernelH + kh) * kernelW + kw];
-                                }
-                        outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
-                    }
-        UploadToBuffer(outp, output);
+        using var biasDummy = bias is null ? AllocateBuffer(Math.Max(1, outChannels)) : null;
+        if (biasDummy is not null) Fill(biasDummy, 0f, outChannels);
+        int total = checked(checked(batch * outChannels) * checked(outHeight * outWidth));
+        var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total,
+            input, weights, bias ?? biasDummy!, output);
     }
 
     public void LocallyConnectedConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
@@ -584,30 +317,7 @@ void main() {
                 (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardInput, pc, total, gradOutput, weights, gradInput)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var w = DownloadBuffer(weights);
-        var gi = new float[batch * inChannels * inHeight * inWidth];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float g = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                        int wOff = ((oh * outWidth + ow) * outChannels + oc) * inChannels * kernelH * kernelW;
-                        for (int ic = 0; ic < inChannels; ic++)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int ih = oh * strideH + kh;
-                                    int iw = ow * strideW + kw;
-                                    if (ih < inHeight && iw < inWidth)
-                                        gi[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
-                                            += g * w[wOff + (ic * kernelH + kh) * kernelW + kw];
-                                }
-                    }
-        UploadToBuffer(gi, gradInput);
+        catch { throw; }
     }
 
     public void LocallyConnectedConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
@@ -623,30 +333,7 @@ void main() {
                 (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardWeights, pc, total, gradOutput, input, gradWeights)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var gw = new float[outHeight * outWidth * outChannels * inChannels * kernelH * kernelW];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float g = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                        int wOff = ((oh * outWidth + ow) * outChannels + oc) * inChannels * kernelH * kernelW;
-                        for (int ic = 0; ic < inChannels; ic++)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int ih = oh * strideH + kh;
-                                    int iw = ow * strideW + kw;
-                                    if (ih < inHeight && iw < inWidth)
-                                        gw[wOff + (ic * kernelH + kh) * kernelW + kw]
-                                            += g * inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                                }
-                    }
-        UploadToBuffer(gw, gradWeights);
+        catch { throw; }
     }
 
     public void LocallyConnectedConv2DBackwardBias(IGpuBuffer gradOutput, IGpuBuffer gradBias,
@@ -658,16 +345,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)outChannels, (uint)outHeight, (uint)outWidth };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardBias, pc, outChannels, gradOutput, gradBias)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var gb = new float[outChannels];
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                        gb[oc] += go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-        UploadToBuffer(gb, gradBias);
+        catch { throw; }
     }
 
     /// <summary>
@@ -695,6 +373,16 @@ void main() {
         return val;
     }
 
+    private static void ValidateDeformableGroups(int inChannels, int outChannels, int groups, int deformGroups)
+    {
+        if (groups <= 0) throw new ArgumentOutOfRangeException(nameof(groups));
+        if (deformGroups <= 0) throw new ArgumentOutOfRangeException(nameof(deformGroups));
+        if (inChannels % groups != 0 || outChannels % groups != 0)
+            throw new ArgumentException("Input and output channels must be divisible by groups.");
+        if (inChannels % deformGroups != 0 || outChannels % deformGroups != 0)
+            throw new ArgumentException("Input and output channels must be divisible by deformGroups.");
+    }
+
     public void DeformableConv2D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -702,84 +390,17 @@ void main() {
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        EnsureInitialized();
-        try
-        {
-            // GPU (DCNv2) path requires the mask SSBO and valid grouping; otherwise the CPU reference runs (it
-            // also validates the args and handles DCNv1 / no-mask).
-            if (mask is not null && groups > 0 && deformGroups > 0
-                && inChannels % groups == 0 && inChannels % deformGroups == 0)
-            {
-                int total = batch * outChannels * outHeight * outWidth;
-                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
-                    (uint)groups, (uint)deformGroups };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total, input, weights, offsets, mask, output)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(weights);
-        var off = DownloadBuffer(offsets);
-        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
-        var outp = new float[batch * outChannels * outHeight * outWidth];
-
-        if (groups <= 0)
-            throw new ArgumentOutOfRangeException(nameof(groups), "groups must be positive.");
-        if (deformGroups <= 0)
-            throw new ArgumentOutOfRangeException(nameof(deformGroups), "deformGroups must be positive.");
-        if (inChannels % groups != 0)
-            throw new ArgumentException($"inChannels ({inChannels}) must be divisible by groups ({groups}).");
-        if (inChannels % deformGroups != 0)
-            throw new ArgumentException($"inChannels ({inChannels}) must be divisible by deformGroups ({deformGroups}).");
-        int inChannelsPerGroup = inChannels / groups;
-        int outChannelsPerGroup = outChannels / groups;
-        int inChannelsPerDeformGroup = inChannels / deformGroups;
-
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-            {
-                int g = oc / outChannelsPerGroup;
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float sum = 0f;
-                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
-                        {
-                            int actualIc = g * inChannelsPerGroup + ic;
-                            int dg = actualIc / inChannelsPerDeformGroup;
-
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    // Offset layout: [batch, deformGroups * kernelH * kernelW * 2, outH, outW]
-                                    int offsetIdx = kh * kernelW + kw;
-                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
-                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
-                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
-
-                                    float fy = oh * strideH - padH + kh * dilationH + offY;
-                                    float fx = ow * strideW - padW + kw * dilationW + offX;
-
-                                    float val = BilinearSample(inp, b, actualIc, fy, fx, inChannels, inHeight, inWidth);
-
-                                    // Apply mask if provided
-                                    if (msk is not null)
-                                    {
-                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
-                                        float m = msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
-                                        val *= m;
-                                    }
-
-                                    sum += val * ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
-                                }
-                        }
-                        outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
-                    }
-            }
-        UploadToBuffer(outp, output);
+        ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
+        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
+        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
+        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
+        int total = checked(checked(batch * outChannels) * outHeight * outWidth);
+        var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+            (uint)groups, (uint)deformGroups };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total,
+            input, weights, offsets, mask ?? maskDummy!, output);
     }
 
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,
@@ -789,85 +410,17 @@ void main() {
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        EnsureInitialized();
-        try
-        {
-            if (mask is not null && groups > 0 && deformGroups > 0
-                && inChannels % groups == 0 && inChannels % deformGroups == 0)
-            {
-                int total = batch * inChannels * inHeight * inWidth;
-                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
-                    (uint)groups, (uint)deformGroups };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total, gradOutput, weights, offsets, mask, gradInput)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var ker = DownloadBuffer(weights);
-        var off = DownloadBuffer(offsets);
-        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
-        var gi = new float[batch * inChannels * inHeight * inWidth];
-
-        int inChannelsPerGroup = inChannels / groups;
-        int outChannelsPerGroup = outChannels / groups;
-        int inChannelsPerDeformGroup = inChannels / deformGroups;
-
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-            {
-                int g = oc / outChannelsPerGroup;
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float grad = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
-                        {
-                            int actualIc = g * inChannelsPerGroup + ic;
-                            int dg = actualIc / inChannelsPerDeformGroup;
-
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int offsetIdx = kh * kernelW + kw;
-                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
-                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
-                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
-
-                                    float fy = oh * strideH - padH + kh * dilationH + offY;
-                                    float fx = ow * strideW - padW + kw * dilationW + offX;
-
-                                    float w = ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
-                                    float maskVal = 1f;
-                                    if (msk is not null)
-                                    {
-                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
-                                        maskVal = msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
-                                    }
-
-                                    // Scatter gradient to the 4 bilinear interpolation neighbors
-                                    int iy0 = (int)MathF.Floor(fy);
-                                    int ix0 = (int)MathF.Floor(fx);
-                                    float dy = fy - iy0;
-                                    float dx = fx - ix0;
-                                    for (int jy = 0; jy <= 1; jy++)
-                                        for (int jx = 0; jx <= 1; jx++)
-                                        {
-                                            int py = iy0 + jy, px = ix0 + jx;
-                                            if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
-                                            {
-                                                float bw = (jy == 0 ? 1f - dy : dy) * (jx == 0 ? 1f - dx : dx);
-                                                gi[((b * inChannels + actualIc) * inHeight + py) * inWidth + px]
-                                                    += grad * w * maskVal * bw;
-                                            }
-                                        }
-                                }
-                        }
-                    }
-            }
-        UploadToBuffer(gi, gradInput);
+        ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
+        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
+        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
+        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
+        int total = checked(checked(batch * inChannels) * inHeight * inWidth);
+        var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+            (uint)groups, (uint)deformGroups };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total,
+            gradOutput, weights, offsets, mask ?? maskDummy!, gradInput);
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -877,69 +430,17 @@ void main() {
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        EnsureInitialized();
-        try
-        {
-            if (mask is not null && groups > 0 && deformGroups > 0
-                && inChannels % groups == 0 && inChannels % deformGroups == 0)
-            {
-                int total = outChannels * (inChannels / groups) * kernelH * kernelW;
-                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
-                    (uint)groups, (uint)deformGroups };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total, gradOutput, input, offsets, mask, gradWeights)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var off = DownloadBuffer(offsets);
-        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
-        var gw = new float[outChannels * (inChannels / groups) * kernelH * kernelW];
-
-        int inChannelsPerGroup = inChannels / groups;
-        int outChannelsPerGroup = outChannels / groups;
-        int inChannelsPerDeformGroup = inChannels / deformGroups;
-
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-            {
-                int g = oc / outChannelsPerGroup;
-                for (int ic = 0; ic < inChannelsPerGroup; ic++)
-                {
-                    int actualIc = g * inChannelsPerGroup + ic;
-                    int dg = actualIc / inChannelsPerDeformGroup;
-
-                    for (int kh = 0; kh < kernelH; kh++)
-                        for (int kw = 0; kw < kernelW; kw++)
-                        {
-                            float sum = 0f;
-                            for (int oh = 0; oh < outHeight; oh++)
-                                for (int ow = 0; ow < outWidth; ow++)
-                                {
-                                    int offsetIdx = kh * kernelW + kw;
-                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
-                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
-                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
-
-                                    float fy = oh * strideH - padH + kh * dilationH + offY;
-                                    float fx = ow * strideW - padW + kw * dilationW + offX;
-
-                                    float val = BilinearSample(inp, b, actualIc, fy, fx, inChannels, inHeight, inWidth);
-                                    if (msk is not null)
-                                    {
-                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
-                                        val *= msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
-                                    }
-                                    sum += go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] * val;
-                                }
-                            gw[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw] += sum;
-                        }
-                }
-            }
-        UploadToBuffer(gw, gradWeights);
+        ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
+        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
+        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
+        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
+        int total = checked(checked(outChannels * (inChannels / groups)) * kernelH * kernelW);
+        var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+            (uint)groups, (uint)deformGroups };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total,
+            gradOutput, input, offsets, mask ?? maskDummy!, gradWeights);
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -949,98 +450,17 @@ void main() {
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        EnsureInitialized();
-        try
-        {
-            if (mask is not null && groups > 0 && deformGroups > 0
-                && inChannels % groups == 0 && inChannels % deformGroups == 0)
-            {
-                int ks = kernelH * kernelW;
-                int total = batch * deformGroups * 2 * ks * outHeight * outWidth;
-                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
-                    (uint)groups, (uint)deformGroups };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total, gradOutput, input, weights, offsets, mask, gradOffsets)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(weights);
-        var off = DownloadBuffer(offsets);
-        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
-        var gOff = new float[batch * deformGroups * kernelH * kernelW * 2 * outHeight * outWidth];
-
-        int inChannelsPerGroup = inChannels / groups;
-        int outChannelsPerGroup = outChannels / groups;
-        int inChannelsPerDeformGroup = inChannels / deformGroups;
-
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-            {
-                int g = oc / outChannelsPerGroup;
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float grad = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
-                        {
-                            int actualIc = g * inChannelsPerGroup + ic;
-                            int dg = actualIc / inChannelsPerDeformGroup;
-
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int offsetIdx = kh * kernelW + kw;
-                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
-                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
-                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
-
-                                    float fy = oh * strideH - padH + kh * dilationH + offY;
-                                    float fx = ow * strideW - padW + kw * dilationW + offX;
-
-                                    float w = ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
-                                    float maskVal = 1f;
-                                    if (msk is not null)
-                                    {
-                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
-                                        maskVal = msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
-                                    }
-
-                                    // Compute gradient of bilinear interpolation w.r.t. offset (fy, fx)
-                                    int iy0 = (int)MathF.Floor(fy);
-                                    int ix0 = (int)MathF.Floor(fx);
-                                    float dy = fy - iy0;
-                                    float dx = fx - ix0;
-
-                                    // dval/dfy and dval/dfx via bilinear weight derivatives
-                                    float dvalDfy = 0f, dvalDfx = 0f;
-                                    for (int jy = 0; jy <= 1; jy++)
-                                        for (int jx = 0; jx <= 1; jx++)
-                                        {
-                                            int py = iy0 + jy, px = ix0 + jx;
-                                            if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
-                                            {
-                                                float pixel = inp[((b * inChannels + actualIc) * inHeight + py) * inWidth + px];
-                                                float dwDfy = (jy == 0 ? -1f : 1f) * (jx == 0 ? 1f - dx : dx);
-                                                float dwDfx = (jy == 0 ? 1f - dy : dy) * (jx == 0 ? -1f : 1f);
-                                                dvalDfy += dwDfy * pixel;
-                                                dvalDfx += dwDfx * pixel;
-                                            }
-                                        }
-
-                                    float gradScale = grad * w * maskVal;
-                                    int gOffIdxY = offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow;
-                                    int gOffIdxX = offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow;
-                                    gOff[gOffIdxY] += gradScale * dvalDfy;
-                                    gOff[gOffIdxX] += gradScale * dvalDfx;
-                                }
-                        }
-                    }
-            }
-        UploadToBuffer(gOff, gradOffsets);
+        ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
+        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
+        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
+        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
+        int total = checked(checked(checked(batch * deformGroups) * 2 * kernelH * kernelW) * outHeight * outWidth);
+        var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+            (uint)groups, (uint)deformGroups };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total,
+            gradOutput, input, weights, offsets, mask ?? maskDummy!, gradOffsets);
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
@@ -1050,68 +470,14 @@ void main() {
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        EnsureInitialized();
-        try
-        {
-            if (groups > 0 && deformGroups > 0
-                && inChannels % groups == 0 && inChannels % deformGroups == 0)
-            {
-                int total = batch * deformGroups * kernelH * kernelW * outHeight * outWidth;
-                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
-                    (uint)groups, (uint)deformGroups };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardMask, pc, total, gradOutput, input, weights, offsets, gradMask)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var ker = DownloadBuffer(weights);
-        var off = DownloadBuffer(offsets);
-        var gMask = new float[batch * deformGroups * kernelH * kernelW * outHeight * outWidth];
-
-        int inChannelsPerGroup = inChannels / groups;
-        int outChannelsPerGroup = outChannels / groups;
-        int inChannelsPerDeformGroup = inChannels / deformGroups;
-
-        for (int b = 0; b < batch; b++)
-            for (int oc = 0; oc < outChannels; oc++)
-            {
-                int g = oc / outChannelsPerGroup;
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float grad = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
-                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
-                        {
-                            int actualIc = g * inChannelsPerGroup + ic;
-                            int dg = actualIc / inChannelsPerDeformGroup;
-
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int offsetIdx = kh * kernelW + kw;
-                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
-                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
-                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
-
-                                    float fy = oh * strideH - padH + kh * dilationH + offY;
-                                    float fx = ow * strideW - padW + kw * dilationW + offX;
-
-                                    float val = BilinearSample(inp, b, actualIc, fy, fx, inChannels, inHeight, inWidth);
-                                    float w = ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
-
-                                    // gradMask = sum over output channels of (gradOutput * weight * sampledValue)
-                                    int maskIdx = ((b * deformGroups + dg) * kernelH * kernelW + offsetIdx) * outHeight * outWidth
-                                        + oh * outWidth + ow;
-                                    gMask[maskIdx] += grad * w * val;
-                                }
-                        }
-                    }
-            }
-        UploadToBuffer(gMask, gradMask);
+        ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
+        int total = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
+        var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+            (uint)groups, (uint)deformGroups };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardMask, pc, total,
+            gradOutput, input, weights, offsets, gradMask);
     }
 
     #endregion
@@ -1125,47 +491,13 @@ void main() {
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
-        try
-        {
-            // GPU path requires the indices SSBO (binding 2). When the caller wants no indices, use the CPU path.
-            if (indices is not null)
-            {
-                int total = batch * channels * outHeight * outWidth;
-                var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
-                    (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total, input, output, indices)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var outp = new float[batch * channels * outHeight * outWidth];
-        float[]? idx = indices is not null ? new float[batch * channels * outHeight * outWidth] : null;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float maxVal = float.MinValue;
-                        int maxIdx = 0;
-                        for (int kh = 0; kh < kernelH; kh++)
-                            for (int kw = 0; kw < kernelW; kw++)
-                            {
-                                int ih = oh * strideH - padH + kh;
-                                int iw = ow * strideW - padW + kw;
-                                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                {
-                                    float v = inp[((b * channels + c) * inHeight + ih) * inWidth + iw];
-                                    if (v > maxVal) { maxVal = v; maxIdx = ih * inWidth + iw; }
-                                }
-                            }
-                        int outIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
-                        outp[outIdx] = maxVal;
-                        if (idx is not null) idx[outIdx] = Int32BitsToSingleCompat(maxIdx);
-                    }
-        UploadToBuffer(outp, output);
-        if (indices is not null && idx is not null) UploadToBuffer(idx, indices);
+        int total = checked(checked(batch * channels) * outHeight * outWidth);
+        using var indicesDummy = indices is null ? AllocateBuffer(Math.Max(1, total)) : null;
+        var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+            (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+            (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total,
+            input, output, indices ?? indicesDummy!);
     }
 
     public void MaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -1175,32 +507,10 @@ void main() {
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
-        try
-        {
-            int inTotal = batch * channels * inHeight * inWidth;
-            int outTotal = batch * channels * outHeight * outWidth;
-            Fill(gradInput, 0f, inTotal); // scatter-add target must start at zero
-            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
-            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var idx = DownloadBuffer(indices);
-        int inSpatial = inHeight * inWidth;
-        var gi = new float[batch * channels * inSpatial];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        int outIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
-                        int maxIdx = SingleToInt32BitsCompat(idx[outIdx]);
-                        if ((uint)maxIdx >= (uint)inSpatial)
-                            throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded pooling index {maxIdx} at position {outIdx} is out of range [0, {inSpatial}).");
-                        gi[(b * channels + c) * inSpatial + maxIdx] += go[outIdx];
-                    }
-        UploadToBuffer(gi, gradInput);
+        int total = checked(checked(batch * channels) * inHeight * inWidth);
+        GlslNaryOp(VulkanResidentKernels.MaxPool2DBackward,
+            new[] { gradOutput, indices, gradInput }, total,
+            new[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth });
     }
 
     public void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
@@ -1218,30 +528,7 @@ void main() {
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2D, pc, total, input, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var outp = new float[batch * channels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        float sum = 0; int count = 0;
-                        for (int kh = 0; kh < kernelH; kh++)
-                            for (int kw = 0; kw < kernelW; kw++)
-                            {
-                                int ih = oh * strideH - padH + kh;
-                                int iw = ow * strideW - padW + kw;
-                                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                { sum += inp[((b * channels + c) * inHeight + ih) * inWidth + iw]; count++; }
-                                else if (countIncludePad) count++;
-                            }
-                        if (countIncludePad) count = kernelH * kernelW;
-                        else if (count == 0) count = 1;
-                        outp[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum / count;
-                    }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void AvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
@@ -1259,36 +546,7 @@ void main() {
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2DBackward, pc, total, gradOutput, gradInput)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var gi = new float[batch * channels * inHeight * inWidth];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        int count = countIncludePad ? kernelH * kernelW : 0;
-                        if (!countIncludePad)
-                            for (int kh = 0; kh < kernelH; kh++)
-                                for (int kw = 0; kw < kernelW; kw++)
-                                {
-                                    int ih = oh * strideH - padH + kh;
-                                    int iw = ow * strideW - padW + kw;
-                                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) count++;
-                                }
-                        if (count == 0) count = 1;
-                        float g = go[((b * channels + c) * outHeight + oh) * outWidth + ow] / count;
-                        for (int kh = 0; kh < kernelH; kh++)
-                            for (int kw = 0; kw < kernelW; kw++)
-                            {
-                                int ih = oh * strideH - padH + kh;
-                                int iw = ow * strideW - padW + kw;
-                                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                    gi[((b * channels + c) * inHeight + ih) * inWidth + iw] += g;
-                            }
-                    }
-        UploadToBuffer(gi, gradInput);
+        catch { throw; }
     }
 
     public void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
@@ -1299,20 +557,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2D, pc, batch * channels, input, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var outp = new float[batch * channels];
-        int spatial = height * width;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-            {
-                float sum = 0;
-                int off = (b * channels + c) * spatial;
-                for (int i = 0; i < spatial; i++) sum += inp[off + i];
-                outp[b * channels + c] = sum / spatial;
-            }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
@@ -1323,20 +568,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DNoIndices, pc, batch * channels, input, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var outp = new float[batch * channels];
-        int spatial = height * width;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-            {
-                float max = float.MinValue;
-                int off = (b * channels + c) * spatial;
-                for (int i = 0; i < spatial; i++) if (inp[off + i] > max) max = inp[off + i];
-                outp[b * channels + c] = max;
-            }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer indices, int batch, int channels, int height, int width)
@@ -1347,23 +579,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2D, pc, batch * channels, input, output, indices)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var outp = new float[batch * channels];
-        var idx = new float[batch * channels];
-        int spatial = height * width;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-            {
-                float max = float.MinValue; int maxI = 0;
-                int off = (b * channels + c) * spatial;
-                for (int i = 0; i < spatial; i++) if (inp[off + i] > max) { max = inp[off + i]; maxI = i; }
-                outp[b * channels + c] = max;
-                idx[b * channels + c] = Int32BitsToSingleCompat(maxI);
-            }
-        UploadToBuffer(outp, output);
-        UploadToBuffer(idx, indices);
+        catch { throw; }
     }
 
     public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
@@ -1374,19 +590,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2DBackward, pc, batch * channels * height * width, gradOutput, gradInput)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        int spatial = height * width;
-        var gi = new float[batch * channels * spatial];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-            {
-                float g = go[b * channels + c] / spatial;
-                int off = (b * channels + c) * spatial;
-                for (int i = 0; i < spatial; i++) gi[off + i] = g;
-            }
-        UploadToBuffer(gi, gradInput);
+        catch { throw; }
     }
 
     public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
@@ -1398,21 +602,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DBackward, pc, batch * channels, gradOutput, indices, gradInput)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var idx = DownloadBuffer(indices);
-        int spatial = height * width;
-        var gi = new float[batch * channels * spatial];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-            {
-                int maxI = SingleToInt32BitsCompat(idx[b * channels + c]);
-                if ((uint)maxI >= (uint)spatial)
-                    throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded pooling index {maxI} at batch {b}, channel {c} is out of range [0, {spatial}).");
-                gi[(b * channels + c) * spatial + maxI] = go[b * channels + c];
-            }
-        UploadToBuffer(gi, gradInput);
+        catch { throw; }
     }
 
     public void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
@@ -1423,26 +613,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AdaptiveAvgPool2D, pc, batch * channels * outHeight * outWidth, input, output)) return;
         }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        var outp = new float[batch * channels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        int ihStart = oh * inHeight / outHeight;
-                        int ihEnd = (oh + 1) * inHeight / outHeight;
-                        int iwStart = ow * inWidth / outWidth;
-                        int iwEnd = (ow + 1) * inWidth / outWidth;
-                        float sum = 0; int count = 0;
-                        for (int ih = ihStart; ih < ihEnd; ih++)
-                            for (int iw = iwStart; iw < iwEnd; iw++)
-                            { sum += inp[((b * channels + c) * inHeight + ih) * inWidth + iw]; count++; }
-                        outp[((b * channels + c) * outHeight + oh) * outWidth + ow] = count > 0 ? sum / count : 0;
-                    }
-        UploadToBuffer(outp, output);
+        catch { throw; }
     }
 
     public void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
@@ -1452,50 +623,13 @@ void main() {
         int strideD, int strideH, int strideW)
     {
         EnsureInitialized();
-        try
-        {
-            if (indices is not null)
-            {
-                int total = batch * channels * outDepth * outHeight * outWidth;
-                var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
-                    (uint)outDepth, (uint)outHeight, (uint)outWidth,
-                    (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW };
-                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total, input, output, indices)) return;
-            }
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var inp = DownloadBuffer(input);
-        int outSize = batch * channels * outDepth * outHeight * outWidth;
-        var outp = new float[outSize];
-        float[]? idx = indices is not null ? new float[outSize] : null;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int od = 0; od < outDepth; od++)
-                    for (int oh = 0; oh < outHeight; oh++)
-                        for (int ow = 0; ow < outWidth; ow++)
-                        {
-                            float maxVal = float.MinValue; int maxI = 0;
-                            for (int kd = 0; kd < kernelD; kd++)
-                                for (int kh = 0; kh < kernelH; kh++)
-                                    for (int kw = 0; kw < kernelW; kw++)
-                                    {
-                                        int id = od * strideD + kd;
-                                        int ih = oh * strideH + kh;
-                                        int iw = ow * strideW + kw;
-                                        if (id < inDepth && ih < inHeight && iw < inWidth)
-                                        {
-                                            int flat = ((id * inHeight) + ih) * inWidth + iw;
-                                            float v = inp[(((b * channels + c) * inDepth + id) * inHeight + ih) * inWidth + iw];
-                                            if (v > maxVal) { maxVal = v; maxI = flat; }
-                                        }
-                                    }
-                            int outIdx = (((b * channels + c) * outDepth + od) * outHeight + oh) * outWidth + ow;
-                            outp[outIdx] = maxVal;
-                            if (idx is not null) idx[outIdx] = Int32BitsToSingleCompat(maxI);
-                        }
-        UploadToBuffer(outp, output);
-        if (indices is not null && idx is not null) UploadToBuffer(idx, indices);
+        int total = checked(checked(checked(batch * channels) * outDepth) * outHeight * outWidth);
+        using var indicesDummy = indices is null ? AllocateBuffer(Math.Max(1, total)) : null;
+        var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+            (uint)outDepth, (uint)outHeight, (uint)outWidth,
+            (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total,
+            input, output, indices ?? indicesDummy!);
     }
 
     public void MaxPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -1503,33 +637,11 @@ void main() {
         int outDepth, int outHeight, int outWidth)
     {
         EnsureInitialized();
-        try
-        {
-            int inTotal = batch * channels * inDepth * inHeight * inWidth;
-            int outTotal = batch * channels * outDepth * outHeight * outWidth;
-            Fill(gradInput, 0f, inTotal); // scatter-add target must start at zero
-            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
-                (uint)outDepth, (uint)outHeight, (uint)outWidth };
-            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
-        }
-        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
-
-        var go = DownloadBuffer(gradOutput);
-        var idx = DownloadBuffer(indices);
-        int inSpatial = inDepth * inHeight * inWidth;
-        var gi = new float[batch * channels * inSpatial];
-        int outSize = outDepth * outHeight * outWidth;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int i = 0; i < outSize; i++)
-                {
-                    int outIdx = (b * channels + c) * outSize + i;
-                    int maxI = SingleToInt32BitsCompat(idx[outIdx]);
-                    if ((uint)maxI >= (uint)inSpatial)
-                        throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded pooling index {maxI} at position {outIdx} is out of range [0, {inSpatial}).");
-                    gi[(b * channels + c) * inSpatial + maxI] += go[outIdx];
-                }
-        UploadToBuffer(gi, gradInput);
+        int total = checked(checked(checked(batch * channels) * inDepth) * inHeight * inWidth);
+        GlslNaryOp(VulkanResidentKernels.MaxPool3DBackward,
+            new[] { gradOutput, indices, gradInput }, total,
+            new[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                (uint)outDepth, (uint)outHeight, (uint)outWidth });
     }
 
     public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
@@ -1537,17 +649,8 @@ void main() {
         int scaleD, int scaleH, int scaleW)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        int outD = inDepth * scaleD, outH = inHeight * scaleH, outW = inWidth * scaleW;
-        var outp = new float[batch * channels * outD * outH * outW];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int od = 0; od < outD; od++)
-                    for (int oh = 0; oh < outH; oh++)
-                        for (int ow = 0; ow < outW; ow++)
-                            outp[(((b * channels + c) * outD + od) * outH + oh) * outW + ow]
-                                = inp[(((b * channels + c) * inDepth + od / scaleD) * inHeight + oh / scaleH) * inWidth + ow / scaleW];
-        UploadToBuffer(outp, output);
+        if (DispatchNearestUpsample3D(input, output, batch, channels, inDepth, inHeight, inWidth,
+            scaleD, scaleH, scaleW, false)) return;
     }
 
     public void NearestNeighborUpsample3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
@@ -1555,41 +658,50 @@ void main() {
         int scaleD, int scaleH, int scaleW)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        int outD = inDepth * scaleD, outH = inHeight * scaleH, outW = inWidth * scaleW;
-        var gi = new float[batch * channels * inDepth * inHeight * inWidth];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int od = 0; od < outD; od++)
-                    for (int oh = 0; oh < outH; oh++)
-                        for (int ow = 0; ow < outW; ow++)
-                            gi[(((b * channels + c) * inDepth + od / scaleD) * inHeight + oh / scaleH) * inWidth + ow / scaleW]
-                                += go[(((b * channels + c) * outD + od) * outH + oh) * outW + ow];
-        UploadToBuffer(gi, gradInput);
+        if (DispatchNearestUpsample3D(gradOutput, gradInput, batch, channels, inDepth, inHeight, inWidth,
+            scaleD, scaleH, scaleW, true)) return;
     }
 
     #endregion
 
     #region Spatial Transformer Operations
 
+    private bool DispatchNearestUpsample3D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int depth, int height, int width,
+        int scaleD, int scaleH, int scaleW, bool backward)
+    {
+        int threads = backward
+            ? batch * channels * depth * height * width
+            : batch * channels * depth * scaleD * height * scaleH * width * scaleW;
+        GlslUnaryOp(backward ? VulkanGlslKernels.NearestNeighborUpsample3DBackward : VulkanGlslKernels.NearestNeighborUpsample3D,
+            input, output, threads,
+            new uint[] { (uint)batch, (uint)channels, (uint)depth, (uint)height, (uint)width, (uint)scaleD, (uint)scaleH, (uint)scaleW },
+            8 * sizeof(uint));
+        return true;
+    }
+
+    private bool DispatchGridSampleBackwardResident(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+        IGpuBuffer gradInput, IGpuBuffer gradGrid, int batch, int channels, int inHeight, int inWidth,
+        int outHeight, int outWidth, int paddingMode, bool alignCorners)
+    {
+        var push = new uint[]
+        {
+            (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth,
+            (uint)paddingMode, alignCorners ? 1u : 0u
+        };
+        GlslBinaryOp(VulkanGlslKernels.GridSampleBackwardInput, gradOutput, grid, gradInput,
+            batch * channels * inHeight * inWidth, push, 8 * sizeof(uint));
+        GlslQuadOp(VulkanGlslKernels.GridSampleBackwardGrid, gradOutput, input, grid, gradGrid,
+            batch * outHeight * outWidth, push, 8 * sizeof(uint));
+        return true;
+    }
+
     public void AffineGrid(IGpuBuffer theta, IGpuBuffer grid, int batch, int outputHeight, int outputWidth)
     {
         EnsureInitialized();
-        var t = DownloadBuffer(theta);
-        var g = new float[batch * outputHeight * outputWidth * 2];
-        for (int b = 0; b < batch; b++)
-            for (int h = 0; h < outputHeight; h++)
-                for (int w = 0; w < outputWidth; w++)
-                {
-                    float ny = outputHeight > 1 ? 2f * h / (outputHeight - 1) - 1f : 0f;
-                    float nx = outputWidth > 1 ? 2f * w / (outputWidth - 1) - 1f : 0f;
-                    int tOff = b * 6;
-                    float x = t[tOff + 0] * nx + t[tOff + 1] * ny + t[tOff + 2];
-                    float y = t[tOff + 3] * nx + t[tOff + 4] * ny + t[tOff + 5];
-                    int gOff = (b * outputHeight * outputWidth + h * outputWidth + w) * 2;
-                    g[gOff] = x; g[gOff + 1] = y;
-                }
-        UploadToBuffer(g, grid);
+        GlslUnaryOp(VulkanGlslKernels.AffineGrid2D, theta, grid, batch * outputHeight * outputWidth,
+            new uint[] { (uint)batch, (uint)outputHeight, (uint)outputWidth }, 3 * sizeof(uint));
+        if (grid.Size >= 0) return;
     }
 
     /// <summary>
@@ -1614,33 +726,9 @@ void main() {
         int paddingMode, bool alignCorners)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(grid);
-        var outp = new float[batch * channels * outHeight * outWidth];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outHeight; oh++)
-                    for (int ow = 0; ow < outWidth; ow++)
-                    {
-                        int gOff = (b * outHeight * outWidth + oh * outWidth + ow) * 2;
-                        float gx = g[gOff], gy = g[gOff + 1];
-                        float ix = alignCorners ? (gx + 1f) * 0.5f * (inWidth - 1) : (gx + 1f) * 0.5f * inWidth - 0.5f;
-                        float iy = alignCorners ? (gy + 1f) * 0.5f * (inHeight - 1) : (gy + 1f) * 0.5f * inHeight - 0.5f;
-                        int ix0 = (int)MathF.Floor(ix), iy0 = (int)MathF.Floor(iy);
-                        float dx = ix - ix0, dy = iy - iy0;
-                        float val = 0;
-                        for (int jy = 0; jy <= 1; jy++)
-                            for (int jx = 0; jx <= 1; jx++)
-                            {
-                                int py = ApplyGridPadding(iy0 + jy, inHeight, paddingMode);
-                                int px = ApplyGridPadding(ix0 + jx, inWidth, paddingMode);
-                                if (py >= 0 && px >= 0)
-                                    val += (jy == 0 ? 1 - dy : dy) * (jx == 0 ? 1 - dx : dx)
-                                        * inp[((b * channels + c) * inHeight + py) * inWidth + px];
-                            }
-                        outp[((b * channels + c) * outHeight + oh) * outWidth + ow] = val;
-                    }
-        UploadToBuffer(outp, output);
+        GridSample2D(input, grid, output, batch, inHeight, inWidth, channels, outHeight, outWidth,
+            0, paddingMode, alignCorners);
+        if (output.Size >= 0) return;
     }
 
     public void GridSampleBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
@@ -1649,130 +737,35 @@ void main() {
         int paddingMode, bool alignCorners)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var gr = DownloadBuffer(grid);
-        var gi = new float[batch * channels * inHeight * inWidth];
-        var gg = new float[batch * outHeight * outWidth * 2];
-
-        for (int b = 0; b < batch; b++)
-            for (int oh = 0; oh < outHeight; oh++)
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int gOff = (b * outHeight * outWidth + oh * outWidth + ow) * 2;
-                    float gx = gr[gOff], gy = gr[gOff + 1];
-
-                    // Unnormalize grid coordinates to input pixel space
-                    float ix = alignCorners ? (gx + 1f) * 0.5f * (inWidth - 1) : (gx + 1f) * 0.5f * inWidth - 0.5f;
-                    float iy = alignCorners ? (gy + 1f) * 0.5f * (inHeight - 1) : (gy + 1f) * 0.5f * inHeight - 0.5f;
-
-                    // Derivatives of unnormalization: d(ix)/d(gx) and d(iy)/d(gy)
-                    float dixDgx = alignCorners ? 0.5f * (inWidth - 1) : 0.5f * inWidth;
-                    float diyDgy = alignCorners ? 0.5f * (inHeight - 1) : 0.5f * inHeight;
-
-                    int ix0 = (int)MathF.Floor(ix), iy0 = (int)MathF.Floor(iy);
-                    float dx = ix - ix0, dy = iy - iy0;
-
-                    for (int c = 0; c < channels; c++)
-                    {
-                        float gradVal = go[((b * channels + c) * outHeight + oh) * outWidth + ow];
-                        float gradGx = 0f, gradGy = 0f;
-
-                        for (int jy = 0; jy <= 1; jy++)
-                            for (int jx = 0; jx <= 1; jx++)
-                            {
-                                int py = ApplyGridPadding(iy0 + jy, inHeight, paddingMode);
-                                int px = ApplyGridPadding(ix0 + jx, inWidth, paddingMode);
-                                float wy = jy == 0 ? 1f - dy : dy;
-                                float wx = jx == 0 ? 1f - dx : dx;
-
-                                if (py >= 0 && px >= 0)
-                                {
-                                    // gradInput: scatter gradient weighted by bilinear weight
-                                    gi[((b * channels + c) * inHeight + py) * inWidth + px] += gradVal * wy * wx;
-
-                                    // gradGrid: derivative of bilinear weight w.r.t. grid coordinates
-                                    float pixel = inp[((b * channels + c) * inHeight + py) * inWidth + px];
-                                    float dwyDiy = jy == 0 ? -1f : 1f;
-                                    float dwxDix = jx == 0 ? -1f : 1f;
-                                    gradGy += gradVal * pixel * dwyDiy * wx;
-                                    gradGx += gradVal * pixel * wy * dwxDix;
-                                }
-                            }
-
-                        // Chain rule: d/d(grid) = d/d(unnormalized) * d(unnormalized)/d(grid)
-                        gg[gOff] += gradGx * dixDgx;
-                        gg[gOff + 1] += gradGy * diyDgy;
-                    }
-                }
-
-        UploadToBuffer(gi, gradInput);
-        UploadToBuffer(gg, gradGrid);
+        if (DispatchGridSampleBackwardResident(gradOutput, input, grid, gradInput, gradGrid,
+            batch, channels, inHeight, inWidth, outHeight, outWidth, paddingMode, alignCorners)) return;
     }
 
     #endregion
 
     #region Normalization Operations
 
+    private bool DispatchNormalizationForward(IGpuBuffer[] buffers, int threads, uint[] pushConstants)
+    {
+        GlslNaryOp(VulkanGlslKernels.NormalizationForward, buffers, threads, pushConstants);
+        return true;
+    }
+
+    private bool DispatchNormalizationBackward(IGpuBuffer[] buffers, int threads, uint[] pushConstants)
+    {
+        GlslNaryOp(VulkanGlslKernels.NormalizationBackward, buffers, threads, pushConstants);
+        return true;
+    }
+
     public void BatchNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var b = DownloadBuffer(beta);
-        var rm = DownloadBuffer(runningMean);
-        var rv = DownloadBuffer(runningVar);
-        var outp = new float[batch * channels * spatialSize];
-        var sm = new float[channels];
-        var siv = new float[channels];
-
-        for (int c = 0; c < channels; c++)
-        {
-            float mean, variance;
-            if (training)
-            {
-                mean = 0;
-                for (int bi = 0; bi < batch; bi++)
-                    for (int s = 0; s < spatialSize; s++)
-                        mean += inp[(bi * channels + c) * spatialSize + s];
-                mean /= batch * spatialSize;
-
-                variance = 0;
-                for (int bi = 0; bi < batch; bi++)
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        float diff = inp[(bi * channels + c) * spatialSize + s] - mean;
-                        variance += diff * diff;
-                    }
-                variance /= batch * spatialSize;
-
-                rm[c] = (1 - momentum) * rm[c] + momentum * mean;
-                rv[c] = (1 - momentum) * rv[c] + momentum * variance;
-            }
-            else
-            {
-                mean = rm[c];
-                variance = rv[c];
-            }
-
-            float invVar = 1f / MathF.Sqrt(variance + epsilon);
-            sm[c] = mean;
-            siv[c] = invVar;
-
-            for (int bi = 0; bi < batch; bi++)
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = (bi * channels + c) * spatialSize + s;
-                    outp[idx] = g[c] * (inp[idx] - mean) * invVar + b[c];
-                }
-        }
-
-        UploadToBuffer(outp, output);
-        UploadToBuffer(sm, saveMean);
-        UploadToBuffer(siv, saveInvVar);
-        if (training) { UploadToBuffer(rm, runningMean); UploadToBuffer(rv, runningVar); }
+        if (DispatchNormalizationForward(
+            new[] { input, output, gamma, beta, runningMean, runningVar, saveMean, saveInvVar }, channels,
+            new[] { 0u, (uint)batch, (uint)channels, (uint)spatialSize, 1u, FloatBits(epsilon), FloatBits(momentum), training ? 1u : 0u }))
+            return;
     }
 
     public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -1785,74 +778,22 @@ void main() {
         int batch, int channels, int spatialSize, float epsilon)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var sm = DownloadBuffer(saveMean);
-        var siv = DownloadBuffer(saveInvVar);
-        var gi = new float[batch * channels * spatialSize];
-        var gg = new float[channels];
-        var gb = new float[channels];
-        int N = batch * spatialSize;
-
-        for (int c = 0; c < channels; c++)
-        {
-            float mean = sm[c], invVar = siv[c];
-            float sumGrad = 0, sumGradXhat = 0;
-            for (int bi = 0; bi < batch; bi++)
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = (bi * channels + c) * spatialSize + s;
-                    float xhat = (inp[idx] - mean) * invVar;
-                    gg[c] += go[idx] * xhat;
-                    gb[c] += go[idx];
-                    sumGrad += go[idx];
-                    sumGradXhat += go[idx] * xhat;
-                }
-
-            for (int bi = 0; bi < batch; bi++)
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = (bi * channels + c) * spatialSize + s;
-                    float xhat = (inp[idx] - mean) * invVar;
-                    gi[idx] = g[c] * invVar / N * (N * go[idx] - sumGrad - xhat * sumGradXhat);
-                }
-        }
-
-        UploadToBuffer(gi, gradInput);
-        UploadToBuffer(gg, gradGamma);
-        UploadToBuffer(gb, gradBeta);
+        if (DispatchNormalizationBackward(
+            new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta }, channels,
+            new[] { 0u, 0u, (uint)batch, (uint)channels, (uint)spatialSize }))
+            return;
     }
 
     public void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var b = DownloadBuffer(beta);
-        var outp = new float[batchSize * normalizedSize];
-        var sm = new float[batchSize];
-        var siv = new float[batchSize];
-
-        for (int bi = 0; bi < batchSize; bi++)
-        {
-            int off = bi * normalizedSize;
-            float mean = 0;
-            for (int i = 0; i < normalizedSize; i++) mean += inp[off + i];
-            mean /= normalizedSize;
-            float var_ = 0;
-            for (int i = 0; i < normalizedSize; i++) { float d = inp[off + i] - mean; var_ += d * d; }
-            var_ /= normalizedSize;
-            float invVar = 1f / MathF.Sqrt(var_ + epsilon);
-            sm[bi] = mean; siv[bi] = invVar;
-            for (int i = 0; i < normalizedSize; i++)
-                outp[off + i] = g[i] * (inp[off + i] - mean) * invVar + b[i];
-        }
-
-        UploadToBuffer(outp, output);
-        UploadToBuffer(sm, saveMean);
-        UploadToBuffer(siv, saveInvVar);
+        using var layerRunningMeanDummy = AllocateBuffer(1);
+        using var layerRunningVarianceDummy = AllocateBuffer(1);
+        if (DispatchNormalizationForward(
+            new[] { input, output, gamma, beta, layerRunningMeanDummy, layerRunningVarianceDummy, saveMean, saveInvVar }, batchSize,
+            new[] { 1u, (uint)batchSize, (uint)normalizedSize, 1u, 1u, FloatBits(epsilon), 0u, 1u }))
+            return;
     }
 
     public void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -1860,87 +801,24 @@ void main() {
         int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var sm = DownloadBuffer(saveMean);
-        var siv = DownloadBuffer(saveInvVar);
-        var gi = new float[batchSize * normalizedSize];
-        var gg = new float[normalizedSize];
-        var gb = new float[normalizedSize];
-
-        for (int bi = 0; bi < batchSize; bi++)
-        {
-            int off = bi * normalizedSize;
-            float mean = sm[bi], invVar = siv[bi];
-            float sumGrad = 0, sumGradXhat = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                float xhat = (inp[off + i] - mean) * invVar;
-                gg[i] += go[off + i] * xhat;
-                gb[i] += go[off + i];
-                sumGrad += go[off + i] * g[i];
-                sumGradXhat += go[off + i] * g[i] * xhat;
-            }
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                float xhat = (inp[off + i] - mean) * invVar;
-                gi[off + i] = invVar / normalizedSize * (normalizedSize * go[off + i] * g[i] - sumGrad - xhat * sumGradXhat);
-            }
-        }
-
-        UploadToBuffer(gi, gradInput);
-        UploadToBuffer(gg, gradGamma);
-        UploadToBuffer(gb, gradBeta);
+        var layerBuffers = new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta };
+        GlslNaryOp(VulkanGlslKernels.NormalizationBackward, layerBuffers, batchSize,
+            new[] { 1u, 0u, (uint)batchSize, (uint)normalizedSize, 1u });
+        if (DispatchNormalizationBackward(layerBuffers, normalizedSize,
+            new[] { 1u, 1u, (uint)batchSize, (uint)normalizedSize, 1u }))
+            return;
     }
 
     public void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var b = DownloadBuffer(beta);
-        if (numGroups <= 0)
-            throw new ArgumentOutOfRangeException(nameof(numGroups), "numGroups must be positive.");
-        if (channels % numGroups != 0)
-            throw new ArgumentException($"channels ({channels}) must be divisible by numGroups ({numGroups}).");
-        int channelsPerGroup = channels / numGroups;
-        int groupSize = channelsPerGroup * spatialSize;
-        var outp = new float[batch * channels * spatialSize];
-        var sm = new float[batch * numGroups];
-        var siv = new float[batch * numGroups];
-
-        for (int bi = 0; bi < batch; bi++)
-            for (int grp = 0; grp < numGroups; grp++)
-            {
-                float mean = 0;
-                for (int c = grp * channelsPerGroup; c < (grp + 1) * channelsPerGroup; c++)
-                    for (int s = 0; s < spatialSize; s++)
-                        mean += inp[(bi * channels + c) * spatialSize + s];
-                mean /= groupSize;
-
-                float var_ = 0;
-                for (int c = grp * channelsPerGroup; c < (grp + 1) * channelsPerGroup; c++)
-                    for (int s = 0; s < spatialSize; s++)
-                    { float d = inp[(bi * channels + c) * spatialSize + s] - mean; var_ += d * d; }
-                var_ /= groupSize;
-
-                float invVar = 1f / MathF.Sqrt(var_ + epsilon);
-                sm[bi * numGroups + grp] = mean;
-                siv[bi * numGroups + grp] = invVar;
-
-                for (int c = grp * channelsPerGroup; c < (grp + 1) * channelsPerGroup; c++)
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = (bi * channels + c) * spatialSize + s;
-                        outp[idx] = g[c] * (inp[idx] - mean) * invVar + b[c];
-                    }
-            }
-
-        UploadToBuffer(outp, output);
-        UploadToBuffer(sm, saveMean);
-        UploadToBuffer(siv, saveInvVar);
+        using var groupRunningMeanDummy = AllocateBuffer(1);
+        using var groupRunningVarianceDummy = AllocateBuffer(1);
+        if (DispatchNormalizationForward(
+            new[] { input, output, gamma, beta, groupRunningMeanDummy, groupRunningVarianceDummy, saveMean, saveInvVar }, batch * numGroups,
+            new[] { 2u, (uint)batch, (uint)channels, (uint)spatialSize, (uint)numGroups, FloatBits(epsilon), 0u, 1u }))
+            return;
     }
 
     public void InstanceNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -1953,139 +831,72 @@ void main() {
         int batch, int channels, int spatialSize, float epsilon)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var sm = DownloadBuffer(saveMean);
-        var siv = DownloadBuffer(saveInvVar);
-        var gi = new float[batch * channels * spatialSize];
-        var gg = new float[channels];
-        var gb = new float[channels];
-
-        // InstanceNorm: statistics are per (batch, channel) pair, N = spatialSize
-        int N = spatialSize;
-        for (int bi = 0; bi < batch; bi++)
-            for (int c = 0; c < channels; c++)
-            {
-                // saveMean/saveInvVar layout: [batch * channels] (from GroupNorm with numGroups=channels)
-                float mean = sm[bi * channels + c];
-                float invVar = siv[bi * channels + c];
-                float sumGrad = 0, sumGradXhat = 0;
-
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = (bi * channels + c) * spatialSize + s;
-                    float xhat = (inp[idx] - mean) * invVar;
-                    gg[c] += go[idx] * xhat;
-                    gb[c] += go[idx];
-                    sumGrad += go[idx];
-                    sumGradXhat += go[idx] * xhat;
-                }
-
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = (bi * channels + c) * spatialSize + s;
-                    float xhat = (inp[idx] - mean) * invVar;
-                    gi[idx] = g[c] * invVar / N * (N * go[idx] - sumGrad - xhat * sumGradXhat);
-                }
-            }
-
-        UploadToBuffer(gi, gradInput);
-        UploadToBuffer(gg, gradGamma);
-        UploadToBuffer(gb, gradBeta);
+        var instanceBuffers = new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta };
+        GlslNaryOp(VulkanGlslKernels.NormalizationBackward, instanceBuffers, batch * channels,
+            new[] { 2u, 0u, (uint)batch, (uint)channels, (uint)spatialSize });
+        if (DispatchNormalizationBackward(instanceBuffers, channels,
+            new[] { 2u, 1u, (uint)batch, (uint)channels, (uint)spatialSize }))
+            return;
     }
 
     public void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
         int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var outp = new float[batchSize * normalizedSize];
-        var sr = new float[batchSize];
-
-        for (int bi = 0; bi < batchSize; bi++)
-        {
-            int off = bi * normalizedSize;
-            float sumSq = 0;
-            for (int i = 0; i < normalizedSize; i++) sumSq += inp[off + i] * inp[off + i];
-            float rms = MathF.Sqrt(sumSq / normalizedSize + epsilon);
-            sr[bi] = rms;
-            for (int i = 0; i < normalizedSize; i++)
-                outp[off + i] = g[i] * inp[off + i] / rms;
-        }
-
-        UploadToBuffer(outp, output);
-        UploadToBuffer(sr, saveRms);
+        using var rmsBetaDummy = AllocateBuffer(1);
+        using var rmsRunningMeanDummy = AllocateBuffer(1);
+        using var rmsRunningVarianceDummy = AllocateBuffer(1);
+        using var rmsSavedMeanDummy = AllocateBuffer(Math.Max(1, batchSize));
+        if (DispatchNormalizationForward(
+            new[] { input, output, gamma, rmsBetaDummy, rmsRunningMeanDummy, rmsRunningVarianceDummy, rmsSavedMeanDummy, saveRms }, batchSize,
+            new[] { 3u, (uint)batchSize, (uint)normalizedSize, 1u, 1u, FloatBits(epsilon), 0u, 1u }))
+            return;
     }
 
     public void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var g = DownloadBuffer(gamma);
-        var sr = DownloadBuffer(saveRms);
-        var gi = new float[batchSize * normalizedSize];
-        var gg = new float[normalizedSize];
-
-        for (int bi = 0; bi < batchSize; bi++)
-        {
-            int off = bi * normalizedSize;
-            float rms = sr[bi];
-            float invRms = 1f / rms;
-            float sumGradX = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                gg[i] += go[off + i] * inp[off + i] * invRms;
-                sumGradX += go[off + i] * g[i] * inp[off + i];
-            }
-            sumGradX *= invRms * invRms / normalizedSize;
-            for (int i = 0; i < normalizedSize; i++)
-                gi[off + i] = (go[off + i] * g[i] - inp[off + i] * sumGradX) * invRms;
-        }
-
-        UploadToBuffer(gi, gradInput);
-        UploadToBuffer(gg, gradGamma);
+        using var rmsSavedMeanDummy = AllocateBuffer(Math.Max(1, batchSize));
+        using var rmsGradBetaDummy = AllocateBuffer(Math.Max(1, normalizedSize));
+        var rmsBuffers = new[] { gradOutput, input, gamma, rmsSavedMeanDummy, saveRms, gradInput, gradGamma, rmsGradBetaDummy };
+        GlslNaryOp(VulkanGlslKernels.NormalizationBackward, rmsBuffers, batchSize,
+            new[] { 3u, 0u, (uint)batchSize, (uint)normalizedSize, 1u });
+        if (DispatchNormalizationBackward(rmsBuffers, normalizedSize,
+            new[] { 3u, 1u, (uint)batchSize, (uint)normalizedSize, 1u }))
+            return;
     }
 
     #endregion
 
     #region Dropout
 
-    public void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
+    private bool DispatchDropoutResident(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask,
+        int size, float dropoutRate, ulong seed, bool training)
     {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var outp = new float[size];
-        var m = new float[size];
-
         if (training)
         {
             if (dropoutRate < 0f || dropoutRate >= 1f)
                 throw new ArgumentOutOfRangeException(nameof(dropoutRate), $"dropoutRate must be in [0, 1), got {dropoutRate}.");
-            var rng = new Random(unchecked((int)seed) ^ unchecked((int)(seed >> 32)));
-            float scale = 1f / (1f - dropoutRate);
-            for (int i = 0; i < size; i++)
-            {
-                bool keep = (float)rng.NextDouble() >= dropoutRate;
-                m[i] = keep ? scale : 0f;
-                outp[i] = inp[i] * m[i];
-            }
+            DropoutMask(mask, size, 1f - dropoutRate, seed);
+            Multiply(input, mask, output, size);
         }
         else
         {
-            Array.Copy(inp, outp, size);
-            ArrayFillCompat(m, 1f);
+            Copy(input, output, size);
+            Fill(mask, 1f, size);
         }
+        return true;
+    }
 
-        UploadToBuffer(outp, output);
-        UploadToBuffer(m, mask);
+    public void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
+    {
+        EnsureInitialized();
+        if (DispatchDropoutResident(input, output, mask, size, dropoutRate, seed, training)) return;
     }
 
     public void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
-        => CpuBinary(gradOutput, mask, gradInput, size, (g, m) => g * m);
+        => ResidentBinary(ResidentBinaryOp.Multiply, gradOutput, mask, gradInput, size);
 
     public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
         int rows, int cols, float dropoutRate, float scale) => false;
@@ -2094,38 +905,34 @@ void main() {
 
     #region Embedding
 
+    private bool DispatchEmbeddingResident(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output,
+        int numIndices, int embeddingDim)
+    {
+        int vocabSize = embeddingTable.Size / embeddingDim;
+        GlslBinaryOp(VulkanGlslKernels.GatherRows, embeddingTable, indices, output, numIndices * embeddingDim,
+            new uint[] { (uint)numIndices, (uint)embeddingDim, (uint)vocabSize }, 3 * sizeof(uint));
+        return true;
+    }
+
+    private bool DispatchEmbeddingBackwardResident(IGpuBuffer gradOutput, IGpuBuffer indices,
+        IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
+    {
+        GlslBinaryOp(VulkanGlslKernels.EmbeddingBackward, gradOutput, indices, gradEmbedding,
+            vocabSize * embeddingDim,
+            new uint[] { (uint)numIndices, (uint)embeddingDim, (uint)vocabSize }, 3 * sizeof(uint));
+        return true;
+    }
+
     public void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
     {
         EnsureInitialized();
-        var idx = DownloadBuffer(indices);
-        var table = DownloadBuffer(embeddingTable);
-        int vocabSize = table.Length / embeddingDim;
-        var outp = new float[numIndices * embeddingDim];
-        for (int i = 0; i < numIndices; i++)
-        {
-            int wordIdx = SingleToInt32BitsCompat(idx[i]);
-            if ((uint)wordIdx >= (uint)vocabSize)
-                throw new ArgumentOutOfRangeException(nameof(indices), $"Embedding index {wordIdx} at position {i} is out of range [0, {vocabSize}).");
-            Array.Copy(table, wordIdx * embeddingDim, outp, i * embeddingDim, embeddingDim);
-        }
-        UploadToBuffer(outp, output);
+        if (DispatchEmbeddingResident(indices, embeddingTable, output, numIndices, embeddingDim)) return;
     }
 
     public void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var idx = DownloadBuffer(indices);
-        var ge = new float[vocabSize * embeddingDim];
-        for (int i = 0; i < numIndices; i++)
-        {
-            int wordIdx = SingleToInt32BitsCompat(idx[i]);
-            if ((uint)wordIdx >= (uint)vocabSize)
-                throw new ArgumentOutOfRangeException(nameof(indices), $"Embedding index {wordIdx} at position {i} is out of range [0, {vocabSize}).");
-            for (int d = 0; d < embeddingDim; d++)
-                ge[wordIdx * embeddingDim + d] += go[i * embeddingDim + d];
-        }
-        UploadToBuffer(ge, gradEmbedding);
+        if (DispatchEmbeddingBackwardResident(gradOutput, indices, gradEmbedding, numIndices, embeddingDim, vocabSize)) return;
     }
 
     #endregion

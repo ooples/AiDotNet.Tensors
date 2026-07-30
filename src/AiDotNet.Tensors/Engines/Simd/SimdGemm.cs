@@ -1203,6 +1203,42 @@ internal static partial class SimdGemm
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PARALLEL_MINWORK"), out var gpw) && gpw > 0
             ? gpw : ComputeParallelWorkThreshold();
 
+    /// <summary>
+    /// Minimum FMAs a single parallel chunk must carry to justify waking a
+    /// <see cref="Helpers.PersistentParallelExecutor"/> worker on the direct-parallel-M
+    /// GEMM paths (<see cref="SgemmDirectParallelM"/> and the TransA/TransB variants).
+    /// The direct paths bypass <see cref="ParallelWorkThreshold"/> (they are reached via
+    /// the #368 thin-M fast path in <c>BlasManaged.TryThinMDirect</c>, not the strategy
+    /// dispatcher) and previously split by M-block count alone, so on a many-core box a
+    /// tiny N-BEATS-scale GEMM — e.g. [64x256]x[256x256] ≈ 4.2M FMA — was split ~5 ways
+    /// (~0.8M FMA/chunk), waking pool workers for microseconds of work while the resident
+    /// 32-worker pool spun (measured: ~18 avg-cores of which most was worker re-arm spin,
+    /// PyTorch runs the same shape single-threaded). Capping the chunk count so each chunk
+    /// carries at least this many FMAs runs those GEMMs SERIAL (pool stays parked) while a
+    /// genuinely large GEMM (tens of M+ FMAs) still fans out. Env override:
+    /// AIDOTNET_GEMM_MIN_FMAS_PER_CHUNK.
+    /// </summary>
+    internal static readonly long MinFmasPerParallelChunk =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_MIN_FMAS_PER_CHUNK"), out var mfpc) && mfpc > 0
+            ? mfpc : 1L * 1024 * 1024; // 1M FMAs/chunk — a [64x96]x[96x256]≈1.5M stays serial,
+                                       // a [64x256]x[256x256]≈4.2M fans to ~4 chunks (its measured
+                                       // sweet spot), a large MLP/attention GEMM still fans wide.
+
+    /// <summary>
+    /// Cap a proposed parallel chunk count so every chunk carries at least
+    /// <see cref="MinFmasPerParallelChunk"/> FMAs of work. Returns 1 (serial) when the
+    /// total work can't fill even a single chunk beyond the floor. Pure dispatch decision —
+    /// does not change numerics (the kernels write disjoint output rows in fixed K order).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CapDirectChunksByWork(int numChunks, long work)
+    {
+        if (numChunks <= 1) return numChunks;
+        long byWork = work / MinFmasPerParallelChunk;
+        if (byWork < 1) return 1;
+        return byWork < numChunks ? (int)byWork : numChunks;
+    }
+
     // #653 Phase 1 parallel-work-threshold scaling constants (see ComputeParallelWorkThreshold).
     private const long ParallelFmasPerCore = 256L * 1024;          // ~256K FMAs per woken core
     private const long ParallelWorkFloor = 1L * 1024 * 1024;       // 1M FMAs — tiny GEMMs stay serial
@@ -2057,6 +2093,24 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// beta=0 write-first sibling of <see cref="SgemmDirectParallelMInto"/>: computes
+    /// C := A·B WITHOUT the leading <c>c.Clear()</c>. Safe because
+    /// <see cref="SgemmDirectParallelM"/> with <c>clearedOutput: true</c> dispatches only the
+    /// store-only kernels (<c>DirectKernel6x16Store</c> / <c>DirectKernelMxNMaskedStore</c>),
+    /// which OVERWRITE every element of the [m, n] tile (full Mr-row blocks over all N,
+    /// masked N-tail, and the M-edge rows) — nothing is read from C. The result is therefore
+    /// bit-identical to zero-then-store, just without the redundant memset. Callers that need
+    /// C accumulated (C += A·B) must NOT use this; use the SgemmAdd entry points instead.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void SgemmDirectParallelMOverwrite(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n)
+    {
+        SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
+    }
+
+    /// <summary>
     /// FP64 analog of <see cref="SgemmDirectParallelMInto"/> (#368): overwrite GEMM
     /// (C = A·B) via a no-pack register-blocked 4×8 <see cref="Vector256{T}"/> double
     /// microkernel, parallelised over disjoint M-row-blocks. For thin/moderate-M
@@ -2334,6 +2388,7 @@ internal static partial class SimdGemm
         int numFullBlocks = mFull / MRf;
         int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        numChunks = CapDirectChunksByWork(numChunks, (long)m * k * n);
         fixed (float* pA = a, pB = b, pC = c)
         {
             IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
@@ -2403,6 +2458,7 @@ internal static partial class SimdGemm
         int numFullBlocks = mFull / MRf;
         int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        numChunks = CapDirectChunksByWork(numChunks, (long)m * k * n);
         fixed (float* pA = a, pB = b, pC = c)
         {
             IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
@@ -2514,6 +2570,9 @@ internal static partial class SimdGemm
         int numFullBlocks = mFull / Mr;     // count of complete Mr-row blocks
         int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         int numChunks = Math.Min(cores, (numFullBlocks + 1) / 2);
+        // Per-chunk work floor: keep tiny (N-BEATS-scale) GEMMs SERIAL so the resident
+        // worker pool stays parked instead of spinning through a microsecond dispatch.
+        numChunks = CapDirectChunksByWork(numChunks, (long)m * k * n);
         if (numChunks <= 1)
         {
             // Not enough work to parallelize meaningfully.

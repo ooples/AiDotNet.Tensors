@@ -130,6 +130,19 @@ public sealed class LicenseValidator
         try
         {
             var result = ValidateOnline();
+
+            // v2 hybrid: off the hot path (background, throttled), refresh the signed CRL and — for a server
+            // AIDN-* key — mint + cache a fresh machine-bound offline aidn2 token, so this key keeps working
+            // (with correct caps, still revocable) the next time the server is unreachable. Best-effort:
+            // never blocks or throws into this result.
+            if (result.Status == LicenseKeyStatus.Active)
+            {
+                TensorsOnlineLicenseServices.RefreshInBackground(
+                    _licenseKey.ServerUrl ?? DefaultServerUrl,
+                    _licenseKey.Key,
+                    TensorsMachineFingerprint.GetMachineIdHash());
+            }
+
             return Cache(result);
         }
         catch (Exception ex)

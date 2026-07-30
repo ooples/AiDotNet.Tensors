@@ -864,31 +864,28 @@ public sealed partial class MetalBackend
     public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
         ThrowIfDisposed();
-        // CPU fallback for squash
-        var data = DownloadBuffer(input);
-        var result = new float[numCapsules * capsuleDim];
-
-        for (int c = 0; c < numCapsules; c++)
+        int count = checked(numCapsules * capsuleDim);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        if (input is not MetalGpuBuffer source || target is not MetalGpuBuffer destination)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
+        if (_residentLibrary == IntPtr.Zero)
+            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+        var pipeline = GetPipeline("Resident", _residentLibrary, "capsule_squash");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(count);
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
         {
-            float normSq = 0;
-            for (int d = 0; d < capsuleDim; d++)
-            {
-                float v = data[c * capsuleDim + d];
-                normSq += v * v;
-            }
-            float norm = MathF.Sqrt(normSq + epsilon);
-            float scale = normSq / ((1 + normSq) * norm);
-
-            for (int d = 0; d < capsuleDim; d++)
-            {
-                result[c * capsuleDim + d] = data[c * capsuleDim + d] * scale;
-            }
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(source, 0);
+            encoder.SetBuffer(destination, 1);
+            encoder.SetBytes((uint)numCapsules, 2);
+            encoder.SetBytes((uint)capsuleDim, 3);
+            encoder.SetBytes(epsilon, 4);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
         }
-
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -897,32 +894,30 @@ public sealed partial class MetalBackend
     public void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
         ThrowIfDisposed();
-        // Simplified CPU fallback
-        var gradOut = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var gradIn = new float[numCapsules * capsuleDim];
-
-        for (int c = 0; c < numCapsules; c++)
+        int count = checked(numCapsules * capsuleDim);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(gradInput, gradOutput) || ReferenceEquals(gradInput, input);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? gradInput;
+        if (gradOutput is not MetalGpuBuffer gradient || input is not MetalGpuBuffer source ||
+            target is not MetalGpuBuffer destination)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
+        if (_residentLibrary == IntPtr.Zero)
+            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+        var pipeline = GetPipeline("Resident", _residentLibrary, "capsule_squash_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(count);
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
         {
-            float normSq = 0;
-            for (int d = 0; d < capsuleDim; d++)
-            {
-                float v = inp[c * capsuleDim + d];
-                normSq += v * v;
-            }
-            float norm = MathF.Sqrt(normSq + epsilon);
-            float scale = normSq / ((1 + normSq) * norm);
-
-            for (int d = 0; d < capsuleDim; d++)
-            {
-                gradIn[c * capsuleDim + d] = gradOut[c * capsuleDim + d] * scale;
-            }
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(gradient, 0);
+            encoder.SetBuffer(source, 1);
+            encoder.SetBuffer(destination, 2);
+            encoder.SetBytes((uint)numCapsules, 3);
+            encoder.SetBytes((uint)capsuleDim, 4);
+            encoder.SetBytes(epsilon, 5);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
         }
-
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(gradIn);
-        }
+        if (temporary is not null) Copy(temporary, gradInput, count);
     }
 
     /// <summary>
@@ -932,39 +927,14 @@ public sealed partial class MetalBackend
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
         ThrowIfDisposed();
-        // CPU fallback - proper implementation would use GPU kernel
-        var inp = DownloadBuffer(input);
-        var w = DownloadBuffer(weights);
-        var result = new float[batchSize * inputCapsules * outputCapsules * outputDim];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int i = 0; i < inputCapsules; i++)
-            {
-                for (int c = 0; c < outputCapsules; c++)
-                {
-                    for (int d = 0; d < outputDim; d++)
-                    {
-                        float sum = 0;
-                        for (int k = 0; k < inputDim; k++)
-                        {
-                            int inIdx = b * inputCapsules * inputDim + i * inputDim + k;
-                            int wIdx = i * outputCapsules * inputDim * outputDim +
-                                      c * inputDim * outputDim + k * outputDim + d;
-                            sum += inp[inIdx] * w[wIdx];
-                        }
-                        int outIdx = b * inputCapsules * outputCapsules * outputDim +
-                                    i * outputCapsules * outputDim + c * outputDim + d;
-                        result[outIdx] = sum;
-                    }
-                }
-            }
-        }
-
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        int count = checked(batchSize * inputCapsules * outputCapsules * outputDim);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(output, input) || ReferenceEquals(output, weights);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("capsule_predictions", count, new[] { input, weights, target },
+            (uint)batchSize, (uint)inputCapsules, (uint)inputDim, (uint)outputCapsules, (uint)outputDim);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -984,34 +954,14 @@ public sealed partial class MetalBackend
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
         ThrowIfDisposed();
-        // CPU fallback
-        var c = DownloadBuffer(coupling);
-        var p = DownloadBuffer(predictions);
-        var result = new float[batchSize * outputCapsules * capsuleDim];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int oc = 0; oc < outputCapsules; oc++)
-            {
-                for (int d = 0; d < capsuleDim; d++)
-                {
-                    float sum = 0;
-                    for (int ic = 0; ic < inputCapsules; ic++)
-                    {
-                        int cIdx = b * inputCapsules * outputCapsules + ic * outputCapsules + oc;
-                        int pIdx = b * inputCapsules * outputCapsules * capsuleDim +
-                                  ic * outputCapsules * capsuleDim + oc * capsuleDim + d;
-                        sum += c[cIdx] * p[pIdx];
-                    }
-                    result[b * outputCapsules * capsuleDim + oc * capsuleDim + d] = sum;
-                }
-            }
-        }
-
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        int count = checked(batchSize * outputCapsules * capsuleDim);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(output, coupling) || ReferenceEquals(output, predictions);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("capsule_weighted_sum", count, new[] { coupling, predictions, target },
+            (uint)batchSize, (uint)inputCapsules, (uint)outputCapsules, (uint)capsuleDim);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -1021,34 +971,14 @@ public sealed partial class MetalBackend
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
         ThrowIfDisposed();
-        // CPU fallback
-        var p = DownloadBuffer(predictions);
-        var o = DownloadBuffer(output);
-        var result = new float[batchSize * inputCapsules * outputCapsules];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int ic = 0; ic < inputCapsules; ic++)
-            {
-                for (int oc = 0; oc < outputCapsules; oc++)
-                {
-                    float sum = 0;
-                    for (int d = 0; d < capsuleDim; d++)
-                    {
-                        int pIdx = b * inputCapsules * outputCapsules * capsuleDim +
-                                  ic * outputCapsules * capsuleDim + oc * capsuleDim + d;
-                        int oIdx = b * outputCapsules * capsuleDim + oc * capsuleDim + d;
-                        sum += p[pIdx] * o[oIdx];
-                    }
-                    result[b * inputCapsules * outputCapsules + ic * outputCapsules + oc] = sum;
-                }
-            }
-        }
-
-        if (agreement is MetalGpuBuffer aBuffer)
-        {
-            aBuffer.CopyFrom(result);
-        }
+        int count = checked(batchSize * inputCapsules * outputCapsules);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(agreement, predictions) || ReferenceEquals(agreement, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? agreement;
+        DispatchResidentMetal("capsule_agreement", count, new[] { predictions, output, target },
+            (uint)batchSize, (uint)inputCapsules, (uint)outputCapsules, (uint)capsuleDim);
+        if (temporary is not null) Copy(temporary, agreement, count);
     }
 
     /// <summary>
@@ -1057,18 +987,13 @@ public sealed partial class MetalBackend
     public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
         ThrowIfDisposed();
-        var data = DownloadBuffer(input);
-        var result = new float[repeats * innerSize];
-
-        for (int r = 0; r < repeats; r++)
-        {
-            Array.Copy(data, 0, result, r * innerSize, innerSize);
-        }
-
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        int count = checked(repeats * innerSize);
+        if (count <= 0) return;
+        bool aliasesInput = ReferenceEquals(input, output);
+        using var temporary = aliasesInput ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("tile_batch", count, new[] { input, target }, (uint)repeats, (uint)innerSize);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -1077,26 +1002,51 @@ public sealed partial class MetalBackend
     public void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
     {
         ThrowIfDisposed();
-        var data = DownloadBuffer(input);
-        var result = new float[outerSize * axisSize * repeats * innerSize];
+        if (input is not MetalGpuBuffer inputBuffer || output is not MetalGpuBuffer outputBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
-        for (int o = 0; o < outerSize; o++)
-        {
-            for (int a = 0; a < axisSize; a++)
-            {
-                for (int r = 0; r < repeats; r++)
-                {
-                    int srcOffset = o * axisSize * innerSize + a * innerSize;
-                    int dstOffset = o * axisSize * repeats * innerSize + (a * repeats + r) * innerSize;
-                    Array.Copy(data, srcOffset, result, dstOffset, innerSize);
-                }
-            }
-        }
+        int total = checked(outerSize * axisSize * repeats * innerSize);
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "tile_axis");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inputBuffer, 0);
+        encoder.SetBuffer(outputBuffer, 1);
+        encoder.SetBytes((uint)outerSize, 2);
+        encoder.SetBytes((uint)axisSize, 3);
+        encoder.SetBytes((uint)innerSize, 4);
+        encoder.SetBytes((uint)repeats, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
 
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+    public void PixelShuffle(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inH, int inW, int scale)
+        => DispatchPixelShuffle("pixel_shuffle", input, output,
+            checked(batch * channels * inH * scale * inW * scale), batch, channels, inH, inW, scale);
+
+    public void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inH, int inW, int scale)
+        => DispatchPixelShuffle("pixel_shuffle_backward", gradOutput, gradInput,
+            checked(batch * channels * scale * scale * inH * inW), batch, channels, inH, inW, scale);
+
+    private void DispatchPixelShuffle(string kernelName, IGpuBuffer input, IGpuBuffer output,
+        int total, int batch, int channels, int inH, int inW, int scale)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer inputBuffer || output is not MetalGpuBuffer outputBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inputBuffer, 0);
+        encoder.SetBuffer(outputBuffer, 1);
+        encoder.SetBytes((uint)batch, 2);
+        encoder.SetBytes((uint)channels, 3);
+        encoder.SetBytes((uint)inH, 4);
+        encoder.SetBytes((uint)inW, 5);
+        encoder.SetBytes((uint)scale, 6);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     #endregion

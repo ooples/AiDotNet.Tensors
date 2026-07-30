@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <item>RX 6800 XT: 8,000+ GFLOPS (optimized scalar)</item>
 /// </list>
 /// </remarks>
-public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
+public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
 {
     /// <summary>
     /// HIP has no cuDNN-equivalent half/bfloat16 conv path yet — returns
@@ -65,6 +65,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _poolingModule;
     private IntPtr _normalizationModule;
     private IntPtr _fusedModule;
+    private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
+    private IntPtr _pagedAttnModule; // P1: paged-attention decode
+    private IntPtr _flashDecodeModule; // P2: fused decode attention (FlashDecoding)
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
@@ -494,6 +497,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(HipFusedKernels.GetSource(), "fused", ref _fusedModule,
                 HipFusedKernels.GetKernelNames());
 
+            CompileKernelModule(Kernels.HipQuantGemmKernels.GetSource(), "quant_gemm", ref _quantGemmModule,
+                Kernels.HipQuantGemmKernels.GetKernelNames());
+
+            CompileKernelModule(Kernels.HipPagedAttentionKernels.GetSource(), "paged_attention", ref _pagedAttnModule,
+                Kernels.HipPagedAttentionKernels.GetKernelNames());
+
+            CompileKernelModule(Kernels.HipFlashDecodeKernels.GetSource(), "flash_decode", ref _flashDecodeModule,
+                Kernels.HipFlashDecodeKernels.GetKernelNames());
+
             // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct)
             CompileKernelModule(HipAttentionKernels.GetSource(), "attention", ref _attentionModule,
                 HipAttentionKernels.GetKernelNames());
@@ -630,7 +642,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             try
             {
                 CompileKernelModule(Kernels.HipParity210Kernels.GetSource(), "parity210",
-                    ref _parity210Module, Kernels.HipParity210Kernels.GetKernelNames());
+                    ref _parity210Module, Kernels.HipParity210Kernels.GetKernelNames(), useFastMath: false);
             }
             catch
             {
@@ -694,6 +706,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             {
                 System.Diagnostics.Debug.WriteLine($"HIP audio kernel compilation failed: {ex.Message}");
                 _audioModule = IntPtr.Zero;
+            }
+
+            // Fused ANN kernels (IAnnBackend). Supply-chain-clean replacement for FaissNet/MKL.
+            try
+            {
+                CompileKernelModule(Kernels.HipAnnKernels.GetSource(), "ann",
+                    ref _annModule, Kernels.HipAnnKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP ANN kernel compilation failed: {ex.Message}");
+                _annModule = IntPtr.Zero;
             }
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
@@ -802,6 +826,194 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             kernel, gridX, 1, 1, blockSize, 1, 1,
             sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
         HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
+    }
+
+    /// <summary>Paged-attention decode (P1): out[heads*headDim] = softmax(scale·Q·K)·V over the
+    /// sequence, reading K/V from the physical block pool [maxBlocks, blockSize, heads, headDim] via
+    /// <paramref name="blockTable"/> (an int buffer of physical block ids). headDim &lt;= 256.
+    /// Matches a standard-attention CPU oracle.</summary>
+    public unsafe IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
+        if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: paged_attention_decode");
+        var output = AllocateBuffer(heads * headDim);
+        uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, hd = headDim, bs = blockSize, sl = seqLen; float sc = scale;
+        void** args = stackalloc void*[10];
+        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+        args[5] = &hh; args[6] = &hd; args[7] = &bs; args[8] = &sl; args[9] = &sc;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return output;
+    }
+
+    /// <summary>Prefill / multi-query paged attention (P1, causal): out[numQueries,heads,headDim];
+    /// query qi (logical position startPos+qi) attends to key positions 0..(startPos+qi). headDim &lt;= 256.</summary>
+    public unsafe IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
+        if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill");
+        var output = AllocateBuffer(numQueries * heads * headDim);
+        int totalItems = numQueries * heads;
+        uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, hd = headDim, bs = blockSize, nq = numQueries, sp = startPos; float sc = scale;
+        void** args = stackalloc void*[11];
+        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+        args[5] = &hh; args[6] = &hd; args[7] = &bs; args[8] = &nq; args[9] = &sp; args[10] = &sc;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return output;
+    }
+
+    /// <summary>GQA decode (P1): like <see cref="PagedAttentionDecode"/> but query head h shares KV head
+    /// h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public unsafe IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
+        if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: paged_attention_decode_gqa");
+        var output = AllocateBuffer(heads * headDim);
+        uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, sl = seqLen; float sc = scale;
+        void** args = stackalloc void*[11];
+        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+        args[5] = &hh; args[6] = &kv; args[7] = &hd; args[8] = &bs; args[9] = &sl; args[10] = &sc;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return output;
+    }
+
+    /// <summary>GQA prefill (P1, causal): like <see cref="PagedAttentionPrefill"/> but query head h shares
+    /// KV head h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public unsafe IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
+        if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill_gqa");
+        var output = AllocateBuffer(numQueries * heads * headDim);
+        int totalItems = numQueries * heads;
+        uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
+        int hh = heads, kv = kvHeads, hd = headDim, bs = blockSize, nq = numQueries, sp = startPos; float sc = scale;
+        void** args = stackalloc void*[12];
+        args[0] = &qPtr; args[1] = &kPtr; args[2] = &vPtr; args[3] = &btPtr; args[4] = &oPtr;
+        args[5] = &hh; args[6] = &kv; args[7] = &hd; args[8] = &bs; args[9] = &nq; args[10] = &sp; args[11] = &sc;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return output;
+    }
+
+    /// <summary>Fused decode attention (P2, FlashDecoding): single-query attention over contiguous K/V
+    /// [seqLen,kvHeads,headDim], split across threads and merged by an online-softmax reduction. GQA via
+    /// kvHead=h/(heads/kvHeads); pass kvHeads==heads for MHA. headDim &lt;= 256.</summary>
+    public unsafe IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
+    {
+        if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
+            throw new InvalidOperationException("HIP kernel not found: flash_decode_partial");
+        if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
+            throw new InvalidOperationException("HIP kernel not found: flash_decode_reduce");
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
+        if (effSplits > seqLen) effSplits = seqLen;
+        int splitLen = (seqLen + effSplits - 1) / effSplits;
+
+        var output = AllocateBuffer(heads * headDim);
+        var partialM = AllocateBuffer(heads * effSplits);
+        var partialL = AllocateBuffer(heads * effSplits);
+        var partialAcc = AllocateBuffer(heads * effSplits * headDim);
+        try
+        {
+            IntPtr qPtr = q.Handle, kPtr = k.Handle, vPtr = v.Handle;
+            IntPtr pmPtr = partialM.Handle, plPtr = partialL.Handle, paPtr = partialAcc.Handle, oPtr = output.Handle;
+            int hh = heads, kv = kvHeads, hd = headDim, sl = seqLen, sp = effSplits, slen = splitLen; float sc = scale;
+
+            int totalItems = heads * effSplits;
+            uint gridP = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsP = stackalloc void*[13];
+            argsP[0] = &qPtr; argsP[1] = &kPtr; argsP[2] = &vPtr;
+            argsP[3] = &pmPtr; argsP[4] = &plPtr; argsP[5] = &paPtr;
+            argsP[6] = &hh; argsP[7] = &kv; argsP[8] = &hd; argsP[9] = &sl; argsP[10] = &sp; argsP[11] = &slen; argsP[12] = &sc;
+            LaunchKernel(partKernel, gridP, (uint)DefaultBlockSize, argsP);
+
+            uint gridR = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** argsR = stackalloc void*[7];
+            argsR[0] = &pmPtr; argsR[1] = &plPtr; argsR[2] = &paPtr; argsR[3] = &oPtr;
+            argsR[4] = &hh; argsR[5] = &hd; argsR[6] = &sp;
+            LaunchKernel(reduceKernel, gridR, (uint)DefaultBlockSize, argsR);
+            return output;
+        }
+        catch { output.Dispose(); throw; }
+        finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
+    }
+
+    /// <summary>Weight-only fused dequant-GEMM (int8), symmetric per-tensor/per-group; weights are a
+    /// byte buffer of the int8 payload. Matches FusedDequantMatmulKernels.Q8MatMul.</summary>
+    public IGpuBuffer DequantGemmInt8(IGpuBuffer activations, IGpuBuffer weightsInt8, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
+        return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    }
+
+    /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte). Weights are a byte buffer
+    /// of length ceil(K*N/2). Matches FusedDequantMatmulKernels.Q4MatMul.</summary>
+    public IGpuBuffer DequantGemmInt4(IGpuBuffer activations, IGpuBuffer weightsInt4Packed, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(weightsInt4Packed, ((long)K * N + 1) / 2, nameof(weightsInt4Packed), nameof(DequantGemmInt4));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt4));
+        return LaunchDequantGemm("dequant_gemm_int4", activations, weightsInt4Packed, scales, M, K, N, groupSize, scaleCount);
+    }
+
+    /// <summary>Weight-only fused dequant-GEMM (OCP FP8 E4M3). Weights are a byte buffer of raw e4m3
+    /// bytes; in-kernel decode matches Float8E4M3.ToFloat.</summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(weightsFp8, (long)K * N, nameof(weightsFp8), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
+        return LaunchDequantGemm("dequant_gemm_fp8_e4m3", activations, weightsFp8, scales, M, K, N, groupSize, scaleCount);
+    }
+
+    private unsafe IGpuBuffer LaunchDequantGemm(string kernelName, IGpuBuffer act, IGpuBuffer weights, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        var output = AllocateBuffer(M * N);
+        uint grid = (uint)(((long)M * N + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = act.Handle, wPtr = weights.Handle, sPtr = scales.Handle, oPtr = output.Handle;
+        int m = M, k = K, n = N, gs = groupSize, sc = scaleCount;
+        void** args = stackalloc void*[9];
+        args[0] = &aPtr; args[1] = &wPtr; args[2] = &sPtr; args[3] = &oPtr;
+        args[4] = &m; args[5] = &k; args[6] = &n; args[7] = &gs; args[8] = &sc;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return output;
     }
 
     /// <summary>
@@ -1070,6 +1282,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         var hipBuffer = (HipGpuBuffer)buffer;
         var size = (UIntPtr)(hipBuffer.Size * sizeof(float));
 
@@ -1081,6 +1294,54 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 size,
                 HipMemcpyKind.DeviceToHost);
             HipNativeBindings.CheckError(result, "hipMemcpy D2H");
+        }
+    }
+
+    public unsafe byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        if (buffer is null)
+            throw new ArgumentNullException(nameof(buffer));
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        if (byteCount > buffer.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({buffer.SizeInBytes}).", nameof(byteCount));
+
+        var resultBytes = new byte[byteCount];
+        if (byteCount == 0)
+            return resultBytes;
+
+        fixed (byte* destPtr = resultBytes)
+        {
+            var result = HipNativeBindings.hipMemcpy(
+                (IntPtr)destPtr,
+                buffer.Handle,
+                (UIntPtr)byteCount,
+                HipMemcpyKind.DeviceToHost);
+            HipNativeBindings.CheckError(result, "hipMemcpy D2H (byte buffer)");
+        }
+
+        return resultBytes;
+    }
+
+    public unsafe void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        if (buffer is null)
+            throw new ArgumentNullException(nameof(buffer));
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        if (data.LongLength > buffer.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({buffer.SizeInBytes} bytes).", nameof(data));
+        if (data.Length == 0)
+            return;
+
+        fixed (byte* srcPtr = data)
+        {
+            var result = HipNativeBindings.hipMemcpy(
+                buffer.Handle,
+                (IntPtr)srcPtr,
+                (UIntPtr)data.Length,
+                HipMemcpyKind.HostToDevice);
+            HipNativeBindings.CheckError(result, "hipMemcpy H2D (byte buffer)");
         }
     }
 
@@ -1215,17 +1476,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// used only when hipBLAS isn't available.</summary>
     private IGpuBuffer TransposeBufferRowMajor(IGpuBuffer src, int rows, int cols)
     {
-        // Caller cleans up via using; allocate a fresh buffer of the
-        // same size and re-arrange element layout. The custom kernel
-        // route would be faster, but this fallback is dead-code on
-        // hardware where hipBLAS is loadable.
         var dst = AllocateBuffer(rows * cols);
-        var hostBuf = new float[rows * cols];
-        var srcArr = DownloadBuffer(src);
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-                hostBuf[c * rows + r] = srcArr[r * cols + c];
-        UploadToBuffer(dst, hostBuf);
+        Transpose(src, dst, rows, cols);
         return dst;
     }
 
@@ -2982,6 +3234,34 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
+    public unsafe void PixelShuffle(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inH, int inW, int scale)
+    {
+        if (!_kernelCache.TryGetValue("pixel_shuffle", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: pixel_shuffle");
+        IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &batch; args[3] = &channels;
+        args[4] = &inH; args[5] = &inW; args[6] = &scale;
+        uint total = (uint)checked(batch * channels * inH * scale * inW * scale);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inH, int inW, int scale)
+    {
+        if (!_kernelCache.TryGetValue("pixel_shuffle_backward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: pixel_shuffle_backward");
+        IntPtr outputPtr = gradOutput.Handle, inputPtr = gradInput.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &outputPtr; args[1] = &inputPtr; args[2] = &batch; args[3] = &channels;
+        args[4] = &inH; args[5] = &inW; args[6] = &scale;
+        uint total = (uint)checked(batch * channels * scale * scale * inH * inW);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
+        Synchronize();
+    }
+
     private void UploadToBuffer(IGpuBuffer buffer, float[] data)
     {
         var hipBuffer = (HipGpuBuffer)buffer;
@@ -3024,45 +3304,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return new HipGpuByteBuffer(devicePtr, size);
     }
 
-    public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
+    public unsafe void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
     {
         if (K % 4 != 0)
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
-        // Download dense data
-        var denseData = DownloadBuffer(denseInput);
-
-        // Use SparsityUtils for CPU-side sparsity enforcement
-        var compressed = SparsityUtils.CompressTo2x4(denseData, M, K);
-
-        // Upload compressed values
-        UploadToBuffer(sparseValues, compressed.Values);
-
-        // Upload indices
-        var byteBuffer = (HipGpuByteBuffer)sparseIndices;
-        UploadBytesToBuffer(byteBuffer, compressed.Indices);
+        if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: enforce_2x4_sparsity");
+        int totalGroups = checked(M * (K / 4));
+        IntPtr dense = denseInput.Handle, values = sparseValues.Handle, indices = sparseIndices.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &dense; args[1] = &values; args[2] = &indices; args[3] = &M; args[4] = &K;
+        LaunchKernel(kernel, (uint)((totalGroups + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
-    public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
+    public unsafe void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
     {
         if (K % 4 != 0)
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
-        // Download compressed data
-        var values = DownloadBuffer(sparseValues);
-        var indices = DownloadBytesFromBuffer((HipGpuByteBuffer)sparseIndices);
-
-        // Create compressed representation
-        var compressed = new Compressed2x4Sparse(values, indices, M, K);
-
-        // Decompress
-        var denseData = SparsityUtils.DecompressFrom2x4(compressed);
-
-        // Upload result
-        UploadToBuffer(denseOutput, denseData);
+        if (!_kernelCache.TryGetValue("decompress_2x4_sparse", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: decompress_2x4_sparse");
+        int totalGroups = checked(M * (K / 4));
+        IntPtr values = sparseValues.Handle, indices = sparseIndices.Handle, dense = denseOutput.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &values; args[1] = &indices; args[2] = &dense; args[3] = &M; args[4] = &K;
+        LaunchKernel(kernel, (uint)((totalGroups + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
-    public void SparseGemm(
+    public unsafe void SparseGemm(
         IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices,
         IGpuBuffer B, IGpuBuffer C,
         int M, int N, int K,
@@ -3071,25 +3341,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (K % 4 != 0)
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
-        // Download sparse A data
-        var aValues = DownloadBuffer(sparseAValues);
-        var aIndices = DownloadBytesFromBuffer((HipGpuByteBuffer)sparseAIndices);
-
-        // Create compressed representation
-        var sparseA = new Compressed2x4Sparse(aValues, aIndices, M, K);
-
-        // Download B and existing C
-        var bData = DownloadBuffer(B);
-        var cData = DownloadBuffer(C);
-
-        // Execute sparse GEMM on CPU (later can be HIP-accelerated)
-        SparsityUtils.SparseGemmCpu(sparseA, bData, cData, N, alpha, beta);
-
-        // Upload result
-        UploadToBuffer(C, cData);
+        if (!_kernelCache.TryGetValue("sparse_gemm_2x4", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: sparse_gemm_2x4");
+        IntPtr values = sparseAValues.Handle, indices = sparseAIndices.Handle, b = B.Handle, c = C.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &values; args[1] = &indices; args[2] = &b; args[3] = &c;
+        args[4] = &M; args[5] = &N; args[6] = &K; args[7] = &alpha; args[8] = &beta;
+        const int tile = 16;
+        LaunchKernel2D(kernel, (uint)((N + tile - 1) / tile), (uint)((M + tile - 1) / tile), tile, tile, args);
     }
 
-    public IGpuBuffer SparseGemmBiasRelu(
+    public unsafe IGpuBuffer SparseGemmBiasRelu(
         IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices,
         IGpuBuffer B, IGpuBuffer bias,
         int M, int N, int K)
@@ -3097,29 +3359,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (K % 4 != 0)
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
-        // Create output buffer
-        var C = AllocateBuffer(M * N);
-
-        // Execute sparse GEMM
-        SparseGemm(sparseAValues, sparseAIndices, B, C, M, N, K, 1.0f, 0.0f);
-
-        // Download, apply bias + ReLU
-        var cData = DownloadBuffer(C);
-        var biasData = DownloadBuffer(bias);
-
-        for (int row = 0; row < M; row++)
-        {
-            for (int col = 0; col < N; col++)
-            {
-                int idx = row * N + col;
-                float val = cData[idx] + biasData[col];
-                cData[idx] = Math.Max(0, val);
-            }
-        }
-
-        // Upload back
-        UploadToBuffer(C, cData);
-        return C;
+        if (!_kernelCache.TryGetValue("sparse_gemm_bias_relu", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: sparse_gemm_bias_relu");
+        var output = AllocateBuffer(checked(M * N));
+        IntPtr values = sparseAValues.Handle, indices = sparseAIndices.Handle, b = B.Handle, biasPointer = bias.Handle, c = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &values; args[1] = &indices; args[2] = &b; args[3] = &biasPointer; args[4] = &c;
+        args[5] = &M; args[6] = &N; args[7] = &K;
+        const int tile = 16;
+        LaunchKernel2D(kernel, (uint)((N + tile - 1) / tile), (uint)((M + tile - 1) / tile), tile, tile, args);
+        return output;
     }
 
     #region CSR Sparse Operations (General Sparsity)
@@ -3152,6 +3401,60 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
             M, K, N, nnz);
+    }
+
+    /// <summary>
+    /// SDDMM: output[p] = sum_k x[rowIndices[p], k] * y[colIndices[p], k], one thread per pattern
+    /// non-zero. CUDA mirror: <see cref="CUDA.CudaBackend.CsrSddmm"/>.
+    /// </summary>
+    public unsafe void CsrSddmm(
+        IGpuBuffer rowIndices,
+        IGpuBuffer colIndices,
+        IGpuBuffer x,
+        IGpuBuffer y,
+        IGpuBuffer output,
+        int nnz, int innerK)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("HIP backend is not available.");
+        if (nnz == 0) return;
+
+        if (!_kernelCache.TryGetValue("sddmm", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: sddmm");
+
+        int gridX = (nnz + DefaultBlockSize - 1) / DefaultBlockSize;
+
+        IntPtr rowHandle = ((HipGpuBuffer)rowIndices).Handle;
+        IntPtr colHandle = ((HipGpuBuffer)colIndices).Handle;
+        IntPtr xHandle = ((HipGpuBuffer)x).Handle;
+        IntPtr yHandle = ((HipGpuBuffer)y).Handle;
+        IntPtr outputHandle = ((HipGpuBuffer)output).Handle;
+
+        void*[] args = new void*[7];
+        fixed (void** argsPtr = args)
+        {
+            IntPtr[] handles = [rowHandle, colHandle, xHandle, yHandle, outputHandle];
+            int[] ints = [nnz, innerK];
+
+            fixed (IntPtr* h = handles)
+            fixed (int* i = ints)
+            {
+                argsPtr[0] = &h[0];
+                argsPtr[1] = &h[1];
+                argsPtr[2] = &h[2];
+                argsPtr[3] = &h[3];
+                argsPtr[4] = &h[4];
+                argsPtr[5] = &i[0];
+                argsPtr[6] = &i[1];
+
+                var result = HipNativeBindings.hipModuleLaunchKernel(
+                    kernel,
+                    (uint)gridX, 1, 1,
+                    (uint)DefaultBlockSize, 1, 1,
+                    0, _stream, (IntPtr)argsPtr, IntPtr.Zero);
+                HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (sddmm)");
+            }
+        }
     }
 
     /// <summary>Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>
@@ -3556,49 +3859,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     #endregion
-
-    private void UploadBytesToBuffer(HipGpuByteBuffer buffer, byte[] data)
-    {
-        var size = (UIntPtr)data.Length;
-
-        GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
-        try
-        {
-            var result = HipNativeBindings.hipMemcpy(
-                buffer.Handle,
-                handle.AddrOfPinnedObject(),
-                size,
-                HipMemcpyKind.HostToDevice);
-            HipNativeBindings.CheckError(result, "hipMemcpy H2D (bytes)");
-        }
-        finally
-        {
-            handle.Free();
-        }
-    }
-
-    private byte[] DownloadBytesFromBuffer(HipGpuByteBuffer buffer)
-    {
-        byte[] result = new byte[buffer.Size];
-        var size = (UIntPtr)buffer.Size;
-
-        GCHandle handle = GCHandle.Alloc(result, GCHandleType.Pinned);
-        try
-        {
-            var hipResult = HipNativeBindings.hipMemcpy(
-                handle.AddrOfPinnedObject(),
-                buffer.Handle,
-                size,
-                HipMemcpyKind.DeviceToHost);
-            HipNativeBindings.CheckError(hipResult, "hipMemcpy D2H (bytes)");
-        }
-        finally
-        {
-            handle.Free();
-        }
-
-        return result;
-    }
 
     #endregion
 
@@ -4980,9 +5240,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (gradBeta.Size < channels)
             throw new ArgumentException($"InstanceNormBackward: gradBeta size {gradBeta.Size} is less than channels {channels}.");
 
-        // Try to use GPU kernels
-        if (_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel) &&
-            _kernelCache.TryGetValue("instancenorm_backward", out var backwardKernel))
+        if (!_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel) ||
+            !_kernelCache.TryGetValue("instancenorm_backward", out var backwardKernel))
+            throw new InvalidOperationException("HIP InstanceNormBackward kernels are unavailable.");
+
         {
             // Allocate temporary buffers for intermediate sums
             using var sumDy = AllocateBuffer(statsSize);
@@ -5112,112 +5373,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return;
         }
 
-        // CPU fallback only if kernels are not available
-        System.Diagnostics.Debug.WriteLine("HipBackend InstanceNormBackward is executing on CPU fallback; GPU kernels not available.");
-        InstanceNormBackwardCpuFallback(gradOutput, input, gamma, saveMean, saveInvVar,
-            gradInput, gradGamma, gradBeta, batch, channels, spatialSize);
-    }
-
-    private void InstanceNormBackwardCpuFallback(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
-        IGpuBuffer saveMean, IGpuBuffer saveInvVar,
-        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
-        int batch, int channels, int spatialSize)
-    {
-        var gradOutData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var meanData = DownloadBuffer(saveMean);
-        var invVarData = DownloadBuffer(saveInvVar);
-        var gradInputData = new float[gradOutData.Length];
-        var gradGammaData = new float[channels];
-        var gradBetaData = new float[channels];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                int offset = (b * channels + c) * spatialSize;
-                float meanVal = meanData[b * channels + c];
-                float invStd = invVarData[b * channels + c];
-                float g = gammaData[c];
-
-                // First pass: compute sums for gradient correction
-                float sumDelta = 0.0f;
-                float sumDeltaXNorm = 0.0f;
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    float go = gradOutData[offset + s];
-                    float x = inputData[offset + s];
-                    float xNorm = (x - meanVal) * invStd;
-                    float delta = go * g;
-
-                    gradGammaData[c] += go * xNorm;
-                    gradBetaData[c] += go;
-
-                    sumDelta += delta;
-                    sumDeltaXNorm += delta * xNorm;
-                }
-
-                // Second pass: compute gradInput with proper correction terms
-                float invN = 1.0f / spatialSize;
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    float go = gradOutData[offset + s];
-                    float x = inputData[offset + s];
-                    float xNorm = (x - meanVal) * invStd;
-                    float delta = go * g;
-
-                    // dx = invStd * invN * (N * delta - sum(delta) - xNorm * sum(delta * xNorm))
-                    gradInputData[offset + s] = invStd * invN * (spatialSize * delta - sumDelta - xNorm * sumDeltaXNorm);
-                }
-            }
-        }
-
-        // Upload results to GPU buffers using hipMemcpy
-        var handle1 = GCHandle.Alloc(gradInputData, GCHandleType.Pinned);
-        try
-        {
-            var result = HipNativeBindings.hipMemcpy(
-                gradInput.Handle,
-                handle1.AddrOfPinnedObject(),
-                (UIntPtr)(gradInputData.Length * sizeof(float)),
-                HipMemcpyKind.HostToDevice);
-            HipNativeBindings.CheckError(result, "hipMemcpy H2D (InstanceNormBackward gradInput)");
-        }
-        finally
-        {
-            handle1.Free();
-        }
-
-        var handle2 = GCHandle.Alloc(gradGammaData, GCHandleType.Pinned);
-        try
-        {
-            var result = HipNativeBindings.hipMemcpy(
-                gradGamma.Handle,
-                handle2.AddrOfPinnedObject(),
-                (UIntPtr)(gradGammaData.Length * sizeof(float)),
-                HipMemcpyKind.HostToDevice);
-            HipNativeBindings.CheckError(result, "hipMemcpy H2D (InstanceNormBackward gradGamma)");
-        }
-        finally
-        {
-            handle2.Free();
-        }
-
-        var handle3 = GCHandle.Alloc(gradBetaData, GCHandleType.Pinned);
-        try
-        {
-            var result = HipNativeBindings.hipMemcpy(
-                gradBeta.Handle,
-                handle3.AddrOfPinnedObject(),
-                (UIntPtr)(gradBetaData.Length * sizeof(float)),
-                HipMemcpyKind.HostToDevice);
-            HipNativeBindings.CheckError(result, "hipMemcpy H2D (InstanceNormBackward gradBeta)");
-        }
-        finally
-        {
-            handle3.Free();
-        }
     }
 
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -5307,49 +5462,23 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
     {
-        if (!training)
-        {
-            // During inference, just copy input to output
-            Copy(input, output, size);
-            return;
-        }
-
-        // Generate mask using CPU and upload (GPU RNG would need additional kernel)
-        float scale = 1.0f / (1.0f - dropoutRate);
-        var rand = new Random((int)(seed % int.MaxValue));
-        var maskData = new float[size];
-        for (int i = 0; i < size; i++)
-            maskData[i] = rand.NextDouble() > dropoutRate ? 1.0f : 0.0f;
-
-        // Upload mask to GPU
-        fixed (float* ptr = maskData)
-        {
-            var result = HipNativeBindings.hipMemcpy(
-                mask.Handle, (IntPtr)ptr,
-                (UIntPtr)(size * sizeof(float)),
-                HipMemcpyKind.HostToDevice);
-            HipNativeBindings.CheckError(result, "hipMemcpy H2D (mask)");
-        }
-
-        if (!_kernelCache.TryGetValue("dropout_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: dropout_forward");
-
-            {
-            IntPtr _p0 = input.Handle;
-            IntPtr _p1 = output.Handle;
-            IntPtr _p2 = mask.Handle;
-            void** args = stackalloc void*[5];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &scale;
-            args[4] = &size;
-
-
-            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("dropout_dotnet_random_serial", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: dropout_dotnet_random_serial");
+        bool sharedOutputs = ReferenceEquals(output, mask);
+        bool maskAliasesInput = ReferenceEquals(mask, input);
+        using var outputTemporary = sharedOutputs ? AllocateBuffer(size) : null;
+        using var maskTemporary = sharedOutputs || maskAliasesInput ? AllocateBuffer(size) : null;
+        IGpuBuffer outputTarget = outputTemporary ?? output, maskTarget = maskTemporary ?? mask;
+        IntPtr inputPointer = input.Handle, outputPointer = outputTarget.Handle, maskPointer = maskTarget.Handle;
+        int seedValue = (int)(seed % int.MaxValue), trainingValue = training ? 1 : 0;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPointer; args[1] = &outputPointer; args[2] = &maskPointer; args[3] = &size;
+        args[4] = &dropoutRate; args[5] = &seedValue; args[6] = &trainingValue;
+        LaunchKernel(kernel, 1, 1, args);
+        Synchronize();
+        if (outputTemporary is not null) Copy(outputTemporary, output, size);
+        if (maskTemporary is not null) Copy(maskTemporary, mask, size);
     }
 
     public unsafe void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
@@ -5491,7 +5620,30 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
-        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the HIP backend.");
+    {
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer));
+
+        GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        try
+        {
+            var result = HipNativeBindings.hipMemcpy(
+                buffer.Handle,
+                handle.AddrOfPinnedObject(),
+                (UIntPtr)(data.Length * sizeof(int)),
+                HipMemcpyKind.HostToDevice);
+            HipNativeBindings.CheckError(result, "hipMemcpy H2D (in-place int upload)");
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
@@ -5947,105 +6099,140 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
     {
-        // Compute attention: softmax((Q @ K^T) * scale) @ V
-        int totalBatches = batch * numHeads;
-        int matrixSize = seqLen * headDim;
+        if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
+        if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: scaled_dot_product_attention");
 
-        // Allocate temporary buffers for Q @ K^T result (scores)
-        using var scores = AllocateBuffer(new float[totalBatches * seqLen * seqLen]);
-        using var keyT = AllocateBuffer(new float[totalBatches * headDim * seqLen]);
+        // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+        // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+        int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+        if (numHeads % kvHeads != 0)
+            throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
+        int querySize = checked(batch * numHeads * seqQ * headDim);
+        int keyValueSize = checked(batch * kvHeads * seqK * headDim);
+        int weightsSize = checked(batch * numHeads * seqQ * seqK);
+        if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
+            throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
+        if (attentionWeights is not null && attentionWeights.Size < weightsSize)
+            throw new ArgumentException("The attention-weights buffer is too small.", nameof(attentionWeights));
+        if (mask is not null && mask.Size < seqQ * seqK)
+            throw new ArgumentException("The attention mask must contain at least seqQ * seqK elements.", nameof(mask));
 
-        // Transpose K for each batch
-        BatchedTranspose(key, keyT, totalBatches, seqLen, headDim);
+        IntPtr queryPtr = query.Handle;
+        IntPtr keyPtr = key.Handle;
+        IntPtr valuePtr = value.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr weightsPtr = attentionWeights?.Handle ?? IntPtr.Zero;
+        IntPtr maskPtr = mask?.Handle ?? IntPtr.Zero;
+        int causalFlag = isCausal ? 1 : 0;
+        int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
+        int storeWeights = attentionWeights is null ? 0 : 1;
+        void** args = stackalloc void*[17];
+        args[0] = &queryPtr;
+        args[1] = &keyPtr;
+        args[2] = &valuePtr;
+        args[3] = &outputPtr;
+        args[4] = &weightsPtr;
+        args[5] = &maskPtr;
+        args[6] = &batch;
+        args[7] = &numHeads;
+        args[8] = &seqQ;
+        args[9] = &seqK;
+        args[10] = &headDim;
+        args[11] = &scale;
+        args[12] = &causalFlag;
+        args[13] = &maskMode;
+        args[14] = &storeWeights;
+        args[15] = &softcap;
+        args[16] = &kvHeads;
 
-        // Q @ K^T for each batch
-        for (int b = 0; b < totalBatches; b++)
-        {
-            int qOffset = b * matrixSize;
-            int kOffset = b * matrixSize;
-            int sOffset = b * seqLen * seqLen;
+        int rows = checked(batch * numHeads * seqQ);
+        uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        Synchronize();
+    }
 
-            // Use offset-based gemm or slice buffers
-            using var qSlice = AllocateBuffer(new float[seqLen * headDim]);
-            using var kSlice = AllocateBuffer(new float[headDim * seqLen]);
-            using var sSlice = AllocateBuffer(new float[seqLen * seqLen]);
+    public unsafe void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        if (!_kernelCache.TryGetValue("rope_interleaved", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: rope_interleaved");
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
 
-            Copy(query, qSlice, seqLen * headDim);
-            Copy(keyT, kSlice, headDim * seqLen);
-            Gemm(qSlice, kSlice, sSlice, seqLen, seqLen, headDim);
-            Scale(sSlice, sSlice, scale, seqLen * seqLen);
-            Softmax(sSlice, sSlice, seqLen, seqLen);
+        IntPtr inputPtr = input.Handle;
+        IntPtr cosPtr = cos.Handle;
+        IntPtr sinPtr = sin.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPtr;
+        args[1] = &cosPtr;
+        args[2] = &sinPtr;
+        args[3] = &outputPtr;
+        args[4] = &rows;
+        args[5] = &headDim;
+        args[6] = &seqLen;
+        args[7] = &startPosition;
 
-            // Store attention weights if requested
-            if (attentionWeights is not null)
-                Copy(sSlice, attentionWeights, seqLen * seqLen);
-
-            // scores @ V
-            using var outSlice = AllocateBuffer(new float[seqLen * headDim]);
-            using var vSlice = AllocateBuffer(new float[seqLen * headDim]);
-            Copy(value, vSlice, seqLen * headDim);
-            Gemm(sSlice, vSlice, outSlice, seqLen, headDim, seqLen);
-            Copy(outSlice, output, seqLen * headDim);
-        }
+        int pairs = checked(rows * (headDim / 2));
+        uint grid = (uint)((pairs + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        Synchronize();
     }
 
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
-        // Simplified backward pass using stored attention weights
-        int totalBatches = batch * numHeads;
+        if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
 
-        for (int b = 0; b < totalBatches; b++)
-        {
-            // gradValue = attentionWeights^T @ gradOutput
-            using var attnT = AllocateBuffer(new float[seqLen * seqLen]);
-            using var attnSlice = AllocateBuffer(new float[seqLen * seqLen]);
-            using var gradOutSlice = AllocateBuffer(new float[seqLen * headDim]);
-            using var gradVSlice = AllocateBuffer(new float[seqLen * headDim]);
+        int batchHeads = checked(batch * numHeads);
+        int matrixSize = checked(seqQ * seqK);
+        int querySize = checked(batchHeads * seqQ * headDim);
+        int keySize = checked(batchHeads * seqK * headDim);
+        int weightsSize = checked(batchHeads * matrixSize);
+        if (gradOutput.Size < querySize || query.Size < querySize || key.Size < keySize || value.Size < keySize ||
+            gradQuery.Size < querySize || gradKey.Size < keySize || gradValue.Size < keySize ||
+            attentionWeights.Size < weightsSize)
+            throw new ArgumentException("Attention backward buffers are smaller than the requested dimensions.");
 
-            Copy(attentionWeights, attnSlice, seqLen * seqLen);
-            Transpose(attnSlice, attnT, seqLen, seqLen);
-            Copy(gradOutput, gradOutSlice, seqLen * headDim);
-            Gemm(attnT, gradOutSlice, gradVSlice, seqLen, headDim, seqLen);
-            Copy(gradVSlice, gradValue, seqLen * headDim);
+        using var gradScores = AllocateBuffer(weightsSize);
+        using var softmaxGrad = AllocateBuffer(weightsSize);
+        using var attentionTransposed = AllocateBuffer(weightsSize);
+        using var valueTransposed = AllocateBuffer(keySize);
+        using var gradScoresTransposed = AllocateBuffer(weightsSize);
 
-            // gradQuery = (gradScores @ K) where gradScores = gradAttn * scale
-            using var gradScores = AllocateBuffer(new float[seqLen * seqLen]);
-            using var vSlice = AllocateBuffer(new float[seqLen * headDim]);
-            Copy(value, vSlice, seqLen * headDim);
-            using var vT = AllocateBuffer(new float[headDim * seqLen]);
-            Transpose(vSlice, vT, seqLen, headDim);
-            Gemm(gradOutSlice, vT, gradScores, seqLen, seqLen, headDim);
-
-            // Apply softmax backward
-            using var softmaxGrad = AllocateBuffer(new float[seqLen * seqLen]);
-            SoftmaxBackward(gradScores, attnSlice, softmaxGrad, seqLen, seqLen);
-            Scale(softmaxGrad, softmaxGrad, scale, seqLen * seqLen);
-
-            // gradQuery = gradScores @ K
-            using var kSlice = AllocateBuffer(new float[seqLen * headDim]);
-            using var gradQSlice = AllocateBuffer(new float[seqLen * headDim]);
-            Copy(key, kSlice, seqLen * headDim);
-            Gemm(softmaxGrad, kSlice, gradQSlice, seqLen, headDim, seqLen);
-            Copy(gradQSlice, gradQuery, seqLen * headDim);
-
-            // gradKey = gradScores^T @ Q
-            using var gradScoresT = AllocateBuffer(new float[seqLen * seqLen]);
-            Transpose(softmaxGrad, gradScoresT, seqLen, seqLen);
-            using var qSlice = AllocateBuffer(new float[seqLen * headDim]);
-            using var gradKSlice = AllocateBuffer(new float[seqLen * headDim]);
-            Copy(query, qSlice, seqLen * headDim);
-            Gemm(gradScoresT, qSlice, gradKSlice, seqLen, headDim, seqLen);
-            Copy(gradKSlice, gradKey, seqLen * headDim);
-        }
+        BatchedTranspose(attentionWeights, attentionTransposed, batchHeads, seqQ, seqK);
+        BatchedGemm(attentionTransposed, gradOutput, gradValue, seqK, headDim, seqQ, batchHeads);
+        BatchedTranspose(value, valueTransposed, batchHeads, seqK, headDim);
+        BatchedGemm(gradOutput, valueTransposed, gradScores, seqQ, seqK, headDim, batchHeads);
+        SoftmaxBackward(gradScores, attentionWeights, softmaxGrad, batchHeads * seqQ, seqK);
+        Scale(softmaxGrad, gradScores, scale, weightsSize);
+        BatchedGemm(gradScores, key, gradQuery, seqQ, headDim, seqK, batchHeads);
+        BatchedTranspose(gradScores, gradScoresTransposed, batchHeads, seqQ, seqK);
+        BatchedGemm(gradScoresTransposed, query, gradKey, seqK, headDim, seqQ, batchHeads);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
     {
+        if (mask is not null)
+        {
+            ScaledDotProductAttention(query, key, value, output, null, mask,
+                batch, numHeads, seqLen, seqLen, headDim, scale, isCausal);
+            return;
+        }
+
         // Allocate temporary buffer for softmax stats (not returned but required by FlashAttentionV2)
         using var softmaxStats = AllocateBuffer(batch * numHeads * seqLen);
 
@@ -6567,12 +6754,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend is not available.");
 
-        // Check for the kernel, if not available fall back to CPU implementation
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample", out var kernel))
-        {
-            NearestNeighborUpsampleFallback(input, output, batchChannels, height, width, scaleFactor);
-            return;
-        }
+            throw new InvalidOperationException("HIP kernel not found: nearest_neighbor_upsample");
 
         int outHeight = height * scaleFactor;
         int outWidth = width * scaleFactor;
@@ -6610,39 +6793,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
     }
 
-    /// <summary>
-    /// CPU fallback for nearest-neighbor upsampling when kernel is not available.
-    /// </summary>
-    private void NearestNeighborUpsampleFallback(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
-    {
-        int outHeight = height * scaleFactor;
-        int outWidth = width * scaleFactor;
-        int outputSize = batchChannels * outHeight * outWidth;
-
-        // Download input using existing method
-        var inputData = DownloadBuffer(input);
-
-        // Perform CPU upsampling
-        var outputData = new float[outputSize];
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            for (int oh = 0; oh < outHeight; oh++)
-            {
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int ih = oh / scaleFactor;
-                    int iw = ow / scaleFactor;
-                    int inputIdx = bc * height * width + ih * width + iw;
-                    int outputIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                    outputData[outputIdx] = inputData[inputIdx];
-                }
-            }
-        }
-
-        // Upload output using existing method
-        UploadToBuffer(output, outputData);
-    }
-
     /// <inheritdoc/>
     public unsafe void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
@@ -6654,10 +6804,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int inputSize = batchChannels * height * width;
 
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample_backward", out var kernel))
-        {
-            NearestNeighborUpsampleBackwardFallback(gradOutput, gradInput, batchChannels, height, width, scaleFactor);
-            return;
-        }
+            throw new InvalidOperationException("HIP kernel not found: nearest_neighbor_upsample_backward");
 
         // Grid size based on input elements (each thread handles one input element)
         int grid = (inputSize + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -6690,40 +6837,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (nearest_neighbor_upsample_backward)");
             }
         }
-    }
-
-    /// <summary>
-    /// CPU fallback for nearest-neighbor upsampling backward when kernel is not available.
-    /// </summary>
-    private void NearestNeighborUpsampleBackwardFallback(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
-    {
-        int outHeight = height * scaleFactor;
-        int outWidth = width * scaleFactor;
-        int outputSize = batchChannels * outHeight * outWidth;
-        int inputSize = batchChannels * height * width;
-
-        // Download gradOutput
-        var gradOutData = DownloadBuffer(gradOutput);
-
-        // Accumulate gradients on CPU
-        var gradInData = new float[inputSize];
-        for (int bc = 0; bc < batchChannels; bc++)
-        {
-            for (int oh = 0; oh < outHeight; oh++)
-            {
-                for (int ow = 0; ow < outWidth; ow++)
-                {
-                    int ih = oh / scaleFactor;
-                    int iw = ow / scaleFactor;
-                    int inputIdx = bc * height * width + ih * width + iw;
-                    int outputIdx = bc * outHeight * outWidth + oh * outWidth + ow;
-                    gradInData[inputIdx] += gradOutData[outputIdx];
-                }
-            }
-        }
-
-        // Upload gradInput
-        UploadToBuffer(gradInput, gradInData);
     }
 
     #endregion
@@ -6829,7 +6942,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("cross_entropy_loss", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: cross_entropy_loss");
 
-        using var lossBuffer = AllocateBuffer(new float[batchSize]);
+        using var lossBuffer = AllocateBuffer(batchSize);
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -6848,11 +6961,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             Synchronize();
             }
 
-        var lossData = new float[batchSize];
-        DownloadBuffer(lossBuffer, lossData);
-        float sum = 0;
-        for (int i = 0; i < batchSize; i++) sum += lossData[i];
-        return sum / batchSize;
+        return Sum(lossBuffer, batchSize) / batchSize;
     }
 
     public unsafe void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
@@ -6884,7 +6993,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("bce_loss", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: bce_loss");
 
-        using var lossBuffer = AllocateBuffer(new float[size]);
+        using var lossBuffer = AllocateBuffer(size);
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -6902,11 +7011,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             Synchronize();
             }
 
-        var lossData = new float[size];
-        DownloadBuffer(lossBuffer, lossData);
-        float sum = 0;
-        for (int i = 0; i < size; i++) sum += lossData[i];
-        return sum / size;
+        return Sum(lossBuffer, size) / size;
     }
 
     public unsafe void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
@@ -6922,7 +7027,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("mse_loss", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: mse_loss");
 
-        using var lossBuffer = AllocateBuffer(new float[size]);
+        using var lossBuffer = AllocateBuffer(size);
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -6940,11 +7045,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             Synchronize();
             }
 
-        var lossData = new float[size];
-        DownloadBuffer(lossBuffer, lossData);
-        float sum = 0;
-        for (int i = 0; i < size; i++) sum += lossData[i];
-        return sum / size;
+        return Sum(lossBuffer, size) / size;
     }
 
     public unsafe void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
@@ -6960,7 +7061,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("smooth_l1_loss", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: smooth_l1_loss");
 
-        using var lossBuffer = AllocateBuffer(new float[size]);
+        using var lossBuffer = AllocateBuffer(size);
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -6979,11 +7080,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             Synchronize();
             }
 
-        var lossData = new float[size];
-        DownloadBuffer(lossBuffer, lossData);
-        float sum = 0;
-        for (int i = 0; i < size; i++) sum += lossData[i];
-        return sum / size;
+        return Sum(lossBuffer, size) / size;
     }
 
     public unsafe void SmoothL1Backward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float beta)
@@ -7041,10 +7138,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             Synchronize();
             }
 
-        float[] lossData = DownloadBuffer(lossBuffer);
-        float sum = 0;
-        for (int i = 0; i < batchSize; i++) sum += lossData[i];
-        return sum / batchSize;
+        return Sum(lossBuffer, batchSize) / batchSize;
     }
 
     public unsafe void TripletLossBackward(IGpuBuffer anchor, IGpuBuffer positive, IGpuBuffer negative,
@@ -7892,14 +7986,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("l2_norm_squared", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: l2_norm_squared");
 
-        using var squaredBuffer = AllocateBuffer(new float[size]);
+        using var squaredBuffer = AllocateBuffer(size);
         LaunchElementwiseOp(krnl, A.Handle, squaredBuffer.Handle, size);
 
-        var data = new float[size];
-        DownloadBuffer(squaredBuffer, data);
-        float sum = 0;
-        for (int i = 0; i < size; i++) sum += data[i];
-        return (float)Math.Sqrt(sum);
+        return MathF.Sqrt(Math.Max(0.0f, Sum(squaredBuffer, size)));
     }
 
     public void ClipByValue(IGpuBuffer A, IGpuBuffer B, float clipValue, int size)
@@ -7909,16 +7999,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ClipByNorm(IGpuBuffer A, IGpuBuffer B, float maxNorm, int size)
     {
-        float norm = L2Norm(A, size);
-        if (norm > maxNorm)
-        {
-            float scale = maxNorm / norm;
-            Scale(A, B, scale, size);
-        }
-        else
-        {
-            Copy(A, B, size);
-        }
+        if (!_kernelCache.TryGetValue("l2_norm_squared", out var squareKernel))
+            throw new InvalidOperationException("HIP kernel not found: l2_norm_squared");
+        if (!_kernelCache.TryGetValue("clip_by_norm_from_squared_sum", out var clipKernel))
+            throw new InvalidOperationException("HIP kernel not found: clip_by_norm_from_squared_sum");
+        using var squared = AllocateBuffer(size);
+        using var squaredSum = AllocateBuffer(1);
+        LaunchElementwiseOp(squareKernel, A.Handle, squared.Handle, size);
+        SumAxis(squared, squaredSum, 1, size);
+        IntPtr inputPointer = A.Handle, sumPointer = squaredSum.Handle, outputPointer = B.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPointer; args[1] = &sumPointer; args[2] = &outputPointer; args[3] = &maxNorm; args[4] = &size;
+        LaunchKernel(clipKernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        Synchronize();
     }
 
     public unsafe void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
@@ -8001,115 +8094,31 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
         if (size <= 1) return 0.0f;
 
-        const int blockSize = 256;
-        int gridSize = (size + blockSize - 1) / blockSize;
-
-        // Step 1: Compute mean via GPU reduction.
-        // Issue #382: deterministic variant is single-block strided reduce and writes
-        // mean/size directly; atomic variant writes raw sum (caller divides).
-        float mean;
-        string meanKernelName = GpuDeterminism.IsActive ? "reduce_mean_kernel_deterministic" : "reduce_mean_kernel";
-        if (_kernelCache.TryGetValue(meanKernelName, out var meanKernel))
-        {
-            var zeroData = new float[1];
-            using var meanBuffer = AllocateBuffer(zeroData);
-
-            IntPtr _p0 = input.Handle;
-            IntPtr _p1 = meanBuffer.Handle;
-            void** meanArgs = stackalloc void*[3];
-            meanArgs[0] = &_p0;
-            meanArgs[1] = &_p1;
-            meanArgs[2] = &size;
-
-            uint sharedBytes = (uint)(blockSize * sizeof(float));
-            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
-            LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, meanArgs);
-            Synchronize();
-
-            float[] meanResult = DownloadBuffer(meanBuffer);
-            // Both kernels now write the raw sum; normalize once on the host so
-            // deterministic and non-deterministic paths agree (CodeRabbit PR #390).
-            mean = meanResult[0] / size;
-        }
-        else
-        {
-            mean = Sum(input, size) / size;
-        }
-
-        // Step 2: Compute variance via GPU reduction
-        float variance;
-        string varKernelName = GpuDeterminism.IsActive ? "reduce_variance_kernel_deterministic" : "reduce_variance_kernel";
-        if (_kernelCache.TryGetValue(varKernelName, out var varKernel))
-        {
-            var zeroData = new float[1];
-            using var varianceBuffer = AllocateBuffer(zeroData);
-
-            IntPtr _p0 = input.Handle;
-            IntPtr _p1 = varianceBuffer.Handle;
-            void** varArgs = stackalloc void*[4];
-            varArgs[0] = &_p0;
-            varArgs[1] = &_p1;
-            varArgs[2] = &mean;
-            varArgs[3] = &size;
-
-            uint sharedBytes = (uint)(blockSize * sizeof(float));
-            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
-            LaunchKernelWithSharedMem(varKernel, launchGrid, (uint)blockSize, sharedBytes, varArgs);
-            Synchronize();
-
-            float[] varResult = DownloadBuffer(varianceBuffer);
-            variance = varResult[0] / size;
-        }
-        else
-        {
-            // Fallback: download and compute on CPU
-            float[] data = DownloadBuffer(input);
-            float varSum = 0.0f;
-            for (int i = 0; i < size; i++)
-            {
-                float diff = data[i] - mean;
-                varSum += diff * diff;
-            }
-            variance = varSum / size;
-        }
-
-        // Clamp variance to avoid NaN from floating-point round-off
-        variance = Math.Max(0, variance);
-        return MathF.Sqrt(variance);
+        using var mean = AllocateBuffer(1);
+        using var squaredDeviations = AllocateBuffer(size);
+        SumAxis(input, mean, 1, size);
+        Scale(mean, mean, 1.0f / size, 1);
+        if (!_kernelCache.TryGetValue("squared_deviation_from_mean", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: squared_deviation_from_mean");
+        IntPtr inputPointer = input.Handle, meanPointer = mean.Handle, outputPointer = squaredDeviations.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPointer; args[1] = &meanPointer; args[2] = &outputPointer; args[3] = &size;
+        LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        Synchronize();
+        float variance = Sum(squaredDeviations, size) / size;
+        return MathF.Sqrt(Math.Max(0.0f, variance));
     }
 
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
-        // CPU fallback for HIP scatter (no dedicated kernel yet). The caller passes an
-        // INT buffer for `indices` (AllocateIntBuffer in the wrapper); the previous code
-        // downloaded that buffer into a `float[]` and then did `(int)idxData[i]` — which
-        // bit-reinterpreted each int as a float, producing a denormal-near-zero value
-        // that truncated to 0 on the cast. Every update then accumulated at dest[0]
-        // (max_abs_err ≈ sourceSize × meanUpdate in the differential test).
-        //
-        // Fix: download into a float[] (HIP doesn't expose a typed int download today,
-        // but int and float are both 4 bytes so the underlying bit pattern is identical)
-        // then Buffer.BlockCopy the bytes into an int[] so we read the original index
-        // bit pattern instead of float-casting it. Destination is seeded by the wrapper
-        // via backend.Copy(destination, output) and this routine ACCUMULATES on top.
-        var srcData = new float[sourceSize];
-        var idxRaw = new float[sourceSize];     // raw transport — same 4-byte width as int
-        var idxData = new int[sourceSize];
-        var dstData = new float[destSize];
-
-        DownloadBuffer(source, srcData);
-        DownloadBuffer(indices, idxRaw);
-        System.Buffer.BlockCopy(idxRaw, 0, idxData, 0, sourceSize * sizeof(int));
-        DownloadBuffer(destination, dstData);
-
-        for (int i = 0; i < sourceSize; i++)
-        {
-            int idx = idxData[i];
-            if (idx >= 0 && idx < destSize)
-                dstData[idx] += srcData[i];
-        }
-
-        UploadToBuffer(destination, dstData);
+        if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: scatter_add_accumulate_deterministic");
+        IntPtr sourcePointer = source.Handle, indexPointer = indices.Handle, destinationPointer = destination.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &sourcePointer; args[1] = &indexPointer; args[2] = &destinationPointer;
+        args[3] = &sourceSize; args[4] = &destSize;
+        LaunchKernel(kernel, (uint)((destSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        Synchronize();
     }
 
     public unsafe void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
@@ -8229,7 +8238,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
     {
         var kernel = ResolveParity210Kernel("parity210_index_write");
-        int __total = outerSize*idxAxis*innerSize; if (__total <= 0) return;
+        int __total = outerSize*dstAxis*innerSize; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = output.Handle; IntPtr la1 = indices.Handle; IntPtr la2 = source.Handle; float la3 = fillValue; int la4 = mode; int la5 = outerSize; int la6 = idxAxis; int la7 = innerSize; int la8 = dstAxis;
         void** args = stackalloc void*[9];
@@ -8303,14 +8312,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
-    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
         int __total = batch*numHeads; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
-        void** args = stackalloc void*[12];
-        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        IntPtr la0 = r.Handle; IntPtr la1 = kappa.Handle; IntPtr la2 = kTilde.Handle; IntPtr la3 = v.Handle; IntPtr la4 = decayLogit.Handle; IntPtr la5 = iclRate.Handle; IntPtr la6 = output.Handle; IntPtr la7 = sbuf.Handle; int la8 = batch; int la9 = seqLen; int la10 = modelDim; int la11 = numHeads; int la12 = headDim;
+        void** args = stackalloc void*[13];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11; args[12] = &la12;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
@@ -8427,7 +8436,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
     {
         var kernel = ResolveParity210Kernel("parity210_istft_from_spectrum");
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = batch*outputLength; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = specRe.Handle; IntPtr la1 = specIm.Handle; IntPtr la2 = window.Handle; IntPtr la3 = result.Handle; IntPtr la4 = windowSum.Handle; int la5 = batch; int la6 = numFrames; int la7 = nFft; int la8 = hop; int la9 = outputLength; int la10 = center;
         void** args = stackalloc void*[11];
@@ -8992,8 +9001,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new InvalidOperationException("HIP backend not available");
 
         // Copy input to output buffers for in-place operation
-        HipCopyBuffer(inputReal, outputReal, n);
-        HipCopyBuffer(inputImag, outputImag, n);
+        if (inputReal.Handle != outputReal.Handle)
+            HipCopyBuffer(inputReal, outputReal, n);
+        if (inputImag.Handle != outputImag.Handle)
+            HipCopyBuffer(inputImag, outputImag, n);
 
         int log2n = (int)Math.Log(n, 2);
 
@@ -9042,17 +9053,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/N for inverse FFT
+        // Scale by 1/n for inverse FFT (n elements, factor 1/n).
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / n;
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &n;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9209,7 +9222,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/N for inverse FFT (batched)
+        // Scale batched inverse: touch batch*n elements but scale each by 1/n (NOT 1/(batch*n)).
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             int total = batch * n;
@@ -9217,10 +9230,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / n;   // per-transform length, NOT 1/(batch*n)
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &total;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9246,17 +9261,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         HipCopyBuffer(inputReal, outputReal, total);
         HipCopyBuffer(inputImag, outputImag, total);
 
-        // Row-wise bit reversal and FFT
-        if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel) &&
+        // Row-wise bit reversal (DIT operates on bit-reversed input) then row butterflies. The previous
+        // code left an EMPTY per-row loop here (no bit reversal at all), so the DIT butterflies ran on
+        // un-permuted data and the whole 2D FFT produced garbage. Now each row is bit-reversed first.
+        if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowsBitRevKernel) &&
             _kernelCache.TryGetValue("fft_rows_butterfly", out var rowsButterflyKernel))
         {
-            // Bit reversal for each row (using batched approach)
-            for (int row = 0; row < height; row++)
-            {
-                int offset = row * width;
-                // Note: For production, we should use offset buffers or batched kernel
-                // This is a simplified version that operates row by row
-            }
+                {
+                uint gridBrX = (uint)((width + DefaultBlockSize - 1) / DefaultBlockSize);
+                uint gridBrY = (uint)height;
+                IntPtr _b0 = outputReal.Handle;
+                IntPtr _b1 = outputImag.Handle;
+#pragma warning disable CA2014
+                void** brArgs = stackalloc void*[5];
+#pragma warning restore CA2014
+                brArgs[0] = &_b0;
+                brArgs[1] = &_b1;
+                brArgs[2] = &height;
+                brArgs[3] = &width;
+                brArgs[4] = &log2Width;
+                LaunchKernel2D(rowsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+                }
 
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= width; stride *= 2)
@@ -9282,9 +9307,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Column-wise FFT
+        // Column-wise bit reversal then column butterflies (same missing-bit-reversal fix as the rows).
         if (_kernelCache.TryGetValue("fft_cols_butterfly", out var colsButterflyKernel))
         {
+            if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colsBitRevKernel))
+            {
+                uint gridBrX = (uint)((height + DefaultBlockSize - 1) / DefaultBlockSize);
+                uint gridBrY = (uint)width;
+                IntPtr _b0 = outputReal.Handle;
+                IntPtr _b1 = outputImag.Handle;
+#pragma warning disable CA2014
+                void** brArgs = stackalloc void*[5];
+#pragma warning restore CA2014
+                brArgs[0] = &_b0;
+                brArgs[1] = &_b1;
+                brArgs[2] = &height;
+                brArgs[3] = &width;
+                brArgs[4] = &log2Height;
+                LaunchKernel2D(colsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+            }
+
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= height; stride *= 2)
             {
@@ -9311,17 +9353,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/(height*width) for inverse FFT
+        // Scale by 1/(height*width) for inverse 2D FFT.
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint gridSize = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / total;   // 2D transform length = height*width
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &total;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9795,6 +9839,28 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void FusedGemmBiasActivationAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
         int M, int N, int K, FusedActivationType activation, IGpuStream stream)
     {
+        // Softmax is row-wise; the old default SILENTLY applied ReLU instead (wrong distribution).
+        // GEMM+bias then per-row softmax over [M, N]. Parity fix from OpenCL; unverified on ROCm hardware.
+        if (activation == FusedActivationType.Softmax)
+        {
+            // GemmBias and the softmax kernel both run on the backend's DEFAULT stream, not `stream`.
+            // To preserve ordering w.r.t. the caller's stream, drain it first (so prior writes to
+            // A/B/bias complete before GemmBias reads them), then fully synchronize after so the result
+            // in `output` is ready on return — a subsequent SynchronizeStream(stream) is then a no-op.
+            SynchronizeStream(stream);
+            var gemmBias = GemmBias(A, B, bias, M, N, K);
+            try
+            {
+                Softmax(gemmBias, output, M, N);
+            }
+            finally
+            {
+                gemmBias.Dispose();   // release the temp even if Softmax throws
+            }
+            Synchronize();
+            return;
+        }
+
         // Map activation type to appropriate kernel
         string kernelName = activation switch
         {
@@ -9992,6 +10058,23 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void GenerateStatelessDropoutMask(
+        IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+    {
+        if (!_kernelCache.TryGetValue("stateless_dropout_mask", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: stateless_dropout_mask");
+
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &outputPtr;
+        args[1] = &size;
+        args[2] = &threshold;
+        args[3] = &scale;
+        args[4] = &seed;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
@@ -10007,15 +10090,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         if (size <= 0) return;
-        var data = new float[size];
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-            float range = max - min;
-            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-            UploadToBuffer(output, data);
-        }
-        finally { Array.Clear(data, 0, size); }
+        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
     }
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
@@ -10160,22 +10235,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
-    // Maximum dimension supported by hyperbolic kernels (due to shared memory limits)
-    private const int HyperbolicMaxDim = 128;
-
     public unsafe void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
-        // Validate dimension limits - kernel will silently clamp dimensions > 128
-        if (inputFeatures > HyperbolicMaxDim)
-            throw new ArgumentOutOfRangeException(nameof(inputFeatures),
-                $"HyperbolicLinearForward requires inputFeatures <= {HyperbolicMaxDim}. Got {inputFeatures}.");
-        if (outputFeatures > HyperbolicMaxDim)
-            throw new ArgumentOutOfRangeException(nameof(outputFeatures),
-                $"HyperbolicLinearForward requires outputFeatures <= {HyperbolicMaxDim}. Got {outputFeatures}.");
-
-        if (!_kernelCache.TryGetValue("hyperbolic_linear_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_forward");
+        if (!_kernelCache.TryGetValue("hyperbolic_linear_euclidean_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_euclidean_forward");
 
         int totalThreads = batchSize * outputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10199,20 +10263,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             LaunchKernel(kernel, grid, DefaultBlockSize, args);
             Synchronize();
             }
+        PoincareProject(output, output, batchSize, outputFeatures, curvature, epsilon);
     }
 
     /// <inheritdoc/>
     public unsafe void HyperbolicLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // Validate dimension limits - kernel will silently clamp dimensions > 128
-        if (inputFeatures > HyperbolicMaxDim)
-            throw new ArgumentOutOfRangeException(nameof(inputFeatures),
-                $"HyperbolicLinearBackwardInput requires inputFeatures <= {HyperbolicMaxDim}. Got {inputFeatures}.");
-        if (outputFeatures > HyperbolicMaxDim)
-            throw new ArgumentOutOfRangeException(nameof(outputFeatures),
-                $"HyperbolicLinearBackwardInput requires outputFeatures <= {HyperbolicMaxDim}. Got {outputFeatures}.");
-
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_input", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_backward_input");
 
@@ -10243,14 +10300,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void HyperbolicLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        // Validate dimension limits - kernel will silently clamp dimensions > 128
-        if (inputFeatures > HyperbolicMaxDim)
-            throw new ArgumentOutOfRangeException(nameof(inputFeatures),
-                $"HyperbolicLinearBackwardWeights requires inputFeatures <= {HyperbolicMaxDim}. Got {inputFeatures}.");
-        if (outputFeatures > HyperbolicMaxDim)
-            throw new ArgumentOutOfRangeException(nameof(outputFeatures),
-                $"HyperbolicLinearBackwardWeights requires outputFeatures <= {HyperbolicMaxDim}. Got {outputFeatures}.");
-
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_weights", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_backward_weights");
 
@@ -11076,6 +11125,24 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipNativeBindings.hipModuleUnload(_fusedModule);
             _fusedModule = IntPtr.Zero;
         }
+
+        if (_quantGemmModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_quantGemmModule);
+            _quantGemmModule = IntPtr.Zero;
+        }
+
+        if (_pagedAttnModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_pagedAttnModule);
+            _pagedAttnModule = IntPtr.Zero;
+        }
+
+        if (_flashDecodeModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_flashDecodeModule);
+            _flashDecodeModule = IntPtr.Zero;
+        }
         if (_attentionModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_attentionModule);
@@ -11208,6 +11275,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 HipNativeBindings.hipModuleUnload(modRef);
         }
         _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
+
+        // Unload the fused ANN kernel module (IAnnBackend).
+        if (_annModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_annModule);
+            _annModule = IntPtr.Zero;
+        }
 
         // Unload all additional kernel modules
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })
@@ -11346,6 +11420,106 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        if (!_kernelCache.TryGetValue("adam_bf16_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: adam_bf16_update");
+
+            {
+            IntPtr _p0 = param.Handle;
+            IntPtr _p1 = gradient.Handle;
+            IntPtr _p2 = m.Handle;
+            IntPtr _p3 = v.Handle;
+            void** args = stackalloc void*[11];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &learningRate;
+            args[5] = &beta1;
+            args[6] = &beta2;
+            args[7] = &epsilon;
+            args[8] = &weightDecay;
+            args[9] = &step;
+            args[10] = &size;
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    public unsafe void AdamWUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
+    {
+        if (!_kernelCache.TryGetValue("adamw_bf16_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: adamw_bf16_update");
+
+            {
+            IntPtr _p0 = param.Handle;
+            IntPtr _p1 = gradient.Handle;
+            IntPtr _p2 = m.Handle;
+            IntPtr _p3 = v.Handle;
+            void** args = stackalloc void*[11];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &learningRate;
+            args[5] = &beta1;
+            args[6] = &beta2;
+            args[7] = &epsilon;
+            args[8] = &weightDecay;
+            args[9] = &step;
+            args[10] = &size;
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        if (!_kernelCache.TryGetValue("adam8bit_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: adam8bit_update");
+
+            {
+            IntPtr _p0 = param.Handle;
+            IntPtr _p1 = gradient.Handle;
+            IntPtr _p2 = mQuant.Handle;
+            IntPtr _p3 = vQuant.Handle;
+            IntPtr _p4 = mScales.Handle;
+            IntPtr _p5 = vScales.Handle;
+            void** args = stackalloc void*[17];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &_p4;
+            args[5] = &_p5;
+            args[6] = &learningRate;
+            args[7] = &beta1;
+            args[8] = &beta2;
+            args[9] = &epsilon;
+            args[10] = &oneMinusBeta1;
+            args[11] = &oneMinusBeta2;
+            args[12] = &biasCorrection1;
+            args[13] = &biasCorrection2;
+            args[14] = &blockSize;
+            args[15] = &paramLength;
+            args[16] = &numBlocks;
+
+            LaunchKernel(krnl, (uint)numBlocks, 256u, args);
             Synchronize();
             }
     }
@@ -11671,6 +11845,30 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[6] = &l2Reg;
             args[7] = &beta;
             args[8] = &size;
+
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+            }
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        if (!_kernelCache.TryGetValue("proximal_l1_update", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: proximal_l1_update");
+
+            {
+            IntPtr _p0 = ((HipGpuBuffer)param).Handle;
+            IntPtr _p1 = ((HipGpuBuffer)gradient).Handle;
+            void** args = stackalloc void*[5];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &learningRate;
+            args[3] = &l1Strength;
+            args[4] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);

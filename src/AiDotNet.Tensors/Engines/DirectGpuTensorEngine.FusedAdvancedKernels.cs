@@ -49,16 +49,14 @@ public partial class DirectGpuTensorEngine
                 var gb = UploadTensorRaw(backend, baseOutput);
                 var ga = UploadTensorRaw(backend, loraA);
                 var glb = UploadTensorRaw(backend, loraB);
-                var go = backend.AllocateBuffer(batch * outFeat);
+                var go = GetOrCreateResidentBuffer(backend, output, batch * outFeat);
                 fusedBackend.FusedLoRAForward(gi, gb, ga, glb, go, batch, inFeat, rank, outFeat, scaling);
-                // Download directly into the caller's destination instead of
-                // allocating a new tensor and copying.
-                DownloadGpuBufferInto(backend, new OwnedBuffer(go, ownsBuffer: true),
-                    (float[])(object)output.GetDataArray(), batch * outFeat);
+                BindResidentBuffer(output, go, backend);
                 return;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
+                if (ThrowOnGpuKernelFallback) throw;
                 // CPU fallback — preserves correctness when GPU dispatch fails.
                 LogGpuFallback(nameof(FusedLoRAForwardInto), ex);
             }
@@ -110,14 +108,14 @@ public partial class DirectGpuTensorEngine
             {
                 var gx = UploadTensorRaw(backend, xT);
                 var ge = UploadTensorRaw(backend, epsilonTheta);
-                var go = backend.AllocateBuffer(xT.Length);
+                var go = GetOrCreateResidentBuffer(backend, output, xT.Length);
                 fusedBackend.FusedDDIMStep(gx, ge, go, xT.Length, alphaBarT, alphaBarTMinus1);
-                DownloadGpuBufferInto(backend, new OwnedBuffer(go, ownsBuffer: true),
-                    (float[])(object)output.GetDataArray(), xT.Length);
+                BindResidentBuffer(output, go, backend);
                 return;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
+                if (ThrowOnGpuKernelFallback) throw;
                 LogGpuFallback(nameof(FusedDDIMStepInto), ex);
             }
         }
@@ -170,18 +168,18 @@ public partial class DirectGpuTensorEngine
                     ? new OwnedBuffer(backend.AllocateBuffer(new[] { 0f }), true)
                     : default;
                 var gb = bias is null ? zeroBias.Buffer : UploadTensorRaw(backend, bias);
-                var go = backend.AllocateBuffer(batch * outFeat);
+                var go = GetOrCreateResidentBuffer(backend, output, batch * outFeat);
 
                 fusedBackend.FusedSparseLinear(
                     gi, csr.Buffer, gv, gb, go,
                     batch, inFeat, outFeat, nnz, bias is null ? 0 : 1, (int)activation);
 
-                DownloadGpuBufferInto(backend, new OwnedBuffer(go, ownsBuffer: true),
-                    (float[])(object)output.GetDataArray(), batch * outFeat);
+                BindResidentBuffer(output, go, backend);
                 return;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
+                if (ThrowOnGpuKernelFallback) throw;
                 LogGpuFallback(nameof(FusedSparseLinearInto), ex);
             }
         }

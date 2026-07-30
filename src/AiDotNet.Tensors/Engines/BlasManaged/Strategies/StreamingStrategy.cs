@@ -1,7 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
-using AiDotNet.Tensors.Engines.BlasManaged.Pool;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
@@ -73,13 +72,13 @@ internal static class StreamingStrategy
             return;
         }
 
-        // Sub-G #375 (Layer B): M-axis + MN_2D fallback through
-        // StreamingWorkerPool. AxisSelector picks MN_2D for shapes where
+        // Sub-G #375 (Layer B): M-axis + MN_2D fallback through the
+        // persistent worker pool. AxisSelector picks MN_2D for shapes where
         // neither M nor N reaches the procs×{mr,nr}×2 gate (e.g. 64×64×64
         // FP64 at procs=16). The MN_2D path falls through to M-axis since
         // C[m,n] row-slicing has disjoint writes and matches the
         // RunNParallel column-disjoint contract on the other axis.
-        // StreamingWorkerPool's sub-µs dispatch latency makes this win
+        // The persistent pool's sub-µs dispatch latency makes this win
         // even at tiny shapes (the earlier TPL-Parallel.For prototype
         // was net-zero on 64³ because dispatch overhead ≈ compute).
         if ((axis == ParallelismAxis.M || axis == ParallelismAxis.MN_2D)

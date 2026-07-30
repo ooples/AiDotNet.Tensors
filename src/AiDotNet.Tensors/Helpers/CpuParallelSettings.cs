@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -23,12 +26,102 @@ public static class CpuParallelSettings
     /// </remarks>
     public static int MaxDegreeOfParallelism { get; set; } = Environment.ProcessorCount;
 
+    // #475 thread-scaling: FMA-bound GEMM gets nothing from SMT and the 2nd-thread contention HURTS
+    // (measured: ffn scaling peaks at 16 physical cores, regresses at 24/32). GEMM fan-out should cap
+    // at PHYSICAL cores, not the logical Environment.ProcessorCount. Detected once; any failure falls
+    // back to the logical count (no cap — safe). Other (memory-bound) ops keep the logical count.
+    private static int _physicalCores;
+
+    /// <summary>Physical (non-SMT) core count; falls back to <see cref="Environment.ProcessorCount"/>
+    /// on any detection failure. Cached after first use.</summary>
+    public static int PhysicalCoreCount
+    {
+        get
+        {
+            if (_physicalCores == 0) _physicalCores = DetectPhysicalCores();
+            return _physicalCores;
+        }
+    }
+
+    /// <summary>GEMM fan-out cap at <see cref="PhysicalCoreCount"/>. DEFAULT OFF — a clean same-process
+    /// A/B measured it as a LOSS (medium 0.77×, ffn 0.91×): more threads beat fewer even on a 16-physical
+    /// box, so FMA-bound GEMM is NOT SMT-oversubscribed here (the noisy scaling curve that suggested it
+    /// was wrong). Kept as a knob; the detection is reused elsewhere.</summary>
+    public static bool CapGemmAtPhysicalCores { get; set; } = false;
+
+    /// <summary>The thread count the GEMM strategies should fan out to: the requested count capped at
+    /// physical cores when <see cref="CapGemmAtPhysicalCores"/> (FMA-bound work hates SMT).</summary>
+    public static int GemmThreadCount(int requested)
+        => CapGemmAtPhysicalCores ? Math.Min(requested, PhysicalCoreCount) : requested;
+
+    private static int DetectPhysicalCores()
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return DetectPhysicalCoresWindows();
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return DetectPhysicalCoresLinux();
+        }
+        catch { /* any failure → no cap */ }
+        return Environment.ProcessorCount;
+    }
+
     /// <summary>
-    /// Worker-thread count for the library's persistent custom thread pools (PersistentParallelExecutor,
-    /// StreamingWorkerPool, CooperativeGemmScheduler). Honors <see cref="MaxDegreeOfParallelism"/> and clamps to
-    /// a ceiling so a high-core box (e.g. 64 logical processors) does NOT spawn ~63 threads PER pool — three such
-    /// pools at 63 each = ~189 mostly-parked threads of pure oversubscription tax. Each pool reads this once at
-    /// construction. Override the ceiling with AIDOTNET_POOL_THREADS.
+    /// Value of <see cref="SystemLogicalProcessorInformation.Relationship"/> that denotes a physical
+    /// processor core (Win32 <c>LOGICAL_PROCESSOR_RELATIONSHIP.RelationProcessorCore</c>). Encodes the
+    /// native interop contract instead of testing the raw <c>0</c> in the scan loop.
+    /// </summary>
+    private const int RelationProcessorCore = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SystemLogicalProcessorInformation
+    {
+        public UIntPtr ProcessorMask;
+        public int Relationship;   // RelationProcessorCore
+        private readonly int _pad;
+        private readonly ulong _u0, _u1; // union (16 bytes)
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetLogicalProcessorInformation(IntPtr buffer, ref uint returnLength);
+
+    private static unsafe int DetectPhysicalCoresWindows()
+    {
+        uint len = 0;
+        GetLogicalProcessorInformation(IntPtr.Zero, ref len); // probe size (expected to "fail" with len set)
+        if (len == 0) return Environment.ProcessorCount;
+        int structSize = Marshal.SizeOf<SystemLogicalProcessorInformation>();
+        IntPtr buf = Marshal.AllocHGlobal((int)len);
+        try
+        {
+            if (!GetLogicalProcessorInformation(buf, ref len)) return Environment.ProcessorCount;
+            int n = (int)(len / structSize), cores = 0;
+            var p = (SystemLogicalProcessorInformation*)buf;
+            for (int i = 0; i < n; i++) if (p[i].Relationship == RelationProcessorCore) cores++;
+            return cores > 0 ? cores : Environment.ProcessorCount;
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    /// <summary>Linux file that lists per-logical-processor topology used for physical-core counting.</summary>
+    private const string LinuxCpuInfoPath = "/proc/cpuinfo";
+
+    private static int DetectPhysicalCoresLinux()
+    {
+        var seen = new HashSet<string>();
+        string phys = "";
+        foreach (var line in File.ReadLines(LinuxCpuInfoPath))
+        {
+            if (line.StartsWith("physical id", StringComparison.Ordinal)) phys = line;
+            else if (line.StartsWith("core id", StringComparison.Ordinal)) seen.Add(phys + "|" + line);
+        }
+        return seen.Count > 0 ? seen.Count : Environment.ProcessorCount;
+    }
+
+    /// <summary>
+    /// Worker-thread count for the library's persistent custom thread pool (PersistentParallelExecutor).
+    /// Honors <see cref="MaxDegreeOfParallelism"/> and clamps to a ceiling so a high-core box (e.g. 64
+    /// logical processors) does NOT spawn ~63 mostly-parked worker threads of pure oversubscription tax.
+    /// The pool reads this once at construction. Override the ceiling with AIDOTNET_POOL_THREADS.
     /// </summary>
     public static int WorkerPoolThreads
     {
@@ -179,15 +272,18 @@ public static class CpuParallelSettings
 
         int chunkSize = (length + numChunks - 1) / numChunks;
 
-        Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
+        // Persistent-pool dispatch: the benchmark-proven winner (ParallelPrimitiveBench)
+        // over both raw Parallel.For and the since-removed cooperative-scheduler path — parked
+        // workers wake with near-zero latency (adaptive keep-warm, PR #762). Disjoint
+        // [start,count) chunks ⇒ bit-identical to Parallel.For. The A/B / kill-switch
+        // (AIDOTNET_COOP_POOL=0 → raw Parallel.For) now lives in ONE place inside
+        // PersistentParallelExecutor.Execute, so this call site has a single path.
+        PersistentParallelExecutor.Instance.Execute(numChunks, i =>
         {
             using var _region = EnterParallelRegion();
             int start = i * chunkSize;
             int count = Math.Min(chunkSize, length - start);
-            if (count > 0)
-            {
-                action(start, count);
-            }
+            if (count > 0) action(start, count);
         });
     }
 
@@ -217,13 +313,17 @@ public static class CpuParallelSettings
             for (int p = 0; p < count; p++) body(p);
             return;
         }
-        Parallel.For(0, count,
-            new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism },
-            p =>
-            {
-                using var _region = EnterParallelRegion();
-                body(p);
-            });
+        // Route off raw Parallel.For (the .NET ThreadPool — per-call task/range allocation +
+        // LowLevelLifoSemaphore park/wakeup, the per-op dispatch overhead that shows as
+        // Parallel.ForWorker in the leaf profile) onto the low-latency cooperative pool, exactly
+        // as ParallelForOrSerial does (PR #531/#688). The caller already chose `count` partitions
+        // (disjoint-write GEMM tiles), so cooperative chunking is bit-identical to Parallel.For.
+        // The A/B / kill-switch fallback (AIDOTNET_COOP_POOL=0) lives inside Execute.
+        PersistentParallelExecutor.Instance.Execute(count, p =>
+        {
+            using var _region = EnterParallelRegion();
+            body(p);
+        });
     }
 
     /// <summary>
@@ -254,6 +354,67 @@ public static class CpuParallelSettings
     public static void LightweightParallel(int numChunks, long totalWork, Action<int> action)
     {
         PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, action);
+    }
+
+    /// <summary>
+    /// Per-call max-degree-of-parallelism variant. <paramref name="maxDop"/> &lt;= 0 uses the global
+    /// <see cref="MaxDegreeOfParallelism"/>; a positive value caps THIS dispatch (bounded by the
+    /// global). The lightweight-pool drop-in for a <c>Parallel.For</c> whose <c>ParallelOptions</c>
+    /// pin <c>MaxDegreeOfParallelism</c> per call — e.g. the SpMM row loop, which already pre-decides
+    /// serial vs parallel and passes a pinned thread count.
+    /// </summary>
+    /// <param name="numChunks">Number of work items (e.g. rows) to distribute across participants.</param>
+    /// <param name="maxDop">Per-call participant cap; &lt;= 0 uses the global setting.</param>
+    /// <param name="action">Action receiving each work-item index (0..numChunks-1).</param>
+    public static void LightweightParallel(int numChunks, int maxDop, Action<int> action)
+    {
+        PersistentParallelExecutor.Instance.Execute(numChunks, maxDop, action);
+    }
+
+    /// <summary>
+    /// Thread-local-state variant — the persistent-pool drop-in for
+    /// <c>Parallel.For&lt;TLocal&gt;(from, to, localInit, body, localFinally)</c>. Each participant
+    /// (main + each woken worker) gets ONE <typeparamref name="TLocal"/> from
+    /// <paramref name="localInit"/>, reuses it across the strided run of chunks it owns, then disposes
+    /// it once via <paramref name="localFinally"/> — so a per-worker rented buffer (e.g. an im2col
+    /// packing panel) is rented/returned once per participant, not per chunk. <paramref name="maxDop"/>
+    /// &lt;= 0 uses the global <see cref="MaxDegreeOfParallelism"/>.
+    /// </summary>
+    public static void LightweightParallel<TLocal>(int numChunks, int maxDop,
+        Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
+    {
+        PersistentParallelExecutor.Instance.Execute(numChunks, maxDop, localInit, body, localFinally);
+    }
+
+    /// <summary>
+    /// Runs a small fixed set of INDEPENDENT actions in parallel on the persistent worker pool —
+    /// the lightweight drop-in for <see cref="System.Threading.Tasks.Parallel.Invoke(Action[])"/>.
+    /// For 0/1 actions (or when parallelism is pinned off / already inside a parallel region) it runs
+    /// them inline. Intended for a flat, fixed handful of tasks (e.g. two independent backward passes);
+    /// NOT for recursive/nested fork-join, which a fixed-worker pool serializes by design — keep those
+    /// on the TPL or restructure to iterative chunking.
+    /// </summary>
+    public static void LightweightInvoke(params Action[] actions)
+    {
+        if (actions is null) throw new ArgumentNullException(nameof(actions));
+        int n = actions.Length;
+        if (n == 0) return;
+        if (n == 1 || MaxDegreeOfParallelism <= 1 || _inParallelRegion)
+        {
+            Exception? first = null;
+            for (int i = 0; i < n; i++)
+            {
+                try { actions[i](); }
+                catch (Exception ex) { first ??= ex; }
+            }
+            if (first is not null) throw first;
+            return;
+        }
+        PersistentParallelExecutor.Instance.Execute(n, i =>
+        {
+            using var _region = EnterParallelRegion();
+            actions[i]();
+        });
     }
 
     /// <summary>
@@ -335,7 +496,6 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
-        System.Threading.Interlocked.Increment(ref s_parallelForInvocations);
 
         // PR #531: route the general parallel-op path off raw Parallel.For (the .NET
         // ThreadPool — high dispatch latency + per-call task/range allocation, and the
@@ -347,72 +507,53 @@ public static class CpuParallelSettings
         // Disjoint-iteration safety is the SAME contract Parallel.For already requires of
         // its callers (this is the Action overload — each iteration writes its own output,
         // no cross-iteration reduction — so chunking is bit-identical to Parallel.For).
-        // Gated by its OWN switch, decoupled from CooperativeGemmScheduler.Enabled (which
-        // still gates the GEMM strategies pending their concurrency benchmark). Default-on
-        // (validated across the full test suite); set false to fall back to Parallel.For.
-        if (UseCooperativePool)
+        // Default-on (validated across the full test suite); the A/B / kill-switch fallback
+        // to Parallel.For (AIDOTNET_COOP_POOL=0)
+        // now lives in ONE place inside PersistentParallelExecutor.Execute.
+        int count = toExclusive - fromInclusive;
+        // Scale the chunk count with the work, not blindly to maxDegree. Waking all
+        // cores-1 workers (plus the participating caller) for a small memory-bound op
+        // oversubscribes the box — the OS preempts active workers and a stolen chunk
+        // stalls the caller's join, which is the entire p95 tail (PR #531 sweep: at the
+        // 64K-relu shape, 8 active threads → p95 29.6us beating Parallel.For's 32.6us,
+        // while 31 → 224us). One chunk per ~16K work units gives each chunk enough to
+        // amortize dispatch, caps active threads for small ops, and still fans a large
+        // compute-bound op out to maxDegree. The pool keeps cores-1 workers parked; only
+        // `chunks` of them wake per dispatch.
+        const long workPerChunk = 8 * 1024;
+        int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
+        int chunks = Math.Min(maxDegree, byWork);
+        int from = fromInclusive;
+        PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
         {
-            int count = toExclusive - fromInclusive;
-            // Scale the chunk count with the work, not blindly to maxDegree. Waking all
-            // cores-1 workers (plus the participating caller) for a small memory-bound op
-            // oversubscribes the box — the OS preempts active workers and a stolen chunk
-            // stalls the caller's join, which is the entire p95 tail (PR #531 sweep: at the
-            // 64K-relu shape, 8 active threads → p95 29.6us beating Parallel.For's 32.6us,
-            // while 31 → 224us). One chunk per ~16K work units gives each chunk enough to
-            // amortize dispatch, caps active threads for small ops, and still fans a large
-            // compute-bound op out to maxDegree. The pool keeps cores-1 workers parked; only
-            // `chunks` of them wake per dispatch.
-            const long workPerChunk = 8 * 1024;
-            int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
-            int chunks = Math.Min(maxDegree, byWork);
-            int from = fromInclusive;
-            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(chunks, chunk =>
-            {
-                using var _region = EnterParallelRegion();
-                int cs = from + (int)((long)chunk * count / chunks);
-                int ce = from + (int)((long)(chunk + 1) * count / chunks);
-                for (int i = cs; i < ce; i++) body(i);
-            });
-            return;
-        }
-
-        System.Threading.Tasks.Parallel.For(
-            fromInclusive,
-            toExclusive,
-            new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
-            i =>
-            {
-                // Mark this worker as inside a parallel region so any nested
-                // parallel loop it triggers (e.g. a per-iteration GEMM) serializes.
-                using var _region = EnterParallelRegion();
-                body(i);
-            });
+            using var _region = EnterParallelRegion();
+            int cs = from + (int)((long)chunk * count / chunks);
+            int ce = from + (int)((long)(chunk + 1) * count / chunks);
+            for (int i = cs; i < ce; i++) body(i);
+        });
     }
 
     /// <summary>
-    /// PR #531: route <see cref="ParallelForOrSerial(int,int,long,Action{int},bool)"/>'s parallel
-    /// path through the low-latency <c>CooperativeGemmScheduler</c> instead of
-    /// <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>. Cheaper dispatch
-    /// (≈15× less per-call allocation, lower median/p95 — the cooperative pool's fixed worker set
+    /// Route <see cref="ParallelForOrSerial(int,int,long,Action{int},bool)"/>'s parallel
+    /// path through the low-latency persistent worker pool (<see cref="PersistentParallelExecutor"/>)
+    /// instead of <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>. Cheaper
+    /// dispatch (≈15× less per-call allocation, lower median/p95 — the pool's fixed worker set
     /// + caller-participation avoids the .NET ThreadPool's per-call task/range state and
     /// park/wakeup) with no oversubscription under concurrent inference.
     ///
-    /// <para>Default <c>true</c>. This is the Action overload only — disjoint-write iterations,
-    /// so the result is bit-identical to <c>Parallel.For</c> regardless of chunk scheduling (the
-    /// reduction-style <c>TLocal</c> overload is unaffected and keeps using <c>Parallel.For</c>).
-    /// Decoupled from <c>CooperativeGemmScheduler.Enabled</c>, which separately gates the GEMM
-    /// strategies. Set <c>false</c> to fall back to <c>Parallel.For</c> (e.g. to avoid the
-    /// cooperative pool's dedicated worker threads in a thread-count-sensitive host).</para>
+    /// <para>Default <c>true</c>. Gates BOTH the Action and the reduction-style <c>TLocal</c>
+    /// dispatch paths (PR #762 routed the <c>TLocal</c> reduction overload onto the pool too);
+    /// disjoint-write iterations mean the result is bit-identical to <c>Parallel.For</c> regardless
+    /// of chunk scheduling, and per-participant reduction merges in the same nondeterministic order
+    /// <c>Parallel.For&lt;TLocal&gt;</c> already used (bit-reproducibility is a separate concern
+    /// handled by <see cref="DeterministicReductions"/>, which forces serial). The switch is now
+    /// read in ONE place — inside <see cref="PersistentParallelExecutor"/>'s dispatch — so every
+    /// call site has a single code path. Set <c>false</c> to fall back to <c>Parallel.For</c>
+    /// (e.g. to avoid the pool's dedicated worker threads in a thread-count-sensitive host,
+    /// or to A/B benchmark the pool against the .NET ThreadPool).</para>
     /// </summary>
-    public static bool UseCooperativePool { get; set; } = true;
-
-    // PR #531 diagnostic: how often the general op path actually dispatches through
-    // System.Threading.Tasks.Parallel.For (the .NET ThreadPool — the LowLevelLifoSemaphore
-    // in the small-op trace) versus the low-latency StreamingWorkerPool (which is wired only
-    // into StreamingStrategy). Counts the Action overload's parallel/serial branches.
-    internal static long s_parallelForInvocations;
-    internal static long ParallelForStatsSnapshot() => System.Threading.Volatile.Read(ref s_parallelForInvocations);
-    internal static void ResetParallelForStats() { s_parallelForInvocations = 0; }
+    public static bool UseCooperativePool { get; set; } =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") != "0"; // =0 forces raw Parallel.For for A/B
 
     /// <summary>
     /// Grain-size-aware drop-in for the localInit/localFinally overload of
@@ -422,12 +563,14 @@ public static class CpuParallelSettings
     /// runs the body inline on the calling thread with a single
     /// thread-local accumulator that's seeded by <paramref name="localInit"/>
     /// before the loop and finalised by <paramref name="localFinally"/> after.
-    /// Above the threshold, dispatches to <c>Parallel.For</c>'s per-task-local
-    /// overload unchanged.
+    /// Above the threshold, dispatches through the persistent worker pool's
+    /// reducing <see cref="PersistentParallelExecutor.Execute{TLocal}(int,int,Func{TLocal},Func{int,TLocal,TLocal},Action{TLocal})"/>
+    /// overload (PR #762), which falls back to <c>Parallel.For</c>'s per-task-local
+    /// overload only when the pool is disabled (<see cref="UseCooperativePool"/>).
     ///
     /// <para>Issue #319 follow-up: closes the gap for kernels that build
     /// per-thread accumulators (cross-entropy loss, BatchNorm reductions,
-    /// random-fill primitives) — these stayed on raw <c>Parallel.For</c>
+    /// random-fill primitives) — these previously stayed on raw <c>Parallel.For</c>
     /// because the existing helper only had the <c>Action&lt;int&gt;</c>
     /// signature. The serial-path <paramref name="localFinally"/> still runs
     /// once, so callers that aggregate per-task results into a shared field
@@ -484,17 +627,36 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
-        System.Threading.Tasks.Parallel.For(
-            fromInclusive,
-            toExclusive,
-            new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
+        // Route the reduction overload's parallel path onto the persistent worker pool
+        // (PR #762 consolidation), matching the Action overload above — same low-latency
+        // dispatch, same disjoint chunking. Each pool chunk owns a contiguous index
+        // sub-range and threads its per-participant accumulator through reduceBody, then
+        // localFinally merges once per participant (identical merge semantics to
+        // Parallel.For<TLocal>, whose per-task localFinally also runs in nondeterministic
+        // order — DeterministicReductions already forced the serial path above when
+        // bit-reproducibility is required). The A/B / kill-switch fallback to Parallel.For
+        // (AIDOTNET_COOP_POOL=0) lives in ONE place inside PersistentParallelExecutor.
+        int count = toExclusive - fromInclusive;
+        // Same work-scaled chunk count as the Action overload: one chunk per ~8K work
+        // units, capped at maxDegree, so a small reduction doesn't oversubscribe.
+        const long workPerChunk = 8 * 1024;
+        int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
+        int chunks = Math.Min(maxDegree, byWork);
+        int from = fromInclusive;
+        PersistentParallelExecutor.Instance.Execute<TLocal>(
+            chunks,
+            maxDegree,
             localInit,
-            (i, state, local) =>
+            (chunk, local) =>
             {
-                // Mark this worker as inside a parallel region for the body call
-                // so nested parallel loops serialize (restored after each call).
                 using var _region = EnterParallelRegion();
-                return body(i, state, local);
+                int cs = from + (int)((long)chunk * count / chunks);
+                int ce = from + (int)((long)(chunk + 1) * count / chunks);
+                // ParallelLoopState is null on this path (no Stop/Break) — the serial
+                // path above passes null! for the same reason (ParallelLoopState is
+                // sealed with no public ctor), so the body contract is unchanged.
+                for (int i = cs; i < ce; i++) local = body(i, null!, local);
+                return local;
             },
             localFinally);
     }

@@ -1,0 +1,88 @@
+using System;
+using System.Reflection;
+using AiDotNet.Tensors.Engines;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+/// <summary>
+/// Source-parity guard for the #775 SpiralConv (mesh convolution) kernels (forward + input/weight
+/// backward) across the backends that carry them. Only OpenCL is runtime-validated here; CUDA/HIP are
+/// source-validated, so this asserts their kernel source performs the SAME neighbour gather + matmul as
+/// the OpenCL reference, catching a divergent blind port.
+/// </summary>
+public sealed class SpiralConvKernelSourceTests
+{
+    private const string CudaConv = "AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaConvolutionKernels";
+    private const string HipConv = "AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipConvolutionKernels";
+    private const string OpenClConv = "AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ConvolutionKernels";
+    private const string MetalExt = "AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalExtendedConvKernels";
+    private const string VulkanExt = "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanExtendedConvKernels";
+    private const string WebGpuExt = "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels";
+
+    private const string FwdC = "sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];";
+    private const string FwdWgsl = "sum=sum+vertexFeatures[neighborIdx*pm.inC+c]*weights[oc*gatheredSize+gatherOffset+c];";
+
+    [Theory]
+    [InlineData(CudaConv, "GetSource", FwdC)]
+    [InlineData(HipConv, "GetSource", FwdC)]
+    [InlineData(OpenClConv, "GetSource", FwdC)]
+    [InlineData(MetalExt, "Source", FwdC)]
+    [InlineData(VulkanExt, "SpiralConv", FwdC)]
+    [InlineData(WebGpuExt, "SpiralConv", FwdWgsl)]
+    public void ForwardNeighbourGatherMatmul_MatchesAcrossBackends(string typeName, string memberName, string marker)
+    {
+        string source = GetStaticString(typeName, memberName);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
+    }
+
+    private const string BwdC = "sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];";
+    private const string BwdWgsl = "sum=sum+gradOutput[v*pm.outC+oc]*vertexFeatures[neighborIdx*pm.inC+ic];";
+
+    [Theory]
+    [InlineData(CudaConv, "GetSource", BwdC)]
+    [InlineData(HipConv, "GetSource", BwdC)]
+    [InlineData(OpenClConv, "GetSource", BwdC)]
+    [InlineData(MetalExt, "Source", BwdC)]
+    [InlineData(VulkanExt, "SpiralConvBackwardWeights", BwdC)]
+    [InlineData(WebGpuExt, "SpiralConvBackwardWeights", BwdWgsl)]
+    public void BackwardWeightsGather_MatchesAcrossBackends(string typeName, string memberName, string marker)
+    {
+        string source = GetStaticString(typeName, memberName);
+        Assert.Contains(marker, source, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(CudaConv)]
+    [InlineData(HipConv)]
+    [InlineData(OpenClConv)]
+    public void AllThreeKernelNames_AreRegistered(string typeName)
+    {
+        string[] names = GetStaticStringArray(typeName, "GetKernelNames");
+        Assert.Contains("spiral_conv", names);
+        Assert.Contains("spiral_conv_backward_input", names);
+        Assert.Contains("spiral_conv_backward_weights", names);
+    }
+
+    private static string GetStaticString(string typeName, string memberName) =>
+        (string)(InvokeStatic(typeName, memberName)
+            ?? throw new InvalidOperationException($"{memberName} returned null for {typeName}"));
+
+    private static string[] GetStaticStringArray(string typeName, string memberName) =>
+        (string[])(InvokeStatic(typeName, memberName)
+            ?? throw new InvalidOperationException($"{memberName} returned null for {typeName}"));
+
+    private static object? InvokeStatic(string typeName, string memberName)
+    {
+        Type type = typeof(DirectGpuTensorEngine).Assembly.GetType(typeName)
+            ?? throw new InvalidOperationException($"Kernel source type not found: {typeName}");
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+        MethodInfo? method = type.GetMethod(memberName, flags, binder: null, Type.EmptyTypes, modifiers: null);
+        if (method is not null) return method.Invoke(null, null);
+        FieldInfo? field = type.GetField(memberName, flags);
+        if (field is not null) return field.GetValue(null);
+        PropertyInfo? property = type.GetProperty(memberName, flags);
+        if (property is not null) return property.GetValue(null);
+        throw new InvalidOperationException($"Static member not found: {typeName}.{memberName}");
+    }
+}

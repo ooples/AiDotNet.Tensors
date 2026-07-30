@@ -2074,12 +2074,12 @@ internal static class Im2ColHelper
         if (useParallel)
         {
             int packedSize = Mc * k;
-            var po = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = procs };
-            System.Threading.Tasks.Parallel.For(
-                0, mcBlocks,
-                po,
+            // Per-worker rented packing panel reused across the worker's mc-blocks (rented/returned
+            // once per participant), dispatched through the lightweight persistent pool.
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel<double[]>(
+                mcBlocks, procs,
                 localInit: () => pool.Rent(packedSize),
-                body: (mb, _, packedA) =>
+                body: (mb, packedA) =>
                 {
                     int mcStart = mb * Mc;
                     PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, Mc, k);
@@ -2092,7 +2092,6 @@ internal static class Im2ColHelper
                             c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
                             k);
                     }
-                    return packedA;
                 },
                 localFinally: localPacked => pool.Return(localPacked));
         }
@@ -2311,11 +2310,12 @@ internal static class Im2ColHelper
         if (useParallel)
         {
             int packedSize = Mc * k;
-            var po = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = procs };
-            System.Threading.Tasks.Parallel.For(
-                0, mcBlocks, po,
+            // Per-worker rented packing panel reused across the worker's mc-blocks, dispatched
+            // through the lightweight persistent pool (one rent/return per participant).
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel<double[]>(
+                mcBlocks, procs,
                 localInit: () => pool.Rent(packedSize),
-                body: (mb, _, packedA) =>
+                body: (mb, packedA) =>
                 {
                     int mcStart = mb * Mc;
                     PackAPanel_TransA_N16_Mr8(a, kernelOffset, lda, packedA, mcStart, Mc, k);
@@ -2324,7 +2324,6 @@ internal static class Im2ColHelper
                         Microkernel_TransA_N16_Mr8(
                             packedA, mrOuter * k * Mr, b, bOffset, ldb,
                             c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc, k);
-                    return packedA;
                 },
                 localFinally: localPacked => pool.Return(localPacked));
         }

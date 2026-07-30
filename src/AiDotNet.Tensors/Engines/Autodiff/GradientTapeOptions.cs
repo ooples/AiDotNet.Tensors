@@ -61,4 +61,15 @@ public sealed class GradientTapeOptions
     /// Disabled by default to avoid dictionary allocation overhead.
     /// </summary>
     public bool EnableHooks { get; init; }
+
+    /// <summary>
+    /// When true, this tape never owns/creates a <see cref="AiDotNet.Tensors.Helpers.TensorArena"/>
+    /// and never <c>Reset()</c>s the active arena on Dispose. Set for transient INNER tapes created
+    /// DURING an outer tape's backward pass — notably the <c>GradientCheckpointing</c> recompute tape.
+    /// Such a tape borrows the active arena for scratch, but must NOT manage its step lifecycle:
+    /// because the outer tape nulls the thread-current tape while walking backward, an inner tape sees
+    /// <c>_parent == null</c> and would otherwise be mistaken for a step-boundary tape and reset the
+    /// OUTER tape's arena mid-backward, corrupting every accumulating gradient (#734).
+    /// </summary>
+    public bool SuppressArenaScope { get; init; }
 }

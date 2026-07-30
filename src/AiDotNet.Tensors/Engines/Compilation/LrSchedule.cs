@@ -3,6 +3,21 @@ using System.Runtime.CompilerServices;
 namespace AiDotNet.Tensors.Engines.Compilation;
 
 /// <summary>
+/// Decay shape applied AFTER the linear-warmup ramp in <see cref="LrSchedule.LinearWarmup"/>.
+/// Mirrors <c>AiDotNet.LearningRateSchedulers.LinearWarmupScheduler.DecayMode</c> so the
+/// fused mapping reproduces the eager scheduler exactly.
+/// </summary>
+public enum WarmupDecayMode
+{
+    /// <summary>Hold the peak learning rate after warmup.</summary>
+    Constant,
+    /// <summary>Linearly decay from peak to <c>endLr</c> over the post-warmup steps.</summary>
+    Linear,
+    /// <summary>Cosine-anneal from peak to <c>endLr</c> over the post-warmup steps.</summary>
+    Cosine
+}
+
+/// <summary>
 /// Per-step learning-rate schedule used by the fused-compiled training path.
 /// Implementations must be pure and allocation-free — they're called inside
 /// the tight <c>Step()</c> loop, once per optimizer step.
@@ -22,6 +37,13 @@ public abstract class LrSchedule
     /// convention so the same counter feeds both the schedule and the moment
     /// debiasing without an off-by-one trap.</param>
     public abstract double GetLr(int step);
+
+    /// <summary>
+    /// Captures built-in schedule parameters for compiled-training checkpoint
+    /// resume. Custom schedules return null and are rejected by plan
+    /// serialization rather than being restored with a different LR sequence.
+    /// </summary>
+    internal virtual FusedLrScheduleCheckpoint? TryCaptureCheckpoint() => null;
 
     /// <summary>Constant learning rate. Use this when you don't want a schedule.</summary>
     public static LrSchedule Constant(double lr) => new ConstantLr(lr);
@@ -79,6 +101,24 @@ public abstract class LrSchedule
         => new LinearWarmupCosineLr(lrMax, warmupSteps, totalSteps, lrMin);
 
     /// <summary>
+    /// Linear warmup from <paramref name="warmupInitLr"/> to <paramref name="lrMax"/>
+    /// over <paramref name="warmupSteps"/> steps, then a Constant / Linear / Cosine
+    /// decay to <paramref name="endLr"/> per <paramref name="decayMode"/>. This is the
+    /// fused-path image of <c>AiDotNet.LearningRateSchedulers.LinearWarmupScheduler</c>:
+    /// its per-step sequence is bit-identical to that eager scheduler's per-batch LR
+    /// (batch 1 = ctor <c>warmupInitLr</c>; batch n = <c>max(endLr, ComputeLearningRate(n-1))</c>),
+    /// so the warmup recipe runs on the captured fast path instead of the eager tape.
+    /// Unlike <see cref="LinearWarmupCosine"/> (warmup→cosine only, floor 0), this honors
+    /// a non-zero warmup-init, all three decay modes, and a non-zero end LR.
+    /// </summary>
+    public static LrSchedule LinearWarmup(
+        double lrMax, int warmupSteps, int totalSteps,
+        double warmupInitLr = 0.0,
+        WarmupDecayMode decayMode = WarmupDecayMode.Constant,
+        double endLr = 0.0)
+        => new LinearWarmupLr(lrMax, warmupSteps, totalSteps, warmupInitLr, decayMode, endLr);
+
+    /// <summary>
     /// Noam schedule from "Attention Is All You Need" (Vaswani et al. 2017,
     /// §5.3): linear warmup then inverse-square-root decay —
     /// <c>lr(t) = factor · d_model^(-0.5) · min(t^(-0.5), t · warmup^(-1.5))</c>,
@@ -103,6 +143,8 @@ internal sealed class ConstantLr : LrSchedule
     public ConstantLr(double lr) { _lr = lr; }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr;
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Constant, new[] { _lr }, System.Array.Empty<int>());
 }
 
 internal sealed class NoamLr : LrSchedule
@@ -141,6 +183,11 @@ internal sealed class NoamLr : LrSchedule
         double warmupBranch = _scaledWarmupTerm * t;
         return System.Math.Min(invSqrtBranch, warmupBranch);
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.NoamScaled,
+            new[] { _scaledModelInvSqrt, _scaledWarmupTerm },
+            System.Array.Empty<int>());
 }
 
 internal sealed class CosineLr : LrSchedule
@@ -163,6 +210,9 @@ internal sealed class CosineLr : LrSchedule
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrMin + (_lrMax - _lrMin) * cos;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Cosine, new[] { _lrMax, _lrMin }, new[] { _total });
 }
 
 internal sealed class OneCycleLr : LrSchedule
@@ -201,6 +251,11 @@ internal sealed class OneCycleLr : LrSchedule
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrFinal + (_lrMax - _lrFinal) * cos;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.OneCycleResolved,
+            new[] { _lrMax, _lrInitial, _lrFinal },
+            new[] { _total, _warmupEnd });
 }
 
 internal sealed class ExponentialLr : LrSchedule
@@ -214,6 +269,9 @@ internal sealed class ExponentialLr : LrSchedule
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr0 * System.Math.Pow(_gamma, System.Math.Max(0, step - 1));
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Exponential, new[] { _lr0, _gamma }, System.Array.Empty<int>());
 }
 
 internal sealed class StepLrImpl : LrSchedule
@@ -229,6 +287,9 @@ internal sealed class StepLrImpl : LrSchedule
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr0 * System.Math.Pow(_gamma, System.Math.Max(0, step - 1) / _stepSize);
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Step, new[] { _lr0, _gamma }, new[] { _stepSize });
 }
 
 internal sealed class CyclicLr : LrSchedule
@@ -253,6 +314,9 @@ internal sealed class CyclicLr : LrSchedule
             : 1.0 - (phase - _stepSize) / (double)_stepSize;
         return _base + (_max - _base) * t;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.Cyclic, new[] { _base, _max }, new[] { _stepSize });
 }
 
 internal sealed class LinearWarmupCosineLr : LrSchedule
@@ -284,4 +348,80 @@ internal sealed class LinearWarmupCosineLr : LrSchedule
         double cos = 0.5 * (1.0 + System.Math.Cos(System.Math.PI * progress));
         return _lrMin + (_lrMax - _lrMin) * cos;
     }
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.LinearWarmupCosine,
+            new[] { _lrMax, _lrMin },
+            new[] { _warmup, _total });
+}
+
+internal sealed class LinearWarmupLr : LrSchedule
+{
+    private readonly double _lrMax;
+    private readonly int _warmupSteps;
+    private readonly int _totalSteps;
+    private readonly double _warmupInitLr;
+    private readonly WarmupDecayMode _decayMode;
+    private readonly double _endLr;
+
+    public LinearWarmupLr(double lrMax, int warmupSteps, int totalSteps,
+        double warmupInitLr, WarmupDecayMode decayMode, double endLr)
+    {
+        if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
+        if (!Enum.IsDefined(typeof(WarmupDecayMode), decayMode))
+            throw new ArgumentOutOfRangeException(nameof(decayMode), decayMode, "Undefined warmup decay mode.");
+        int normalizedTotalSteps = totalSteps > 0 ? totalSteps : warmupSteps;
+        if (decayMode != WarmupDecayMode.Constant && normalizedTotalSteps < warmupSteps)
+            throw new ArgumentOutOfRangeException(nameof(totalSteps),
+                "totalSteps must be >= warmupSteps for decay modes.");
+        _lrMax = lrMax;
+        _warmupSteps = warmupSteps;
+        _totalSteps = normalizedTotalSteps;
+        _warmupInitLr = warmupInitLr;
+        _decayMode = decayMode;
+        _endLr = endLr;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public override double GetLr(int step)
+    {
+        // The eager LinearWarmupScheduler reports its ctor value (warmupInitLr) on
+        // batch 1 (unfloored), then on batch n>=2 reports max(endLr, ComputeLearningRate(n-1))
+        // — _currentStep is (batch - 1) and Step() floors with _minLearningRate = endLr.
+        // The 1-indexed fused step maps batch n → GetLr(n); reproduce both branches so the
+        // per-step LR is bit-identical to the eager replay (FusedLrScheduleMappingTests).
+        if (step <= 1)
+            return _warmupSteps > 0 ? _warmupInitLr : _lrMax;
+        double raw = ComputeRaw(step - 1);
+        return raw > _endLr ? raw : _endLr;
+    }
+
+    // Mirror of LinearWarmupScheduler.ComputeLearningRate(step) with _baseLearningRate = lrMax.
+    private double ComputeRaw(int t)
+    {
+        if (t < _warmupSteps)
+        {
+            if (_warmupSteps == 0) return _lrMax;
+            return _warmupInitLr + (_lrMax - _warmupInitLr) * ((double)t / _warmupSteps);
+        }
+        if (_decayMode == WarmupDecayMode.Constant) return _lrMax;
+
+        int decaySteps = _totalSteps - _warmupSteps;
+        int decayStep = t - _warmupSteps;
+        if (decayStep >= decaySteps) return _endLr;
+        double progress = (double)decayStep / decaySteps;
+        if (_decayMode == WarmupDecayMode.Linear)
+            return _lrMax - (_lrMax - _endLr) * progress;
+        double cos = (1.0 + System.Math.Cos(System.Math.PI * progress)) / 2.0;
+        return _endLr + (_lrMax - _endLr) * cos;
+    }
+
+    // Was the ONE built-in schedule with no checkpoint capture, so a compiled plan using it lost its
+    // schedule on resume (base default returns null → serialization rejects/drops it). Capture the full
+    // parameter set (incl. warmupInitLr, endLr and the decay mode) so the restored LR sequence is
+    // bit-identical. _totalSteps is already the ctor-normalized value.
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.LinearWarmupDecay,
+            new[] { _lrMax, _warmupInitLr, _endLr },
+            new[] { _warmupSteps, _totalSteps, (int)_decayMode });
 }

@@ -489,7 +489,7 @@ public static class ExecutionGraphBuilderExtensions
             if (activation.HasValue && activation.Value != FusedActivationType.None)
             {
                 builder.AddActivation(output, output, activation.Value,
-                    (b, s) => ApplyActivation(b, output.Buffer, output.Buffer, output.Buffer.Size, activation.Value));
+                    (b, s) => ApplyActivation(b, output.Buffer, output.Buffer, batchSize, outputFeatures, activation.Value));
             }
 
             return builder;
@@ -523,8 +523,9 @@ public static class ExecutionGraphBuilderExtensions
         return builder;
     }
 
-    private static void ApplyActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int size, FusedActivationType activation)
+    private static void ApplyActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int batchSize, int features, FusedActivationType activation)
     {
+        int size = batchSize * features;
         switch (activation)
         {
             case FusedActivationType.None:
@@ -554,9 +555,28 @@ public static class ExecutionGraphBuilderExtensions
                 backend.Swish(input, output, size);
                 break;
             case FusedActivationType.Softmax:
-                // Softmax requires batch and feature dimensions.
-                // When only total size is available, treat as single batch.
-                backend.Softmax(input, output, 1, size);
+                // Per-row softmax: pass real (batchSize, features); the old (1, size) collapsed
+                // the whole batch into one row for batchSize > 1. Softmax reads the whole row before
+                // writing, and WebGPU forbids binding one storage buffer as both read and read_write —
+                // so when this is called in-place (input == output, as AddLinearLayer's separate-node
+                // path does) route through a scratch buffer and copy back instead of aliasing.
+                if (input == output)
+                {
+                    var softmaxScratch = backend.AllocateBuffer(size);
+                    try
+                    {
+                        backend.Softmax(input, softmaxScratch, batchSize, features);
+                        backend.Copy(softmaxScratch, output, size);
+                    }
+                    finally
+                    {
+                        softmaxScratch.Dispose();
+                    }
+                }
+                else
+                {
+                    backend.Softmax(input, output, batchSize, features);
+                }
                 break;
         }
     }

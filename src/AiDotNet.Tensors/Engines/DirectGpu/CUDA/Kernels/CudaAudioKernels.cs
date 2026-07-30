@@ -7,14 +7,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 {
     public static class CudaAudioKernels
     {
-        public static string[] GetKernelNames() => new[]
-        {
+        public static string[] GetKernelNames() =>
+        [
             "audio_amplitude_to_db",
             "audio_mulaw_encoding",
             "audio_mulaw_decoding",
             "audio_compute_deltas",
             "audio_resample",
-        };
+            .. CudaInstantNgpKernels.GetKernelNames(),
+        ];
 
         public static string GetSource() => @"
 #include <math.h>
@@ -52,13 +53,13 @@ extern ""C"" __global__ __launch_bounds__(256) void audio_mulaw_encoding(
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void audio_mulaw_decoding(
-    const float* __restrict__ input, float* __restrict__ output,
+    const int* __restrict__ input, float* __restrict__ output,
     int length, int quantizationChannels)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= length) return;
     float mu = (float)(quantizationChannels - 1);
-    float q = input[gid];
+    float q = (float)input[gid];
     float y = (q / mu) * 2.0f - 1.0f;
     float x = ((y > 0.0f) - (y < 0.0f)) * (powf(1.0f + mu, fabsf(y)) - 1.0f) / mu;
     output[gid] = x;
@@ -117,14 +118,17 @@ extern ""C"" __global__ __launch_bounds__(256) void audio_resample(
         int idx = centre + k;
         if (idx < 0 || idx >= inLen) continue;
         float t = (idx - srcIdx) * cutoff;
-        float sinc = (fabsf(t) < 1e-12f) ? 1.0f : __sinf(PI * t) / (PI * t);
-        float hann = 0.5f - 0.5f * __cosf(2.0f * PI * (k + halfWidth) / (2.0f * halfWidth));
+        // Full-precision sinf/cosf (NOT fast-math __sinf/__cosf): the Hann arg spans [0,2π] where the fast
+        // intrinsics lose accuracy, biasing this 513-tap filter ~2% off the CPU Math.Sin/Cos reference.
+        // Matches the HIP port of this kernel.
+        float sinc = (fabsf(t) < 1e-12f) ? 1.0f : sinf(PI * t) / (PI * t);
+        float hann = 0.5f - 0.5f * cosf(2.0f * PI * (k + halfWidth) / (2.0f * halfWidth));
         float w = sinc * hann;
         acc += w * input[sBase + idx];
         wSum += w;
     }
     output[gid] = wSum > 0.0f ? acc / wSum : 0.0f;
 }
-";
+" + CudaInstantNgpKernels.GetSource();
     }
 }

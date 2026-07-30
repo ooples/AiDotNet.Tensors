@@ -206,9 +206,23 @@ public static class GpuMemoryTracker
         }
         if (!Enabled) return;
         var rec = new Rec { Bytes = bytes, Site = CaptureSite(), Seq = Interlocked.Increment(ref s_seq) };
-        s_live[(long)ptr] = rec;
+        long key = (long)ptr;
+        long delta;
+        while (true)
+        {
+            if (s_live.TryAdd(key, rec))
+            {
+                delta = bytes;
+                break;
+            }
+            if (s_live.TryGetValue(key, out var prior) && s_live.TryUpdate(key, rec, prior))
+            {
+                delta = bytes - prior.Bytes;
+                break;
+            }
+        }
         Interlocked.Increment(ref s_totalAllocs);
-        long lb = Interlocked.Add(ref s_liveBytes, bytes);
+        long lb = Interlocked.Add(ref s_liveBytes, delta);
         // Best-effort peak update (CAS loop; a benign miss under contention only undercounts the peak slightly).
         long peak;
         while (lb > (peak = Interlocked.Read(ref s_peakBytes)))

@@ -73,6 +73,11 @@ internal static class TrainingPlanWriter
                 writer.Write(grads[i]._shape[d]);
         }
 
+        // Fused optimizer configuration + transient state. This is what makes
+        // a serialized compiled training plan a real training checkpoint rather
+        // than a forward/backward graph that resumes with fresh Adam moments.
+        FusedOptimizerCheckpointSerializer.Write(writer, plan.CaptureFusedOptimizerCheckpoint());
+
         // ── Footer ──────────────────────────────────────────────────────
         // Avoid ToArray()'s second full-size copy — hash and write directly
         // from the MemoryStream's internal buffer. See InferencePlanWriter

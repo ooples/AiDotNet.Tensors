@@ -78,6 +78,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         ["TensorErfinv"] = "domain is (-1,1); generic input includes values > 1",
         // invalid input SEMANTICS for random input
         ["TensorNLLLoss"] = "targets must be class indices / log-probabilities, not random floats",
+        ["TensorCrossEntropyLoss"] = "targets must be one-hot / probabilities, not random floats; with random ~1.0 targets over a wide class dim (129) the softmax-CE magnitude is O(numClasses)~650 and GPU fast-math exp/log absolute error scales with it (~4.6), input ill-conditioning not a kernel bug — OpParity with valid targets passes at 1e-3",
         ["CompleteBoxIou"] = "needs valid boxes (x1<x2,y1<y2); CIoU center/enclose terms diverge on random boxes",
         ["GeneralizedBoxIou"] = "needs valid boxes; GIoU enclosing-box term diverges on random boxes",
         ["TensorMaxPool2D"] = "expects 4-D [N,C,H,W]; generic generator supplies 2-D/odd ranks",
@@ -100,6 +101,8 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         ["TensorLayerNorm"] = "gamma/beta must match normalized-shape suffix, not full input shape",
         ["GroupNorm"] = "gamma/beta must be per-channel [C]; group count vs channels constraint",
         ["RMSNorm"] = "gamma must be [C] (last dim), not full input shape",
+        ["MaxPool2DBackwardWithTensorIndices"] = "gradient, resident indices, input shape, pool, and stride geometry are interdependent; exact dedicated parity and residency tests cover valid inputs",
+        ["ReduceMaxBackwardWithTensorIndices"] = "gradient/index length must equal the unreduced shape product; exact dedicated parity and residency tests cover valid inputs",
         // transcendental composite precision (NOT a structural bug)
         ["TensorLogSumExp"] = "per-row reduction verified exact; multi-row uses a composite GPU path (reduce-max/exp/reduce-sum, each <1e-2) that accumulates ~0.058 (<1%) at width 129 — precision, not garbage",
     };
@@ -442,14 +445,22 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         // MaxPool2DBackwardGpuCorrectnessTests). These were hidden from this gate by a `public new`
         // hide on DirectGpuTensorEngine until it was converted to `override`.
         "DeformableConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
-        // DCNv3 grouped/depthwise single-launch GPU kernel — GPU-vs-CPU parity in
-        // GpuConvKernelCoverageTests.DeformableConv2DGrouped_Gpu_MatchesCpu (+ …WithMask) (#1691).
+        // DCNv3 grouped/depthwise single-launch GPU kernels (forward + 4 backward) — GPU-vs-CPU parity in
+        // GpuConvKernelCoverageTests.DeformableConv2DGrouped*_Gpu_MatchesCpu (#1691).
         "DeformableConv2DGrouped(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32,Int32)",
+        "DeformableConv2DGroupedBackwardInput(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[],Int32,Int32)",
+        "DeformableConv2DGroupedBackwardKernel(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[],Int32,Int32)",
+        "DeformableConv2DGroupedBackwardOffset(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32,Int32)",
+        "DeformableConv2DGroupedBackwardMask(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32,Int32)",
         "DeformableConv2DBackwardInput(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
         "DeformableConv2DBackwardKernel(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
         "DeformableConv2DBackwardMask(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
         "DeformableConv2DBackwardOffset(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
         "DepthwiseConv2D(Tensor<T>,Tensor<T>,Int32[],Int32[])",
+        // DepthwiseConv1D reshapes [B,C,L]->[B,C,1,L] onto the DepthwiseConv2D GPU kernel; input and
+        // kernel have distinct shapes (feature map vs [C,mult,K]) so the single-shape generic harness
+        // can't drive it. Dedicated GPU-vs-CPU parity in GpuConvKernelCoverageTests.DepthwiseConv1D_Gpu_MatchesCpu.
+        "DepthwiseConv1D(Tensor<T>,Tensor<T>,Int32,Int32)",
         "FlashAttentionBackward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Double,Boolean,out Tensor<T>,out Tensor<T>,out Tensor<T>,Tensor<T>)",
         "FusedConv3D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
         "FusedConvTranspose2D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
@@ -507,9 +518,21 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "MlpForward(Tensor<T>,IReadOnlyList<Tensor<T>>,IReadOnlyList<Tensor<T>>,FusedActivationType,FusedActivationType,FusedActivationParams,FusedActivationParams)",
         "MultiHeadAttentionForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32,Tensor<Boolean>)",
         "Nms(Tensor<T>,Tensor<T>,Double)",
+        "BatchedNms(Tensor<T>,Tensor<T>,Tensor<Int32>,Double)",
+        "MaxPool2DBackwardWithTensorIndices(Tensor<T>,Tensor<Int32>,Int32[],Int32[],Int32[])",
+        "MaxPool3DWithTensorIndices(Tensor<T>,Int32[],Int32[],out Tensor<Int32>)",
+        "MaxPool3DBackwardWithTensorIndices(Tensor<T>,Tensor<Int32>,Int32[],Int32[],Int32[])",
+        "ReduceMaxBackwardWithTensorIndices(Tensor<T>,Tensor<Int32>,Int32[],Int32[])",
+        "MultiresolutionHashEncoding(Tensor<T>,Tensor<T>[],Int32[],Int32)",
+        "PitchShift(Tensor<T>,Int32,Double,Int32,Int32)",
+        "ReorderToNchwc(Tensor<T>,TensorLayout)",
         "Spectrogram(Tensor<T>,Int32,Int32,Int32,Tensor<T>)",
         "TensorArgsort(Tensor<T>,Int32,Boolean)",
+        "TensorBucketize(Tensor<T>,Tensor<T>,Boolean)",
         "TensorCross(Tensor<T>,Tensor<T>,Int32)",
+        // Bit-mask condition can't be driven by the generic float-fuzzer — covered by
+        // GpuCpuCorrectnessTests.TensorWhere_BitMask_GpuMatchesCpu.
+        "TensorWhere(Tensor<Bit>,Tensor<T>,Tensor<T>)",
         "TensorEq(Tensor<T>,Tensor<T>)",
         "TensorEqScalar(Tensor<T>,T)",
         "TensorHistogram(Tensor<T>,Int32,T,T)",
@@ -520,9 +543,11 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "TensorIsInf(Tensor<T>)",
         "TensorIsNan(Tensor<T>)",
         "TensorMaskedScatter(Tensor<T>,Tensor<Bit>,Tensor<T>)",
+        "TensorMaskedFill(Tensor<T>,Tensor<Bit>,T)",
         "TensorMaskedSelect(Tensor<T>,Tensor<Bit>)",
         "TensorMatMul2DWithPrePackedB(Tensor<T>,Tensor<T>,WeightPackHandle)",
         "TensorNonzero(Tensor<T>)",
+        "TensorIndexPut(Tensor<T>,Tensor<Int32>[],Tensor<T>,Boolean)",
         "TensorSearchSorted(Tensor<T>,Tensor<T>,Boolean)",
         "TensorSelectScatter(Tensor<T>,Tensor<T>,Int32,Int32)",
         "TimeStretch(Tensor<T>,Double,Int32,Int32)",

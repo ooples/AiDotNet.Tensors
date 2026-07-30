@@ -1,0 +1,315 @@
+# Changelog
+
+## [0.120.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.4...v0.120.5) (2026-07-30)
+
+
+### Bug Fixes
+
+* **autodiff:** pin savedState tensors against pool/arena reuse (Issue [#338](https://github.com/ooples/AiDotNet.Tensors/issues/338) completion) ([#906](https://github.com/ooples/AiDotNet.Tensors/issues/906)) ([bb56e31](https://github.com/ooples/AiDotNet.Tensors/commit/bb56e313ca09d2ffad3189d6bc810058e1b408fd))
+* **gpu:** correct LSTM forward+backward GPU kernels + POCL cpu-opencl parity gate ([#907](https://github.com/ooples/AiDotNet.Tensors/issues/907)) ([e54f99f](https://github.com/ooples/AiDotNet.Tensors/commit/e54f99f9ccec7dbbf76fd0cdee83b4199c9c1e95))
+
+## [0.120.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.3...v0.120.4) (2026-07-30)
+
+
+### Bug Fixes
+
+* **compilation:** replay stop-gradient forward values ([#903](https://github.com/ooples/AiDotNet.Tensors/issues/903)) ([b80e21a](https://github.com/ooples/AiDotNet.Tensors/commit/b80e21a685cf510b0bb7383dc862ce02052a4ad0))
+
+## [0.120.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.2...v0.120.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* **compilation:** preserve COW parameter views and FP64 training ([#901](https://github.com/ooples/AiDotNet.Tensors/issues/901)) ([da337a4](https://github.com/ooples/AiDotNet.Tensors/commit/da337a469278100b72f79817ec1e5046cdb53522))
+
+## [0.120.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.1...v0.120.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **autodiff:** elementwise backwards threw on a rank-0 operand vs a rank-1 seed gradient ([#898](https://github.com/ooples/AiDotNet.Tensors/issues/898)) ([ff15edc](https://github.com/ooples/AiDotNet.Tensors/commit/ff15edcc0eca4e44cf101a262421d0a33e03b67d))
+* preserve COW isolation in compiled training ([#899](https://github.com/ooples/AiDotNet.Tensors/issues/899)) ([f74c0eb](https://github.com/ooples/AiDotNet.Tensors/commit/f74c0eb91bbf1c507815962a81b662c07ffa2d36))
+
+## [0.120.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.0...v0.120.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **rwkv7:** implement the paper-faithful RWKV-7 generalized delta rule ([#895](https://github.com/ooples/AiDotNet.Tensors/issues/895)) ([ecad0b7](https://github.com/ooples/AiDotNet.Tensors/commit/ecad0b7870d401596bd2dfd293ae40ed8859ce34))
+
+## [0.120.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.119.0...v0.120.0) (2026-07-28)
+
+
+### Features
+
+* add direct PTX fused-kernel blueprint ([#832](https://github.com/ooples/AiDotNet.Tensors/issues/832)) ([2832eb2](https://github.com/ooples/AiDotNet.Tensors/commit/2832eb21d7dd749a139e245a95ba0285d83490c4))
+* **ptx:** compile and dispatch direct-PTX on net471 (all TFMs) ([#881](https://github.com/ooples/AiDotNet.Tensors/issues/881)) ([cc14666](https://github.com/ooples/AiDotNet.Tensors/commit/cc1466621664b53107033d8ce59742307aa55393))
+* **ptx:** direct-PTX kernel foundation - 5 emitter gaps closed + convolution family ([#886](https://github.com/ooples/AiDotNet.Tensors/issues/886)) ([3b21f7d](https://github.com/ooples/AiDotNet.Tensors/commit/3b21f7df74546a9d9c8525004ae451a89463906e))
+* **ptx:** fuse decode QKV, RoPE, and KV-cache update ([#858](https://github.com/ooples/AiDotNet.Tensors/issues/858)) ([51dace6](https://github.com/ooples/AiDotNet.Tensors/commit/51dace68e3e7d309ec2115555aa1a547648c08d1))
+* **ptx:** implement fused attention kernel family ([#857](https://github.com/ooples/AiDotNet.Tensors/issues/857)) ([8fb5e91](https://github.com/ooples/AiDotNet.Tensors/commit/8fb5e91ea0ae2b8841e749b74f44cc26be258144))
+
+
+### Bug Fixes
+
+* **autodiff:** gather backward must scatter-ADD, not reuse the gather-shaped helper ([#894](https://github.com/ooples/AiDotNet.Tensors/issues/894)) ([b541350](https://github.com/ooples/AiDotNet.Tensors/commit/b54135043a75b6d2d9426d5c3c4c62fd2bf91f4a))
+* **autodiff:** write fused-linear grads to live buffers ([#888](https://github.com/ooples/AiDotNet.Tensors/issues/888)) ([4ac1684](https://github.com/ooples/AiDotNet.Tensors/commit/4ac1684e7acb9064849997383b06eb50974e5b3b))
+* **gpu:** gate sparsemax on where-select availability ([#866](https://github.com/ooples/AiDotNet.Tensors/issues/866)) ([9b1a88a](https://github.com/ooples/AiDotNet.Tensors/commit/9b1a88a11c451f81a494ead92a5ba0607542222a))
+
+
+### Performance
+
+* **ptx:** staged + double-buffered tensor-core GEMM - 0.05x to 0.57x at 4096^3 ([#893](https://github.com/ooples/AiDotNet.Tensors/issues/893)) ([6d41166](https://github.com/ooples/AiDotNet.Tensors/commit/6d41166df0176b4ee885822df5c3d89c4bfca709))
+* **training:** element-parallel fused optimizer + reusable per-step arena ([#892](https://github.com/ooples/AiDotNet.Tensors/issues/892)) ([4d3c3ec](https://github.com/ooples/AiDotNet.Tensors/commit/4d3c3ecf83cbfadf41ab79557f9ae12c3c721e77))
+
+## [0.119.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.118.0...v0.119.0) (2026-07-21)
+
+
+### Features
+
+* **simd:** block-Q8_0 GEMM matching ggml_vec_dot_q8_0_q8_0 ([#830](https://github.com/ooples/AiDotNet.Tensors/issues/830)) ([3a4d27e](https://github.com/ooples/AiDotNet.Tensors/commit/3a4d27eaadb2382f71277b3487fe64fde9f1ed33))
+
+
+### Bug Fixes
+
+* **cuda:** power_scalar returned NaN for negative bases under --use_fast_math ([#827](https://github.com/ooples/AiDotNet.Tensors/issues/827)) ([4ae2377](https://github.com/ooples/AiDotNet.Tensors/commit/4ae237736a7196c717efbe486cbf2b1d9653a19a))
+* **gpu:** add tape-gradient parity and correct backward kernels ([#829](https://github.com/ooples/AiDotNet.Tensors/issues/829)) ([f1b6dff](https://github.com/ooples/AiDotNet.Tensors/commit/f1b6dff4df7f5aea7b675bb56201f82366d57ece))
+
+
+### Performance
+
+* **fft:** blittable buffer-reusing NativeComplexFFT — kill per-call Complex&lt;T&gt; allocation ([#855](https://github.com/ooples/AiDotNet.Tensors/issues/855)) ([b61cd73](https://github.com/ooples/AiDotNet.Tensors/commit/b61cd730c01e7596c522e7fdc630d789c268c9f7))
+* **fft:** wire NativeComplexFFT butterfly to SIMD radix-2 (test-gated) ([#831](https://github.com/ooples/AiDotNet.Tensors/issues/831)) ([7938eb2](https://github.com/ooples/AiDotNet.Tensors/commit/7938eb2f5ddb24914e7fe0cc348dc6e2c360ec46))
+
+## [0.118.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.2...v0.118.0) (2026-07-20)
+
+
+### Features
+
+* document and release the native ANN kernel stack (0.118.0) ([#825](https://github.com/ooples/AiDotNet.Tensors/issues/825)) ([fb5a70e](https://github.com/ooples/AiDotNet.Tensors/commit/fb5a70ea1457af41367388a5fffc13a13b2de184))
+
+## [0.117.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.1...v0.117.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* **gpu:** centralize the persistent-weight version gate into the shared cache lookup ([#821](https://github.com/ooples/AiDotNet.Tensors/issues/821) follow-up) ([#822](https://github.com/ooples/AiDotNet.Tensors/issues/822)) ([87aebd0](https://github.com/ooples/AiDotNet.Tensors/commit/87aebd067219a231d7852d16431f9b99d12188ef))
+* **gpu:** version-gate the persistent weight buffer so in-place weight loads under a GPU engine are not served stale ([#821](https://github.com/ooples/AiDotNet.Tensors/issues/821)) ([4c44737](https://github.com/ooples/AiDotNet.Tensors/commit/4c447370c0a08e4777de2d5f68fe2868efe92f20))
+
+## [0.117.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.117.0...v0.117.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* GPU [#226](https://github.com/ooples/AiDotNet.Tensors/issues/226) concurrency crash and a chain of pre-existing DirectGpu bugs ([#818](https://github.com/ooples/AiDotNet.Tensors/issues/818)) ([4af7ba8](https://github.com/ooples/AiDotNet.Tensors/commit/4af7ba83ed755be90ad9b8017713a417366dc1e0))
+
+## [0.117.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.116.0...v0.117.0) (2026-07-19)
+
+
+### Features
+
+* **attention:** optional logit soft-cap on ScaledDotProductAttention (CPU + all 6 GPU backends) ([#816](https://github.com/ooples/AiDotNet.Tensors/issues/816)) ([ddccf57](https://github.com/ooples/AiDotNet.Tensors/commit/ddccf57207c9000ad51399fbedbd4d6f81e27bc9))
+* batch-vectorized float FFT + CUDA/HIP FFT correctness fixes ([#811](https://github.com/ooples/AiDotNet.Tensors/issues/811)) ([#812](https://github.com/ooples/AiDotNet.Tensors/issues/812)) ([77320ef](https://github.com/ooples/AiDotNet.Tensors/commit/77320ef07cf4ccf5f51115651cb2ec8c7345f2b1))
+
+
+### Bug Fixes
+
+* **cpu:** bound Tanh/Sigmoid SIMD backward by logical length (fixes OOB write / AccessViolation) ([#815](https://github.com/ooples/AiDotNet.Tensors/issues/815)) ([8daadc1](https://github.com/ooples/AiDotNet.Tensors/commit/8daadc1bd808bc48579cdf8416d69b346a970aba))
+
+## [0.116.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.1...v0.116.0) (2026-07-18)
+
+
+### Features
+
+* **gpu:** expose paged-attention kernels via IPagedAttentionBackend capability interface ([#806](https://github.com/ooples/AiDotNet.Tensors/issues/806)) ([2ccba00](https://github.com/ooples/AiDotNet.Tensors/commit/2ccba0029f5e3e7ccad7740832e018cdbc4ee683))
+* **licensing:** P1 mirror — scope binding + jti/CRL revocation on signed entitlements ([#808](https://github.com/ooples/AiDotNet.Tensors/issues/808)) ([1db25fc](https://github.com/ooples/AiDotNet.Tensors/commit/1db25fcdfc0c2c503c672c1c3373f54470a755f5))
+
+
+### Refactoring
+
+* **gpu:** put paged-attention on IDirectGpuBackend; drop the capability interface ([#809](https://github.com/ooples/AiDotNet.Tensors/issues/809)) ([c369ab4](https://github.com/ooples/AiDotNet.Tensors/commit/c369ab4cc692500b9fff42b8212352d1dd5bca2a))
+
+## [0.115.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.115.0...v0.115.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* **ci:** repair line-ending autofix workflow (revives release automation) ([#804](https://github.com/ooples/AiDotNet.Tensors/issues/804)) ([e35fc35](https://github.com/ooples/AiDotNet.Tensors/commit/e35fc355adf4eacfa025a0c65f853f003eef95be))
+
+## [0.115.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.5...v0.115.0) (2026-07-16)
+
+
+### Features
+
+* **gpu:** cross-backend CPU/GPU op-parity + full residency ([#775](https://github.com/ooples/AiDotNet.Tensors/issues/775)) ([#790](https://github.com/ooples/AiDotNet.Tensors/issues/790)) ([106bbca](https://github.com/ooples/AiDotNet.Tensors/commit/106bbca0ff1213c503b5b83520a8b18c959088c4))
+
+## [0.114.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.4...v0.114.5) (2026-07-15)
+
+
+### Bug Fixes
+
+* **autodiff:** manual backward tape nodes now propagate input gradients through the graph path ([#786](https://github.com/ooples/AiDotNet.Tensors/issues/786)) ([db5029d](https://github.com/ooples/AiDotNet.Tensors/commit/db5029dbe8b0e631ec7e939f195e70d08cf31329))
+* **gpu:** LayerNorm forward returns TRUE variance, not inverse-std, so compiled-replay backward gradients are correct ([#784](https://github.com/ooples/AiDotNet.Tensors/issues/784)) ([e735690](https://github.com/ooples/AiDotNet.Tensors/commit/e7356905c2d8f1c6dfb1352ac4007c1716351784))
+
+## [0.114.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.3...v0.114.4) (2026-07-15)
+
+
+### Bug Fixes
+
+* **autodiff:** manual backward tape nodes now propagate input gradients through the graph path ([#786](https://github.com/ooples/AiDotNet.Tensors/issues/786)) ([3547028](https://github.com/ooples/AiDotNet.Tensors/commit/3547028282295b735cb484451459be19bab7a32b))
+
+## [0.114.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.2...v0.114.3) (2026-07-13)
+
+
+### Performance
+
+* **autotune:** eliminate per-GEMM disk touches on the compiled-replay hot path ([#782](https://github.com/ooples/AiDotNet.Tensors/issues/782)) ([4fedc3b](https://github.com/ooples/AiDotNet.Tensors/commit/4fedc3b9e78accd596849459ff50dd272663fd37))
+
+## [0.114.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.1...v0.114.2) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cpu:** support groups&lt;deformGroups in DeformableConv2DGrouped (key deform group on input channel) ([#780](https://github.com/ooples/AiDotNet.Tensors/issues/780)) ([2b5a080](https://github.com/ooples/AiDotNet.Tensors/commit/2b5a0809389eed4df45c105954dfb5a99abbde36))
+
+## [0.114.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.114.0...v0.114.1) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cpu:** race-free GridSample-3D backward scatter (thread-local accumulators) ([#774](https://github.com/ooples/AiDotNet.Tensors/issues/774)) ([7773fc8](https://github.com/ooples/AiDotNet.Tensors/commit/7773fc8ac2048d0920589375d9e349a3e9dbfb54))
+* **fft:** guard IRFFT against degenerate length-1 transform (nFft=0 OOR) ([#779](https://github.com/ooples/AiDotNet.Tensors/issues/779)) ([f72615b](https://github.com/ooples/AiDotNet.Tensors/commit/f72615b7bf131f6124a6fccad36755f4b320268e))
+
+## [0.114.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.113.0...v0.114.0) (2026-07-11)
+
+
+### Features
+
+* **engine:** DepthwiseConv1D primitive (CPU + GPU) for time-channel separable convs ([#772](https://github.com/ooples/AiDotNet.Tensors/issues/772)) ([f72b182](https://github.com/ooples/AiDotNet.Tensors/commit/f72b1827d3d145eb1c3fed12e737ff73eacb67ff))
+
+
+### Performance
+
+* **parallel:** adaptive spare-core-gated warm-spin for the persistent worker pool ([#762](https://github.com/ooples/AiDotNet.Tensors/issues/762)) ([e5b2a0a](https://github.com/ooples/AiDotNet.Tensors/commit/e5b2a0afece8bcbbefefcbcb23158d3dd87007e6))
+
+## [0.113.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.112.0...v0.113.0) (2026-07-10)
+
+
+### Features
+
+* **training:** compiled backward + createGraph, DP-SGD, multi-slot persistent inputs ([#763](https://github.com/ooples/AiDotNet.Tensors/issues/763)) ([b7cf72e](https://github.com/ooples/AiDotNet.Tensors/commit/b7cf72e1838455f9d57b46e2e0d2e4f0c953e3d1))
+
+
+### Performance
+
+* **compile:** SIMD-vectorize global-L2 gradient clip in fused training ([#766](https://github.com/ooples/AiDotNet.Tensors/issues/766)) ([ea98267](https://github.com/ooples/AiDotNet.Tensors/commit/ea98267f85d5f762f07313563064627c952f3b5e))
+* fused-training optimizer + arena suite (clip SIMD, moment pooling, AdamW fusion, bias-corr hoist, multi-tensor foreach) ([#770](https://github.com/ooples/AiDotNet.Tensors/issues/770)) ([7c8455d](https://github.com/ooples/AiDotNet.Tensors/commit/7c8455db631c4acc9abd9a6f4420b1e0251f400d))
+
+## [0.112.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.2...v0.112.0) (2026-07-10)
+
+
+### Features
+
+* **sparse:** tape-auto-tracking sparse engine ops + fully GPU-resident sparse autograd backward ([#758](https://github.com/ooples/AiDotNet.Tensors/issues/758)) ([4a865b7](https://github.com/ooples/AiDotNet.Tensors/commit/4a865b70a1426f2ccdcebfff22bbf6902669e8fb))
+
+
+### Bug Fixes
+
+* **compile:** fill entire output in compiled ReduceMax axis reduction ([#765](https://github.com/ooples/AiDotNet.Tensors/issues/765)) ([d04f8ca](https://github.com/ooples/AiDotNet.Tensors/commit/d04f8cafcd8bda78fa2c6d73ac1cfae87103ff41))
+* **compile:** zero only accumulating multi-consumer grad buffers (N-BEATS resident blow-up) ([#759](https://github.com/ooples/AiDotNet.Tensors/issues/759)) ([d94b919](https://github.com/ooples/AiDotNet.Tensors/commit/d94b91924e51d707dbdbfa29f98d4608df4ffdde))
+* **gpu:** resident params no longer flat-line FP32 fused-Adam training ([#764](https://github.com/ooples/AiDotNet.Tensors/issues/764)) ([c8da627](https://github.com/ooples/AiDotNet.Tensors/commit/c8da6270bb3241b7cbf1202a7760adf419132a7d))
+
+## [0.111.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.1...v0.111.2) (2026-07-09)
+
+
+### Bug Fixes
+
+* **cpu:** zero the unwritten tail in the axis-0 concat fast path ([#755](https://github.com/ooples/AiDotNet.Tensors/issues/755)) ([369b36a](https://github.com/ooples/AiDotNet.Tensors/commit/369b36a1a7f025fbb7cbfa094698d80906bd84a4))
+
+## [0.111.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.111.0...v0.111.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* **autodiff:** make 2D AffineGrid tape-aware + vectorize (fixes STN untrainable) ([#751](https://github.com/ooples/AiDotNet.Tensors/issues/751)) ([890ed53](https://github.com/ooples/AiDotNet.Tensors/commit/890ed53656bc409da8930380085feeb59390adcf))
+* **compiled-training:** keep plan activation buffers alive across replay — unfreezes fused training at large vocab ([#754](https://github.com/ooples/AiDotNet.Tensors/issues/754)) ([687a4c6](https://github.com/ooples/AiDotNet.Tensors/commit/687a4c6ad2a031c9ad5f5caa91c0df009e0abdd9))
+
+
+### Performance
+
+* **arena:** recycle transformer-layer scratch between layers for memory-bounded inference (AiDotNet[#1824](https://github.com/ooples/AiDotNet.Tensors/issues/1824)) ([#753](https://github.com/ooples/AiDotNet.Tensors/issues/753)) ([2572bd8](https://github.com/ooples/AiDotNet.Tensors/commit/2572bd80e4b9014ffb9b3ee5ad2d9ad8f79fe44b))
+
+## [0.111.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.110.1...v0.111.0) (2026-07-07)
+
+
+### Features
+
+* **simd:** dual-path Adam kernel — bit-exact default + AIDOTNET_FAST_MATH FMA fast path ([#738](https://github.com/ooples/AiDotNet.Tensors/issues/738)) ([d670ce3](https://github.com/ooples/AiDotNet.Tensors/commit/d670ce31750d09311125761c9d3db8ed2dcc7bdf))
+
+
+### Bug Fixes
+
+* **autodiff:** make 2D AffineGrid differentiable w.r.t. theta ([#747](https://github.com/ooples/AiDotNet.Tensors/issues/747)) ([72e4116](https://github.com/ooples/AiDotNet.Tensors/commit/72e4116efcf33c11310f54fe0401f3597477db06))
+* **bench:** gate gemm-bench on the median per-round paired ON/OFF ratio ([#741](https://github.com/ooples/AiDotNet.Tensors/issues/741)) ([39194bb](https://github.com/ooples/AiDotNet.Tensors/commit/39194bbf96e44f40c5d13969b05a565f732405b1))
+* **gpu:** fused-optimizer weight-coherence — refresh resident device buffer after in-place update ([#739](https://github.com/ooples/AiDotNet.Tensors/issues/739)) ([8e61dc4](https://github.com/ooples/AiDotNet.Tensors/commit/8e61dc48df46d7981044fe98b22dc1b6a453218c))
+* **gpu:** hardware-independent determinism for scatter-add grad + cuBLAS under SetDeterministicMode (Closes [#742](https://github.com/ooples/AiDotNet.Tensors/issues/742)) ([#744](https://github.com/ooples/AiDotNet.Tensors/issues/744)) ([b815872](https://github.com/ooples/AiDotNet.Tensors/commit/b8158726d08bc72b85bef25fabffef811aef6938))
+
+
+### Performance
+
+* **gemm:** beta=0 write-first path — skip redundant C-zeroing on pure C:=A·B ([#743](https://github.com/ooples/AiDotNet.Tensors/issues/743)) ([2aac704](https://github.com/ooples/AiDotNet.Tensors/commit/2aac704a5d9a55ff2407903a95ad74bae164e18b))
+* kill training spin-storm — lower resident-pool MRES spin (2047 -&gt; 32) ([#736](https://github.com/ooples/AiDotNet.Tensors/issues/736)) ([8ede01f](https://github.com/ooples/AiDotNet.Tensors/commit/8ede01f1c9802bbafbc6eed2fd7c6db2e94a00da))
+* zero-alloc training via TensorArena reuse + shape-safe ring (DRAFT) ([#734](https://github.com/ooples/AiDotNet.Tensors/issues/734)) ([3f7178a](https://github.com/ooples/AiDotNet.Tensors/commit/3f7178af342e4ed33871501ae160fd51479e858d))
+
+## [0.103.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.102.16...v0.103.0) (2026-07-07)
+
+
+### Features
+
+* **cuda:** wire BatchNorm to cuDNN + fix cuDNN context binding (AiDotNet[#1159](https://github.com/ooples/AiDotNet.Tensors/issues/1159)) ([#726](https://github.com/ooples/AiDotNet.Tensors/issues/726)) ([5ff173c](https://github.com/ooples/AiDotNet.Tensors/commit/5ff173c746319fcc7e00b1c2843cdad0c2683856))
+* **dcnv3:** fused grouped/depthwise deformable convolution kernel [WIP] ([#691](https://github.com/ooples/AiDotNet.Tensors/issues/691)) ([c16345f](https://github.com/ooples/AiDotNet.Tensors/commit/c16345f007f7eb8fb8b95b45a87f04849b823199))
+* **dcnv3:** single-launch fused grouped deformable backward (GPU) + CPU follow-up ([#693](https://github.com/ooples/AiDotNet.Tensors/issues/693)) ([4006015](https://github.com/ooples/AiDotNet.Tensors/commit/4006015f4cac96785b7a6b46c4c4941cde920415))
+* **fused:** bfloat16 moment storage for fused Adam/AdamW (CPU) ([#713](https://github.com/ooples/AiDotNet.Tensors/issues/713)) ([02655de](https://github.com/ooples/AiDotNet.Tensors/commit/02655dea06ffba03c143e761f88e28e32a8e8f6b))
+* **gemm:** opt-in bf16-B GEMM + fused epilogue on the fast GotoGemm path ([#706](https://github.com/ooples/AiDotNet.Tensors/issues/706)) ([5fa4cff](https://github.com/ooples/AiDotNet.Tensors/commit/5fa4cfffafd870b89734584646f995f3fb851cbb))
+* **simd:** shared bit-identical simd adam/amsgrad step kernel ([#1757](https://github.com/ooples/AiDotNet.Tensors/issues/1757)) ([#721](https://github.com/ooples/AiDotNet.Tensors/issues/721)) ([628abd5](https://github.com/ooples/AiDotNet.Tensors/commit/628abd516a4029917861df88c92f94b4098f2df9))
+* **streaming:** RAM-aware Auto store — step bf16 -&gt; int8 -&gt; int4 to fit resident cap in inference ([#720](https://github.com/ooples/AiDotNet.Tensors/issues/720)) ([c8681be](https://github.com/ooples/AiDotNet.Tensors/commit/c8681be3e8c303f19570c9ab6d2c96cdbda4d01d))
+
+
+### Bug Fixes
+
+* **#638:** CUDA-graph capture training now LEARNS (device barrier + deterministic scratch pool + LN resident-weight gate) ([#705](https://github.com/ooples/AiDotNet.Tensors/issues/705)) ([25132d1](https://github.com/ooples/AiDotNet.Tensors/commit/25132d1681130f40ef06f31b2eb97c61e3f7fe6d))
+* **autodiff:** route backward row-parallelism through the cooperative pool (fixes single-core training) ([#729](https://github.com/ooples/AiDotNet.Tensors/issues/729)) ([c2b85f2](https://github.com/ooples/AiDotNet.Tensors/commit/c2b85f2110ccd523db01675956084601017d990c))
+* **blas:** default to managed BlasManaged; make native CPU BLAS opt-in ([#686](https://github.com/ooples/AiDotNet.Tensors/issues/686)) ([5ca9f14](https://github.com/ooples/AiDotNet.Tensors/commit/5ca9f14476cfbff89352f872a396819d7c2eb06c))
+* **blas:** real fix for the Linux FP32 GEMM crash — add a SysV-ABI tile kernel (GotoGemm now cross-platform) ([#699](https://github.com/ooples/AiDotNet.Tensors/issues/699)) ([b7d4582](https://github.com/ooples/AiDotNet.Tensors/commit/b7d4582c12a41fb2f7f288176e0aac658ffcf402))
+* **build:** cold builds fail — split LicenseValidator Restore/Build into distinct-property MSBuild calls ([#724](https://github.com/ooples/AiDotNet.Tensors/issues/724)) ([ec9b889](https://github.com/ooples/AiDotNet.Tensors/commit/ec9b8892d6f42fb8146d6abd7a08e140dd0f8303))
+* **ci:** harden historical shard regressions ([#718](https://github.com/ooples/AiDotNet.Tensors/issues/718)) ([6ac5bc6](https://github.com/ooples/AiDotNet.Tensors/commit/6ac5bc6628ec370d6f8c9a13eeeaa2c867421577))
+* **compilation:** fused optimizer NREs on params with no materialized weights (kicks lazy/multi-modal models off the fused path) ([#712](https://github.com/ooples/AiDotNet.Tensors/issues/712)) ([b54086e](https://github.com/ooples/AiDotNet.Tensors/commit/b54086e3190aaa7fc56c5e3c04929f8fa6d0d73f))
+* **compilation:** stop topo-sort dropping in-place op chains (BatchNorm running-stat staleness) ([#704](https://github.com/ooples/AiDotNet.Tensors/issues/704)) ([0f764be](https://github.com/ooples/AiDotNet.Tensors/commit/0f764bec1d5741f31a7dd8fbeef6de6eb6baed99))
+* **compile:** refresh norm statistics in the fused training forward (GroupNorm + BatchNorm) ([#722](https://github.com/ooples/AiDotNet.Tensors/issues/722)) ([7f2c94d](https://github.com/ooples/AiDotNet.Tensors/commit/7f2c94da78329d8cc6bf6e2316f26ce3690a3f87))
+* **cpu:** invalidate per-array derived-weight caches on invalidatepersistenttensor ([#708](https://github.com/ooples/AiDotNet.Tensors/issues/708)) ([d03ea35](https://github.com/ooples/AiDotNet.Tensors/commit/d03ea35f36dd8ab31ad1cf18b6c62667e505667f))
+* **gpu:** apply softmax row-wise in fused-linear epilogue (was crash/garbage) ([#711](https://github.com/ooples/AiDotNet.Tensors/issues/711)) ([e7fbc3e](https://github.com/ooples/AiDotNet.Tensors/commit/e7fbc3e3d995d43a821b23c2e3c439e5ec6e9b9d))
+* **gpu:** clamp box w/h in IoU-family loss kernels so degenerate boxes match CPU ([#709](https://github.com/ooples/AiDotNet.Tensors/issues/709)) ([deaf1ea](https://github.com/ooples/AiDotNet.Tensors/commit/deaf1eae23ebfe011fb3bb93253b6762649085d4))
+* **gpu:** CUDA Dropout dropped 100% of activations (mask never generated) + stale seed ([#732](https://github.com/ooples/AiDotNet.Tensors/issues/732)) ([41d923f](https://github.com/ooples/AiDotNet.Tensors/commit/41d923f7c11313f5f398ed4642bfcc4aaad6a243))
+* **gpu:** DetectVendor must prefer CUDA over OpenCL device-0 vendor on mixed boxes ([#733](https://github.com/ooples/AiDotNet.Tensors/issues/733)) ([e8a4fb4](https://github.com/ooples/AiDotNet.Tensors/commit/e8a4fb4b3160fb50bfe5a3e9a3cc7d1ef2e71d15))
+* **gpu:** LayerNorm/RMSNorm normalize over gamma dims for rank &gt; 2 (fixes GPU transformer forward) ([#730](https://github.com/ooples/AiDotNet.Tensors/issues/730)) ([82464c2](https://github.com/ooples/AiDotNet.Tensors/commit/82464c2f8da9be6b50c3f940e5d19322178dbf45))
+* **streaming:** defer ReleaseToPool drop on shared storage (refcount &gt; 1) ([#692](https://github.com/ooples/AiDotNet.Tensors/issues/692)) ([0cf29fd](https://github.com/ooples/AiDotNet.Tensors/commit/0cf29fd18830aefd52cbe07e64f5c8d0f10c82bf))
+* **streaming:** quiesce in-flight prefetch workers before pool teardown ([#687](https://github.com/ooples/AiDotNet.Tensors/issues/687)) ([f833a92](https://github.com/ooples/AiDotNet.Tensors/commit/f833a92af0f9e8ee164f3586853a7779eaac20a1))
+* **streaming:** reclaim WeightRegistry entries for GC'd owners ([#714](https://github.com/ooples/AiDotNet.Tensors/issues/714)) ([#716](https://github.com/ooples/AiDotNet.Tensors/issues/716)) ([be97676](https://github.com/ooples/AiDotNet.Tensors/commit/be97676be3916d1a4e59a832b9d312bdf46f4477))
+
+
+### Performance
+
+* **#1650/#638:** diffusion UNet forward CUDA-graph capture ENGAGES — whole forward resident, ~3.2x (replay bit-exact) ([#671](https://github.com/ooples/AiDotNet.Tensors/issues/671)) ([1eec88e](https://github.com/ooples/AiDotNet.Tensors/commit/1eec88e6ae30124d6e98c1b38a684cbf3366f03b))
+* **#1672:** *Into resident-scratch engine kernels (SDPA/AdaLN/FusedLinear) for diffusion inference ([#696](https://github.com/ooples/AiDotNet.Tensors/issues/696)) ([3652dc7](https://github.com/ooples/AiDotNet.Tensors/commit/3652dc7e427251d34442ac7e4315d209900cd58f))
+* **#1715:** bound streaming-pool resident set on the GetParameters/register path (foundation-scale OOM) ([#707](https://github.com/ooples/AiDotNet.Tensors/issues/707)) ([170517e](https://github.com/ooples/AiDotNet.Tensors/commit/170517ef49ae10eec762f095c30ce5ee1df9f809))
+* **#653:** route StreamingStrategy GEMM dispatch onto low-latency PersistentParallelExecutor ([#688](https://github.com/ooples/AiDotNet.Tensors/issues/688)) ([d9e7462](https://github.com/ooples/AiDotNet.Tensors/commit/d9e7462e32a75bb06bff70d6b53737d9d1a85ba2))
+* **attn:** scatter-lock GC sweep — GQA backward 6.4x less GC + 3D-op locks ([#698](https://github.com/ooples/AiDotNet.Tensors/issues/698)) ([f9596de](https://github.com/ooples/AiDotNet.Tensors/commit/f9596dee4b86f63ca7d11cc51ada0f53d771c287))
+* **blas:** managed FP32 GEMM — GotoBLAS rewrite + CCX-2D-NUMA + short-M campaign (DiT ~2x; sq4096 &gt; throttled MKL) ([#695](https://github.com/ooples/AiDotNet.Tensors/issues/695)) ([5f19acb](https://github.com/ooples/AiDotNet.Tensors/commit/5f19acb843653604bec84c4d4d368a3c878c810a))
+* cache per-op env-var reads + skip zero-fill on small RentUninitialized ([#731](https://github.com/ooples/AiDotNet.Tensors/issues/731)) ([61ab50f](https://github.com/ooples/AiDotNet.Tensors/commit/61ab50fae556adc9c47fbbc239d5e69b5667d823))
+* **conv:** batch=1 conv-backward-kernel writes gradient straight into dest ([#689](https://github.com/ooples/AiDotNet.Tensors/issues/689)) ([a1d61e0](https://github.com/ooples/AiDotNet.Tensors/commit/a1d61e016e6c68f336bcf9edd635e60c18b6b214))
+* **conv:** bounded large-array pool for conv-backward stacks — ~8x less GC traffic ([#1691](https://github.com/ooples/AiDotNet.Tensors/issues/1691) follow-up) ([#694](https://github.com/ooples/AiDotNet.Tensors/issues/694)) ([aeaa5ea](https://github.com/ooples/AiDotNet.Tensors/commit/aeaa5ea360fa7802660bda21861ce8e79b896896))
+* **conv:** route large-spatial 3x3 convs to implicit-GEMM (24x forward, 8x CNN step) ([#690](https://github.com/ooples/AiDotNet.Tensors/issues/690)) ([7a8a727](https://github.com/ooples/AiDotNet.Tensors/commit/7a8a727e3b66766fcf8c5b0e9c90029c9b3f6011))
+* **cpu:** parallelize 3 linear-attn scans + fused fp16-weight GEMM ([#723](https://github.com/ooples/AiDotNet.Tensors/issues/723)) ([c840501](https://github.com/ooples/AiDotNet.Tensors/commit/c84050122773ac7d35eea46735c71effa6cd4415))
+* **dcnv3:** make grouped deformable-conv backward ~2.9× faster (GC + dispatch + lock contention) ([#697](https://github.com/ooples/AiDotNet.Tensors/issues/697)) ([9d60add](https://github.com/ooples/AiDotNet.Tensors/commit/9d60addd4cd8fe939838d6ec59eaacf94b91fc89))
+* **gemm:** exceed OpenBLAS — JIT small-GEMM (1.5–6×) + scientific multi-thread routing/pinning wins on diffusion shapes ([#700](https://github.com/ooples/AiDotNet.Tensors/issues/700)) ([ce14327](https://github.com/ooples/AiDotNet.Tensors/commit/ce14327c77f06ea39190b0f55586714ed3fd5b21))
+* **geometry:** kill per-element indexer/numOps dispatch in sampling+distance kernels (GridSample ~50x +3) ([#702](https://github.com/ooples/AiDotNet.Tensors/issues/702)) ([1224c7d](https://github.com/ooples/AiDotNet.Tensors/commit/1224c7d16cf5a28bc8d3620ce852a3df9e66ae54))
+* **ssm:** parallelize fused SSM/linear-attention scan kernels (Mamba, GLA, RWKV-7, GatedDeltaNet, xLSTM) ([#703](https://github.com/ooples/AiDotNet.Tensors/issues/703)) ([26fb3f4](https://github.com/ooples/AiDotNet.Tensors/commit/26fb3f47f4e7e0d65a7ca79a0a7d527373fc0095))

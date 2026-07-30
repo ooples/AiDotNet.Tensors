@@ -16,9 +16,31 @@ public enum CudaDeviceAttribute
     MaxSharedMemoryPerBlock = 8,
     ClockRate = 13,
     MultiprocessorCount = 16,
+    MaxThreadsPerMultiprocessor = 39,
     ComputeCapabilityMajor = 75,
     ComputeCapabilityMinor = 76,
     CooperativeLaunch = 95
+}
+
+/// <summary>
+/// CUDA function attributes returned by <c>cuFuncGetAttribute</c>.
+/// These values are part of the CUDA Driver API ABI.
+/// </summary>
+internal enum CudaFunctionAttribute
+{
+    MaxThreadsPerBlock = 0,
+    SharedSizeBytes = 1,
+    ConstSizeBytes = 2,
+    LocalSizeBytes = 3,
+    NumRegisters = 4,
+    PtxVersion = 5,
+    BinaryVersion = 6
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct CudaDeviceUuid
+{
+    internal fixed byte Bytes[16];
 }
 
 internal static class CudaNativeBindings
@@ -86,14 +108,56 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuDeviceTotalMem_v2")]
     public static extern CudaResult cuDeviceTotalMem(out ulong bytes, int device);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuDeviceGetUuid_v2")]
+    internal static extern CudaResult cuDeviceGetUuidV2(out CudaDeviceUuid uuid, int device);
+
     [DllImport(CudaLibrary, EntryPoint = "cuModuleLoadData")]
     public static extern CudaResult cuModuleLoadData(out IntPtr module, IntPtr image);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuModuleLoadDataEx")]
+    public static extern CudaResult cuModuleLoadDataEx(
+        out IntPtr module,
+        IntPtr image,
+        uint numOptions,
+        [In] int[] options,
+        [In] IntPtr[] optionValues);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkCreate_v2")]
+    internal static extern CudaResult cuLinkCreate(
+        uint numOptions,
+        [In] int[] options,
+        [In] IntPtr[] optionValues,
+        out IntPtr state);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkAddData_v2")]
+    internal static extern CudaResult cuLinkAddData(
+        IntPtr state,
+        int inputType,
+        IntPtr data,
+        UIntPtr size,
+        string name,
+        uint numOptions,
+        IntPtr options,
+        IntPtr optionValues);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkComplete")]
+    internal static extern CudaResult cuLinkComplete(
+        IntPtr state,
+        out IntPtr cubin,
+        out UIntPtr size);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkDestroy")]
+    internal static extern CudaResult cuLinkDestroy(IntPtr state);
 
     [DllImport(CudaLibrary, EntryPoint = "cuModuleUnload")]
     public static extern CudaResult cuModuleUnload(IntPtr module);
 
     [DllImport(CudaLibrary, EntryPoint = "cuModuleGetFunction")]
     public static extern CudaResult cuModuleGetFunction(out IntPtr function, IntPtr module, string name);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuFuncGetAttribute")]
+    public static extern CudaResult cuFuncGetAttribute(
+        out int value, CudaFunctionAttribute attribute, IntPtr function);
 
     [DllImport(CudaLibrary, EntryPoint = "cuLaunchKernel")]
     public static extern CudaResult cuLaunchKernel(
@@ -294,6 +358,9 @@ internal static class CudaNativeBindings
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxGetCurrent")]
     public static extern CudaResult cuCtxGetCurrent(out IntPtr ctx);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxGetDevice")]
+    public static extern CudaResult cuCtxGetDevice(out int device);
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPushCurrent_v2")]
     public static extern CudaResult cuCtxPushCurrent(IntPtr ctx);

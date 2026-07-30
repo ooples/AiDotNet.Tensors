@@ -7,14 +7,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// - Quantum computing operations
 /// - Measurement/probability operations
 /// </summary>
-/// <remarks>
-/// <para>
-/// <b>LIMITATION:</b> Hyperbolic geometry kernels (poincare_exp_map, poincare_distance,
-/// hyperbolic_linear_forward) use fixed-size arrays and are limited to dimensions &lt;= 32.
-/// If dim &gt; 32, these kernels will output zeros for the affected elements.
-/// For higher dimensions, use the CPU fallback implementation.
-/// </para>
-/// </remarks>
 public static class CudaSpecializedKernels
 {
     public static string GetSource()
@@ -135,17 +127,12 @@ extern ""C"" __global__ __launch_bounds__(256) void poincare_exp_map(
     float arg = sqrtC * vNorm * lambda;
     float scale = tanhf(arg) / (sqrtC * vNorm);
 
-    // Compute scaled tangent vector
-    float scaledV[32]; // Max dim supported
-    for (int i = 0; i < dim && i < 32; i++) {
-        scaledV[i] = v[i] * scale;
-    }
-
     // Now do Mobius addition of x and scaledV
     float svNormSq = 0.0f, xsvDot = 0.0f;
-    for (int i = 0; i < dim && i < 32; i++) {
-        svNormSq += scaledV[i] * scaledV[i];
-        xsvDot += x[i] * scaledV[i];
+    for (int i = 0; i < dim; i++) {
+        float scaledV = v[i] * scale;
+        svNormSq += scaledV * scaledV;
+        xsvDot += x[i] * scaledV;
     }
 
     float num_coef_x = 1.0f + 2.0f * c * xsvDot + c * svNormSq;
@@ -153,8 +140,9 @@ extern ""C"" __global__ __launch_bounds__(256) void poincare_exp_map(
     float denom = 1.0f + 2.0f * c * xsvDot + c * c * xNormSq * svNormSq;
     if (fabsf(denom) < 1e-10f) denom = 1e-10f;
 
-    for (int i = 0; i < dim && i < 32; i++) {
-        out[i] = (num_coef_x * x[i] + num_coef_sv * scaledV[i]) / denom;
+    for (int i = 0; i < dim; i++) {
+        float scaledV = v[i] * scale;
+        out[i] = (num_coef_x * x[i] + num_coef_sv * scaledV) / denom;
     }
 }
 
@@ -172,19 +160,16 @@ extern ""C"" __global__ __launch_bounds__(256) void poincare_distance(
     float c = curvature;
     float sqrtC = sqrtf(c);
 
-    // Compute -x
-    float negX[32];
     float xNormSq = 0.0f;
-    for (int i = 0; i < dim && i < 32; i++) {
-        negX[i] = -xi[i];
+    for (int i = 0; i < dim; i++) {
         xNormSq += xi[i] * xi[i];
     }
 
     // Compute (-x) (+) y using Mobius addition formula
     float yNormSq = 0.0f, negXyDot = 0.0f;
-    for (int i = 0; i < dim && i < 32; i++) {
+    for (int i = 0; i < dim; i++) {
         yNormSq += yi[i] * yi[i];
-        negXyDot += negX[i] * yi[i];
+        negXyDot += (-xi[i]) * yi[i];
     }
 
     float num_coef_negX = 1.0f + 2.0f * c * negXyDot + c * yNormSq;
@@ -193,8 +178,8 @@ extern ""C"" __global__ __launch_bounds__(256) void poincare_distance(
     if (fabsf(denom) < 1e-10f) denom = 1e-10f;
 
     float diffNormSq = 0.0f;
-    for (int i = 0; i < dim && i < 32; i++) {
-        float diff = (num_coef_negX * negX[i] + num_coef_y * yi[i]) / denom;
+    for (int i = 0; i < dim; i++) {
+        float diff = (num_coef_negX * (-xi[i]) + num_coef_y * yi[i]) / denom;
         diffNormSq += diff * diff;
     }
 
@@ -231,93 +216,141 @@ extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_forward(
     const float* bo = biases + o * inputFeatures;
 
     // Project input to Poincare ball
-    float projInput[32];
     float inputNormSq = 0.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
+    for (int i = 0; i < inputFeatures; i++) {
         inputNormSq += xi[i] * xi[i];
     }
     float maxNorm = 1.0f / sqrtC - epsilon;
     float maxNormSq = maxNorm * maxNorm;
     float inputScale = (inputNormSq >= maxNormSq) ? (maxNorm / sqrtf(inputNormSq)) : 1.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        projInput[i] = xi[i] * inputScale;
-    }
-
     // Compute exp_origin(weight) - origin is zero vector
     // exp_0(v) = tanh(sqrt(c)||v||/2) * v / (sqrt(c)||v||)
     float weightNorm = 0.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
+    for (int i = 0; i < inputFeatures; i++) {
         weightNorm += wo[i] * wo[i];
     }
     weightNorm = sqrtf(weightNorm);
-
-    float weightPoint[32];
-    if (weightNorm > 1e-10f) {
-        float scale = tanhf(sqrtC * weightNorm / 2.0f) / (sqrtC * weightNorm);
-        for (int i = 0; i < inputFeatures && i < 32; i++) {
-            weightPoint[i] = wo[i] * scale;
-        }
-    } else {
-        for (int i = 0; i < inputFeatures && i < 32; i++) {
-            weightPoint[i] = 0.0f;
-        }
-    }
+    float weightScale = weightNorm > 1e-10f
+        ? tanhf(sqrtC * weightNorm / 2.0f) / (sqrtC * weightNorm)
+        : 0.0f;
 
     // Mobius add: projInput (+) weightPoint
     float wpNormSq = 0.0f, piWpDot = 0.0f, piNormSq = 0.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        wpNormSq += weightPoint[i] * weightPoint[i];
-        piNormSq += projInput[i] * projInput[i];
-        piWpDot += projInput[i] * weightPoint[i];
+    for (int i = 0; i < inputFeatures; i++) {
+        float projInput = xi[i] * inputScale;
+        float weightPoint = wo[i] * weightScale;
+        wpNormSq += weightPoint * weightPoint;
+        piNormSq += projInput * projInput;
+        piWpDot += projInput * weightPoint;
     }
 
-    float transformed[32];
     float num1 = 1.0f + 2.0f * c * piWpDot + c * wpNormSq;
     float num2 = 1.0f - c * piNormSq;
     float den = 1.0f + 2.0f * c * piWpDot + c * c * piNormSq * wpNormSq;
     if (fabsf(den) < 1e-10f) den = 1e-10f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        transformed[i] = (num1 * projInput[i] + num2 * weightPoint[i]) / den;
-    }
+    float firstNum1 = num1;
+    float firstNum2 = num2;
+    float firstDen = den;
 
     // Project bias
-    float projBias[32];
     float biasNormSq = 0.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
+    for (int i = 0; i < inputFeatures; i++) {
         biasNormSq += bo[i] * bo[i];
     }
     float biasScale = (biasNormSq >= maxNormSq) ? (maxNorm / sqrtf(biasNormSq)) : 1.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        projBias[i] = bo[i] * biasScale;
-    }
 
     // Mobius add: transformed (+) projBias
     float pbNormSq = 0.0f, trPbDot = 0.0f, trNormSq = 0.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        pbNormSq += projBias[i] * projBias[i];
-        trNormSq += transformed[i] * transformed[i];
-        trPbDot += transformed[i] * projBias[i];
+    for (int i = 0; i < inputFeatures; i++) {
+        float projInput = xi[i] * inputScale;
+        float weightPoint = wo[i] * weightScale;
+        float transformed = (firstNum1 * projInput + firstNum2 * weightPoint) / firstDen;
+        float projBias = bo[i] * biasScale;
+        pbNormSq += projBias * projBias;
+        trNormSq += transformed * transformed;
+        trPbDot += transformed * projBias;
     }
 
-    float withBias[32];
     num1 = 1.0f + 2.0f * c * trPbDot + c * pbNormSq;
     num2 = 1.0f - c * trNormSq;
     den = 1.0f + 2.0f * c * trPbDot + c * c * trNormSq * pbNormSq;
     if (fabsf(den) < 1e-10f) den = 1e-10f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        withBias[i] = (num1 * transformed[i] + num2 * projBias[i]) / den;
-    }
 
     // Compute distance from origin: d(0, x) = (2/sqrt(c)) * arctanh(sqrt(c) * ||x||)
     float wbNormSq = 0.0f;
-    for (int i = 0; i < inputFeatures && i < 32; i++) {
-        wbNormSq += withBias[i] * withBias[i];
+    for (int i = 0; i < inputFeatures; i++) {
+        float projInput = xi[i] * inputScale;
+        float weightPoint = wo[i] * weightScale;
+        float transformed = (firstNum1 * projInput + firstNum2 * weightPoint) / firstDen;
+        float projBias = bo[i] * biasScale;
+        float withBias = (num1 * transformed + num2 * projBias) / den;
+        wbNormSq += withBias * withBias;
     }
     float wbNorm = sqrtf(wbNormSq);
     float arg = sqrtC * wbNorm;
     if (arg >= 1.0f) arg = 1.0f - 1e-6f;
 
     output[b * outputFeatures + o] = (2.0f / sqrtC) * atanhf(arg);
+}
+
+// Current hyperbolic-linear contract: Euclidean linear followed by a separate
+// Poincare projection pass. Weights are [outputFeatures,inputFeatures] and
+// biases are [outputFeatures]. Backward intentionally differentiates the
+// Euclidean linear step; the Riemannian correction belongs to the optimizer.
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_euclidean_forward(
+    const float* input, const float* weights, const float* biases, float* output,
+    int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batchSize * outputFeatures;
+    if (tid >= total) return;
+    int b = tid / outputFeatures;
+    int o = tid % outputFeatures;
+    float sum = biases[o];
+    for (int i = 0; i < inputFeatures; i++)
+        sum += input[b * inputFeatures + i] * weights[o * inputFeatures + i];
+    output[tid] = sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_input(
+    const float* gradOutput, const float* input, const float* weights, float* gradInput,
+    int batchSize, int inputFeatures, int outputFeatures, float curvature)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batchSize * inputFeatures;
+    if (tid >= total) return;
+    int b = tid / inputFeatures;
+    int i = tid % inputFeatures;
+    float sum = 0.0f;
+    for (int o = 0; o < outputFeatures; o++)
+        sum += gradOutput[b * outputFeatures + o] * weights[o * inputFeatures + i];
+    gradInput[tid] = sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_weights(
+    const float* gradOutput, const float* input, float* gradWeights,
+    int batchSize, int inputFeatures, int outputFeatures, float curvature)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outputFeatures * inputFeatures;
+    if (tid >= total) return;
+    int o = tid / inputFeatures;
+    int i = tid % inputFeatures;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++)
+        sum += gradOutput[b * outputFeatures + o] * input[b * inputFeatures + i];
+    gradWeights[tid] = sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_biases(
+    const float* gradOutput, const float* input, float* gradBiases,
+    int batchSize, int inputFeatures, int outputFeatures, float curvature)
+{
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= outputFeatures) return;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++) sum += gradOutput[b * outputFeatures + o];
+    gradBiases[o] = sum;
 }
 
 // ============================================================================
@@ -653,6 +686,10 @@ extern ""C"" __global__ __launch_bounds__(256) void complex_magnitude(
             "poincare_exp_map",
             "poincare_distance",
             "hyperbolic_linear_forward",
+            "hyperbolic_linear_euclidean_forward",
+            "hyperbolic_linear_backward_input",
+            "hyperbolic_linear_backward_weights",
+            "hyperbolic_linear_backward_biases",
             // Octonion algebra
             "octonion_multiply",
             "octonion_add",

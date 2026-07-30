@@ -49,7 +49,11 @@ __kernel void im2col(
     const int ow = rem % outW;
 
     const int patchSize = channels * kernelH * kernelW;
-    __global float* outPtr = output + idx * patchSize;
+    // Output is [batch, C*kH*kW, L] (L = outH*outW), matching CpuEngine.Unfold. The old write
+    // (output[idx*patchSize + colRow]) produced the transposed [batch, L, C*kH*kW] layout, so the
+    // GPU columns came out permuted vs the CPU convention (#775). Write [patchSize, L] instead.
+    const int L = outH * outW;
+    const int s = oh * outW + ow;
 
     for (int c = 0; c < channels; c++) {
         for (int kh = 0; kh < kernelH; kh++) {
@@ -62,8 +66,8 @@ __kernel void im2col(
                     val = input[((b * channels + c) * height + ih) * width + iw];
                 }
 
-                int outIdx = (c * kernelH + kh) * kernelW + kw;
-                outPtr[outIdx] = val;
+                int colRow = (c * kernelH + kh) * kernelW + kw;
+                output[(b * patchSize + colRow) * L + s] = val;
             }
         }
     }
@@ -113,9 +117,13 @@ __kernel void col2im(
                 int ow = ow_base / strideW;
 
                 if (oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
-                    int patchIdx = (b * outH + oh) * outW + ow;
+                    // Input is [batch, C*kH*kW, L] (L = outH*outW patches), matching CpuEngine.Fold:
+                    // flat = b*patchSize*L + colIdx*L + s. The old index (patchIdx*patchSize + colIdx)
+                    // assumed a transposed [batch, L, C*kH*kW] layout and produced wrong values (#775).
+                    int L = outH * outW;
+                    int s = oh * outW + ow;
                     int colIdx = (c * kernelH + kh) * kernelW + kw;
-                    sum += input[patchIdx * patchSize + colIdx];
+                    sum += input[(b * patchSize + colIdx) * L + s];
                 }
             }
         }
@@ -779,6 +787,342 @@ __kernel void conv3d_direct(
 
     output[(((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
 }
+
+// #775: Depthwise Conv2D backward w.r.t. input (NCHW). Gathers per gradInput element (no race/zero).
+// kernel is [inC, M, kH, kW] flattened == [outC, kH, kW] with outC = inC*M, oc = ic*M + m.
+__kernel void depthwise_conv2d_backward_input(
+    __global const float* gradOutput,
+    __global const float* weights,
+    __global float* gradInput,
+    const int N, const int inC, const int H, const int W,
+    const int M, const int outH, const int outW,
+    const int kH, const int kW,
+    const int strideH, const int strideW, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    const int total = N * inC * H * W;
+    if (idx >= total) return;
+    const int iw = idx % W;
+    const int ih = (idx / W) % H;
+    const int ic = (idx / (W * H)) % inC;
+    const int b = idx / (W * H * inC);
+    const int outC = inC * M;
+    float sum = 0.0f;
+    for (int m = 0; m < M; m++) {
+        int oc = ic * M + m;
+        for (int kh = 0; kh < kH; kh++) {
+            int t = ih + padH - kh;
+            if (t < 0 || (t % strideH) != 0) continue;
+            int oh = t / strideH;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = iw + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int ow = tw / strideW;
+                if (ow < 0 || ow >= outW) continue;
+                sum += weights[(oc * kH + kh) * kW + kw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: Depthwise Conv2D backward w.r.t. weights (NCHW). Gathers per gradKernel element (no race/zero).
+__kernel void depthwise_conv2d_backward_weights(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global float* gradKernel,
+    const int N, const int inC, const int H, const int W,
+    const int M, const int outH, const int outW,
+    const int kH, const int kW,
+    const int strideH, const int strideW, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    const int outC = inC * M;
+    const int total = outC * kH * kW;
+    if (idx >= total) return;
+    const int kw = idx % kW;
+    const int kh = (idx / kW) % kH;
+    const int oc = idx / (kW * kH);
+    const int ic = oc / M;
+    float sum = 0.0f;
+    for (int b = 0; b < N; b++) {
+        for (int oh = 0; oh < outH; oh++) {
+            int ih = oh * strideH - padH + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int ow = 0; ow < outW; ow++) {
+                int iw = ow * strideW - padW + kw;
+                if (iw < 0 || iw >= W) continue;
+                sum += input[((b * inC + ic) * H + ih) * W + iw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}
+
+// #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] (z,y,x) positions -> [P,C]. One work item
+// per (position, channel). Matches CpuEngine: clamp each coord to [0, dim-1-eps], 8-corner blend.
+__kernel void trilinear_interpolate(
+    __global const float* grid,
+    __global const float* positions,
+    __global float* output,
+    const int D, const int H, const int W, const int C,
+    const int P, const float upperEps)
+{
+    const int idx = get_global_id(0);
+    if (idx >= P * C) return;
+    const int c = idx % C;
+    const int n = idx / C;
+    float z = fmax(0.0f, fmin((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+    float y = fmax(0.0f, fmin((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+    float x = fmax(0.0f, fmin((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+    int z0 = (int)floor(z), y0 = (int)floor(y), x0 = (int)floor(x);
+    int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+    float fz = z - z0, fy = y - y0, fx = x - x0;
+    float w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx;
+    float w010 = (1 - fz) * fy * (1 - fx),       w011 = (1 - fz) * fy * fx;
+    float w100 = fz * (1 - fy) * (1 - fx),       w101 = fz * (1 - fy) * fx;
+    float w110 = fz * fy * (1 - fx),             w111 = fz * fy * fx;
+    output[n * C + c] =
+        w000 * grid[(((z0 * H + y0) * W + x0) * C) + c] + w001 * grid[(((z0 * H + y0) * W + x1) * C) + c] +
+        w010 * grid[(((z0 * H + y1) * W + x0) * C) + c] + w011 * grid[(((z0 * H + y1) * W + x1) * C) + c] +
+        w100 * grid[(((z1 * H + y0) * W + x0) * C) + c] + w101 * grid[(((z1 * H + y0) * W + x1) * C) + c] +
+        w110 * grid[(((z1 * H + y1) * W + x0) * C) + c] + w111 * grid[(((z1 * H + y1) * W + x1) * C) + c];
+}
+
+// #775: Trilinear-interpolate backward w.r.t. the grid. GATHER form (one work item per grid cell,
+// deterministic — no atomics): the 8-corner weight factorizes per axis, so this cell's z/y/x weight is
+// the additive contribution over the (possibly-coincident, when clamped) low/high indices.
+__kernel void trilinear_interpolate_backward(
+    __global const float* gradOutput,
+    __global const float* positions,
+    __global float* gradGrid,
+    const int D, const int H, const int W, const int C,
+    const int P, const float upperEps)
+{
+    const int idx = get_global_id(0);
+    if (idx >= D * H * W * C) return;
+    const int c = idx % C;
+    const int gx = (idx / C) % W;
+    const int gy = (idx / (C * W)) % H;
+    const int gz = idx / (C * W * H);
+    float sum = 0.0f;
+    for (int n = 0; n < P; n++) {
+        float z = fmax(0.0f, fmin((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+        float y = fmax(0.0f, fmin((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+        float x = fmax(0.0f, fmin((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+        int z0 = (int)floor(z), y0 = (int)floor(y), x0 = (int)floor(x);
+        int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+        float fz = z - z0, fy = y - y0, fx = x - x0;
+        float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);
+        if (wz == 0.0f) continue;
+        float wy = (gy == y0 ? (1.0f - fy) : 0.0f) + (gy == y1 ? fy : 0.0f);
+        if (wy == 0.0f) continue;
+        float wx = (gx == x0 ? (1.0f - fx) : 0.0f) + (gx == x1 ? fx : 0.0f);
+        sum += wz * wy * wx * gradOutput[n * C + c];
+    }
+    gradGrid[idx] = sum;
+}
+
+// #775: ConvTranspose3D forward (NCDHW), weights [inC,outC,kD,kH,kW]. GATHER over output elements:
+// od = id*stride - pad + kd  ->  id = (od + pad - kd)/stride (integer, in range). No output-padding here.
+__kernel void conv_transpose3d(
+    __global const float* input,
+    __global const float* weights,
+    __global float* output,
+    const int N, const int inC, const int iD, const int iH, const int iW,
+    const int outC, const int outD, const int outH, const int outW,
+    const int kD, const int kH, const int kW,
+    const int strideD, const int strideH, const int strideW,
+    const int padD, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    if (idx >= N * outC * outD * outH * outW) return;
+    const int ow = idx % outW;
+    const int oh = (idx / outW) % outH;
+    const int od = (idx / (outW * outH)) % outD;
+    const int oc = (idx / (outW * outH * outD)) % outC;
+    const int n = idx / (outW * outH * outD * outC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int td = od + padD - kd;
+        if (td < 0 || (td % strideD) != 0) continue;
+        int id = td / strideD;
+        if (id < 0 || id >= iD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int th = oh + padH - kh;
+            if (th < 0 || (th % strideH) != 0) continue;
+            int ih = th / strideH;
+            if (ih < 0 || ih >= iH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = ow + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int iw = tw / strideW;
+                if (iw < 0 || iw >= iW) continue;
+                for (int ic = 0; ic < inC; ic++) {
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    output[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. input. GATHER over gradInput; od = id*stride - pad + kd directly.
+__kernel void conv_transpose3d_backward_input(
+    __global const float* gradOutput,
+    __global const float* weights,
+    __global float* gradInput,
+    const int N, const int inC, const int iD, const int iH, const int iW,
+    const int outC, const int outD, const int outH, const int outW,
+    const int kD, const int kH, const int kW,
+    const int strideD, const int strideH, const int strideW,
+    const int padD, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    if (idx >= N * inC * iD * iH * iW) return;
+    const int iw = idx % iW;
+    const int ih = (idx / iW) % iH;
+    const int id = (idx / (iW * iH)) % iD;
+    const int ic = (idx / (iW * iH * iD)) % inC;
+    const int n = idx / (iW * iH * iD * inC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int od = id * strideD - padD + kd;
+        if (od < 0 || od >= outD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int oh = ih * strideH - padH + kh;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int ow = iw * strideW - padW + kw;
+                if (ow < 0 || ow >= outW) continue;
+                for (int oc = 0; oc < outC; oc++) {
+                    sum += gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. weights. GATHER over gradWeights [inC,outC,kD,kH,kW].
+__kernel void conv_transpose3d_backward_weights(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global float* gradWeights,
+    const int N, const int inC, const int iD, const int iH, const int iW,
+    const int outC, const int outD, const int outH, const int outW,
+    const int kD, const int kH, const int kW,
+    const int strideD, const int strideH, const int strideW,
+    const int padD, const int padH, const int padW)
+{
+    const int idx = get_global_id(0);
+    if (idx >= inC * outC * kD * kH * kW) return;
+    const int kw = idx % kW;
+    const int kh = (idx / kW) % kH;
+    const int kd = (idx / (kW * kH)) % kD;
+    const int oc = (idx / (kW * kH * kD)) % outC;
+    const int ic = idx / (kW * kH * kD * outC);
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int id = 0; id < iD; id++) {
+            int od = id * strideD - padD + kd;
+            if (od < 0 || od >= outD) continue;
+            for (int ih = 0; ih < iH; ih++) {
+                int oh = ih * strideH - padH + kh;
+                if (oh < 0 || oh >= outH) continue;
+                for (int iw = 0; iw < iW; iw++) {
+                    int ow = iw * strideW - padW + kw;
+                    if (ow < 0 || ow >= outW) continue;
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx] = sum;
+}
+
+// #775: SpiralConv (mesh conv). Per (vertex, out-channel): gather the spiralLength neighbour features and
+// matmul with weights [outC, inC*spiralLength] + bias. Invalid neighbour index contributes 0. 1D over V*outC.
+__kernel void spiral_conv(
+    __global const float* vertexFeatures,  // [V, inC]
+    __global const int* spiralIndices,     // [V, spiralLength]
+    __global const float* weights,         // [outC, inC*spiralLength]
+    __global const float* biases,          // [outC]
+    __global float* output,                // [V, outC]
+    const int V, const int inC, const int spiralLength, const int outC)
+{
+    const int idx = get_global_id(0);
+    if (idx >= V * outC) return;
+    const int oc = idx % outC;
+    const int v = idx / outC;
+    const int gatheredSize = inC * spiralLength;
+    float sum = biases[oc];
+    for (int s = 0; s < spiralLength; s++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        int gatherOffset = s * inC;
+        for (int c = 0; c < inC; c++) {
+            sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];
+        }
+    }
+    output[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. vertex features. GATHER over gradVertexFeatures [V,inC]: for cell
+// (nbr,ic), sum over every (v,s) whose spiral index == nbr of sum_oc gradOut[v,oc]*weights[oc, s*inC+ic].
+__kernel void spiral_conv_backward_input(
+    __global const float* gradOutput,   // [V, outC]
+    __global const int* spiralIndices,  // [V, spiralLength]
+    __global const float* weights,      // [outC, inC*spiralLength]
+    __global float* gradVertexFeatures, // [V, inC]
+    const int V, const int inC, const int spiralLength, const int outC)
+{
+    const int idx = get_global_id(0);
+    if (idx >= V * inC) return;
+    const int ic = idx % inC;
+    const int nbr = idx / inC;
+    const int gatheredSize = inC * spiralLength;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        for (int s = 0; s < spiralLength; s++) {
+            if (spiralIndices[v * spiralLength + s] != nbr) continue;
+            for (int oc = 0; oc < outC; oc++) {
+                sum += gradOutput[v * outC + oc] * weights[oc * gatheredSize + s * inC + ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. weights. GATHER over gradWeights [outC, inC*spiralLength].
+__kernel void spiral_conv_backward_weights(
+    __global const float* gradOutput,      // [V, outC]
+    __global const float* vertexFeatures,  // [V, inC]
+    __global const int* spiralIndices,     // [V, spiralLength]
+    __global float* gradWeights,           // [outC, inC*spiralLength]
+    const int V, const int inC, const int spiralLength, const int outC)
+{
+    const int idx = get_global_id(0);
+    const int gatheredSize = inC * spiralLength;
+    if (idx >= outC * gatheredSize) return;
+    const int g = idx % gatheredSize;
+    const int oc = idx / gatheredSize;
+    const int s = g / inC;
+    const int ic = g % inC;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];
+    }
+    gradWeights[idx] = sum;
+}
 ";
         }
 
@@ -800,7 +1144,17 @@ __kernel void conv3d_direct(
                 "conv_transpose2d_backward_weights",
                 "conv2d_tiled",
                 "conv2d_winograd_f2x2_3x3",
-                "conv3d_direct"
+                "conv3d_direct",
+                "depthwise_conv2d_backward_input",
+                "depthwise_conv2d_backward_weights",
+                "trilinear_interpolate",
+                "trilinear_interpolate_backward",
+                "conv_transpose3d",
+                "conv_transpose3d_backward_input",
+                "conv_transpose3d_backward_weights",
+                "spiral_conv",
+                "spiral_conv_backward_input",
+                "spiral_conv_backward_weights"
             };
         }
     }

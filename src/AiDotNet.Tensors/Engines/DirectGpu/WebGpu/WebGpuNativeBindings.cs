@@ -107,6 +107,25 @@ public static partial class WebGpuNativeBindings
     }
 
     /// <summary>
+    /// Writes raw bytes to a GPU buffer (internal double[] version for JS interop).
+    /// </summary>
+    [JSImport("writeByteBuffer", ModuleName)]
+    internal static partial void WriteByteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
+
+    /// <summary>
+    /// Writes raw bytes to a GPU buffer.
+    /// </summary>
+    public static void WriteByteBuffer(int bufferId, byte[] data, int offsetBytes)
+    {
+        var doubleData = new double[data.Length];
+        for (int i = 0; i < data.Length; i++)
+        {
+            doubleData[i] = data[i];
+        }
+        WriteByteBufferInternal(bufferId, doubleData, offsetBytes);
+    }
+
+    /// <summary>
     /// Reads data from a GPU buffer. Returns JSON string of the data array.
     /// </summary>
     /// <remarks>
@@ -116,6 +135,13 @@ public static partial class WebGpuNativeBindings
     [JSImport("readBufferAsJson", ModuleName)]
     [return: JSMarshalAs<JSType.Promise<JSType.String>>]
     internal static partial Task<string> ReadBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
+
+    /// <summary>
+    /// Reads raw bytes from a GPU buffer. Returns JSON string of byte values.
+    /// </summary>
+    [JSImport("readByteBufferAsJson", ModuleName)]
+    [return: JSMarshalAs<JSType.Promise<JSType.String>>]
+    internal static partial Task<string> ReadByteBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
 
     /// <summary>
     /// Reads data from a GPU buffer.
@@ -145,6 +171,31 @@ public static partial class WebGpuNativeBindings
             floatData[i] = (float)values[i];
         }
         return floatData;
+    }
+
+    /// <summary>
+    /// Reads raw bytes from a GPU buffer.
+    /// </summary>
+    public static async Task<byte[]> ReadByteBufferAsync(int bufferId, int sizeBytes, int offsetBytes)
+    {
+        var jsonData = await ReadByteBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
+        if (string.IsNullOrEmpty(jsonData))
+        {
+            return Array.Empty<byte>();
+        }
+
+        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData);
+        if (values is null)
+        {
+            return Array.Empty<byte>();
+        }
+
+        var byteData = new byte[values.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            byteData[i] = checked((byte)values[i]);
+        }
+        return byteData;
     }
 
     /// <summary>

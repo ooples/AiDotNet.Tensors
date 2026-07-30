@@ -44,15 +44,45 @@ public sealed partial class WebGpuBackend
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         EnsureInitialized();
         return DownloadBufferData(buffer);
     }
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         EnsureInitialized();
         var data = DownloadBufferData(buffer);
         Array.Copy(data, destination, Math.Min(data.Length, destination.Length));
+    }
+
+    public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
+    {
+        EnsureInitialized();
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+        var wb = AsWebGpu(buffer);
+        if (byteCount > wb.SizeInBytes)
+            throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({wb.SizeInBytes}).", nameof(byteCount));
+
+        var result = new byte[byteCount];
+        if (byteCount > 0)
+            wb.CopyBytesTo(result);
+        return result;
+    }
+
+    public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
+    {
+        EnsureInitialized();
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
+        var wb = AsWebGpu(buffer);
+        if (data.Length > wb.SizeInBytes)
+            throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({wb.SizeInBytes} bytes).", nameof(data));
+
+        if (data.Length > 0)
+            wb.CopyBytesFrom(data);
     }
 
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
@@ -193,6 +223,151 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => GemmBiasActivation(A, B, bias, M, N, K, 0);
 
+    /// <summary>
+    /// Paged-attention decode (P1): out[heads*headDim] = softmax(scale·Q·K)·V over the sequence,
+    /// reading K/V from the physical block pool [maxBlocks, blockSize, heads, headDim] via
+    /// <paramref name="blockTable"/> (an int buffer of physical block ids). headDim &lt;= 256.
+    /// Matches a standard-attention CPU oracle. (scale is passed as its int bit pattern; the WGSL
+    /// recovers it via bitcast, since the recurrence-dispatch uniform is i32-only.)
+    /// </summary>
+    public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
+        var output = AllocateBuffer(heads * headDim);
+        DispatchRecurrence("paged_attention_decode", WebGpuKernels.PagedAttentionDecodeSource, heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, headDim, blockSize, seqLen, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>
+    /// Prefill / multi-query paged attention (P1, causal): out[numQueries,heads,headDim]; query qi
+    /// (logical position startPos+qi) attends to key positions 0..(startPos+qi). headDim &lt;= 256.
+    /// </summary>
+    public IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
+        var output = AllocateBuffer(numQueries * heads * headDim);
+        DispatchRecurrence("paged_attention_prefill", WebGpuKernels.PagedAttentionPrefillSource, numQueries * heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, headDim, blockSize, numQueries, startPos, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>GQA decode (P1): like <see cref="PagedAttentionDecode"/> but query head h shares KV head
+    /// h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
+        var output = AllocateBuffer(heads * headDim);
+        DispatchRecurrence("paged_attention_decode_gqa", WebGpuKernels.PagedAttentionDecodeGqaSource, heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, kvHeads, headDim, blockSize, seqLen, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>GQA prefill (P1, causal): like <see cref="PagedAttentionPrefill"/> but query head h shares
+    /// KV head h/(heads/kvHeads); K/V pool is [maxBlocks, blockSize, kvHeads, headDim]. headDim &lt;= 256.</summary>
+    public IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+    {
+        GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
+        GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
+        if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
+        GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
+        var output = AllocateBuffer(numQueries * heads * headDim);
+        DispatchRecurrence("paged_attention_prefill_gqa", WebGpuKernels.PagedAttentionPrefillGqaSource, numQueries * heads,
+            new[] { q, kcache, vcache, blockTable, output },
+            new[] { heads, kvHeads, headDim, blockSize, numQueries, startPos, BitConverter.SingleToInt32Bits(scale) });
+        return output;
+    }
+
+    /// <summary>Fused decode attention (P2, FlashDecoding): single-query attention over contiguous K/V
+    /// [seqLen,kvHeads,headDim], split across work-items and merged by an online-softmax reduction. GQA via
+    /// kvHead=h/(heads/kvHeads); pass <paramref name="kvHeads"/> == heads for MHA. headDim &lt;= 256.</summary>
+    public IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
+    {
+        GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
+        GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
+        GpuKernelGuards.Capacity(v, (long)seqLen * kvHeads * headDim, nameof(v), nameof(FlashDecode));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        int effSplits = splits > 0 ? splits : Math.Min(seqLen, 8);
+        if (effSplits > seqLen) effSplits = seqLen;
+        int splitLen = (seqLen + effSplits - 1) / effSplits;
+
+        var output = AllocateBuffer(heads * headDim);
+        var partialM = AllocateBuffer(heads * effSplits);
+        var partialL = AllocateBuffer(heads * effSplits);
+        var partialAcc = AllocateBuffer(heads * effSplits * headDim);
+        try
+        {
+            DispatchRecurrence("flash_decode_partial", WebGpuKernels.FlashDecodePartialSource, heads * effSplits,
+                new[] { q, k, v, partialM, partialL, partialAcc },
+                new[] { heads, kvHeads, headDim, seqLen, effSplits, splitLen, BitConverter.SingleToInt32Bits(scale) });
+            DispatchRecurrence("flash_decode_reduce", WebGpuKernels.FlashDecodeReduceSource, heads,
+                new[] { partialM, partialL, partialAcc, output },
+                new[] { heads, headDim, effSplits });
+            return output;
+        }
+        catch { output.Dispose(); throw; }
+        finally { partialM.Dispose(); partialL.Dispose(); partialAcc.Dispose(); }
+    }
+
+    // Uniform padded to 8 floats (32 bytes) for WebGPU's 16-byte uniform-buffer alignment.
+    private static float[] QuantUniforms(int M, int K, int N, int groupSize, int scaleCount) => new float[]
+    {
+        BitConverter.Int32BitsToSingle(M), BitConverter.Int32BitsToSingle(K), BitConverter.Int32BitsToSingle(N),
+        BitConverter.Int32BitsToSingle(groupSize), BitConverter.Int32BitsToSingle(scaleCount), 0f, 0f, 0f
+    };
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for integer weights (int8 or unpacked int4): C[M,N] =
+    /// act[M,K] · (scale · W[K,N]). Symmetric per-tensor/per-group scales, matching the CPU oracle
+    /// FusedDequantMatmulKernels Q8/Q4. <paramref name="weightsInt"/> is an int buffer (AllocateIntBuffer).
+    /// </summary>
+    public IGpuBuffer DequantGemmInt(IGpuBuffer activations, IGpuBuffer weightsInt, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(weightsInt, (long)K * N, nameof(weightsInt), nameof(DequantGemmInt));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt));
+        var output = AllocateBuffer(M * N);
+        Dispatch4BufferAsync("DequantGemmInt", WebGpuKernels.DequantGemmIntSource, "dequant_gemm_int",
+            activations, weightsInt, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
+            .GetAwaiter().GetResult();
+        return output;
+    }
+
+    /// <summary>
+    /// Weight-only fused dequant-GEMM for OCP FP8 E4M3 weights: C[M,N] = act[M,K] ·
+    /// (scale · decode_e4m3(W[K,N])). <paramref name="weightsFp8Raw"/> is an int buffer of raw fp8
+    /// bytes (0..255); decode matches Float8E4M3.ToFloat.
+    /// </summary>
+    public IGpuBuffer DequantGemmFp8E4M3(IGpuBuffer activations, IGpuBuffer weightsFp8Raw, IGpuBuffer scales,
+        int M, int K, int N, int groupSize, int scaleCount)
+    {
+        GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(weightsFp8Raw, (long)K * N, nameof(weightsFp8Raw), nameof(DequantGemmFp8E4M3));
+        GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmFp8E4M3));
+        var output = AllocateBuffer(M * N);
+        Dispatch4BufferAsync("DequantGemmFp8", WebGpuKernels.DequantGemmFp8Source, "dequant_gemm_fp8",
+            activations, weightsFp8Raw, scales, output, QuantUniforms(M, K, N, groupSize, scaleCount), M * N)
+            .GetAwaiter().GetResult();
+        return output;
+    }
+
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         var temp = GemmBias(A, B, bias, M, N, K);
@@ -285,20 +460,19 @@ public sealed partial class WebGpuBackend
     public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
-        if (aSize <= 0) { Scale(result, result, 0f, Math.Max(1, result.Size)); return; }
+        if (aSize <= 0) { Fill(result, 0f, Math.Max(1, result.Size)); return; }
         if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
         if (bSize < 0) throw new ArgumentOutOfRangeException(nameof(bSize), "bSize must be non-negative.");
 
-        var bData = DownloadBuffer(b);
-        int bLen = bData.Length;
-        var window = new float[aSize];
-        for (int i = 0; i < aSize; i++)
+        var uniforms = new float[]
         {
-            int bIdx = bOffset + i * bStride;
-            window[i] = (bIdx >= 0 && bIdx < bLen) ? bData[bIdx] : 0f;
-        }
-        using var windowBuf = AllocateBuffer(window);
-        DotProduct(a, windowBuf, result, aSize);
+            BitConverter.Int32BitsToSingle(aSize),
+            BitConverter.Int32BitsToSingle(bSize),
+            BitConverter.Int32BitsToSingle(bOffset),
+            BitConverter.Int32BitsToSingle(bStride)
+        };
+        Dispatch3BufferAsync("StridedDot", WebGpuKernels.StridedDotSource, "strided_dot_product",
+            a, b, result, uniforms, 1).GetAwaiter().GetResult();
     }
 
     public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
@@ -354,31 +528,15 @@ public sealed partial class WebGpuBackend
 
     public void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
-        // CPU fallback: compute squash Jacobian and propagate gradients
-        var goData = DownloadBufferData(gradOutput);
-        var inData = DownloadBufferData(input);
-        var giData = new float[numCapsules * capsuleDim];
-        for (int c = 0; c < numCapsules; c++)
+        var uniforms = new float[]
         {
-            int off = c * capsuleDim;
-            float sqNorm = 0;
-            for (int d = 0; d < capsuleDim; d++)
-                sqNorm += inData[off + d] * inData[off + d];
-            float norm = MathF.Sqrt(sqNorm + epsilon);
-            float scale = sqNorm / ((1 + sqNorm) * norm);
-            float dscale = 1f / ((1 + sqNorm) * (1 + sqNorm) * norm);
-            for (int d = 0; d < capsuleDim; d++)
-            {
-                float gi = 0;
-                for (int k = 0; k < capsuleDim; k++)
-                {
-                    float jac = (d == k ? scale : 0f) - dscale * inData[off + d] * inData[off + k];
-                    gi += jac * goData[off + k];
-                }
-                giData[off + d] = gi;
-            }
-        }
-        UploadToBuffer(giData, gradInput);
+            BitConverter.Int32BitsToSingle(numCapsules),
+            BitConverter.Int32BitsToSingle(capsuleDim),
+            epsilon, 0
+        };
+        Dispatch3BufferAsync("CapsuleSquashBackward", WebGpuKernels.CapsuleSquashBackwardSource,
+            "squash_backward", gradOutput, input, gradInput, uniforms,
+            numCapsules * capsuleDim).GetAwaiter().GetResult();
     }
 
     public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
@@ -462,6 +620,38 @@ public sealed partial class WebGpuBackend
         Dispatch2BufferAsync("Tile", WebGpuKernels.TileSource, "tile_axis",
             input, output, uniforms, total).GetAwaiter().GetResult();
     }
+
+    public void PixelShuffle(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inH, int inW, int scale)
+    {
+        int total = checked(batch * channels * inH * scale * inW * scale);
+        Dispatch2BufferAsync("PixelShuffle", WebGpuKernels.PixelShuffleSource, "pixel_shuffle",
+            input, output, MakePixelShuffleUniforms(batch, channels, inH, inW, scale, total), total)
+            .GetAwaiter().GetResult();
+    }
+
+    public void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inH, int inW, int scale)
+    {
+        int total = checked(batch * channels * scale * scale * inH * inW);
+        Dispatch2BufferAsync("PixelShuffle", WebGpuKernels.PixelShuffleSource, "pixel_shuffle_backward",
+            gradOutput, gradInput, MakePixelShuffleUniforms(batch, channels, inH, inW, scale, total), total)
+            .GetAwaiter().GetResult();
+    }
+
+    private static float[] MakePixelShuffleUniforms(
+        int batch, int channels, int inH, int inW, int scale, int total)
+        => new[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inH),
+            BitConverter.Int32BitsToSingle(inW),
+            BitConverter.Int32BitsToSingle(scale),
+            0f,
+            BitConverter.Int32BitsToSingle(total),
+            0f
+        };
 
     #endregion
 
@@ -712,25 +902,42 @@ public sealed partial class WebGpuBackend
 
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (permutation is null) throw new ArgumentNullException(nameof(permutation));
         int ndim = shape.Length;
-        if (ndim > 4)
+        if (permutation.Length != ndim)
+            throw new ArgumentException("Permutation rank must match the input rank.", nameof(permutation));
+        if (ndim > 8)
         {
             throw new ArgumentException(
-                $"Permute supports up to 4 dimensions, but got {ndim}. " +
-                "The GPU kernel uses fixed 4-element stride arrays.",
+                $"Permute supports up to 8 dimensions, but got {ndim}.",
                 nameof(shape));
         }
+
+        var seen = new bool[ndim];
         int total = 1;
-        for (int i = 0; i < ndim; i++) total *= shape[i];
+        for (int i = 0; i < ndim; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(shape), "Shape dimensions cannot be negative.");
+            if ((uint)permutation[i] >= (uint)ndim || seen[permutation[i]])
+                throw new ArgumentException("Permutation must contain each input axis exactly once.", nameof(permutation));
+            seen[permutation[i]] = true;
+            total = checked(total * shape[i]);
+        }
+
+        if (total == 0) return;
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("Input and output buffers must contain the complete permuted tensor.");
+
         // Compute output shape and strides
         var newShape = new int[ndim];
         for (int i = 0; i < ndim; i++) newShape[i] = shape[permutation[i]];
-        var outStrides = new int[4]; // max 4 dims
-        var inStrides = new int[4];
-        var perm = new int[4];
-        var shapeArr = new int[4];
+        var outStrides = new int[8];
+        var inStrides = new int[8];
+        var perm = new int[8];
         // Initialize with identity (for unused dims)
-        for (int i = 0; i < 4; i++) { outStrides[i] = 1; inStrides[i] = 1; perm[i] = i; shapeArr[i] = 1; }
+        for (int i = 0; i < 8; i++) { outStrides[i] = 1; inStrides[i] = 1; perm[i] = i; }
         // Compute strides
         if (ndim > 0)
         {
@@ -741,25 +948,23 @@ public sealed partial class WebGpuBackend
                 srcStr[i] = srcStr[i + 1] * shape[i + 1];
                 dstStr[i] = dstStr[i + 1] * newShape[i + 1];
             }
-            for (int i = 0; i < ndim && i < 4; i++)
+            for (int i = 0; i < ndim; i++)
             {
                 outStrides[i] = dstStr[i];
                 inStrides[i] = srcStr[i];
                 perm[i] = permutation[i];
-                shapeArr[i] = newShape[i];
             }
         }
-        // Pack uniform: total, ndim, pad, pad, shape(4), out_strides(4), in_strides(4), perm(4)
-        var uniforms = new float[20];
+        // Pack as individual scalar fields. WGSL uniform arrays have a 16-byte element stride.
+        var uniforms = new float[28];
         uniforms[0] = BitConverter.Int32BitsToSingle(total);
         uniforms[1] = BitConverter.Int32BitsToSingle(ndim);
         uniforms[2] = 0; uniforms[3] = 0;
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < 8; i++)
         {
-            uniforms[4 + i] = BitConverter.Int32BitsToSingle(shapeArr[i]);
-            uniforms[8 + i] = BitConverter.Int32BitsToSingle(outStrides[i]);
+            uniforms[4 + i] = BitConverter.Int32BitsToSingle(outStrides[i]);
             uniforms[12 + i] = BitConverter.Int32BitsToSingle(inStrides[i]);
-            uniforms[16 + i] = BitConverter.Int32BitsToSingle(perm[i]);
+            uniforms[20 + i] = BitConverter.Int32BitsToSingle(perm[i]);
         }
         Dispatch2BufferAsync("Permute", WebGpuKernels.PermuteSource, "permute_op",
             input, output, uniforms, total).GetAwaiter().GetResult();
@@ -834,7 +1039,6 @@ public sealed partial class WebGpuBackend
         // PhiloxRngSource gpu_random: mode=0 (uniform)
         uint seedLo = (uint)(seed & 0xFFFFFFFF);
         uint seedHi = (uint)((seed >> 32) & 0xFFFFFFFF);
-        if (seed == 0) { seedLo = (uint)Environment.TickCount; seedHi = (uint)(Environment.TickCount >> 16) ^ 0xDEADBEEF; }
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle((int)size),
@@ -847,12 +1051,26 @@ public sealed partial class WebGpuBackend
             output, uniforms, size).GetAwaiter().GetResult();
     }
 
+    public void GenerateStatelessDropoutMask(
+        IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+    {
+        if (size <= 0) return;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            BitConverter.Int32BitsToSingle(unchecked((int)threshold)),
+            scale,
+            BitConverter.Int32BitsToSingle(unchecked((int)seed))
+        };
+        Dispatch1BufferAsync("StatelessDropoutMask", WebGpuKernels.StatelessDropoutMaskSource,
+            "stateless_dropout_mask", output, uniforms, size).GetAwaiter().GetResult();
+    }
+
     public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         // PhiloxRngSource gpu_random: mode=1 (normal via Box-Muller)
         uint seedLo = (uint)(seed & 0xFFFFFFFF);
         uint seedHi = (uint)((seed >> 32) & 0xFFFFFFFF);
-        if (seed == 0) { seedLo = (uint)Environment.TickCount; seedHi = (uint)(Environment.TickCount >> 16) ^ 0xDEADBEEF; }
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle((int)size),
@@ -868,15 +1086,7 @@ public sealed partial class WebGpuBackend
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         if (size <= 0) return;
-        var data = new float[size];
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-            float range = max - min;
-            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-            UploadToBuffer(data, output);
-        }
-        finally { Array.Clear(data, 0, size); }
+        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
     }
 
     #endregion

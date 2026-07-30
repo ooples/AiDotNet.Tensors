@@ -146,6 +146,12 @@ internal sealed class X64Assembler
     /// <summary>vmovups ymm_dst, [base+disp32] (FP32 256-bit load).</summary>
     internal void VmovupsLoadD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x10, dst, baseReg, disp32);
 
+    /// <summary>vmovups [base+disp32], ymm_src (FP32 256-bit store). Op 0x11; src in ModRM.reg.</summary>
+    internal void VmovupsStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x11, src, baseReg, disp32);
+
+    /// <summary>vmovupd [base+disp32], ymm_src (FP64 256-bit store). 66 prefix; op 0x11.</summary>
+    internal void VmovupdStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, Pp66, 0, 1, 0x11, src, baseReg, disp32);
+
     /// <summary>vbroadcastss ymm_dst, [base+disp32].</summary>
     internal void VbroadcastSsD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp32);
 
@@ -201,6 +207,15 @@ internal sealed class X64Assembler
         B(rex, 0x8B, (byte)(0x40 | ((dst & 7) << 3) | 4), 0x24, (byte)disp);
     }
 
+    /// <summary>mov dst64, [rsp+disp32]. REX.W[.R] 8B /r, mod=10, rm=100 (SIB rsp), disp32.
+    /// For reading a stack argument after the frame has grown past the disp8 (±127) range.</summary>
+    internal void MovRegFromRspD32(int dst, int disp32)
+    {
+        byte rex = (byte)(0x48 | (dst >= 8 ? 4 : 0));
+        B(rex, 0x8B, (byte)(0x80 | ((dst & 7) << 3) | 4), 0x24);
+        Imm32(disp32);
+    }
+
     /// <summary>lea rax, [idx*8]. REX.W[.X] 8D, mod=00 reg=rax rm=100, SIB(scale8,idx,base=disp32), disp32=0.</summary>
     internal void LeaRaxIndexScale8(int idx)
     {
@@ -249,6 +264,70 @@ internal sealed class X64Assembler
 
     /// <summary>vfmadd231pd dst, s1, s2  (dst += s1*s2). VEX.DDS.256.66.0F38.W1 B8.</summary>
     internal void Vfmadd231pd(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 1, 1, 0xB8, dst, s1, s2);
+
+    // ── OpenBLAS Zen sgemm-kernel port: the broadcast-free B-load + de-interleave technique
+    // from OpenBLAS kernel/x86_64/sgemm_kernel_8x4_haswell_2.c. vmovsldup/vmovshdup load 8 packed
+    // floats and duplicate even/odd lanes; paired with vbroadcastsd of B this does 2 N-columns per
+    // broadcast (half the broadcast traffic of vbroadcastss-per-column). The interleaved C is
+    // de-shuffled back to column order at SAVE via vunpck{l,h}p{s,d}.
+    /// <summary>vmovsldup ymm_dst, [base+disp8] — load 8 floats, duplicate EVEN lanes
+    /// ([a0 a0 a2 a2 a4 a4 a6 a6]). VEX.256.F3.0F.WIG 12 /r.</summary>
+    internal void VmovsldupLoad(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F, PpF3, 0, 1, 0x12, dst, baseReg, disp8);
+
+    /// <summary>vmovshdup ymm_dst, [base+disp8] — load 8 floats, duplicate ODD lanes
+    /// ([a1 a1 a3 a3 a5 a5 a7 a7]). VEX.256.F3.0F.WIG 16 /r.</summary>
+    internal void VmovshdupLoad(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F, PpF3, 0, 1, 0x16, dst, baseReg, disp8);
+
+    /// <summary>vunpcklps dst, s1, s2 — interleave low FP32 elements per 128-bit lane. VEX.NDS.256.0F.WIG 14 /r.</summary>
+    internal void Vunpcklps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x14, dst, s1, s2);
+
+    /// <summary>vunpckhps dst, s1, s2 — interleave high FP32 elements per 128-bit lane. VEX.NDS.256.0F.WIG 15 /r.</summary>
+    internal void Vunpckhps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x15, dst, s1, s2);
+
+    /// <summary>vunpcklpd dst, s1, s2 — interleave low FP64 elements per 128-bit lane. VEX.NDS.256.66.0F.WIG 14 /r.</summary>
+    internal void Vunpcklpd(int dst, int s1, int s2) => VexRR(Map0F, Pp66, 0, 1, 0x14, dst, s1, s2);
+
+    /// <summary>vunpckhpd dst, s1, s2 — interleave high FP64 elements per 128-bit lane. VEX.NDS.256.66.0F.WIG 15 /r.</summary>
+    internal void Vunpckhpd(int dst, int s1, int s2) => VexRR(Map0F, Pp66, 0, 1, 0x15, dst, s1, s2);
+
+    /// <summary>prefetcht1 [base+disp32]. Legacy 0F 18 /2 — mid-level (L2) prefetch; OpenBLAS pulls the
+    /// upcoming C panel into L2 via prefetcht1 during the K-loop so the SAVE doesn't stall.</summary>
+    internal void Prefetcht1D32(int baseReg, int disp32)
+    {
+        if (baseReg >= 8) B(0x41); // REX.B
+        B(0x0F, 0x18);
+        _code.Add((byte)(0x80 | (2 << 3) | (baseReg & 7))); // mod=10, reg=010 (/2)
+        if ((baseReg & 7) == 4) _code.Add(0x24);
+        Imm32(disp32);
+    }
+
+    /// <summary>prefetcht2 [base+disp32]. Legacy 0F 18 /3 — L3 prefetch.</summary>
+    internal void Prefetcht2D32(int baseReg, int disp32)
+    {
+        if (baseReg >= 8) B(0x41); // REX.B
+        B(0x0F, 0x18);
+        _code.Add((byte)(0x80 | (3 << 3) | (baseReg & 7))); // mod=10, reg=011 (/3)
+        if ((baseReg & 7) == 4) _code.Add(0x24);
+        Imm32(disp32);
+    }
+
+    /// <summary>vaddps dst, s1, s2 (dst = s1 + s2, FP32 256-bit). VEX.NDS.256.0F.WIG 58 /r.
+    /// Used to fold the de-interleaved / tile result into C at SAVE (C += A·B).</summary>
+    internal void Vaddps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x58, dst, s1, s2);
+
+    /// <summary>vmovsldup ymm_dst, [base] (disp0). F3.0F 12 /r.</summary>
+    internal void VmovsldupLoad0(int dst, int baseReg) => VexMemDisp8(Map0F, PpF3, 0, 1, 0x12, dst, baseReg, 0);
+
+    /// <summary>vxorps dst, dst, dst (zero a ymm). VEX.256.0F.WIG 57 /r — cheaper/cleaner than vxorpd for FP32 accumulators.</summary>
+    internal void Vxorps(int dst) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, dst, dst);
+
+    /// <summary>vpmovzxwd ymm_dst, [base+disp8] — load 8×u16 (m128) and zero-extend to 8×u32 (ymm).
+    /// VEX.256.66.0F38.WIG 33 /r. Used to widen bf16 inputs (then vpslld 16 → fp32) in the bf16 microkernel.</summary>
+    internal void VpmovzxwdLoad(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x33, dst, baseReg, disp8);
+
+    /// <summary>vpslld ymm_dst, ymm_src, imm8 — shift 8×u32 left by imm. VEX.NDD.256.66.0F.WIG 72 /6 ib
+    /// (dst in VEX.vvvv, src in rm, /6 in modrm.reg). bf16→fp32: vpmovzxwd then vpslld(.,16).</summary>
+    internal void Vpslld(int dst, int src, byte imm) { VexRR(Map0F, Pp66, 0, 1, 0x72, 6, dst, src); B(imm); }
 
     // ── EVEX register-register form (#378: AVX-512-BF16) ───────────────────────
     // 4-byte EVEX: 62 P0 P1 P2  opcode  ModRM(mod=11). Limited to ymm/zmm 0..15
@@ -395,6 +474,15 @@ internal sealed class X64Assembler
 
     /// <summary>vfmadd231ps dst, s1, s2 (dst += s1*s2). VEX.DDS.256.66.0F38.W0 B8.</summary>
     internal void Vfmadd231ps(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 0, 1, 0xB8, dst, s1, s2);
+
+    /// <summary>vxorps ymm_dst, s1, s2. VEX.256.0F.WIG 57 /r. Zeroes a register via dst,dst,dst.</summary>
+    internal void Vxorps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x57, dst, s1, s2);
+
+    // vaddps (dst = s1 + s2) — used here for the fused-bias epilogue — shares the single
+    // definition declared with the tile-SAVE helpers above; do not redeclare it here.
+
+    /// <summary>vmaxps ymm_dst, s1, s2 (dst = max(s1, s2)). VEX.256.0F.WIG 5F /r. For fused ReLU.</summary>
+    internal void Vmaxps(int dst, int s1, int s2) => VexRR(Map0F, PpNone, 0, 1, 0x5F, dst, s1, s2);
 
     /// <summary>vbroadcastss ymm_dst, [base+disp8]. VEX.256.66.0F38.W0 18.</summary>
     internal void VbroadcastSs(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp8);

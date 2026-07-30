@@ -187,8 +187,27 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(
     int total = batchSize * numClasses;
     if (idx >= total) return;
 
-    float pred = fmaxf(predictions[idx], 1e-7f);
-    gradInput[idx] = (-targets[idx] / pred) / (float)batchSize;
+    // CONTRACT: `predictions` are LOGITS. CpuEngine.CrossEntropyBackward softmaxes them per row and
+    // returns (softmax - target) / batchSize; the OpenCL kernel does the same. This kernel instead treated
+    // them as probabilities and returned (-target / pred) / batchSize — a different derivative entirely,
+    // which forward parity measured as maxAbs 4.526E+01 @[18]: CPU 0.008488914 vs GPU -8.555251.
+    //
+    // Third instance this branch of a #775 fix landing on OpenCL/Metal and never reaching CUDA (after the
+    // SELU >= boundary and nll_loss reading float targets as int*). The registry case is even annotated
+    // FIXED (#775) while the test kept failing.
+    int b = idx / numClasses;
+    int rowOffset = b * numClasses;
+
+    float maxVal = -INFINITY;
+    for (int i = 0; i < numClasses; i++)
+        maxVal = fmaxf(maxVal, predictions[rowOffset + i]);
+
+    float sumExp = 0.0f;
+    for (int i = 0; i < numClasses; i++)
+        sumExp += expf(predictions[rowOffset + i] - maxVal);
+
+    float softmax = expf(predictions[idx] - maxVal) / sumExp;
+    gradInput[idx] = (softmax - targets[idx]) / (float)batchSize;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void bce_loss(
@@ -751,7 +770,30 @@ extern ""C"" __global__ __launch_bounds__(256) void equals(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    C[idx] = fabsf(A[idx] - B[idx]) < 1e-6f ? 1.0f : 0.0f;
+
+    // IEEE equality, NOT a tolerance. This kernel used fabsf(a-b) < 1e-6f, which is a different
+    // predicate and was measurably wrong in three distinct ways against CpuEngine:
+    //     idx  a           b       CPU  GPU(old)
+    //     0    0.0         1e-8     0    1        near-equal counted as equal
+    //     2    3.0000002   3.0      0    1        near-equal counted as equal
+    //     5    +Inf        +Inf     1    0        Inf-Inf = NaN, NaN < 1e-6 is false
+    // Measured raw masks: CPU 00010101 (exactly IEEE ==) vs GPU 10110001.
+    //
+    // NOTE there are TWO equality kernels in this backend: the bit-exact equals_kernel in
+    // CudaBroadcastKernels, and this one. CudaBackend.Equal looks up the name equals - this one - so the correct
+    // implementation was present but unreachable. Bodies are kept in sync rather than rewiring the lookup,
+    // because several callers (TensorEq, TensorEqScalar, TensorIsIn, the mode/threshold masks) go through
+    // backend.Equal and all of them want IEEE semantics.
+    //
+    // Bit-pattern form: aa/ba <= 0x7F800000 rejects NaN on either side (NaN != NaN); ab == bb covers the
+    // ordinary case; (aa | ba) == 0 makes -0.0 == +0.0 as IEEE requires.
+    unsigned int ab = __float_as_uint(A[idx]);
+    unsigned int bb = __float_as_uint(B[idx]);
+    unsigned int aa = ab & 0x7FFFFFFFu;
+    unsigned int ba = bb & 0x7FFFFFFFu;
+    bool eq = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    C[idx] = eq ? 1.0f : 0.0f;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void where_cond(
@@ -823,6 +865,24 @@ extern ""C"" __global__ __launch_bounds__(256) void argmin_axis(
         }
     }
     indices[outer] = (float)minIdx;
+}
+
+// Reduce-max along the innermost (contiguous) axis: output[outer] = max over the axisSize block.
+// Mirrors argmax_axis but emits the max VALUE (not its index). Consumers: GumbelSoftmax / softmax-max
+// subtraction, MelSpectrogram log-floor normalization, BinCount range sizing.
+extern ""C"" __global__ __launch_bounds__(256) void max_axis(
+    const float* input, float* output, int outerSize, int axisSize)
+{
+    int outer = blockIdx.x * blockDim.x + threadIdx.x;
+    if (outer >= outerSize) return;
+
+    int baseIdx = outer * axisSize;
+    float maxVal = input[baseIdx];
+    for (int i = 1; i < axisSize; i++) {
+        float val = input[baseIdx + i];
+        if (val > maxVal) maxVal = val;
+    }
+    output[outer] = maxVal;
 }
 
 // ===========================================================================
@@ -1093,9 +1153,12 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
     float vMaxVal = fmaxf(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)safe_step));
+    float beta1Pow = powf(beta1, (float)safe_step);
+    float beta2Pow = powf(beta2, (float)safe_step);
+    float mHat = mVal / (1.0f - beta1Pow);
+    float vMaxHat = vMaxVal / (1.0f - beta2Pow);
 
-    param[idx] -= learningRate * mHat / (sqrtf(vMaxVal) + epsilon);
+    param[idx] -= learningRate * mHat / (sqrtf(vMaxHat) + epsilon);
 }
 
 // AdaMax optimizer update
@@ -1173,11 +1236,12 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
     v[idx] = vVal;
 
     float beta1Pow = powf(beta1, (float)safe_step);
+    float beta1PowNext = powf(beta1, (float)(safe_step + 1));
     float beta2Pow = powf(beta2, (float)safe_step);
     float mHat = mVal / (1.0f - beta1Pow);
     float vHat = vVal / (1.0f - beta2Pow);
 
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1PowNext);
 
     param[idx] -= learningRate * mNesterov / (sqrtf(vHat) + epsilon);
 }
@@ -1963,6 +2027,32 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
     dst[dstIdx] = sum;
 }
 
+// scatter_add — bit-deterministic ACCUMULATING variant (issue #742).
+// Unlike scatter_add_deterministic (which OVERWRITES: dst = sum), this ADDS onto a
+// pre-SEEDED destination (dst += sum) — the semantics the CudaBackend.ScatterAdd
+// wrapper needs, since it copies the base tensor into `dst` first and expects the
+// indexed contributions accumulated on top. One thread per destination cell scans
+// numElements in fixed ascending order (no atomicAdd → bit-identical across runs on
+// ANY GPU/driver, unlike the default atomic path which is only incidentally stable).
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_accumulate_deterministic(
+    const float* src,
+    const int* indices,
+    float* dst,              // PRE-SEEDED destination; contributions are ADDED on top
+    int numElements,
+    int dstSize)
+{
+    int dstIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dstIdx >= dstSize) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) {
+            sum += src[i];
+        }
+    }
+    dst[dstIdx] += sum;   // accumulate onto seed; this thread solely owns dstIdx → race-free
+}
+
 // Batched scatter add for multi-dimensional tensors.
 // NON-DETERMINISTIC across runs (issue #382); see scatter_add_batched_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
@@ -2695,6 +2785,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "compute_mean_var",
                 "argmax_axis",
                 "argmin_axis",
+                "max_axis",
                 // Optimizers
                 "sgd_step",
                 "adam_step",
@@ -2751,6 +2842,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 // bit-reproducible scatter accumulation)
                 "scatter_add",
                 "scatter_add_deterministic",
+                "scatter_add_accumulate_deterministic",
                 "scatter_add_batched",
                 "scatter_add_batched_deterministic",
                 "scatter_max",

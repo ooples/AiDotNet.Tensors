@@ -24,6 +24,9 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     // create + push our own. Field stays IntPtr.Zero until first
     // Allocate; Dispose destroys it iff non-zero.
     private IntPtr _context;
+    // Device whose PRIMARY context we retained (owned path). -1 until EnsureContext runs. Needed because
+    // cuDevicePrimaryCtxRelease is keyed by device, not by context handle.
+    private int _device = -1;
     // True when this allocator created _context itself (standalone offload path)
     // and must destroy it on Dispose. False when _context is SHARED with an
     // existing CudaBackend — then the offload buffers live in the SAME context
@@ -128,15 +131,16 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuDeviceGet(out int device, 0),
             "cuDeviceGet(offload)");
+        // RETAIN the device primary context instead of cuCtxCreate. A fresh cuCtxCreate reserves a whole
+        // new ~200 MB context per allocator; under memory pressure (or many allocators) that OOMs. The
+        // primary context is SHARED with every other retainer (including the compute backend's primary-ctx
+        // consumers), so this adds no meaningful device memory. cuDevicePrimaryCtxRetain does NOT push the
+        // context onto the calling thread's stack, so — unlike cuCtxCreate — there is nothing to pop here;
+        // allocate/free still push+pop it via PushContextScope around their native calls.
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuCtxCreate(out _context, 0, device),
-            "cuCtxCreate(offload)");
-        // Pop the just-pushed context so we don't leak our context onto
-        // the caller's thread stack. If we left it pushed, a sibling
-        // CudaBackend's later cuCtxPopCurrent would pop our context
-        // instead of its own — exactly the finalizer crash mode this
-        // method exists to prevent.
-        CuBlasNative.cuCtxPopCurrent(out _);
+            CuBlasNative.cuDevicePrimaryCtxRetain(out _context, device),
+            "cuDevicePrimaryCtxRetain(offload)");
+        _device = device;
     }
 
     private CudaContextPushScope PushContextScope() => new(_context);
@@ -250,17 +254,19 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
 
             if (ctxToDestroy != IntPtr.Zero && _ownsContext)
             {
-                // WE created and own this context, so it is guaranteed valid
-                // here. Push it to free its allocations cleanly, then pop and
-                // destroy. Push/pop discipline matters even at dispose time: a
-                // CudaBackend running on the same thread might have its own
-                // context current, and a free issued against the wrong context
-                // would be INVALID_CONTEXT or worse.
+                // WE retained the device primary context, so it is guaranteed valid here. Push it to free
+                // our allocations cleanly, then pop and RELEASE our retain reference. Push/pop discipline
+                // matters even at dispose time: a CudaBackend running on the same thread might have its own
+                // context current, and a free issued against the wrong context would be INVALID_CONTEXT or
+                // worse. cuDevicePrimaryCtxRelease only drops OUR reference — the primary context is torn
+                // down by the driver only when the last retainer releases it, so this never pulls the context
+                // out from under a sibling consumer that still holds it.
                 using (var scope = new CudaContextPushScope(ctxToDestroy))
                 {
                     foreach (var h in snapshot) FreeNative(h);
                 }
-                CuBlasNative.cuCtxDestroy(ctxToDestroy);
+                if (_device >= 0)
+                    CuBlasNative.cuDevicePrimaryCtxRelease(_device);
             }
             else if (ctxToDestroy != IntPtr.Zero)
             {

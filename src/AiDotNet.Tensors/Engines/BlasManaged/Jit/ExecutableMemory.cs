@@ -27,6 +27,9 @@ internal sealed class ExecutableMemory : IDisposable
     /// <summary>Base address of the executable region (call target). IntPtr.Zero if allocation failed.</summary>
     internal IntPtr Pointer => _ptr;
 
+    /// <summary>Size in bytes of the emitted code region (used by callers to bound their kernel caches).</summary>
+    internal long Size => (long)_size;
+
     private ExecutableMemory(IntPtr ptr, nuint size, bool isWindows)
     {
         _ptr = ptr;

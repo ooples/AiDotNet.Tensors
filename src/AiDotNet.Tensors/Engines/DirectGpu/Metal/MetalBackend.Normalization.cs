@@ -17,84 +17,10 @@ public sealed partial class MetalBackend
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
         ThrowIfDisposed();
-
-        // CPU fallback implementation
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var betaData = DownloadBuffer(beta);
-        var runningMeanData = DownloadBuffer(runningMean);
-        var runningVarData = DownloadBuffer(runningVar);
-
-        var outputData = new float[batch * channels * spatialSize];
-        var saveMeanData = new float[channels];
-        var saveInvVarData = new float[channels];
-
-        for (int c = 0; c < channels; c++)
-        {
-            float mean, invVar;
-
-            if (training)
-            {
-                // Compute mean
-                float sum = 0;
-                for (int b = 0; b < batch; b++)
-                {
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * channels * spatialSize + c * spatialSize + s;
-                        sum += inputData[idx];
-                    }
-                }
-                mean = sum / (batch * spatialSize);
-
-                // Compute variance
-                float varSum = 0;
-                for (int b = 0; b < batch; b++)
-                {
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * channels * spatialSize + c * spatialSize + s;
-                        float diff = inputData[idx] - mean;
-                        varSum += diff * diff;
-                    }
-                }
-                float variance = varSum / (batch * spatialSize);
-                invVar = 1.0f / MathF.Sqrt(variance + epsilon);
-
-                // Update running statistics
-                runningMeanData[c] = (1 - momentum) * runningMeanData[c] + momentum * mean;
-                runningVarData[c] = (1 - momentum) * runningVarData[c] + momentum * variance;
-
-                saveMeanData[c] = mean;
-                saveInvVarData[c] = invVar;
-            }
-            else
-            {
-                mean = runningMeanData[c];
-                invVar = 1.0f / MathF.Sqrt(runningVarData[c] + epsilon);
-            }
-
-            // Normalize and scale
-            for (int b = 0; b < batch; b++)
-            {
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float normalized = (inputData[idx] - mean) * invVar;
-                    outputData[idx] = gammaData[c] * normalized + betaData[c];
-                }
-            }
-        }
-
-        // Upload results
-        UploadToBuffer(output, outputData);
-        if (training)
-        {
-            UploadToBuffer(runningMean, runningMeanData);
-            UploadToBuffer(runningVar, runningVarData);
-            UploadToBuffer(saveMean, saveMeanData);
-            UploadToBuffer(saveInvVar, saveInvVarData);
-        }
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0) return;
+        DispatchResidentMetal("batch_norm_forward_serial_channels", channels,
+            new[] { input, output, gamma, beta, runningMean, runningVar, saveMean, saveInvVar },
+            (uint)batch, (uint)channels, (uint)spatialSize, unchecked((uint)SingleToInt32BitsCompat(epsilon)), unchecked((uint)SingleToInt32BitsCompat(momentum)), training ? 1u : 0u);
     }
 
     public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -110,67 +36,10 @@ public sealed partial class MetalBackend
         int batch, int channels, int spatialSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var saveMeanData = DownloadBuffer(saveMean);
-        var saveInvVarData = DownloadBuffer(saveInvVar);
-
-        var gradInputData = new float[batch * channels * spatialSize];
-        var gradGammaData = new float[channels];
-        var gradBetaData = new float[channels];
-
-        int N = batch * spatialSize;
-
-        for (int c = 0; c < channels; c++)
-        {
-            float mean = saveMeanData[c];
-            float invVar = saveInvVarData[c];
-            float g = gammaData[c];
-
-            // Compute gradGamma and gradBeta
-            float dgamma = 0, dbeta = 0;
-            for (int b = 0; b < batch; b++)
-            {
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float xhat = (inputData[idx] - mean) * invVar;
-                    dgamma += gradOutputData[idx] * xhat;
-                    dbeta += gradOutputData[idx];
-                }
-            }
-            gradGammaData[c] = dgamma;
-            gradBetaData[c] = dbeta;
-
-            // Compute gradInput
-            float sum1 = 0, sum2 = 0;
-            for (int b = 0; b < batch; b++)
-            {
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float xhat = (inputData[idx] - mean) * invVar;
-                    sum1 += gradOutputData[idx];
-                    sum2 += gradOutputData[idx] * xhat;
-                }
-            }
-
-            for (int b = 0; b < batch; b++)
-            {
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float xhat = (inputData[idx] - mean) * invVar;
-                    gradInputData[idx] = g * invVar * (gradOutputData[idx] - sum1 / N - xhat * sum2 / N);
-                }
-            }
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
-        UploadToBuffer(gradGamma, gradGammaData);
-        UploadToBuffer(gradBeta, gradBetaData);
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0) return;
+        DispatchResidentMetal("batch_norm_backward_serial_channels", channels,
+            new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta },
+            (uint)batch, (uint)channels, (uint)spatialSize);
     }
 
     /// <summary>
@@ -180,50 +49,10 @@ public sealed partial class MetalBackend
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var betaData = DownloadBuffer(beta);
-
-        var outputData = new float[batchSize * normalizedSize];
-        var saveMeanData = new float[batchSize];
-        var saveInvVarData = new float[batchSize];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            // Compute mean
-            float sum = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                sum += inputData[b * normalizedSize + i];
-            }
-            float mean = sum / normalizedSize;
-
-            // Compute variance
-            float varSum = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                float diff = inputData[b * normalizedSize + i] - mean;
-                varSum += diff * diff;
-            }
-            float variance = varSum / normalizedSize;
-            float invVar = 1.0f / MathF.Sqrt(variance + epsilon);
-
-            saveMeanData[b] = mean;
-            saveInvVarData[b] = invVar;
-
-            // Normalize and scale
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                float normalized = (inputData[idx] - mean) * invVar;
-                outputData[idx] = gammaData[i] * normalized + betaData[i];
-            }
-        }
-
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(saveMean, saveMeanData);
-        UploadToBuffer(saveInvVar, saveInvVarData);
+        if (batchSize <= 0 || normalizedSize <= 0) return;
+        DispatchResidentMetal("layer_norm_forward_serial_rows", batchSize,
+            new[] { input, output, gamma, beta, saveMean, saveInvVar },
+            (uint)batchSize, (uint)normalizedSize, unchecked((uint)SingleToInt32BitsCompat(epsilon)));
     }
 
     /// <summary>
@@ -234,60 +63,10 @@ public sealed partial class MetalBackend
         int batchSize, int normalizedSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var saveMeanData = DownloadBuffer(saveMean);
-        var saveInvVarData = DownloadBuffer(saveInvVar);
-
-        var gradInputData = new float[batchSize * normalizedSize];
-        var gradGammaData = new float[normalizedSize];
-        var gradBetaData = new float[normalizedSize];
-
-        // Initialize gradGamma and gradBeta
-        for (int i = 0; i < normalizedSize; i++)
-        {
-            gradGammaData[i] = 0;
-            gradBetaData[i] = 0;
-        }
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            float mean = saveMeanData[b];
-            float invVar = saveInvVarData[b];
-
-            // Accumulate gradGamma and gradBeta
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                float xhat = (inputData[idx] - mean) * invVar;
-                gradGammaData[i] += gradOutputData[idx] * xhat;
-                gradBetaData[i] += gradOutputData[idx];
-            }
-
-            // Compute intermediate sums for gradInput
-            float sum1 = 0, sum2 = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                float xhat = (inputData[idx] - mean) * invVar;
-                sum1 += gradOutputData[idx] * gammaData[i];
-                sum2 += gradOutputData[idx] * gammaData[i] * xhat;
-            }
-
-            // Compute gradInput
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                float xhat = (inputData[idx] - mean) * invVar;
-                gradInputData[idx] = invVar * (gradOutputData[idx] * gammaData[i] - sum1 / normalizedSize - xhat * sum2 / normalizedSize);
-            }
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
-        UploadToBuffer(gradGamma, gradGammaData);
-        UploadToBuffer(gradBeta, gradBetaData);
+        if (batchSize <= 0 || normalizedSize <= 0) return;
+        DispatchResidentMetal("layer_norm_backward_serial", 1,
+            new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta },
+            (uint)batchSize, (uint)normalizedSize);
     }
 
     /// <summary>
@@ -297,70 +76,12 @@ public sealed partial class MetalBackend
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var betaData = DownloadBuffer(beta);
-
-        int channelsPerGroup = channels / numGroups;
-        int groupSize = channelsPerGroup * spatialSize;
-
-        var outputData = new float[batch * channels * spatialSize];
-        var saveMeanData = new float[batch * numGroups];
-        var saveInvVarData = new float[batch * numGroups];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int g = 0; g < numGroups; g++)
-            {
-                // Compute mean for this group
-                float sum = 0;
-                for (int c = 0; c < channelsPerGroup; c++)
-                {
-                    int channelIdx = g * channelsPerGroup + c;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * channels * spatialSize + channelIdx * spatialSize + s;
-                        sum += inputData[idx];
-                    }
-                }
-                float mean = sum / groupSize;
-
-                // Compute variance
-                float varSum = 0;
-                for (int c = 0; c < channelsPerGroup; c++)
-                {
-                    int channelIdx = g * channelsPerGroup + c;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * channels * spatialSize + channelIdx * spatialSize + s;
-                        float diff = inputData[idx] - mean;
-                        varSum += diff * diff;
-                    }
-                }
-                float variance = varSum / groupSize;
-                float invVar = 1.0f / MathF.Sqrt(variance + epsilon);
-
-                saveMeanData[b * numGroups + g] = mean;
-                saveInvVarData[b * numGroups + g] = invVar;
-
-                // Normalize and scale
-                for (int c = 0; c < channelsPerGroup; c++)
-                {
-                    int channelIdx = g * channelsPerGroup + c;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * channels * spatialSize + channelIdx * spatialSize + s;
-                        float normalized = (inputData[idx] - mean) * invVar;
-                        outputData[idx] = gammaData[channelIdx] * normalized + betaData[channelIdx];
-                    }
-                }
-            }
-        }
-
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(saveMean, saveMeanData);
-        UploadToBuffer(saveInvVar, saveInvVarData);
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0) return;
+        if (numGroups <= 0 || channels % numGroups != 0)
+            throw new ArgumentException("The group count must be a positive divisor of channels.", nameof(numGroups));
+        DispatchResidentMetal("group_norm_forward_serial_groups", checked(batch * numGroups),
+            new[] { input, output, gamma, beta, saveMean, saveInvVar },
+            (uint)batch, (uint)numGroups, (uint)channels, (uint)spatialSize, unchecked((uint)SingleToInt32BitsCompat(epsilon)));
     }
 
     /// <summary>
@@ -370,55 +91,10 @@ public sealed partial class MetalBackend
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int channels, int spatialSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var betaData = DownloadBuffer(beta);
-
-        var outputData = new float[batch * channels * spatialSize];
-        var saveMeanData = new float[batch * channels];
-        var saveInvVarData = new float[batch * channels];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                // Compute mean for this instance
-                float sum = 0;
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    sum += inputData[idx];
-                }
-                float mean = sum / spatialSize;
-
-                // Compute variance
-                float varSum = 0;
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float diff = inputData[idx] - mean;
-                    varSum += diff * diff;
-                }
-                float variance = varSum / spatialSize;
-                float invVar = 1.0f / MathF.Sqrt(variance + epsilon);
-
-                saveMeanData[b * channels + c] = mean;
-                saveInvVarData[b * channels + c] = invVar;
-
-                // Normalize and scale
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float normalized = (inputData[idx] - mean) * invVar;
-                    outputData[idx] = gammaData[c] * normalized + betaData[c];
-                }
-            }
-        }
-
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(saveMean, saveMeanData);
-        UploadToBuffer(saveInvVar, saveInvVarData);
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0) return;
+        DispatchResidentMetal("instance_norm_forward_serial_channels", checked(batch * channels),
+            new[] { input, output, gamma, beta, saveMean, saveInvVar },
+            (uint)batch, (uint)channels, (uint)spatialSize, unchecked((uint)SingleToInt32BitsCompat(epsilon)));
     }
 
     /// <summary>
@@ -430,59 +106,10 @@ public sealed partial class MetalBackend
         int batch, int channels, int spatialSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var saveMeanData = DownloadBuffer(saveMean);
-        var saveInvVarData = DownloadBuffer(saveInvVar);
-
-        var gradInputData = new float[batch * channels * spatialSize];
-        var gradGammaData = new float[channels];
-        var gradBetaData = new float[channels];
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                float mean = saveMeanData[b * channels + c];
-                float invVar = saveInvVarData[b * channels + c];
-                float g = gammaData[c];
-
-                // Compute gradGamma and gradBeta contributions
-                float dgamma = 0, dbeta = 0;
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float xhat = (inputData[idx] - mean) * invVar;
-                    dgamma += gradOutputData[idx] * xhat;
-                    dbeta += gradOutputData[idx];
-                }
-                gradGammaData[c] += dgamma;
-                gradBetaData[c] += dbeta;
-
-                // Compute gradInput
-                float sum1 = 0, sum2 = 0;
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float xhat = (inputData[idx] - mean) * invVar;
-                    sum1 += gradOutputData[idx];
-                    sum2 += gradOutputData[idx] * xhat;
-                }
-
-                for (int s = 0; s < spatialSize; s++)
-                {
-                    int idx = b * channels * spatialSize + c * spatialSize + s;
-                    float xhat = (inputData[idx] - mean) * invVar;
-                    gradInputData[idx] = g * invVar * (gradOutputData[idx] - sum1 / spatialSize - xhat * sum2 / spatialSize);
-                }
-            }
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
-        UploadToBuffer(gradGamma, gradGammaData);
-        UploadToBuffer(gradBeta, gradBetaData);
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0) return;
+        DispatchResidentMetal("instance_norm_backward_serial", 1,
+            new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta },
+            (uint)batch, (uint)channels, (uint)spatialSize);
     }
 
     /// <summary>
@@ -492,35 +119,10 @@ public sealed partial class MetalBackend
         int batchSize, int normalizedSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-
-        var outputData = new float[batchSize * normalizedSize];
-        var saveRmsData = new float[batchSize];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            // Compute RMS
-            float sumSq = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                float val = inputData[b * normalizedSize + i];
-                sumSq += val * val;
-            }
-            float rms = MathF.Sqrt(sumSq / normalizedSize + epsilon);
-            saveRmsData[b] = rms;
-
-            // Normalize and scale
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                outputData[idx] = inputData[idx] / rms * gammaData[i];
-            }
-        }
-
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(saveRms, saveRmsData);
+        if (batchSize <= 0 || normalizedSize <= 0) return;
+        DispatchResidentMetal("rms_norm_forward_serial_rows", batchSize,
+            new[] { input, output, gamma, saveRms },
+            (uint)batchSize, (uint)normalizedSize, unchecked((uint)SingleToInt32BitsCompat(epsilon)));
     }
 
     /// <summary>
@@ -530,46 +132,10 @@ public sealed partial class MetalBackend
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gammaData = DownloadBuffer(gamma);
-        var saveRmsData = DownloadBuffer(saveRms);
-
-        var gradInputData = new float[batchSize * normalizedSize];
-        var gradGammaData = new float[normalizedSize];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            float rms = saveRmsData[b];
-            float invRms = 1.0f / rms;
-
-            // Accumulate gradGamma
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                gradGammaData[i] += gradOutputData[idx] * inputData[idx] * invRms;
-            }
-
-            // Compute sum for gradInput
-            float sum = 0;
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                sum += gradOutputData[idx] * gammaData[i] * inputData[idx];
-            }
-
-            // Compute gradInput
-            for (int i = 0; i < normalizedSize; i++)
-            {
-                int idx = b * normalizedSize + i;
-                float gradNorm = gradOutputData[idx] * gammaData[i];
-                gradInputData[idx] = invRms * (gradNorm - inputData[idx] * sum / (rms * rms * normalizedSize));
-            }
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
-        UploadToBuffer(gradGamma, gradGammaData);
+        if (batchSize <= 0 || normalizedSize <= 0) return;
+        DispatchResidentMetal("rms_norm_backward_serial", 1,
+            new[] { gradOutput, input, gamma, saveRms, gradInput, gradGamma },
+            (uint)batchSize, (uint)normalizedSize);
     }
 
     #endregion
@@ -582,49 +148,18 @@ public sealed partial class MetalBackend
     public void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var outputData = new float[size];
-        var maskData = new float[size];
-
-        if (training && dropoutRate > 0)
-        {
-            if (dropoutRate >= 1.0f)
-            {
-                // dropoutRate of 1.0 (or higher) means drop everything — leave arrays as zeros
-                // The common upload at the end of the method will write these zeros to the buffers.
-            }
-            else
-            {
-                var rng = new Random((int)(seed & 0x7FFFFFFF));
-                float scale = 1.0f / (1.0f - dropoutRate);
-
-                for (int i = 0; i < size; i++)
-                {
-                    if (rng.NextDouble() >= dropoutRate)
-                    {
-                        maskData[i] = scale;
-                        outputData[i] = inputData[i] * scale;
-                    }
-                    else
-                    {
-                        maskData[i] = 0;
-                        outputData[i] = 0;
-                    }
-                }
-            }
-        }
-        else
-        {
-            for (int i = 0; i < size; i++)
-            {
-                maskData[i] = 1.0f;
-                outputData[i] = inputData[i];
-            }
-        }
-
-        UploadToBuffer(output, outputData);
-        UploadToBuffer(mask, maskData);
+        if (size <= 0) return;
+        bool sharedOutputs = ReferenceEquals(output, mask);
+        bool maskAliasesInput = ReferenceEquals(mask, input);
+        using var outputTemporary = sharedOutputs ? AllocateBuffer(size) : null;
+        using var maskTemporary = sharedOutputs || maskAliasesInput ? AllocateBuffer(size) : null;
+        IGpuBuffer outputTarget = outputTemporary ?? output;
+        IGpuBuffer maskTarget = maskTemporary ?? mask;
+        DispatchResidentMetal("dropout_dotnet_random_serial", 1,
+            new[] { input, outputTarget, maskTarget }, (uint)size, unchecked((uint)SingleToInt32BitsCompat(dropoutRate)),
+            (uint)(seed & 0x7ffffffful), training ? 1u : 0u);
+        if (outputTemporary is not null) Copy(outputTemporary, output, size);
+        if (maskTemporary is not null) Copy(maskTemporary, mask, size);
     }
 
     /// <summary>
@@ -633,17 +168,7 @@ public sealed partial class MetalBackend
     public void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        var maskData = DownloadBuffer(mask);
-        var gradInputData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            gradInputData[i] = gradOutputData[i] * maskData[i];
-        }
-
-        UploadToBuffer(gradInput, gradInputData);
+        Multiply(gradOutput, mask, gradInput, size);
     }
 
     public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
@@ -659,22 +184,15 @@ public sealed partial class MetalBackend
     public void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
     {
         ThrowIfDisposed();
-
-        // Download indices as int buffer
-        var indicesData = DownloadIntBuffer(indices, numIndices);
-        var tableData = DownloadBuffer(embeddingTable);
-        var outputData = new float[numIndices * embeddingDim];
-
-        for (int i = 0; i < numIndices; i++)
-        {
-            int idx = indicesData[i];
-            for (int d = 0; d < embeddingDim; d++)
-            {
-                outputData[i * embeddingDim + d] = tableData[idx * embeddingDim + d];
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        int count = checked(numIndices * embeddingDim);
+        if (count <= 0) return;
+        int vocabulary = embeddingTable.Size / embeddingDim;
+        bool aliasesTable = ReferenceEquals(output, embeddingTable);
+        using var temporary = aliasesTable ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? output;
+        DispatchResidentMetal("embedding_lookup", count, new[] { indices, embeddingTable, target },
+            (uint)numIndices, (uint)embeddingDim, (uint)vocabulary);
+        if (temporary is not null) Copy(temporary, output, count);
     }
 
     /// <summary>
@@ -683,37 +201,19 @@ public sealed partial class MetalBackend
     public void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
         ThrowIfDisposed();
-
-        var gradOutputData = DownloadBuffer(gradOutput);
-        var indicesData = DownloadIntBuffer(indices, numIndices);
-        var gradEmbeddingData = new float[vocabSize * embeddingDim];
-
-        // Accumulate gradients
-        for (int i = 0; i < numIndices; i++)
-        {
-            int idx = indicesData[i];
-            for (int d = 0; d < embeddingDim; d++)
-            {
-                gradEmbeddingData[idx * embeddingDim + d] += gradOutputData[i * embeddingDim + d];
-            }
-        }
-
-        UploadToBuffer(gradEmbedding, gradEmbeddingData);
+        int count = checked(vocabSize * embeddingDim);
+        if (count <= 0) return;
+        bool aliasesGradient = ReferenceEquals(gradEmbedding, gradOutput);
+        using var temporary = aliasesGradient ? AllocateBuffer(count) : null;
+        IGpuBuffer target = temporary ?? gradEmbedding;
+        DispatchResidentMetal("embedding_backward_deterministic", count,
+            new[] { gradOutput, indices, target }, (uint)numIndices, (uint)embeddingDim, (uint)vocabSize);
+        if (temporary is not null) Copy(temporary, gradEmbedding, count);
     }
 
     /// <summary>
     /// Downloads an integer buffer.
     /// </summary>
-    private int[] DownloadIntBuffer(IGpuBuffer buffer, int size)
-    {
-        var floatData = DownloadBuffer(buffer);
-        var intData = new int[size];
-        for (int i = 0; i < size; i++)
-        {
-            intData[i] = SingleToInt32BitsCompat(floatData[i]);
-        }
-        return intData;
-    }
 
     #endregion
 }

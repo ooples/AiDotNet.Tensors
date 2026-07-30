@@ -96,32 +96,47 @@ public partial class CpuEngine
         var negA = new double[innerDim * stateDim];
         for (int i = 0; i < negA.Length; i++) negA[i] = -Math.Exp(aLog[i]);
 
-        var h = new double[innerDim * stateDim];
+        // The recurrence is sequential over t, but every di (inner channel) evolves an independent
+        // state row h[di,:], so di is an embarrassingly-parallel axis. Parallelize over di within each
+        // batch element; each di owns a private state row and writes disjoint output slots (no locks).
         for (int b = 0; b < batch; b++)
         {
-            Array.Clear(h, 0, h.Length);
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, (diStart, diCount) =>
             {
-                int baseID = (b * seqLen + t) * innerDim;
-                int baseSD = (b * seqLen + t) * stateDim;
-                for (int di = 0; di < innerDim; di++)
+                var hRow = new double[stateDim];
+                int diEnd = diStart + diCount;
+                for (int di = diStart; di < diEnd; di++)
                 {
-                    double dt = delta[baseID + di];
-                    double xv = X[baseID + di];
+                    Array.Clear(hRow, 0, stateDim);
                     int hrow = di * stateDim;
-                    double y = 0.0;
-                    for (int ni = 0; ni < stateDim; ni++)
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        double aBar = Math.Exp(dt * negA[hrow + ni]);
-                        double hv = aBar * h[hrow + ni] + dt * B[baseSD + ni] * xv;
-                        h[hrow + ni] = hv;
-                        y += C[baseSD + ni] * hv;
+                        int baseID = (bb * seqLen + t) * innerDim;
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        double dt = delta[baseID + di];
+                        double xv = X[baseID + di];
+                        double y = 0.0;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            double aBar = Math.Exp(dt * negA[hrow + ni]);
+                            double hv = aBar * hRow[ni] + dt * B[baseSD + ni] * xv;
+                            hRow[ni] = hv;
+                            y += C[baseSD + ni] * hv;
+                        }
+                        outp[baseID + di] = y + D[di] * xv;
                     }
-                    outp[baseID + di] = y + D[di] * xv;
                 }
-            }
+            });
         }
     }
+
+    /// <summary>
+    /// Minimum inner-channels (di) per parallel chunk for the Mamba selective-scan kernels. Below this
+    /// the scan runs serially; above it the di axis is split across cores (each di owns a disjoint state
+    /// row and output region — lock-free except for a per-chunk dB/dC partial reduction in the backward).
+    /// </summary>
+    private const int MambaDiGrain = 4;
 
     private static void MambaScanBackwardDouble(
         double[] dOut, double[] X, double[] delta, double[] aLog, double[] B, double[] C, double[] D,
@@ -132,81 +147,106 @@ public partial class CpuEngine
         var negA = new double[isd];
         for (int i = 0; i < isd; i++) negA[i] = -Math.Exp(aLog[i]);
 
-        var hTraj = new double[seqLen * isd];
-        var h = new double[isd];
-        var dh = new double[isd];
-
+        // Parallelize over di (each di-row's forward recompute + reverse sweep is independent). dX, dDelta,
+        // dD and dALog are all indexed by di (or di,ni), so each di-thread writes them lock-free. dB and dC
+        // are indexed by (b,t,ni) and summed over di — the one cross-di reduction — so each chunk accumulates
+        // private partials and adds them into the shared dB/dC under a coarse per-chunk lock.
+        int sd = seqLen * stateDim;
+        var reduceLock = new object();
         for (int b = 0; b < batch; b++)
         {
-            // Forward recompute, saving the post-update state trajectory.
-            Array.Clear(h, 0, isd);
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, (diStart, diCount) =>
             {
-                int baseID = (b * seqLen + t) * innerDim;
-                int baseSD = (b * seqLen + t) * stateDim;
-                for (int di = 0; di < innerDim; di++)
+                var hTrajRow = new double[seqLen * stateDim]; // this di's state trajectory over time
+                var st = new double[stateDim];
+                var dhRow = new double[stateDim];
+                var dBpart = new double[sd];
+                var dCpart = new double[sd];
+                int diEnd = diStart + diCount;
+                for (int di = diStart; di < diEnd; di++)
                 {
-                    double dt = delta[baseID + di];
-                    double xv = X[baseID + di];
-                    int hrow = di * stateDim;
-                    for (int ni = 0; ni < stateDim; ni++)
-                    {
-                        double aBar = Math.Exp(dt * negA[hrow + ni]);
-                        h[hrow + ni] = aBar * h[hrow + ni] + dt * B[baseSD + ni] * xv;
-                    }
-                }
-                Array.Copy(h, 0, hTraj, t * isd, isd);
-            }
-
-            // Reverse sweep (dh carries the adjoint state from t+1).
-            Array.Clear(dh, 0, isd);
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int baseID = (b * seqLen + t) * innerDim;
-                int baseSD = (b * seqLen + t) * stateDim;
-                int stOff = t * isd;
-                int sprevOff = (t - 1) * isd;
-                for (int di = 0; di < innerDim; di++)
-                {
-                    double dt = delta[baseID + di];
-                    double xv = X[baseID + di];
-                    double dOutVal = dOut[baseID + di];
                     int hrow = di * stateDim;
 
-                    // D skip connection.
-                    dX[baseID + di] += D[di] * dOutVal;
-                    dD[di] += xv * dOutVal;
-
-                    double dDeltaAcc = 0.0;
-                    for (int ni = 0; ni < stateDim; ni++)
+                    // Forward recompute for this di-row, saving the post-update state trajectory.
+                    Array.Clear(st, 0, stateDim);
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        double a = negA[hrow + ni];
-                        double dtA = dt * a;
-                        double aBar = Math.Exp(dtA);
-                        double hCur = hTraj[stOff + hrow + ni];
-                        double hPrev = t > 0 ? hTraj[sprevOff + hrow + ni] : 0.0;
-                        double cVal = C[baseSD + ni];
-                        double bVal = B[baseSD + ni];
-
-                        // Output gradient into the state adjoint; dC from readout.
-                        dh[hrow + ni] += cVal * dOutVal;
-                        double dhVal = dh[hrow + ni];
-                        dC[baseSD + ni] += hCur * dOutVal;
-
-                        // d(Abar) = dh * h_prev  ; chain to delta (via Abar*A) and aLog (via Abar*dt*A).
-                        double dAbar = dhVal * hPrev;
-                        dDeltaAcc += dAbar * aBar * a;          // A_bar path: dAbar*Abar*A
-                        dDeltaAcc += dhVal * bVal * xv;         // B*x path: dh*B*x
-                        dB[baseSD + ni] += dhVal * dt * xv;     // dB = dh*delta*x
-                        dX[baseID + di] += dhVal * dt * bVal;   // dx (state path) = dh*delta*B
-                        dALog[hrow + ni] += dAbar * aBar * dtA; // aLog: dAbar*Abar*(delta*A)
-
-                        // Propagate adjoint to previous step: dh_{t-1} = Abar * dh_t.
-                        dh[hrow + ni] = aBar * dhVal;
+                        int baseID = (bb * seqLen + t) * innerDim;
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        double dt = delta[baseID + di];
+                        double xv = X[baseID + di];
+                        int rowOff = t * stateDim;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            double aBar = Math.Exp(dt * negA[hrow + ni]);
+                            st[ni] = aBar * st[ni] + dt * B[baseSD + ni] * xv;
+                            hTrajRow[rowOff + ni] = st[ni];
+                        }
                     }
-                    dDelta[baseID + di] = dDeltaAcc;
+
+                    // Reverse sweep (dhRow carries the adjoint state from t+1).
+                    Array.Clear(dhRow, 0, stateDim);
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int baseID = (bb * seqLen + t) * innerDim;
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        int rowOff = t * stateDim;
+                        int prevOff = (t - 1) * stateDim;
+                        double dt = delta[baseID + di];
+                        double xv = X[baseID + di];
+                        double dOutVal = dOut[baseID + di];
+
+                        // D skip connection.
+                        dX[baseID + di] += D[di] * dOutVal;
+                        dD[di] += xv * dOutVal;
+
+                        double dDeltaAcc = 0.0;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            double a = negA[hrow + ni];
+                            double dtA = dt * a;
+                            double aBar = Math.Exp(dtA);
+                            double hCur = hTrajRow[rowOff + ni];
+                            double hPrev = t > 0 ? hTrajRow[prevOff + ni] : 0.0;
+                            double cVal = C[baseSD + ni];
+                            double bVal = B[baseSD + ni];
+
+                            // Output gradient into the state adjoint; dC from readout.
+                            dhRow[ni] += cVal * dOutVal;
+                            double dhVal = dhRow[ni];
+                            dCpart[rowOff + ni] += hCur * dOutVal;
+
+                            // d(Abar) = dh * h_prev  ; chain to delta (via Abar*A) and aLog (via Abar*dt*A).
+                            double dAbar = dhVal * hPrev;
+                            dDeltaAcc += dAbar * aBar * a;          // A_bar path: dAbar*Abar*A
+                            dDeltaAcc += dhVal * bVal * xv;         // B*x path: dh*B*x
+                            dBpart[rowOff + ni] += dhVal * dt * xv; // dB = dh*delta*x
+                            dX[baseID + di] += dhVal * dt * bVal;   // dx (state path) = dh*delta*B
+                            dALog[hrow + ni] += dAbar * aBar * dtA; // aLog: dAbar*Abar*(delta*A)
+
+                            // Propagate adjoint to previous step: dh_{t-1} = Abar * dh_t.
+                            dhRow[ni] = aBar * dhVal;
+                        }
+                        dDelta[baseID + di] = dDeltaAcc;
+                    }
                 }
-            }
+
+                // Reduce this chunk's dB/dC partials into the shared gradients (cross-di sum).
+                lock (reduceLock)
+                {
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        int rowOff = t * stateDim;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            dB[baseSD + ni] += dBpart[rowOff + ni];
+                            dC[baseSD + ni] += dCpart[rowOff + ni];
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -220,31 +260,37 @@ public partial class CpuEngine
         var negA = new T[isd];
         for (int i = 0; i < isd; i++) negA[i] = ops.Negate(ops.Exp(aLog[i]));
 
-        var h = new T[isd];
+        // Parallelize over di (each inner channel evolves an independent state row); see the double path.
         for (int b = 0; b < batch; b++)
         {
-            for (int i = 0; i < isd; i++) h[i] = ops.Zero;
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, (diStart, diCount) =>
             {
-                int baseID = (b * seqLen + t) * innerDim;
-                int baseSD = (b * seqLen + t) * stateDim;
-                for (int di = 0; di < innerDim; di++)
+                var hRow = new T[stateDim];
+                int diEnd = diStart + diCount;
+                for (int di = diStart; di < diEnd; di++)
                 {
-                    T dt = delta[baseID + di];
-                    T xv = X[baseID + di];
+                    for (int i = 0; i < stateDim; i++) hRow[i] = ops.Zero;
                     int hrow = di * stateDim;
-                    T y = ops.Zero;
-                    for (int ni = 0; ni < stateDim; ni++)
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        T aBar = ops.Exp(ops.Multiply(dt, negA[hrow + ni]));
-                        T hv = ops.Add(ops.Multiply(aBar, h[hrow + ni]),
-                            ops.Multiply(ops.Multiply(dt, B[baseSD + ni]), xv));
-                        h[hrow + ni] = hv;
-                        y = ops.Add(y, ops.Multiply(C[baseSD + ni], hv));
+                        int baseID = (bb * seqLen + t) * innerDim;
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        T dt = delta[baseID + di];
+                        T xv = X[baseID + di];
+                        T y = ops.Zero;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            T aBar = ops.Exp(ops.Multiply(dt, negA[hrow + ni]));
+                            T hv = ops.Add(ops.Multiply(aBar, hRow[ni]),
+                                ops.Multiply(ops.Multiply(dt, B[baseSD + ni]), xv));
+                            hRow[ni] = hv;
+                            y = ops.Add(y, ops.Multiply(C[baseSD + ni], hv));
+                        }
+                        outp[baseID + di] = ops.Add(y, ops.Multiply(D[di], xv));
                     }
-                    outp[baseID + di] = ops.Add(y, ops.Multiply(D[di], xv));
                 }
-            }
+            });
         }
     }
 
@@ -258,76 +304,98 @@ public partial class CpuEngine
         var negA = new T[isd];
         for (int i = 0; i < isd; i++) negA[i] = ops.Negate(ops.Exp(aLog[i]));
 
-        var hTraj = new T[seqLen * isd];
-        var h = new T[isd];
-        var dh = new T[isd];
-
+        // Parallelize over di with per-chunk dB/dC partials (cross-di reduction); see the double path.
+        int sd = seqLen * stateDim;
+        var reduceLock = new object();
         for (int b = 0; b < batch; b++)
         {
-            for (int i = 0; i < isd; i++) h[i] = ops.Zero;
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, (diStart, diCount) =>
             {
-                int baseID = (b * seqLen + t) * innerDim;
-                int baseSD = (b * seqLen + t) * stateDim;
-                for (int di = 0; di < innerDim; di++)
+                var hTrajRow = new T[seqLen * stateDim];
+                var st = new T[stateDim];
+                var dhRow = new T[stateDim];
+                var dBpart = new T[sd];
+                var dCpart = new T[sd];
+                for (int i = 0; i < sd; i++) { dBpart[i] = ops.Zero; dCpart[i] = ops.Zero; }
+                int diEnd = diStart + diCount;
+                for (int di = diStart; di < diEnd; di++)
                 {
-                    T dt = delta[baseID + di];
-                    T xv = X[baseID + di];
-                    int hrow = di * stateDim;
-                    for (int ni = 0; ni < stateDim; ni++)
-                    {
-                        T aBar = ops.Exp(ops.Multiply(dt, negA[hrow + ni]));
-                        h[hrow + ni] = ops.Add(ops.Multiply(aBar, h[hrow + ni]),
-                            ops.Multiply(ops.Multiply(dt, B[baseSD + ni]), xv));
-                    }
-                }
-                Array.Copy(h, 0, hTraj, t * isd, isd);
-            }
-
-            for (int i = 0; i < isd; i++) dh[i] = ops.Zero;
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int baseID = (b * seqLen + t) * innerDim;
-                int baseSD = (b * seqLen + t) * stateDim;
-                int stOff = t * isd;
-                int sprevOff = (t - 1) * isd;
-                for (int di = 0; di < innerDim; di++)
-                {
-                    T dt = delta[baseID + di];
-                    T xv = X[baseID + di];
-                    T dOutVal = dOut[baseID + di];
                     int hrow = di * stateDim;
 
-                    dX[baseID + di] = ops.Add(dX[baseID + di], ops.Multiply(D[di], dOutVal));
-                    dD[di] = ops.Add(dD[di], ops.Multiply(xv, dOutVal));
-
-                    T dDeltaAcc = ops.Zero;
-                    for (int ni = 0; ni < stateDim; ni++)
+                    for (int i = 0; i < stateDim; i++) st[i] = ops.Zero;
+                    for (int t = 0; t < seqLen; t++)
                     {
-                        T a = negA[hrow + ni];
-                        T dtA = ops.Multiply(dt, a);
-                        T aBar = ops.Exp(dtA);
-                        T hCur = hTraj[stOff + hrow + ni];
-                        T hPrev = t > 0 ? hTraj[sprevOff + hrow + ni] : ops.Zero;
-                        T cVal = C[baseSD + ni];
-                        T bVal = B[baseSD + ni];
-
-                        dh[hrow + ni] = ops.Add(dh[hrow + ni], ops.Multiply(cVal, dOutVal));
-                        T dhVal = dh[hrow + ni];
-                        dC[baseSD + ni] = ops.Add(dC[baseSD + ni], ops.Multiply(hCur, dOutVal));
-
-                        T dAbar = ops.Multiply(dhVal, hPrev);
-                        dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(ops.Multiply(dAbar, aBar), a));
-                        dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(dhVal, ops.Multiply(bVal, xv)));
-                        dB[baseSD + ni] = ops.Add(dB[baseSD + ni], ops.Multiply(dhVal, ops.Multiply(dt, xv)));
-                        dX[baseID + di] = ops.Add(dX[baseID + di], ops.Multiply(dhVal, ops.Multiply(dt, bVal)));
-                        dALog[hrow + ni] = ops.Add(dALog[hrow + ni], ops.Multiply(ops.Multiply(dAbar, aBar), dtA));
-
-                        dh[hrow + ni] = ops.Multiply(aBar, dhVal);
+                        int baseID = (bb * seqLen + t) * innerDim;
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        T dt = delta[baseID + di];
+                        T xv = X[baseID + di];
+                        int rowOff = t * stateDim;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            T aBar = ops.Exp(ops.Multiply(dt, negA[hrow + ni]));
+                            st[ni] = ops.Add(ops.Multiply(aBar, st[ni]),
+                                ops.Multiply(ops.Multiply(dt, B[baseSD + ni]), xv));
+                            hTrajRow[rowOff + ni] = st[ni];
+                        }
                     }
-                    dDelta[baseID + di] = dDeltaAcc;
+
+                    for (int i = 0; i < stateDim; i++) dhRow[i] = ops.Zero;
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int baseID = (bb * seqLen + t) * innerDim;
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        int rowOff = t * stateDim;
+                        int prevOff = (t - 1) * stateDim;
+                        T dt = delta[baseID + di];
+                        T xv = X[baseID + di];
+                        T dOutVal = dOut[baseID + di];
+
+                        dX[baseID + di] = ops.Add(dX[baseID + di], ops.Multiply(D[di], dOutVal));
+                        dD[di] = ops.Add(dD[di], ops.Multiply(xv, dOutVal));
+
+                        T dDeltaAcc = ops.Zero;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            T a = negA[hrow + ni];
+                            T dtA = ops.Multiply(dt, a);
+                            T aBar = ops.Exp(dtA);
+                            T hCur = hTrajRow[rowOff + ni];
+                            T hPrev = t > 0 ? hTrajRow[prevOff + ni] : ops.Zero;
+                            T cVal = C[baseSD + ni];
+                            T bVal = B[baseSD + ni];
+
+                            dhRow[ni] = ops.Add(dhRow[ni], ops.Multiply(cVal, dOutVal));
+                            T dhVal = dhRow[ni];
+                            dCpart[rowOff + ni] = ops.Add(dCpart[rowOff + ni], ops.Multiply(hCur, dOutVal));
+
+                            T dAbar = ops.Multiply(dhVal, hPrev);
+                            dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(ops.Multiply(dAbar, aBar), a));
+                            dDeltaAcc = ops.Add(dDeltaAcc, ops.Multiply(dhVal, ops.Multiply(bVal, xv)));
+                            dBpart[rowOff + ni] = ops.Add(dBpart[rowOff + ni], ops.Multiply(dhVal, ops.Multiply(dt, xv)));
+                            dX[baseID + di] = ops.Add(dX[baseID + di], ops.Multiply(dhVal, ops.Multiply(dt, bVal)));
+                            dALog[hrow + ni] = ops.Add(dALog[hrow + ni], ops.Multiply(ops.Multiply(dAbar, aBar), dtA));
+
+                            dhRow[ni] = ops.Multiply(aBar, dhVal);
+                        }
+                        dDelta[baseID + di] = dDeltaAcc;
+                    }
                 }
-            }
+
+                lock (reduceLock)
+                {
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseSD = (bb * seqLen + t) * stateDim;
+                        int rowOff = t * stateDim;
+                        for (int ni = 0; ni < stateDim; ni++)
+                        {
+                            dB[baseSD + ni] = ops.Add(dB[baseSD + ni], dBpart[rowOff + ni]);
+                            dC[baseSD + ni] = ops.Add(dC[baseSD + ni], dCpart[rowOff + ni]);
+                        }
+                    }
+                }
+            });
         }
     }
 

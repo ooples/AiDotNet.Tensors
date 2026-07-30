@@ -134,6 +134,65 @@ public class MambaScanTests
         }
     }
 
+    [Fact]
+    public void Forward_ParallelDiPath_MatchesReferenceScan()
+    {
+        // innerDim well above MambaDiGrain with batch>1 forces the multi-chunk parallel di path.
+        var engine = new CpuEngine();
+        int batch = 3, seqLen = 12, innerDim = 96, stateDim = 8;
+        var (x, delta, aLog, b, c, d) = MakeInputs(batch, seqLen, innerDim, stateDim, 13);
+
+        var outp = engine.MambaSelectiveScanForward(x, delta, aLog, b, c, d);
+        var expected = ReferenceForward(
+            (double[])(object)x.GetDataArray()!, (double[])(object)delta.GetDataArray()!,
+            (double[])(object)aLog.GetDataArray()!, (double[])(object)b.GetDataArray()!,
+            (double[])(object)c.GetDataArray()!, (double[])(object)d.GetDataArray()!,
+            batch, seqLen, innerDim, stateDim);
+
+        var got = (double[])(object)outp.GetDataArray()!;
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(got[i] - expected[i]) < 1e-9,
+                $"Forward[{i}] = {got[i]} vs reference {expected[i]}");
+    }
+
+    [Fact]
+    public void Backward_ParallelDiPath_MatchesFiniteDifferences()
+    {
+        // batch>1, innerDim>grain → exercises the parallel di backward + the cross-di dB/dC reduction.
+        var engine = new CpuEngine();
+        int batch = 2, seqLen = 6, innerDim = 32, stateDim = 4;
+        var (x, delta, aLog, b, c, d) = MakeInputs(batch, seqLen, innerDim, stateDim, 5);
+
+        Tensor<double> outp;
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads;
+        using (var tape = new GradientTape<double>())
+        {
+            outp = engine.MambaSelectiveScanForward(x, delta, aLog, b, c, d);
+            grads = tape.ComputeGradients(outp, new[] { x, delta, aLog, b, c, d });
+        }
+
+        const double eps = 1e-6;
+        foreach (var input in new[] { x, delta, aLog, b, c, d })
+        {
+            var data = (double[])(object)input.GetDataArray()!;
+            var grad = grads[input];
+            for (int i = 0; i < data.Length; i++)
+            {
+                double orig = data[i];
+                data[i] = orig + eps;
+                double sumPlus = SumForward(engine, x, delta, aLog, b, c, d);
+                data[i] = orig - eps;
+                double sumMinus = SumForward(engine, x, delta, aLog, b, c, d);
+                data[i] = orig;
+                double numeric = (sumPlus - sumMinus) / (2.0 * eps);
+                double analytic = grad.GetFlat(i);
+                double tol = 1e-5 + 1e-4 * Math.Abs(analytic);
+                Assert.True(Math.Abs(numeric - analytic) < tol,
+                    $"grad mismatch at element {i}: analytic={analytic}, finite-diff={numeric}");
+            }
+        }
+    }
+
     private static double SumForward(
         CpuEngine engine, Tensor<double> x, Tensor<double> delta, Tensor<double> aLog,
         Tensor<double> b, Tensor<double> c, Tensor<double> d)

@@ -130,6 +130,21 @@ public interface IDirectGpuBackend : IDisposable
     void DownloadBuffer(IGpuBuffer buffer, float[] destination);
 
     /// <summary>
+    /// Downloads raw bytes from a GPU byte buffer to CPU.
+    /// </summary>
+    /// <param name="buffer">GPU byte buffer to download.</param>
+    /// <param name="byteCount">Number of bytes to download.</param>
+    /// <returns>CPU byte array with the requested buffer contents.</returns>
+    byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount);
+
+    /// <summary>
+    /// Uploads raw bytes into an existing GPU byte buffer.
+    /// </summary>
+    /// <param name="buffer">GPU byte buffer to update.</param>
+    /// <param name="data">Raw bytes to upload.</param>
+    void UploadByteBuffer(IGpuBuffer buffer, byte[] data);
+
+    /// <summary>
     /// Copies data between GPU buffers.
     /// </summary>
     /// <param name="source">Source buffer.</param>
@@ -1368,7 +1383,7 @@ public interface IDirectGpuBackend : IDisposable
     IGpuBuffer AllocateIntBuffer(int[] data);
 
     /// <summary>In-place int upload (no allocation) — refreshes a stable embedding-index buffer each step.
-    /// Only the CUDA graph-capture cortex path needs it; other backends may throw NotSupported.</summary>
+    /// Used to refresh device-resident embedding indices without replacing the buffer object.</summary>
     void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer);
 
     #endregion
@@ -1397,13 +1412,38 @@ public interface IDirectGpuBackend : IDisposable
 
     #region Attention Operations
 
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0, each scaled score
+    /// is passed through <c>softcap · tanh(score / softcap)</c> before the softmax. 0 disables it.</param>
+    /// <param name="numKVHeads">Grouped-Query Attention: number of key/value heads, each shared by
+    /// <c>numHeads / numKVHeads</c> query heads. When &lt;= 0 it defaults to <paramref name="numHeads"/> (standard
+    /// multi-head attention). When &gt; 0 the key/value buffers are sized [batch * numKVHeads * seqK * headDim] and
+    /// the shared K/V heads are broadcast internally — the caller never materializes the expanded K/V.</param>
     void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0);
 
     void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+
+    /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE), the GPT-NeoX / LLaMA / GGML variant that rotates each
+    /// adjacent dim pair (2i, 2i+1). Operates on a row-major [rows, headDim] view (rows = leading * seqLen) and
+    /// writes the rotated result to <paramref name="output"/> (may alias <paramref name="input"/>). The cos/sin
+    /// caches are precomputed host-side as [maxSeq, headDim/2] and indexed by absolute position
+    /// (startPosition + rowWithinSequence).
+    /// </summary>
+    /// <param name="input">Q or K activations, [rows * headDim] row-major, GPU-resident.</param>
+    /// <param name="cos">Cosine cache [maxSeq * (headDim/2)], GPU-resident.</param>
+    /// <param name="sin">Sine cache [maxSeq * (headDim/2)], GPU-resident.</param>
+    /// <param name="output">Rotated output [rows * headDim], GPU-resident.</param>
+    /// <param name="rows">Number of (leading × seq) rows.</param>
+    /// <param name="headDim">Per-head dimension (must be even).</param>
+    /// <param name="seqLen">Sequence length, used to recover the position of each row.</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (for incremental decode).</param>
+    void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition);
 
     void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? mask, int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal);
@@ -1971,10 +2011,17 @@ public interface IDirectGpuBackend : IDisposable
     void IotaPad(IGpuBuffer idx, int l, int p, int numRows);
 
     /// <summary>
-    /// RWKV-7 (WKV7 generalized delta rule) sequence forward, parallel over (batch, head) with a
-    /// per-(b,h) [headDim,headDim] state in the <paramref name="sbuf"/> scratch (size batch*numHeads*headDim^2).
+    /// RWKV-7 "Goose" generalized-delta-rule sequence forward (arXiv:2503.14456, Eq. 17), parallel over
+    /// (batch, head):
+    /// <c>S_t = S_{t-1}(diag(w_t) - kappaHat_t^T(a_t (*) kappaHat_t)) + v_t^T kTilde_t</c>,
+    /// <c>o_t = S_t . r_t</c>, with <c>w = exp(-e^(-1/2) sigmoid(decayLogit))</c> and
+    /// <c>kappaHat = kappa/||kappa||_2</c> per head, both applied internally. <paramref name="iclRate"/>
+    /// is already post-sigmoid.
     /// </summary>
-    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
+    /// <param name="sbuf">Per-(b,h) scratch of size <c>batch*numHeads*(headDim^2 + 3*headDim)</c>: the
+    /// <c>[headDim,headDim]</c> state followed by the kappaHat / w / a gate vectors.</param>
+    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v,
+        IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output,
         IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
     /// <summary>
@@ -2010,7 +2057,7 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Build the full conj-symmetric spectrum (two CPU passes in order) from mag/phase.</summary>
     void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft);
 
-    /// <summary>Inverse STFT from the full spectrum: windowed overlap-add (atomic) into result + windowSum.</summary>
+    /// <summary>Inverse STFT from the full spectrum: deterministic frame-ordered overlap-add into result + windowSum.</summary>
     void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center);
 
     /// <summary>ISTFT normalize: result /= windowSum where windowSum &gt; 1e-8.</summary>
@@ -2314,20 +2361,32 @@ public interface IDirectGpuBackend : IDisposable
     void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
         float learningRate, float l1Reg, float l2Reg, float beta, int size);
 
+    /// <summary>
+    /// Proximal gradient (ISTA) step with L1 soft-thresholding.
+    /// </summary>
+    /// <param name="param">Parameters to update (in-place).</param>
+    /// <param name="gradient">Gradient values.</param>
+    /// <param name="learningRate">Learning rate.</param>
+    /// <param name="l1Strength">L1 regularization strength; shrinkage threshold is learningRate * l1Strength.</param>
+    /// <param name="size">Number of parameters.</param>
+    void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size);
+
     // --------------------------------------------------------------
     // PR #567 — Sparse counterparts of the dense optimizer steps above.
-    // Each method launches a native CUDA scatter-update kernel with one
-    // thread per non-zero gradient (nnz). Only (param[idx], state[idx])
-    // entries are read/written; the other (N − nnz) entries are never
-    // touched. Memory traffic is O(nnz) vs. the dense path's O(N).
+    // Each method performs a GPU sparse scatter update with one thread or
+    // staged update per non-zero gradient (nnz). Only (param[idx], state[idx])
+    // entries are read/written; the other (N − nnz) entries are never touched.
+    // Native scatter backends provide O(nnz) device work and memory traffic
+    // vs. the dense path's O(N). Staged correctness fallback backends may
+    // transfer full param/state buffers and must document that behavior.
     //
     // sparseIndices and sparseValues are GPU-resident buffers of length
-    // >= nnz; the dense state buffers (m, v, accum, ...) keep their full
-    // shape and are mutated in place at the touched indices only.
-    //
-    // Backends that don't ship the sparse_* kernel should throw
-    // NotSupportedException; the GpuOptimizer wrapper will then return
-    // false so the caller falls back to the CPU sparse path.
+    // >= nnz. sparseIndices[0..nnz) must be in range, unique, and
+    // pre-aggregated before dispatch; native kernels use non-atomic scatter
+    // writes and duplicate-index order is intentionally undefined. The dense
+    // state buffers (m, v, accum, ...) keep their full shape and are mutated
+    // in place at the touched indices only.
     // --------------------------------------------------------------
 
     /// <summary>Sparse SGD scatter-update on GPU. See SgdUpdate for the dense counterpart.</summary>
@@ -2567,6 +2626,13 @@ public interface IDirectGpuBackend : IDisposable
     void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed);
 
     /// <summary>
+    /// Generates a seeded dropout mask with the shared integer-only CPU/GPU random contract.
+    /// Each output is exactly zero when the unsigned sample is below <paramref name="threshold"/>,
+    /// otherwise exactly <paramref name="scale"/>.
+    /// </summary>
+    void GenerateStatelessDropoutMask(IGpuBuffer output, int size, uint threshold, float scale, uint seed);
+
+    /// <summary>
     /// Generates normally distributed (Gaussian) random numbers on GPU using Box-Muller transform.
     /// </summary>
     /// <param name="output">Output buffer [size].</param>
@@ -2691,7 +2757,7 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     /// <param name="input">Input [batchSize * inputFeatures].</param>
     /// <param name="weights">Weights [outputFeatures * inputFeatures].</param>
-    /// <param name="biases">Biases [outputFeatures * inputFeatures].</param>
+    /// <param name="biases">Biases [outputFeatures].</param>
     /// <param name="output">Output [batchSize * outputFeatures].</param>
     /// <param name="batchSize">Batch size.</param>
     /// <param name="inputFeatures">Input features.</param>
@@ -2733,7 +2799,7 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     /// <param name="gradOutput">Output gradient [batchSize, outputFeatures].</param>
     /// <param name="input">Input from forward pass [batchSize, inputFeatures].</param>
-    /// <param name="gradBiases">Output: bias gradient [outputFeatures, inputFeatures].</param>
+    /// <param name="gradBiases">Output: bias gradient [outputFeatures].</param>
     /// <param name="batchSize">Batch size.</param>
     /// <param name="inputFeatures">Input features.</param>
     /// <param name="outputFeatures">Output features.</param>
@@ -3000,11 +3066,21 @@ public interface IDirectGpuBackend : IDisposable
     float FusedLinearCrossEntropyIndex(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab);
 
+    /// <summary>Resident-output variant. Writes the mean CE to <paramref name="meanLoss"/>.</summary>
+    void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab);
+
     /// <summary>
     /// Fused linear (LM head) + cross-entropy with dense [N, vocab] soft targets (#1464). Returns mean CE.
     /// </summary>
     float FusedLinearCrossEntropyDense(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab);
+
+    /// <summary>Resident-output variant. Writes the mean CE to <paramref name="meanLoss"/>.</summary>
+    void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab);
 
     /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
@@ -3271,6 +3347,32 @@ public interface IDirectGpuBackend : IDisposable
     // Tensor<Complex<T>> (array-of-structs) and split buffers at the GPU boundary.
     // Callers of IEngine never see the split format — it's an internal GPU optimization.
 
+    /// <summary>
+    /// Packs split real/imag buffers into one interleaved [re0, im0, re1, im1, ...] buffer.
+    /// </summary>
+    /// <param name="real">Real parts, n elements.</param>
+    /// <param name="imag">Imaginary parts, n elements.</param>
+    /// <param name="interleaved">Destination, 2*n elements.</param>
+    /// <param name="n">Number of complex values.</param>
+    /// <remarks>
+    /// The GPU keeps complex data SPLIT (hence the SplitComplex* family below); interleaved is the layout
+    /// IEngine.RFFT's tensor contract requires. Without this primitive the dispatch layer bridged the two by
+    /// issuing two Copy calls PER FREQUENCY BIN — at numFreqs=129 and batch=4096 that is ~1.06 million
+    /// device-to-device copies for a single RFFT, which dominated the operation completely. One kernel with a
+    /// stride-2 write replaces all of them.
+    /// </remarks>
+    void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n);
+
+    /// <summary>
+    /// Splits an interleaved [re0, im0, ...] buffer into separate real/imag buffers. Inverse of
+    /// <see cref="InterleaveComplex"/>; used by IRFFT, whose input arrives interleaved.
+    /// </summary>
+    /// <param name="interleaved">Source, 2*n elements.</param>
+    /// <param name="real">Real destination, n elements.</param>
+    /// <param name="imag">Imaginary destination, n elements.</param>
+    /// <param name="n">Number of complex values.</param>
+    void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n);
+
     /// <summary>Element-wise complex multiply with split real/imag buffers.</summary>
     void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int n);
@@ -3305,11 +3407,9 @@ public interface IDirectGpuBackend : IDisposable
         IGpuBuffer outReal, IGpuBuffer outImag, int n);
 
     /// <summary>
-    /// Top-K by magnitude: retain elements whose magnitude-squared is at or above the K-th largest,
-    /// zeroing the rest. When ties exist at the threshold, all tied elements are retained, so some
-    /// GPU threshold-based implementations may produce more than K non-zero elements. This differs
-    /// from the CPU NativeComplexTopK behavior, which uses an index-based approach to guarantee
-    /// exactly min(k,n) retained elements.
+    /// Top-K by magnitude: retain exactly min(k,n) input indices and zero the rest. Magnitudes are
+    /// ordered descending, equal magnitudes use the lower input index first, and NaN magnitudes sort
+    /// after numeric magnitudes. Output elements remain at their original indices.
     /// </summary>
     void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k);
 
@@ -3320,12 +3420,10 @@ public interface IDirectGpuBackend : IDisposable
     // Backend-native kernels for the HRR ops the engine exposes through
     // NativeUnitPhaseCodebook<T>, NativeComplexPhaseCoherenceDecode<T>,
     // NativeHRRBindAccumulate<T>. Split Re/Im, fp32 (matches the rest of
-    // the GPU surface). Per-cell deterministic phase generation uses a
-    // splitmix64 hash so different threads produce independent phases
-    // from (seed, v, d) without sharing state — matches the engine's
-    // deterministic-per-seed contract but not the exact CPU phase
-    // sequence (which is fine; random init doesn't need cross-device
-    // bit-identity).
+    // the GPU surface). Per-cell deterministic phase generation uses the
+    // same 32-bit hash as the CPU reference so different threads produce
+    // independent phases from (seed, v, d) without sharing state or
+    // changing the phase sequence across backends.
 
     /// <summary>
     /// Fill a V×D codebook of unit-phase complex numbers: every entry
@@ -3470,6 +3568,29 @@ public interface IDirectGpuBackend : IDisposable
     AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv { get; }
 
     #endregion
+
+    #region Paged Attention (P1)
+
+    /// <summary>Single-query paged-attention decode over a vLLM-style paged KV cache (see DevicePagedKVCache):
+    /// <c>out[h] = softmax(scale · Q[h]·K[.,h]) · V[.,h]</c>, gathering K/V through the block table. All six
+    /// backends implement this; higher layers (inference/serving) invoke it via the engine's backend.</summary>
+    IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale);
+
+    /// <summary>Multi-query paged-attention prefill with causal masking: query <c>qi</c> attends to key
+    /// positions <c>0..(startPos+qi)</c>.</summary>
+    IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale);
+
+    /// <summary>Grouped-query variant of <see cref="PagedAttentionDecode"/> (<paramref name="kvHeads"/> &lt; heads).</summary>
+    IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale);
+
+    /// <summary>Grouped-query variant of <see cref="PagedAttentionPrefill"/> (<paramref name="kvHeads"/> &lt; heads).</summary>
+    IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale);
+
+    #endregion
 }
 
 /// <summary>
@@ -3593,6 +3714,18 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim);
     void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim);
     void PairwiseDistanceSquared(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim);
+}
+
+/// <summary>
+/// Cross-backend pixel-shuffle capability. Kept separate from batch execution because pixel
+/// shuffle is a layout transform available on every native backend, including OpenCL and Metal.
+/// </summary>
+public interface IPixelShuffleBackend
+{
+    void PixelShuffle(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inH, int inW, int scale);
+    void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
+        int batch, int channels, int inH, int inW, int scale);
 }
 
 /// <summary>

@@ -96,6 +96,26 @@ internal static class MpsSparseBackend
         // _ = rowPtr; _ = colIdx; _ = values; _ = b; _ = rows; _ = cols; _ = n;
     }
 
+    /// <summary>SDDMM: <c>out[p] = Σ_k x[rowIndices[p], k] · y[colIndices[p], k]</c>. Same MPS-stub
+    /// shape as <see cref="SpMM"/> — gated off by <see cref="IsAvailable"/> = false until an
+    /// Apple-Silicon CI runner validates the descriptor lifecycle; callers fall back to the CPU
+    /// tier meanwhile.</summary>
+    public static float[] SDDMM(
+        int[] rowIndices, int[] colIndices,
+        float[] x, float[] y, int innerK)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("MPS sparse backend is not available on this host.");
+
+        throw new NotSupportedException(
+            "MPS sparse SDDMM is wired to the runtime probe but the descriptor lifecycle needs " +
+            "an Apple-Silicon CI runner to land its end-to-end validation. Until that lands, " +
+            "callers fall back to the CPU tier — the IsAvailable gate above keeps this method off " +
+            "the hot path.");
+        // Reachable variables retained as documentation for the future binding:
+        // _ = rowIndices; _ = colIndices; _ = x; _ = y; _ = innerK;
+    }
+
     // Selector cache — registering selectors is cheap but the runtime
     // walks the class table each time. Caching is the standard
     // Objective-C-from-managed pattern used elsewhere in the repo.

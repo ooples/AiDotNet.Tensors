@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 using BlasMgd = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
@@ -33,13 +34,18 @@ public class NAxisParityTests
     [InlineData(768, 4096, 512)]   // larger mr-aligned M, wide N
     public void NAxis_BitIdentical_ToMAxis(int m, int n, int k)
     {
-        // The N-axis private-B path requires the FP32 machine-code panel kernel; without it the
-        // "N-axis" run silently falls back to M-axis and the comparison would be a vacuous M-vs-M.
+        // The N-axis private-B path requires the FP32 6x16 machine-code panel kernel.
+        // Exercise PackBothStrategy directly with the matching tile so this route-coverage
+        // test is independent of the host's top-level BlasManaged tile heuristic.
         Skip.IfNot(MachineKernelGemm.IsFp32PanelAvailable,
             "FP32 machine-code panel kernel unavailable — N-axis path cannot run on this platform.");
 
         var prior = CpuParallelSettings.MaxDegreeOfParallelism;
         var priorDisable = PB.s_disableNAxis;
+        var priorMachineKernel = MachineKernelGemm.Enabled;
+        var priorPanelKernel = MachineKernelGemm.EnablePanelKernel;
+        var priorDeterministic = BlasProvider.IsDeterministicMode;
+        var priorThreadDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
         CpuParallelSettings.MaxDegreeOfParallelism = 4;
         var a = Rand(m * k, 1);
         var b = Rand(k * n, 2);
@@ -48,17 +54,31 @@ public class NAxisParityTests
         long nAxisRunsForThisCase;
         try
         {
+            MachineKernelGemm.Enabled = true;
+            MachineKernelGemm.EnablePanelKernel = true;
+            BlasProvider.SetThreadLocalDeterministicMode(null);
+            BlasProvider.SetDeterministicMode(false);
+
+            var opts = new BlasOptions<float> { NumThreads = 4 };
+            const int kc = 256;
+            int mr = MachineKernelGemm.Fp32Mr;
+            int nr = MachineKernelGemm.Fp32Nr;
+
             PB.s_disableNAxis = true;
-            BlasMgd.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k);
+            PB.Run<float>(a, k, false, b, n, false, cM, n, m, n, k, m, n, kc, mr, nr, opts);
 
             PB.s_disableNAxis = false;
             long before = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount);
-            BlasMgd.Gemm<float>(a, k, false, b, n, false, cN, n, m, n, k);
+            PB.Run<float>(a, k, false, b, n, false, cN, n, m, n, k, m, n, kc, mr, nr, opts);
             nAxisRunsForThisCase = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount) - before;
         }
         finally
         {
             PB.s_disableNAxis = priorDisable;
+            MachineKernelGemm.Enabled = priorMachineKernel;
+            MachineKernelGemm.EnablePanelKernel = priorPanelKernel;
+            BlasProvider.SetDeterministicMode(priorDeterministic);
+            BlasProvider.SetThreadLocalDeterministicMode(priorThreadDeterministic);
             CpuParallelSettings.MaxDegreeOfParallelism = prior;
         }
 
@@ -69,5 +89,52 @@ public class NAxisParityTests
         for (int i = 0; i < cM.Length; i++)
             if (cM[i] != cN[i])
                 Assert.Fail($"N-axis diverged at [{i / n},{i % n}] m={m} n={n} k={k}: Maxis={cM[i]:R} Naxis={cN[i]:R}");
+    }
+
+    [SkippableFact]
+    public void Avx512PackBothTile_DoesNotEnterSixBySixteenNAxisPanelPath()
+    {
+        Skip.IfNot(MachineKernelGemm.IsFp32PanelAvailable && Avx512Fp32_16x16.IsSupported,
+            "Requires an AVX-512 FP32 PackBoth host with the FP32 panel kernel available.");
+
+        var prior = CpuParallelSettings.MaxDegreeOfParallelism;
+        var priorDisable = PB.s_disableNAxis;
+        var priorDisableGoto = BlasMgd.s_disableGotoGemm;
+        var priorMachineKernel = MachineKernelGemm.Enabled;
+        var priorPanelKernel = MachineKernelGemm.EnablePanelKernel;
+        var priorDeterministic = BlasProvider.IsDeterministicMode;
+        var priorThreadDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
+        CpuParallelSettings.MaxDegreeOfParallelism = 4;
+        try
+        {
+            MachineKernelGemm.Enabled = true;
+            MachineKernelGemm.EnablePanelKernel = true;
+            BlasProvider.SetThreadLocalDeterministicMode(null);
+            BlasProvider.SetDeterministicMode(false);
+            BlasMgd.s_disableGotoGemm = true;
+            PB.s_disableNAxis = false;
+
+            int m = 384, n = 4096, k = 512;
+            var a = Rand(m * k, 11);
+            var b = Rand(k * n, 12);
+            var c = new float[m * n];
+            long before = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount);
+
+            BlasMgd.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k,
+                new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth, NumThreads = 4 });
+
+            long nAxisRuns = System.Threading.Interlocked.Read(ref PB.s_nAxisRunCount) - before;
+            Assert.Equal(0, nAxisRuns);
+        }
+        finally
+        {
+            PB.s_disableNAxis = priorDisable;
+            BlasMgd.s_disableGotoGemm = priorDisableGoto;
+            MachineKernelGemm.Enabled = priorMachineKernel;
+            MachineKernelGemm.EnablePanelKernel = priorPanelKernel;
+            BlasProvider.SetDeterministicMode(priorDeterministic);
+            BlasProvider.SetThreadLocalDeterministicMode(priorThreadDeterministic);
+            CpuParallelSettings.MaxDegreeOfParallelism = prior;
+        }
     }
 }

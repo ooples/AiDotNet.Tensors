@@ -24,6 +24,7 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend)) return null;
 
         int rank = interleaved.Rank;
+        if (rank == 0) return null;
         int last = interleaved.Shape[rank - 1];
         if (last % 2 != 0) return null;
         int n = last / 2;
@@ -38,7 +39,7 @@ public partial class DirectGpuTensorEngine
             // preserve the input (some call paths expect the input tensor to
             // still contain its original data — GetOrAllocateBuffer returns
             // a buffer that may be cached).
-            var outBuf = AllocateOutputBuffer(backend, interleaved.Length);
+            using var outBuf = AllocateOutputBuffer(backend, interleaved.Length);
 
             // Pre-handoff phase: outBuf still owned by us. Narrow the catch
             // to the exceptions GPU dispatch is expected to throw when a
@@ -46,62 +47,69 @@ public partial class DirectGpuTensorEngine
             // library-not-compiled, NotSupported for out-of-contract shapes,
             // ArgumentOutOfRange for dimension guards). Other exceptions are
             // real bugs and should propagate.
-            float[] outArr;
             try
             {
                 backend.CopyBuffer(buf.Buffer, outBuf.Buffer, interleaved.Length);
                 fftBackend.LaunchFft(outBuf.Buffer, batch, n, inverse);
-                outArr = FinishGpuOp<float>(backend, outBuf, interleaved.Length);
-                // outBuf ownership now in the activation cache — do NOT Dispose below.
+                var result = DeferTensorResult<float>(backend, outBuf.Buffer,
+                    interleaved.Length, (int[])interleaved._shape.Clone());
+                outBuf.RelinquishOwnership();
+                return result;
             }
             catch (Exception ex) when (
                 ex is InvalidOperationException
                    or NotSupportedException
                    or ArgumentException)
             {
-                outBuf.Dispose();
-                return null;
+                if (ThrowOnGpuKernelFallback) throw;
             }
-
-            // Post-handoff phase: outBuf is cache-owned, don't touch it.
-            return new Tensor<float>(outArr, (int[])interleaved._shape.Clone());
         }
 
-        // Path B: split real/imag engine.FFT (CUDA / HIP / OpenCL — existing
-        // surface). Decompose the interleaved buffer CPU-side (cheap for the
-        // sizes that actually matter), dispatch the native kernel, reassemble.
-        var realShape = (int[])interleaved._shape.Clone();
-        realShape[realShape.Length - 1] = n;
-        var realIn = new Tensor<float>(realShape);
-        var imagIn = new Tensor<float>(realShape);
-        var inD = interleaved.GetDataArray();
-        var reD = realIn.GetDataArray();
-        var imD = imagIn.GetDataArray();
-        for (int b = 0; b < batch; b++)
+        // Path B: split real/imag FFT. Deinterleave and reassemble with strided
+        // device copies so the public FFT module never materializes an intermediate.
+        IGpuBuffer? realInput = null;
+        IGpuBuffer? imaginaryInput = null;
+        IGpuBuffer? realOutput = null;
+        IGpuBuffer? imaginaryOutput = null;
+        IGpuBuffer? interleavedOutput = null;
+        bool outputHandedOff = false;
+        try
         {
-            for (int i = 0; i < n; i++)
-            {
-                reD[b * n + i] = inD[b * last + 2 * i];
-                imD[b * n + i] = inD[b * last + 2 * i + 1];
-            }
+            using var input = GetOrAllocateBuffer(backend, interleaved);
+            int complexCount = checked(batch * n);
+            realInput = backend.AllocateBuffer(complexCount);
+            imaginaryInput = backend.AllocateBuffer(complexCount);
+            realOutput = backend.AllocateBuffer(complexCount);
+            imaginaryOutput = backend.AllocateBuffer(complexCount);
+            interleavedOutput = backend.AllocateBuffer(interleaved.Length);
+
+            backend.StridedGather(input.Buffer, realInput, 0, 2, complexCount);
+            backend.StridedGather(input.Buffer, imaginaryInput, 1, 2, complexCount);
+            backend.BatchedFFT(realInput, imaginaryInput, realOutput, imaginaryOutput,
+                batch, n, inverse);
+            backend.StridedScatter(realOutput, interleavedOutput, 0, 2, complexCount);
+            backend.StridedScatter(imaginaryOutput, interleavedOutput, 1, 2, complexCount);
+            backend.Synchronize();
+
+            var result = DeferTensorResult<float>(backend, interleavedOutput,
+                interleaved.Length, (int[])interleaved._shape.Clone());
+            outputHandedOff = true;
+            return result;
         }
-        Tensor<float> reOut, imOut;
-        if (inverse)
-            IFFT(realIn, imagIn, out reOut, out imOut);
-        else
-            FFT(realIn, imagIn, out reOut, out imOut);
-        var output = new Tensor<float>((int[])interleaved._shape.Clone());
-        var oD = output.GetDataArray();
-        var outReD = reOut.GetDataArray();
-        var outImD = imOut.GetDataArray();
-        for (int b = 0; b < batch; b++)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            for (int i = 0; i < n; i++)
-            {
-                oD[b * last + 2 * i] = outReD[b * n + i];
-                oD[b * last + 2 * i + 1] = outImD[b * n + i];
-            }
+            if (ThrowOnGpuKernelFallback) throw;
+            System.Diagnostics.Trace.TraceWarning(
+                $"GPU interleaved FFT fallback: {ex.GetType().Name}: {ex.Message}");
+            return null;
         }
-        return output;
+        finally
+        {
+            realInput?.Dispose();
+            imaginaryInput?.Dispose();
+            realOutput?.Dispose();
+            imaginaryOutput?.Dispose();
+            if (!outputHandedOff) interleavedOutput?.Dispose();
+        }
     }
 }

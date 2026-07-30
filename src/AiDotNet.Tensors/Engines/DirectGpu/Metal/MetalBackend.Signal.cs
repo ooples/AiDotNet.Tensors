@@ -8,6 +8,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    private void DispatchSplitFftMetal(IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag, int sequences, int length,
+        int baseStride, int elementStride, bool inverse)
+    {
+        if (length <= 0 || (length & (length - 1)) != 0)
+            throw new ArgumentException($"FFT size must be a positive power of two, got {length}", nameof(length));
+        if (ReferenceEquals(outputReal, outputImag))
+            throw new ArgumentException("Real and imaginary FFT outputs must use distinct buffers.");
+        DispatchResidentMetal("split_fft_strided_serial", sequences,
+            new[] { inputReal, inputImag, outputReal, outputImag },
+            (uint)sequences, (uint)length, (uint)baseStride, (uint)elementStride, inverse ? 1u : 0u);
+    }
+
     #region FFT and Signal Processing
 
     /// <summary>
@@ -16,17 +29,7 @@ public sealed partial class MetalBackend
     public void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
         ThrowIfDisposed();
-
-        var inReal = DownloadBuffer(inputReal);
-        var inImag = DownloadBuffer(inputImag);
-        var outReal = new float[n];
-        var outImag = new float[n];
-
-        // Cooley-Tukey FFT implementation
-        CooleyTukeyFFT(inReal, inImag, outReal, outImag, n, inverse);
-
-        UploadToBuffer(outputReal, outReal);
-        UploadToBuffer(outputImag, outImag);
+        DispatchSplitFftMetal(inputReal, inputImag, outputReal, outputImag, 1, n, n, 1, inverse);
     }
 
     private static void CooleyTukeyFFT(float[] inReal, float[] inImag, float[] outReal, float[] outImag, int n, bool inverse)
@@ -116,22 +119,16 @@ public sealed partial class MetalBackend
     public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
     {
         ThrowIfDisposed();
-
-        var inData = DownloadBuffer(input);
-        var inImag = new float[n];
-        var outReal = new float[n];
-        var outImag = new float[n];
-
-        CooleyTukeyFFT(inData, inImag, outReal, outImag, n, false);
-
-        // Copy only first n/2 + 1 elements
-        var resultReal = new float[n / 2 + 1];
-        var resultImag = new float[n / 2 + 1];
-        Array.Copy(outReal, resultReal, n / 2 + 1);
-        Array.Copy(outImag, resultImag, n / 2 + 1);
-
-        UploadToBuffer(outputReal, resultReal);
-        UploadToBuffer(outputImag, resultImag);
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw new ArgumentException($"FFT size must be a positive power of two, got {n}", nameof(n));
+        int halfLength = n / 2 + 1;
+        using var zeroImaginary = AllocateBuffer(n);
+        using var fullReal = AllocateBuffer(n);
+        using var fullImaginary = AllocateBuffer(n);
+        Fill(zeroImaginary, 0f, n);
+        DispatchSplitFftMetal(input, zeroImaginary, fullReal, fullImaginary, 1, n, n, 1, false);
+        Copy(fullReal, 0, outputReal, 0, halfLength);
+        Copy(fullImaginary, 0, outputImag, 0, halfLength);
     }
 
     /// <summary>
@@ -140,32 +137,16 @@ public sealed partial class MetalBackend
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
         ThrowIfDisposed();
-
-        var inReal = DownloadBuffer(inputReal);
-        var inImag = DownloadBuffer(inputImag);
-
-        // Reconstruct full complex spectrum
-        var fullReal = new float[n];
-        var fullImag = new float[n];
-
-        int halfN = n / 2 + 1;
-        for (int i = 0; i < halfN; i++)
-        {
-            fullReal[i] = inReal[i];
-            fullImag[i] = inImag[i];
-        }
-        // Conjugate symmetry
-        for (int i = 1; i < n / 2; i++)
-        {
-            fullReal[n - i] = fullReal[i];
-            fullImag[n - i] = -fullImag[i];
-        }
-
-        var outReal = new float[n];
-        var outImag = new float[n];
-        CooleyTukeyFFT(fullReal, fullImag, outReal, outImag, n, true);
-
-        UploadToBuffer(output, outReal);
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw new ArgumentException($"FFT size must be a positive power of two, got {n}", nameof(n));
+        using var fullReal = AllocateBuffer(n);
+        using var fullImaginary = AllocateBuffer(n);
+        using var transformedReal = AllocateBuffer(n);
+        using var transformedImaginary = AllocateBuffer(n);
+        DispatchResidentMetal("irfft_reconstruct", n,
+            new[] { inputReal, inputImag, fullReal, fullImaginary }, (uint)n);
+        DispatchSplitFftMetal(fullReal, fullImaginary, transformedReal, transformedImaginary, 1, n, n, 1, true);
+        Copy(transformedReal, output, n);
     }
 
     /// <summary>
@@ -175,30 +156,8 @@ public sealed partial class MetalBackend
         int batch, int n, bool inverse)
     {
         ThrowIfDisposed();
-
-        var inReal = DownloadBuffer(inputReal);
-        var inImag = DownloadBuffer(inputImag);
-        var outReal = new float[batch * n];
-        var outImag = new float[batch * n];
-
-        for (int b = 0; b < batch; b++)
-        {
-            var batchInReal = new float[n];
-            var batchInImag = new float[n];
-            var batchOutReal = new float[n];
-            var batchOutImag = new float[n];
-
-            Array.Copy(inReal, b * n, batchInReal, 0, n);
-            Array.Copy(inImag, b * n, batchInImag, 0, n);
-
-            CooleyTukeyFFT(batchInReal, batchInImag, batchOutReal, batchOutImag, n, inverse);
-
-            Array.Copy(batchOutReal, 0, outReal, b * n, n);
-            Array.Copy(batchOutImag, 0, outImag, b * n, n);
-        }
-
-        UploadToBuffer(outputReal, outReal);
-        UploadToBuffer(outputImag, outImag);
+        DispatchSplitFftMetal(inputReal, inputImag, outputReal, outputImag,
+            batch, n, n, 1, inverse);
     }
 
     /// <summary>
@@ -208,65 +167,16 @@ public sealed partial class MetalBackend
         int height, int width, bool inverse)
     {
         ThrowIfDisposed();
-
-        var inReal = DownloadBuffer(inputReal);
-        var inImag = DownloadBuffer(inputImag);
-        var outReal = new float[height * width];
-        var outImag = new float[height * width];
-
-        // First pass: FFT on rows
-        for (int h = 0; h < height; h++)
-        {
-            var rowReal = new float[width];
-            var rowImag = new float[width];
-            var rowOutReal = new float[width];
-            var rowOutImag = new float[width];
-
-            for (int w = 0; w < width; w++)
-            {
-                rowReal[w] = inReal[h * width + w];
-                rowImag[w] = inImag[h * width + w];
-            }
-
-            CooleyTukeyFFT(rowReal, rowImag, rowOutReal, rowOutImag, width, inverse);
-
-            for (int w = 0; w < width; w++)
-            {
-                outReal[h * width + w] = rowOutReal[w];
-                outImag[h * width + w] = rowOutImag[w];
-            }
-        }
-
-        // Second pass: FFT on columns
-        var tempReal = new float[height * width];
-        var tempImag = new float[height * width];
-        Array.Copy(outReal, tempReal, height * width);
-        Array.Copy(outImag, tempImag, height * width);
-
-        for (int w = 0; w < width; w++)
-        {
-            var colReal = new float[height];
-            var colImag = new float[height];
-            var colOutReal = new float[height];
-            var colOutImag = new float[height];
-
-            for (int h = 0; h < height; h++)
-            {
-                colReal[h] = tempReal[h * width + w];
-                colImag[h] = tempImag[h * width + w];
-            }
-
-            CooleyTukeyFFT(colReal, colImag, colOutReal, colOutImag, height, inverse);
-
-            for (int h = 0; h < height; h++)
-            {
-                outReal[h * width + w] = colOutReal[h];
-                outImag[h * width + w] = colOutImag[h];
-            }
-        }
-
-        UploadToBuffer(outputReal, outReal);
-        UploadToBuffer(outputImag, outImag);
+        if (height <= 0 || width <= 0) return;
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            throw new ArgumentException("FFT dimensions must be powers of two.");
+        int count = checked(height * width);
+        using var rowReal = AllocateBuffer(count);
+        using var rowImaginary = AllocateBuffer(count);
+        DispatchSplitFftMetal(inputReal, inputImag, rowReal, rowImaginary,
+            height, width, width, 1, inverse);
+        DispatchSplitFftMetal(rowReal, rowImaginary, outputReal, outputImag,
+            width, height, 1, width, inverse);
     }
 
     /// <summary>
@@ -317,17 +227,7 @@ public sealed partial class MetalBackend
     public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
     {
         ThrowIfDisposed();
-
-        var inData = DownloadBuffer(input);
-        var windowData = DownloadBuffer(window);
-        var outData = new float[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            outData[i] = inData[i] * windowData[i];
-        }
-
-        UploadToBuffer(output, outData);
+        Multiply(input, window, output, n);
     }
 
     /// <summary>
@@ -336,17 +236,7 @@ public sealed partial class MetalBackend
     public void ComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer magnitude, int n)
     {
         ThrowIfDisposed();
-
-        var realData = DownloadBuffer(real);
-        var imagData = DownloadBuffer(imag);
-        var magData = new float[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            magData[i] = MathF.Sqrt(realData[i] * realData[i] + imagData[i] * imagData[i]);
-        }
-
-        UploadToBuffer(magnitude, magData);
+        SplitComplexMagnitude(real, imag, magnitude, n);
     }
 
     /// <summary>
@@ -355,17 +245,7 @@ public sealed partial class MetalBackend
     public void ComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int n)
     {
         ThrowIfDisposed();
-
-        var realData = DownloadBuffer(real);
-        var imagData = DownloadBuffer(imag);
-        var phaseData = new float[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            phaseData[i] = MathF.Atan2(imagData[i], realData[i]);
-        }
-
-        UploadToBuffer(phase, phaseData);
+        SplitComplexPhase(real, imag, phase, n);
     }
 
     /// <summary>
@@ -374,20 +254,7 @@ public sealed partial class MetalBackend
     public void PolarToComplex(IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer real, IGpuBuffer imag, int n)
     {
         ThrowIfDisposed();
-
-        var magData = DownloadBuffer(magnitude);
-        var phaseData = DownloadBuffer(phase);
-        var realData = new float[n];
-        var imagData = new float[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            realData[i] = magData[i] * MathF.Cos(phaseData[i]);
-            imagData[i] = magData[i] * MathF.Sin(phaseData[i]);
-        }
-
-        UploadToBuffer(real, realData);
-        UploadToBuffer(imag, imagData);
+        SplitComplexFromPolar(magnitude, phase, real, imag, n);
     }
 
     /// <summary>
@@ -397,25 +264,7 @@ public sealed partial class MetalBackend
         int numFrames, int numFreqs, int nMels)
     {
         ThrowIfDisposed();
-
-        var powerData = DownloadBuffer(powerSpec);
-        var filterData = DownloadBuffer(filterbank);
-        var melData = new float[numFrames * nMels];
-
-        for (int f = 0; f < numFrames; f++)
-        {
-            for (int m = 0; m < nMels; m++)
-            {
-                float sum = 0;
-                for (int k = 0; k < numFreqs; k++)
-                {
-                    sum += filterData[m * numFreqs + k] * powerData[f * numFreqs + k];
-                }
-                melData[f * nMels + m] = sum;
-            }
-        }
-
-        UploadToBuffer(melSpec, melData);
+        MelFilterbankApply(powerSpec, filterbank, melSpec, numFrames, numFreqs, nMels);
     }
 
     /// <summary>
@@ -424,17 +273,8 @@ public sealed partial class MetalBackend
     public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
     {
         ThrowIfDisposed();
-
-        var powerData = DownloadBuffer(power);
-        var dbData = new float[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            float val = 10.0f * MathF.Log10(MathF.Max(powerData[i], 1e-10f) / refValue);
-            dbData[i] = MathF.Max(val, minDb);
-        }
-
-        UploadToBuffer(db, dbData);
+        DispatchResidentMetal("power_to_db", n, new[] { power, db },
+            (uint)n, unchecked((uint)SingleToInt32BitsCompat(refValue)), unchecked((uint)SingleToInt32BitsCompat(minDb)));
     }
 
     /// <summary>
@@ -443,16 +283,8 @@ public sealed partial class MetalBackend
     public void DbToPower(IGpuBuffer db, IGpuBuffer power, int n, float refValue)
     {
         ThrowIfDisposed();
-
-        var dbData = DownloadBuffer(db);
-        var powerData = new float[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            powerData[i] = refValue * MathF.Pow(10.0f, dbData[i] / 10.0f);
-        }
-
-        UploadToBuffer(power, powerData);
+        DispatchResidentMetal("db_to_power", n, new[] { db, power },
+            (uint)n, unchecked((uint)SingleToInt32BitsCompat(refValue)));
     }
 
     #endregion
@@ -465,16 +297,18 @@ public sealed partial class MetalBackend
     public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
         ThrowIfDisposed();
+        if (size <= 0) return;
+        DispatchResidentMetal("random_uniform_resident", size, [output], (uint)size,
+            unchecked((uint)SingleToInt32BitsCompat(min)), unchecked((uint)SingleToInt32BitsCompat(max)), (uint)seed, (uint)(seed >> 32));
+    }
 
-        var rng = new Random((int)(seed & 0x7FFFFFFF));
-        var data = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            data[i] = min + (float)rng.NextDouble() * (max - min);
-        }
-
-        UploadToBuffer(output, data);
+    public void GenerateStatelessDropoutMask(
+        IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+    {
+        ThrowIfDisposed();
+        if (size <= 0) return;
+        DispatchResidentMetal("stateless_dropout_mask", size, [output], (uint)size, threshold,
+            unchecked((uint)SingleToInt32BitsCompat(scale)), seed);
     }
 
     /// <summary>
@@ -483,44 +317,16 @@ public sealed partial class MetalBackend
     public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         ThrowIfDisposed();
-
-        var rng = new Random((int)(seed & 0x7FFFFFFF));
-        var data = new float[size];
-
-        for (int i = 0; i < size; i += 2)
-        {
-            // Box-Muller transform
-            float u1 = (float)rng.NextDouble();
-            float u2 = (float)rng.NextDouble();
-
-            u1 = MathF.Max(u1, 1e-10f);
-
-            float r = MathF.Sqrt(-2.0f * MathF.Log(u1));
-            float theta = 2.0f * MathF.PI * u2;
-
-            data[i] = mean + stdDev * r * MathF.Cos(theta);
-            if (i + 1 < size)
-            {
-                data[i + 1] = mean + stdDev * r * MathF.Sin(theta);
-            }
-        }
-
-        UploadToBuffer(output, data);
+        if (size <= 0) return;
+        DispatchResidentMetal("random_normal_resident", (size + 1) / 2, [output], (uint)size,
+            unchecked((uint)SingleToInt32BitsCompat(mean)), unchecked((uint)SingleToInt32BitsCompat(stdDev)), (uint)seed, (uint)(seed >> 32));
     }
 
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         ThrowIfDisposed();
         if (size <= 0) return;
-        var data = new float[size];
-        try
-        {
-            Helpers.SimdRandom.SecureFillFloats(data.AsSpan());
-            float range = max - min;
-            for (int i = 0; i < size; i++) data[i] = data[i] * range + min;
-            UploadToBuffer(output, data);
-        }
-        finally { Array.Clear(data, 0, size); }
+        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
     }
 
     #endregion
@@ -534,27 +340,9 @@ public sealed partial class MetalBackend
         int batchSize, int numCenters, int inputDim)
     {
         ThrowIfDisposed();
-
-        var inputData = DownloadBuffer(input);
-        var centersData = DownloadBuffer(centers);
-        var epsilonsData = DownloadBuffer(epsilons);
-        var outputData = new float[batchSize * numCenters];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int c = 0; c < numCenters; c++)
-            {
-                float distSq = 0;
-                for (int d = 0; d < inputDim; d++)
-                {
-                    float diff = inputData[b * inputDim + d] - centersData[c * inputDim + d];
-                    distSq += diff * diff;
-                }
-                outputData[b * numCenters + c] = MathF.Exp(-epsilonsData[c] * distSq);
-            }
-        }
-
-        UploadToBuffer(output, outputData);
+        int count = checked(batchSize * numCenters);
+        DispatchResidentMetal("rbf_forward", count, new[] { input, centers, epsilons, output },
+            (uint)batchSize, (uint)numCenters, (uint)inputDim);
     }
 
     /// <summary>
@@ -566,40 +354,11 @@ public sealed partial class MetalBackend
         float minWeight, float maxWeight, int numPre, int numPost)
     {
         ThrowIfDisposed();
-
-        var weightsData = DownloadBuffer(weights);
-        var preTraceData = DownloadBuffer(preTrace);
-        var postTraceData = DownloadBuffer(postTrace);
-        var preSpikeData = DownloadBuffer(preSpike);
-        var postSpikeData = DownloadBuffer(postSpike);
-
-        for (int i = 0; i < numPre; i++)
-        {
-            for (int j = 0; j < numPost; j++)
-            {
-                int idx = i * numPost + j;
-
-                // LTP: pre spike when post has trace
-                if (preSpikeData[i] > 0)
-                {
-                    weightsData[idx] += ltpRate * postTraceData[j];
-                }
-
-                // LTD: post spike when pre has trace
-                if (postSpikeData[j] > 0)
-                {
-                    weightsData[idx] -= ltdRate * preTraceData[i];
-                }
-
-                // Homeostasis
-                weightsData[idx] -= homeostasisRate * weightsData[idx];
-
-                // Clamp weights
-                weightsData[idx] = MathF.Max(minWeight, MathF.Min(maxWeight, weightsData[idx]));
-            }
-        }
-
-        UploadToBuffer(weights, weightsData);
+        int count = checked(numPre * numPost);
+        DispatchResidentMetal("stdp_update", count,
+            new[] { weights, preTrace, postTrace, preSpike, postSpike },
+            (uint)numPre, (uint)numPost, unchecked((uint)SingleToInt32BitsCompat(ltpRate)), unchecked((uint)SingleToInt32BitsCompat(ltdRate)),
+            unchecked((uint)SingleToInt32BitsCompat(homeostasisRate)), unchecked((uint)SingleToInt32BitsCompat(minWeight)), unchecked((uint)SingleToInt32BitsCompat(maxWeight)));
     }
 
     /// <summary>
@@ -609,33 +368,8 @@ public sealed partial class MetalBackend
         float decay, float threshold, int size)
     {
         ThrowIfDisposed();
-
-        var tracesData = DownloadBuffer(traces);
-        var inputData = DownloadBuffer(input);
-        var spikesData = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            // Decay trace
-            tracesData[i] *= decay;
-
-            // Add input
-            tracesData[i] += inputData[i];
-
-            // Check for spike
-            if (tracesData[i] >= threshold)
-            {
-                spikesData[i] = 1.0f;
-                tracesData[i] -= threshold;
-            }
-            else
-            {
-                spikesData[i] = 0.0f;
-            }
-        }
-
-        UploadToBuffer(traces, tracesData);
-        UploadToBuffer(spikes, spikesData);
+        DispatchResidentMetal("update_traces", size, new[] { traces, spikes, input },
+            (uint)size, unchecked((uint)SingleToInt32BitsCompat(decay)), unchecked((uint)SingleToInt32BitsCompat(threshold)));
     }
 
     #endregion

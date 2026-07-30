@@ -7,6 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string[] GetKernelNames() => new[]
         {
+            "interleave_complex", "deinterleave_complex",
             "split_complex_multiply", "split_complex_conjugate",
             "split_complex_magnitude", "split_complex_magnitude_squared",
             "split_complex_phase", "split_complex_from_polar",
@@ -33,6 +34,29 @@ extern ""C"" __global__ __launch_bounds__(256) void split_complex_multiply(
     float br = bReal[idx], bi = bImag[idx];
     outReal[idx] = ar * br - ai * bi;
     outImag[idx] = ar * bi + ai * br;
+}
+
+// Pack split real/imag into one [re0, im0, re1, im1, ...] buffer. Replaces the dispatch layer's
+// two-Copy-calls-per-frequency-bin bridge, which cost ~1.06M device copies for a single batched RFFT.
+extern ""C"" __global__ __launch_bounds__(256) void interleave_complex(
+    const float* real, const float* imag,
+    float* interleaved, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    interleaved[2 * idx] = real[idx];
+    interleaved[2 * idx + 1] = imag[idx];
+}
+
+// Inverse of interleave_complex: used by IRFFT, whose spectrum arrives interleaved.
+extern ""C"" __global__ __launch_bounds__(256) void deinterleave_complex(
+    const float* interleaved,
+    float* real, float* imag, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    real[idx] = interleaved[2 * idx];
+    imag[idx] = interleaved[2 * idx + 1];
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void split_complex_conjugate(
@@ -119,26 +143,31 @@ extern ""C"" __global__ __launch_bounds__(256) void split_complex_cross_spectral
     outImag[idx] = xi * yr - xr * yi;
 }
 
-// Top-K by magnitude: zero elements not in top-K.
-// Step 1: compute magnitude squared into scratch buffer (caller does this).
-// Step 2: this kernel zeros elements below the K-th largest magnitude.
-// Caller provides the threshold magnitude squared value.
+// Exact top-K by magnitude. Equal magnitudes are ordered by lower input index;
+// NaN magnitudes sort after all numeric magnitudes.
 extern ""C"" __global__ __launch_bounds__(256) void split_complex_topk(
     const float* inReal, const float* inImag,
     float* outReal, float* outImag,
-    float thresholdMagSq, int n)
+    int k, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float re = inReal[idx], im = inImag[idx];
     float magSq = re * re + im * im;
-    if (magSq >= thresholdMagSq) {
-        outReal[idx] = re;
-        outImag[idx] = im;
-    } else {
-        outReal[idx] = 0.0f;
-        outImag[idx] = 0.0f;
+    bool magIsNan = (__float_as_uint(magSq) & 0x7fffffffu) > 0x7f800000u;
+    int rank = 0;
+    for (int other = 0; other < n; ++other) {
+        float otherRe = inReal[other], otherIm = inImag[other];
+        float otherMagSq = otherRe * otherRe + otherIm * otherIm;
+        bool otherIsNan = (__float_as_uint(otherMagSq) & 0x7fffffffu) > 0x7f800000u;
+        bool otherBefore = magIsNan
+            ? (!otherIsNan || (otherIsNan && other < idx))
+            : (!otherIsNan && (otherMagSq > magSq || (otherMagSq == magSq && other < idx)));
+        rank += otherBefore ? 1 : 0;
     }
+    bool keep = rank < k;
+    outReal[idx] = keep ? re : 0.0f;
+    outImag[idx] = keep ? im : 0.0f;
 }
 
 // Per-row softmax: each block handles one row.
@@ -160,9 +189,15 @@ extern ""C"" __global__ void softmax_rows(
         maxVal = fmaxf(maxVal, rowIn[c]);
     sdata[tid] = maxVal;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+    // Non-power-of-2-safe reduction: blockDim.x = min(256, cols), so cols=3/6 give a
+    // non-pow2 block. A plain s=blockDim.x/2; s>>=1 tree drops the top odd element
+    // (e.g. blockDim=6 never folds sdata[2]), corrupting the max/sum -> unnormalized
+    // softmax. Halve the ACTIVE count with ceil and bound-check tid+half.
+    for (int n = blockDim.x; n > 1; ) {
+        int half = (n + 1) >> 1;
+        if (tid < half && tid + half < n) sdata[tid] = fmaxf(sdata[tid], sdata[tid + half]);
         __syncthreads();
+        n = half;
     }
     maxVal = sdata[0];
 
@@ -175,9 +210,12 @@ extern ""C"" __global__ void softmax_rows(
     }
     sdata[tid] = sumExp;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    // Same non-power-of-2-safe reduction as the max pass above.
+    for (int n = blockDim.x; n > 1; ) {
+        int half = (n + 1) >> 1;
+        if (tid < half && tid + half < n) sdata[tid] += sdata[tid + half];
         __syncthreads();
+        n = half;
     }
     sumExp = sdata[0];
 
@@ -196,13 +234,9 @@ extern ""C"" __global__ void softmax_rows(
 // OpenCL, Metal, Vulkan, WebGPU); same seed + same (V, D) ⇒ identical
 // codebook on any GPU. The 32-bit Murmur3 variant is used (rather
 // than the 64-bit splitmix64 this kernel previously used) because
-// WebGPU's WGSL lacks native u64 support; keeping all GPU kernels
-// bit-identical is higher value than the small entropy gain of 64-bit.
-//
-// Does NOT bit-match the CPU xorshift64* sequence — the CPU path is
-// intentionally sequential (fastest on a single thread), while the
-// GPU path must be parallel per-cell. Cross-device bit-identity is
-// not part of the contract; per-backend determinism is.
+// WebGPU's WGSL lacks native u64 support. The CPU reference uses this
+// same hash and top-24-bit phase construction so the random sequence is
+// independent of backend and execution scheduling.
 __device__ __forceinline__ unsigned int hrr_hash(unsigned int seed_u, unsigned int cell_u)
 {
     // Murmur3 fmix variant — good-quality uniform 32-bit output.
@@ -213,14 +247,55 @@ __device__ __forceinline__ unsigned int hrr_hash(unsigned int seed_u, unsigned i
     return z;
 }
 
-__device__ __forceinline__ float hrr_phase_from_cell(int seed, long long cellIdx)
+__device__ __forceinline__ unsigned int hrr_mul_hi(unsigned int a, unsigned int b)
 {
-    unsigned int z = hrr_hash((unsigned int)seed, (unsigned int)cellIdx);
-    // Upper 24 bits → float in [0, 1). 24 bits is exact-representable
-    // in float32 so the distribution has no rounding artefacts at the
-    // top of the range.
-    unsigned int top24 = z >> 8;
-    return (float)top24 * (1.0f / 16777216.0f) * 6.28318530717958647692f;
+    unsigned int a0 = a & 0xFFFFu, a1 = a >> 16;
+    unsigned int b0 = b & 0xFFFFu, b1 = b >> 16;
+    unsigned int p0 = a0 * b0, p1 = a1 * b0, p2 = a0 * b1;
+    unsigned int carry = (p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);
+    return a1 * b1 + (p1 >> 16) + (p2 >> 16) + (carry >> 16);
+}
+
+__device__ __forceinline__ unsigned int hrr_quantize_turn(unsigned int turn, unsigned int k)
+{
+    unsigned int lattice = hrr_mul_hi(turn, k);
+    if (turn * k >= 0x80000000u) lattice++;
+    if (lattice == k) lattice = 0;
+    unsigned int quotient = 0, remainder = lattice;
+    for (int i = 0; i < 32; i++) {
+        remainder <<= 1;
+        quotient <<= 1;
+        if (remainder >= k) { remainder -= k; quotient |= 1u; }
+    }
+    return quotient;
+}
+
+__device__ __constant__ int hrr_cordic_angles[30] = {
+    536870912, 316933406, 167458907, 85004756, 42667331,
+    21354465, 10679838, 5340245, 2670163, 1335087,
+    667544, 333772, 166886, 83443, 41722,
+    20861, 10430, 5215, 2608, 1304,
+    652, 326, 163, 81, 41, 20, 10, 5, 3, 1
+};
+
+__device__ __forceinline__ void hrr_sincos(unsigned int turn, float* outCos, float* outSin)
+{
+    unsigned int quadrant = turn >> 30;
+    unsigned int offset = turn & 0x3FFFFFFFu;
+    int z = (int)((quadrant == 1u || quadrant == 3u) ? 0x40000000u - offset : offset);
+    int x = 652032874, y = 0;
+    for (int i = 0; i < 30; i++) {
+        int oldX = x;
+        if (z >= 0) {
+            x -= y >> i; y += oldX >> i; z -= hrr_cordic_angles[i];
+        } else {
+            x += y >> i; y -= oldX >> i; z += hrr_cordic_angles[i];
+        }
+    }
+    if (quadrant == 1u || quadrant == 2u) x = -x;
+    if (quadrant >= 2u) y = -y;
+    *outCos = (float)x * (1.0f / 1073741824.0f);
+    *outSin = (float)y * (1.0f / 1073741824.0f);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void hrr_unit_phase_codebook(
@@ -231,14 +306,10 @@ extern ""C"" __global__ __launch_bounds__(256) void hrr_unit_phase_codebook(
     long long total = (long long)V * D;
     if (idx >= total) return;
 
-    float phase = hrr_phase_from_cell(seed, idx);
-    if (kPsk) {
-        // Snap to nearest multiple of 2π/k.
-        float step = 6.28318530717958647692f / (float)k;
-        phase = floorf(phase / step + 0.5f) * step;
-    }
+    unsigned int turn = hrr_hash((unsigned int)seed, (unsigned int)idx) & 0xFFFFFF00u;
+    if (kPsk) turn = hrr_quantize_turn(turn, (unsigned int)k);
     float c, s;
-    sincosf(phase, &s, &c);
+    hrr_sincos(turn, &c, &s);
     outReal[idx] = c;
     outImag[idx] = s;
 }

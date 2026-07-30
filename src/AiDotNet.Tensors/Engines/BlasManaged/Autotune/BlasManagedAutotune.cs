@@ -162,9 +162,15 @@ internal static class BlasManagedAutotune
     /// </summary>
     public static (ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)? TryLookup(ShapeProfile shape)
     {
+        if (_blockMemo.TryGetValue(shape, out var memo))
+            return memo;
+
         KernelChoice? choice = AutotuneCache.Lookup(GemmKernelId, shape);
-        if (choice is null) return null;
-        return DecodeChoice(choice);
+        (ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)? result =
+            choice is null ? null : DecodeChoice(choice);
+        if (_blockMemo.Count >= StrategyMemoCap) _blockMemo.Clear(); // bound memory (same cap as strategy memo)
+        _blockMemo[shape] = result;  // memoize hit or miss (null)
+        return result;
     }
 
     /// <summary>
@@ -174,6 +180,9 @@ internal static class BlasManagedAutotune
     {
         var choice = EncodeChoice(axis, mc, nc, kc, threadCount, measuredTimeMs);
         AutotuneCache.Store(GemmKernelId, shape, choice);
+        // Refresh the in-memory memo so the freshly-stored block choice is served immediately
+        // on the next TryLookup/Decide without touching disk.
+        _blockMemo[shape] = (axis, mc, nc, kc, threadCount);
     }
 
     /// <summary>
@@ -193,6 +202,13 @@ internal static class BlasManagedAutotune
     // strategy is picked up immediately on the next call.
     private static readonly ConcurrentDictionary<ShapeProfile, StrategyChoice?> _strategyMemo = new();
 
+    // Same #375-G13 rationale as _strategyMemo, but for the block-size TryLookup that Decide()
+    // calls on every GEMM: it went straight to AutotuneCache.Lookup (a filesystem stat per call
+    // even after the read+parse was memoized), which measured ~14% of a compiled Transformer's
+    // replay hot path. Memoize the decoded block-size decision per shape (a null value is a
+    // remembered miss); Store refreshes it so a freshly-tuned block choice is served immediately.
+    private static readonly ConcurrentDictionary<ShapeProfile, (ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)?> _blockMemo = new();
+
     /// <summary>
     /// Cap on the in-memory strategy memo (#375 G4 consistency). Real workloads have a
     /// bounded set of distinct GEMM shapes (dozens–hundreds); this only trips on an
@@ -207,7 +223,11 @@ internal static class BlasManagedAutotune
     /// untouched. Used by <c>BlasManaged.ClearCaches</c> and by diagnostics that need to
     /// observe genuine cold-miss behavior rather than warm-memo hits.
     /// </summary>
-    public static void ClearStrategyMemo() => _strategyMemo.Clear();
+    public static void ClearStrategyMemo()
+    {
+        _strategyMemo.Clear();
+        _blockMemo.Clear();
+    }
 
     public static void StoreStrategy(ShapeProfile shape, PackingMode mode, ParallelismAxis axis,
         int mc, int nc, int kc, int threadCount, string kernelVersion)

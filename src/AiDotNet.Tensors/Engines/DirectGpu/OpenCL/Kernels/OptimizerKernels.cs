@@ -24,6 +24,21 @@ internal static class OptimizerKernels
 // gradient-based optimization algorithms. Each kernel operates on individual
 // parameter elements in parallel.
 
+static inline float bf16_to_float(ushort x)
+{
+    return as_float(((uint)x) << 16);
+}
+
+static inline ushort float_to_bf16_rne(float x)
+{
+    uint bits = as_uint(x);
+    if ((bits & 0x7FFFFFFFU) > 0x7F800000U) {
+        return (ushort)((bits >> 16) | 0x0040U);
+    }
+    uint rounding = 0x7FFFU + ((bits >> 16) & 1U);
+    return (ushort)((bits + rounding) >> 16);
+}
+
 // ---------------------------------------------------------------------------
 // SGD with momentum update
 // Formula: v = momentum * v + grad
@@ -52,6 +67,28 @@ __kernel void sgd_momentum_update(
 }
 
 // ---------------------------------------------------------------------------
+// Vanilla SGD update
+// Formula: param = param - lr * grad
+// ---------------------------------------------------------------------------
+__kernel void sgd_update(
+    __global float* param,
+    __global const float* gradient,
+    const float learningRate,
+    const float weightDecay,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+
+    float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
+
+    param[idx] -= learningRate * grad;
+}
+
+// ---------------------------------------------------------------------------
 // Adam optimizer update
 // Formula: m = beta1 * m + (1 - beta1) * grad
 //          v = beta2 * v + (1 - beta2) * grad^2
@@ -76,6 +113,9 @@ __kernel void adam_update(
     if (idx >= size) return;
 
     float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
 
     // Update biased first moment estimate
     float m_new = beta1 * m[idx] + (1.0f - beta1) * grad;
@@ -92,11 +132,7 @@ __kernel void adam_update(
     float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
 
     // Update parameters
-    float update = learningRate * m_hat / (sqrt(v_hat) + epsilon);
-    if (weightDecay > 0.0f) {
-        update += learningRate * weightDecay * param[idx];
-    }
-    param[idx] -= update;
+    param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +177,174 @@ __kernel void adamw_update(
 
     // Update parameters
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
+// Adam optimizer update with bfloat16 moment storage
+// ---------------------------------------------------------------------------
+__kernel void adam_bf16_update(
+    __global float* param,
+    __global const float* gradient,
+    __global ushort* m,
+    __global ushort* v,
+    const float learningRate,
+    const float beta1,
+    const float beta2,
+    const float epsilon,
+    const float weightDecay,
+    const int step,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+
+    float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
+    float oldM = step <= 1 ? 0.0f : bf16_to_float(m[idx]);
+    float oldV = step <= 1 ? 0.0f : bf16_to_float(v[idx]);
+    float m_new = beta1 * oldM + (1.0f - beta1) * grad;
+    float v_new = beta2 * oldV + (1.0f - beta2) * grad * grad;
+    m[idx] = float_to_bf16_rne(m_new);
+    v[idx] = float_to_bf16_rne(v_new);
+
+    int safe_step = step < 1 ? 1 : step;
+    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
+    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
+
+    param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
+// AdamW optimizer update with bfloat16 moment storage
+// ---------------------------------------------------------------------------
+__kernel void adamw_bf16_update(
+    __global float* param,
+    __global const float* gradient,
+    __global ushort* m,
+    __global ushort* v,
+    const float learningRate,
+    const float beta1,
+    const float beta2,
+    const float epsilon,
+    const float weightDecay,
+    const int step,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+
+    float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        param[idx] *= (1.0f - learningRate * weightDecay);
+    }
+
+    float oldM = step <= 1 ? 0.0f : bf16_to_float(m[idx]);
+    float oldV = step <= 1 ? 0.0f : bf16_to_float(v[idx]);
+    float m_new = beta1 * oldM + (1.0f - beta1) * grad;
+    float v_new = beta2 * oldV + (1.0f - beta2) * grad * grad;
+    m[idx] = float_to_bf16_rne(m_new);
+    v[idx] = float_to_bf16_rne(v_new);
+
+    int safe_step = step < 1 ? 1 : step;
+    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
+    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
+
+    param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
+// 8-bit Adam blockwise dynamic quantization. One OpenCL workgroup per quant block.
+// ---------------------------------------------------------------------------
+__kernel void adam8bit_update(
+    __global float* param,
+    __global const float* gradient,
+    __global uchar* mQ,
+    __global uchar* vQ,
+    __global float* mScales,
+    __global float* vScales,
+    const float learningRate,
+    const float beta1,
+    const float beta2,
+    const float epsilon,
+    const float oneMinusBeta1,
+    const float oneMinusBeta2,
+    const float biasCorrection1,
+    const float biasCorrection2,
+    const int blockSize,
+    const int paramLength,
+    const int numBlocks)
+{
+    const int blk = get_group_id(0);
+    const int tid = get_local_id(0);
+    if (blk >= numBlocks) return;
+
+    int start = blk * blockSize;
+    int endIdx = start + blockSize;
+    if (endIdx > paramLength) endIdx = paramLength;
+    int firstStep = (biasCorrection1 <= oneMinusBeta1 + 1e-7f) && (biasCorrection2 <= oneMinusBeta2 + 1e-7f); /* both corrections must indicate step 1 — bc1 alone is always-true when beta1==0, wrongly discarding v history every step */
+    float mScale = firstStep ? 0.0f : mScales[blk];
+    float vScale = firstStep ? 0.0f : vScales[blk];
+
+    __local float sMaxM[256];
+    __local float sMaxV[256];
+
+    float locM = 0.0f;
+    float locV = 0.0f;
+    for (int i = start + tid; i < endIdx; i += 256) {
+        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
+        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float g = gradient[i];
+        float newM = beta1 * m_i + oneMinusBeta1 * g;
+        float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
+        locM = fmax(locM, fabs(newM));
+        locV = fmax(locV, fabs(newV));
+    }
+
+    sMaxM[tid] = locM;
+    sMaxV[tid] = locV;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            sMaxM[tid] = fmax(sMaxM[tid], sMaxM[tid + s]);
+            sMaxV[tid] = fmax(sMaxV[tid], sMaxV[tid + s]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    float newMScale = sMaxM[0] / 127.0f;
+    if (newMScale < 1e-10f) newMScale = 1e-10f;
+    float newVScale = sMaxV[0] / 255.0f;
+    if (newVScale < 1e-10f) newVScale = 1e-10f;
+    if (tid == 0) {
+        mScales[blk] = newMScale;
+        vScales[blk] = newVScale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int i = start + tid; i < endIdx; i += 256) {
+        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
+        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float g = gradient[i];
+        float newM = beta1 * m_i + oneMinusBeta1 * g;
+        float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
+
+        float mHat = newM / biasCorrection1;
+        float vHat = newV / biasCorrection2;
+        param[i] = param[i] - learningRate * mHat / (sqrt(vHat) + epsilon);
+
+        int qm = (int)rint(newM / newMScale);
+        if (qm < -127) qm = -127;
+        if (qm > 127) qm = 127;
+        mQ[i] = (uchar)(qm + 128);
+
+        int qv = (int)rint(newV / newVScale);
+        if (qv < 0) qv = 0;
+        if (qv > 255) qv = 255;
+        vQ[i] = (uchar)qv;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,13 +604,14 @@ __kernel void amsgrad_update(
     float vMaxVal = fmax(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
-    // Bias correction for m only (AMSGrad uses raw v_max)
+    // Bias correction.
     // Guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
     float mHat = mVal / (1.0f - pow(beta1, (float)safe_step));
+    float vMaxHat = vMaxVal / (1.0f - pow(beta2, (float)safe_step));
 
     // Update parameters using v_max instead of v
-    param[idx] -= learningRate * mHat / (sqrt(vMaxVal) + epsilon);
+    param[idx] -= learningRate * mHat / (sqrt(vMaxHat) + epsilon);
 }
 
 // ---------------------------------------------------------------------------
@@ -527,12 +732,13 @@ __kernel void nadam_update(
     // Bias corrections - guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
     float beta1Pow = pow(beta1, (float)safe_step);
+    float beta1PowNext = pow(beta1, (float)(safe_step + 1));
     float beta2Pow = pow(beta2, (float)safe_step);
     float mHat = mVal / (1.0f - beta1Pow);
     float vHat = vVal / (1.0f - beta2Pow);
 
     // Nesterov lookahead: use next step's momentum estimate
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1PowNext);
 
     // Update parameters
     param[idx] -= learningRate * mNesterov / (sqrt(vHat) + epsilon);
@@ -585,25 +791,288 @@ __kernel void ftrl_update(
 }
 
 // ---------------------------------------------------------------------------
-// Vanilla SGD update (no momentum)
-// Formula: param = param - lr * grad
+// Proximal gradient (ISTA) update with L1 soft-thresholding
+// Formula: tmp = param - lr * grad
+//          param = sign(tmp) * max(abs(tmp) - lr * l1Strength, 0)
 // ---------------------------------------------------------------------------
-__kernel void sgd_update(
+__kernel void proximal_l1_update(
     __global float* param,
     __global const float* gradient,
     const float learningRate,
-    const float weightDecay,
+    const float l1Strength,
     const int size)
 {
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
+    float tmp = param[idx] - learningRate * gradient[idx];
+    float mag = fabs(tmp) - (learningRate * l1Strength);
+    if (mag <= 0.0f) {
+        param[idx] = 0.0f;
+    } else {
+        float signTmp = (tmp > 0.0f) ? 1.0f : -1.0f;
+        param[idx] = signTmp * mag;
     }
+}
 
-    param[idx] -= learningRate * grad;
+inline int decode_sparse_index(float raw, int param_size)
+{
+    int bitcast = as_int(raw);
+    if (bitcast >= 0 && bitcast < param_size) return bitcast;
+    // Validate in the FLOAT domain before the (int) cast — (int)raw is undefined for NaN/Inf or
+    // out-of-int-range values on the device. Only convert once raw is finite, non-negative, in range
+    // and integral.
+    if (isfinite(raw) && raw >= 0.0f && raw < (float)param_size && raw == trunc(raw)) return (int)raw;
+    return -1;
+}
+
+__kernel void sparse_sgd_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    const float learningRate, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    param[i] -= learningRate * grad;
+}
+
+__kernel void sparse_sgd_momentum_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* velocity,
+    const float learningRate, const float momentum, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float v = momentum * velocity[i] + grad;
+    velocity[i] = v;
+    param[i] -= learningRate * v;
+}
+
+__kernel void sparse_adam_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - pow(beta1, (float)step));
+    float vHat = vVal / (1.0f - pow(beta2, (float)step));
+    param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_adamw_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float p = param[i];
+    if (weightDecay > 0.0f) p -= learningRate * weightDecay * p;
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - pow(beta1, (float)step));
+    float vHat = vVal / (1.0f - pow(beta2, (float)step));
+    param[i] = p - learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_rmsprop_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* squaredAvg,
+    const float learningRate, const float rho, const float epsilon, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float sq = rho * squaredAvg[i] + (1.0f - rho) * grad * grad;
+    squaredAvg[i] = sq;
+    param[i] -= learningRate * grad / (sqrt(sq) + epsilon);
+}
+
+__kernel void sparse_adagrad_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* accum,
+    const float learningRate, const float epsilon, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float a = accum[i] + grad * grad;
+    accum[i] = a;
+    param[i] -= learningRate * grad / (sqrt(a) + epsilon);
+}
+
+__kernel void sparse_nag_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* velocity,
+    const float learningRate, const float momentum, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float vOld = velocity[i];
+    float vNew = momentum * vOld + grad;
+    velocity[i] = vNew;
+    param[i] -= learningRate * ((1.0f + momentum) * vNew - momentum * vOld);
+}
+
+__kernel void sparse_adadelta_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* accumGrad, __global float* accumUpdate,
+    const float rho, const float epsilon, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float oneMinusRho = 1.0f - rho;
+    float ag = rho * accumGrad[i] + oneMinusRho * grad * grad;
+    accumGrad[i] = ag;
+    float dx = sqrt(accumUpdate[i] + epsilon) / sqrt(ag + epsilon) * grad;
+    accumUpdate[i] = rho * accumUpdate[i] + oneMinusRho * dx * dx;
+    param[i] -= dx;
+}
+
+__kernel void sparse_amsgrad_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v, __global float* vMax,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float vMaxNew = fmax(vMax[i], vVal);
+    vMax[i] = vMaxNew;
+    float mHat = mVal / (1.0f - pow(beta1, (float)step));
+    float vHat = vMaxNew / (1.0f - pow(beta2, (float)step));
+    param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_adamax_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* u,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float uVal = fmax(beta2 * u[i], fabs(grad));
+    m[i] = mVal;
+    u[i] = uVal;
+    float lrAdj = learningRate / (1.0f - pow(beta1, (float)step));
+    param[i] -= lrAdj * mVal / (uVal + epsilon);
+}
+
+__kernel void sparse_lion_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m,
+    const float learningRate, const float beta1, const float beta2, const float weightDecay, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float c = beta1 * m[i] + (1.0f - beta1) * grad;
+    float update = (c > 0.0f) ? 1.0f : ((c < 0.0f) ? -1.0f : 0.0f);
+    if (weightDecay > 0.0f) update += weightDecay * param[i];
+    param[i] -= learningRate * update;
+    m[i] = beta2 * m[i] + (1.0f - beta2) * grad;
+}
+
+__kernel void sparse_nadam_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon,
+    const float weightDecay, const int step, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float bc1 = 1.0f - pow(beta1, (float)step);
+    float bc1Next = 1.0f - pow(beta1, (float)(step + 1));
+    float bc2 = 1.0f - pow(beta2, (float)step);
+    float mHat = beta1 * (mVal / bc1) + (1.0f - beta1) * grad / bc1Next;
+    float vHat = vVal / bc2;
+    param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
+}
+
+__kernel void sparse_ftrl_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    __global float* z, __global float* n,
+    const float learningRate, const float l1Reg, const float l2Reg, const float beta, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float grad = values[k];
+    float nOld = n[i];
+    float nNew = nOld + grad * grad;
+    n[i] = nNew;
+    float sigma = (sqrt(nNew) - sqrt(nOld)) / learningRate;
+    z[i] += grad - sigma * param[i];
+    float zVal = z[i];
+    if (fabs(zVal) <= l1Reg) {
+        param[i] = 0.0f;
+    } else {
+        float sign = (zVal > 0.0f) ? 1.0f : -1.0f;
+        param[i] = (sign * l1Reg - zVal) / ((beta + sqrt(nNew)) / learningRate + l2Reg);
+    }
+}
+
+__kernel void sparse_proximal_l1_update(
+    __global float* param, __global const float* indices, __global const float* values,
+    const float learningRate, const float l1Strength, const int nnz, const int param_size)
+{
+    const int k = get_global_id(0);
+    if (k >= nnz) return;
+    int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
+    float p = param[i] - learningRate * values[k];
+    float threshold = learningRate * l1Strength;
+    if (p > threshold)       param[i] = p - threshold;
+    else if (p < -threshold) param[i] = p + threshold;
+    else                     param[i] = 0.0f;
 }
 ";
     }
@@ -619,6 +1088,9 @@ __kernel void sgd_update(
             "sgd_update",
             "adam_update",
             "adamw_update",
+            "adam_bf16_update",
+            "adamw_bf16_update",
+            "adam8bit_update",
             "rmsprop_update",
             "adagrad_update",
             "nag_update",
@@ -629,7 +1101,22 @@ __kernel void sgd_update(
             "adamax_update",
             "lion_update",
             "nadam_update",
-            "ftrl_update"
+            "ftrl_update",
+            "proximal_l1_update",
+            "sparse_sgd_update",
+            "sparse_sgd_momentum_update",
+            "sparse_adam_update",
+            "sparse_adamw_update",
+            "sparse_rmsprop_update",
+            "sparse_adagrad_update",
+            "sparse_nag_update",
+            "sparse_adadelta_update",
+            "sparse_amsgrad_update",
+            "sparse_adamax_update",
+            "sparse_lion_update",
+            "sparse_nadam_update",
+            "sparse_ftrl_update",
+            "sparse_proximal_l1_update"
         };
     }
 }

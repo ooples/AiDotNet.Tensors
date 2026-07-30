@@ -59,37 +59,75 @@ public class PersistentExecutorGrainSizeTests
         int callerId = Thread.CurrentThread.ManagedThreadId;
         int numChunks = Math.Max(2, Environment.ProcessorCount);
         long totalWork = (long)PersistentParallelExecutor.DefaultSerialGrainSize * 4;
-        var observed = new int[numChunks];
 
-        // Synchronization-based probe — deterministically detects at
-        // least one worker-thread execution without depending on a spin
-        // loop being long enough for the scheduler. Caller-thread
-        // chunks Wait briefly for any worker to signal; worker-thread
-        // chunks Set the event. Because the dispatcher's main thread
-        // runs chunks 0, _numWorkers+1, … round-robin AFTER workers
-        // are signaled, the caller-thread Wait gives the woken workers
-        // an actual scheduling window. If no worker ever runs (the
-        // bug we're trying to detect), the Wait times out and the
-        // assertion fails with a clean diagnostic.
-        using var workerSeen = new ManualResetEventSlim(false);
-        PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, c =>
-        {
-            int tid = Thread.CurrentThread.ManagedThreadId;
-            observed[c] = tid;
-            if (tid != callerId)
-                workerSeen.Set();
-            else
-                workerSeen.Wait(TimeSpan.FromMilliseconds(200));
-        });
+        bool sawWorker = TryObserveWorkerDispatch(
+            action => PersistentParallelExecutor.Instance.Execute(numChunks, totalWork, action),
+            numChunks, callerId);
 
-        bool sawOtherThread = false;
-        for (int c = 0; c < numChunks; c++)
-            if (observed[c] != callerId) { sawOtherThread = true; break; }
-        Assert.True(sawOtherThread && workerSeen.IsSet,
-            $"All {numChunks} chunks ran on caller thread {callerId} despite "
+        Assert.True(sawWorker,
+            $"No chunk ran on a worker thread across {WorkerDispatchAttempts} attempts despite "
             + $"totalWork ({totalWork}) >> DefaultSerialGrainSize "
-            + $"({PersistentParallelExecutor.DefaultSerialGrainSize}). The worker pool "
-            + $"should have been engaged. workerSeen.IsSet={workerSeen.IsSet}.");
+            + $"({PersistentParallelExecutor.DefaultSerialGrainSize}) and a pinned parallel config. "
+            + "The worker pool should have been engaged.");
+    }
+
+    private const int WorkerDispatchAttempts = 8;
+
+    /// <summary>
+    /// Runs <paramref name="dispatch"/> (a parallel <c>Execute</c> variant) under a PINNED parallel
+    /// config — cooperative pool on, <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> &gt; 1 —
+    /// and returns whether any chunk was observed running on a non-caller (worker) thread.
+    ///
+    /// <para>Retry rationale: <see cref="CpuParallelSettings"/> is a process-global mutable static, and
+    /// sibling test classes (BLAS/GEMM determinism, single-core-profile and concurrency tests) pin
+    /// <c>MaxDegreeOfParallelism = 1</c> inside a try/finally. xUnit runs test collections in parallel,
+    /// so one of those can be mid-critical-section when this test dispatches, leaving MaxDoP == 1 — at
+    /// which point the executor CORRECTLY runs every chunk on the caller (workersNeeded == 0, stride == 1)
+    /// and a single-shot worker-participation assertion spuriously fails (the #813 coverage-run flake,
+    /// observed as "all N chunks ran on the caller thread"). Re-pinning MaxDoP &gt; 1 each attempt makes a
+    /// transient concurrent clobber recoverable, while a genuine "workers never engage" regression still
+    /// fails every attempt. The config is saved and restored so this test doesn't itself pollute others.</para>
+    /// </summary>
+    private static bool TryObserveWorkerDispatch(Action<Action<int>> dispatch, int numChunks, int callerId)
+    {
+        int savedMaxDop = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool savedCoop = CpuParallelSettings.UseCooperativePool;
+        try
+        {
+            CpuParallelSettings.UseCooperativePool = true;
+            for (int attempt = 0; attempt < WorkerDispatchAttempts; attempt++)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount);
+
+                var observed = new int[numChunks];
+                // Synchronization-based probe: worker-thread chunks Set the event; caller-thread
+                // chunks Wait briefly so woken workers get an actual scheduling window. The final
+                // check runs after Execute returns (i.e. after the dispatcher has joined all
+                // participants), so a worker that ran any chunk has already Set the event.
+                using var workerSeen = new ManualResetEventSlim(false);
+                dispatch(c =>
+                {
+                    int tid = Thread.CurrentThread.ManagedThreadId;
+                    observed[c] = tid;
+                    if (tid != callerId)
+                        workerSeen.Set();
+                    else
+                        workerSeen.Wait(TimeSpan.FromMilliseconds(200));
+                });
+
+                bool sawOtherThread = false;
+                for (int c = 0; c < numChunks; c++)
+                    if (observed[c] != callerId) { sawOtherThread = true; break; }
+                if (sawOtherThread && workerSeen.IsSet)
+                    return true;
+            }
+            return false;
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = savedMaxDop;
+            CpuParallelSettings.UseCooperativePool = savedCoop;
+        }
     }
 
     /// <summary>
@@ -106,28 +144,17 @@ public class PersistentExecutorGrainSizeTests
 
         int callerId = Thread.CurrentThread.ManagedThreadId;
         int numChunks = Math.Max(2, Environment.ProcessorCount);
-        var observed = new int[numChunks];
 
-        // Same synchronization-based probe as the AboveGrainSize test
-        // — deterministic worker detection rather than a spin race.
-        using var workerSeen = new ManualResetEventSlim(false);
-        PersistentParallelExecutor.Instance.Execute(numChunks, c =>
-        {
-            int tid = Thread.CurrentThread.ManagedThreadId;
-            observed[c] = tid;
-            if (tid != callerId)
-                workerSeen.Set();
-            else
-                workerSeen.Wait(TimeSpan.FromMilliseconds(200));
-        });
+        // Same pinned-config + retry probe as the AboveGrainSize test (see TryObserveWorkerDispatch)
+        // — robust to a concurrent test transiently pinning the process-global MaxDegreeOfParallelism.
+        bool sawWorker = TryObserveWorkerDispatch(
+            action => PersistentParallelExecutor.Instance.Execute(numChunks, action),
+            numChunks, callerId);
 
-        bool sawOtherThread = false;
-        for (int c = 0; c < numChunks; c++)
-            if (observed[c] != callerId) { sawOtherThread = true; break; }
-        Assert.True(sawOtherThread && workerSeen.IsSet,
-            "2-arg Execute should continue to dispatch to the worker pool — "
-            + "backward-compatibility for callers that haven't been migrated. "
-            + $"workerSeen.IsSet={workerSeen.IsSet}.");
+        Assert.True(sawWorker,
+            $"2-arg Execute did not dispatch to a worker thread across {WorkerDispatchAttempts} "
+            + "attempts under a pinned parallel config — backward-compatibility for callers that "
+            + "haven't been migrated to grain-size.");
     }
 
     /// <summary>

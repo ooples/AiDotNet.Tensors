@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -10,7 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Tests are skipped when no GPU backend is available.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public class GpuFusedKernelCorrectnessTests
+public class GpuFusedKernelCorrectnessTests : IDisposable
 {
     private readonly CpuEngine _cpu = new();
     private readonly DirectGpuTensorEngine? _gpu;
@@ -28,6 +29,12 @@ public class GpuFusedKernelCorrectnessTests
         {
             _gpu = null;
         }
+    }
+
+    public void Dispose()
+    {
+        _gpu?.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     private void SkipIfNoGpu()

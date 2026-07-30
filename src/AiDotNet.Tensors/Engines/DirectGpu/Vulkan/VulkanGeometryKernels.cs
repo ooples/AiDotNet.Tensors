@@ -192,7 +192,7 @@ float sample_safe(int n, int y, int x, int c) {
     } else {
         y = reflect_index(y, H); x = reflect_index(x, W);
     }
-    return input_[((n * H + y) * W + x) * C + c];
+    return input_[((n * C + c) * H + y) * W + x];
 }
 
 void main() {
@@ -210,7 +210,7 @@ void main() {
     if (mode == 1) {
         int nx = int(round(sx)), ny = int(round(sy));
         for (int c = 0; c < C; c++)
-            output_[((n * outH + oy) * outW + ox) * C + c] = sample_safe(n, ny, nx, c);
+            output_[((n * C + c) * outH + oy) * outW + ox] = sample_safe(n, ny, nx, c);
     } else if (mode == 0) {
         int x0 = int(floor(sx)), y0 = int(floor(sy));
         int x1 = x0 + 1, y1 = y0 + 1;
@@ -220,7 +220,7 @@ void main() {
             float v01 = sample_safe(n, y0, x1, c);
             float v10 = sample_safe(n, y1, x0, c);
             float v11 = sample_safe(n, y1, x1, c);
-            output_[((n * outH + oy) * outW + ox) * C + c] =
+            output_[((n * C + c) * outH + oy) * outW + ox] =
                 v00 * (1.0 - fx) * (1.0 - fy) + v01 * fx * (1.0 - fy)
               + v10 * (1.0 - fx) * fy + v11 * fx * fy;
         }
@@ -242,7 +242,7 @@ void main() {
                 }
                 acc += wy[yy] * rowAcc;
             }
-            output_[((n * outH + oy) * outW + ox) * C + c] = acc;
+            output_[((n * C + c) * outH + oy) * outW + ox] = acc;
         }
     }
 }

@@ -76,6 +76,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void DownloadBuffer(IGpuBuffer buffer, float[] destination) => Inner.DownloadBuffer(buffer, destination);
 
+    /// <inheritdoc/>
+    public virtual byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount) => Inner.DownloadByteBuffer(buffer, byteCount);
+
+    /// <inheritdoc/>
+    public virtual void UploadByteBuffer(IGpuBuffer buffer, byte[] data) => Inner.UploadByteBuffer(buffer, data);
+
     #endregion
 
     #region GEMM Operations
@@ -87,6 +93,26 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
         => Inner.MatMul(A, B, M, N, K);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int seqLen, float scale)
+        => Inner.PagedAttentionDecode(q, kcache, vcache, blockTable, heads, headDim, blockSize, seqLen, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        => Inner.PagedAttentionPrefill(q, kcache, vcache, blockTable, heads, headDim, blockSize, numQueries, startPos, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
+        => Inner.PagedAttentionDecodeGqa(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, scale);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
+        => Inner.PagedAttentionPrefillGqa(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, numQueries, startPos, scale);
 
     /// <inheritdoc/>
     public virtual void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -847,16 +873,22 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
         => Inner.ScaledDotProductAttention(query, key, value, output, attentionWeights, mask,
-            batch, numHeads, seqLen, headDim, scale, isCausal);
+            batch, numHeads, seqQ, seqK, headDim, scale, isCausal, softcap, numKVHeads);
+
+    /// <inheritdoc/>
+    public virtual void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+        => Inner.RopeInterleaved(input, cos, sin, output, rows, headDim, seqLen, startPosition);
 
     /// <inheritdoc/>
     public virtual void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
         => Inner.ScaledDotProductAttentionBackward(gradOutput, query, key, value, attentionWeights,
-            gradQuery, gradKey, gradValue, batch, numHeads, seqLen, headDim, scale, isCausal);
+            gradQuery, gradKey, gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
 
     /// <inheritdoc/>
     public virtual void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -941,6 +973,10 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
         => Inner.GenerateRandomUniform(output, size, min, max, seed);
+
+    /// <inheritdoc/>
+    public virtual void GenerateStatelessDropoutMask(IGpuBuffer output, int size, uint threshold, float scale, uint seed)
+        => Inner.GenerateStatelessDropoutMask(output, size, threshold, scale, seed);
 
     /// <inheritdoc/>
     public virtual void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
@@ -1462,7 +1498,7 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
     /// <inheritdoc/>
-    public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, k, v, a, b, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
+    public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
     /// <inheritdoc/>
     public virtual void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => Inner.HierarchicalSoftmaxPaths(acts, output, rows, treeDepth, numClasses);
     /// <inheritdoc/>
@@ -1632,6 +1668,11 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
         float learningRate, float l1Reg, float l2Reg, float beta, int size)
         => Inner.FtrlUpdate(param, gradient, z, n, learningRate, l1Reg, l2Reg, beta, size);
+
+    /// <inheritdoc/>
+    public virtual void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+        => Inner.ProximalL1Update(param, gradient, learningRate, l1Strength, size);
 
     /// <inheritdoc/>
     public virtual void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float weightDecay)
@@ -1828,9 +1869,21 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.FusedLinearCrossEntropyIndex(hidden, weight, bias, targetIds, n, d, vocab);
 
     /// <inheritdoc/>
+    public virtual void FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyIndex(hidden, weight, bias, targetIds, meanLoss, n, d, vocab);
+
+    /// <inheritdoc/>
     public virtual float FusedLinearCrossEntropyDense(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
         => Inner.FusedLinearCrossEntropyDense(hidden, weight, bias, target, n, d, vocab);
+
+    /// <inheritdoc/>
+    public virtual void FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target,
+        IGpuBuffer meanLoss, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyDense(hidden, weight, bias, target, meanLoss, n, d, vocab);
 
     /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
@@ -1960,6 +2013,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     // --- Split-buffer native Complex<T> operations ---
     public virtual void SplitComplexMultiply(IGpuBuffer aReal, IGpuBuffer aImag, IGpuBuffer bReal, IGpuBuffer bImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexMultiply(aReal, aImag, bReal, bImag, outReal, outImag, n);
+    public virtual void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n) => Inner.InterleaveComplex(real, imag, interleaved, n);
+    public virtual void DeinterleaveComplex(IGpuBuffer interleaved, IGpuBuffer real, IGpuBuffer imag, int n) => Inner.DeinterleaveComplex(interleaved, real, imag, n);
     public virtual void SplitComplexConjugate(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n) => Inner.SplitComplexConjugate(inReal, inImag, outReal, outImag, n);
     public virtual void SplitComplexMagnitude(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMag, int n) => Inner.SplitComplexMagnitude(inReal, inImag, outMag, n);
     public virtual void SplitComplexMagnitudeSquared(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outMagSq, int n) => Inner.SplitComplexMagnitudeSquared(inReal, inImag, outMagSq, n);

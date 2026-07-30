@@ -16,18 +16,21 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 // the GPU engine so they exercise exactly that path; they SKIP when no GPU backend
 // is present (the regression is GPU-path-specific and cannot manifest on CPU). CPU
 // autodiff correctness for these ops is covered separately by GradientCorrectnessTests.
-public class ConvGroupNormGradCheck
+[Collection("DirectGpuSerial")]
+public class ConvGroupNormGradCheck : IDisposable
 {
     private readonly ITestOutputHelper _out;
-    private readonly IEngine _engine;
+    private readonly DirectGpuTensorEngine _engine;
     private readonly bool _gpuAvailable;
 
     public ConvGroupNormGradCheck(ITestOutputHelper output)
     {
         _out = output;
-        _engine = AiDotNetEngine.Current;
-        _gpuAvailable = _engine is DirectGpuTensorEngine gpu && gpu.IsGpuAvailable;
+        _engine = new DirectGpuTensorEngine();
+        _gpuAvailable = _engine.IsGpuAvailable;
     }
+
+    public void Dispose() => _engine.Dispose();
 
     // Guards the GPU regression these tests exist for: without an active GPU backend
     // AiDotNetEngine.Current is the CPU engine, which always recorded correctly, so a

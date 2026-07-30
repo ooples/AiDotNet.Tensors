@@ -79,7 +79,7 @@ internal static partial class SimdGemm
     /// (see <see cref="BuildInt8RowScaledPrePackedB"/>). The grid is sized to the machine width
     /// so the int8 GEMM scales regardless of the MaxDegreeOfParallelism at first build; this cap
     /// keeps it bounded on very-many-core hosts (matches the worker-pool ceiling in
-    /// CooperativeGemmScheduler / PersistentParallelExecutor).
+    /// PersistentParallelExecutor).
     /// </summary>
     private const int Int8RowScaledMaxGridThreads = 64;
 

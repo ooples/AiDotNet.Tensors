@@ -924,8 +924,8 @@ kernel void parity210_istft_from_spectrum(
     device const float* specRe [[buffer(0)]],
     device const float* specIm [[buffer(1)]],
     device const float* window [[buffer(2)]],
-    device atomic_float* result [[buffer(3)]],
-    device atomic_float* windowSum [[buffer(4)]],
+    device float* result [[buffer(3)]],
+    device float* windowSum [[buffer(4)]],
     constant int& batch [[buffer(5)]],
     constant int& numFrames [[buffer(6)]],
     constant int& nFft [[buffer(7)]],
@@ -933,12 +933,17 @@ kernel void parity210_istft_from_spectrum(
     constant int& outputLength [[buffer(9)]],
     constant int& center [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; int total = batch*numFrames*nFft; if (idx >= total) return;
-    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames; int specOff = (b*numFrames + frame) * nFft;
-    float acc = 0.0f;
-    for (int k = 0; k < nFft; k++) { float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
-    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int outIdx = writeStart + i;
-    if (outIdx >= 0 && outIdx < outputLength) { float w = window[i]; atomic_fetch_add_explicit(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w, memory_order_relaxed); atomic_fetch_add_explicit(&windowSum[b*outputLength + outIdx], w*w, memory_order_relaxed); }
+    int idx = (int)gid; int total = batch*outputLength; if (idx >= total) return;
+    int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0f; float windowAcc = 0.0f;
+    for (int frame = 0; frame < numFrames; frame++) {
+        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        if (i >= 0 && i < nFft) {
+            int specOff = (b*numFrames + frame) * nFft; float acc = 0.0f;
+            for (int k = 0; k < nFft; k++) { float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
+            float w = window[i]; resultAcc += acc*(1.0f/(float)nFft)*w; windowAcc += w*w;
+        }
+    }
+    result[idx] = resultAcc; windowSum[idx] = windowAcc;
 }
 
 kernel void parity210_istft_normalize(
@@ -1019,7 +1024,7 @@ kernel void parity210_histogramdd(
     constant int& d [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int i = (int)gid; if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floor((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } int kIdx; if (v == mx) { kIdx = bins[k] - 1; } else { float width = (mx - mn) / (float)bins[k]; kIdx = (int)floor((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; } linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomic_fetch_add_explicit(&hist[linIdx], 1.0f, memory_order_relaxed);
 }
 
@@ -1035,16 +1040,16 @@ kernel void parity210_gridsample_backward_input(
     constant int& outW [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
     int idx = (int)gid; int total = batch*outH*outW*C; if (idx >= total) return;
-    int c = idx % C; int tmp = idx / C; int ow = tmp % outW; tmp /= outW; int oh = tmp % outH; int b = tmp / outH;
+    int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; tmp /= outH; int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1); float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
     if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
     int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0; float g = gradOut[idx];
-    if (h0>=0 && h0<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw), memory_order_relaxed);
-    if (h0>=0 && h0<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw, memory_order_relaxed);
-    if (h1>=0 && h1<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw), memory_order_relaxed);
-    if (h1>=0 && h1<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw, memory_order_relaxed);
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h0)*W+w0], g*(1.0f-lh)*(1.0f-lw), memory_order_relaxed);
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h0)*W+w1], g*(1.0f-lh)*lw, memory_order_relaxed);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h1)*W+w0], g*lh*(1.0f-lw), memory_order_relaxed);
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h1)*W+w1], g*lh*lw, memory_order_relaxed);
 }
 
 kernel void parity210_gridsample_backward_grid(
@@ -1070,10 +1075,10 @@ kernel void parity210_gridsample_backward_grid(
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
         int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
         for (int c = 0; c < C; c++) {
-            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f; float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
-            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f; float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            float v00 = in00 ? input[((b*C+c)*H+h0)*W+w0] : 0.0f; float v01 = in01 ? input[((b*C+c)*H+h0)*W+w1] : 0.0f;
+            float v10 = in10 ? input[((b*C+c)*H+h1)*W+w0] : 0.0f; float v11 = in11 ? input[((b*C+c)*H+h1)*W+w1] : 0.0f;
             float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01); float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
-            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            float go = gradOut[((b*C+c)*outH+oh)*outW+ow];
             gradGx += go * dW * (float)(W-1)*0.5f; gradGy += go * dH * (float)(H-1)*0.5f;
         }
     }
@@ -1172,10 +1177,11 @@ kernel void parity210_index_write(
     constant int& innerSize [[buffer(7)]],
     constant int& dstAxis [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; int total=outerSize*idxAxis*innerSize; if (idx>=total) return;
-    int inner=idx%innerSize; int j=(idx/innerSize)%idxAxis; int outer=(idx/innerSize)/idxAxis; int dstJ=indices[j];
-    if (dstJ<0||dstJ>=dstAxis) return; float v=(mode==0)?source[idx]:fillValue;
-    output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
+    int idx = (int)gid; int total=outerSize*dstAxis*innerSize; if (idx>=total) return;
+    int inner=idx%innerSize; int dstJ=(idx/innerSize)%dstAxis; int outer=(idx/innerSize)/dstAxis; int last=-1;
+    for (int j=0;j<idxAxis;j++) if (indices[j]==dstJ) last=j;
+    if (last<0) return;
+    output[idx]=(mode==0)?source[(outer*idxAxis+last)*innerSize+inner]:fillValue;
 }
 
 kernel void parity210_cdist(
@@ -1346,26 +1352,37 @@ kernel void parity210_polygamma(
     int i = (int)gid; if (i>=size) return; out[i]=p210_polygamma_scalar(n, x[i]);
 }
 
+// RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17); see the CUDA twin for the derivation.
 kernel void parity210_rwkv7_forward(
     device const float* R [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* A [[buffer(3)]],
-    device const float* B [[buffer(4)]],
-    device float* outp [[buffer(5)]],
-    device float* Sbuf [[buffer(6)]],
-    constant int& batch [[buffer(7)]],
-    constant int& seqLen [[buffer(8)]],
-    constant int& modelDim [[buffer(9)]],
-    constant int& numHeads [[buffer(10)]],
-    constant int& headDim [[buffer(11)]],
+    device const float* KAP [[buffer(1)]],
+    device const float* KT [[buffer(2)]],
+    device const float* V [[buffer(3)]],
+    device const float* D [[buffer(4)]],
+    device const float* AR [[buffer(5)]],
+    device float* outp [[buffer(6)]],
+    device float* Sbuf [[buffer(7)]],
+    constant int& batch [[buffer(8)]],
+    constant int& seqLen [[buffer(9)]],
+    constant int& modelDim [[buffer(10)]],
+    constant int& numHeads [[buffer(11)]],
+    constant int& headDim [[buffer(12)]],
     uint gid [[thread_position_in_grid]]) {
-    int bh = (int)gid; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim; float* S=Sbuf+bh*hh;
+    int bh = (int)gid; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim;
+    device float* S=Sbuf+bh*(hh+3*headDim); device float* kh=S+hh; device float* wv=S+hh+headDim; device float* av=S+hh+2*headDim;
     for (int i=0;i<hh;i++) S[i]=0.0f;
     for (int t=0;t<seqLen;t++) {
         int baseOff=(b*seqLen+t)*modelDim+hOff;
-        for (int di=0;di<headDim;di++) { float ga=1.0f/(1.0f+exp(-A[baseOff+di])); float gbk=(1.0f/(1.0f+exp(-B[baseOff+di])))*K[baseOff+di]; int srow=di*headDim; for (int vi=0;vi<headDim;vi++) S[srow+vi]=ga*S[srow+vi]+gbk*V[baseOff+vi]; }
-        for (int di=0;di<headDim;di++) { int srow=di*headDim; float sk=0.0f; for (int vi=0;vi<headDim;vi++) sk+=S[srow+vi]*K[baseOff+vi]; outp[baseOff+di]=(1.0f/(1.0f+exp(-R[baseOff+di])))*sk; }
+        float ss=1e-12f; for (int ki=0;ki<headDim;ki++) { float kp=KAP[baseOff+ki]; ss+=kp*kp; }
+        float invN=1.0f/sqrt(ss);
+        for (int ki=0;ki<headDim;ki++) { kh[ki]=KAP[baseOff+ki]*invN; wv[ki]=exp(-0.60653065971263342f/(1.0f+exp(-D[baseOff+ki]))); av[ki]=AR[baseOff+ki]; }
+        for (int vi=0;vi<headDim;vi++) {
+            int srow=vi*headDim; float p=0.0f;
+            for (int ki=0;ki<headDim;ki++) p+=S[srow+ki]*kh[ki];
+            float vv=V[baseOff+vi]; float o=0.0f;
+            for (int ki=0;ki<headDim;ki++) { float sv=S[srow+ki]*wv[ki]-p*av[ki]*kh[ki]+vv*KT[baseOff+ki]; S[srow+ki]=sv; o+=sv*R[baseOff+ki]; }
+            outp[baseOff+vi]=o;
+        }
     }
 }
 ";

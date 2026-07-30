@@ -490,6 +490,140 @@ __kernel void grid_sample_backward_grad_input_deterministic(
     }
     gradInput[((b * channels + c) * inHeight + h_in) * inWidth + w_in] += sum;
 }
+
+// #775: 3D Gaussian-splat covariance. rotations [N,4] quaternion (w,x,y,z), scales [N,3] ->
+// covariances [N,6] upper triangular (c00,c01,c02,c11,c12,c22) of Sigma = R * S^2 * R^T. Gather over
+// gaussians; mirrors GaussianSplattingOperations.ComputeGaussianCovariance exactly.
+__kernel void gaussian_covariance(
+    __global const float* rotations,
+    __global const float* scales,
+    __global float* covariances,
+    const int numGaussians)
+{
+    int i = get_global_id(0);
+    if (i >= numGaussians) return;
+
+    float qw = rotations[i * 4], qx = rotations[i * 4 + 1], qy = rotations[i * 4 + 2], qz = rotations[i * 4 + 3];
+    float qNorm = sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+    if (qNorm > 0.0f) { float inv = 1.0f / qNorm; qw *= inv; qx *= inv; qy *= inv; qz *= inv; }
+
+    float r00 = 1.0f - 2.0f * (qy * qy + qz * qz);
+    float r01 = 2.0f * (qx * qy - qw * qz);
+    float r02 = 2.0f * (qx * qz + qw * qy);
+    float r10 = 2.0f * (qx * qy + qw * qz);
+    float r11 = 1.0f - 2.0f * (qx * qx + qz * qz);
+    float r12 = 2.0f * (qy * qz - qw * qx);
+    float r20 = 2.0f * (qx * qz - qw * qy);
+    float r21 = 2.0f * (qy * qz + qw * qx);
+    float r22 = 1.0f - 2.0f * (qx * qx + qy * qy);
+
+    float sx = fmax(1e-6f, fabs(scales[i * 3])); float sx2 = sx * sx;
+    float sy = fmax(1e-6f, fabs(scales[i * 3 + 1])); float sy2 = sy * sy;
+    float sz = fmax(1e-6f, fabs(scales[i * 3 + 2])); float sz2 = sz * sz;
+
+    float m00 = r00 * sx2, m01 = r01 * sy2, m02 = r02 * sz2;
+    float m10 = r10 * sx2, m11 = r11 * sy2, m12 = r12 * sz2;
+    float m20 = r20 * sx2, m21 = r21 * sy2, m22 = r22 * sz2;
+
+    int o = i * 6;
+    covariances[o]     = m00 * r00 + m01 * r01 + m02 * r02;
+    covariances[o + 1] = m00 * r10 + m01 * r11 + m02 * r12;
+    covariances[o + 2] = m00 * r20 + m01 * r21 + m02 * r22;
+    covariances[o + 3] = m10 * r10 + m11 * r11 + m12 * r12;
+    covariances[o + 4] = m10 * r20 + m11 * r21 + m12 * r22;
+    covariances[o + 5] = m20 * r20 + m21 * r21 + m22 * r22;
+}
+
+// #775: spherical-harmonics color eval. shCoefficients [N, basisCount, numChannels], viewDirections
+// [N or 1, 3] -> colors [N, numChannels] = clamp01(sum_b coeff[i,b,ch]*basis_b(dir)). Basis constants
+// and clamp mirror GaussianSplattingOperations.ComputeSphericalHarmonicsBasis exactly.
+__kernel void spherical_harmonics(
+    __global const float* shCoefficients,
+    __global const float* viewDirections,
+    __global float* output,
+    const int numPoints, const int basisCount, const int numChannels, const int degree, const int broadcastDir)
+{
+    int idx = get_global_id(0);
+    if (idx >= numPoints * numChannels) return;
+    int ch = idx % numChannels;
+    int i = idx / numChannels;
+
+    int dirIdx = broadcastDir ? 0 : i;
+    float dx = viewDirections[dirIdx * 3], dy = viewDirections[dirIdx * 3 + 1], dz = viewDirections[dirIdx * 3 + 2];
+    float norm = sqrt(dx * dx + dy * dy + dz * dz);
+    if (norm > 0.0f) { float inv = 1.0f / norm; dx *= inv; dy *= inv; dz *= inv; }
+
+    float basis[16];
+    basis[0] = 0.282095f;
+    if (degree >= 1) { basis[1] = 0.488603f * dy; basis[2] = 0.488603f * dz; basis[3] = 0.488603f * dx; }
+    if (degree >= 2) {
+        basis[4] = 1.092548f * dx * dy; basis[5] = 1.092548f * dy * dz;
+        basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);
+        basis[7] = 1.092548f * dx * dz; basis[8] = 0.546274f * (dx * dx - dy * dy);
+    }
+    if (degree >= 3) {
+        basis[9]  = 0.590044f * dy * (3.0f * dx * dx - dy * dy);
+        basis[10] = 2.890611f * dx * dy * dz;
+        basis[11] = 0.457046f * dy * (5.0f * dz * dz - 1.0f);
+        basis[12] = 0.373176f * dz * (5.0f * dz * dz - 3.0f);
+        basis[13] = 0.457046f * dx * (5.0f * dz * dz - 1.0f);
+        basis[14] = 1.445306f * dz * (dx * dx - dy * dy);
+        basis[15] = 0.590044f * dx * (dx * dx - 3.0f * dy * dy);
+    }
+
+    float color = 0.0f;
+    for (int b = 0; b < basisCount; b++)
+        color += shCoefficients[i * basisCount * numChannels + b * numChannels + ch] * basis[b];
+
+    output[i * numChannels + ch] = fmin(fmax(color, 0.0f), 1.0f);
+}
+
+// #775: SH backward w.r.t. coefficients. shGrad[i,b,ch] = colorGrad*basis_b where colorGrad =
+// outputGradient[i,ch] masked to 0 when the pre-clamp color was outside [0,1] (clamp01 derivative).
+__kernel void spherical_harmonics_backward(
+    __global const float* shCoefficients,
+    __global const float* viewDirections,
+    __global const float* outputGradient,
+    __global float* shGrad,
+    const int numPoints, const int basisCount, const int numChannels, const int degree, const int broadcastDir)
+{
+    int idx = get_global_id(0);
+    if (idx >= numPoints * basisCount * numChannels) return;
+    int ch = idx % numChannels;
+    int b = (idx / numChannels) % basisCount;
+    int i = idx / (basisCount * numChannels);
+
+    int dirIdx = broadcastDir ? 0 : i;
+    float dx = viewDirections[dirIdx * 3], dy = viewDirections[dirIdx * 3 + 1], dz = viewDirections[dirIdx * 3 + 2];
+    float norm = sqrt(dx * dx + dy * dy + dz * dz);
+    if (norm > 0.0f) { float inv = 1.0f / norm; dx *= inv; dy *= inv; dz *= inv; }
+
+    float basis[16];
+    basis[0] = 0.282095f;
+    if (degree >= 1) { basis[1] = 0.488603f * dy; basis[2] = 0.488603f * dz; basis[3] = 0.488603f * dx; }
+    if (degree >= 2) {
+        basis[4] = 1.092548f * dx * dy; basis[5] = 1.092548f * dy * dz;
+        basis[6] = 0.315392f * (3.0f * dz * dz - 1.0f);
+        basis[7] = 1.092548f * dx * dz; basis[8] = 0.546274f * (dx * dx - dy * dy);
+    }
+    if (degree >= 3) {
+        basis[9]  = 0.590044f * dy * (3.0f * dx * dx - dy * dy);
+        basis[10] = 2.890611f * dx * dy * dz;
+        basis[11] = 0.457046f * dy * (5.0f * dz * dz - 1.0f);
+        basis[12] = 0.373176f * dz * (5.0f * dz * dz - 3.0f);
+        basis[13] = 0.457046f * dx * (5.0f * dz * dz - 1.0f);
+        basis[14] = 1.445306f * dz * (dx * dx - dy * dy);
+        basis[15] = 0.590044f * dx * (dx * dx - 3.0f * dy * dy);
+    }
+
+    float preclamp = 0.0f;
+    for (int bb = 0; bb < basisCount; bb++)
+        preclamp += shCoefficients[i * basisCount * numChannels + bb * numChannels + ch] * basis[bb];
+
+    float colorGrad = outputGradient[i * numChannels + ch];
+    if (preclamp < 0.0f || preclamp > 1.0f) colorGrad = 0.0f;
+    shGrad[idx] = colorGrad * basis[b];
+}
 ";
         }
     }

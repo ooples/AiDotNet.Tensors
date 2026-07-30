@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
@@ -166,6 +167,48 @@ public class EvictActivationsCreatedAfterLifetimeTests
                 "before disposing its buffer (#226 contract on the per-step release path).");
             Assert.Equal(0, disposeCountWhenMaterialized);
             Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.Equal(1, buffer.DisposeCount);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
+        }
+    }
+
+    [Fact]
+    public void EvictActivationsCreatedAfter_DiscardsPendingDownloadsWhenRequested()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var engineType = typeof(DirectGpuTensorEngine);
+        var activationCacheField = engineType.GetField(
+            "_activationCache", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var timestampField = engineType.GetField(
+            "_activationCacheTimestamp", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var evictMethod = engineType.GetMethod(
+            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance,
+            null, new[] { typeof(long), typeof(HashSet<object>), typeof(bool) }, null)!;
+        var activationCacheEntryType = engineType.Assembly.GetType(
+            "AiDotNet.Tensors.Engines.ActivationCacheEntry")!;
+        var entryCtor = GetActivationCacheEntryCtor(activationCacheEntryType);
+        object activationCache = activationCacheField.GetValue(engine)!;
+        var tryAdd = activationCache.GetType().GetMethod("TryAdd")!;
+
+        var key = new float[4];
+        var buffer = new TrackingGpuBuffer(size: 4);
+        object entry = entryCtor.Invoke(new object?[] { buffer, new[] { 4 }, 5L, null, 16L });
+        Assert.True((bool)tryAdd.Invoke(activationCache, new[] { (object)key, entry })!);
+        timestampField.SetValue(engine, 5L);
+
+        bool materializerRan = false;
+        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(key, _ => materializerRan = true);
+
+        try
+        {
+            evictMethod.Invoke(engine, new object?[] { 0L, null, false });
+
+            Assert.False(materializerRan);
+            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.False(((System.Collections.IDictionary)activationCache).Contains(key));
             Assert.Equal(1, buffer.DisposeCount);
         }
         finally

@@ -187,6 +187,33 @@ internal static class GapInvestigationBench
     }
 
     /// <summary>
+    /// Isolated latency of <see cref="AutotuneDispatcher.Decide{T}"/> on a WARM (cached)
+    /// shape — the block-size autotune path every GEMM hits. Before the #3 in-memory block memo,
+    /// each warm call still paid a FileInfo stat inside AutotuneCache.Lookup (~14% of a compiled
+    /// Transformer replay); with the memo it is a pure dictionary hit. Sibling of
+    /// <see cref="SelectStrategyHotPath"/> for the strategy path.
+    /// </summary>
+    public static void DecideHotPath()
+    {
+        Console.WriteLine("=== AutotuneDispatcher.Decide hot-path latency (#3 block memo) ===");
+        const int M = 197, N = 197, K = 64, mr = 8, nr = 16, procs = 16;
+        // Seed the cache so every timed call is a warm HIT (the path the memo governs).
+        var shape = BlasManagedAutotune.EncodeShape<double>(M, N, K, false, false, mr, nr, false);
+        BlasManagedAutotune.Store(shape, ParallelismAxis.M, mc: 128, nc: 512, kc: 512, threadCount: 8, measuredTimeMs: 1.0);
+
+        for (int w = 0; w < 1000; w++)
+            AutotuneDispatcher.Decide<double>(M, N, K, false, false, mr, nr, procs, false, false, PackingMode.Auto);
+        const int iters = 200_000;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            AutotuneDispatcher.Decide<double>(M, N, K, false, false, mr, nr, procs, false, false, PackingMode.Auto);
+        sw.Stop();
+        double nsPerCall = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+        Console.WriteLine($"  Decide (warm hit): {nsPerCall:F0} ns/call over {iters} iters");
+        Console.WriteLine($"  → memo hit is tens of ns; a per-call FileInfo stat shows as hundreds of ns.");
+    }
+
+    /// <summary>
     /// #375: demonstrate the hybrid win. Over a set of TRANSPOSED shapes (the ones the hybrid
     /// governs) spanning regimes where different strategies win, compare three policies on
     /// aggregate wall-clock: always-Streaming, always-PackBoth, and hybrid Auto (per-shape

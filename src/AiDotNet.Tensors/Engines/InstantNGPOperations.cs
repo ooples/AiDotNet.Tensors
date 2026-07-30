@@ -136,19 +136,14 @@ public static class InstantNGPOperations
         int numLevels = hashTables.Length;
         int totalFeatures = numLevels * featuresPerLevel;
 
-        // Create gradient tensors for each hash table
+        // Create gradient tensors for each hash table. Gradient accumulation into the hash tables
+        // uses the shared striped lock pool (no per-call per-entry lock allocation — see ScatterLockPool).
         var hashGradients = new Tensor<T>[numLevels];
-        var lockObjects = new object[numLevels][];
 
         for (int level = 0; level < numLevels; level++)
         {
             int tableSize = hashTables[level]._shape[0];
             hashGradients[level] = new Tensor<T>(new T[tableSize * featuresPerLevel], [tableSize, featuresPerLevel]);
-            lockObjects[level] = new object[tableSize];
-            for (int i = 0; i < tableSize; i++)
-            {
-                lockObjects[level][i] = new object();
-            }
         }
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numPoints, (long)numPoints * numLevels * featuresPerLevel, n =>
@@ -205,14 +200,14 @@ public static class InstantNGPOperations
                     if (Math.Abs(grad) < 1e-10) continue;
 
                     // Accumulate gradients with locking for thread safety
-                    AccumulateGradient(gradTable, lockObjects[level], h000, f, featuresPerLevel, grad * w000, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h001, f, featuresPerLevel, grad * w001, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h010, f, featuresPerLevel, grad * w010, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h011, f, featuresPerLevel, grad * w011, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h100, f, featuresPerLevel, grad * w100, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h101, f, featuresPerLevel, grad * w101, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h110, f, featuresPerLevel, grad * w110, numOps);
-                    AccumulateGradient(gradTable, lockObjects[level], h111, f, featuresPerLevel, grad * w111, numOps);
+                    AccumulateGradient(gradTable, h000, f, featuresPerLevel, grad * w000, numOps);
+                    AccumulateGradient(gradTable, h001, f, featuresPerLevel, grad * w001, numOps);
+                    AccumulateGradient(gradTable, h010, f, featuresPerLevel, grad * w010, numOps);
+                    AccumulateGradient(gradTable, h011, f, featuresPerLevel, grad * w011, numOps);
+                    AccumulateGradient(gradTable, h100, f, featuresPerLevel, grad * w100, numOps);
+                    AccumulateGradient(gradTable, h101, f, featuresPerLevel, grad * w101, numOps);
+                    AccumulateGradient(gradTable, h110, f, featuresPerLevel, grad * w110, numOps);
+                    AccumulateGradient(gradTable, h111, f, featuresPerLevel, grad * w111, numOps);
                 }
             }
         });
@@ -222,7 +217,6 @@ public static class InstantNGPOperations
 
     private static void AccumulateGradient<T>(
         Tensor<T> gradTable,
-        object[] locks,
         int hashIdx,
         int featureIdx,
         int featuresPerLevel,
@@ -230,7 +224,9 @@ public static class InstantNGPOperations
         INumericOperations<T> numOps)
     {
         int idx = hashIdx * featuresPerLevel + featureIdx;
-        lock (locks[hashIdx])
+        // Shared striped lock pool (no per-call lock allocation — see ScatterLockPool). Distinct
+        // hash entries (and levels) map to a stable stripe; rare collisions just serialize.
+        lock (ScatterLockPool.For(hashIdx))
         {
             double current = numOps.ToDouble(gradTable.GetFlat(idx));
             gradTable.SetFlat(idx, numOps.FromDouble(current + grad));

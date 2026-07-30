@@ -11,6 +11,9 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Distributed;
 
+[CollectionDefinition("DistributedSerial", DisableParallelization = true)]
+public sealed class DistributedSerialCollection { }
+
 /// <summary>
 /// Acceptance tests for issue #215 — ProcessGroup, DDP, FSDP, DTensor,
 /// Pipeline, RPC, ElasticLauncher.
@@ -23,6 +26,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Distributed;
 /// Behaviour is bit-identical to the network backend per the in-process
 /// backend's contract.</para>
 /// </summary>
+[Collection("DistributedSerial")]
 public class DistributedTrainingTests
 {
     // ── ProcessGroup core ───────────────────────────────────────────────
@@ -610,12 +614,22 @@ public class DistributedTrainingTests
                 WorldSize = worldSize,
                 Backend = RendezvousBackend.Tcp,
                 Endpoint = $"127.0.0.1:{port}",
-                RendezvousTimeoutSeconds = 10,
+                // 60s (not 10s) for parity with the TcpProcessGroup_* tests
+                // above. The rendezvous completes in ~30ms locally, but a free
+                // CI runner under CPU contention can starve the worker threads
+                // and the Thread.Sleep-based poll/retry loops long enough to
+                // blow a 10s budget — producing "Saw 1 of 3 workers" timeouts.
+                // A generous deadline is free on the happy path (it's an upper
+                // bound, not a fixed wait) and removes the contention flake.
+                RendezvousTimeoutSeconds = 60,
             });
             var a = launcher.Rendezvous(nonces[idx]);
             Assert.Equal(worldSize, a.WorldSize);
             assigned[idx] = a.Rank;
-        }, timeout: TimeSpan.FromSeconds(15), opName: "ElasticLauncher_TcpBackend_Rendezvous");
+            // Join window must exceed RendezvousTimeoutSeconds so a genuine
+            // rendezvous failure surfaces its own "Saw N of M" message before
+            // RunWorkers force-joins with the less informative timeout error.
+        }, timeout: TimeSpan.FromSeconds(75), opName: "ElasticLauncher_TcpBackend_Rendezvous");
 
         // Sort by nonce — alpha=0, bravo=1, charlie=2.
         Assert.Equal(0, assigned[0]);

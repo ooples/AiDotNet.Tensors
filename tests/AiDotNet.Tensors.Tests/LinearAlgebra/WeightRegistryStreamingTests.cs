@@ -1,7 +1,11 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -94,6 +98,91 @@ public class WeightRegistryStreamingTests : IDisposable
             "Drop should now succeed with refcount == 1.");
         Assert.False(w.StreamingDropDeferred, "Flag clears on successful finalize.");
         Assert.Equal(0, w.DataVector.Length);
+    }
+
+    // Registers streaming weights in a NON-INLINED helper so the locals genuinely leave scope and
+    // become collectable, and returns WEAK references to them so the caller can deterministically WAIT
+    // for the GC to reclaim them (rather than assuming a single GC.Collect suffices — see
+    // WaitUntilCollected). The WeakReferences do not keep the tensors alive.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static List<WeakReference> RegisterAndAbandonStreamingWeights(int count)
+    {
+        var refs = new List<WeakReference>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var w = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+            w.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(w);
+            refs.Add(new WeakReference(w));
+        }
+        return refs;
+    }
+
+    // Deterministically drives GC until every owner is OBSERVABLY collected (or a generous timeout),
+    // so a subsequent "reclaimed > 0" / "count == 0" assertion reflects a real registry regression
+    // rather than GC-timing nondeterminism (background/concurrent GC, delayed collection, JIT liveness).
+    private static void WaitUntilCollected(List<WeakReference> refs, int timeoutMs = 15000)
+    {
+        var sw = Stopwatch.StartNew();
+        do
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            if (refs.TrueForAll(static r => !r.IsAlive)) return;
+            Thread.Sleep(15);
+        }
+        while (sw.ElapsedMilliseconds < timeoutMs);
+
+        Assert.True(refs.TrueForAll(static r => !r.IsAlive),
+            "Owning tensors were not garbage-collected within the timeout — a test-environment issue, not a registry regression.");
+    }
+
+    [Fact]
+    public void PruneDeadEntries_ReclaimsPoolEntriesForGarbageCollectedOwners()
+    {
+        // #714: a streaming weight whose owning tensor is GC'd WITHOUT UnregisterWeight leaves its
+        // serialized bytes pinned in the pool forever. Across sequentially-created-then-dropped models
+        // (the CV/diffusion foundation-scale test shards, long training loops) RegisteredEntryCount
+        // climbs until Configure throws "existing streaming pool has N registered entries" / the host
+        // OOMs. PruneDeadEntries must reclaim those orphaned entries; a fresh Configure must then work.
+        var refs = RegisterAndAbandonStreamingWeights(20);
+        Assert.True(WeightRegistry.GetStreamingReport().RegisteredEntryCount > 0,
+            "Sanity: the 20 streaming registrations should be resident in the pool before GC.");
+
+        WaitUntilCollected(refs); // deterministic: all owners are provably collected past this point
+
+        int reclaimed = WeightRegistry.PruneDeadEntries();
+
+        Assert.True(reclaimed > 0, "PruneDeadEntries should reclaim entries whose owners were GC'd.");
+        Assert.Equal(0, WeightRegistry.GetStreamingReport().RegisteredEntryCount);
+
+        // The leak used to make this throw "existing streaming pool has N registered entries";
+        // after the sweep (Configure also prunes internally) it must succeed.
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024 * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+    }
+
+    [Fact]
+    public void Configure_PrunesGarbageCollectedOwners_InsteadOfThrowing()
+    {
+        // #714 (the exact CV/diffusion shard symptom): a new streaming model's Configure must not be
+        // blocked by a PRIOR model's entries once that model has been GC'd. Configure prunes dead
+        // owners first, so only genuinely-live registrations still throw.
+        var refs = RegisterAndAbandonStreamingWeights(15);
+        WaitUntilCollected(refs); // deterministic: all owners are provably collected past this point
+
+        // Should NOT throw — the 15 orphaned entries are reclaimed by Configure's internal sweep.
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024 * 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+
+        Assert.Equal(0, WeightRegistry.GetStreamingReport().RegisteredEntryCount);
     }
 
     [Fact]
@@ -213,6 +302,72 @@ public class WeightRegistryStreamingTests : IDisposable
         Assert.Equal(10f, span[0]);
         Assert.Equal(20f, span[1]);
         Assert.Equal(30f, span[2]);
+    }
+
+    [Fact]
+    public void ReleaseToPool_RefcountTwo_DefersDrop_DoesNotThrow()
+    {
+        // Regression for the foundation-scale streaming-inference break: during
+        // a layer's Forward a peer takes a SECOND ref on a materialized streaming
+        // weight's storage — a copy-on-write clone (#624), a RebindStorageFrom
+        // peer (CompiledInferencePlan / MemoryPlanning), or an int8/int4
+        // quant-resident alias (#629). ReleaseToPool used the STRICT
+        // DropStorageForStreaming(), which threw "requires sole storage
+        // ownership; refcount is 2" — surfaced to the consumer as the
+        // MaterializeScope.Dispose AggregateException that broke every paper-scale
+        // VLM forward (Phi3Vision / SmolVLM / Whisper / …). Post-fix it DEFERS,
+        // mirroring the RegisterWeight #430 fix.
+        var w = new Tensor<float>(new float[] { 1.5f, 2.5f, 3.5f, 4.5f }, new[] { 4 });
+        w.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(w);   // drops the resident copy to the pool
+        WeightRegistry.Materialize(w);      // page back in — resident, refcount 1
+        Assert.Equal(4, w.DataVector.Length);
+
+        // A peer shares the materialized storage for the duration of the forward.
+        var peer = new Tensor<float>(new[] { 4 });
+        peer.RebindStorageFrom(w);
+        Assert.Equal(2, w._storage.RefCount);
+
+        // Pre-fix this threw InvalidOperationException. Post-fix it defers.
+        WeightRegistry.ReleaseToPool(w);
+        Assert.True(w.StreamingDropDeferred, "Release must defer when storage is shared.");
+        Assert.Equal(4, w.DataVector.Length);            // still resident for the peer
+        Assert.Equal(1.5f, peer[0]);
+        Assert.Equal(4.5f, peer[3]);
+
+        // Once the peer releases, the deferred drop finalizes.
+        var fresh = new Tensor<float>(new[] { 4 });
+        peer.RebindStorageFrom(fresh);
+        Assert.Equal(1, w._storage.RefCount);
+        Assert.True(WeightRegistry.TryFinalizeDeferredDrop(w),
+            "Deferred drop should finalize once the peer ref releases.");
+        Assert.False(w.StreamingDropDeferred);
+        Assert.Equal(0, w.DataVector.Length);
+    }
+
+    [Fact]
+    public void MaterializeScope_Dispose_WithSharedWeight_DoesNotThrow()
+    {
+        // The exact CI failure mode: MaterializeScope.Dispose -> ReleaseToPool on
+        // a weight whose storage a forward-op peer still shares used to throw
+        // "One or more ReleaseToPool calls failed during MaterializeScope.Dispose".
+        var w = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        w.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(w);
+
+        var peer = new Tensor<float>(new[] { 4 });
+        using (WeightRegistry.MaterializeMany(new[] { w }))
+        {
+            // Inside the scope w is resident; a forward op shares its storage
+            // (e.g. a COW clone of the weight that outlives the op).
+            peer.RebindStorageFrom(w);
+            Assert.Equal(2, w._storage.RefCount);
+        } // Dispose -> ReleaseToPool(w): must NOT throw now (drop deferred).
+
+        Assert.True(w.StreamingDropDeferred, "Shared weight's drop is deferred, not forced.");
+        Assert.Equal(4, w.DataVector.Length);            // still resident, uncorrupted
+        Assert.Equal(1f, peer[0]);
+        Assert.Equal(4f, peer[3]);
     }
 
     [Fact]
@@ -687,8 +842,10 @@ public class WeightRegistryStreamingTests : IDisposable
             WeightRegistry.RegisterWeight(tensors[k]);
         }
 
-        // Concurrent Materialize from 4 threads, each owning a slice of
-        // tensors. All-or-nothing correctness.
+        // Concurrent scoped Materialize from 4 threads, each owning a
+        // slice of tensors. The scope must pin the owner copy while the
+        // caller reads it, even when sibling workers push the pool and
+        // materialized-owner LRU over budget.
         var tasks = new System.Threading.Tasks.Task[4];
         for (int worker = 0; worker < 4; worker++)
         {
@@ -697,13 +854,15 @@ public class WeightRegistryStreamingTests : IDisposable
             {
                 for (int k = wId; k < numTensors; k += 4)
                 {
-                    WeightRegistry.Materialize(tensors[k]);
-                    var got = tensors[k].DataVector.AsSpan();
-                    for (int i = 0; i < 1024; i++)
+                    using (WeightRegistry.MaterializeMany(new[] { tensors[k] }))
                     {
-                        if (got[i] != expected[k][i])
-                            throw new Xunit.Sdk.XunitException(
-                                $"Tensor {k} index {i}: expected {expected[k][i]}, got {got[i]}");
+                        var got = tensors[k].DataVector.AsSpan();
+                        for (int i = 0; i < 1024; i++)
+                        {
+                            if (got[i] != expected[k][i])
+                                throw new Xunit.Sdk.XunitException(
+                                    $"Tensor {k} index {i}: expected {expected[k][i]}, got {got[i]}");
+                        }
                     }
                 }
             });

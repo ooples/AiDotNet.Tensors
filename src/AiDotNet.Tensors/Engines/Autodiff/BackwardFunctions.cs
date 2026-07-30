@@ -1,4 +1,4 @@
-﻿using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -110,6 +110,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // See AlignGradRank: a rank-0 operand paired with a rank-1 [1] seed would otherwise throw.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+
         var gradA = engine.TensorMultiply(gradOutput, inputs[1]);
         var gradB = engine.TensorMultiply(gradOutput, inputs[0]);
         if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], gradA, engine))
@@ -119,10 +122,37 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>d(a/b)/da = grad/b, d(a/b)/db = -grad*a/(b*b)</summary>
+    /// <summary>
+    /// Reshapes an upstream gradient to an operand's shape when the two describe the SAME number of
+    /// elements but different ranks, e.g. a rank-1 <c>[1]</c> seed against a rank-0 <c>[]</c> operand.
+    /// </summary>
+    /// <remarks>
+    /// Elementwise backward functions divide/multiply the upstream gradient by an operand directly,
+    /// which requires matching shapes. A rank-0 result (any full reduction with
+    /// <c>keepDims: false</c>) receives a rank-1 <c>[1]</c> seed gradient from the tape, so those ops
+    /// threw "Tensor shapes must match. Got [1] and []" from inside ComputeGradients -- turning a
+    /// perfectly valid loss into an exception mid-training-step. Because the element count is
+    /// identical, a reshape is exact and loses nothing; anything that is NOT a pure rank mismatch is
+    /// left untouched so genuine shape errors still surface.
+    /// </remarks>
+    private static Tensor<T> AlignGradRank(IEngine engine, Tensor<T> grad, Tensor<T> operand)
+    {
+        if (grad.Shape.Length == operand.Shape.Length || grad.Length != operand.Length)
+        {
+            return grad;
+        }
+
+        return engine.Reshape(grad, (int[])operand._shape.Clone());
+    }
+
     internal static void DivideBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // The forward divide requires a and b to share a shape, so aligning against inputs[0] is
+        // enough to make every product/quotient below shape-consistent.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+
         var gradA = engine.TensorDivide(gradOutput, inputs[1]);
         var bSquared = engine.TensorMultiply(inputs[1], inputs[1]);
         var posGradA = engine.TensorMultiply(gradOutput, inputs[0]);
@@ -145,6 +175,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        gradOutput = AlignGradRank(engine, gradOutput, output);
         var grad = engine.TensorMultiply(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -154,6 +185,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
         var grad = engine.TensorDivide(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -988,6 +1020,23 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
     }
 
+    /// <summary>DepthwiseConv1D backward: uses engine.DepthwiseConv1DBackwardInput and DepthwiseConv1DBackwardKernel</summary>
+    internal static void DepthwiseConv1DBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var stride = (int)savedState[0];
+        var padding = (int)savedState[1];
+
+        var gradInput = engine.DepthwiseConv1DBackwardInput(
+            gradOutput, inputs[1], inputs[0]._shape, stride, padding);
+        var gradKernel = engine.DepthwiseConv1DBackwardKernel(
+            gradOutput, inputs[0], inputs[1]._shape, stride, padding);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+    }
+
     /// <summary>Conv3D backward: uses engine.Conv3DBackwardInput and Conv3DBackwardKernel</summary>
     internal static void Conv3DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1056,6 +1105,19 @@ internal static class BackwardFunctions<T>
         var stride = (int[])savedState[2];
 
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>MaxPool2D backward with tensor-resident flat spatial indices.</summary>
+    internal static void MaxPool2DTensorIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var maxIndices = (Tensor<int>)savedState[0];
+        var poolSize = (int[])savedState[1];
+        var stride = (int[])savedState[2];
+        var grad = engine.MaxPool2DBackwardWithTensorIndices(
+            gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -1202,6 +1264,27 @@ internal static class BackwardFunctions<T>
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+    }
+
+    /// <summary>
+    /// Interleaved-RoPE backward. RoPE is an orthogonal rotation R(θ) applied per (2i, 2i+1) pair, so its
+    /// Jacobian is that rotation matrix and the input gradient is R(θ)^T · gradOutput = R(-θ) · gradOutput —
+    /// i.e. the same interleaved rotation with the sine negated. Reuses the forward kernel with a negated sin
+    /// cache, so it stays float-specialized and matches the forward exactly.
+    /// </summary>
+    internal static void ApplyRoPEInterleavedBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var cos = (Tensor<T>)savedState[0];
+        var sin = (Tensor<T>)savedState[1];
+        var startPosition = (int)savedState[2];
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var negSin = engine.TensorMultiplyScalar(sin, numOps.FromDouble(-1.0));
+        var gradInput = engine.ApplyRoPEInterleaved(gradOutput, cos, negSin, startPosition);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
     }
 
     /// <summary>InstanceNorm backward: uses engine.InstanceNormBackward</summary>
@@ -1781,7 +1864,7 @@ internal static class BackwardFunctions<T>
 
             if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
             {
-                var dense = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+                var dense = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
             }
             return;
@@ -1791,7 +1874,20 @@ internal static class BackwardFunctions<T>
         // Generalizing SparseEmbeddingGradient to N-D / arbitrary-axis gathers is a
         // forward-ledger surface change for a future PR. For now, the perf win we
         // care about (embedding-table lookups) is covered.
-        var grad = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+        //
+        // Uses ScatterAdd (output[indices[i]] += source[i]) and NOT ScatterAddBackward.
+        // Despite the name, ScatterAddBackward is the backward of a SCATTER-ADD forward with
+        // respect to that op's `src` input, which is a GATHER:
+        // gradSource[s] = gradOutput[indices[s]], with `indices` indexed by SOURCE position.
+        // Gather's backward is the opposite - it must ACCUMULATE gradOutput[i] into source slice
+        // indices[i], because gather indices routinely REPEAT (duplicate tokens in an embedding
+        // lookup; relative-position-bias tables where many (i, j) window positions share a
+        // bucket), so a slice selected k times must receive k contributions. Borrowing the
+        // gather-shaped helper here also read `indices` OUT OF RANGE whenever the source extent
+        // exceeded the index count, because it wrapped via `indices[d % indices.Length]`: a 4-row
+        // source gathered by 3 indices produced uniform garbage instead of per-occurrence sums,
+        // and never-selected slices came back nonzero when they must be exactly 0.
+        var grad = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -1803,10 +1899,27 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
 
-        // Gradient flows to both destination and updates
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
-        var gradUpdates = engine.TensorGather(gradOutput, indices, axis);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradUpdates, engine);
+        // TWO different ops share this backward, and they have different arities:
+        //   TensorScatterAdd(destination, indices, updates, axis) records BINARY  — inputs[0], inputs[1]
+        //   ScatterAdd(source, indices, dim, outputSize)          records UNARY   — inputs[0] only
+        // Reading inputs[1] unconditionally threw IndexOutOfRangeException on every ScatterAdd backward.
+        //
+        // The arities also imply different gradients. For the BINARY form the output has the destination's
+        // shape, so d/d(destination) is a pass-through and d/d(updates) gathers. For the UNARY form the
+        // output is a larger scattered buffer (e.g. [4,8] -> [6,8]), so d/d(source) must GATHER the rows
+        // back from the scattered positions — passing gradOutput through would have been both the wrong
+        // shape and the wrong value.
+        var gradGathered = engine.TensorGather(gradOutput, indices, axis);
+
+        if (inputs.Length > 1)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGathered, engine);
+        }
+        else
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradGathered, engine);
+        }
     }
 
     /// <summary>ExpandDims backward: squeeze the added dimension</summary>
@@ -2401,13 +2514,13 @@ internal static class BackwardFunctions<T>
             double srcY = (oy + 0.5) * h / outH - 0.5;
             int y0 = Math.Max(0, (int)Math.Floor(srcY));
             int y1 = Math.Min(y0 + 1, h - 1);
-            double fy = srcY - y0;
+            double fy = Math.Max(0.0, srcY - y0); // clamp to match the forward (#775 align_corners=False edge).
             for (int ox = 0; ox < outW; ox++)
             {
                 double srcX = (ox + 0.5) * w / outW - 0.5;
                 int x0 = Math.Max(0, (int)Math.Floor(srcX));
                 int x1 = Math.Min(x0 + 1, w - 1);
-                double fx = srcX - x0;
+                double fx = Math.Max(0.0, srcX - x0); // clamp to match the forward (#775).
                 double g = numOps.ToDouble(gradOutput[bc * outH * outW + oy * outW + ox]);
                 int baseIdx = bc * h * w;
                 inputGrad[baseIdx + y0 * w + x0] = numOps.Add(inputGrad[baseIdx + y0 * w + x0], numOps.FromDouble(g * (1 - fy) * (1 - fx)));
@@ -2516,12 +2629,33 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Create a zero gradient with original input shape, then copy chunk into correct position
-        var grad = TensorPool<T>.RentZeroed(originalShape);
-        engine.TensorFill(grad, numOps.Zero);
+        var zeroGradient = TensorPool<T>.RentZeroed(originalShape);
+        engine.TensorFill(zeroGradient, numOps.Zero);
         var startArr = new int[originalShape.Length];
         startArr[axis] = start;
-        engine.TensorSetSlice(grad, gradOutput, startArr);
+        var grad = engine.TensorSetSlice(zeroGradient, gradOutput, startArr);
+        TensorPool<T>.Return(zeroGradient);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// Set-slice backward: the source receives the overwritten output region,
+    /// while the destination receives every gradient outside that region.
+    /// </summary>
+    internal static void SetSliceBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int[] start = (int[])savedState[0];
+        var sourceShape = inputs[1]._shape;
+
+        var gradSource = engine.TensorSlice(gradOutput, start, sourceShape);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradSource, engine);
+
+        var zeroSlice = TensorPool<T>.RentZeroed(sourceShape);
+        var gradDestination = engine.TensorSetSlice(gradOutput, zeroSlice, start);
+        TensorPool<T>.Return(zeroSlice);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
     }
 
     /// <summary>AvgPool1D backward</summary>
@@ -2713,10 +2847,45 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // dx = gradOutput * x / norm — use broadcast ops for scalar norm
+        // dx = gradOutput * x / norm.
+        //
+        // The AXIS overload records its axis in savedState[0], but this backward used to ignore it and
+        // broadcast the reduced tensors directly against the input. Broadcasting aligns from the RIGHT, so
+        // TensorNorm(x[4,32], axis:1) produced output [4] and then threw
+        // "shapes [4] and [4,32] cannot be broadcast" — every axis norm crashed on its backward pass.
+        // Only the global overload (which records NO savedState and yields a scalar) ever worked.
+        //
+        // Restoring the reduced axis as a size-1 dimension makes the broadcast align correctly: [4,1]
+        // against [4,32]. keepDims:true already has that shape, so the reshape is a no-op there.
         var numOps = MathHelper.GetNumericOperations<T>();
-        var scaledInput = engine.TensorBroadcastMultiply(gradOutput, inputs[0]);
-        var normClamped = engine.TensorClamp(output, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
+
+        var reducedGrad = gradOutput;
+        var reducedNorm = output;
+        if (savedState is { Length: > 0 } && savedState[0] is int axis)
+        {
+            var inShape = inputs[0]._shape;
+            int rank = inShape.Length;
+            int ax = axis < 0 ? rank + axis : axis;
+            if (ax >= 0 && ax < rank)
+            {
+                var keepShape = new int[rank];
+                for (int d = 0; d < rank; d++) keepShape[d] = d == ax ? 1 : inShape[d];
+
+                // Guard the reshape: it is only valid when the reduced tensor holds exactly the elements
+                // the keep-dims shape describes. A mismatch means the recording and the forward disagree,
+                // which should surface as the original broadcast error rather than a silent reinterpretation.
+                long keepCount = 1;
+                for (int d = 0; d < rank; d++) keepCount *= keepShape[d];
+                if (reducedGrad.Length == keepCount && reducedNorm.Length == keepCount)
+                {
+                    reducedGrad = engine.Reshape(reducedGrad, keepShape);
+                    reducedNorm = engine.Reshape(reducedNorm, keepShape);
+                }
+            }
+        }
+
+        var scaledInput = engine.TensorBroadcastMultiply(reducedGrad, inputs[0]);
+        var normClamped = engine.TensorClamp(reducedNorm, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
         var grad = engine.TensorBroadcastDivide(scaledInput, normClamped);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -3240,16 +3409,40 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             // dIntersection/d(px1,py1,px2,py2)
-            var dI0 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            var dI1 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            var dI2 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            var dI3 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            //
+            // TIE-BREAKING MUST MATCH CpuEngine's decomposition, which builds these from TensorMax nodes.
+            // MaxBackward computes aMask = 1 - sign(|output - a|), so when a == b it routes the FULL
+            // gradient to inputs[0] and zero to inputs[1] — first argument wins ties. Strict > and < give
+            // ZERO at a tie instead, which is the disagreement.
+            //
+            // ix1 = max(px1, tx1)          -> inputs[0] is px1,  so px1 wins ties  -> use >=
+            // ix2 = min(px2, tx2), built as -max(-px2, -tx2) -> inputs[0] is -px2, so px2 wins ties -> use <=
+            //
+            // Not an edge case for box losses: integer-valued corners share coordinates constantly (the
+            // parity boxes include px1=tx1=0 and px2=tx2=2). Same failure shape as the SELU backward, where
+            // a strict > at the zero boundary disagreed with CpuEngine's >=.
+            var dI0 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            var dI1 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            var dI2 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            var dI3 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
 
             // dUnion/d(px1,py1,px2,py2)
-            var dU0 = numOps.Subtract(numOps.Negate(ph), dI0);
-            var dU1 = numOps.Subtract(numOps.Negate(pw), dI1);
-            var dU2 = numOps.Subtract(ph, dI2);
-            var dU3 = numOps.Subtract(pw, dI3);
+            //
+            // predArea = max(0, px2-px1) * max(0, py2-py1), so d(predArea)/d(px1) = -[px2 > px1] * ph and
+            // d(predArea)/d(px2) = +[px2 > px1] * ph. The ReLU INDICATORS were missing here: this used
+            // -ph / +ph unconditionally, so a degenerate box (px2 <= px1) got a non-zero width gradient
+            // where the CPU decomposition — which builds the same quantity out of real ReLU nodes and
+            // therefore carries the indicator through its backward — correctly gives zero.
+            //
+            // This is not an edge case under the parity inputs: coordinates come from OpInput.Rand(-1, 1)
+            // rather than well-formed boxes, so roughly half of them satisfy px2 <= px1.
+            var pwPos = numOps.ToDouble(numOps.Subtract(px2, px1)) > 0 ? numOps.One : numOps.Zero;
+            var phPos = numOps.ToDouble(numOps.Subtract(py2, py1)) > 0 ? numOps.One : numOps.Zero;
+
+            var dU0 = numOps.Subtract(numOps.Negate(numOps.Multiply(pwPos, ph)), dI0);
+            var dU1 = numOps.Subtract(numOps.Negate(numOps.Multiply(phPos, pw)), dI1);
+            var dU2 = numOps.Subtract(numOps.Multiply(pwPos, ph), dI2);
+            var dU3 = numOps.Subtract(numOps.Multiply(phPos, pw), dI3);
 
             // dIoU/d(coord) = (dI*U - I*dU) / U^2, loss = 1 - IoU, so d(loss) = -dIoU
             var go = gradOutput[i];
@@ -3263,7 +3456,81 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradTensor, engine);
     }
 
+    /// <summary>
+    /// Gradient of the CIoU aspect-ratio term v w.r.t. the PREDICTED boxes.
+    /// </summary>
+    /// <remarks>
+    /// CpuEngine.TensorCIoULoss computes v = (4/pi^2)*(atan(tw/th) - atan(pw/ph))^2 in a numeric loop and
+    /// materialises it as `new Tensor&lt;T&gt;(vData, ...)` — a CONSTANT LEAF on the tape. Combined with the
+    /// deliberate StopGradient on alpha, that left CIoU with NO aspect-ratio gradient at all, which makes it
+    /// numerically identical to DIoU during training: the term CIoU exists to add contributed nothing.
+    /// The engine has no differentiable atan to rebuild v from ops, so the node is recorded here with its
+    /// analytic derivative instead.
+    ///
+    /// Using the forward's own definitions pw = relu(px2-px1)+eps, ph = relu(py2-py1)+eps:
+    ///   d(atan(pw/ph))/d(pw) =  ph / (pw^2 + ph^2)
+    ///   d(atan(pw/ph))/d(ph) = -pw / (pw^2 + ph^2)
+    ///   dv/d(pw) = 2*(4/pi^2)*atanDiff*(-d(atan)/d(pw))          [atanDiff = targAtan - predAtan]
+    /// then chained through pw = relu(px2-px1), whose ReLU indicator is carried explicitly so a degenerate
+    /// box contributes zero — matching how the rest of the forward treats those widths.
+    /// </remarks>
+    internal static void CIoUAspectBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var predicted = inputs[0];
+        var target = (Tensor<T>)savedState[0];
+        double eps = 1e-7;
+        double fourOverPiSq = 4.0 / (Math.PI * Math.PI);
+
+        int n = predicted.Shape[0];
+        var gradPred = new T[n * 4];
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * 4;
+            double px1 = numOps.ToDouble(predicted[o]), py1 = numOps.ToDouble(predicted[o + 1]);
+            double px2 = numOps.ToDouble(predicted[o + 2]), py2 = numOps.ToDouble(predicted[o + 3]);
+            double tx1 = numOps.ToDouble(target[o]), ty1 = numOps.ToDouble(target[o + 1]);
+            double tx2 = numOps.ToDouble(target[o + 2]), ty2 = numOps.ToDouble(target[o + 3]);
+
+            double rawPw = px2 - px1, rawPh = py2 - py1;
+            double pw = Math.Max(0.0, rawPw) + eps;
+            double ph = Math.Max(0.0, rawPh) + eps;
+            double tw = Math.Max(0.0, tx2 - tx1) + eps;
+            double th = Math.Max(0.0, ty2 - ty1) + eps;
+
+            double atanDiff = Math.Atan(tw / th) - Math.Atan(pw / ph);
+            double rss = pw * pw + ph * ph;
+
+            double dvdPw = 2.0 * fourOverPiSq * atanDiff * -(ph / rss);
+            double dvdPh = 2.0 * fourOverPiSq * atanDiff * (pw / rss);
+
+            // ReLU indicators: d(relu(px2-px1))/d(px2) = 1 only where the width is positive.
+            double wOn = rawPw > 0 ? 1.0 : 0.0;
+            double hOn = rawPh > 0 ? 1.0 : 0.0;
+
+            double go = numOps.ToDouble(gradOutput[i]);
+            gradPred[o] = numOps.FromDouble(go * dvdPw * -wOn);
+            gradPred[o + 1] = numOps.FromDouble(go * dvdPh * -hOn);
+            gradPred[o + 2] = numOps.FromDouble(go * dvdPw * wOn);
+            gradPred[o + 3] = numOps.FromDouble(go * dvdPh * hOn);
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, predicted, new Tensor<T>(gradPred, new[] { n, 4 }), engine);
+    }
+
     /// <summary>GIoU loss backward: IoU gradient + enclosing area penalty gradient.</summary>
+    /// <remarks>
+    /// TIE-BREAKING: every predicted-vs-target comparison here includes equality, matching CpuEngine's
+    /// decomposition. That path builds these terms from TensorMax nodes, and MaxBackward computes
+    /// aMask = 1 - sign(|output - a|), so at a == b the FULL gradient goes to inputs[0] and none to
+    /// inputs[1] — the first argument wins ties. Predicted is always inputs[0] (min(p,t) is built as
+    /// -max(-p,-t), so predicted stays first there too), hence predicted wins every tie. Strict > and <
+    /// gave ZERO at a tie and disagreed with the decomposition. Box corners share coordinates constantly
+    /// once they are integer-valued, so this is routine rather than an edge case.
+    /// </remarks>
     internal static void GIoULossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
@@ -3298,10 +3565,10 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             var dI = new T[4];
-            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
             var dU = new T[] {
                 numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
                 numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
@@ -3319,10 +3586,10 @@ internal static class BackwardFunctions<T>
             var encASq = numOps.Multiply(encA, encA);
 
             var dEncA = new T[4];
-            dEncA[0] = numOps.Multiply(numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, encH);
-            dEncA[1] = numOps.Multiply(numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, encW);
-            dEncA[2] = numOps.Multiply(numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, encH);
-            dEncA[3] = numOps.Multiply(numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, encW);
+            dEncA[0] = numOps.Multiply(numOps.ToDouble(px1) <= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, encH);
+            dEncA[1] = numOps.Multiply(numOps.ToDouble(py1) <= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, encW);
+            dEncA[2] = numOps.Multiply(numOps.ToDouble(px2) >= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, encH);
+            dEncA[3] = numOps.Multiply(numOps.ToDouble(py2) >= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, encW);
 
             // GIoU penalty = (U - encA) / encA → d/d(coord) = -(dU*encA - U*dEncA)/encA^2
             var go = gradOutput[i];
@@ -3372,10 +3639,10 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             var dI = new T[4];
-            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
             var dU = new T[] {
                 numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
                 numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
@@ -3399,10 +3666,10 @@ internal static class BackwardFunctions<T>
 
             var two = numOps.FromDouble(2.0);
             var dCSq = new T[4];
-            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
-            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
+            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) <= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) <= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) >= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
+            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) >= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
 
             var go = gradOutput[i];
             for (int c = 0; c < 4; c++)
@@ -3452,10 +3719,10 @@ internal static class BackwardFunctions<T>
             var hi = hasIntersection ? numOps.One : numOps.Zero;
 
             var dI = new T[4];
-            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
-            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
-            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
-            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) >= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) >= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) <= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) <= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
             var dU = new T[] {
                 numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
                 numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
@@ -3476,10 +3743,10 @@ internal static class BackwardFunctions<T>
             var cSqSq = numOps.Multiply(cSq, cSq);
             var two = numOps.FromDouble(2.0);
             var dCSq = new T[4];
-            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
-            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
-            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
+            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) <= numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) <= numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) >= numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
+            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) >= numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
 
             // Aspect ratio penalty: v = (4/pi^2) * (atan(tw/th) - atan(pw/ph))^2
             double piSq = Math.PI * Math.PI;
@@ -3819,6 +4086,20 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>MaxPool3D backward with tensor-resident flat spatial indices.</summary>
+    internal static void MaxPool3DTensorIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var maxIndices = (Tensor<int>)savedState[0];
+        var inputShape = inputs[0]._shape;
+        var poolSize = (int[])savedState[1];
+        var stride = (int[])savedState[2];
+        var grad = engine.MaxPool3DBackwardWithTensorIndices(
+            gradOutput, maxIndices, inputShape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>DepthwiseConv2D backward via engine backward helpers</summary>
     internal static void DepthwiseConv2DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4061,6 +4342,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>ReduceMax backward with tensor-resident relative argmax positions.</summary>
+    internal static void ReduceMaxTensorIndicesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var maxIndices = (Tensor<int>)savedState[0];
+        var axes = (int[])savedState[1];
+        var grad = engine.ReduceMaxBackwardWithTensorIndices(
+            gradOutput, maxIndices, inputs[0]._shape, axes);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>ReduceVariance backward via engine</summary>
     internal static void ReduceVarianceBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4132,8 +4425,18 @@ internal static class BackwardFunctions<T>
             : (int[])savedState[0];
         var axis = (int)savedState[1];
 
-        // dL/dinput = gradOutput with scattered positions zeroed
-        var gradInput = gradOutput.Clone();
+        // dL/dinput = gradOutput with scattered positions zeroed.
+        //
+        // FRESH allocation, NOT gradOutput.Clone(): Clone() shares gradOutput's TensorStorage
+        // copy-on-write, and the privatised buffer is pool-backed, so it is recycled when the backward
+        // scope ends while the grads dictionary still references it — the stored gradient silently
+        // becomes zeros. Same defect fixed in MaskedScatter/IndexFill/IndexCopy.
+        var gradInput = new Tensor<T>(gradOutput._shape);
+        {
+            var scSrc = gradOutput.AsSpan();
+            var scDst = gradInput.AsWritableSpan();
+            for (int i = 0; i < scSrc.Length; i++) scDst[i] = scSrc[i];
+        }
         var gradInputData = gradInput.GetDataArray();
         var inputShape = inputs[0]._shape;
         int axisSize = inputShape[axis];
@@ -4209,6 +4512,9 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var two = numOps.FromDouble(2.0);
+        // See AlignGradRank: same rank-0-operand / rank-1-seed hazard as the other elementwise
+        // backwards. Found by sweeping all 245 backward functions for this pattern.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
         var gradReal = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[0]), two);
         var gradImag = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[1]), two);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradReal, engine);
@@ -4233,6 +4539,30 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // TensorBatchOuterProduct shares this backward with the unbatched TensorOuterProduct, but only the
+        // unbatched shapes were ever handled. Batched: a is [B,M], b is [B,N], grad is [B,M,N]. Flattening b
+        // to [B*N,1] collapses the batch dimension, so the matmul threw
+        // "last dim of a is 5, first dim of b is 20" for a=[4,3], b=[4,5].
+        //
+        // Batched gradients, from out[b,i,j] = a[b,i] * b[b,j]:
+        //   da[b,i] = sum_j grad[b,i,j] * b[b,j]      -> broadcast b as [B,1,N], reduce axis 2
+        //   db[b,j] = sum_i grad[b,i,j] * a[b,i]      -> broadcast a as [B,M,1], reduce axis 1
+        if (gradOutput.Rank == 3 && inputs[0].Rank == 2 && inputs[1].Rank == 2)
+        {
+            int batch = inputs[0]._shape[0];
+            int m = inputs[0]._shape[1];
+            int n = inputs[1]._shape[1];
+
+            var bBroadcast = inputs[1].Reshape(new[] { batch, 1, n });
+            var dA = engine.ReduceSum(engine.TensorBroadcastMultiply(gradOutput, bBroadcast), new[] { 2 });
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], dA.Reshape(inputs[0]._shape), engine);
+
+            var aBroadcast = inputs[0].Reshape(new[] { batch, m, 1 });
+            var dB = engine.ReduceSum(engine.TensorBroadcastMultiply(gradOutput, aBroadcast), new[] { 1 });
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], dB.Reshape(inputs[1]._shape), engine);
+            return;
+        }
+
         // grad is [M, N], a is [M], b is [N]
         // da = sum(grad * b_broadcast, axis=1) = grad @ b
         var gradA = engine.TensorMatMul(gradOutput, inputs[1].Reshape(new[] { inputs[1].Length, 1 }));
@@ -4265,9 +4595,16 @@ internal static class BackwardFunctions<T>
     {
         // Each input gets its own copy of gradOutput to prevent AccumulateGrad
         // from mutating a shared tensor via TensorAddInPlace
+        // Every input gets its OWN fresh copy — including the first. Handing gradOutput itself to
+        // input[0] aliases the upstream gradient into the grads dictionary, and Clone() for the rest
+        // shares its storage copy-on-write over a pool-backed buffer that is recycled once the backward
+        // scope ends. Both leave a gradient that can be mutated or zeroed after the fact.
         for (int i = 0; i < inputs.Length; i++)
         {
-            var grad = i == 0 ? gradOutput : gradOutput.Clone();
+            var grad = new Tensor<T>(gradOutput._shape);
+            var amSrc = gradOutput.AsSpan();
+            var amDst = grad.AsWritableSpan();
+            for (int k = 0; k < amSrc.Length; k++) amDst[k] = amSrc[k];
             DifferentiableOps.AccumulateGrad(grads, inputs[i], grad, engine);
         }
     }
@@ -4514,8 +4851,14 @@ internal static class BackwardFunctions<T>
             // gradient tensors).
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradInputArr = (float[])(object)inputGrad.GetDataArray();
-            var gradWeightArr = (float[])(object)weightGrad.GetDataArray();
+            var gradInputArr = (float[])(object)(
+                inputGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear float input-gradient buffer must be a contiguous CPU tensor."));
+            var gradWeightArr = (float[])(object)(
+                weightGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear float weight-gradient buffer must be a contiguous CPU tensor."));
 
             bool used = false;
 
@@ -4552,7 +4895,10 @@ internal static class BackwardFunctions<T>
             if (inputs.Length > 2)
             {
                 var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var biasArr = (float[])(object)biasGrad.GetDataArray();
+                var biasArr = (float[])(object)(
+                    biasGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "FusedLinear float bias-gradient buffer must be a contiguous CPU tensor."));
                 Array.Clear(biasArr, 0, N);
                 fixed (float* pG = gArr, pB = biasArr)
                 {
@@ -4592,8 +4938,14 @@ internal static class BackwardFunctions<T>
 
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradInputArr = (double[])(object)inputGrad.GetDataArray();
-            var gradWeightArr = (double[])(object)weightGrad.GetDataArray();
+            var gradInputArr = (double[])(object)(
+                inputGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear double input-gradient buffer must be a contiguous CPU tensor."));
+            var gradWeightArr = (double[])(object)(
+                weightGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear double weight-gradient buffer must be a contiguous CPU tensor."));
 
             // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W stored [K,N] (ldb=N), transB=true.
             bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
@@ -4614,7 +4966,10 @@ internal static class BackwardFunctions<T>
             if (inputs.Length > 2)
             {
                 var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var biasArr = (double[])(object)biasGrad.GetDataArray();
+                var biasArr = (double[])(object)(
+                    biasGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "FusedLinear double bias-gradient buffer must be a contiguous CPU tensor."));
                 Array.Clear(biasArr, 0, N);
                 for (int row = 0; row < M; row++)
                 {
@@ -5608,7 +5963,20 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
 
         // dL/d(input): clone gradOutput, zero the overwritten positions.
-        var grad = (Tensor<T>)gradOutput.Clone();
+            // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
+            // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
+            // gets recycled once the backward scope ends — while the grads dictionary still holds a
+            // REFERENCE to it. The gradient was measured correct at every step (correct entering
+            // AccumulateGrad, correctly stored on the existing==null branch) and then read back as all
+            // zeros, because the buffer had been reclaimed underneath it. Building a fresh tensor and
+            // copying is what the sibling source-gradient path in MaskedScatterBackward already did, which
+            // is exactly why that one always survived while this one did not.
+        var grad = new Tensor<T>(gradOutput._shape);
+        {
+            var srcSpan0 = gradOutput.AsSpan();
+            var dstSpan0 = grad.AsWritableSpan();
+            for (int i = 0; i < srcSpan0.Length; i++) dstSpan0[i] = srcSpan0[i];
+        }
         var dst = grad.AsWritableSpan();
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -5661,7 +6029,20 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        var grad = (Tensor<T>)gradOutput.Clone();
+            // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
+            // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
+            // gets recycled once the backward scope ends — while the grads dictionary still holds a
+            // REFERENCE to it. The gradient was measured correct at every step (correct entering
+            // AccumulateGrad, correctly stored on the existing==null branch) and then read back as all
+            // zeros, because the buffer had been reclaimed underneath it. Building a fresh tensor and
+            // copying is what the sibling source-gradient path in MaskedScatterBackward already did, which
+            // is exactly why that one always survived while this one did not.
+        var grad = new Tensor<T>(gradOutput._shape);
+        {
+            var srcSpan0 = gradOutput.AsSpan();
+            var dstSpan0 = grad.AsWritableSpan();
+            for (int i = 0; i < srcSpan0.Length; i++) dstSpan0[i] = srcSpan0[i];
+        }
         var dst = grad.AsWritableSpan();
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -5734,8 +6115,21 @@ internal static class BackwardFunctions<T>
         var mask = (Tensor<Bit>)savedState[0];
         var ops = MathHelper.GetNumericOperations<T>();
 
-        // dL/d(input): clone gradOutput, zero masked positions.
-        var inputGrad = (Tensor<T>)gradOutput.Clone();
+        // dL/d(input): copy gradOutput into a fresh tensor, then zero masked positions.
+            // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
+            // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
+            // gets recycled once the backward scope ends — while the grads dictionary still holds a
+            // REFERENCE to it. The gradient was measured correct at every step (correct entering
+            // AccumulateGrad, correctly stored on the existing==null branch) and then read back as all
+            // zeros, because the buffer had been reclaimed underneath it. Building a fresh tensor and
+            // copying is what the sibling source-gradient path in MaskedScatterBackward already did, which
+            // is exactly why that one always survived while this one did not.
+            var inputGrad = new Tensor<T>(gradOutput._shape);
+        {
+            var srcSpan = gradOutput.AsSpan();
+            var dstSpan = inputGrad.AsWritableSpan();
+            for (int i = 0; i < srcSpan.Length; i++) dstSpan[i] = srcSpan[i];
+        }
         var inputDst = inputGrad.AsWritableSpan();
         var maskSpan = mask.AsSpan();
         var go = gradOutput.AsSpan();
@@ -6521,6 +6915,49 @@ internal static class BackwardFunctions<T>
                             gTheta[tBase + row * 4 + 2] = numOps.Add(gTheta[tBase + row * 4 + 2], numOps.FromDouble(g * z));
                             gTheta[tBase + row * 4 + 3] = numOps.Add(gTheta[tBase + row * 4 + 3], numOps.FromDouble(g));
                         }
+                    }
+                }
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, theta, gradTheta, engine);
+    }
+
+    /// <summary>
+    /// AffineGrid (2D) backward — the output grid is linear in theta, so
+    /// ∂grid[n,h,w,r] / ∂theta[n,r,k] = coord_k(h,w) for k ∈ {x, y, 1}.
+    /// Sum the product over all (h, w) to get gradTheta[n, r, k]. Coordinate
+    /// normalization mirrors the forward (align-corners style: 2·i/(size-1) − 1).
+    /// </summary>
+    internal static void AffineGridBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var theta = inputs[0];
+        int outH = (int)savedState[0];
+        int outW = (int)savedState[1];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int N = theta._shape[0];
+        var gradTheta = new Tensor<T>(theta._shape);
+        var gOut = gradOutput.AsSpan();
+        var gTheta = gradTheta.AsWritableSpan();
+
+        for (int n = 0; n < N; n++)
+        {
+            int tBase = n * 6; // 2 × 3 affine matrix
+            for (int h = 0; h < outH; h++)
+            {
+                double y = outH <= 1 ? 0.0 : 2.0 * h / (outH - 1) - 1.0;
+                for (int w = 0; w < outW; w++)
+                {
+                    double x = outW <= 1 ? 0.0 : 2.0 * w / (outW - 1) - 1.0;
+                    int gBase = ((n * outH + h) * outW + w) * 2;
+                    for (int row = 0; row < 2; row++)
+                    {
+                        double g = numOps.ToDouble(gOut[gBase + row]);
+                        if (g == 0) continue;
+                        gTheta[tBase + row * 3]     = numOps.Add(gTheta[tBase + row * 3],     numOps.FromDouble(g * x));
+                        gTheta[tBase + row * 3 + 1] = numOps.Add(gTheta[tBase + row * 3 + 1], numOps.FromDouble(g * y));
+                        gTheta[tBase + row * 3 + 2] = numOps.Add(gTheta[tBase + row * 3 + 2], numOps.FromDouble(g));
                     }
                 }
             }

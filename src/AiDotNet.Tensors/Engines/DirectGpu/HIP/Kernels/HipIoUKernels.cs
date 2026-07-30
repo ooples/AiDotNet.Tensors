@@ -140,9 +140,11 @@ extern ""C"" __global__ void ciou_loss(
     float encX2 = max_f(px2,tx2), encY2 = max_f(py2,ty2);
     float encDx = encX2-encX1, encDy = encY2-encY1;
     float diagSq = encDx*encDx + encDy*encDy + 1e-7f;
-    // Aspect ratio
-    float predW = px2-px1+1e-7f, predH = py2-py1+1e-7f;
-    float targW = tx2-tx1+1e-7f, targH = ty2-ty1+1e-7f;
+    // Aspect ratio. Clamp width/height positive so degenerate boxes (x2<x1 or
+    // y2<y1) cannot yield a negative ratio whose atan spans far past [0,pi/2),
+    // inflating v beyond its [0,1] bound and diverging from the CPU ReLU clamp.
+    float predW = max_f(px2-px1, 1e-7f), predH = max_f(py2-py1, 1e-7f);
+    float targW = max_f(tx2-tx1, 1e-7f), targH = max_f(ty2-ty1, 1e-7f);
     float rDiff = atanf(targW/targH) - atanf(predW/predH);
     float v = (4.0f / (3.14159265f * 3.14159265f)) * rDiff * rDiff;
     float alpha = v / (1.0f - iou + v + 1e-7f);
@@ -391,7 +393,7 @@ extern ""C"" __global__ void ciou_loss_backward(
 
     // Aspect ratio: v = (4/π²) * (atan(tw/th) - atan(pw/ph))²
     float pw=max_f(px2-px1, 1e-7f), ph=max_f(py2-py1, 1e-7f);
-    float tw=tx2-tx1+1e-7f, th=ty2-ty1+1e-7f;
+    float tw=max_f(tx2-tx1, 1e-7f), th=max_f(ty2-ty1, 1e-7f);
     float atanDiff = atanf(tw/th) - atanf(pw/ph);
     float fourOverPiSq = 4.0f / (3.14159265f * 3.14159265f);
     float v = fourOverPiSq * atanDiff * atanDiff;

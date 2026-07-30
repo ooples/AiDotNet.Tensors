@@ -196,6 +196,100 @@ public class WeightRegistryBf16StoreTests
         finally { Cleanup(dir); }
     }
 
+    // ── RAM-aware Auto (inference): step bf16 → int8 → int4 to fit the resident cap ──────────
+    // Registers ONE rank-2 weight of `shape` under Auto+inference with the given whole-model
+    // footprint + resident cap, and returns its chosen store encoding. Auto compares the
+    // footprint at each precision (÷2 bf16, ÷4 int8, ÷8 int4) to the cap and picks the
+    // highest-fidelity tier that fits.
+    private static byte AutoInferenceEncoding(int[] shape, long footprintBytes, long capBytes)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-autoram-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = capBytes,
+            ExpectedStreamingFootprintBytes = footprintBytes,
+            StreamingStoreDtype = StreamingStoreDtype.Auto,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false); // inference (read-only weights)
+        try
+        {
+            long n = 1L;
+            foreach (var d in shape) n *= d;
+            var t = new Tensor<float>(shape);
+            for (int i = 0; i < n; i++) t[i] = (float)Math.Sin(i * 0.001) * 0.05f;
+            t.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(t);
+            return t.StreamingStoreEncoding;
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void Auto_Inference_RamAware_KeepsBf16_WhenModelFitsAtBf16()
+    {
+        // footprint/2 (bf16) = 5,000 <= cap 8,000 → bf16 keeps its higher fidelity. A large weight
+        // is NOT stepped down just because it's large — only when bf16 would overflow the cap.
+        Assert.Equal(StreamingEncoding.Bf16, AutoInferenceEncoding(new[] { 256, 128 }, footprintBytes: 10_000, capBytes: 8_000));
+    }
+
+    [Fact]
+    public void Auto_Inference_RamAware_StepsToInt8_WhenBf16Overflows_ButInt8Fits()
+    {
+        // bf16 (÷2 = 4,000) > cap 2,500, but int8 (÷4 = 2,000) <= 2,500 → int8 for the large weight.
+        Assert.Equal(StreamingEncoding.Int8, AutoInferenceEncoding(new[] { 256, 128 }, footprintBytes: 8_000, capBytes: 2_500));
+    }
+
+    [Fact]
+    public void Auto_Inference_RamAware_StepsToInt4_WhenInt8AlsoOverflows()
+    {
+        // bf16 (4,000) and int8 (2,000) both > cap 1,000 → int4 (÷8 = 1,000, the most aggressive rung).
+        Assert.Equal(StreamingEncoding.Int4, AutoInferenceEncoding(new[] { 256, 128 }, footprintBytes: 8_000, capBytes: 1_000));
+    }
+
+    [Fact]
+    public void Auto_Inference_RamAware_KeepsSmallAnd1DWeightsBf16_EvenUnderPressure()
+    {
+        // Same overflow regime as the int4 case, but SMALL / 1-D weights are precision-sensitive
+        // and a negligible share of the footprint, so they stay bf16 (mirrors bitsandbytes/AWQ
+        // keeping norms + biases in higher precision).
+        Assert.Equal(StreamingEncoding.Bf16, AutoInferenceEncoding(new[] { 64, 64 }, footprintBytes: 8_000, capBytes: 1_000));   // 4,096 < 16,384 elems
+        Assert.Equal(StreamingEncoding.Bf16, AutoInferenceEncoding(new[] { 65_536 }, footprintBytes: 8_000, capBytes: 1_000));  // rank 1 (bias/norm)
+    }
+
+    [Fact]
+    public void Auto_Inference_NoFootprintHint_StaysBf16()
+    {
+        // No ExpectedStreamingFootprintBytes (0) → behaviour unchanged: bf16 regardless of cap.
+        Assert.Equal(StreamingEncoding.Bf16, AutoInferenceEncoding(new[] { 256, 128 }, footprintBytes: 0, capBytes: 1_000));
+    }
+
+    [Fact]
+    public void Auto_Training_StaysLossless_EvenWhenFootprintOverflowsCap()
+    {
+        // Even under the exact memory pressure that drives inference to int4, TRAINING must stay
+        // LOSSLESS: the quantized tiers' eviction write-back is native-only, so a mutated quantized
+        // master would silently lose its update. Correctness beats the extra compression here.
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-autotrain-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1_000,
+            ExpectedStreamingFootprintBytes = 8_000,
+            StreamingStoreDtype = StreamingStoreDtype.Auto,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(true); // training
+        try
+        {
+            var t = new Tensor<float>(new[] { 256, 128 });
+            for (int i = 0; i < 256 * 128; i++) t[i] = (float)Math.Sin(i * 0.001) * 0.05f;
+            t.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(t);
+            Assert.Equal(StreamingEncoding.Lossless, t.StreamingStoreEncoding);
+        }
+        finally { Cleanup(dir); }
+    }
+
     private static void Cleanup(string dir)
     {
         WeightRegistry.SetStreamingExecutionTraining(null);

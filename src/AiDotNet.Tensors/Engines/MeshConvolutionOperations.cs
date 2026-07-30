@@ -175,8 +175,7 @@ public static class MeshConvolutionOperations
         int gatheredSize = inputChannels * spiralLength;
 
         var inputGrad = new T[numVertices * inputChannels];
-        var gradLocks = new object[numVertices];
-        for (int i = 0; i < numVertices; i++) gradLocks[i] = new object();
+        // Per-vertex gradient accumulation via the shared striped lock pool (no per-call alloc).
 
         var gradData = outputGradient.ToArray();
         var indicesData = spiralIndices.ToArray();
@@ -245,7 +244,7 @@ public static class MeshConvolutionOperations
 
                 if (neighborIdx >= 0 && neighborIdx < numVertices)
                 {
-                    lock (gradLocks[neighborIdx])
+                    lock (ScatterLockPool.For(neighborIdx))
                     {
                         for (int c = 0; c < inputChannels; c++)
                         {
@@ -282,8 +281,7 @@ public static class MeshConvolutionOperations
         int gatheredSize = inputChannels * spiralLength;
 
         var weightGrad = new T[outputChannels * gatheredSize];
-        var weightLocks = new object[outputChannels];
-        for (int i = 0; i < outputChannels; i++) weightLocks[i] = new object();
+        // Per-output-channel weight-gradient accumulation via the shared striped lock pool (no per-call alloc).
 
         var gradData = outputGradient.ToArray();
         var vertexData = vertexFeatures.ToArray();
@@ -315,7 +313,7 @@ public static class MeshConvolutionOperations
                 T grad = gradData[v * outputChannels + oc];
                 int weightRowOffset = oc * gatheredSize;
 
-                lock (weightLocks[oc])
+                lock (ScatterLockPool.For(oc))
                 {
                     // Use SIMD for gradient accumulation
                     int simdWidth = System.Numerics.Vector<float>.Count;

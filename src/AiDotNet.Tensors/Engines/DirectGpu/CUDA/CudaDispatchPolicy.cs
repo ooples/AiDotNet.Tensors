@@ -15,12 +15,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>PerformanceProfiler.Instance.GetStats("Conv2D.cuDNN")</c> that the
 /// vendor path actually ran.</para>
 ///
-/// <para>The actual vendor dispatch (calling cudnnConvolutionForward on
-/// GPU buffers) is tracked in a follow-up; today the CudaBackend Conv2D
-/// / BatchNorm methods still run their hand-written kernels. The
-/// dispatch-label scope + availability helpers are here so that path can
-/// be plugged in later with a single <c>if (UseCudnn) ... else ...</c>
-/// check without further wiring.</para>
+/// <para>Dispatch status (verified against CudaBackend on an NVIDIA + cuDNN
+/// host, AiDotNet#1159):
+/// <list type="bullet">
+/// <item><b>Conv2D</b> — routes to cuDNN (<c>cudnnConvolutionForward</c> on GPU
+/// buffers via <c>CuDnnConvolution.Conv2DForwardGpu</c>) when
+/// <see cref="UseCudnnForConv"/>; otherwise the generic Winograd/tiled/im2col
+/// kernel.</item>
+/// <item><b>MatMul / GEMM</b> — always routes to cuBLAS (<c>cublasSgemm</c>);
+/// the scope is labelled <c>"MatMul.cuBLAS"</c> unconditionally.</item>
+/// <item><b>BatchNorm</b> — routes to cuDNN
+/// (<c>cudnnBatchNormalizationForwardTraining</c> in training,
+/// <c>...ForwardInference</c> in eval, on GPU buffers via
+/// <c>CuDnnBatchNorm.ForwardTrainingGpu</c>/<c>ForwardInferenceGpu</c>) when
+/// <see cref="UseCudnnForBatchNorm"/>; otherwise the hand-written
+/// <c>batchnorm_forward</c> kernel. Both paths accumulate the UNBIASED
+/// (Bessel-corrected) running variance — the paper-faithful estimator
+/// (Ioffe &amp; Szegedy 2015 §3.1) — while normalizing the current batch with the
+/// biased variance; the CUDA/HIP/OpenCL hand-written kernels were aligned to
+/// cuDNN so the two dispatch paths agree.</item>
+/// </list></para>
 /// </summary>
 internal static class CudaDispatchPolicy
 {

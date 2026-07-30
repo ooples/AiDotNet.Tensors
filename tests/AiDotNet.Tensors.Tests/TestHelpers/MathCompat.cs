@@ -180,5 +180,49 @@ namespace AiDotNet.Tensors.Tests.TestHelpers
         }
 
         #endregion
+
+        #region Float bit helpers (net471-safe reinterpret + BitDecrement)
+
+        /// <summary>Reinterprets a float's bits as an int (BitConverter.SingleToInt32Bits is net-core-only).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int SingleToInt32Bits(float value)
+        {
+#if NET5_0_OR_GREATER
+            return BitConverter.SingleToInt32Bits(value);
+#else
+            return BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
+#endif
+        }
+
+        /// <summary>Reinterprets an int's bits as a float (BitConverter.Int32BitsToSingle is net-core-only).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Int32BitsToSingle(int value)
+        {
+#if NET5_0_OR_GREATER
+            return BitConverter.Int32BitsToSingle(value);
+#else
+            return BitConverter.ToSingle(BitConverter.GetBytes(value), 0);
+#endif
+        }
+
+        /// <summary>Returns the largest float strictly less than <paramref name="x"/>
+        /// (float.BitDecrement is net7+ generic-math only). Faithful IEEE-754 polyfill for net471.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float BitDecrement(float x)
+        {
+#if NET5_0_OR_GREATER
+            return MathF.BitDecrement(x);
+#else
+            int bits = SingleToInt32Bits(x);
+            if ((bits & 0x7F800000) >= 0x7F800000)
+                return bits == 0x7F800000 ? float.MaxValue : x; // +Inf -> MaxValue; NaN/-Inf -> x
+            if (bits == 0)
+                return -float.Epsilon;                          // +0.0 -> -epsilon
+            bits += bits < 0 ? +1 : -1;                          // negative: away from zero; positive: toward zero
+            return Int32BitsToSingle(bits);
+#endif
+        }
+
+        #endregion
     }
 }

@@ -76,7 +76,18 @@ public static class DirectGpuBackendFactory
     /// </summary>
     public static GpuVendor DetectVendor()
     {
-        // Try OpenCL first (works on all vendors)
+        // Prefer CUDA detection FIRST. The OpenCL probe below returns the vendor of OpenCL device 0,
+        // which on a mixed-vendor box (an NVIDIA discrete GPU alongside an AMD/Intel iGPU that exposes
+        // its own OpenCL platform) can be the integrated AMD/Intel part — silently routing an
+        // NVIDIA+CUDA machine down the AMD/OpenCL fallback path (CreateAmdBackend → OpenCL) even though
+        // cuBLAS/NVRTC load fine. If the CUDA runtime is present this is an NVIDIA box; trust that and
+        // let CreateNvidiaBackend pick CUDA (its own OpenCL fallback still covers a CUDA-init failure).
+        if (CudaBackend.IsCudaAvailable)
+        {
+            return GpuVendor.NVIDIA;
+        }
+
+        // Try OpenCL next (works on all vendors)
         if (DirectOpenClContext.IsAvailable)
         {
             try
@@ -88,12 +99,6 @@ public static class DirectGpuBackendFactory
             {
                 // Fall through to other detection methods
             }
-        }
-
-        // Try CUDA (NVIDIA only)
-        if (CudaBackend.IsCudaAvailable)
-        {
-            return GpuVendor.NVIDIA;
         }
 
         // Try HIP (AMD only)

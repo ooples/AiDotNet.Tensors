@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// for qualifying FP64 shapes (Auto pack-mode), matching both the managed
 /// ForcePackBoth strategy and a naive triple-loop reference.
 /// </summary>
-[Collection("BlasManaged-Perf-Serial")]
+[Collection("BlasManaged-Stats-Serial")]
 public class MachineKernelGemmTests
 {
     private readonly ITestOutputHelper _output;

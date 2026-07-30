@@ -26,6 +26,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -37,10 +38,10 @@ public class MatrixMultiplyResidencyTests
 
     public MatrixMultiplyResidencyTests(ITestOutputHelper output) { _output = output; }
 
-    private static bool TryGetGpuEngine(out DirectGpuTensorEngine engine)
+    private static bool TryGetCudaEngine(out DirectGpuTensorEngine engine)
     {
         engine = new DirectGpuTensorEngine();
-        if (engine.IsGpuAvailable) return true;
+        if (engine.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend && cudaBackend.IsAvailable) return true;
         engine.Dispose();
         engine = null!;
         return false;
@@ -71,7 +72,7 @@ public class MatrixMultiplyResidencyTests
         // #562 regression: chained C=A·B, E=C·D inside a GpuScope must find C's
         // buffer in the activation cache for the second MatMul. Pre-fix, C was
         // downloaded after the first MatMul and re-uploaded for the second.
-        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
+        Skip.IfNot(TryGetCudaEngine(out var engine), "CUDA backend is not available.");
         using (engine)
         {
             var a = RandomFloat(64, 64, seed: 1);
@@ -116,7 +117,7 @@ AssertCloseFloat(e.AsSpan().ToArray(), eRef.AsSpan().ToArray(), absTol: 1e-2f, r
         // #561 regression: a single MatMul under GpuScope used to download
         // synchronously. Now the result is deferred, the array materializes on
         // first read, and the final value still matches CPU.
-        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
+        Skip.IfNot(TryGetCudaEngine(out var engine), "CUDA backend is not available.");
         using (engine)
         {
             var a = RandomFloat(48, 48, seed: 10);
@@ -159,7 +160,7 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         //   2. The result must match the rounded-FP32 reference within
         //      FP16-accumulation tolerance, proving correctness regardless
         //      of which backend served it.
-        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
+        Skip.IfNot(TryGetCudaEngine(out var engine), "CUDA backend is not available.");
         using (engine)
         {
             const int N = 256;
@@ -234,12 +235,16 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
     // claim isn't a trust-the-comments problem. They use [Fact] (not Theory)
     // so the output appears in the test runner. Tolerances on the assertion
     // bounds are generous (we just want "did the fix engage", not exact
-    // numbers from a specific GPU SKU).
+    // numbers from a specific GPU SKU). They are gated by
+    // AIDOTNET_RUN_PERF_TESTS so default correctness runs do not fail on
+    // wall-clock jitter.
 
     [SkippableFact]
     [Trait("Category", "CudaRequired")]
+    [Trait("Category", "Performance")]
     public void Benchmark_Fp16_VsFp32()
     {
+        PerformanceGate.SkipUnlessEnabled();
         // #560: pre-fix, FP16 MatMul hit a CPU scalar path because the GPU
         // dispatch declined (kernel-not-found / FP16-not-supported); on
         // an RTX 3080 with N=2048 that was 280s vs 195ms FP32 (1437× — the
@@ -258,7 +263,7 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         // of FP32). On tensor-core hardware FP16 should be ≤ FP32; on
         // non-tensor-core hardware (GTX 16-series) FP16 is bounded by SGEMM
         // + the small conversion overhead.
-        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
+        Skip.IfNot(TryGetCudaEngine(out var engine), "CUDA backend is not available.");
         using (engine)
         {
             const int N = 512;
@@ -300,14 +305,16 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
 
     [SkippableFact]
     [Trait("Category", "CudaRequired")]
+    [Trait("Category", "Performance")]
     public void Benchmark_ChainedGemm_InsideVsOutsideGpuScope()
     {
+        PerformanceGate.SkipUnlessEnabled();
         // #561 / #562: pre-fix, a 20-step chained N=2048 GEMM was SLOWER
         // inside BeginGpuScope() (5722 ms) than outside (4673 ms) — 0.82× —
         // because the scope's deferred-download path went unused and added
         // overhead. After the fix it should be FASTER inside (no host
         // round-trip per step).
-        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
+        Skip.IfNot(TryGetCudaEngine(out var engine), "CUDA backend is not available.");
         using (engine)
         {
             const int N = 1024;   // smaller than 2048 to keep test under ~10s

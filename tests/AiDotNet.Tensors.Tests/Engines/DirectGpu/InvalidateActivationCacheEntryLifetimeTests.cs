@@ -120,4 +120,31 @@ public class InvalidateActivationCacheEntryLifetimeTests
             AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
         }
     }
+
+    [Fact]
+    public void TryFreeActivationByKey_CacheMiss_DoesNotDropPendingMaterializer()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var method = typeof(DirectGpuTensorEngine).GetMethod(
+            "TryFreeActivationByKey", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var key = new float[4];
+        bool materializerRan = false;
+        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(key, _ => materializerRan = true);
+        try
+        {
+            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+
+            var removed = (bool)method.Invoke(engine, new object[] { key })!;
+
+            Assert.False(removed);
+            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key),
+                "A miss in the activation cache must not remove an unrelated still-valid deferred materializer.");
+            Assert.False(materializerRan);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
+        }
+    }
 }

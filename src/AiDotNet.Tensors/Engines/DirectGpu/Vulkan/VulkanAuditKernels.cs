@@ -140,13 +140,12 @@ void main() {
 }";
 
     public static string IstftFromSpectrum => @"#version 450
-#extension GL_EXT_shader_atomic_float : enable
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float specRe[]; };
 layout(set=0, binding=1) buffer B1 { float specIm[]; };
 layout(set=0, binding=2) buffer B2 { float window[]; };
-layout(set=0, binding=3) buffer B3 { uint result[]; };
-layout(set=0, binding=4) buffer B4 { uint windowSum[]; };
+layout(set=0, binding=3) buffer B3 { float result[]; };
+layout(set=0, binding=4) buffer B4 { float windowSum[]; };
 layout(push_constant) uniform PC {
     int batch;
     int numFrames;
@@ -167,12 +166,17 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFrames*nFft; if (idx >= total) return;
-    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames; int specOff = (b*numFrames + frame) * nFft;
-    float acc = 0.0;
-    for (int k = 0; k < nFft; k++) { float a = 2.0*float(M_PI)*float(k)*float(i)/float(nFft); acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
-    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int outIdx = writeStart + i;
-    if (outIdx >= 0 && outIdx < outputLength) { float w = window[i]; atomicAdd(result[b*outputLength + outIdx], acc*(1.0/float(nFft))*w); atomicAdd(windowSum[b*outputLength + outIdx], w*w); }
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*outputLength; if (idx >= total) return;
+    int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0; float windowAcc = 0.0;
+    for (int frame = 0; frame < numFrames; frame++) {
+        int writeStart = center != 0 ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        if (i >= 0 && i < nFft) {
+            int specOff = (b*numFrames + frame) * nFft; float acc = 0.0;
+            for (int k = 0; k < nFft; k++) { float a = 2.0*float(M_PI)*float(k)*float(i)/float(nFft); acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
+            float w = window[i]; resultAcc += acc*(1.0/float(nFft))*w; windowAcc += w*w;
+        }
+    }
+    result[idx] = resultAcc; windowSum[idx] = windowAcc;
 
 }";
 
@@ -359,7 +363,7 @@ float p210_lgamma(float x) {
 void main() {
 
     int i = int(gl_GlobalInvocationID.x); if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / float(bins[k]); int kIdx = int(floor((v - mn) / width)); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } int kIdx; if (v == mx) { kIdx = bins[k] - 1; } else { float width = (mx - mn) / float(bins[k]); kIdx = int(floor((v - mn) / width)); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; } linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomicAdd(hist[linIdx], 1.0);
 
 }";
@@ -391,16 +395,16 @@ float p210_lgamma(float x) {
 void main() {
 
     int idx = int(gl_GlobalInvocationID.x); int total = batch*outH*outW*C; if (idx >= total) return;
-    int c = idx % C; int tmp = idx / C; int ow = tmp % outW; tmp /= outW; int oh = tmp % outH; int b = tmp / outH;
+    int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; tmp /= outH; int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0) * 0.5 * float((H - 1)); float srcW = (gx + 1.0) * 0.5 * float((W - 1));
     if (srcH <= -1.0 || srcH >= float(H) || srcW <= -1.0 || srcW >= float(W)) return;
     int h0 = int(floor(srcH)); int h1 = h0 + 1; int w0 = int(floor(srcW)); int w1 = w0 + 1;
     float lh = srcH - float(h0); float lw = srcW - float(w0); float g = gradOut[idx];
-    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAdd(gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0-lh)*(1.0-lw));
-    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAdd(gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0-lh)*lw);
-    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAdd(gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0-lw));
-    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAdd(gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAdd(gradIn[((b*C+c)*H+h0)*W+w0], g*(1.0-lh)*(1.0-lw));
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAdd(gradIn[((b*C+c)*H+h0)*W+w1], g*(1.0-lh)*lw);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAdd(gradIn[((b*C+c)*H+h1)*W+w0], g*lh*(1.0-lw));
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAdd(gradIn[((b*C+c)*H+h1)*W+w1], g*lh*lw);
 
 }";
 
@@ -441,10 +445,10 @@ void main() {
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
         int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
         for (int c = 0; c < C; c++) {
-            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0; float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0;
-            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0; float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0;
+            float v00 = in00 ? input[((b*C+c)*H+h0)*W+w0] : 0.0; float v01 = in01 ? input[((b*C+c)*H+h0)*W+w1] : 0.0;
+            float v10 = in10 ? input[((b*C+c)*H+h1)*W+w0] : 0.0; float v11 = in11 ? input[((b*C+c)*H+h1)*W+w1] : 0.0;
             float dH = (1.0-lw)*(v10-v00) + lw*(v11-v01); float dW = (1.0-lh)*(v01-v00) + lh*(v11-v10);
-            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            float go = gradOut[((b*C+c)*outH+oh)*outW+ow];
             gradGx += go * dW * float((W-1))*0.5; gradGy += go * dH * float((H-1))*0.5;
         }
     }
@@ -648,10 +652,11 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = int(gl_GlobalInvocationID.x); int total=outerSize*idxAxis*innerSize; if (idx>=total) return;
-    int inner=idx%innerSize; int j=(idx/innerSize)%idxAxis; int outer=(idx/innerSize)/idxAxis; int dstJ=indices[j];
-    if (dstJ<0||dstJ>=dstAxis) return; float v=(mode==0)?source[idx]:fillValue;
-    output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
+    int idx = int(gl_GlobalInvocationID.x); int total=outerSize*dstAxis*innerSize; if (idx>=total) return;
+    int inner=idx%innerSize; int dstJ=(idx/innerSize)%dstAxis; int outer=(idx/innerSize)/dstAxis; int last=-1;
+    for (int j=0;j<idxAxis;j++) if (indices[j]==dstJ) last=j;
+    if (last<0) return;
+    output[idx]=(mode==0)?source[(outer*idxAxis+last)*innerSize+inner]:fillValue;
 
 }";
 
@@ -769,6 +774,40 @@ void main() {
     int up=((i&k)==0); if (descending!=0) up=!up; int doSwap=up?(ka>kb):(ka<kb);
     if (doSwap) { values[base+i]=b; values[base+ixj]=a; float t=indices[base+i]; indices[base+i]=indices[base+ixj]; indices[base+ixj]=t; }
 
+}";
+
+    /// <summary>
+    /// Packs split real/imag buffers into one interleaved [re0, im0, re1, im1, ...] buffer.
+    /// </summary>
+    /// <remarks>
+    /// Cannot be composed from CopyRows: that expresses real -> interleaved[2i] (srcRowLen 1, dstRowLen 2)
+    /// but has no destination offset, so imag -> interleaved[2i+1] is inexpressible. Hence a shader.
+    /// </remarks>
+    public static string InterleaveComplex => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float real[]; };
+layout(set=0, binding=1) buffer B1 { float imag[]; };
+layout(set=0, binding=2) buffer B2 { float interleaved[]; };
+layout(push_constant) uniform PC { int n; };
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid>=n) return;
+    interleaved[2*gid]   = real[gid];
+    interleaved[2*gid+1] = imag[gid];
+}";
+
+    /// <summary>Splits an interleaved complex buffer into separate real/imag buffers.</summary>
+    public static string DeinterleaveComplex => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float interleaved[]; };
+layout(set=0, binding=1) buffer B1 { float real[]; };
+layout(set=0, binding=2) buffer B2 { float imag[]; };
+layout(push_constant) uniform PC { int n; };
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid>=n) return;
+    real[gid] = interleaved[2*gid];
+    imag[gid] = interleaved[2*gid+1];
 }";
 
     public static string CopyRows => @"#version 450
@@ -1052,15 +1091,19 @@ void main() {
 
 }";
 
+    // RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17). Sbuf holds, per (b,h), the
+    // [d_v, d_k] state followed by the kappaHat / w / a gate vectors (GLSL has no pointers, so the
+    // sub-regions are addressed by base index).
     public static string Rwkv7Forward => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float R[]; };
-layout(set=0, binding=1) buffer B1 { float K[]; };
-layout(set=0, binding=2) buffer B2 { float V[]; };
-layout(set=0, binding=3) buffer B3 { float A[]; };
-layout(set=0, binding=4) buffer B4 { float B[]; };
-layout(set=0, binding=5) buffer B5 { float outp[]; };
-layout(set=0, binding=6) buffer B6 { float Sbuf[]; };
+layout(set=0, binding=1) buffer B1 { float KAP[]; };
+layout(set=0, binding=2) buffer B2 { float KT[]; };
+layout(set=0, binding=3) buffer B3 { float V[]; };
+layout(set=0, binding=4) buffer B4 { float D[]; };
+layout(set=0, binding=5) buffer B5 { float AR[]; };
+layout(set=0, binding=6) buffer B6 { float outp[]; };
+layout(set=0, binding=7) buffer B7 { float Sbuf[]; };
 layout(push_constant) uniform PC {
     int batch;
     int seqLen;
@@ -1069,23 +1112,25 @@ layout(push_constant) uniform PC {
     int headDim;
 };
 
-#define M_PI 3.14159265358979323846
-#define P210_INF (uintBitsToFloat(0x7F800000u))
-float p210_lgamma(float x) {
-    float[9] c = float[9](0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7);
-    float xx = x - 1.0; float a = c[0]; float t = xx + 7.5;
-    for (int i = 1; i < 9; i++) a += c[i] / (xx + float(i));
-    return 0.5*log(2.0*M_PI) + (xx+0.5)*log(t) - t + log(a);
-}
-
 void main() {
 
-    int bh = int(gl_GlobalInvocationID.x); if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim; float* S=Sbuf+bh*hh;
-    for (int i=0;i<hh;i++) S[i]=0.0;
+    int bh = int(gl_GlobalInvocationID.x); if (bh>=batch*numHeads) return;
+    int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim;
+    int sB=bh*(hh+3*headDim); int khB=sB+hh; int wB=sB+hh+headDim; int aB=sB+hh+2*headDim;
+    for (int i=0;i<hh;i++) Sbuf[sB+i]=0.0;
     for (int t=0;t<seqLen;t++) {
         int baseOff=(b*seqLen+t)*modelDim+hOff;
-        for (int di=0;di<headDim;di++) { float ga=1.0/(1.0+exp(-A[baseOff+di])); float gbk=(1.0/(1.0+exp(-B[baseOff+di])))*K[baseOff+di]; int srow=di*headDim; for (int vi=0;vi<headDim;vi++) S[srow+vi]=ga*S[srow+vi]+gbk*V[baseOff+vi]; }
-        for (int di=0;di<headDim;di++) { int srow=di*headDim; float sk=0.0; for (int vi=0;vi<headDim;vi++) sk+=S[srow+vi]*K[baseOff+vi]; outp[baseOff+di]=(1.0/(1.0+exp(-R[baseOff+di])))*sk; }
+        float ss=1e-12;
+        for (int ki=0;ki<headDim;ki++) { float kp=KAP[baseOff+ki]; ss+=kp*kp; }
+        float invN=1.0/sqrt(ss);
+        for (int ki=0;ki<headDim;ki++) { Sbuf[khB+ki]=KAP[baseOff+ki]*invN; Sbuf[wB+ki]=exp(-0.60653065971263342/(1.0+exp(-D[baseOff+ki]))); Sbuf[aB+ki]=AR[baseOff+ki]; }
+        for (int vi=0;vi<headDim;vi++) {
+            int srow=sB+vi*headDim; float p=0.0;
+            for (int ki=0;ki<headDim;ki++) p+=Sbuf[srow+ki]*Sbuf[khB+ki];
+            float vv=V[baseOff+vi]; float o=0.0;
+            for (int ki=0;ki<headDim;ki++) { float sv=Sbuf[srow+ki]*Sbuf[wB+ki]-p*Sbuf[aB+ki]*Sbuf[khB+ki]+vv*KT[baseOff+ki]; Sbuf[srow+ki]=sv; o+=sv*R[baseOff+ki]; }
+            outp[baseOff+vi]=o;
+        }
     }
 
 }";

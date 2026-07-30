@@ -32,10 +32,13 @@ public class GeometryGpuParityTests : IDisposable
 
     private bool BackendImplementsGeometry()
     {
-        var backendField = typeof(DirectGpuTensorEngine).GetField(
-            "_backend",
+        // The runtime backend is _directGpu.Backend (a DirectGpuEngine), NOT the _backend field (which is
+        // null on the lazy path). Probing _backend made these parity tests silently skip everywhere.
+        var directGpuField = typeof(DirectGpuTensorEngine).GetField(
+            "_directGpu",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-        var backend = backendField?.GetValue(_gpu);
+        var directGpu = directGpuField?.GetValue(_gpu);
+        var backend = directGpu?.GetType().GetProperty("Backend")?.GetValue(directGpu);
         return backend is IGeometryBackend;
     }
 

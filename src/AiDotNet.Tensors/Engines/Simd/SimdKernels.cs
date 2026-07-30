@@ -1506,7 +1506,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Tanh — 2*sigmoid(2x)-1 with zero bounds-checking.
+        /// Pointer-based Tanh with zero bounds-checking.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void TanhUnsafe(float* input, float* output, int length)
@@ -1517,34 +1517,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 return;
 #endif
 
-            int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    // tanh(x) = 2*sigmoid(2x) - 1
-                    Avx.Store(output + i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i)))), vone));
-                    Avx.Store(output + i + 8, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 8)))), vone));
-                    Avx.Store(output + i + 16, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 16)))), vone));
-                    Avx.Store(output + i + 24, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 24)))), vone));
-                }
-            }
-            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    Avx.Store(output + i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i)))), vone));
-                }
-            }
-#endif
-            for (; i < length; i++)
+            // The former 2*FastSigmoid256(2*x)-1 path cancelled near zero and exceeded the
+            // public parity contract by hundreds of ULP. Keep VML above when available; the
+            // portable path must use libm until an equivalently accurate vector approximation exists.
+            for (int i = 0; i < length; i++)
             {
                 output[i] = MathF.Tanh(input[i]);
             }
@@ -1672,58 +1648,21 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
             }
 
-            // Polynomial fallback (no VML): fully fused single-pass, no buffer needed
-            if (Avx.IsSupported && Fma.IsSupported && length >= 32)
-            {
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
-                var vCoeff = Vector256.Create(0.044715f);
-                var vHalf = Vector256.Create(0.5f);
-                var vOne = Vector256.Create(1.0f);
-                var vTwo = Vector256.Create(2.0f);
-
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    for (int k = 0; k < 32; k += 8)
-                    {
-                        var x = Avx.LoadVector256(input + i + k);
-                        var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
-                        var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
-                        var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-                        var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
-                        Avx.Store(output + i + k, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
-                    }
-                }
-            }
-            if (Avx.IsSupported && Fma.IsSupported && length - i >= 8)
-            {
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
-                var vCoeff = Vector256.Create(0.044715f);
-                var vHalf = Vector256.Create(0.5f);
-                var vOne = Vector256.Create(1.0f);
-                var vTwo = Vector256.Create(2.0f);
-
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    var x = Avx.LoadVector256(input + i);
-                    var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
-                    var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
-                    var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-                    var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
-                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
-                }
-            }
 #endif
-            for (; i < length; i++)
-            {
-                float x = input[i];
-                float x3 = x * x * x;
-                float inner = x + 0.044715f * x3;
-                float tanh_arg = 0.7978845608028654f * inner;
-                float tanh_val = MathF.Tanh(tanh_arg);
-                output[i] = 0.5f * x * (1f + tanh_val);
-            }
+            // #775: the previous SIMD path here computed tanh via the identity
+            //   tanh(z) = 2·sigmoid(2z) − 1.
+            // Near z = 0 that subtracts a value ≈1.0 from another ≈1.0 — CATASTROPHIC
+            // CANCELLATION — so small GELU outputs (the ViT flat region) lost most of their
+            // significant bits. This kernel feeds GELUInto, i.e. the COMPILED / GraphMode
+            // training path (what #775's diverging CpuEngine training actually runs), while the
+            // EAGER GELU already used the stable x·sigmoid form (FusedGELUUnsafe, #319) — so the
+            // two CPU GELU paths silently disagreed near zero and only the compiled one drifted.
+            // The CPU-vs-GPU op-parity scaffold flagged GELU as the one ViT-path op with a large
+            // cross-engine delta; a ViT + BCE-with-logits then AMPLIFIES that small forward error
+            // into CPU training divergence. Fix: delegate to the same cancellation-free, vectorized
+            // x·sigmoid kernel the eager path uses — one GELU implementation, no near-zero drift,
+            // no vectorization loss. (Arrays ≥ 500K still take the VML erf-exact path above.)
+            if (i < length) FusedGELUUnsafe(input + i, output + i, length - i);
         }
 
         /// <summary>
@@ -1733,53 +1672,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static unsafe void MishUnsafe(float* input, float* output, int length)
         {
-            int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                var vthreshold = Vector256.Create(20.0f);
-
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    for (int k = 0; k < 32; k += 8)
-                    {
-                        var x = Avx.LoadVector256(input + i + k);
-                        // softplus(x) = ln(1 + exp(x)), or x if x > 20
-                        var expx = FastExp256(x);
-                        var softplus = FastLog256(Avx.Add(vone, expx));
-                        // For large x, softplus ≈ x (avoid log overflow)
-                        var mask = Avx.Compare(x, vthreshold, FloatComparisonMode.OrderedGreaterThanSignaling);
-                        softplus = Avx.BlendVariable(softplus, x, mask);
-                        // tanh(softplus) via 2*sigmoid(2*softplus)-1
-                        var tanh_sp = Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, softplus))), vone);
-                        // mish = x * tanh(softplus(x))
-                        Avx.Store(output + i + k, Avx.Multiply(x, tanh_sp));
-                    }
-                }
-            }
-            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
-            {
-                var vtwo = Vector256.Create(2.0f);
-                var vone = Vector256.Create(1.0f);
-                var vthreshold = Vector256.Create(20.0f);
-
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    var x = Avx.LoadVector256(input + i);
-                    var expx = FastExp256(x);
-                    var softplus = FastLog256(Avx.Add(vone, expx));
-                    var mask = Avx.Compare(x, vthreshold, FloatComparisonMode.OrderedGreaterThanSignaling);
-                    softplus = Avx.BlendVariable(softplus, x, mask);
-                    var tanh_sp = Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, softplus))), vone);
-                    Avx.Store(output + i, Avx.Multiply(x, tanh_sp));
-                }
-            }
-#endif
-            for (; i < length; i++)
+            // FastExp/FastLog plus the sigmoid tanh identity accumulated errors far beyond
+            // Mish's 64-ULP contract. Preserve the stable large-positive branch and use libm
+            // for the portable implementation until an accuracy-bounded SIMD kernel exists.
+            for (int i = 0; i < length; i++)
             {
                 float x = input[i];
                 float sp = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
@@ -6784,6 +6680,41 @@ namespace AiDotNet.Tensors.Engines.Simd
         for (; j < end; j++) dst[j] = (float)src[j];
     }
 
+#if NET8_0_OR_GREATER
+    /// <summary>True when <see cref="Fp16To32Vec8"/>'s AVX2 path is available.</summary>
+    internal static bool Fp16Vec8Supported => Avx2.IsSupported;
+
+    /// <summary>
+    /// Bit-exact AVX2 IEEE-754 decode of 8 contiguous Half bit-patterns (<paramref name="us"/> as ushort*)
+    /// into 8 floats at <paramref name="dst"/>. Same algorithm as <see cref="HalfToSingleRange"/> (validated
+    /// identical to <c>(float)Half</c> for all 65536 patterns incl. NaN-quieting); factored out so the
+    /// fused fp16-weight GEMM packer (SgemmFp16WeightB) converts during packing without a scalar pass.
+    /// Caller must ensure AVX2 (<see cref="Fp16Vec8Supported"/>) and 8 readable/writable lanes.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void Fp16To32Vec8(ushort* us, float* dst)
+    {
+        var h = Avx2.ConvertToVector256Int32(Sse2.LoadVector128(us)).AsUInt32();
+        var sign = Avx2.ShiftLeftLogical(Avx2.And(h, Vector256.Create(0x8000u)), 16);
+        var exp5 = Avx2.And(Avx2.ShiftRightLogical(h, 10), Vector256.Create(0x1Fu));
+        var mant = Avx2.And(h, Vector256.Create(0x3FFu));
+        var mantShift = Avx2.ShiftLeftLogical(mant, 13);
+        var normal = Avx2.Or(Avx2.ShiftLeftLogical(Avx2.Add(exp5, Vector256.Create(112u)), 23), mantShift);
+        var isInfNan = Avx2.CompareEqual(exp5, Vector256.Create(0x1Fu));
+        var mantIsZero = Avx2.CompareEqual(mant, Vector256<uint>.Zero);
+        var isNan = Avx2.AndNot(mantIsZero, isInfNan);
+        var quietBit = Avx2.And(isNan, Vector256.Create(0x400000u));
+        var infnan = Avx2.Or(Avx2.Or(Vector256.Create(0x7F800000u), mantShift), quietBit);
+        var denorm = Avx.Multiply(Avx.ConvertToVector256Single(mant.AsInt32()),
+                                  Vector256.Create(5.9604644775390625e-08f)).AsUInt32();
+        var isZeroDen = Avx2.CompareEqual(exp5, Vector256<uint>.Zero);
+        var notSpecial = Avx2.Xor(Avx2.Or(isInfNan, isZeroDen), Vector256<uint>.AllBitsSet);
+        var body = Avx2.Or(Avx2.Or(Avx2.And(normal, notSpecial), Avx2.And(infnan, isInfNan)),
+                           Avx2.And(denorm, isZeroDen));
+        Avx.Store(dst, Avx2.Or(sign, body).AsSingle());
+    }
+#endif
+
     /// <summary>
     /// Converts double span to float span using AVX narrowing conversion.
     /// </summary>
@@ -7711,7 +7642,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vSqrtTwoPi = Vector256.Create(sqrtTwoPi);
                 var vCoeff = Vector256.Create(coeff);
                 var vThreeCoeff = Vector256.Create(3f * coeff);
-                var vHalf = Vector256.Create(0.5f);
                 var vOne = Vector256.Create(1f);
                 var vTwo = Vector256.Create(2f);
                 int simdLength = length & ~7;
@@ -7724,17 +7654,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                     // k = sqrt(2/pi) * (x + 0.044715 * x^3)
                     var inner = Fma.MultiplyAdd(vCoeff, x3, x);
                     var k = Avx.Multiply(vSqrtTwoPi, inner);
-                    // tanh(k) using exp: tanh(k) = (exp(2k) - 1) / (exp(2k) + 1)
-                    var exp2k = ExpApprox256(Avx.Multiply(vTwo, k));
-                    var tanhK = Avx.Divide(Avx.Subtract(exp2k, vOne), Avx.Add(exp2k, vOne));
-                    // sech^2(k) = 1 - tanh^2(k)
-                    var sech2 = Avx.Subtract(vOne, Avx.Multiply(tanhK, tanhK));
+                    // #775: the derivative was evaluated with an APPROXIMATE exp (ExpApprox256) for
+                    // tanh(k) = (exp(2k)-1)/(exp(2k)+1), drifting ~0.5% from the accurate GPU builtin
+                    // tanh (op-parity scaffold flagged GeluBackward). Rewrite it via the accurate,
+                    // cancellation-free Padé sigmoid the FORWARD fix already adopted, using the exact
+                    // identities  0.5(1+tanh k) = sigmoid(2k) = σ  and  sech²(k) = 1 − tanh²(k) = 4σ(1−σ):
+                    //   dGELU/dx = σ + 0.5·x·(4σ(1−σ))·k' = σ + 2·x·σ(1−σ)·k'.
+                    var sigma = PadeSigmoid.Sigmoid8(Avx.Multiply(vTwo, k)); // σ = sigmoid(2k)
+                    var sigmaComp = Avx.Subtract(vOne, sigma);              // 1 − σ
                     // k' = sqrt(2/pi) * (1 + 3*0.044715*x^2)
                     var kPrime = Avx.Multiply(vSqrtTwoPi, Fma.MultiplyAdd(vThreeCoeff, x2, vOne));
-                    // derivative = 0.5 * (1 + tanh(k)) + 0.5 * x * sech^2(k) * k'
-                    var term1 = Avx.Multiply(vHalf, Avx.Add(vOne, tanhK));
-                    var term2 = Avx.Multiply(vHalf, Avx.Multiply(Avx.Multiply(x, sech2), kPrime));
-                    var derivative = Avx.Add(term1, term2);
+                    var term2 = Avx.Multiply(vTwo, Avx.Multiply(Avx.Multiply(x, Avx.Multiply(sigma, sigmaComp)), kPrime));
+                    var derivative = Avx.Add(sigma, term2);
                     Avx.Store(output + i, Avx.Multiply(g, derivative));
                 }
             }

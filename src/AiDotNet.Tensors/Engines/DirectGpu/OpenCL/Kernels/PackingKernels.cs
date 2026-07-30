@@ -92,6 +92,32 @@ __kernel void copy_submatrix(
 
     dst[row * dstStride + col] = src[row * srcStride + col];
 }
+
+// Gathers a 1-D strided view into a contiguous destination.
+__kernel void strided_gather(
+    __global const float* src,
+    __global float* dst,
+    const int offset,
+    const int stride,
+    const int count)
+{
+    const int idx = get_global_id(0);
+    if (idx >= count) return;
+    dst[idx] = src[offset + idx * stride];
+}
+
+// Scatters a contiguous source into a 1-D strided destination view.
+__kernel void strided_scatter(
+    __global const float* src,
+    __global float* dst,
+    const int offset,
+    const int stride,
+    const int count)
+{
+    const int idx = get_global_id(0);
+    if (idx >= count) return;
+    dst[offset + idx * stride] = src[idx];
+}
 ";
         }
 
@@ -102,7 +128,9 @@ __kernel void copy_submatrix(
                 "pad_copy",
                 "pad_copy_transpose",
                 "pad_copy_from_column_major",
-                "copy_submatrix"
+                "copy_submatrix",
+                "strided_gather",
+                "strided_scatter"
             };
         }
     }

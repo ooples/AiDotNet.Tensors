@@ -127,7 +127,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_index_write");
-        int __total = outerSize*idxAxis*innerSize; if (__total <= 0) return;
+        int __total = outerSize*dstAxis*innerSize; if (__total <= 0) return;
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -237,7 +237,7 @@ public sealed partial class MetalBackend
         encoder.SetBytes(numRows, 3);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
-    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_rwkv7_forward");
@@ -246,17 +246,18 @@ public sealed partial class MetalBackend
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer((MetalGpuBuffer)r, 0);
-        encoder.SetBuffer((MetalGpuBuffer)k, 1);
-        encoder.SetBuffer((MetalGpuBuffer)v, 2);
-        encoder.SetBuffer((MetalGpuBuffer)a, 3);
-        encoder.SetBuffer((MetalGpuBuffer)b, 4);
-        encoder.SetBuffer((MetalGpuBuffer)output, 5);
-        encoder.SetBuffer((MetalGpuBuffer)sbuf, 6);
-        encoder.SetBytes(batch, 7);
-        encoder.SetBytes(seqLen, 8);
-        encoder.SetBytes(modelDim, 9);
-        encoder.SetBytes(numHeads, 10);
-        encoder.SetBytes(headDim, 11);
+        encoder.SetBuffer((MetalGpuBuffer)kappa, 1);
+        encoder.SetBuffer((MetalGpuBuffer)kTilde, 2);
+        encoder.SetBuffer((MetalGpuBuffer)v, 3);
+        encoder.SetBuffer((MetalGpuBuffer)decayLogit, 4);
+        encoder.SetBuffer((MetalGpuBuffer)iclRate, 5);
+        encoder.SetBuffer((MetalGpuBuffer)output, 6);
+        encoder.SetBuffer((MetalGpuBuffer)sbuf, 7);
+        encoder.SetBytes(batch, 8);
+        encoder.SetBytes(seqLen, 9);
+        encoder.SetBytes(modelDim, 10);
+        encoder.SetBytes(numHeads, 11);
+        encoder.SetBytes(headDim, 12);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
@@ -424,7 +425,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_istft_from_spectrum");
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = batch*outputLength; if (__total <= 0) return;
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);

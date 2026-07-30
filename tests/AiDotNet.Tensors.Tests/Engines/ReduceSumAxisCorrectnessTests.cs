@@ -22,9 +22,24 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// reductions on a rank-3 tensor, plus rank-4 to exercise the more
 /// complex permute path that the public override falls through to.
 /// </summary>
-public class ReduceSumAxisCorrectnessTests
+/// <summary>
+/// These are CPU functional correctness tests. Pin the global engine because
+/// GPU/mock fixtures can replace AiDotNetEngine.Current in the same test process.
+/// </summary>
+[Collection("EngineCurrentGlobalState")]
+public class ReduceSumAxisCorrectnessTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    private readonly IEngine _previousEngine;
+
+    public ReduceSumAxisCorrectnessTests()
+    {
+        _previousEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
+    }
+
+    public void Dispose() => AiDotNetEngine.Current = _previousEngine;
 
     private static Tensor<float> MakeAscending(int[] shape)
     {

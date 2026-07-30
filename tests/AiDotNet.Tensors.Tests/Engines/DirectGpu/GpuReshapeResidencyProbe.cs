@@ -34,21 +34,25 @@ public sealed class GpuReshapeResidencyProbe : IDisposable
         var a = Rand(1, 64, 64);
         var b = Rand(2, 64, 64);
         var r = _gpu.TensorMatMul(a, b);
-        var rArr = r.DataVector.GetBackingArrayUnsafe();
-        Assert.NotNull(rArr);
-        bool rPending = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rArr);
+        var rVector = r.DataVector;
+        bool rPending = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rVector);
 
         var rs = r.Reshape(4096);
-        var rsArr = rs.DataVector.GetBackingArrayUnsafe();
-        bool rsPending = rsArr != null && AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rsArr);
+        var rsVector = rs.DataVector;
+        bool rsPending = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rsVector);
 
         // Emit findings so the run output answers the residency question directly.
-        Assert.True(true, "");
         System.Console.WriteLine($"[PROBE] matmul-result pending(resident)={rPending}; " +
-            $"reshape shares-backing-array={ReferenceEquals(rArr, rsArr)}; reshaped pending(resident)={rsPending}");
+            $"reshape shares-vector={ReferenceEquals(rVector, rsVector)}; reshaped pending(resident)={rsPending}");
 
+        Assert.True(r.IsGpuResident, "PRECONDITION: matmul result should be GPU-resident");
         Assert.True(rPending, "PRECONDITION: matmul result should be GPU-resident");
-        Assert.Same(rArr, rsArr);
+        Assert.False(rVector.GetBackingArrayUnsafe() is { Length: > 0 },
+            "GPU-resident matmul result allocated logical host storage.");
+        Assert.True(rs.IsGpuResident, "Reshape dropped the tensor's GPU device residency.");
+        Assert.Same(rVector, rsVector);
+        Assert.False(rsVector.GetBackingArrayUnsafe() is { Length: > 0 },
+            "Reshape allocated logical host storage.");
         Assert.True(rsPending, "Reshape forced a host download — residency NOT preserved");
     }
 }

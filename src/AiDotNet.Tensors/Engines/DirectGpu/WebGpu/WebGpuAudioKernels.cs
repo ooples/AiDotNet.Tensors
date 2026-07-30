@@ -49,7 +49,7 @@ struct P { length: i32, quantizationChannels: i32 };
 ";
 
     public static string MuLawDecoding => @"
-@group(0) @binding(0) var<storage, read> input_ : array<f32>;
+@group(0) @binding(0) var<storage, read> input_ : array<i32>;
 @group(0) @binding(1) var<storage, read_write> output_ : array<f32>;
 struct P { length: i32, quantizationChannels: i32 };
 @group(0) @binding(2) var<uniform> p : P;
@@ -59,7 +59,7 @@ struct P { length: i32, quantizationChannels: i32 };
     if (gid >= p.length) { return; }
     if (p.quantizationChannels < 2) { output_[gid] = 0.0; return; }
     let mu = f32(p.quantizationChannels - 1);
-    let q = input_[gid];
+    let q = f32(input_[gid]);
     let y = (q / mu) * 2.0 - 1.0;
     let sgn = f32(y > 0.0) - f32(y < 0.0);
     output_[gid] = sgn * (pow(1.0 + mu, abs(y)) - 1.0) / mu;

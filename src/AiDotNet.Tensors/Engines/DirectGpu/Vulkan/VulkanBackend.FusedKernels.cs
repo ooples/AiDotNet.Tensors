@@ -124,7 +124,7 @@ public sealed partial class VulkanBackend
     }
     public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
     {
-        GlslDispatchN(VulkanAuditKernels.IndexWrite, outerSize*idxAxis*innerSize,
+        GlslDispatchN(VulkanAuditKernels.IndexWrite, outerSize*dstAxis*innerSize,
             new IGpuBuffer[] { output, indices, source },
             new uint[] { FloatBits(fillValue), (uint)mode, (uint)outerSize, (uint)idxAxis, (uint)innerSize, (uint)dstAxis });
     }
@@ -164,10 +164,10 @@ public sealed partial class VulkanBackend
             new IGpuBuffer[] { idx },
             new uint[] { (uint)l, (uint)p, (uint)numRows });
     }
-    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         GlslDispatchN(VulkanAuditKernels.Rwkv7Forward, batch*numHeads,
-            new IGpuBuffer[] { r, k, v, a, b, output, sbuf },
+            new IGpuBuffer[] { r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf },
             new uint[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
     }
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
@@ -232,7 +232,7 @@ public sealed partial class VulkanBackend
     }
     public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
     {
-        GlslDispatchN(VulkanAuditKernels.IstftFromSpectrum, batch*numFrames*nFft,
+        GlslDispatchN(VulkanAuditKernels.IstftFromSpectrum, batch*outputLength,
             new IGpuBuffer[] { specRe, specIm, window, result, windowSum },
             new uint[] { (uint)batch, (uint)numFrames, (uint)nFft, (uint)hop, (uint)outputLength, (uint)center });
     }

@@ -4,12 +4,9 @@
 // and throws NotImplementedException for everything else. Sidesteps the
 // 470-member interface surface that would require a hand-written stub.
 //
-// DispatchProxy lives in System.Reflection from .NET Core 5+; it is NOT
-// available on .NET Framework, so the whole mock + its tests are gated
-// to non-Framework targets. Coverage on net10.0 is the meaningful one
-// for codecov.
-
-#if !NETFRAMEWORK
+// DispatchProxy is provided to net471 by the test project's
+// System.Reflection.DispatchProxy reference so this mock compiles on every
+// target framework the test project builds.
 #nullable disable
 
 using System;
@@ -31,6 +28,7 @@ internal sealed class MockGpuBuffer : IGpuBuffer
     public int Size => Data.Length;
     public long SizeInBytes => (long)Data.Length * sizeof(float);
     public IntPtr Handle { get; }
+    public int DisposeCount { get; private set; }
 
     public MockGpuBuffer(float[] data)
     {
@@ -41,7 +39,7 @@ internal sealed class MockGpuBuffer : IGpuBuffer
     }
 
     private static int _handleCounter;
-    public void Dispose() { }
+    public void Dispose() => DisposeCount++;
 }
 
 /// <summary>
@@ -63,9 +61,11 @@ internal sealed class MockBackendState
     public string DeviceName { get; set; } = "MockDevice";
     public string DeviceVendor { get; set; } = "Mock";
     public List<int> AllocationSizes { get; } = new();
+    public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
     public int DownloadBufferCalls { get; set; }
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
+    public List<string> OptimizerCalls { get; } = new();
 }
 
 /// <summary>
@@ -112,14 +112,18 @@ public class MockDirectGpuBackend : DispatchProxy
                 // Copy so subsequent host writes don't affect the buffer.
                 var copy = new float[arr.Length];
                 Array.Copy(arr, copy, arr.Length);
-                return new MockGpuBuffer(copy);
+                var buffer = new MockGpuBuffer(copy);
+                _state.AllocatedBuffers.Add(buffer);
+                return buffer;
             }
             case "AllocateBuffer" when args.Length == 1 && args[0] is int size:
             {
                 long bytes = (long)size * sizeof(float);
                 GpuBufferSizeGuard.EnsureFits("Mock", bytes, _state.MaxBufferAllocBytes, _state.DeviceName);
                 _state.AllocationSizes.Add(size);
-                return new MockGpuBuffer(new float[size]);
+                var buffer = new MockGpuBuffer(new float[size]);
+                _state.AllocatedBuffers.Add(buffer);
+                return buffer;
             }
             case "DownloadBuffer" when args.Length == 1:
             {
@@ -137,10 +141,44 @@ public class MockDirectGpuBackend : DispatchProxy
                 Array.Copy(b.Data, dest, b.Size);
                 return null!;
             }
+
+            // Optimizer dispatch probes. These methods are void on IDirectGpuBackend; tests
+            // verify the wrapper reached the backend and marked only the mutated tensors current.
+            case "AdamUpdate":
+            case "AdamWUpdate":
+            case "SgdUpdate":
+            case "SgdMomentumUpdate":
+            case "RmspropUpdate":
+            case "AdagradUpdate":
+            case "NagUpdate":
+            case "ProximalL1Update":
+            case "LarsUpdate":
+            case "LambUpdate":
+            case "AdadeltaUpdate":
+            case "AmsgradUpdate":
+            case "AdamaxUpdate":
+            case "LionUpdate":
+            case "NadamUpdate":
+            case "FtrlUpdate":
+            case "SparseAdamUpdate":
+            case "SparseAdamWUpdate":
+            case "SparseSgdUpdate":
+            case "SparseSgdMomentumUpdate":
+            case "SparseRmspropUpdate":
+            case "SparseAdagradUpdate":
+            case "SparseNagUpdate":
+            case "SparseAdadeltaUpdate":
+            case "SparseAmsgradUpdate":
+            case "SparseAdamaxUpdate":
+            case "SparseLionUpdate":
+            case "SparseNadamUpdate":
+            case "SparseFtrlUpdate":
+            case "SparseProximalL1Update":
+                _state.OptimizerCalls.Add(targetMethod.Name);
+                return null!;
         }
         throw new NotImplementedException(
             $"MockDirectGpuBackend does not implement {targetMethod.Name}. " +
             "Add a case in MockDirectGpuBackend.Invoke if your test exercises this op.");
     }
 }
-#endif

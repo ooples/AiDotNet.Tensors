@@ -302,7 +302,12 @@ extern ""C"" __global__ __launch_bounds__(256) void selu_backward(const float* _
     const float alpha = 1.6732632423543772848170429916717f;
     const float scale = 1.0507009873554804934193349852946f;
     float x = input[idx];
-    float grad = x > 0.0f ? scale : scale * alpha * expf(x);
+    // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)). The fix landed in the
+    // OpenCL and WebGpu kernels but was missed here, in HIP and in Metal, while this kernel's own caller in
+    // DirectGpuTensorEngine documented it as already using >=. Measured divergence at x==0 and x==-0 was
+    // 1.7E-01 / 1.8E-01 absolute (a factor of alpha), zero elsewhere. -0.0 matters: `-0.0 >= 0` is true but
+    // `-0.0 > 0` is false, so signed zero took the wrong branch too.
+    float grad = x >= 0.0f ? scale : scale * alpha * expf(x);
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
@@ -440,12 +445,14 @@ extern ""C"" __global__ __launch_bounds__(256) void threshold_backward(const flo
 // ===========================================================================
 // Reciprocal backward: d(1/x)/dx = -1/x^2
 // ===========================================================================
-extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* __restrict__ gradOutput, const float* __restrict__ output, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = input[idx];
-    gradInput[idx] = -gradOutput[idx] / (x * x);
+    // Second arg is the reciprocal OUTPUT y = 1/x (see ReciprocalBackward signature), so
+    // d/dx(1/x) = -1/x^2 = -y^2. Must MULTIPLY by y*y, not divide (matches CpuEngine.ReciprocalBackward).
+    float y = output[idx];
+    gradInput[idx] = -gradOutput[idx] * (y * y);
 }
 
 // ===========================================================================
@@ -861,11 +868,38 @@ extern ""C"" __global__ __launch_bounds__(256) void sign_vector(const float* __r
     B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void squared_deviation_from_mean(
+    const float* __restrict__ input, const float* __restrict__ mean, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float difference = input[idx] - mean[0];
+    output[idx] = difference * difference;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* __restrict__ A, float* __restrict__ B, float exponent, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = powf(A[idx], exponent);
+    float x = A[idx];
+    // This module compiles with --use_fast_math, under which powf lowers to the fast intrinsic
+    // exp2(y * log2(x)). log2 of a negative number is NaN, so powf(-2, 2) returned NaN instead of 4 —
+    // i.e. squaring any negative value produced NaN on GPU while the CPU path returned the right answer.
+    // pow(x, y) IS defined for x < 0 when y is integral, so handle that case explicitly via |x| and
+    // restore the sign from the exponent's parity. Non-integral exponents with x < 0 remain genuinely
+    // undefined and keep propagating NaN, matching the CPU/IEEE behaviour.
+    float r;
+    if (x < 0.0f && exponent == truncf(exponent))
+    {
+        float magnitude = powf(-x, exponent);
+        // Odd exponent keeps the negative sign; even exponent is positive.
+        r = (fmodf(fabsf(exponent), 2.0f) == 1.0f) ? -magnitude : magnitude;
+    }
+    else
+    {
+        r = powf(x, exponent);
+    }
+    B[idx] = r;
 }
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* __restrict__ input, float* __restrict__ output, int size)
 {
@@ -1030,86 +1064,31 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __res
 // TRIGONOMETRIC KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ __launch_bounds__(256) void sin_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = sinf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void cos_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = cosf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void tan_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = tanf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void asin_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = asinf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void acos_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = acosf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void atan_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = atanf(A[idx]);
-}
+
+
+
+
+
+
 
 // ===========================================================================
 // HYPERBOLIC KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ __launch_bounds__(256) void sinh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = sinhf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void cosh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = coshf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void asinh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = asinhf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void acosh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = acoshf(A[idx]);
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void atanh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    B[idx] = atanhf(A[idx]);
-}
+
+
+
+
+
 
 // ===========================================================================
 // ADDITIONAL UNARY KERNELS
@@ -1456,18 +1435,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "sqrt_vector",
                 "sign_vector",
                 // Trigonometric
-                "sin_vector",
-                "cos_vector",
-                "tan_vector",
-                "asin_vector",
-                "acos_vector",
-                "atan_vector",
                 // Hyperbolic
-                "sinh_vector",
-                "cosh_vector",
-                "asinh_vector",
-                "acosh_vector",
-                "atanh_vector",
                 // Additional unary
                 "reciprocal_vector",
                 "cbrt_vector",
@@ -1481,6 +1449,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "reduce_sum",
                 "reduce_max",
                 "reduce_min",
+                "squared_deviation_from_mean",
                 "sum_axis",
                 "bias_add",
                 "bias_add_out",

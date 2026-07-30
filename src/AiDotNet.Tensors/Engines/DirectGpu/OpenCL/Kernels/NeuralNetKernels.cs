@@ -442,506 +442,6 @@ __kernel void smooth_l1_backward(
     gradInput[idx] = grad / (float)size;
 }
 
-// ===========================================================================
-// OPTIMIZER KERNELS
-// ===========================================================================
-
-// SGD with momentum update
-__kernel void sgd_momentum_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* velocity,
-    const float learningRate,
-    const float momentum,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    float v = momentum * velocity[idx] + grad;
-    velocity[idx] = v;
-    param[idx] -= learningRate * v;
-}
-
-// Adam optimizer update
-__kernel void adam_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* v,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const int step,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-
-    // Update biased first moment estimate
-    float m_new = beta1 * m[idx] + (1.0f - beta1) * grad;
-    m[idx] = m_new;
-
-    // Update biased second moment estimate
-    float v_new = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
-    v[idx] = v_new;
-
-    // Bias correction - guard against step==0 which causes division by zero
-    // Step should always be >= 1; if step==0, use step==1 to avoid NaN/Inf
-    int safe_step = step < 1 ? 1 : step;
-    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
-    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
-
-    // Update parameters
-    float update = learningRate * m_hat / (sqrt(v_hat) + epsilon);
-    if (weightDecay > 0.0f) {
-        update += learningRate * weightDecay * param[idx];
-    }
-    param[idx] -= update;
-}
-
-// AdamW optimizer update (decoupled weight decay)
-__kernel void adamw_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* v,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const int step,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-
-    // Decoupled weight decay (applied directly to params, not gradients)
-    if (weightDecay > 0.0f) {
-        param[idx] *= (1.0f - learningRate * weightDecay);
-    }
-
-    // Update biased first moment estimate
-    float m_new = beta1 * m[idx] + (1.0f - beta1) * grad;
-    m[idx] = m_new;
-
-    // Update biased second moment estimate
-    float v_new = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
-    v[idx] = v_new;
-
-    // Bias correction - guard against step==0 which causes division by zero
-    // Step should always be >= 1; if step==0, use step==1 to avoid NaN/Inf
-    int safe_step = step < 1 ? 1 : step;
-    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
-    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
-
-    // Update parameters
-    param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
-}
-
-// RMSprop optimizer update
-__kernel void rmsprop_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* squaredAvg,
-    const float learningRate,
-    const float rho,
-    const float epsilon,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    // Update moving average of squared gradients
-    float sqAvg = rho * squaredAvg[idx] + (1.0f - rho) * grad * grad;
-    squaredAvg[idx] = sqAvg;
-
-    // Update parameters
-    param[idx] -= learningRate * grad / (sqrt(sqAvg) + epsilon);
-}
-
-// Adagrad optimizer update
-__kernel void adagrad_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* accumulatedGrad,
-    const float learningRate,
-    const float epsilon,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    // Accumulate squared gradients
-    float accum = accumulatedGrad[idx] + grad * grad;
-    accumulatedGrad[idx] = accum;
-
-    // Update parameters
-    param[idx] -= learningRate * grad / (sqrt(accum) + epsilon);
-}
-
-// Nesterov Accelerated Gradient (NAG) optimizer update
-__kernel void nag_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* velocity,
-    const float learningRate,
-    const float momentum,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    // Nesterov momentum (Sutskever-style NAG)
-    // Note: Caller should compute gradient at lookahead position (theta + mu * v) for true NAG
-    float v = velocity[idx];
-    float vNew = momentum * v - learningRate * grad;
-    velocity[idx] = vNew;
-
-    // NAG update - apply velocity directly
-    // vNew already incorporates momentum and gradient, no double-counting
-    param[idx] += vNew;
-}
-
-// LARS (Layer-wise Adaptive Rate Scaling) optimizer update
-// Note: LARS applies trustCoeff to scale the learning rate adaptively per layer.
-// The trustCoeff should be pre-computed as: trustCoeff * ||w|| / (||grad|| + ||w|| * weightDecay)
-// Set trustCoeff=1.0f to disable trust coefficient scaling.
-__kernel void lars_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* velocity,
-    const float learningRate,
-    const float momentum,
-    const float weightDecay,
-    const float trustCoeff,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float p = param[idx];
-
-    // Apply weight decay
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * p;
-    }
-
-    // Update velocity with momentum
-    float v = momentum * velocity[idx] + grad;
-    velocity[idx] = v;
-
-    // Update parameters with trust coefficient scaling
-    param[idx] = p - learningRate * trustCoeff * v;
-}
-
-// LAMB (Layer-wise Adaptive Moments) optimizer update
-// Note: LAMB requires layer-wise trust ratio computation (||w|| / ||update||).
-// The trust ratio must be pre-computed externally and passed to this kernel.
-// Set trustRatio=1.0f to disable trust ratio scaling (degenerates to AdamW).
-__kernel void lamb_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* v,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const float trustRatio,    // Pre-computed: ||param|| / ||update||, or 1.0 to disable
-    const int step,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float p = param[idx];
-
-    // Adam-like moment updates
-    float mVal = beta1 * m[idx] + (1.0f - beta1) * grad;
-    float vVal = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
-    m[idx] = mVal;
-    v[idx] = vVal;
-
-    // Bias correction (ensure step >= 1 to avoid division by zero)
-    int safeStep = max(step, 1);
-    float mHat = mVal / (1.0f - pow(beta1, (float)safeStep));
-    float vHat = vVal / (1.0f - pow(beta2, (float)safeStep));
-
-    // LAMB: Adam update direction with weight decay
-    float adamUpdate = mHat / (sqrt(vHat) + epsilon);
-    float update = adamUpdate + weightDecay * p;
-
-    // Apply trust ratio scaling (LAMB's layer-wise adaptive learning rate)
-    // Trust ratio = ||param|| / ||update||, pre-computed externally
-    param[idx] = p - learningRate * trustRatio * update;
-}
-
-// Vanilla SGD update (no momentum)
-__kernel void sgd_update(
-    __global float* param,
-    __global const float* gradient,
-    const float learningRate,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    param[idx] -= learningRate * grad;
-}
-
-// AdaDelta optimizer update
-__kernel void adadelta_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* accumGrad,
-    __global float* accumUpdate,
-    const float rho,
-    const float epsilon,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    float ag = rho * accumGrad[idx] + (1.0f - rho) * grad * grad;
-    accumGrad[idx] = ag;
-
-    float rmsUpdate = sqrt(accumUpdate[idx] + epsilon);
-    float rmsGrad = sqrt(ag + epsilon);
-    float update = (rmsUpdate / rmsGrad) * grad;
-
-    accumUpdate[idx] = rho * accumUpdate[idx] + (1.0f - rho) * update * update;
-
-    param[idx] -= update;
-}
-
-// AMSGrad optimizer update
-__kernel void amsgrad_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* v,
-    __global float* vMax,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const int step,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    float mVal = beta1 * m[idx] + (1.0f - beta1) * grad;
-    m[idx] = mVal;
-
-    float vVal = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
-    v[idx] = vVal;
-
-    float vMaxVal = fmax(vMax[idx], vVal);
-    vMax[idx] = vMaxVal;
-
-    // Bias correction (ensure step >= 1 to avoid division by zero)
-    int safeStep = max(step, 1);
-    float mHat = mVal / (1.0f - pow(beta1, (float)safeStep));
-
-    param[idx] -= learningRate * mHat / (sqrt(vMaxVal) + epsilon);
-}
-
-// AdaMax optimizer update
-__kernel void adamax_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* u,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const int step,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    float mVal = beta1 * m[idx] + (1.0f - beta1) * grad;
-    m[idx] = mVal;
-
-    float uVal = fmax(beta2 * u[idx], fabs(grad));
-    u[idx] = uVal;
-
-    // Bias correction (ensure step >= 1 to avoid division by zero)
-    int safeStep = max(step, 1);
-    float biasCorrection = 1.0f - pow(beta1, (float)safeStep);
-
-    param[idx] -= (learningRate / biasCorrection) * mVal / (uVal + epsilon);
-}
-
-// Lion optimizer update
-__kernel void lion_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float weightDecay,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float mVal = m[idx];
-
-    float interp = beta1 * mVal + (1.0f - beta1) * grad;
-    float update = (interp > 0.0f) ? 1.0f : ((interp < 0.0f) ? -1.0f : 0.0f);
-
-    m[idx] = beta2 * mVal + (1.0f - beta2) * grad;
-
-    if (weightDecay > 0.0f) {
-        update += weightDecay * param[idx];
-    }
-
-    param[idx] -= learningRate * update;
-}
-
-// Nadam optimizer update
-__kernel void nadam_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* v,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const int step,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    float mVal = beta1 * m[idx] + (1.0f - beta1) * grad;
-    m[idx] = mVal;
-
-    float vVal = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
-    v[idx] = vVal;
-
-    // Bias correction (ensure step >= 1 to avoid division by zero)
-    int safeStep = max(step, 1);
-    float beta1Pow = pow(beta1, (float)safeStep);
-    float beta2Pow = pow(beta2, (float)safeStep);
-    float mHat = mVal / (1.0f - beta1Pow);
-    float vHat = vVal / (1.0f - beta2Pow);
-
-    float mNesterov = beta1 * mHat + (1.0f - beta1) * grad / (1.0f - beta1Pow);
-
-    param[idx] -= learningRate * mNesterov / (sqrt(vHat) + epsilon);
-}
-
-// FTRL optimizer update
-__kernel void ftrl_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* z,
-    __global float* n,
-    const float learningRate,
-    const float l1Reg,
-    const float l2Reg,
-    const float beta,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float nVal = n[idx];
-    float zVal = z[idx];
-    float pVal = param[idx];
-
-    float nNew = nVal + grad * grad;
-    n[idx] = nNew;
-
-    float sigma = (sqrt(nNew) - sqrt(nVal)) / learningRate;
-
-    zVal = zVal + grad - sigma * pVal;
-    z[idx] = zVal;
-
-    float zSign = (zVal > 0.0f) ? 1.0f : ((zVal < 0.0f) ? -1.0f : 0.0f);
-    float zAbs = fabs(zVal);
-
-    if (zAbs <= l1Reg) {
-        param[idx] = 0.0f;
-    } else {
-        float denom = (beta + sqrt(nNew)) / learningRate + l2Reg;
-        param[idx] = -zSign * (zAbs - l1Reg) / denom;
-    }
-}
 
 // ===========================================================================
 // UTILITY KERNELS
@@ -1068,7 +568,13 @@ __kernel void equal_values(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    C[idx] = A[idx] == B[idx] ? 1.0f : 0.0f;
+    uint ab = as_uint(A[idx]);
+    uint bb = as_uint(B[idx]);
+    uint aa = ab & 0x7FFFFFFFu;
+    uint ba = bb & 0x7FFFFFFFu;
+    int equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+        && (ab == bb || ((aa | ba) == 0u));
+    C[idx] = equal ? 1.0f : 0.0f;
 }
 
 // Where (conditional select)
@@ -1215,20 +721,22 @@ __kernel void dropout_backward(
 
 // Embedding lookup
 __kernel void embedding_lookup(
-    __global const float* indices,
+    __global const int* indices,
     __global const float* embeddingTable,
     __global float* output,
     const int numIndices,
     const int embeddingDim)
 {
-    const int idx = get_global_id(0);
-    if (idx >= numIndices) return;
+    const int d = get_global_id(0);
+    const int idx = get_global_id(1);
+    if (idx >= numIndices || d >= embeddingDim) return;
 
-    int index = (int)indices[idx];
+    // OpenClBackend.AllocateIntBuffer(int[]) stores raw int bits in a float
+    // buffer. Reinterpret those bits here; a numeric cast truncates the
+    // denormal float representation of small positive indices to zero.
+    int index = as_int(indices[idx]);
 
-    for (int d = 0; d < embeddingDim; d++) {
-        output[idx * embeddingDim + d] = embeddingTable[index * embeddingDim + d];
-    }
+    output[idx * embeddingDim + d] = embeddingTable[index * embeddingDim + d];
 }
 
 // Embedding backward (scatter add gradients)
@@ -1242,10 +750,12 @@ __kernel void embedding_backward(
     __global const float* indices,
     __global float* gradEmbedding,
     const int numIndices,
-    const int embeddingDim)
+    const int embeddingDim,
+    const int vocabSize)
 {
-    const int idx = get_global_id(0);
-    if (idx >= numIndices) return;
+    const int d = get_global_id(0);
+    const int idx = get_global_id(1);
+    if (idx >= numIndices || d >= embeddingDim) return;
 
     // OpenCL AllocateIntBuffer bit-packs int32 indices into the float buffer via
     // BitConverter (see OpenClBackend.AllocateIntBuffer(int[])). Use as_int() to
@@ -1253,11 +763,10 @@ __kernel void embedding_backward(
     // float interpretation of the bit pattern (e.g. int 1 stored as denormal
     // ~1.4e-45 would truncate to 0).
     int index = as_int(indices[idx]);
+    if (index < 0 || index >= vocabSize) return;
 
-    for (int d = 0; d < embeddingDim; d++) {
-        // Use atomic add for thread safety when multiple indices point to same embedding
-        atomic_add_float(&gradEmbedding[index * embeddingDim + d], gradOutput[idx * embeddingDim + d]);
-    }
+    // Use atomic add for thread safety when multiple indices point to same embedding.
+    atomic_add_float(&gradEmbedding[index * embeddingDim + d], gradOutput[idx * embeddingDim + d]);
 }
 
 // Embedding backward — bit-deterministic variant (issue #382).
@@ -1313,7 +822,7 @@ __kernel void fma_kernel(
 // Gather operation
 __kernel void gather_kernel(
     __global const float* source,
-    __global const float* indices,
+    __global const int* indices,
     __global float* output,
     const int numIndices,
     const int featureSize)
@@ -1321,7 +830,7 @@ __kernel void gather_kernel(
     const int idx = get_global_id(0);
     if (idx >= numIndices) return;
 
-    int index = (int)indices[idx];
+    int index = indices[idx];
     for (int f = 0; f < featureSize; f++) {
         output[idx * featureSize + f] = source[index * featureSize + f];
     }
@@ -2197,6 +1706,169 @@ __kernel void adaptive_avgpool_backward(
 
     gradInput[idx] = sum;
 }
+
+// #775: GNN scatter-add (index_add) along dim 0. output[m, inner] = sum over source rows d whose
+// index == m of source[d, inner]. GATHER over the output (no atomics); ascending d matches the
+// CpuEngine accumulation order bit-for-bit. Uses the first srcDimSize flattened index values
+// (indices[d]), mirroring CpuEngine.ScatterAdd's indicesData[d].
+__kernel void scatter_add_rows(
+    __global const float* source,   // [srcDimSize, innerSize]
+    __global const int* indices,    // first srcDimSize values are the per-row targets
+    __global float* output,         // [outDimSize, innerSize]
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float sum = 0.0f;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) sum += source[d * innerSize + inner];
+    }
+    output[idx] = sum;
+}
+
+// #775: GNN scatter-mean along dim 0 = scatter-add / per-output-row count. Multiply by 1/count
+// (matching CpuEngine's invDivisor) rather than divide, and leave 0 where the count is 0.
+__kernel void scatter_mean_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float sum = 0.0f;
+    int count = 0;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) { sum += source[d * innerSize + inner]; count++; }
+    }
+    output[idx] = count > 0 ? sum * (1.0f / (float)count) : 0.0f;
+}
+
+// #775: GNN scatter-max along dim 0. output[m,inner] = max over source rows d whose index == m of
+// source[d,inner]; empty groups stay -INFINITY (matching CpuEngine's negInf init). Strict > in
+// ascending d = first-row-on-ties, so the host argmax re-scan matches. Only the max is produced here.
+__kernel void scatter_max_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int m = idx / innerSize;
+    float mx = -INFINITY;
+    for (int d = 0; d < srcDimSize; d++) {
+        if (indices[d] == m) { float v = source[d * innerSize + inner]; if (v > mx) mx = v; }
+    }
+    output[idx] = mx;
+}
+
+// #775: GNN scatter-softmax = softmax within each index-group. output has the SAME shape as source;
+// for element (d,inner) with group g=indices[d]: exp(source[d,inner]-maxg)/sumg over the group (max
+// for stability). Invalid group (out of [0,numGroups)) -> 0, matching CpuEngine. Gather over source.
+__kernel void scatter_softmax_rows(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    const int srcDimSize, const int innerSize, const int numGroups)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= numGroups) { output[idx] = 0.0f; return; }
+    float maxg = -INFINITY;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) { float v = source[dd * innerSize + inner]; if (v > maxg) maxg = v; }
+    float sumg = 0.0f;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) sumg += exp(source[dd * innerSize + inner] - maxg);
+    float e = exp(source[d * innerSize + inner] - maxg);
+    output[idx] = (sumg != 0.0f) ? (e / sumg) : e;
+}
+
+// #775: ScatterAdd backward = gather. gradSource[d,inner] = gradOutput[index[d],inner], or 0 when the
+// index is out of range (matching CpuEngine).
+__kernel void scatter_add_backward_rows(
+    __global const float* gradOutput,
+    __global const int* indices,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    gradSource[idx] = (g >= 0 && g < outDimSize) ? gradOutput[g * innerSize + inner] : 0.0f;
+}
+
+// #775: ScatterMean backward = gather / count. gradSource[d,inner] = gradOutput[index[d],inner] /
+// max(count[index[d]], 1) (CpuEngine divides by 1 when the count is 0). Out-of-range index -> 0.
+__kernel void scatter_mean_backward_rows(
+    __global const float* gradOutput,
+    __global const int* indices,
+    __global const int* counts,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= outDimSize) { gradSource[idx] = 0.0f; return; }
+    int cnt = counts[g];
+    float divisor = cnt > 0 ? (float)cnt : 1.0f;
+    gradSource[idx] = gradOutput[g * innerSize + inner] / divisor;
+}
+
+// #775: ScatterMax backward routes each output element's gradient to its argmax source row:
+// gradSource[argmax[m,inner],inner] = gradOutput[m,inner]. As a gather over gradSource, scan all
+// output rows m and keep the LAST match (matches CpuEngine's ascending-m scatter, last write wins).
+__kernel void scatter_max_backward_rows(
+    __global const float* gradOutput,
+    __global const int* argmax,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int outDimSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int dsrc = idx / innerSize;
+    float g = 0.0f;
+    for (int m = 0; m < outDimSize; m++)
+        if (argmax[m * innerSize + inner] == dsrc) g = gradOutput[m * innerSize + inner];
+    gradSource[idx] = g;
+}
+
+// #775: ScatterSoftmax backward (softmax jacobian within each index-group):
+// gradSource[d,inner] = output[d,inner] * (gradOutput[d,inner] - sum_{d' in group} output*gradOutput).
+// Gather over source elements; each recomputes the per-group weighted sum. Invalid group -> 0.
+__kernel void scatter_softmax_backward_rows(
+    __global const float* gradOutput,
+    __global const float* output,
+    __global const int* indices,
+    __global float* gradSource,
+    const int srcDimSize, const int innerSize, const int numGroups)
+{
+    int idx = get_global_id(0);
+    if (idx >= srcDimSize * innerSize) return;
+    int inner = idx % innerSize;
+    int d = idx / innerSize;
+    int g = indices[d];
+    if (g < 0 || g >= numGroups) { gradSource[idx] = 0.0f; return; }
+    float sumg = 0.0f;
+    for (int dd = 0; dd < srcDimSize; dd++)
+        if (indices[dd] == g) sumg += output[dd * innerSize + inner] * gradOutput[dd * innerSize + inner];
+    gradSource[idx] = output[idx] * (gradOutput[idx] - sumg);
+}
 ";
         }
 
@@ -2220,9 +1892,6 @@ __kernel void adaptive_avgpool_backward(
                 "mse_loss", "mse_backward",
                 "smooth_l1_loss", "smooth_l1_backward",
                 // Optimizers
-                "sgd_momentum_update", "adam_update", "adamw_update",
-                "rmsprop_update", "adagrad_update", "nag_update", "lars_update", "lamb_update",
-                "sgd_update", "adadelta_update", "amsgrad_update", "adamax_update", "lion_update", "nadam_update", "ftrl_update",
                 // Utilities
                 "clamp_values", "clip_by_value",
                 "transpose2d", "batched_transpose",
@@ -2231,7 +1900,7 @@ __kernel void adaptive_avgpool_backward(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows", "scatter_add_backward_rows", "scatter_mean_backward_rows", "scatter_max_backward_rows", "scatter_softmax_backward_rows",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels

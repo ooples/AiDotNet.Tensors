@@ -86,7 +86,11 @@ public static class GradientCheckpointing<T>
                     // SymbolicBackwardGraphBuilder.Analyze when the cached pattern
                     // does not match the current tape's reachable entries).
                     using var recomputeTape = new GradientTape<T>(
-                        new GradientTapeOptions { Persistent = false });
+                        // SuppressArenaScope: this inner tape runs mid-backward, where the outer
+                        // tape has nulled the thread-current tape, so it would otherwise look like a
+                        // step-boundary tape and Reset() the OUTER tape's arena — corrupting the
+                        // accumulating gradients (#734). It borrows the arena for scratch only.
+                        new GradientTapeOptions { Persistent = false, SuppressArenaScope = true });
                     var reInput = inputs[0];
                     // Detach the segment input so the recompute graph is SELF-CONTAINED: its backward
                     // stops at the segment boundary instead of following reInput's producer into an

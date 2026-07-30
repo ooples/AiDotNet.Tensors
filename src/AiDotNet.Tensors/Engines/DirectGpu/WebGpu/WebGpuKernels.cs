@@ -159,6 +159,14 @@ fn add_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
+fn sub_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        B[idx] = A[idx] - params.scalar;
+    }
+}
+
+@compute @workgroup_size(256)
 fn mul_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
@@ -170,7 +178,22 @@ fn mul_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn pow_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = pow(A[idx], params.scalar);
+        let x = A[idx];
+        let exponent = params.scalar;
+        // WGSL pow is undefined for a negative base. Integral exponents are
+        // valid, so evaluate |x|^exponent and restore odd parity.
+        if (x < 0.0) {
+            if (exponent == trunc(exponent)) {
+                let magnitude = pow(-x, exponent);
+                let abs_exponent = abs(exponent);
+                let is_odd = (abs_exponent - 2.0 * floor(abs_exponent * 0.5)) == 1.0;
+                B[idx] = select(magnitude, -magnitude, is_odd);
+            } else {
+                B[idx] = bitcast<f32>(0x7fc00000u);
+            }
+        } else {
+            B[idx] = pow(x, exponent);
+        }
     }
 }
 
@@ -180,6 +203,46 @@ fn clamp_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < params.size) {
         B[idx] = clamp(A[idx], -params.scalar, params.scalar);
     }
+}
+";
+
+    /// <summary>
+    /// Fused interleaved Rotary Position Embedding (RoPE) — GPT-NeoX / LLaMA / GGML variant.
+    /// Rotates each adjacent dim pair (2i, 2i+1) of every [rows, headDim] row. One invocation per (row, pair).
+    /// </summary>
+    public const string RopeSource = @"
+@group(0) @binding(0) var<storage, read> inputBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> cosCache: array<f32>;
+@group(0) @binding(2) var<storage, read> sinCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputBuf: array<f32>;
+
+struct RopeParams {
+    rows: u32,
+    headDim: u32,
+    seqLen: u32,
+    startPosition: u32,
+}
+@group(0) @binding(4) var<uniform> params: RopeParams;
+
+@compute @workgroup_size(256)
+fn rope_interleaved(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let halfDim = params.headDim / 2u;
+    let g = gid.x;
+    if (g >= params.rows * halfDim) {
+        return;
+    }
+    let i = g % halfDim;
+    let row = g / halfDim;
+    let s = row % params.seqLen;
+    let pos = params.startPosition + s;
+    let baseIdx = row * params.headDim;
+    let cacheIdx = pos * halfDim + i;
+    let c = cosCache[cacheIdx];
+    let sn = sinCache[cacheIdx];
+    let xEven = inputBuf[baseIdx + 2u * i];
+    let xOdd = inputBuf[baseIdx + 2u * i + 1u];
+    outputBuf[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    outputBuf[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
 }
 ";
 
@@ -320,6 +383,35 @@ fn square_op(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v = A[idx];
         B[idx] = v * v;
     }
+}
+
+@compute @workgroup_size(256)
+fn frac_op(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        B[idx] = A[idx] - floor(A[idx]);
+    }
+}
+";
+
+    public const string StridedDotSource = @"
+@group(0) @binding(0) var<storage, read> dot_a: array<f32>;
+@group(0) @binding(1) var<storage, read> dot_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dot_output: array<f32>;
+struct StridedDotParams { a_size: i32, b_size: i32, b_offset: i32, b_stride: i32 }
+@group(0) @binding(3) var<uniform> dot_params: StridedDotParams;
+
+@compute @workgroup_size(1)
+fn strided_dot_product(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+    var sum: f32 = 0.0;
+    for (var i: i32 = 0; i < dot_params.a_size; i = i + 1) {
+        let b_idx = dot_params.b_offset + i * dot_params.b_stride;
+        if (b_idx >= 0 && b_idx < dot_params.b_size && u32(b_idx) < arrayLength(&dot_b)) {
+            sum = sum + dot_a[u32(i)] * dot_b[u32(b_idx)];
+        }
+    }
+    dot_output[0] = sum;
 }
 ";
 
@@ -1059,7 +1151,13 @@ fn less_than(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = select(0.0, 1.0, abs(A[idx] - B[idx]) < 1e-7);
+        let ab = bitcast<u32>(A[idx]);
+        let bb = bitcast<u32>(B[idx]);
+        let aa = ab & 0x7fffffffu;
+        let ba = bb & 0x7fffffffu;
+        let equal = aa <= 0x7f800000u && ba <= 0x7f800000u
+            && (ab == bb || ((aa | ba) == 0u));
+        C[idx] = select(0.0, 1.0, equal);
     }
 }
 
@@ -1067,7 +1165,13 @@ fn equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn not_equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = select(0.0, 1.0, abs(A[idx] - B[idx]) >= 1e-7);
+        let ab = bitcast<u32>(A[idx]);
+        let bb = bitcast<u32>(B[idx]);
+        let aa = ab & 0x7fffffffu;
+        let ba = bb & 0x7fffffffu;
+        let equal = aa <= 0x7f800000u && ba <= 0x7f800000u
+            && (ab == bb || ((aa | ba) == 0u));
+        C[idx] = select(1.0, 0.0, equal);
     }
 }
 
@@ -1156,7 +1260,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
 
@@ -1180,6 +1284,20 @@ fn sgd_momentum(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
+fn proximal_l1(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < opt_params.size) {
+        let tmp = params_arr[idx] - opt_params.lr * gradients[idx];
+        let mag = abs(tmp) - (opt_params.lr * opt_params.beta1);
+        if (mag <= 0.0) {
+            params_arr[idx] = 0.0;
+        } else {
+            params_arr[idx] = sign(tmp) * mag;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
 fn adam(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
@@ -1192,8 +1310,9 @@ fn adam(@builtin(global_invocation_id) gid: vec3<u32>) {
         velocity[idx] = opt_params.beta2 * velocity[idx] + (1.0 - opt_params.beta2) * grad * grad;
 
         // Bias correction
-        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, opt_params.t));
-        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, opt_params.t));
+        let step = f32(opt_params.t);
+        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, step));
+        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, step));
 
         // Update parameters
         params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
@@ -1211,12 +1330,297 @@ fn adamw(@builtin(global_invocation_id) gid: vec3<u32>) {
         velocity[idx] = opt_params.beta2 * velocity[idx] + (1.0 - opt_params.beta2) * grad * grad;
 
         // Bias correction
-        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, opt_params.t));
-        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, opt_params.t));
+        let step = f32(opt_params.t);
+        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, step));
+        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, step));
 
         // AdamW: decoupled weight decay
         params_arr[idx] = params_arr[idx] * (1.0 - opt_params.lr * opt_params.weight_decay);
         params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+    }
+}
+";
+
+    public const string CompressedOptimizerBf16Source = @"
+@group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
+@group(0) @binding(1) var<storage, read> gradients: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m_bits: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> v_bits: array<atomic<u32>>;
+
+struct OptimizerParams {
+    size: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    weight_decay: f32,
+    t: u32,
+}
+@group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
+
+fn bf16_to_float(x: u32) -> f32 {
+    return bitcast<f32>(x << 16u);
+}
+
+fn float_to_bf16_rne(x: f32) -> u32 {
+    let bits = bitcast<u32>(x);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        return ((bits >> 16u) | 0x40u) & 0xffffu;
+    }
+    let rounding = 0x7fffu + ((bits >> 16u) & 1u);
+    return ((bits + rounding) >> 16u) & 0xffffu;
+}
+
+fn load_m(idx: u32) -> u32 {
+    let word = atomicLoad(&m_bits[idx >> 1u]);
+    let shift = (idx & 1u) * 16u;
+    return (word >> shift) & 0xffffu;
+}
+
+fn load_v(idx: u32) -> u32 {
+    let word = atomicLoad(&v_bits[idx >> 1u]);
+    let shift = (idx & 1u) * 16u;
+    return (word >> shift) & 0xffffu;
+}
+
+fn store_m(idx: u32, value: u32) {
+    let word_idx = idx >> 1u;
+    let shift = (idx & 1u) * 16u;
+    let mask = 0xffffu << shift;
+    loop {
+        let old_word = atomicLoad(&m_bits[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffffu) << shift);
+        let result = atomicCompareExchangeWeak(&m_bits[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+fn store_v(idx: u32, value: u32) {
+    let word_idx = idx >> 1u;
+    let shift = (idx & 1u) * 16u;
+    let mask = 0xffffu << shift;
+    loop {
+        let old_word = atomicLoad(&v_bits[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffffu) << shift);
+        let result = atomicCompareExchangeWeak(&v_bits[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn adam_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= opt_params.size) {
+        return;
+    }
+
+    var grad = gradients[idx];
+    if (opt_params.weight_decay > 0.0) {
+        grad = grad + opt_params.weight_decay * params_arr[idx];
+    }
+    let first_step = opt_params.t <= 1u;
+    let old_m = select(bf16_to_float(load_m(idx)), 0.0, first_step);
+    let old_v = select(bf16_to_float(load_v(idx)), 0.0, first_step);
+    let m_new = opt_params.beta1 * old_m + (1.0 - opt_params.beta1) * grad;
+    let v_new = opt_params.beta2 * old_v + (1.0 - opt_params.beta2) * grad * grad;
+    store_m(idx, float_to_bf16_rne(m_new));
+    store_v(idx, float_to_bf16_rne(v_new));
+
+    let m_hat = m_new / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    let v_hat = v_new / (1.0 - pow(opt_params.beta2, f32(opt_params.t)));
+    params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn adamw_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= opt_params.size) {
+        return;
+    }
+
+    let grad = gradients[idx];
+    if (opt_params.weight_decay > 0.0) {
+        params_arr[idx] = params_arr[idx] * (1.0 - opt_params.lr * opt_params.weight_decay);
+    }
+
+    let first_step = opt_params.t <= 1u;
+    let old_m = select(bf16_to_float(load_m(idx)), 0.0, first_step);
+    let old_v = select(bf16_to_float(load_v(idx)), 0.0, first_step);
+    let m_new = opt_params.beta1 * old_m + (1.0 - opt_params.beta1) * grad;
+    let v_new = opt_params.beta2 * old_v + (1.0 - opt_params.beta2) * grad * grad;
+    store_m(idx, float_to_bf16_rne(m_new));
+    store_v(idx, float_to_bf16_rne(v_new));
+
+    let m_hat = m_new / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    let v_hat = v_new / (1.0 - pow(opt_params.beta2, f32(opt_params.t)));
+    params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+";
+
+    public const string CompressedOptimizerInt8Source = @"
+@group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
+@group(0) @binding(1) var<storage, read> gradients: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m_quant: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> v_quant: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> m_scales: array<f32>;
+@group(0) @binding(5) var<storage, read_write> v_scales: array<f32>;
+
+struct Adam8Params {
+    size: u32,
+    block_size: u32,
+    num_blocks: u32,
+    reserved: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    one_minus_beta1: f32,
+    one_minus_beta2: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+}
+@group(0) @binding(6) var<uniform> opt_params: Adam8Params;
+
+var<workgroup> s_max_m: array<f32, 256>;
+var<workgroup> s_max_v: array<f32, 256>;
+
+fn load_m_byte(idx: u32) -> u32 {
+    let word = atomicLoad(&m_quant[idx >> 2u]);
+    let shift = (idx & 3u) * 8u;
+    return (word >> shift) & 0xffu;
+}
+
+fn load_v_byte(idx: u32) -> u32 {
+    let word = atomicLoad(&v_quant[idx >> 2u]);
+    let shift = (idx & 3u) * 8u;
+    return (word >> shift) & 0xffu;
+}
+
+fn store_m_byte(idx: u32, value: u32) {
+    let word_idx = idx >> 2u;
+    let shift = (idx & 3u) * 8u;
+    let mask = 0xffu << shift;
+    loop {
+        let old_word = atomicLoad(&m_quant[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffu) << shift);
+        let result = atomicCompareExchangeWeak(&m_quant[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+fn store_v_byte(idx: u32, value: u32) {
+    let word_idx = idx >> 2u;
+    let shift = (idx & 3u) * 8u;
+    let mask = 0xffu << shift;
+    loop {
+        let old_word = atomicLoad(&v_quant[word_idx]);
+        let new_word = (old_word & ~mask) | ((value & 0xffu) << shift);
+        let result = atomicCompareExchangeWeak(&v_quant[word_idx], old_word, new_word);
+        if (result.exchanged) {
+            break;
+        }
+    }
+}
+
+fn round_ties_even(x: f32) -> f32 {
+    let lo = floor(x);
+    let frac = x - lo;
+    if (frac < 0.5) {
+        return lo;
+    }
+    if (frac > 0.5) {
+        return lo + 1.0;
+    }
+    let lo_i = i32(lo);
+    if ((lo_i % 2) == 0) {
+        return lo;
+    }
+    return lo + 1.0;
+}
+
+@compute @workgroup_size(256)
+fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let blk = wid.x;
+    let tid = lid.x;
+    if (blk >= opt_params.num_blocks) {
+        return;
+    }
+
+    let start = blk * opt_params.block_size;
+    let end_idx = min(start + opt_params.block_size, opt_params.size);
+    let first_step = opt_params.bias_correction1 <= opt_params.one_minus_beta1 + 0.0000001 && opt_params.bias_correction2 <= opt_params.one_minus_beta2 + 0.0000001;
+    let m_scale = select(m_scales[blk], 0.0, first_step);
+    let v_scale = select(v_scales[blk], 0.0, first_step);
+
+    var loc_m = 0.0;
+    var loc_v = 0.0;
+    var i = start + tid;
+    loop {
+        if (i >= end_idx) {
+            break;
+        }
+        let old_m = select((f32(i32(load_m_byte(i)) - 128) * m_scale), 0.0, first_step);
+        let old_v = select((f32(load_v_byte(i)) * v_scale), 0.0, first_step);
+        let g = gradients[i];
+        let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
+        let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
+        loc_m = max(loc_m, abs(new_m));
+        loc_v = max(loc_v, abs(new_v));
+        i = i + 256u;
+    }
+
+    s_max_m[tid] = loc_m;
+    s_max_v[tid] = loc_v;
+    workgroupBarrier();
+
+    var stride = 128u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (tid < stride) {
+            s_max_m[tid] = max(s_max_m[tid], s_max_m[tid + stride]);
+            s_max_v[tid] = max(s_max_v[tid], s_max_v[tid + stride]);
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+
+    let new_m_scale = max(s_max_m[0] / 127.0, 0.0000000001);
+    let new_v_scale = max(s_max_v[0] / 255.0, 0.0000000001);
+    if (tid == 0u) {
+        m_scales[blk] = new_m_scale;
+        v_scales[blk] = new_v_scale;
+    }
+    workgroupBarrier();
+
+    var j = start + tid;
+    loop {
+        if (j >= end_idx) {
+            break;
+        }
+        let old_m = select((f32(i32(load_m_byte(j)) - 128) * m_scale), 0.0, first_step);
+        let old_v = select((f32(load_v_byte(j)) * v_scale), 0.0, first_step);
+        let g = gradients[j];
+        let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
+        let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
+
+        let m_hat = new_m / opt_params.bias_correction1;
+        let v_hat = new_v / opt_params.bias_correction2;
+        params_arr[j] = params_arr[j] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+
+        let qm = clamp(i32(round_ties_even(new_m / new_m_scale)), -127, 127);
+        store_m_byte(j, u32(qm + 128));
+
+        let qv = clamp(i32(round_ties_even(new_v / new_v_scale)), 0, 255);
+        store_v_byte(j, u32(qv));
+        j = j + 256u;
     }
 }
 ";
@@ -2386,7 +2790,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
     extra: f32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
@@ -2441,7 +2845,7 @@ fn adamax(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, f32(opt_params.t));
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = max(opt_params.beta2 * state2[idx], abs(grad));
         params_arr[idx] = params_arr[idx] - opt_params.lr / bc1 * state1[idx] / (state2[idx] + opt_params.epsilon);
@@ -2463,13 +2867,15 @@ fn nadam(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc1_next = 1.0 - pow(opt_params.beta1, step + 1.0);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
         let m_hat = state1[idx] / bc1;
         let v_hat = state2[idx] / bc2;
-        params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * m_hat + (1.0 - opt_params.beta1) * grad / bc1) / (sqrt(v_hat) + opt_params.epsilon);
+        params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * m_hat + (1.0 - opt_params.beta1) * grad / bc1_next) / (sqrt(v_hat) + opt_params.epsilon);
     }
 }
 ";
@@ -2490,7 +2896,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
 
@@ -2501,8 +2907,9 @@ fn amsgrad(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         m[idx] = opt_params.beta1 * m[idx] + (1.0 - opt_params.beta1) * grad;
         v[idx] = opt_params.beta2 * v[idx] + (1.0 - opt_params.beta2) * grad * grad;
         // v_max stored at offset size
@@ -2517,7 +2924,7 @@ fn amsgrad(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// AMSGrad optimizer with 5 separate storage buffers (params, gradients, m, v, v_max).
     /// Uses Dispatch5BufferAsync so uniform is at binding(5).
     /// </summary>
-    public const string Amsgrad5BufferOptimizerSource = @"
+public const string Amsgrad5BufferOptimizerSource = @"
 @group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
 @group(0) @binding(1) var<storage, read> gradients: array<f32>;
 @group(0) @binding(2) var<storage, read_write> m: array<f32>;
@@ -2531,7 +2938,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
     _pad: f32,
 }
 @group(0) @binding(5) var<uniform> opt_params: OptimizerParams;
@@ -2541,12 +2948,262 @@ fn amsgrad5(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         m[idx] = opt_params.beta1 * m[idx] + (1.0 - opt_params.beta1) * grad;
         v[idx] = opt_params.beta2 * v[idx] + (1.0 - opt_params.beta2) * grad * grad;
         v_max[idx] = max(v_max[idx], v[idx]);
         params_arr[idx] = params_arr[idx] - opt_params.lr * (m[idx] / bc1) / (sqrt(v_max[idx] / bc2) + opt_params.epsilon);
+    }
+}
+";
+
+    /// <summary>
+    /// Sparse optimizer scatter-update kernels. One invocation per non-zero gradient.
+    /// Bindings: params, indices, values, state1, state2, state3, uniforms.
+    /// </summary>
+    public const string SparseOptimizerSource = @"
+@group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
+@group(0) @binding(1) var<storage, read> indices: array<f32>;
+@group(0) @binding(2) var<storage, read> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> state1: array<f32>;
+@group(0) @binding(4) var<storage, read_write> state2: array<f32>;
+@group(0) @binding(5) var<storage, read_write> state3: array<f32>;
+
+struct OptimizerParams {
+    size: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    weight_decay: f32,
+    t: u32,
+    extra: f32,
+    param_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(6) var<uniform> opt_params: OptimizerParams;
+
+// CONTRACT: the sparse index list is expected to be UNIQUE per dispatch - the caller pre-aggregates
+// (sums) gradients for repeated indices before applying them, as is standard for sparse/embedding
+// gradient updates. Under that contract no two invocations touch the same param/state slot, so the
+// non-atomic scatter below is race-free and matches the sequential CPU reference bit-for-bit.
+// (WGSL storage atomics are u32/i32 only, so an f32 accumulate would need a bitcast CAS loop; that is
+// deferred unless a duplicate-index workload is actually required.) The same contract holds for the
+// CUDA/HIP/OpenCL/Metal/Vulkan sparse kernels.
+fn decode_sparse_index(raw: f32) -> u32 {
+    let bitcast = bitcast<i32>(raw);
+    if (bitcast >= 0 && u32(bitcast) < opt_params.param_size) {
+        return u32(bitcast);
+    }
+    // Validate in the FLOAT domain before i32(raw) - the conversion is implementation-defined for NaN/
+    // Inf or out-of-range values. (raw == raw) rejects NaN; the range check rejects +/-Inf.
+    if (raw == raw && raw >= 0.0 && raw < f32(opt_params.param_size) && raw == trunc(raw)) {
+        return u32(raw);
+    }
+    return opt_params.param_size;
+}
+
+fn sparse_slot(k: u32) -> u32 {
+    return decode_sparse_index(indices[k]);
+}
+
+@compute @workgroup_size(256)
+fn sparse_sgd_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    params_arr[i] = params_arr[i] - opt_params.lr * grad;
+}
+
+@compute @workgroup_size(256)
+fn sparse_sgd_momentum_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + grad;
+    params_arr[i] = params_arr[i] - opt_params.lr * state1[i];
+}
+
+@compute @workgroup_size(256)
+fn sparse_adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    let step = f32(opt_params.t);
+    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
+    let v_hat = state2[i] / (1.0 - pow(opt_params.beta2, step));
+    var update = opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+    if (opt_params.weight_decay > 0.0) { update = update + opt_params.lr * opt_params.weight_decay * params_arr[i]; }
+    params_arr[i] = params_arr[i] - update;
+}
+
+@compute @workgroup_size(256)
+fn sparse_adamw_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    var p = params_arr[i];
+    if (opt_params.weight_decay > 0.0) { p = p - opt_params.lr * opt_params.weight_decay * p; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    let step = f32(opt_params.t);
+    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
+    let v_hat = state2[i] / (1.0 - pow(opt_params.beta2, step));
+    params_arr[i] = p - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_rmsprop_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad * grad;
+    params_arr[i] = params_arr[i] - opt_params.lr * grad / (sqrt(state1[i]) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_adagrad_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = state1[i] + grad * grad;
+    params_arr[i] = params_arr[i] - opt_params.lr * grad / (sqrt(state1[i]) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_nag_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    let v_old = state1[i];
+    let v_new = opt_params.beta1 * v_old + grad;
+    state1[i] = v_new;
+    params_arr[i] = params_arr[i] - opt_params.lr * ((1.0 + opt_params.beta1) * v_new - opt_params.beta1 * v_old);
+}
+
+@compute @workgroup_size(256)
+fn sparse_adadelta_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    let one_minus_rho = 1.0 - opt_params.beta1;
+    state1[i] = opt_params.beta1 * state1[i] + one_minus_rho * grad * grad;
+    let dx = sqrt(state2[i] + opt_params.epsilon) / sqrt(state1[i] + opt_params.epsilon) * grad;
+    state2[i] = opt_params.beta1 * state2[i] + one_minus_rho * dx * dx;
+    params_arr[i] = params_arr[i] - dx;
+}
+
+@compute @workgroup_size(256)
+fn sparse_amsgrad_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    state3[i] = max(state3[i], state2[i]);
+    let step = f32(opt_params.t);
+    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
+    let v_hat = state3[i] / (1.0 - pow(opt_params.beta2, step));
+    params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_adamax_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = max(opt_params.beta2 * state2[i], abs(grad));
+    let lr_adj = opt_params.lr / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    params_arr[i] = params_arr[i] - lr_adj * state1[i] / (state2[i] + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_lion_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    var update = sign(opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad);
+    if (opt_params.weight_decay > 0.0) { update = update + opt_params.weight_decay * params_arr[i]; }
+    params_arr[i] = params_arr[i] - opt_params.lr * update;
+    state1[i] = opt_params.beta2 * state1[i] + (1.0 - opt_params.beta2) * grad;
+}
+
+@compute @workgroup_size(256)
+fn sparse_nadam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
+    state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
+    state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
+    let step = f32(opt_params.t);
+    let bc1 = 1.0 - pow(opt_params.beta1, step);
+    let bc2 = 1.0 - pow(opt_params.beta2, step);
+    let m_hat = (opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad) / bc1;
+    let v_hat = state2[i] / bc2;
+    params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+}
+
+@compute @workgroup_size(256)
+fn sparse_ftrl_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let grad = values[k];
+    let n_old = state2[i];
+    let n_new = n_old + grad * grad;
+    state2[i] = n_new;
+    let sigma = (sqrt(n_new) - sqrt(n_old)) / opt_params.lr;
+    state1[i] = state1[i] + grad - sigma * params_arr[i];
+    if (abs(state1[i]) <= opt_params.beta1) {
+        params_arr[i] = 0.0;
+    } else {
+        let sign_z = select(-1.0, 1.0, state1[i] > 0.0);
+        params_arr[i] = (sign_z * opt_params.beta1 - state1[i]) /
+            ((opt_params.extra + sqrt(n_new)) / opt_params.lr + opt_params.beta2);
+    }
+}
+
+@compute @workgroup_size(256)
+fn sparse_proximal_l1_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= opt_params.size) { return; }
+    let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
+    let p = params_arr[i] - opt_params.lr * values[k];
+    let threshold = opt_params.lr * opt_params.beta1;
+    if (p > threshold) {
+        params_arr[i] = p - threshold;
+    } else if (p < -threshold) {
+        params_arr[i] = p + threshold;
+    } else {
+        params_arr[i] = 0.0;
     }
 }
 ";
@@ -2805,7 +3462,7 @@ fn argmax_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
                 max_idx = j;
             }
         }
-        output[idx] = bitcast<f32>(i32(max_idx));
+        output[idx] = f32(max_idx);
     }
 }
 
@@ -2822,7 +3479,7 @@ fn argmin_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
                 min_idx = j;
             }
         }
-        output[idx] = bitcast<f32>(i32(min_idx));
+        output[idx] = f32(min_idx);
     }
 }
 ";
@@ -3596,7 +4253,13 @@ fn where_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn not_equal_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = select(0.0, 1.0, abs(A[idx] - params.scalar) > 1e-6);
+        let ab = bitcast<u32>(A[idx]);
+        let bb = bitcast<u32>(params.scalar);
+        let aa = ab & 0x7fffffffu;
+        let ba = bb & 0x7fffffffu;
+        let equal = aa <= 0x7f800000u && ba <= 0x7f800000u
+            && (ab == bb || ((aa | ba) == 0u));
+        C[idx] = select(1.0, 0.0, equal);
     }
 }
 ";
@@ -3833,8 +4496,48 @@ fn gather_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= total) { return; }
     let i = idx / params.inner_size;
     let col = idx % params.inner_size;
-    let src_row = bitcast<u32>(bitcast<i32>(indices[i]));
-    destination[idx] = source[src_row * params.inner_size + col];
+    let src_row_i = bitcast<i32>(indices[i]);
+    if (src_row_i < 0) {
+        destination[idx] = 0.0;
+        return;
+    }
+    let src_idx = u32(src_row_i) * params.inner_size + col;
+    if (src_idx >= arrayLength(&source)) {
+        destination[idx] = 0.0;
+        return;
+    }
+    destination[idx] = source[src_idx];
+}
+";
+
+    public const string ScatterMeanSource = @"
+@group(0) @binding(0) var<storage, read> scatter_source: array<f32>;
+@group(0) @binding(1) var<storage, read> scatter_indices: array<f32>;
+@group(0) @binding(2) var<storage, read_write> scatter_output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> scatter_counts: array<f32>;
+struct ScatterMeanParams { source_size: u32, output_size: u32, feature_size: u32, _pad: u32 }
+@group(0) @binding(4) var<uniform> scatter_params: ScatterMeanParams;
+
+@compute @workgroup_size(256)
+fn scatter_mean_deterministic(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat = gid.x;
+    let total = scatter_params.output_size * scatter_params.feature_size;
+    if (flat >= total) { return; }
+    let destination_row = flat / scatter_params.feature_size;
+    let column = flat % scatter_params.feature_size;
+    var sum = 0.0;
+    var count = 0u;
+    for (var source_row = 0u; source_row < scatter_params.source_size; source_row = source_row + 1u) {
+        let destination = bitcast<i32>(scatter_indices[source_row]);
+        if (destination >= 0 && u32(destination) == destination_row) {
+            sum = sum + scatter_source[source_row * scatter_params.feature_size + column];
+            count = count + 1u;
+        }
+    }
+    var mean = 0.0;
+    if (count != 0u) { mean = sum / f32(count); }
+    scatter_output[flat] = mean;
+    if (column == 0u) { scatter_counts[destination_row] = f32(count); }
 }
 ";
 
@@ -3856,7 +4559,7 @@ struct OptimizerParams {
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
-    t: f32,
+    t: u32,
     extra: f32,
 }
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
@@ -3880,8 +4583,9 @@ fn lamb_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < opt_params.size) {
         // extra = pre-computed ratio = param_norm / update_norm
         let ratio = opt_params.extra;
-        let bc1 = 1.0 - pow(opt_params.beta1, opt_params.t);
-        let bc2 = 1.0 - pow(opt_params.beta2, opt_params.t);
+        let step = f32(opt_params.t);
+        let bc1 = 1.0 - pow(opt_params.beta1, step);
+        let bc2 = 1.0 - pow(opt_params.beta2, step);
         let grad = gradients[idx];
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
@@ -3918,70 +4622,124 @@ fn ftrl_update(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<storage, read> attn_mask: array<f32>;
+@group(0) @binding(4) var<storage, read> attention_bias: array<f32>;
+@group(0) @binding(5) var<storage, read_write> attention_weights: array<f32>;
+@group(0) @binding(6) var<storage, read_write> softmax_stats: array<f32>;
 
-struct Params {
-    batch_heads: u32,
-    seq_len: u32,
+struct AttentionForwardParams {
+    batch_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    seq_q: u32,
+    seq_k: u32,
     head_dim: u32,
+    queries_per_kv: u32,
     is_causal: u32,
     scale: f32,
-    has_mask: u32,
-    _pad1: u32,
-    _pad2: u32,
+    has_bias: u32,
+    bias_batch_stride: u32,
+    store_weights: u32,
+    store_stats: u32,
+    boolean_mask_mode: u32,
+    softcap: f32,
+    _pad3: u32,
 }
-@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(7) var<uniform> attention_params: AttentionForwardParams;
+
+fn attention_forward_excluded(b: u32, q_head: u32, q_pos: u32, k_pos: u32) -> bool {
+    // KV-cache causal offset: query q_pos sits at absolute position q_pos + (seq_k - seq_q); seq_q==seq_k
+    // collapses to k_pos > q_pos (prefill), while a decode step attends to the whole cached prefix.
+    if (attention_params.is_causal != 0u && k_pos > q_pos + (attention_params.seq_k - attention_params.seq_q)) { return true; }
+    if (attention_params.boolean_mask_mode == 0u) { return false; }
+    var mask_base: u32 = 0u;
+    if (attention_params.boolean_mask_mode == 2u) {
+        mask_base = b * attention_params.bias_batch_stride
+            + q_head * attention_params.seq_q * attention_params.seq_k;
+    }
+    return attention_bias[mask_base + q_pos * attention_params.seq_k + k_pos] == 0.0;
+}
+
+fn attention_forward_score(b: u32, q_head: u32, kv_head: u32, q_pos: u32, k_pos: u32) -> f32 {
+    if (attention_forward_excluded(b, q_head, q_pos, k_pos)) { return -3.402823e+38; }
+
+    let q_base = ((b * attention_params.num_q_heads + q_head) * attention_params.seq_q + q_pos)
+        * attention_params.head_dim;
+    let k_base = ((b * attention_params.num_kv_heads + kv_head) * attention_params.seq_k + k_pos)
+        * attention_params.head_dim;
+    var dot: f32 = 0.0;
+    for (var d: u32 = 0u; d < attention_params.head_dim; d = d + 1u) {
+        dot = dot + query[q_base + d] * key[k_base + d];
+    }
+
+    var score = dot * attention_params.scale;
+    if (attention_params.softcap > 0.0) {
+        score = attention_params.softcap * tanh(score / attention_params.softcap);
+    }
+    if (attention_params.has_bias != 0u && attention_params.boolean_mask_mode == 0u) {
+        var bias_base: u32 = 0u;
+        if (attention_params.bias_batch_stride != 0u) {
+            bias_base = b * attention_params.bias_batch_stride;
+        }
+        let bias_idx = bias_base
+            + q_head * attention_params.seq_q * attention_params.seq_k
+            + q_pos * attention_params.seq_k + k_pos;
+        score = score + attention_bias[bias_idx];
+    }
+    return score;
+}
 
 @compute @workgroup_size(256)
-fn scaled_dot_product_attention(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let total = params.batch_heads * params.seq_len * params.head_dim;
-    if (idx >= total) { return; }
-    let d = idx % params.head_dim;
-    let q_pos = (idx / params.head_dim) % params.seq_len;
-    let bh = idx / (params.head_dim * params.seq_len);
-    let scale = params.scale;
-    let q_base = bh * params.seq_len * params.head_dim + q_pos * params.head_dim;
-    let kv_base = bh * params.seq_len * params.head_dim;
-    let mask_base = bh * params.seq_len * params.seq_len + q_pos * params.seq_len;
-    // Compute attention scores for this query position
+fn attention_forward_resident(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let total_rows = attention_params.batch_size * attention_params.num_q_heads * attention_params.seq_q;
+    if (row >= total_rows) { return; }
+
+    let q_pos = row % attention_params.seq_q;
+    let q_head = (row / attention_params.seq_q) % attention_params.num_q_heads;
+    let b = row / (attention_params.seq_q * attention_params.num_q_heads);
+    let kv_head = q_head / attention_params.queries_per_kv;
+
     var max_score: f32 = -3.402823e+38;
-    for (var k_pos: u32 = 0u; k_pos < params.seq_len; k_pos = k_pos + 1u) {
-        var dot: f32 = 0.0;
-        for (var i: u32 = 0u; i < params.head_dim; i = i + 1u) {
-            dot = dot + query[q_base + i] * key[kv_base + k_pos * params.head_dim + i];
+    for (var k_pos: u32 = 0u; k_pos < attention_params.seq_k; k_pos = k_pos + 1u) {
+        if (!attention_forward_excluded(b, q_head, q_pos, k_pos)) {
+            max_score = max(max_score, attention_forward_score(b, q_head, kv_head, q_pos, k_pos));
         }
-        var score = dot * scale;
-        // Apply causal mask: positions where k_pos > q_pos are masked out
-        if (params.is_causal != 0u && k_pos > q_pos) {
-            score = -3.402823e+38;
-        }
-        // Apply additive mask if provided
-        if (params.has_mask != 0u) {
-            score = score + attn_mask[mask_base + k_pos];
-        }
-        max_score = max(max_score, score);
     }
-    // Softmax and weighted sum
+
     var sum_exp: f32 = 0.0;
-    var result: f32 = 0.0;
-    for (var k_pos: u32 = 0u; k_pos < params.seq_len; k_pos = k_pos + 1u) {
-        var dot: f32 = 0.0;
-        for (var i: u32 = 0u; i < params.head_dim; i = i + 1u) {
-            dot = dot + query[q_base + i] * key[kv_base + k_pos * params.head_dim + i];
+    for (var k_pos: u32 = 0u; k_pos < attention_params.seq_k; k_pos = k_pos + 1u) {
+        if (!attention_forward_excluded(b, q_head, q_pos, k_pos)) {
+            sum_exp = sum_exp + exp(attention_forward_score(b, q_head, kv_head, q_pos, k_pos) - max_score);
         }
-        var score = dot * scale;
-        if (params.is_causal != 0u && k_pos > q_pos) {
-            score = -3.402823e+38;
-        }
-        if (params.has_mask != 0u) {
-            score = score + attn_mask[mask_base + k_pos];
-        }
-        let weight = exp(score - max_score);
-        sum_exp = sum_exp + weight;
-        result = result + weight * value[kv_base + k_pos * params.head_dim + d];
     }
-    output[idx] = result / sum_exp;
+
+    if (attention_params.store_stats != 0u) {
+        softmax_stats[row] = max_score + log(sum_exp);
+    }
+    if (attention_params.store_weights != 0u) {
+        let weights_base = row * attention_params.seq_k;
+        for (var k_pos: u32 = 0u; k_pos < attention_params.seq_k; k_pos = k_pos + 1u) {
+            var weight: f32 = 0.0;
+            if (!attention_forward_excluded(b, q_head, q_pos, k_pos) && sum_exp > 0.0) {
+                weight = exp(attention_forward_score(b, q_head, kv_head, q_pos, k_pos) - max_score) / sum_exp;
+            }
+            attention_weights[weights_base + k_pos] = weight;
+        }
+    }
+
+    let out_base = row * attention_params.head_dim;
+    let value_head_base = (b * attention_params.num_kv_heads + kv_head)
+        * attention_params.seq_k * attention_params.head_dim;
+    for (var d: u32 = 0u; d < attention_params.head_dim; d = d + 1u) {
+        var result: f32 = 0.0;
+        for (var k_pos: u32 = 0u; k_pos < attention_params.seq_k; k_pos = k_pos + 1u) {
+            if (!attention_forward_excluded(b, q_head, q_pos, k_pos) && sum_exp > 0.0) {
+                let weight = exp(attention_forward_score(b, q_head, kv_head, q_pos, k_pos) - max_score) / sum_exp;
+                result = result + weight * value[value_head_base + k_pos * attention_params.head_dim + d];
+            }
+        }
+        output[out_base + d] = result;
+    }
 }
 ";
 
@@ -4151,6 +4909,53 @@ fn apply_window(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    public const string ComplexInterleavedMultiplySource = @"
+@group(0) @binding(0) var<storage, read> cim_a: array<f32>;
+@group(0) @binding(1) var<storage, read> cim_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> cim_output: array<f32>;
+struct ComplexInterleavedParams { size: u32 }
+@group(0) @binding(3) var<uniform> cim_params: ComplexInterleavedParams;
+
+@compute @workgroup_size(256)
+fn complex_interleaved_multiply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pair = gid.x;
+    if (pair >= cim_params.size) { return; }
+    let idx = pair * 2u;
+    let ar = cim_a[idx];
+    let ai = cim_a[idx + 1u];
+    let br = cim_b[idx];
+    let bi = cim_b[idx + 1u];
+    cim_output[idx] = ar * br - ai * bi;
+    cim_output[idx + 1u] = ar * bi + ai * br;
+}
+";
+
+    public const string ComplexInterleavedUnarySource = @"
+@group(0) @binding(0) var<storage, read> ciu_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ciu_output: array<f32>;
+struct ComplexInterleavedUnaryParams { size: u32 }
+@group(0) @binding(2) var<uniform> ciu_params: ComplexInterleavedUnaryParams;
+
+@compute @workgroup_size(256)
+fn complex_interleaved_conjugate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pair = gid.x;
+    if (pair >= ciu_params.size) { return; }
+    let idx = pair * 2u;
+    ciu_output[idx] = ciu_input[idx];
+    ciu_output[idx + 1u] = -ciu_input[idx + 1u];
+}
+
+@compute @workgroup_size(256)
+fn complex_interleaved_magnitude(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pair = gid.x;
+    if (pair >= ciu_params.size) { return; }
+    let idx = pair * 2u;
+    let re = ciu_input[idx];
+    let im = ciu_input[idx + 1u];
+    ciu_output[pair] = sqrt(re * re + im * im);
+}
+";
+
     /// <summary>
     /// RBF forward, STDP update, and trace update kernels for specialized layers.
     /// </summary>
@@ -4211,9 +5016,10 @@ fn poincare_project(@builtin(global_invocation_id) gid: vec3<u32>) {
     let off = b * params.dim;
     var norm_sq: f32 = 0.0;
     for (var i: u32 = 0u; i < params.dim; i = i + 1u) { norm_sq = norm_sq + input_a[off + i] * input_a[off + i]; }
-    let norm = sqrt(norm_sq);
-    let max_norm = (1.0 - params.epsilon) / sqrt(params.curvature);
-    let scale = select(1.0, max_norm / norm, norm > max_norm);
+    let max_norm = 1.0 / sqrt(params.curvature) - params.epsilon;
+    let max_norm_sq = max_norm * max_norm;
+    var scale = 1.0;
+    if (norm_sq >= max_norm_sq) { scale = max_norm / sqrt(norm_sq); }
     output[idx] = input_a[idx] * scale;
 }
 
@@ -4710,6 +5516,227 @@ fn sparse_to_dense(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Permute/reorder kernel for general tensor dimension permutation.
     /// </summary>
+    public const string PixelShuffleSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+struct Params { batch: u32, channels: u32, in_h: u32, in_w: u32, scale: u32, mode: u32, total: u32, _pad: u32 }
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn pixel_shuffle(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.total) { return; }
+    let out_h = params.in_h * params.scale;
+    let out_w = params.in_w * params.scale;
+    let ow = idx % out_w;
+    var temp = idx / out_w;
+    let oh = temp % out_h;
+    temp = temp / out_h;
+    let oc = temp % params.channels;
+    let batch_idx = temp / params.channels;
+    let src_c = oc * params.scale * params.scale + (oh % params.scale) * params.scale + (ow % params.scale);
+    output[idx] = input[((batch_idx * params.channels * params.scale * params.scale + src_c) * params.in_h + oh / params.scale) * params.in_w + ow / params.scale];
+}
+
+@compute @workgroup_size(256)
+fn pixel_shuffle_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.total) { return; }
+    let input_channels = params.channels * params.scale * params.scale;
+    let iw = idx % params.in_w;
+    var temp = idx / params.in_w;
+    let ih = temp % params.in_h;
+    temp = temp / params.in_h;
+    let ic = temp % input_channels;
+    let batch_idx = temp / input_channels;
+    let oc = ic / (params.scale * params.scale);
+    let sub = ic % (params.scale * params.scale);
+    let out_h = params.in_h * params.scale;
+    let out_w = params.in_w * params.scale;
+    output[idx] = input[((batch_idx * params.channels + oc) * out_h + ih * params.scale + sub / params.scale) * out_w + iw * params.scale + sub % params.scale];
+}
+";
+
+    /// <summary>Euclidean linear step used before Poincare projection.</summary>
+    public const string HyperbolicLinearSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read> biases: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+struct Params { batch: u32, input_features: u32, output_features: u32, }
+@group(0) @binding(4) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn hyperbolic_linear_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let index = gid.x;
+    if (index >= params.batch * params.output_features) { return; }
+    let b = index / params.output_features;
+    let o = index % params.output_features;
+    var sum = biases[o];
+    for (var i = 0u; i < params.input_features; i = i + 1u) {
+        sum = sum + input[b * params.input_features + i] * weights[o * params.input_features + i];
+    }
+    output[index] = sum;
+}
+";
+
+    /// <summary>Deterministic Euclidean gradients for the hyperbolic linear step.</summary>
+    public const string HyperbolicLinearBackwardSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> auxiliary: array<f32>;
+@group(0) @binding(2) var<storage, read_write> result: array<f32>;
+struct Params { batch: u32, input_features: u32, output_features: u32, }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn hyperbolic_linear_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let index = gid.x;
+    if (index >= params.batch * params.input_features) { return; }
+    let b = index / params.input_features;
+    let i = index % params.input_features;
+    var sum = 0.0;
+    for (var o = 0u; o < params.output_features; o = o + 1u) {
+        sum = sum + grad_output[b * params.output_features + o] * auxiliary[o * params.input_features + i];
+    }
+    result[index] = sum;
+}
+
+@compute @workgroup_size(256)
+fn hyperbolic_linear_backward_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let index = gid.x;
+    if (index >= params.output_features * params.input_features) { return; }
+    let o = index / params.input_features;
+    let i = index % params.input_features;
+    var sum = 0.0;
+    for (var b = 0u; b < params.batch; b = b + 1u) {
+        sum = sum + grad_output[b * params.output_features + o] * auxiliary[b * params.input_features + i];
+    }
+    result[index] = sum;
+}
+";
+
+    /// <summary>Deterministic batch reduction for the hyperbolic linear bias gradient.</summary>
+    public const string HyperbolicLinearBackwardBiasSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read_write> grad_biases: array<f32>;
+struct Params { batch: u32, output_features: u32, }
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn hyperbolic_linear_backward_biases(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let o = gid.x;
+    if (o >= params.output_features) { return; }
+    var sum = 0.0;
+    for (var b = 0u; b < params.batch; b = b + 1u) {
+        sum = sum + grad_output[b * params.output_features + o];
+    }
+    grad_biases[o] = sum;
+}
+";
+
+    public const string InstanceNormFullSource = @"
+@group(0) @binding(0) var<storage, read> inf_input: array<f32>;
+@group(0) @binding(1) var<storage, read> inf_gamma: array<f32>;
+@group(0) @binding(2) var<storage, read> inf_beta: array<f32>;
+@group(0) @binding(3) var<storage, read_write> inf_output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> inf_mean: array<f32>;
+@group(0) @binding(5) var<storage, read_write> inf_inv_var: array<f32>;
+struct InstanceNormFullParams { batch: u32, channels: u32, spatial: u32, epsilon: f32 }
+@group(0) @binding(6) var<uniform> inf_params: InstanceNormFullParams;
+
+@compute @workgroup_size(256)
+fn instance_norm_full(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let bc = gid.x;
+    if (bc >= inf_params.batch * inf_params.channels) { return; }
+    let channel = bc % inf_params.channels;
+    let base = bc * inf_params.spatial;
+    var mean: f32 = 0.0;
+    for (var s: u32 = 0u; s < inf_params.spatial; s = s + 1u) {
+        mean = mean + inf_input[base + s];
+    }
+    mean = mean / f32(inf_params.spatial);
+    var variance: f32 = 0.0;
+    for (var s: u32 = 0u; s < inf_params.spatial; s = s + 1u) {
+        let d = inf_input[base + s] - mean;
+        variance = variance + d * d;
+    }
+    variance = variance / f32(inf_params.spatial);
+    let inv_var = 1.0 / sqrt(variance + inf_params.epsilon);
+    inf_mean[bc] = mean;
+    inf_inv_var[bc] = inv_var;
+    for (var s: u32 = 0u; s < inf_params.spatial; s = s + 1u) {
+        inf_output[base + s] = inf_gamma[channel] * (inf_input[base + s] - mean) * inv_var + inf_beta[channel];
+    }
+}
+";
+
+    public const string InstanceNormBackwardDataSource = @"
+@group(0) @binding(0) var<storage, read> inbd_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> inbd_input: array<f32>;
+@group(0) @binding(2) var<storage, read> inbd_gamma: array<f32>;
+@group(0) @binding(3) var<storage, read> inbd_mean: array<f32>;
+@group(0) @binding(4) var<storage, read> inbd_inv_var: array<f32>;
+@group(0) @binding(5) var<storage, read_write> inbd_grad_input: array<f32>;
+struct InstanceNormBackwardParams { batch: u32, channels: u32, spatial: u32, epsilon: f32 }
+@group(0) @binding(6) var<uniform> inbd_params: InstanceNormBackwardParams;
+
+@compute @workgroup_size(256)
+fn instance_norm_backward_data(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = inbd_params.batch * inbd_params.channels * inbd_params.spatial;
+    if (idx >= total) { return; }
+    let bc = idx / inbd_params.spatial;
+    let channel = bc % inbd_params.channels;
+    let base = bc * inbd_params.spatial;
+    let mean = inbd_mean[bc];
+    let inv_var = inbd_inv_var[bc];
+    var sum_grad: f32 = 0.0;
+    var sum_grad_xhat: f32 = 0.0;
+    for (var s: u32 = 0u; s < inbd_params.spatial; s = s + 1u) {
+        let go = inbd_grad_output[base + s];
+        let xhat = (inbd_input[base + s] - mean) * inv_var;
+        sum_grad = sum_grad + go;
+        sum_grad_xhat = sum_grad_xhat + go * xhat;
+    }
+    let xhat = (inbd_input[idx] - mean) * inv_var;
+    let n = f32(inbd_params.spatial);
+    inbd_grad_input[idx] = inbd_gamma[channel] * inv_var / n *
+        (n * inbd_grad_output[idx] - sum_grad - xhat * sum_grad_xhat);
+}
+";
+
+    public const string InstanceNormBackwardStatsSource = @"
+@group(0) @binding(0) var<storage, read> inbs_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> inbs_input: array<f32>;
+@group(0) @binding(2) var<storage, read> inbs_mean: array<f32>;
+@group(0) @binding(3) var<storage, read> inbs_inv_var: array<f32>;
+@group(0) @binding(4) var<storage, read_write> inbs_grad_gamma: array<f32>;
+@group(0) @binding(5) var<storage, read_write> inbs_grad_beta: array<f32>;
+struct InstanceNormBackwardStatsParams { batch: u32, channels: u32, spatial: u32, epsilon: f32 }
+@group(0) @binding(6) var<uniform> inbs_params: InstanceNormBackwardStatsParams;
+
+@compute @workgroup_size(256)
+fn instance_norm_backward_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let channel = gid.x;
+    if (channel >= inbs_params.channels) { return; }
+    var grad_gamma: f32 = 0.0;
+    var grad_beta: f32 = 0.0;
+    for (var batch: u32 = 0u; batch < inbs_params.batch; batch = batch + 1u) {
+        let bc = batch * inbs_params.channels + channel;
+        let base = bc * inbs_params.spatial;
+        let mean = inbs_mean[bc];
+        let inv_var = inbs_inv_var[bc];
+        for (var s: u32 = 0u; s < inbs_params.spatial; s = s + 1u) {
+            let go = inbs_grad_output[base + s];
+            grad_beta = grad_beta + go;
+            grad_gamma = grad_gamma + go * (inbs_input[base + s] - mean) * inv_var;
+        }
+    }
+    inbs_grad_gamma[channel] = grad_gamma;
+    inbs_grad_beta[channel] = grad_beta;
+}
+";
+
     public const string PermuteSource = @"
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -4719,11 +5746,12 @@ struct PermuteParams {
     ndim: u32,
     _pad1: u32,
     _pad2: u32,
-    // Followed by shape (4), out_strides (4), in_strides (4), perm (4) = 16 fields
-    shape0: u32, shape1: u32, shape2: u32, shape3: u32,
     out_stride0: u32, out_stride1: u32, out_stride2: u32, out_stride3: u32,
+    out_stride4: u32, out_stride5: u32, out_stride6: u32, out_stride7: u32,
     in_stride0: u32, in_stride1: u32, in_stride2: u32, in_stride3: u32,
+    in_stride4: u32, in_stride5: u32, in_stride6: u32, in_stride7: u32,
     perm0: u32, perm1: u32, perm2: u32, perm3: u32,
+    perm4: u32, perm5: u32, perm6: u32, perm7: u32,
 }
 @group(0) @binding(2) var<uniform> params: PermuteParams;
 
@@ -4733,10 +5761,13 @@ fn permute_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= params.total) { return; }
     // Decompose output index into coordinates
     var remaining = idx;
-    var coords: array<u32, 4>;
-    let out_strides = array<u32, 4>(params.out_stride0, params.out_stride1, params.out_stride2, params.out_stride3);
-    let in_strides = array<u32, 4>(params.in_stride0, params.in_stride1, params.in_stride2, params.in_stride3);
-    let perm = array<u32, 4>(params.perm0, params.perm1, params.perm2, params.perm3);
+    var coords: array<u32, 8>;
+    let out_strides = array<u32, 8>(params.out_stride0, params.out_stride1, params.out_stride2, params.out_stride3,
+        params.out_stride4, params.out_stride5, params.out_stride6, params.out_stride7);
+    let in_strides = array<u32, 8>(params.in_stride0, params.in_stride1, params.in_stride2, params.in_stride3,
+        params.in_stride4, params.in_stride5, params.in_stride6, params.in_stride7);
+    let perm = array<u32, 8>(params.perm0, params.perm1, params.perm2, params.perm3,
+        params.perm4, params.perm5, params.perm6, params.perm7);
     for (var d: u32 = 0u; d < params.ndim; d = d + 1u) {
         coords[d] = remaining / out_strides[d];
         remaining = remaining % out_strides[d];
@@ -4753,6 +5784,334 @@ fn permute_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Fused GEMM + Bias + Activation kernel with proper separate bias buffer.
     /// </summary>
+    // Paged-attention decode (P1). K/V in a physical block pool [maxBlocks, blockSize, heads, headDim];
+    // a block table maps logical -> physical block id. Single-query online-softmax; headDim <= 256.
+    // Dispatched via DispatchRecurrence (5 storage buffers at 0-4, scalar uniform at 5, entry `main`).
+    // scale is passed as its int32 bit pattern and recovered via bitcast (scalars are i32).
+    public const string PagedAttentionDecodeSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, headDim: i32, blockSize: i32, seqLen: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = i32(gid.x);
+    if (h >= p.heads) { return; }
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < p.seqLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.heads + h) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[h * p.headDim + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[h * p.headDim + d] = acc[d] * inv; }
+}
+";
+
+    // Prefill / multi-query paged attention (P1, causal). One work-item per (query, head); query qi
+    // (logical position startPos+qi) attends to key positions 0..(startPos+qi). Dispatched via
+    // DispatchRecurrence (5 storage buffers + i32 scalar uniform; scale passed as its int bit pattern).
+    public const string PagedAttentionPrefillSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, headDim: i32, blockSize: i32, numQueries: i32, startPos: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let total = p.numQueries * p.heads;
+    if (idx >= total) { return; }
+    let qi = idx / p.heads;
+    let h = idx % p.heads;
+    let keyLen = p.startPos + qi + 1;
+    let qbase = (qi * p.heads + h) * p.headDim;
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < keyLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.heads + h) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[qbase + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[qbase + d] = acc[d] * inv; }
+}
+";
+
+    // GQA decode (P1): query head h shares KV head h/(heads/kvHeads); K/V pool
+    // [maxBlocks, blockSize, kvHeads, headDim]. One work-item per head; headDim <= 256.
+    public const string PagedAttentionDecodeGqaSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, kvHeads: i32, headDim: i32, blockSize: i32, seqLen: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = i32(gid.x);
+    if (h >= p.heads) { return; }
+    let kvHead = h / (p.heads / p.kvHeads);
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < p.seqLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.kvHeads + kvHead) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[h * p.headDim + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[h * p.headDim + d] = acc[d] * inv; }
+}
+";
+
+    // GQA prefill (P1, causal): query head h shares KV head h/(heads/kvHeads); K/V pool
+    // [maxBlocks, blockSize, kvHeads, headDim]. One work-item per (query, head); headDim <= 256.
+    public const string PagedAttentionPrefillGqaSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kcache: array<f32>;
+@group(0) @binding(2) var<storage, read> vcache: array<f32>;
+@group(0) @binding(3) var<storage, read> blockTable: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, kvHeads: i32, headDim: i32, blockSize: i32, numQueries: i32, startPos: i32, scaleBits: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let total = p.numQueries * p.heads;
+    if (idx >= total) { return; }
+    let qi = idx / p.heads;
+    let h = idx % p.heads;
+    let kvHead = h / (p.heads / p.kvHeads);
+    let keyLen = p.startPos + qi + 1;
+    let qbase = (qi * p.heads + h) * p.headDim;
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = 0; t < keyLen; t = t + 1) {
+        let blk = blockTable[t / p.blockSize];
+        let pos = t % p.blockSize;
+        let base = ((blk * p.blockSize + pos) * p.kvHeads + kvHead) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[qbase + d] * kcache[base + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * vcache[base + d]; }
+        m = new_m;
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[qbase + d] = acc[d] * inv; }
+}
+";
+
+    // Fused decode attention (P2, FlashDecoding) pass 1: per-(head, split) online-softmax partials over
+    // contiguous K/V [seqLen, kvHeads, headDim]. GQA via kvHead=h/(heads/kvHeads). scale passed as i32
+    // bit pattern (uniform is i32). Dispatched via DispatchRecurrence (6 storage buffers + uniform@6).
+    public const string FlashDecodePartialSource = @"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> partialM: array<f32>;
+@group(0) @binding(4) var<storage, read_write> partialL: array<f32>;
+@group(0) @binding(5) var<storage, read_write> partialAcc: array<f32>;
+struct P { heads: i32, kvHeads: i32, headDim: i32, seqLen: i32, splits: i32, splitLen: i32, scaleBits: i32 };
+@group(0) @binding(6) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let total = p.heads * p.splits;
+    if (idx >= total) { return; }
+    let h = idx / p.splits;
+    let s = idx % p.splits;
+    let kvHead = h / (p.heads / p.kvHeads);
+    let start = s * p.splitLen;
+    var end = start + p.splitLen;
+    if (end > p.seqLen) { end = p.seqLen; }
+    let scale = bitcast<f32>(p.scaleBits);
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var m = -3.4e38;
+    var l = 0.0;
+    for (var t = start; t < end; t = t + 1) {
+        let kb = (t * p.kvHeads + kvHead) * p.headDim;
+        var dot = 0.0;
+        for (var d = 0; d < p.headDim; d = d + 1) { dot = dot + q[h * p.headDim + d] * k[kb + d]; }
+        let logit = dot * scale;
+        let new_m = max(m, logit);
+        let corr = exp(m - new_m);
+        let pp = exp(logit - new_m);
+        l = l * corr + pp;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] * corr + pp * v[kb + d]; }
+        m = new_m;
+    }
+    partialM[idx] = m;
+    partialL[idx] = l;
+    let accBase = idx * p.headDim;
+    for (var d = 0; d < p.headDim; d = d + 1) { partialAcc[accBase + d] = acc[d]; }
+}
+";
+
+    // Fused decode attention (P2, FlashDecoding) pass 2: merge per-head split partials with the
+    // online-softmax combine. Dispatched via DispatchRecurrence (4 storage buffers + uniform@4).
+    public const string FlashDecodeReduceSource = @"
+@group(0) @binding(0) var<storage, read> partialM: array<f32>;
+@group(0) @binding(1) var<storage, read> partialL: array<f32>;
+@group(0) @binding(2) var<storage, read> partialAcc: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct P { heads: i32, headDim: i32, splits: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = i32(gid.x);
+    if (h >= p.heads) { return; }
+    var m = -3.4e38;
+    for (var s = 0; s < p.splits; s = s + 1) {
+        let ms = partialM[h * p.splits + s];
+        if (ms > m) { m = ms; }
+    }
+    var acc: array<f32, 256>;
+    for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = 0.0; }
+    var l = 0.0;
+    for (var s = 0; s < p.splits; s = s + 1) {
+        let idx = h * p.splits + s;
+        let ls = partialL[idx];
+        if (ls <= 0.0) { continue; }
+        let w = exp(partialM[idx] - m);
+        l = l + ls * w;
+        let accBase = idx * p.headDim;
+        for (var d = 0; d < p.headDim; d = d + 1) { acc[d] = acc[d] + partialAcc[accBase + d] * w; }
+    }
+    let inv = select(0.0, 1.0 / l, l > 0.0);
+    for (var d = 0; d < p.headDim; d = d + 1) { outbuf[h * p.headDim + d] = acc[d] * inv; }
+}
+";
+
+    // Weight-only fused dequant-GEMM (P0). Contract matches FusedDequantMatmulKernels:
+    // C[M,N]=act[M,K].dequant(W[K,N]); symmetric scales, per-tensor (scaleCount==1) or per-group
+    // over flat k*N. Integer weights (int8 / unpacked int4) uploaded as array<i32>; fp8 uses raw
+    // e4m3 byte + in-shader decode. Uniform struct padded to 32 bytes (WebGPU 16-byte alignment).
+    public const string DequantGemmIntSource = @"
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<i32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
+@group(0) @binding(4) var<uniform> params: QParams;
+
+@compute @workgroup_size(256)
+fn dequant_gemm_int(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let i = idx / params.N;
+    let j = idx % params.N;
+    var acc = 0.0;
+    if (params.scaleCount == 1u) {
+        let s = scales[0];
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            acc = acc + act[i * params.K + k] * f32(W[k * params.N + j]);
+        }
+        acc = acc * s;
+    } else {
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            let flat = k * params.N + j;
+            acc = acc + act[i * params.K + k] * f32(W[flat]) * scales[flat / params.groupSize];
+        }
+    }
+    outbuf[idx] = acc;
+}
+";
+
+    // FP8 E4M3 weight-only variant; decode matches Float8E4M3.ToFloat.
+    public const string DequantGemmFp8Source = @"
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<i32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outbuf: array<f32>;
+struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
+@group(0) @binding(4) var<uniform> params: QParams;
+
+fn decode_e4m3(raw: u32) -> f32 {
+    let r = raw & 0xFFu;
+    if ((r & 0x7Fu) == 0x7Fu) { return bitcast<f32>(0x7FC00000u); }
+    if ((r & 0x7Fu) == 0u) { return 0.0; }
+    let sign = (r & 0x80u) >> 7u;
+    let exp4 = (r & 0x78u) >> 3u;
+    let m3 = r & 0x07u;
+    let exp32 = i32(exp4) - 7 + 127;
+    let bits = (sign << 31u) | (u32(exp32 & 0xFF) << 23u) | (m3 << 20u);
+    return bitcast<f32>(bits);
+}
+
+@compute @workgroup_size(256)
+fn dequant_gemm_fp8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let i = idx / params.N;
+    let j = idx % params.N;
+    var acc = 0.0;
+    if (params.scaleCount == 1u) {
+        let s = scales[0];
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            acc = acc + act[i * params.K + k] * decode_e4m3(u32(W[k * params.N + j]));
+        }
+        acc = acc * s;
+    } else {
+        for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+            let flat = k * params.N + j;
+            acc = acc + act[i * params.K + k] * decode_e4m3(u32(W[flat])) * scales[flat / params.groupSize];
+        }
+    }
+    outbuf[idx] = acc;
+}
+";
+
     public const string FusedGemmBiasSource = @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
@@ -4890,7 +6249,8 @@ fn squash(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         sq = sq + input[off + d] * input[off + d];
     }
-    let scale = sq / ((1.0 + sq) * sqrt(sq + params.epsilon));
+    let denominator = (1.0 + sq) * (sqrt(sq) + params.epsilon);
+    let scale = select(0.0, sq / denominator, denominator != 0.0);
     for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
         output[off + d] = input[off + d] * scale;
     }
@@ -5623,7 +6983,12 @@ struct CEFwdParams {
 fn cross_entropy_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b = gid.x;
     if (b >= params.batch_size) { return; }
-    let target = bitcast<u32>(bitcast<i32>(targets[b]));
+    let target_i = bitcast<i32>(targets[b]);
+    if (target_i < 0 || u32(target_i) >= params.num_classes) {
+        output[b] = bitcast<f32>(0x7fc00000u);
+        return;
+    }
+    let target = u32(target_i);
     let base = b * params.num_classes;
     var max_val: f32 = -3.402823e+38;
     for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
@@ -6037,8 +7402,12 @@ fn gpu_random(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rand = philox4x32(counter, key);
     let u = u32_to_f32_01(rand[lane]);
     if (params.mode == 0u) {
-        // Uniform: min + u * (max - min)
-        output[idx] = params.min_val + u * (params.max_val - params.min_val);
+        let seed = params.seed_lo ^ params.seed_hi;
+        let state = idx * 747796405u + seed + 2891336453u;
+        let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        let sample = (word >> 22u) ^ word;
+        let uniform = f32(sample >> 8u) * (1.0 / 16777216.0);
+        output[idx] = fma(uniform, params.max_val - params.min_val, params.min_val);
     } else if (params.mode == 1u) {
         // Normal via Box-Muller (use pairs)
         let pair_idx = idx / 2u;
@@ -7535,6 +8904,93 @@ fn max_pool3d_with_indices(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[idx] = select(0.0, max_val, max_val > -3.402823e+38);
     indices_out[idx] = bitcast<f32>(i32(max_pos));
 }
+
+@compute @workgroup_size(256)
+fn max_pool3d_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let in_spatial = params.in_d * params.in_h * params.in_w;
+    let out_spatial = params.out_d * params.out_h * params.out_w;
+    let total = params.batch * params.channels * in_spatial;
+    if (idx >= total) { return; }
+    let bc = idx / in_spatial;
+    let in_pos = idx % in_spatial;
+    var sum: f32 = 0.0;
+    for (var out_pos: u32 = 0u; out_pos < out_spatial; out_pos = out_pos + 1u) {
+        let out_idx = bc * out_spatial + out_pos;
+        if (bitcast<i32>(indices_out[out_idx]) == i32(in_pos)) {
+            sum = sum + input[out_idx];
+        }
+    }
+    output[idx] = sum;
+}
+";
+
+    public const string UnfoldFold2DSource = @"
+@group(0) @binding(0) var<storage, read> uf_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> uf_output: array<f32>;
+struct UnfoldFold2DParams {
+    batch: i32, channels: i32, height: i32, width: i32,
+    window_h: i32, window_w: i32, kernel_h: i32, kernel_w: i32,
+    stride_h: i32, stride_w: i32, pad_h: i32, pad_w: i32,
+}
+@group(0) @binding(2) var<uniform> uf_params: UnfoldFold2DParams;
+
+@compute @workgroup_size(256)
+fn unfold2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let window_size = uf_params.window_h * uf_params.window_w;
+    let kernel_size = uf_params.kernel_h * uf_params.kernel_w;
+    let total = uf_params.batch * uf_params.channels * kernel_size * window_size;
+    if (idx >= total) { return; }
+    let window_pos = idx % window_size;
+    let col_row = (idx / window_size) % (uf_params.channels * kernel_size);
+    let batch = idx / (uf_params.channels * kernel_size * window_size);
+    let ow = window_pos % uf_params.window_w;
+    let oh = window_pos / uf_params.window_w;
+    let kw = col_row % uf_params.kernel_w;
+    let kh = (col_row / uf_params.kernel_w) % uf_params.kernel_h;
+    let channel = col_row / kernel_size;
+    let ih = oh * uf_params.stride_h + kh - uf_params.pad_h;
+    let iw = ow * uf_params.stride_w + kw - uf_params.pad_w;
+    var value: f32 = 0.0;
+    if (ih >= 0 && ih < uf_params.height && iw >= 0 && iw < uf_params.width) {
+        let input_idx = ((batch * uf_params.channels + channel) * uf_params.height + ih) * uf_params.width + iw;
+        value = uf_input[u32(input_idx)];
+    }
+    uf_output[gid.x] = value;
+}
+
+@compute @workgroup_size(256)
+fn fold2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    let image_size = uf_params.height * uf_params.width;
+    let total = uf_params.batch * uf_params.channels * image_size;
+    if (idx >= total) { return; }
+    let image_pos = idx % image_size;
+    let channel = (idx / image_size) % uf_params.channels;
+    let batch = idx / (uf_params.channels * image_size);
+    let ih = image_pos / uf_params.width;
+    let iw = image_pos % uf_params.width;
+    let window_size = uf_params.window_h * uf_params.window_w;
+    let col_channels = uf_params.channels * uf_params.kernel_h * uf_params.kernel_w;
+    var sum: f32 = 0.0;
+    for (var kh: i32 = 0; kh < uf_params.kernel_h; kh = kh + 1) {
+        let oh_numer = ih + uf_params.pad_h - kh;
+        if (oh_numer < 0 || oh_numer % uf_params.stride_h != 0) { continue; }
+        let oh = oh_numer / uf_params.stride_h;
+        if (oh >= uf_params.window_h) { continue; }
+        for (var kw: i32 = 0; kw < uf_params.kernel_w; kw = kw + 1) {
+            let ow_numer = iw + uf_params.pad_w - kw;
+            if (ow_numer < 0 || ow_numer % uf_params.stride_w != 0) { continue; }
+            let ow = ow_numer / uf_params.stride_w;
+            if (ow >= uf_params.window_w) { continue; }
+            let col_row = (channel * uf_params.kernel_h + kh) * uf_params.kernel_w + kw;
+            let input_idx = batch * col_channels * window_size + col_row * window_size + oh * uf_params.window_w + ow;
+            sum = sum + uf_input[u32(input_idx)];
+        }
+    }
+    uf_output[gid.x] = sum;
+}
 ";
 
     /// <summary>
@@ -7948,6 +9404,205 @@ fn attention_backward_kv(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Fully resident attention backward for self-attention, cross-attention, and grouped-query
+    /// attention. It consumes materialized weights when available or recomputes them for FlashAttention.
+    /// </summary>
+    public const string AttentionBackwardResidentSource = @"
+@group(0) @binding(0) var<storage, read> backward_grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> backward_query: array<f32>;
+@group(0) @binding(2) var<storage, read> backward_key: array<f32>;
+@group(0) @binding(3) var<storage, read> backward_value: array<f32>;
+@group(0) @binding(4) var<storage, read> backward_weights: array<f32>;
+@group(0) @binding(5) var<storage, read> backward_bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> backward_grad_primary: array<f32>;
+@group(0) @binding(7) var<storage, read_write> backward_grad_secondary: array<f32>;
+
+struct AttentionBackwardResidentParams {
+    batch_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    seq_q: u32,
+    seq_k: u32,
+    head_dim: u32,
+    queries_per_kv: u32,
+    is_causal: u32,
+    scale: f32,
+    has_bias: u32,
+    bias_batch_stride: u32,
+    use_weights: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+@group(0) @binding(8) var<uniform> backward_params: AttentionBackwardResidentParams;
+
+fn attention_backward_resident_score(b: u32, q_head: u32, kv_head: u32, q_pos: u32, k_pos: u32) -> f32 {
+    if (backward_params.is_causal != 0u && k_pos > q_pos) {
+        return -3.402823e+38;
+    }
+
+    let q_base = ((b * backward_params.num_q_heads + q_head) * backward_params.seq_q + q_pos)
+        * backward_params.head_dim;
+    let k_base = ((b * backward_params.num_kv_heads + kv_head) * backward_params.seq_k + k_pos)
+        * backward_params.head_dim;
+    var dot: f32 = 0.0;
+    for (var d: u32 = 0u; d < backward_params.head_dim; d = d + 1u) {
+        dot = dot + backward_query[q_base + d] * backward_key[k_base + d];
+    }
+
+    var score = dot * backward_params.scale;
+    if (backward_params.has_bias != 0u) {
+        var bias_base: u32 = 0u;
+        if (backward_params.bias_batch_stride != 0u) {
+            bias_base = b * backward_params.bias_batch_stride;
+        }
+        let bias_idx = bias_base
+            + q_head * backward_params.seq_q * backward_params.seq_k
+            + q_pos * backward_params.seq_k + k_pos;
+        score = score + backward_bias[bias_idx];
+    }
+    return score;
+}
+
+fn attention_backward_resident_weight(
+    row: u32, b: u32, q_head: u32, kv_head: u32, q_pos: u32, k_pos: u32,
+    max_score: f32, sum_exp: f32) -> f32 {
+    if (backward_params.use_weights != 0u) {
+        return backward_weights[row * backward_params.seq_k + k_pos];
+    }
+    return exp(attention_backward_resident_score(b, q_head, kv_head, q_pos, k_pos) - max_score) / sum_exp;
+}
+
+@compute @workgroup_size(256)
+fn attention_backward_resident_query(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = backward_params.batch_size * backward_params.num_q_heads
+        * backward_params.seq_q * backward_params.head_dim;
+    if (idx >= total) { return; }
+
+    let d = idx % backward_params.head_dim;
+    let row = idx / backward_params.head_dim;
+    let q_pos = row % backward_params.seq_q;
+    let q_head = (row / backward_params.seq_q) % backward_params.num_q_heads;
+    let b = row / (backward_params.seq_q * backward_params.num_q_heads);
+    let kv_head = q_head / backward_params.queries_per_kv;
+    let grad_out_base = row * backward_params.head_dim;
+    let value_head_base = (b * backward_params.num_kv_heads + kv_head)
+        * backward_params.seq_k * backward_params.head_dim;
+
+    var max_score: f32 = -3.402823e+38;
+    var sum_exp: f32 = 0.0;
+    if (backward_params.use_weights == 0u) {
+        for (var k_pos: u32 = 0u; k_pos < backward_params.seq_k; k_pos = k_pos + 1u) {
+            max_score = max(max_score,
+                attention_backward_resident_score(b, q_head, kv_head, q_pos, k_pos));
+        }
+        for (var k_pos: u32 = 0u; k_pos < backward_params.seq_k; k_pos = k_pos + 1u) {
+            sum_exp = sum_exp + exp(
+                attention_backward_resident_score(b, q_head, kv_head, q_pos, k_pos) - max_score);
+        }
+    }
+
+    var weighted_grad_sum: f32 = 0.0;
+    for (var k_pos: u32 = 0u; k_pos < backward_params.seq_k; k_pos = k_pos + 1u) {
+        let weight = attention_backward_resident_weight(
+            row, b, q_head, kv_head, q_pos, k_pos, max_score, sum_exp);
+        var grad_weight: f32 = 0.0;
+        for (var od: u32 = 0u; od < backward_params.head_dim; od = od + 1u) {
+            grad_weight = grad_weight + backward_grad_out[grad_out_base + od]
+                * backward_value[value_head_base + k_pos * backward_params.head_dim + od];
+        }
+        weighted_grad_sum = weighted_grad_sum + weight * grad_weight;
+    }
+
+    var grad_q: f32 = 0.0;
+    for (var k_pos: u32 = 0u; k_pos < backward_params.seq_k; k_pos = k_pos + 1u) {
+        let weight = attention_backward_resident_weight(
+            row, b, q_head, kv_head, q_pos, k_pos, max_score, sum_exp);
+        var grad_weight: f32 = 0.0;
+        for (var od: u32 = 0u; od < backward_params.head_dim; od = od + 1u) {
+            grad_weight = grad_weight + backward_grad_out[grad_out_base + od]
+                * backward_value[value_head_base + k_pos * backward_params.head_dim + od];
+        }
+        let grad_score = weight * (grad_weight - weighted_grad_sum);
+        grad_q = grad_q + grad_score
+            * backward_key[value_head_base + k_pos * backward_params.head_dim + d]
+            * backward_params.scale;
+    }
+    backward_grad_primary[idx] = grad_q;
+}
+
+@compute @workgroup_size(256)
+fn attention_backward_resident_key_value(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = backward_params.batch_size * backward_params.num_kv_heads
+        * backward_params.seq_k * backward_params.head_dim;
+    if (idx >= total) { return; }
+
+    let d = idx % backward_params.head_dim;
+    let k_pos = (idx / backward_params.head_dim) % backward_params.seq_k;
+    let kv_head = (idx / (backward_params.head_dim * backward_params.seq_k))
+        % backward_params.num_kv_heads;
+    let b = idx / (backward_params.head_dim * backward_params.seq_k * backward_params.num_kv_heads);
+    let first_q_head = kv_head * backward_params.queries_per_kv;
+    let last_q_head = min(first_q_head + backward_params.queries_per_kv, backward_params.num_q_heads);
+
+    var grad_k: f32 = 0.0;
+    var grad_v: f32 = 0.0;
+    for (var q_head = first_q_head; q_head < last_q_head; q_head = q_head + 1u) {
+        for (var q_pos: u32 = 0u; q_pos < backward_params.seq_q; q_pos = q_pos + 1u) {
+            let row = (b * backward_params.num_q_heads + q_head) * backward_params.seq_q + q_pos;
+            let grad_out_base = row * backward_params.head_dim;
+            let kv_head_base = (b * backward_params.num_kv_heads + kv_head)
+                * backward_params.seq_k * backward_params.head_dim;
+
+            var max_score: f32 = -3.402823e+38;
+            var sum_exp: f32 = 0.0;
+            if (backward_params.use_weights == 0u) {
+                for (var kk: u32 = 0u; kk < backward_params.seq_k; kk = kk + 1u) {
+                    max_score = max(max_score,
+                        attention_backward_resident_score(b, q_head, kv_head, q_pos, kk));
+                }
+                for (var kk: u32 = 0u; kk < backward_params.seq_k; kk = kk + 1u) {
+                    sum_exp = sum_exp + exp(
+                        attention_backward_resident_score(b, q_head, kv_head, q_pos, kk) - max_score);
+                }
+            }
+
+            var weighted_grad_sum: f32 = 0.0;
+            for (var kk: u32 = 0u; kk < backward_params.seq_k; kk = kk + 1u) {
+                let kk_weight = attention_backward_resident_weight(
+                    row, b, q_head, kv_head, q_pos, kk, max_score, sum_exp);
+                var kk_grad_weight: f32 = 0.0;
+                for (var od: u32 = 0u; od < backward_params.head_dim; od = od + 1u) {
+                    kk_grad_weight = kk_grad_weight + backward_grad_out[grad_out_base + od]
+                        * backward_value[kv_head_base + kk * backward_params.head_dim + od];
+                }
+                weighted_grad_sum = weighted_grad_sum + kk_weight * kk_grad_weight;
+            }
+
+            let weight = attention_backward_resident_weight(
+                row, b, q_head, kv_head, q_pos, k_pos, max_score, sum_exp);
+            var grad_weight: f32 = 0.0;
+            for (var od: u32 = 0u; od < backward_params.head_dim; od = od + 1u) {
+                grad_weight = grad_weight + backward_grad_out[grad_out_base + od]
+                    * backward_value[kv_head_base + k_pos * backward_params.head_dim + od];
+            }
+            let grad_score = weight * (grad_weight - weighted_grad_sum);
+            let q_idx = ((b * backward_params.num_q_heads + q_head) * backward_params.seq_q + q_pos)
+                * backward_params.head_dim + d;
+            grad_k = grad_k + grad_score * backward_query[q_idx] * backward_params.scale;
+            grad_v = grad_v + weight * backward_grad_out[grad_out_base + d];
+        }
+    }
+
+    backward_grad_primary[idx] = grad_k;
+    backward_grad_secondary[idx] = grad_v;
+}
+";
+
+    /// <summary>
     /// Grouped Query Attention kernel: maps Q-heads to KV-heads via head_ratio.
     /// 4 buffers: query, key, value, output.
     /// </summary>
@@ -8273,7 +9928,7 @@ struct LerpParams {
 fn lerp_fused(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < lp_params.size) {
-        lp_out[idx] = lp_a[idx] + lp_params.t * (lp_b[idx] - lp_a[idx]);
+        lp_out[idx] = fma(lp_params.t, lp_b[idx] - lp_a[idx], lp_a[idx]);
     }
 }
 ";
@@ -8295,7 +9950,7 @@ struct AddScaledParams {
 fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < as_params.size) {
-        as_out[idx] = as_params.scaleA * as_a[idx] + as_params.scaleB * as_b[idx];
+        as_out[idx] = fma(as_params.scaleA, as_a[idx], as_params.scaleB * as_b[idx]);
     }
 }
 ";
@@ -8385,7 +10040,7 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                AdditionalUnarySource + InverseHyperbolicSource + FillSource + ClampSource +
                FmaSource + BiasAddSource + Conv2DBiasAddSource + ActivationBackwardSource +
                LossBackwardSource + SoftmaxBackwardSource + AdditionalOptimizerSource +
-               AmsgradOptimizerSource + Amsgrad5BufferOptimizerSource +
+               AmsgradOptimizerSource + Amsgrad5BufferOptimizerSource + SparseOptimizerSource +
                DropoutSource + EmbeddingSource + InstanceNormSource +
                RMSNormSource + StatisticsSource + BroadcastSource + GradientClipSource +
                ScatterGatherSource + Conv2DBackwardSource + Conv2DBackwardKernelSource +
@@ -8418,7 +10073,7 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                AvgPoolCountPadSource + AvgPoolCountPadBackwardSource +
                Pool3DWithIndicesSource + GridSampleExtSource +
                LayerNormBackwardFullSource + AdaptiveAvgPool2DSource +
-               AttentionBackwardSource + GroupedQueryAttentionSource +
+               AttentionBackwardSource + AttentionBackwardResidentSource + GroupedQueryAttentionSource +
                Fp16ConvertSource + LstmCellBackwardSource + GruCellBackwardSource +
                LerpFusedSource + AddScaledSource +
                GatedActivationSource + SoftmaxVariantsSource +
@@ -8823,6 +10478,450 @@ fn l1_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         let d = logits_data[idx] - target_data[idx];
         grad_input_data[idx] = grad_output[0] * sign(d) * params.inv_size;
     }
+}
+
+@compute @workgroup_size(256)
+fn huber_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let d = logits_data[idx] - target_data[idx];
+        let grad = select(params.param1 * sign(d), d, abs(d) <= params.param1);
+        grad_input_data[idx] = grad_output[0] * grad * params.inv_size;
+    }
+}
+";
+
+    public const string GruCellBackwardGatesSource = @"
+@group(0) @binding(0) var<storage, read> gcbg_grad_h: array<f32>;
+@group(0) @binding(1) var<storage, read> gcbg_gate_r: array<f32>;
+@group(0) @binding(2) var<storage, read> gcbg_gate_z: array<f32>;
+@group(0) @binding(3) var<storage, read> gcbg_gate_n: array<f32>;
+@group(0) @binding(4) var<storage, read> gcbg_prev_h: array<f32>;
+@group(0) @binding(5) var<storage, read> gcbg_weights_hh: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gcbg_grad_r: array<f32>;
+@group(0) @binding(7) var<storage, read_write> gcbg_grad_z: array<f32>;
+@group(0) @binding(8) var<storage, read_write> gcbg_grad_n: array<f32>;
+struct GruCellBackwardFullParams { batch: u32, hidden: u32 }
+@group(0) @binding(9) var<uniform> gcbg_params: GruCellBackwardFullParams;
+
+@compute @workgroup_size(256)
+fn gru_cell_backward_gates(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= gcbg_params.batch * gcbg_params.hidden) { return; }
+    let batch = idx / gcbg_params.hidden;
+    let h = idx % gcbg_params.hidden;
+    let dh = gcbg_grad_h[idx];
+    let r = gcbg_gate_r[idx];
+    let z = gcbg_gate_z[idx];
+    let n = gcbg_gate_n[idx];
+    let dn = dh * (1.0 - z) * (1.0 - n * n);
+    let dz = dh * (gcbg_prev_h[idx] - n) * z * (1.0 - z);
+    var n_hidden: f32 = 0.0;
+    let weight_base = (2u * gcbg_params.hidden + h) * gcbg_params.hidden;
+    let prev_base = batch * gcbg_params.hidden;
+    for (var j: u32 = 0u; j < gcbg_params.hidden; j = j + 1u) {
+        n_hidden = n_hidden + gcbg_weights_hh[weight_base + j] * gcbg_prev_h[prev_base + j];
+    }
+    gcbg_grad_r[idx] = dn * n_hidden * r * (1.0 - r);
+    gcbg_grad_z[idx] = dz;
+    gcbg_grad_n[idx] = dn;
+}
+";
+
+    public const string GruCellBackwardHiddenSource = @"
+@group(0) @binding(0) var<storage, read> gcbh_grad_h: array<f32>;
+@group(0) @binding(1) var<storage, read> gcbh_gate_z: array<f32>;
+@group(0) @binding(2) var<storage, read> gcbh_grad_r: array<f32>;
+@group(0) @binding(3) var<storage, read> gcbh_grad_z: array<f32>;
+@group(0) @binding(4) var<storage, read> gcbh_grad_n: array<f32>;
+@group(0) @binding(5) var<storage, read> gcbh_weights_hh: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gcbh_grad_prev_h: array<f32>;
+struct GruCellBackwardHiddenParams { batch: u32, hidden: u32 }
+@group(0) @binding(7) var<uniform> gcbh_params: GruCellBackwardHiddenParams;
+
+@compute @workgroup_size(256)
+fn gru_cell_backward_hidden(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= gcbh_params.batch * gcbh_params.hidden) { return; }
+    let batch = idx / gcbh_params.hidden;
+    let j = idx % gcbh_params.hidden;
+    let gate_stride = gcbh_params.hidden * gcbh_params.hidden;
+    let grad_base = batch * gcbh_params.hidden;
+    var sum: f32 = gcbh_grad_h[idx] * gcbh_gate_z[idx];
+    for (var h: u32 = 0u; h < gcbh_params.hidden; h = h + 1u) {
+        let grad_idx = grad_base + h;
+        sum = sum + gcbh_grad_r[grad_idx] * gcbh_weights_hh[h * gcbh_params.hidden + j];
+        sum = sum + gcbh_grad_z[grad_idx] * gcbh_weights_hh[gate_stride + h * gcbh_params.hidden + j];
+        sum = sum + gcbh_grad_n[grad_idx] * gcbh_weights_hh[2u * gate_stride + h * gcbh_params.hidden + j];
+    }
+    gcbh_grad_prev_h[idx] = sum;
+}
+";
+
+    public const string LstmForwardLinearSource = @"
+@group(0) @binding(0) var<storage, read> lfl_input: array<f32>;
+@group(0) @binding(1) var<storage, read> lfl_prev_h: array<f32>;
+@group(0) @binding(2) var<storage, read> lfl_weights_ih: array<f32>;
+@group(0) @binding(3) var<storage, read> lfl_weights_hh: array<f32>;
+@group(0) @binding(4) var<storage, read> lfl_bias_ih: array<f32>;
+@group(0) @binding(5) var<storage, read> lfl_bias_hh: array<f32>;
+@group(0) @binding(6) var<storage, read_write> lfl_gates: array<f32>;
+struct RnnLinearParams { batch: u32, input_size: u32, hidden_size: u32, _pad: u32 }
+@group(0) @binding(7) var<uniform> lfl_params: RnnLinearParams;
+
+@compute @workgroup_size(256)
+fn lstm_forward_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let gate_size = 4u * lfl_params.hidden_size;
+    if (idx >= lfl_params.batch * gate_size) { return; }
+    let batch = idx / gate_size;
+    let row = idx % gate_size;
+    var value = lfl_bias_ih[row] + lfl_bias_hh[row];
+    for (var j: u32 = 0u; j < lfl_params.input_size; j = j + 1u) {
+        value = value + lfl_weights_ih[row * lfl_params.input_size + j] *
+            lfl_input[batch * lfl_params.input_size + j];
+    }
+    for (var j: u32 = 0u; j < lfl_params.hidden_size; j = j + 1u) {
+        value = value + lfl_weights_hh[row * lfl_params.hidden_size + j] *
+            lfl_prev_h[batch * lfl_params.hidden_size + j];
+    }
+    lfl_gates[idx] = value;
+}
+";
+
+    public const string LstmForwardStateSource = @"
+@group(0) @binding(0) var<storage, read_write> lfs_gates: array<f32>;
+@group(0) @binding(1) var<storage, read> lfs_prev_c: array<f32>;
+@group(0) @binding(2) var<storage, read_write> lfs_next_h: array<f32>;
+@group(0) @binding(3) var<storage, read_write> lfs_next_c: array<f32>;
+struct RnnStateParams { batch: u32, hidden_size: u32 }
+@group(0) @binding(4) var<uniform> lfs_params: RnnStateParams;
+
+@compute @workgroup_size(256)
+fn lstm_forward_state(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= lfs_params.batch * lfs_params.hidden_size) { return; }
+    let batch = idx / lfs_params.hidden_size;
+    let h = idx % lfs_params.hidden_size;
+    let base = batch * 4u * lfs_params.hidden_size + h;
+    let i_gate = 1.0 / (1.0 + exp(-lfs_gates[base]));
+    let f_gate = 1.0 / (1.0 + exp(-lfs_gates[base + lfs_params.hidden_size]));
+    let g_gate = tanh(lfs_gates[base + 2u * lfs_params.hidden_size]);
+    let o_gate = 1.0 / (1.0 + exp(-lfs_gates[base + 3u * lfs_params.hidden_size]));
+    let c_new = f_gate * lfs_prev_c[idx] + i_gate * g_gate;
+    lfs_gates[base] = i_gate;
+    lfs_gates[base + lfs_params.hidden_size] = f_gate;
+    lfs_gates[base + 2u * lfs_params.hidden_size] = g_gate;
+    lfs_gates[base + 3u * lfs_params.hidden_size] = o_gate;
+    lfs_next_c[idx] = c_new;
+    lfs_next_h[idx] = o_gate * tanh(c_new);
+}
+";
+
+    public const string GruForwardLinearSource = @"
+@group(0) @binding(0) var<storage, read> gfl_input: array<f32>;
+@group(0) @binding(1) var<storage, read> gfl_prev_h: array<f32>;
+@group(0) @binding(2) var<storage, read> gfl_weights_ih: array<f32>;
+@group(0) @binding(3) var<storage, read> gfl_weights_hh: array<f32>;
+@group(0) @binding(4) var<storage, read> gfl_bias_ih: array<f32>;
+@group(0) @binding(5) var<storage, read> gfl_bias_hh: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gfl_parts: array<f32>;
+struct GruLinearParams { batch: u32, input_size: u32, hidden_size: u32, _pad: u32 }
+@group(0) @binding(7) var<uniform> gfl_params: GruLinearParams;
+
+@compute @workgroup_size(256)
+fn gru_forward_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let part_size = 4u * gfl_params.hidden_size;
+    if (idx >= gfl_params.batch * part_size) { return; }
+    let batch = idx / part_size;
+    let part = (idx % part_size) / gfl_params.hidden_size;
+    let h = idx % gfl_params.hidden_size;
+    let row = min(part, 2u) * gfl_params.hidden_size + h;
+    var value: f32 = select(gfl_bias_ih[row], gfl_bias_hh[row], part == 3u);
+    if (part != 3u) {
+        for (var j: u32 = 0u; j < gfl_params.input_size; j = j + 1u) {
+            value = value + gfl_weights_ih[row * gfl_params.input_size + j] *
+                gfl_input[batch * gfl_params.input_size + j];
+        }
+    }
+    if (part < 2u || part == 3u) {
+        for (var j: u32 = 0u; j < gfl_params.hidden_size; j = j + 1u) {
+            value = value + gfl_weights_hh[row * gfl_params.hidden_size + j] *
+                gfl_prev_h[batch * gfl_params.hidden_size + j];
+        }
+    }
+    if (part < 2u) { value = value + gfl_bias_hh[row]; }
+    gfl_parts[idx] = value;
+}
+";
+
+    public const string GruForwardStateSource = @"
+@group(0) @binding(0) var<storage, read> gfs_parts: array<f32>;
+@group(0) @binding(1) var<storage, read> gfs_prev_h: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gfs_next_h: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gfs_gates: array<f32>;
+struct GruStateParams { batch: u32, hidden_size: u32 }
+@group(0) @binding(4) var<uniform> gfs_params: GruStateParams;
+
+@compute @workgroup_size(256)
+fn gru_forward_state(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= gfs_params.batch * gfs_params.hidden_size) { return; }
+    let batch = idx / gfs_params.hidden_size;
+    let h = idx % gfs_params.hidden_size;
+    let part_base = batch * 4u * gfs_params.hidden_size + h;
+    let gate_base = batch * 3u * gfs_params.hidden_size + h;
+    let r = 1.0 / (1.0 + exp(-gfs_parts[part_base]));
+    let z = 1.0 / (1.0 + exp(-gfs_parts[part_base + gfs_params.hidden_size]));
+    let n = tanh(gfs_parts[part_base + 2u * gfs_params.hidden_size] +
+        r * gfs_parts[part_base + 3u * gfs_params.hidden_size]);
+    gfs_gates[gate_base] = r;
+    gfs_gates[gate_base + gfs_params.hidden_size] = z;
+    gfs_gates[gate_base + 2u * gfs_params.hidden_size] = n;
+    gfs_next_h[idx] = (1.0 - z) * n + z * gfs_prev_h[idx];
+}
+";
+
+    public const string LstmBackwardGatesSource = @"
+@group(0) @binding(0) var<storage, read> lbg_grad_h: array<f32>;
+@group(0) @binding(1) var<storage, read> lbg_grad_c: array<f32>;
+@group(0) @binding(2) var<storage, read> lbg_gates: array<f32>;
+@group(0) @binding(3) var<storage, read> lbg_prev_c: array<f32>;
+@group(0) @binding(4) var<storage, read> lbg_new_c: array<f32>;
+@group(0) @binding(5) var<storage, read_write> lbg_grad_gates: array<f32>;
+@group(0) @binding(6) var<storage, read_write> lbg_next_grad_c: array<f32>;
+struct LstmBackwardParams { batch: u32, hidden_size: u32 }
+@group(0) @binding(7) var<uniform> lbg_params: LstmBackwardParams;
+
+@compute @workgroup_size(256)
+fn lstm_backward_gates(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= lbg_params.batch * lbg_params.hidden_size) { return; }
+    let batch = idx / lbg_params.hidden_size;
+    let h = idx % lbg_params.hidden_size;
+    let base = batch * 4u * lbg_params.hidden_size + h;
+    let i_gate = lbg_gates[base];
+    let f_gate = lbg_gates[base + lbg_params.hidden_size];
+    let g_gate = lbg_gates[base + 2u * lbg_params.hidden_size];
+    let o_gate = lbg_gates[base + 3u * lbg_params.hidden_size];
+    let tanh_c = tanh(lbg_new_c[idx]);
+    let dc = lbg_grad_h[idx] * o_gate * (1.0 - tanh_c * tanh_c) + lbg_grad_c[idx];
+    lbg_grad_gates[base] = dc * g_gate * i_gate * (1.0 - i_gate);
+    lbg_grad_gates[base + lbg_params.hidden_size] = dc * lbg_prev_c[idx] * f_gate * (1.0 - f_gate);
+    lbg_grad_gates[base + 2u * lbg_params.hidden_size] = dc * i_gate * (1.0 - g_gate * g_gate);
+    lbg_grad_gates[base + 3u * lbg_params.hidden_size] = lbg_grad_h[idx] * tanh_c * o_gate * (1.0 - o_gate);
+    lbg_next_grad_c[idx] = dc * f_gate;
+}
+";
+
+    public const string RnnBackwardProjectSource = @"
+@group(0) @binding(0) var<storage, read> rbp_grad_gates: array<f32>;
+@group(0) @binding(1) var<storage, read> rbp_weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> rbp_output: array<f32>;
+struct RnnProjectParams { batch: u32, gate_size: u32, output_size: u32, _pad: u32 }
+@group(0) @binding(3) var<uniform> rbp_params: RnnProjectParams;
+
+@compute @workgroup_size(256)
+fn rnn_backward_project(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= rbp_params.batch * rbp_params.output_size) { return; }
+    let batch = idx / rbp_params.output_size;
+    let column = idx % rbp_params.output_size;
+    var sum: f32 = 0.0;
+    for (var row: u32 = 0u; row < rbp_params.gate_size; row = row + 1u) {
+        sum = sum + rbp_grad_gates[batch * rbp_params.gate_size + row] *
+            rbp_weights[row * rbp_params.output_size + column];
+    }
+    rbp_output[idx] = sum;
+}
+";
+
+    public const string LstmBackwardAccumulateSource = @"
+@group(0) @binding(0) var<storage, read> lba_grad_gates: array<f32>;
+@group(0) @binding(1) var<storage, read> lba_input: array<f32>;
+@group(0) @binding(2) var<storage, read> lba_prev_h: array<f32>;
+@group(0) @binding(3) var<storage, read_write> lba_grad_wih: array<f32>;
+@group(0) @binding(4) var<storage, read_write> lba_grad_whh: array<f32>;
+@group(0) @binding(5) var<storage, read_write> lba_grad_bih: array<f32>;
+@group(0) @binding(6) var<storage, read_write> lba_grad_bhh: array<f32>;
+struct RnnAccumulateParams { batch: u32, gate_size: u32, input_size: u32, hidden_size: u32 }
+@group(0) @binding(7) var<uniform> lba_params: RnnAccumulateParams;
+
+@compute @workgroup_size(256)
+fn lstm_backward_accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let wih_size = lba_params.gate_size * lba_params.input_size;
+    let whh_size = lba_params.gate_size * lba_params.hidden_size;
+    if (idx < wih_size) {
+        let row = idx / lba_params.input_size;
+        let column = idx % lba_params.input_size;
+        var sum: f32 = 0.0;
+        for (var batch: u32 = 0u; batch < lba_params.batch; batch = batch + 1u) {
+            sum = sum + lba_grad_gates[batch * lba_params.gate_size + row] *
+                lba_input[batch * lba_params.input_size + column];
+        }
+        lba_grad_wih[idx] = lba_grad_wih[idx] + sum;
+    }
+    if (idx < whh_size) {
+        let row = idx / lba_params.hidden_size;
+        let column = idx % lba_params.hidden_size;
+        var sum: f32 = 0.0;
+        for (var batch: u32 = 0u; batch < lba_params.batch; batch = batch + 1u) {
+            sum = sum + lba_grad_gates[batch * lba_params.gate_size + row] *
+                lba_prev_h[batch * lba_params.hidden_size + column];
+        }
+        lba_grad_whh[idx] = lba_grad_whh[idx] + sum;
+    }
+    if (idx < lba_params.gate_size) {
+        var sum: f32 = 0.0;
+        for (var batch: u32 = 0u; batch < lba_params.batch; batch = batch + 1u) {
+            sum = sum + lba_grad_gates[batch * lba_params.gate_size + idx];
+        }
+        lba_grad_bih[idx] = lba_grad_bih[idx] + sum;
+        lba_grad_bhh[idx] = lba_grad_bhh[idx] + sum;
+    }
+}
+";
+
+    public const string GruBackwardGatesSource = @"
+@group(0) @binding(0) var<storage, read> gbg_grad_h: array<f32>;
+@group(0) @binding(1) var<storage, read> gbg_gates: array<f32>;
+@group(0) @binding(2) var<storage, read> gbg_prev_h: array<f32>;
+@group(0) @binding(3) var<storage, read> gbg_weights_hh: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gbg_grad_gates: array<f32>;
+struct GruBackwardSequenceParams { batch: u32, hidden_size: u32 }
+@group(0) @binding(5) var<uniform> gbg_params: GruBackwardSequenceParams;
+
+@compute @workgroup_size(256)
+fn gru_backward_gates(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= gbg_params.batch * gbg_params.hidden_size) { return; }
+    let batch = idx / gbg_params.hidden_size;
+    let h = idx % gbg_params.hidden_size;
+    let gate_base = batch * 3u * gbg_params.hidden_size + h;
+    let r = gbg_gates[gate_base];
+    let z = gbg_gates[gate_base + gbg_params.hidden_size];
+    let n = gbg_gates[gate_base + 2u * gbg_params.hidden_size];
+    let dh = gbg_grad_h[idx];
+    var n_hidden: f32 = 0.0;
+    let weight_base = (2u * gbg_params.hidden_size + h) * gbg_params.hidden_size;
+    let prev_base = batch * gbg_params.hidden_size;
+    for (var j: u32 = 0u; j < gbg_params.hidden_size; j = j + 1u) {
+        n_hidden = n_hidden + gbg_weights_hh[weight_base + j] * gbg_prev_h[prev_base + j];
+    }
+    let dn = dh * (1.0 - z) * (1.0 - n * n);
+    gbg_grad_gates[gate_base] = dn * n_hidden * r * (1.0 - r);
+    gbg_grad_gates[gate_base + gbg_params.hidden_size] = dh * (gbg_prev_h[idx] - n) * z * (1.0 - z);
+    gbg_grad_gates[gate_base + 2u * gbg_params.hidden_size] = dn;
+}
+";
+
+    public const string GruBackwardHiddenSource = @"
+@group(0) @binding(0) var<storage, read> gbh_grad_h: array<f32>;
+@group(0) @binding(1) var<storage, read> gbh_gates: array<f32>;
+@group(0) @binding(2) var<storage, read> gbh_grad_gates: array<f32>;
+@group(0) @binding(3) var<storage, read> gbh_weights_hh: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gbh_next_grad_h: array<f32>;
+struct GruBackwardHiddenParams { batch: u32, hidden_size: u32 }
+@group(0) @binding(5) var<uniform> gbh_params: GruBackwardHiddenParams;
+
+@compute @workgroup_size(256)
+fn gru_backward_hidden(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= gbh_params.batch * gbh_params.hidden_size) { return; }
+    let batch = idx / gbh_params.hidden_size;
+    let column = idx % gbh_params.hidden_size;
+    let gate_stride = gbh_params.hidden_size * gbh_params.hidden_size;
+    let grad_base = batch * 3u * gbh_params.hidden_size;
+    var sum = gbh_grad_h[idx] * gbh_gates[grad_base + gbh_params.hidden_size + column];
+    for (var h: u32 = 0u; h < gbh_params.hidden_size; h = h + 1u) {
+        sum = sum + gbh_grad_gates[grad_base + h] * gbh_weights_hh[h * gbh_params.hidden_size + column];
+        sum = sum + gbh_grad_gates[grad_base + gbh_params.hidden_size + h] *
+            gbh_weights_hh[gate_stride + h * gbh_params.hidden_size + column];
+        sum = sum + gbh_grad_gates[grad_base + 2u * gbh_params.hidden_size + h] *
+            gbh_weights_hh[2u * gate_stride + h * gbh_params.hidden_size + column];
+    }
+    gbh_next_grad_h[idx] = sum;
+}
+";
+
+    public const string GruBackwardAccumulateSource = @"
+@group(0) @binding(0) var<storage, read> gba_grad_gates: array<f32>;
+@group(0) @binding(1) var<storage, read> gba_input: array<f32>;
+@group(0) @binding(2) var<storage, read> gba_prev_h: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gba_grad_wih: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gba_grad_whh: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gba_grad_bih: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gba_grad_bhh: array<f32>;
+struct GruAccumulateParams { batch: u32, gate_size: u32, input_size: u32, hidden_size: u32 }
+@group(0) @binding(7) var<uniform> gba_params: GruAccumulateParams;
+
+@compute @workgroup_size(256)
+fn gru_backward_accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let wih_size = gba_params.gate_size * gba_params.input_size;
+    let whh_size = gba_params.gate_size * gba_params.hidden_size;
+    if (idx < wih_size) {
+        let row = idx / gba_params.input_size;
+        let column = idx % gba_params.input_size;
+        var sum: f32 = 0.0;
+        for (var batch: u32 = 0u; batch < gba_params.batch; batch = batch + 1u) {
+            sum = sum + gba_grad_gates[batch * gba_params.gate_size + row] *
+                gba_input[batch * gba_params.input_size + column];
+        }
+        gba_grad_wih[idx] = gba_grad_wih[idx] + sum;
+    }
+    if (idx < whh_size) {
+        let row = idx / gba_params.hidden_size;
+        let column = idx % gba_params.hidden_size;
+        var sum: f32 = 0.0;
+        for (var batch: u32 = 0u; batch < gba_params.batch; batch = batch + 1u) {
+            sum = sum + gba_grad_gates[batch * gba_params.gate_size + row] *
+                gba_prev_h[batch * gba_params.hidden_size + column];
+        }
+        gba_grad_whh[idx] = gba_grad_whh[idx] + sum;
+    }
+    if (idx < gba_params.gate_size) {
+        var sum: f32 = 0.0;
+        for (var batch: u32 = 0u; batch < gba_params.batch; batch = batch + 1u) {
+            sum = sum + gba_grad_gates[batch * gba_params.gate_size + idx];
+        }
+        gba_grad_bih[idx] = gba_grad_bih[idx] + sum;
+        gba_grad_bhh[idx] = gba_grad_bhh[idx] + sum;
+    }
+}
+";
+
+    public const string CapsuleSquashBackwardSource = @"
+@group(0) @binding(0) var<storage, read> csb_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> csb_input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> csb_grad_input: array<f32>;
+struct CapsuleSquashBackwardParams { num_capsules: u32, capsule_dim: u32, epsilon: f32, _pad: u32 }
+@group(0) @binding(3) var<uniform> csb_params: CapsuleSquashBackwardParams;
+
+@compute @workgroup_size(256)
+fn squash_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = csb_params.num_capsules * csb_params.capsule_dim;
+    if (idx >= total) { return; }
+    let capsule = idx / csb_params.capsule_dim;
+    let base = capsule * csb_params.capsule_dim;
+    var sq_norm: f32 = 0.0;
+    var dot: f32 = 0.0;
+    for (var d: u32 = 0u; d < csb_params.capsule_dim; d = d + 1u) {
+        let x = csb_input[base + d];
+        sq_norm = sq_norm + x * x;
+        dot = dot + x * csb_grad_output[base + d];
+    }
+    let norm = sqrt(sq_norm);
+    let norm_plus_epsilon = norm + csb_params.epsilon;
+    let denominator = (1.0 + sq_norm) * norm_plus_epsilon;
+    let valid = denominator != 0.0;
+    let scale = select(0.0, sq_norm / denominator, valid);
+    let coefficient = select(0.0,
+        (norm + 2.0 * csb_params.epsilon - sq_norm * norm) / (denominator * denominator), valid);
+    csb_grad_input[idx] = scale * csb_grad_output[idx] + coefficient * csb_input[idx] * dot;
 }
 ";
 
@@ -9309,8 +11408,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iw*ih; let pw=px2-px1+1e-7; let ph=py2-py1+1e-7;
-    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
+    let iA=iw*ih; let pw=max(px2-px1,1e-7); let ph=max(py2-py1,1e-7);
+    let uA=pw*ph+max(0.0,tx2-tx1)*max(0.0,ty2-ty1)-iA+1e-7;
     let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
     let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
     let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
@@ -9324,7 +11423,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cSq=encDx*encDx+encDy*encDy+1e-7; let cSqSq=cSq*cSq;
     let dCSq0=2.0*encDx*select(0.0,-1.0,px1<tx1); let dCSq1=2.0*encDy*select(0.0,-1.0,py1<ty1);
     let dCSq2=2.0*encDx*select(0.0,1.0,px2>tx2); let dCSq3=2.0*encDy*select(0.0,1.0,py2>ty2);
-    let tw=tx2-tx1+1e-7; let th=ty2-ty1+1e-7;
+    let tw=max(tx2-tx1,1e-7); let th=max(ty2-ty1,1e-7);
     let atanDiff=atan(tw/th)-atan(pw/ph); let fourOverPiSq=4.0/(3.14159265*3.14159265);
     let v=fourOverPiSq*atanDiff*atanDiff;
     let iou=iA/uA;
@@ -9353,7 +11452,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let iA=iW*iH; let pA=max(0.0,px2-px1)*max(0.0,py2-py1); let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7; let iou=iA/uA;
     let eA=(max(px2,tx2)-min(px1,tx1))*(max(py2,ty2)-min(py1,ty1))+1e-7;
     loss[i] = 1.0 - (iou - (eA - uA) / eA);
@@ -9373,7 +11472,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let iA=iW*iH; let pA=max(0.0,px2-px1)*max(0.0,py2-py1); let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7; let iou=iA/uA;
     let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
     let cds=dx*dx+dy*dy;
@@ -9396,13 +11495,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
     let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
     let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
-    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let iA=iW*iH; let pA=max(0.0,px2-px1)*max(0.0,py2-py1); let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7; let iou=iA/uA;
     let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
     let cds=dx*dx+dy*dy;
     let eDx=max(px2,tx2)-min(px1,tx1); let eDy=max(py2,ty2)-min(py1,ty1);
     let ds=eDx*eDx+eDy*eDy+1e-7;
-    let pw=px2-px1+1e-7; let ph=py2-py1+1e-7; let tw=tx2-tx1+1e-7; let th=ty2-ty1+1e-7;
+    let pw=max(px2-px1,1e-7); let ph=max(py2-py1,1e-7); let tw=max(tx2-tx1,1e-7); let th=max(ty2-ty1,1e-7);
     let rd=atan(tw/th)-atan(pw/ph);
     let v=(4.0/(3.14159265*3.14159265))*rd*rd;
     let alpha=v/(1.0-iou+v+1e-7);
@@ -9426,10 +11525,67 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iW=max(0.0, min(px2,tx2)-max(px1,tx1));
     let iH=max(0.0, min(py2,ty2)-max(py1,ty1));
     let iA=iW*iH;
-    let pA=(px2-px1)*(py2-py1);
-    let tA=(tx2-tx1)*(ty2-ty1);
+    let pA=max(0.0,px2-px1)*max(0.0,py2-py1);
+    let tA=max(0.0,tx2-tx1)*max(0.0,ty2-ty1);
     let uA=pA+tA-iA+1e-7;
     loss[i] = 1.0 - iA/uA;
+}";
+
+    public const string StatelessDropoutMaskSource = @"
+@group(0) @binding(0) var<storage, read_write> output: array<f32>;
+
+struct Params {
+    count: u32,
+    threshold: u32,
+    scale: f32,
+    seed: u32,
+}
+@group(0) @binding(1) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn stateless_dropout_mask(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.count) { return; }
+    let state = idx * 747796405u + params.seed + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    let sample = (word >> 22u) ^ word;
+    output[idx] = select(params.scale, 0.0, sample < params.threshold);
+}";
+
+    public const string SplitComplexTopKSource = @"
+struct TopKParams { n: u32, k: u32, _pad0: u32, _pad1: u32 };
+@group(0) @binding(0) var<storage, read> topk_in_real: array<f32>;
+@group(0) @binding(1) var<storage, read> topk_in_imag: array<f32>;
+@group(0) @binding(2) var<storage, read_write> topk_out_real: array<f32>;
+@group(0) @binding(3) var<storage, read_write> topk_out_imag: array<f32>;
+@group(0) @binding(4) var<uniform> topk_params: TopKParams;
+
+@compute @workgroup_size(256)
+fn split_complex_topk(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= topk_params.n) { return; }
+    let re = topk_in_real[idx];
+    let im = topk_in_imag[idx];
+    let mag_sq = re * re + im * im;
+    let mag_is_nan = (bitcast<u32>(mag_sq) & 0x7fffffffu) > 0x7f800000u;
+    var rank = 0u;
+    for (var other = 0u; other < topk_params.n; other = other + 1u) {
+        let other_re = topk_in_real[other];
+        let other_im = topk_in_imag[other];
+        let other_mag_sq = other_re * other_re + other_im * other_im;
+        let other_is_nan = (bitcast<u32>(other_mag_sq) & 0x7fffffffu) > 0x7f800000u;
+        var other_before = false;
+        if (mag_is_nan) {
+            other_before = !other_is_nan || (other_is_nan && other < idx);
+        } else {
+            other_before = !other_is_nan &&
+                (other_mag_sq > mag_sq || (other_mag_sq == mag_sq && other < idx));
+        }
+        if (other_before) { rank = rank + 1u; }
+    }
+    let keep = rank < topk_params.k;
+    topk_out_real[idx] = select(0.0, re, keep);
+    topk_out_imag[idx] = select(0.0, im, keep);
 }";
 }
 #endif

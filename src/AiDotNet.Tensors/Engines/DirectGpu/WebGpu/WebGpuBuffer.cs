@@ -148,6 +148,55 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     }
 
     /// <summary>
+    /// Copies raw bytes from a CPU array to the GPU buffer.
+    /// </summary>
+    public void CopyBytesFrom(byte[] data)
+    {
+        ThrowIfDisposed();
+
+        if (data is null)
+        {
+            throw new ArgumentNullException(nameof(data));
+        }
+
+        if (data.Length > _sizeBytes)
+        {
+            throw new ArgumentException($"Data length ({data.Length}) exceeds buffer capacity ({_sizeBytes})", nameof(data));
+        }
+
+        WebGpuNativeBindings.WriteByteBuffer(_bufferId, data, 0);
+    }
+
+    /// <summary>
+    /// Copies raw bytes from the GPU buffer to a CPU array.
+    /// </summary>
+    public void CopyBytesTo(byte[] data)
+    {
+        CopyBytesToAsync(data).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Asynchronously copies raw bytes from the GPU buffer to a CPU array.
+    /// </summary>
+    public async Task CopyBytesToAsync(byte[] data)
+    {
+        ThrowIfDisposed();
+
+        if (data is null)
+        {
+            throw new ArgumentNullException(nameof(data));
+        }
+
+        if (data.Length > _sizeBytes)
+        {
+            throw new ArgumentException($"Data length ({data.Length}) exceeds buffer capacity ({_sizeBytes})", nameof(data));
+        }
+
+        var result = await WebGpuNativeBindings.ReadByteBufferAsync(_bufferId, data.Length, 0);
+        Array.Copy(result, data, Math.Min(result.Length, data.Length));
+    }
+
+    /// <summary>
     /// Asynchronously copies data from the GPU buffer to a float array.
     /// </summary>
     /// <param name="data">Destination data array.</param>

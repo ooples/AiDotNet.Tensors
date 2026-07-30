@@ -161,6 +161,50 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         Assert.True(maxDiff < Tolerance, $"Deferred ResBlock diverged from eager: maxDiff={maxDiff}");
     }
 
+    [SkippableFact]
+    public void DeferredSwishInPlace_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No GPU device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 90);
+        AssertDeferredMatchesEager("SwishInPlace", () =>
+        {
+            var h = input.Clone();
+            _gpu!.SwishInPlace(h);
+            return h;
+        });
+    }
+
+    [SkippableFact]
+    public void DeferredGroupNormSwish_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No GPU device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 91);
+        var gamma = Rand(new[] { C }, 92);
+        var beta = Rand(new[] { C }, 93);
+        AssertDeferredMatchesEager("GroupNorm+Swish", () =>
+        {
+            var h = _gpu!.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+            _gpu.SwishInPlace(h);
+            return h;
+        });
+    }
+
+    [SkippableFact]
+    public void DeferredGroupNormSwishConv_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No GPU device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 94);
+        var gamma = Rand(new[] { C }, 95);
+        var beta = Rand(new[] { C }, 96);
+        var kernel = Rand(new[] { C, C, 3, 3 }, 97);
+        AssertDeferredMatchesEager("GroupNorm+Swish+Conv", () =>
+        {
+            var h = _gpu!.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+            _gpu.SwishInPlace(h);
+            return _gpu.Conv2D(h, kernel, 1, 1, 1);
+        });
+    }
+
     // Pure-CPU async test (no GPU → runs in CI) for the AsyncLocal deferral gate (#642 review,
     // Major): Begin on this thread, hop threads via an await, then TryDefer/EndAndRelease on the
     // continuation thread must see the SAME flowed state. With the old [ThreadStatic] storage the

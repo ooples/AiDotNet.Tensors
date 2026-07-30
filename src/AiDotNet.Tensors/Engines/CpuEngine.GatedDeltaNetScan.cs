@@ -91,13 +91,18 @@ public partial class CpuEngine
     {
         int hh = headDim * headDim;
         double kappa = 1.0 / Math.Sqrt(headDim);
-        var S = new double[hh];
-        var kS = new double[headDim];
-        var sK = new double[headDim];
-        for (int b = 0; b < batch; b++)
+        // Each (batch, head) pair is independent (private state/scratch, disjoint outputs); parallelize
+        // lock-free over the combined (b*numHeads) axis. See GlaForwardDouble.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var S = new double[hh];
+            var kS = new double[headDim];
+            var sK = new double[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 Array.Clear(S, 0, hh);
                 int hOff = h * headDim;
                 for (int t = 0; t < seqLen; t++)
@@ -131,7 +136,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void GatedDeltaBackwardDouble(
@@ -141,19 +146,22 @@ public partial class CpuEngine
     {
         int hh = headDim * headDim;
         double kappa = 1.0 / Math.Sqrt(headDim);
-        var Straj = new double[(seqLen + 1) * hh]; // pre-update state at index t = state entering step t
-        var S = new double[hh];
-        var dS = new double[hh];
-        var dSp = new double[hh];
-        var kS = new double[headDim];
-        var sK = new double[headDim];
-        var dKS = new double[headDim];
-        var dDelta = new double[headDim];
-
-        for (int b = 0; b < batch; b++)
+        // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Straj = new double[(seqLen + 1) * hh]; // pre-update state at index t = state entering step t
+            var S = new double[hh];
+            var dS = new double[hh];
+            var dSp = new double[hh];
+            var kS = new double[headDim];
+            var sK = new double[headDim];
+            var dKS = new double[headDim];
+            var dDelta = new double[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
 
                 // Forward recompute, saving the PRE-update state entering each step (index t).
@@ -252,7 +260,7 @@ public partial class CpuEngine
                     Array.Copy(dSp, 0, dS, 0, hh);
                 }
             }
-        }
+        });
     }
 
     // ── Generic-T path ───────────────────────────────────────────────────────────────────
@@ -263,13 +271,16 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
         T kappa = ops.FromDouble(1.0 / Math.Sqrt(headDim));
-        var S = new T[hh];
-        var kS = new T[headDim];
-        var sK = new T[headDim];
-        for (int b = 0; b < batch; b++)
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var S = new T[hh];
+            var kS = new T[headDim];
+            var sK = new T[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 for (int i = 0; i < hh; i++) S[i] = ops.Zero;
                 int hOff = h * headDim;
                 for (int t = 0; t < seqLen; t++)
@@ -302,7 +313,7 @@ public partial class CpuEngine
                     }
                 }
             }
-        }
+        });
     }
 
     private static void GatedDeltaBackwardGeneric<T>(
@@ -313,19 +324,21 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
         T kappa = ops.FromDouble(1.0 / Math.Sqrt(headDim));
-        var Straj = new T[(seqLen + 1) * hh];
-        var S = new T[hh];
-        var dS = new T[hh];
-        var dSp = new T[hh];
-        var kS = new T[headDim];
-        var sK = new T[headDim];
-        var dKS = new T[headDim];
-        var dDelta = new T[headDim];
-
-        for (int b = 0; b < batch; b++)
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            for (int h = 0; h < numHeads; h++)
+            var Straj = new T[(seqLen + 1) * hh];
+            var S = new T[hh];
+            var dS = new T[hh];
+            var dSp = new T[hh];
+            var kS = new T[headDim];
+            var sK = new T[headDim];
+            var dKS = new T[headDim];
+            var dDelta = new T[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
             {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
                 int hOff = h * headDim;
                 for (int i = 0; i < hh; i++) S[i] = ops.Zero;
                 for (int t = 0; t < seqLen; t++)
@@ -415,7 +428,7 @@ public partial class CpuEngine
                     Array.Copy(dSp, 0, dS, 0, hh);
                 }
             }
-        }
+        });
     }
 
     private static void GatedDeltaNetScanBackward<T>(

@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// executable-memory + call infrastructure (a trivial x+1 function), then the
 /// 12-accumulator FMA-throughput kernel that breaks RyuJIT's 8-register cap.
 /// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class MachineCodeKernelTests
 {
     private readonly ITestOutputHelper _output;

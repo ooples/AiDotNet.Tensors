@@ -15,7 +15,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public class Parity210GpuCorrectnessTests
+public class Parity210GpuCorrectnessTests : IDisposable
 {
     private readonly DirectGpuTensorEngine? _gpu;
     private readonly bool _available;
@@ -33,6 +33,12 @@ public class Parity210GpuCorrectnessTests
         {
             _available = false;
         }
+    }
+
+    public void Dispose()
+    {
+        _gpu?.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     private static Tensor<float> Randn(int seed, params int[] shape)

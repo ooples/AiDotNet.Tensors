@@ -84,25 +84,38 @@ public partial class CpuEngine
         var baseDecay = new double[recDim];
         for (int c = 0; c < recDim; c++) baseDecay[c] = SigD(-decay[c]);
 
-        var h = new double[recDim];
+        // Each recurrent channel c evolves an independent scalar state, so c is parallelizable; keep b
+        // outer (the per-channel gradients dBase/dDecay accumulate across batch in the backward). Local
+        // scalar state + disjoint output writes — fully lock-free.
         for (int b = 0; b < batch; b++)
         {
-            Array.Clear(h, 0, recDim);
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int off = (b * seqLen + t) * recDim;
-                for (int c = 0; c < recDim; c++)
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
-                    double a = R[off + c] * baseDecay[c];
-                    double oneMinus = 1.0 - a * a;
-                    double s = oneMinus > 0.0 ? Math.Sqrt(oneMinus) : 0.0;
-                    double hv = a * h[c] + s * (I[off + c] * V[off + c]);
-                    h[c] = hv;
-                    outp[off + c] = hv;
+                    double hc = 0.0;
+                    double bdc = baseDecay[c];
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int off = (bb * seqLen + t) * recDim;
+                        double a = R[off + c] * bdc;
+                        double oneMinus = 1.0 - a * a;
+                        double s = oneMinus > 0.0 ? Math.Sqrt(oneMinus) : 0.0;
+                        hc = a * hc + s * (I[off + c] * V[off + c]);
+                        outp[off + c] = hc;
+                    }
                 }
-            }
+            });
         }
     }
+
+    /// <summary>
+    /// Minimum recurrent channels per parallel chunk for the channel-parallel scan kernels (RG-LRU,
+    /// RWKV-4). Each channel owns a private scalar state and writes disjoint output/gradient slots.
+    /// </summary>
+    private const int RgLruChannelGrain = 8;
 
     private static void RgLruBackwardDouble(
         double[] dOut, double[] V, double[] R, double[] I, double[] decay,
@@ -112,64 +125,66 @@ public partial class CpuEngine
         var baseDecay = new double[recDim];
         for (int c = 0; c < recDim; c++) baseDecay[c] = SigD(-decay[c]);
 
-        var hTraj = new double[seqLen * recDim];
-        var h = new double[recDim];
-        var dH = new double[recDim];
-        var dBase = new double[recDim];
+        var dBase = new double[recDim]; // [recDim], one slot per channel — disjoint across c-threads
 
+        // Parallelize over channel c (independent scalar recurrence); keep b outer so dBase accumulates
+        // across batch serially. Each c owns a private scalar state + a private seqLen trajectory.
         for (int b = 0; b < batch; b++)
         {
-            // Forward recompute, saving the post-update state trajectory.
-            Array.Clear(h, 0, recDim);
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int off = (b * seqLen + t) * recDim;
-                for (int c = 0; c < recDim; c++)
-                {
-                    double a = R[off + c] * baseDecay[c];
-                    double oneMinus = 1.0 - a * a;
-                    double s = oneMinus > 0.0 ? Math.Sqrt(oneMinus) : 0.0;
-                    h[c] = a * h[c] + s * (I[off + c] * V[off + c]);
-                    hTraj[t * recDim + c] = h[c];
-                }
-            }
-
-            // Reverse sweep. dH carries the adjoint of h_t from t+1 (and y_t = h_t).
-            Array.Clear(dH, 0, recDim);
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int off = (b * seqLen + t) * recDim;
-                for (int c = 0; c < recDim; c++)
+                var hTrajC = new double[seqLen]; // this channel's post-update state over time
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
                     double bd = baseDecay[c];
-                    double a = R[off + c] * bd;
-                    double oneMinus = 1.0 - a * a;
-                    double s = oneMinus > 0.0 ? Math.Sqrt(oneMinus) : 0.0;
-                    double iv = I[off + c] * V[off + c];
-                    double hPrev = t > 0 ? hTraj[(t - 1) * recDim + c] : 0.0;
 
-                    // y_t = h_t.
-                    double dh = dH[c] + dOut[off + c];
+                    // Forward recompute for this channel, saving its post-update state trajectory.
+                    double hc = 0.0;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int off = (bb * seqLen + t) * recDim;
+                        double a = R[off + c] * bd;
+                        double oneMinus = 1.0 - a * a;
+                        double s = oneMinus > 0.0 ? Math.Sqrt(oneMinus) : 0.0;
+                        hc = a * hc + s * (I[off + c] * V[off + c]);
+                        hTrajC[t] = hc;
+                    }
 
-                    // h_t = a*hPrev + s*(i*v).
-                    // d(g=i*v) = dh*s ; d(s) = dh*iv ; d(a) = dh*hPrev + ds/da contribution.
-                    double dG = dh * s;
-                    dI[off + c] += dG * V[off + c];
-                    dV[off + c] += dG * I[off + c];
+                    // Reverse sweep. dHc carries the adjoint of h_t from t+1 (and y_t = h_t).
+                    double dHc = 0.0;
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int off = (bb * seqLen + t) * recDim;
+                        double a = R[off + c] * bd;
+                        double oneMinus = 1.0 - a * a;
+                        double s = oneMinus > 0.0 ? Math.Sqrt(oneMinus) : 0.0;
+                        double iv = I[off + c] * V[off + c];
+                        double hPrev = t > 0 ? hTrajC[t - 1] : 0.0;
 
-                    double dS = dh * iv;
-                    // s = sqrt(1-a^2) (when positive): ds/da = -a/s.
-                    double dA = dh * hPrev;
-                    if (s > 1e-12) dA += dS * (-a / s);
+                        // y_t = h_t.
+                        double dh = dHc + dOut[off + c];
 
-                    // a = r * base.
-                    dR[off + c] += dA * bd;
-                    dBase[c] += dA * R[off + c];
+                        // h_t = a*hPrev + s*(i*v).
+                        double dG = dh * s;
+                        dI[off + c] += dG * V[off + c];
+                        dV[off + c] += dG * I[off + c];
 
-                    // Adjoint to previous step: d(h_{t-1}) = dh * a.
-                    dH[c] = dh * a;
+                        double dS = dh * iv;
+                        // s = sqrt(1-a^2) (when positive): ds/da = -a/s.
+                        double dA = dh * hPrev;
+                        if (s > 1e-12) dA += dS * (-a / s);
+
+                        // a = r * base.
+                        dR[off + c] += dA * bd;
+                        dBase[c] += dA * R[off + c];
+
+                        // Adjoint to previous step: d(h_{t-1}) = dh * a.
+                        dHc = dh * a;
+                    }
                 }
-            }
+            });
         }
 
         // base = sigmoid(-decay): d(base)/d(decay) = -base*(1-base).
@@ -186,23 +201,28 @@ public partial class CpuEngine
         var baseDecay = new T[recDim];
         for (int c = 0; c < recDim; c++) baseDecay[c] = SigGeneric(ops, ops.Negate(decay[c]));
 
-        var h = new T[recDim];
+        // Channel-parallel with b outer; per-channel local scalar state. See RgLruForwardDouble.
         for (int b = 0; b < batch; b++)
         {
-            for (int c = 0; c < recDim; c++) h[c] = zero;
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int off = (b * seqLen + t) * recDim;
-                for (int c = 0; c < recDim; c++)
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
-                    T a = ops.Multiply(R[off + c], baseDecay[c]);
-                    T oneMinus = ops.Subtract(one, ops.Multiply(a, a));
-                    T s = ops.GreaterThan(oneMinus, zero) ? ops.Sqrt(oneMinus) : zero;
-                    T hv = ops.Add(ops.Multiply(a, h[c]), ops.Multiply(s, ops.Multiply(I[off + c], V[off + c])));
-                    h[c] = hv;
-                    outp[off + c] = hv;
+                    T hc = zero;
+                    T bdc = baseDecay[c];
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int off = (bb * seqLen + t) * recDim;
+                        T a = ops.Multiply(R[off + c], bdc);
+                        T oneMinus = ops.Subtract(one, ops.Multiply(a, a));
+                        T s = ops.GreaterThan(oneMinus, zero) ? ops.Sqrt(oneMinus) : zero;
+                        hc = ops.Add(ops.Multiply(a, hc), ops.Multiply(s, ops.Multiply(I[off + c], V[off + c])));
+                        outp[off + c] = hc;
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -216,57 +236,59 @@ public partial class CpuEngine
         var baseDecay = new T[recDim];
         for (int c = 0; c < recDim; c++) baseDecay[c] = SigGeneric(ops, ops.Negate(decay[c]));
 
-        var hTraj = new T[seqLen * recDim];
-        var h = new T[recDim];
-        var dH = new T[recDim];
         var dBase = new T[recDim];
         for (int c = 0; c < recDim; c++) dBase[c] = zero;
 
+        // Channel-parallel with b outer; per-channel local scalar state + private trajectory. See double.
         for (int b = 0; b < batch; b++)
         {
-            for (int c = 0; c < recDim; c++) h[c] = zero;
-            for (int t = 0; t < seqLen; t++)
+            int bb = b;
+            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, (cStart, cCount) =>
             {
-                int off = (b * seqLen + t) * recDim;
-                for (int c = 0; c < recDim; c++)
-                {
-                    T a = ops.Multiply(R[off + c], baseDecay[c]);
-                    T oneMinus = ops.Subtract(one, ops.Multiply(a, a));
-                    T s = ops.GreaterThan(oneMinus, zero) ? ops.Sqrt(oneMinus) : zero;
-                    h[c] = ops.Add(ops.Multiply(a, h[c]), ops.Multiply(s, ops.Multiply(I[off + c], V[off + c])));
-                    hTraj[t * recDim + c] = h[c];
-                }
-            }
-
-            for (int c = 0; c < recDim; c++) dH[c] = zero;
-            for (int t = seqLen - 1; t >= 0; t--)
-            {
-                int off = (b * seqLen + t) * recDim;
-                for (int c = 0; c < recDim; c++)
+                var hTrajC = new T[seqLen];
+                int cEnd = cStart + cCount;
+                for (int c = cStart; c < cEnd; c++)
                 {
                     T bd = baseDecay[c];
-                    T a = ops.Multiply(R[off + c], bd);
-                    T oneMinus = ops.Subtract(one, ops.Multiply(a, a));
-                    T s = ops.GreaterThan(oneMinus, zero) ? ops.Sqrt(oneMinus) : zero;
-                    T iv = ops.Multiply(I[off + c], V[off + c]);
-                    T hPrev = t > 0 ? hTraj[(t - 1) * recDim + c] : zero;
 
-                    T dh = ops.Add(dH[c], dOut[off + c]);
-                    T dG = ops.Multiply(dh, s);
-                    dI[off + c] = ops.Add(dI[off + c], ops.Multiply(dG, V[off + c]));
-                    dV[off + c] = ops.Add(dV[off + c], ops.Multiply(dG, I[off + c]));
+                    T hc = zero;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int off = (bb * seqLen + t) * recDim;
+                        T a = ops.Multiply(R[off + c], bd);
+                        T oneMinus = ops.Subtract(one, ops.Multiply(a, a));
+                        T s = ops.GreaterThan(oneMinus, zero) ? ops.Sqrt(oneMinus) : zero;
+                        hc = ops.Add(ops.Multiply(a, hc), ops.Multiply(s, ops.Multiply(I[off + c], V[off + c])));
+                        hTrajC[t] = hc;
+                    }
 
-                    T dS = ops.Multiply(dh, iv);
-                    T dA = ops.Multiply(dh, hPrev);
-                    if (ops.GreaterThan(s, tiny))
-                        dA = ops.Add(dA, ops.Multiply(dS, ops.Divide(ops.Negate(a), s)));
+                    T dHc = zero;
+                    for (int t = seqLen - 1; t >= 0; t--)
+                    {
+                        int off = (bb * seqLen + t) * recDim;
+                        T a = ops.Multiply(R[off + c], bd);
+                        T oneMinus = ops.Subtract(one, ops.Multiply(a, a));
+                        T s = ops.GreaterThan(oneMinus, zero) ? ops.Sqrt(oneMinus) : zero;
+                        T iv = ops.Multiply(I[off + c], V[off + c]);
+                        T hPrev = t > 0 ? hTrajC[t - 1] : zero;
 
-                    dR[off + c] = ops.Add(dR[off + c], ops.Multiply(dA, bd));
-                    dBase[c] = ops.Add(dBase[c], ops.Multiply(dA, R[off + c]));
+                        T dh = ops.Add(dHc, dOut[off + c]);
+                        T dG = ops.Multiply(dh, s);
+                        dI[off + c] = ops.Add(dI[off + c], ops.Multiply(dG, V[off + c]));
+                        dV[off + c] = ops.Add(dV[off + c], ops.Multiply(dG, I[off + c]));
 
-                    dH[c] = ops.Multiply(dh, a);
+                        T dS = ops.Multiply(dh, iv);
+                        T dA = ops.Multiply(dh, hPrev);
+                        if (ops.GreaterThan(s, tiny))
+                            dA = ops.Add(dA, ops.Multiply(dS, ops.Divide(ops.Negate(a), s)));
+
+                        dR[off + c] = ops.Add(dR[off + c], ops.Multiply(dA, bd));
+                        dBase[c] = ops.Add(dBase[c], ops.Multiply(dA, R[off + c]));
+
+                        dHc = ops.Multiply(dh, a);
+                    }
                 }
-            }
+            });
         }
 
         for (int c = 0; c < recDim; c++)

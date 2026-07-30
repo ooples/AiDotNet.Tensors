@@ -20,9 +20,20 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Phase 3 torch.func-equivalent transforms — Jacobians, Hessian,
 /// Vmap, FunctionalCall.
 /// </summary>
-public class TorchFuncPhase3Tests
+[Collection("EngineCurrentGlobalState")]
+public class TorchFuncPhase3Tests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
+    private readonly IEngine _previousEngine;
+
+    public TorchFuncPhase3Tests()
+    {
+        _previousEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
+    }
+
+    public void Dispose() => AiDotNetEngine.Current = _previousEngine;
 
     // ─── JacRev ───────────────────────────────────────────────────────
 

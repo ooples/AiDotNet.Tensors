@@ -175,6 +175,32 @@ kernel void multiply_scalar(
     }
 }
 
+kernel void strided_gather(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& offset [[buffer(2)]],
+    constant uint& stride [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        dst[gid] = src[offset + gid * stride];
+    }
+}
+
+kernel void strided_scatter(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& offset [[buffer(2)]],
+    constant uint& stride [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        dst[offset + gid * stride] = src[gid];
+    }
+}
+
 // Scalar addition: B = A + scalar
 kernel void add_scalar(
     device const float* A [[buffer(0)]],
@@ -197,7 +223,19 @@ kernel void pow_kernel(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = pow(A[gid], power);
+        float x = A[gid];
+        // Metal pow is undefined for a negative base. Integral exponents are
+        // mathematically valid, so evaluate |x|^power and restore odd parity.
+        if (x < 0.0f) {
+            if (power == trunc(power)) {
+                float magnitude = pow(-x, power);
+                B[gid] = (fmod(fabs(power), 2.0f) == 1.0f) ? -magnitude : magnitude;
+            } else {
+                B[gid] = NAN;
+            }
+        } else {
+            B[gid] = pow(x, power);
+        }
     }
 }
 
@@ -291,11 +329,81 @@ kernel void copy_buffer(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
     constant uint& size [[buffer(2)]],
+    constant uint& srcOffset [[buffer(3)]],
+    constant uint& dstOffset [[buffer(4)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        dst[gid] = src[gid];
+        dst[dstOffset + gid] = src[srcOffset + gid];
     }
+}
+
+// Repeat each logical axis element as a contiguous inner block.
+kernel void tile_axis(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& outerSize [[buffer(2)]],
+    constant uint& axisSize [[buffer(3)]],
+    constant uint& innerSize [[buffer(4)]],
+    constant uint& repeats [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint expandedAxis = axisSize * repeats;
+    uint total = outerSize * expandedAxis * innerSize;
+    if (gid >= total) return;
+    uint inner = gid % innerSize;
+    uint expandedIndex = (gid / innerSize) % expandedAxis;
+    uint outer = gid / (expandedAxis * innerSize);
+    uint axis = expandedIndex / repeats;
+    output[gid] = input[(outer * axisSize + axis) * innerSize + inner];
+}
+
+kernel void pixel_shuffle(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inH [[buffer(4)]],
+    constant uint& inW [[buffer(5)]],
+    constant uint& scale [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint outH = inH * scale;
+    uint outW = inW * scale;
+    if (gid >= batch * channels * outH * outW) return;
+    uint ow = gid % outW;
+    uint temp = gid / outW;
+    uint oh = temp % outH;
+    temp /= outH;
+    uint oc = temp % channels;
+    uint b = temp / channels;
+    uint srcC = oc * scale * scale + (oh % scale) * scale + (ow % scale);
+    output[gid] = input[((b * channels * scale * scale + srcC) * inH + oh / scale) * inW + ow / scale];
+}
+
+kernel void pixel_shuffle_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device float* gradInput [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inH [[buffer(4)]],
+    constant uint& inW [[buffer(5)]],
+    constant uint& scale [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint inputChannels = channels * scale * scale;
+    if (gid >= batch * inputChannels * inH * inW) return;
+    uint iw = gid % inW;
+    uint temp = gid / inW;
+    uint ih = temp % inH;
+    temp /= inH;
+    uint ic = temp % inputChannels;
+    uint b = temp / inputChannels;
+    uint oc = ic / (scale * scale);
+    uint sub = ic % (scale * scale);
+    uint outH = inH * scale;
+    uint outW = inW * scale;
+    gradInput[gid] = gradOutput[((b * channels + oc) * outH + ih * scale + sub / scale) * outW + iw * scale + sub % scale];
 }
 
 // Fill buffer with constant value
@@ -1075,7 +1183,9 @@ kernel void selu_backward(
         const float alpha = 1.6732632423543772f;
         const float scale = 1.0507009873554805f;
         float x = input[gid];
-        float grad = x > 0.0f ? scale : scale * alpha * exp(x);
+        // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)), as OpenCL and
+        // WebGpu already do. Differs only at x==0 and x==-0, where it is a factor-of-alpha error.
+        float grad = x >= 0.0f ? scale : scale * alpha * exp(x);
         gradInput[gid] = gradOutput[gid] * grad;
     }
 }
@@ -3873,6 +3983,27 @@ kernel void lion_update(
     }
 }
 
+// Proximal gradient (ISTA) update with L1 soft-thresholding.
+kernel void proximal_l1_update(
+    device float* param [[buffer(0)]],
+    device const float* grad [[buffer(1)]],
+    constant float& lr [[buffer(2)]],
+    constant float& l1_strength [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float tmp = param[gid] - lr * grad[gid];
+        float mag = abs(tmp) - lr * l1_strength;
+        if (mag <= 0.0f) {
+            param[gid] = 0.0f;
+        } else {
+            float sign_tmp = (tmp > 0.0f) ? 1.0f : -1.0f;
+            param[gid] = sign_tmp * mag;
+        }
+    }
+}
+
 // Gradient clipping by norm
 kernel void clip_grad_norm(
     device float* grad [[buffer(0)]],
@@ -4198,7 +4329,13 @@ kernel void not_equal_scalar(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = abs(A[gid] - scalar) > EPSILON ? 1.0f : 0.0f;
+        uint ab = as_type<uint>(A[gid]);
+        uint bb = as_type<uint>(scalar);
+        uint aa = ab & 0x7FFFFFFFu;
+        uint ba = bb & 0x7FFFFFFFu;
+        bool equal = aa <= 0x7F800000u && ba <= 0x7F800000u
+            && (ab == bb || ((aa | ba) == 0u));
+        B[gid] = equal ? 0.0f : 1.0f;
     }
 }
 
@@ -4396,9 +4533,10 @@ kernel void geglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    float x3 = value * value * value;
-    float gelu = 0.5f * value * (1.0f + tanh(0.7978845608f * (value + 0.044715f * x3)));
-    output[gid] = gelu * gate;
+    // #775: activation on the GATE — out = value * GELU(gate) (was GELU(value)*gate).
+    float g3 = gate * gate * gate;
+    float gelu = 0.5f * gate * (1.0f + tanh(0.7978845608f * (gate + 0.044715f * g3)));
+    output[gid] = value * gelu;
 }
 
 kernel void reglu_forward(device const float* input [[buffer(0)]],
@@ -4411,7 +4549,7 @@ kernel void reglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    output[gid] = max(value, 0.0f) * gate;
+    output[gid] = value * max(gate, 0.0f); // #775: act on gate
 }
 
 kernel void swiglu_forward(device const float* input [[buffer(0)]],
@@ -4424,8 +4562,8 @@ kernel void swiglu_forward(device const float* input [[buffer(0)]],
     uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
     float value = input[outer * fullDim + d];
     float gate = input[outer * fullDim + halfDim + d];
-    float sig = 1.0f / (1.0f + exp(-value));
-    output[gid] = value * sig * gate;
+    float sig = 1.0f / (1.0f + exp(-gate)); // #775: act on gate
+    output[gid] = value * (gate * sig);
 }
 
 kernel void relu_derivative(device const float* input [[buffer(0)]],
@@ -4686,8 +4824,8 @@ kernel void poincare_project(
     float sqNorm = 0.0f;
     for (uint d = 0; d < dim; d++) sqNorm += input[off + d] * input[off + d];
     float maxNorm = 1.0f / sqrt(curvature) - epsilon;
-    float norm = sqrt(max(sqNorm, 1e-20f));
-    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0f;
+    float maxNormSq = maxNorm * maxNorm;
+    float scale = sqNorm >= maxNormSq ? maxNorm / sqrt(sqNorm) : 1.0f;
     for (uint d = 0; d < dim; d++) output[off + d] = input[off + d] * scale;
 }
 
@@ -4980,6 +5118,329 @@ kernel void octonion_linear_backward_weights(
 
     #region Fused Linear Kernels
 
+    // Paged-attention decode (P1). K/V in a physical block pool [maxBlocks, blockSize, heads, headDim];
+    // a block table maps logical -> physical block id. Single-query online-softmax; headDim <= 256.
+    public const string PagedAttentionKernels = CommonHeader + @"
+kernel void paged_attention_decode(
+    device const float* q [[buffer(0)]],
+    device const float* kcache [[buffer(1)]],
+    device const float* vcache [[buffer(2)]],
+    device const int* blockTable [[buffer(3)]],
+    device float* outbuf [[buffer(4)]],
+    constant int& heads [[buffer(5)]],
+    constant int& headDim [[buffer(6)]],
+    constant int& blockSize [[buffer(7)]],
+    constant int& seqLen [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int h = int(gid);
+    if (h >= heads) return;
+    float acc[256];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = 0; t < seqLen; ++t) {
+        int blk = blockTable[t / blockSize];
+        int pos = t % blockSize;
+        int base = ((blk * blockSize + pos) * heads + h) * headDim;
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; ++d) dot += q[h*headDim+d] * kcache[base+d];
+        float logit = dot * scale;
+        float new_m = fmax(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (int d = 0; d < headDim; ++d) acc[d] = acc[d] * corr + p * vcache[base+d];
+        m = new_m;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < headDim; ++d) outbuf[h*headDim+d] = acc[d] * inv;
+}
+
+// Prefill / multi-query paged attention with causal masking. One thread per (query, head).
+kernel void paged_attention_prefill(
+    device const float* q [[buffer(0)]],
+    device const float* kcache [[buffer(1)]],
+    device const float* vcache [[buffer(2)]],
+    device const int* blockTable [[buffer(3)]],
+    device float* outbuf [[buffer(4)]],
+    constant int& heads [[buffer(5)]],
+    constant int& headDim [[buffer(6)]],
+    constant int& blockSize [[buffer(7)]],
+    constant int& numQueries [[buffer(8)]],
+    constant int& startPos [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int total = numQueries * heads;
+    if (idx >= total) return;
+    int qi = idx / heads;
+    int h = idx % heads;
+    int keyLen = startPos + qi + 1;
+    int qbase = (qi * heads + h) * headDim;
+    float acc[256];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = 0; t < keyLen; ++t) {
+        int blk = blockTable[t / blockSize];
+        int pos = t % blockSize;
+        int base = ((blk * blockSize + pos) * heads + h) * headDim;
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; ++d) dot += q[qbase + d] * kcache[base + d];
+        float logit = dot * scale;
+        float new_m = fmax(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (int d = 0; d < headDim; ++d) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < headDim; ++d) outbuf[qbase + d] = acc[d] * inv;
+}
+
+// GQA decode: query head h shares KV head h/(heads/kvHeads); K/V pool [maxBlocks,blockSize,kvHeads,headDim].
+kernel void paged_attention_decode_gqa(
+    device const float* q [[buffer(0)]],
+    device const float* kcache [[buffer(1)]],
+    device const float* vcache [[buffer(2)]],
+    device const int* blockTable [[buffer(3)]],
+    device float* outbuf [[buffer(4)]],
+    constant int& heads [[buffer(5)]],
+    constant int& kvHeads [[buffer(6)]],
+    constant int& headDim [[buffer(7)]],
+    constant int& blockSize [[buffer(8)]],
+    constant int& seqLen [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int h = int(gid);
+    if (h >= heads) return;
+    int kvHead = h / (heads / kvHeads);
+    float acc[256];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = 0; t < seqLen; ++t) {
+        int blk = blockTable[t / blockSize];
+        int pos = t % blockSize;
+        int base = ((blk * blockSize + pos) * kvHeads + kvHead) * headDim;
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; ++d) dot += q[h*headDim+d] * kcache[base+d];
+        float logit = dot * scale;
+        float new_m = fmax(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (int d = 0; d < headDim; ++d) acc[d] = acc[d] * corr + p * vcache[base+d];
+        m = new_m;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < headDim; ++d) outbuf[h*headDim+d] = acc[d] * inv;
+}
+
+// GQA prefill: causal multi-query with grouped KV heads.
+kernel void paged_attention_prefill_gqa(
+    device const float* q [[buffer(0)]],
+    device const float* kcache [[buffer(1)]],
+    device const float* vcache [[buffer(2)]],
+    device const int* blockTable [[buffer(3)]],
+    device float* outbuf [[buffer(4)]],
+    constant int& heads [[buffer(5)]],
+    constant int& kvHeads [[buffer(6)]],
+    constant int& headDim [[buffer(7)]],
+    constant int& blockSize [[buffer(8)]],
+    constant int& numQueries [[buffer(9)]],
+    constant int& startPos [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int total = numQueries * heads;
+    if (idx >= total) return;
+    int qi = idx / heads;
+    int h = idx % heads;
+    int kvHead = h / (heads / kvHeads);
+    int keyLen = startPos + qi + 1;
+    int qbase = (qi * heads + h) * headDim;
+    float acc[256];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = 0; t < keyLen; ++t) {
+        int blk = blockTable[t / blockSize];
+        int pos = t % blockSize;
+        int base = ((blk * blockSize + pos) * kvHeads + kvHead) * headDim;
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; ++d) dot += q[qbase + d] * kcache[base + d];
+        float logit = dot * scale;
+        float new_m = fmax(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (int d = 0; d < headDim; ++d) acc[d] = acc[d] * corr + p * vcache[base + d];
+        m = new_m;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < headDim; ++d) outbuf[qbase + d] = acc[d] * inv;
+}
+";
+
+    // Fused decode attention (P2, FlashDecoding). Single-query attention over contiguous K/V
+    // [seqLen, kvHeads, headDim]; sequence split across threads (pass 1) then merged per head (pass 2)
+    // with the online-softmax combine. GQA via kvHead = h/(heads/kvHeads). headDim <= 256.
+    public const string FlashDecodeKernels = CommonHeader + @"
+kernel void flash_decode_partial(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* partialM [[buffer(3)]],
+    device float* partialL [[buffer(4)]],
+    device float* partialAcc [[buffer(5)]],
+    constant int& heads [[buffer(6)]],
+    constant int& kvHeads [[buffer(7)]],
+    constant int& headDim [[buffer(8)]],
+    constant int& seqLen [[buffer(9)]],
+    constant int& splits [[buffer(10)]],
+    constant int& splitLen [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    int total = heads * splits;
+    if (idx >= total) return;
+    int h = idx / splits;
+    int s = idx % splits;
+    int kvHead = h / (heads / kvHeads);
+    int start = s * splitLen;
+    int end = start + splitLen;
+    if (end > seqLen) end = seqLen;
+    float acc[256];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = start; t < end; ++t) {
+        int kb = (t * kvHeads + kvHead) * headDim;
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; ++d) dot += q[h*headDim+d] * k[kb+d];
+        float logit = dot * scale;
+        float new_m = fmax(m, logit);
+        float corr = exp(m - new_m);
+        float p = exp(logit - new_m);
+        l = l * corr + p;
+        for (int d = 0; d < headDim; ++d) acc[d] = acc[d] * corr + p * v[kb+d];
+        m = new_m;
+    }
+    partialM[idx] = m;
+    partialL[idx] = l;
+    int accBase = idx * headDim;
+    for (int d = 0; d < headDim; ++d) partialAcc[accBase + d] = acc[d];
+}
+
+kernel void flash_decode_reduce(
+    device const float* partialM [[buffer(0)]],
+    device const float* partialL [[buffer(1)]],
+    device const float* partialAcc [[buffer(2)]],
+    device float* outbuf [[buffer(3)]],
+    constant int& heads [[buffer(4)]],
+    constant int& headDim [[buffer(5)]],
+    constant int& splits [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int h = int(gid);
+    if (h >= heads) return;
+    float m = -INFINITY;
+    for (int s = 0; s < splits; ++s) {
+        float ms = partialM[h*splits+s];
+        if (ms > m) m = ms;
+    }
+    float acc[256];
+    for (int d = 0; d < headDim; ++d) acc[d] = 0.0f;
+    float l = 0.0f;
+    for (int s = 0; s < splits; ++s) {
+        int idx = h*splits+s;
+        float ls = partialL[idx];
+        if (ls <= 0.0f) continue;
+        float w = exp(partialM[idx] - m);
+        l += ls * w;
+        int accBase = idx * headDim;
+        for (int d = 0; d < headDim; ++d) acc[d] += partialAcc[accBase + d] * w;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = 0; d < headDim; ++d) outbuf[h*headDim+d] = acc[d] * inv;
+}
+";
+
+    // Weight-only fused dequant-GEMM (P0). Contract matches FusedDequantMatmulKernels: C[M,N] =
+    // act[M,K] . dequant(W[K,N]); symmetric scales, per-tensor (scaleCount==1) or per-group over flat
+    // k*N. Integer weights (int8 / unpacked int4) are device const int*; fp8 uses the raw e4m3 byte.
+    public const string QuantGemmKernels = CommonHeader + @"
+inline float decode_e4m3(uint raw){
+    uint r = raw & 0xFFu;
+    if ((r & 0x7Fu) == 0x7Fu) return as_type<float>(0x7FC00000u);
+    if ((r & 0x7Fu) == 0u) return 0.0f;
+    uint sign=(r&0x80u)>>7, exp4=(r&0x78u)>>3, m3=(r&0x07u);
+    int exp32=int(exp4)-7+127;
+    uint bits=(sign<<31)|(uint(exp32 & 0xFF)<<23)|(m3<<20);
+    return as_type<float>(bits);
+}
+
+kernel void dequant_gemm_int(
+    device const float* act [[buffer(0)]],
+    device const int* w [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* outbuf [[buffer(3)]],
+    constant int& M [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant int& N [[buffer(6)]],
+    constant int& groupSize [[buffer(7)]],
+    constant int& scaleCount [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= M * N) return;
+    int i = idx / N; int j = idx % N;
+    float acc = 0.0f;
+    if (scaleCount == 1) {
+        float s = scales[0];
+        for (int k = 0; k < K; ++k) acc += act[i*K+k] * float(w[k*N+j]);
+        acc *= s;
+    } else {
+        for (int k = 0; k < K; ++k) { int flat = k*N+j; acc += act[i*K+k] * float(w[flat]) * scales[flat/groupSize]; }
+    }
+    outbuf[idx] = acc;
+}
+
+kernel void dequant_gemm_fp8(
+    device const float* act [[buffer(0)]],
+    device const int* w [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* outbuf [[buffer(3)]],
+    constant int& M [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant int& N [[buffer(6)]],
+    constant int& groupSize [[buffer(7)]],
+    constant int& scaleCount [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int idx = int(gid);
+    if (idx >= M * N) return;
+    int i = idx / N; int j = idx % N;
+    float acc = 0.0f;
+    if (scaleCount == 1) {
+        float s = scales[0];
+        for (int k = 0; k < K; ++k) acc += act[i*K+k] * decode_e4m3(uint(w[k*N+j]));
+        acc *= s;
+    } else {
+        for (int k = 0; k < K; ++k) { int flat = k*N+j; acc += act[i*K+k] * decode_e4m3(uint(w[flat])) * scales[flat/groupSize]; }
+    }
+    outbuf[idx] = acc;
+}
+";
+
     public const string FusedLinearKernels = CommonHeader + @"
 inline float act_relu(float x) { return max(x, 0.0f); }
 inline float act_tanh_fn(float x) { return tanh(x); }
@@ -5260,7 +5721,7 @@ kernel void ciou_loss(device const float* pred [[buffer(0)]], device const float
     float cds=dx*dx+dy*dy;
     float eDx=max(px2,tx2)-min(px1,tx1), eDy=max(py2,ty2)-min(py1,ty1);
     float ds=eDx*eDx+eDy*eDy+EPSILON;
-    float pw=px2-px1+EPSILON,ph=py2-py1+EPSILON,tw=tx2-tx1+EPSILON,th=ty2-ty1+EPSILON;
+    float pw=max(px2-px1,EPSILON),ph=max(py2-py1,EPSILON),tw=max(tx2-tx1,EPSILON),th=max(ty2-ty1,EPSILON);
     float rd=atan(tw/th)-atan(pw/ph);
     float v=(4.0f/(PI*PI))*rd*rd;
     float alpha=v/(1.0f-iou+v+EPSILON);
@@ -5345,7 +5806,7 @@ kernel void ciou_loss_backward(device const float* goB [[buffer(0)]], device con
     float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
     float cSq=encDx*encDx+encDy*encDy+EPSILON,cSqSq=cSq*cSq;
     float dCSq[4]={2.0f*encDx*(-(px1<tx1?1.0f:0.0f)),2.0f*encDy*(-(py1<ty1?1.0f:0.0f)),2.0f*encDx*(px2>tx2?1.0f:0.0f),2.0f*encDy*(py2>ty2?1.0f:0.0f)};
-    float pw=px2-px1+EPSILON,ph=py2-py1+EPSILON,tw=tx2-tx1+EPSILON,th=ty2-ty1+EPSILON;
+    float pw=max(px2-px1,EPSILON),ph=max(py2-py1,EPSILON),tw=max(tx2-tx1,EPSILON),th=max(ty2-ty1,EPSILON);
     float atanDiff=atan(tw/th)-atan(pw/ph), fourOverPiSq=4.0f/(PI*PI);
     float v=fourOverPiSq*atanDiff*atanDiff;
     float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);

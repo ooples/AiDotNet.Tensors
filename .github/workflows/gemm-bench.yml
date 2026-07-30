@@ -53,6 +53,7 @@ env:
 
 jobs:
   gemm-bench:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ${{ vars.GEMM_BENCH_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4

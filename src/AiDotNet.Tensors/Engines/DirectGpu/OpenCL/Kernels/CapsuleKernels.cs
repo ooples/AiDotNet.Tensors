@@ -107,6 +107,52 @@ __kernel void capsule_agreement(
     }
     agreement[idx] = sum;
 }
+
+__kernel void squash(
+    __global const float* input, __global float* output,
+    int numCapsules, int capsuleDim, float epsilon)
+{
+    int capsule = get_global_id(0);
+    if (capsule >= numCapsules) return;
+
+    int offset = capsule * capsuleDim;
+    float squaredNorm = 0.0f;
+    for (int d = 0; d < capsuleDim; d++) {
+        float value = input[offset + d];
+        squaredNorm += value * value;
+    }
+    float denominator = (1.0f + squaredNorm) * (sqrt(squaredNorm) + epsilon);
+    float scale = denominator != 0.0f ? squaredNorm / denominator : 0.0f;
+    for (int d = 0; d < capsuleDim; d++)
+        output[offset + d] = scale * input[offset + d];
+}
+
+__kernel void squash_backward(
+    __global const float* gradOutput, __global const float* input, __global float* gradInput,
+    int numCapsules, int capsuleDim, float epsilon)
+{
+    int capsule = get_global_id(0);
+    if (capsule >= numCapsules) return;
+
+    int offset = capsule * capsuleDim;
+    float squaredNorm = 0.0f;
+    float dot = 0.0f;
+    for (int d = 0; d < capsuleDim; d++) {
+        float value = input[offset + d];
+        squaredNorm += value * value;
+        dot += value * gradOutput[offset + d];
+    }
+    float norm = sqrt(squaredNorm);
+    float normPlusEpsilon = norm + epsilon;
+    float denominator = (1.0f + squaredNorm) * normPlusEpsilon;
+    float scale = denominator != 0.0f ? squaredNorm / denominator : 0.0f;
+    float coefficient = denominator != 0.0f
+        ? (norm + 2.0f * epsilon - squaredNorm * norm) / (denominator * denominator)
+        : 0.0f;
+    for (int d = 0; d < capsuleDim; d++)
+        gradInput[offset + d] = scale * gradOutput[offset + d]
+            + coefficient * input[offset + d] * dot;
+}
 ";
     }
 
@@ -117,7 +163,9 @@ __kernel void capsule_agreement(
             "capsule_predictions",
             "capsule_transform",
             "capsule_weighted_sum",
-            "capsule_agreement"
+            "capsule_agreement",
+            "squash",
+            "squash_backward"
         ];
     }
 }

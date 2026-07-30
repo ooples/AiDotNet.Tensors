@@ -23,6 +23,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// the conclusion is durable and the replay path's gradient correctness — which
 /// was previously untested — is now guarded.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class AbsSoftplusGradientRepro
 {
     private readonly ITestOutputHelper _out;

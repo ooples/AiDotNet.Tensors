@@ -226,7 +226,7 @@ __device__ __forceinline__ float grid_sample_safe(const float* __restrict__ src,
         y = reflect_index(y, H);
         x = reflect_index(x, W);
     }
-    return src[((n * H + y) * W + x) * C + c];
+    return src[((n * C + c) * H + y) * W + x];
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void geometry_grid_sample_2d(
@@ -250,7 +250,7 @@ extern ""C"" __global__ __launch_bounds__(256) void geometry_grid_sample_2d(
     if (mode == 1) {  // Nearest
         int nx = (int)lrint(sx), ny = (int)lrint(sy);
         for (int c = 0; c < C; c++)
-            output[((n * outH + oy) * outW + ox) * C + c] =
+            output[((n * C + c) * outH + oy) * outW + ox] =
                 grid_sample_safe(input, n, ny, nx, c, H, W, C, padding);
     } else if (mode == 0) {  // Bilinear
         int x0 = (int)floor(sx), y0 = (int)floor(sy);
@@ -263,7 +263,7 @@ extern ""C"" __global__ __launch_bounds__(256) void geometry_grid_sample_2d(
             float v11 = grid_sample_safe(input, n, y1, x1, c, H, W, C, padding);
             double v = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy)
                      + v10 * (1 - fx) * fy + v11 * fx * fy;
-            output[((n * outH + oy) * outW + ox) * C + c] = (float)v;
+            output[((n * C + c) * outH + oy) * outW + ox] = (float)v;
         }
     } else {  // Bicubic
         int x0 = (int)floor(sx), y0 = (int)floor(sy);
@@ -283,7 +283,7 @@ extern ""C"" __global__ __launch_bounds__(256) void geometry_grid_sample_2d(
                 }
                 acc += wy[yy] * rowAcc;
             }
-            output[((n * outH + oy) * outW + ox) * C + c] = (float)acc;
+            output[((n * C + c) * outH + oy) * outW + ox] = (float)acc;
         }
     }
 }

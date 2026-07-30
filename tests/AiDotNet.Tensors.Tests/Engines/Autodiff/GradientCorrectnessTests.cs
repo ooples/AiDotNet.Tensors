@@ -156,6 +156,24 @@ public class GradientCorrectnessTests : IDisposable
         VerifyGradient(inp => _engine.TensorMatMul(x, inp), w, "MatMul_w");
     }
 
+    // ─── Geometry ───────────────────────────────────────────────
+
+    [Fact]
+    public void AffineGrid_Gradient_MatchesNumerical()
+    {
+        // theta is a [batch=1, 2, 3] affine matrix. The sampling grid is linear in theta,
+        // so a correct backward must reach every theta entry — this pins the tape recording
+        // that a Spatial Transformer's localization network depends on (2D AffineGrid was
+        // previously classified non-differentiable, silently freezing STN training).
+        // NOTE: a plain sum(grid) loss zeroes the gradient of the two linear (xNorm/yNorm)
+        // columns because those coordinates sum to 0 over a symmetric grid — so weight the
+        // grid by a fixed tensor to make ALL six theta gradients non-trivial.
+        const int H = 3, W = 4;
+        var theta = new Tensor<float>(new float[] { 1.0f, 0.2f, 0.1f, -0.15f, 0.9f, -0.05f }, [1, 2, 3]);
+        var weights = MakeFilled([1, H, W, 2], 0.3f, 0.11f);
+        VerifyGradient(inp => _engine.TensorMultiply(_engine.AffineGrid(inp, H, W), weights), theta, "AffineGrid_theta");
+    }
+
     // ─── Activations ────────────────────────────────────────────
 
     [Fact]

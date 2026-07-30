@@ -276,18 +276,20 @@ public sealed class MixedPrecisionCompiledPlan
                 onAfterNodeBackwardWithGrads: _scratchFree
                     ? (node, fp32, fp16) =>
                     {
-                        // Protect the live gradient accumulators (cache key = backing array); evict the rest of
-                        // this node's backward sub-op scratch. Over-eviction degrades to a re-upload, not a fault.
+                        // Protect the live gradient accumulators under both cache-key forms. Host-backed tensors
+                        // use their backing array; zero-allocation resident tensors use their DataVector.
                         protect!.Clear();
                         foreach (var g in fp32.Values)
                         {
                             var a = g.DataVector.GetBackingArrayUnsafe();
                             if (a is not null) protect.Add(a);
+                            protect.Add(g.DataVector);
                         }
                         foreach (var g in fp16.Values)
                         {
                             var a = g.DataVector.GetBackingArrayUnsafe();
                             if (a is not null) protect.Add(a);
+                            protect.Add(g.DataVector);
                         }
                         // materializePending:false — the scratch is dead (not protected, not a forward activation
                         // kept past the snapshot), so dropping its pending download keeps the step fully resident.

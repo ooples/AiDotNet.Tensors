@@ -83,7 +83,13 @@ __kernel void batchnorm_forward(
             saveMean[c] = mean;
             saveInvVar[c] = invVar;
             runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
-            runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * var;
+            // Unbiased (Bessel-corrected) running variance — paper-faithful
+            // (Ioffe & Szegedy 2015 §3.1), matches cuDNN. Normalization uses the
+            // biased var; guard batchSpatial==1 (unbiased is undefined).
+            float runVarUnbiased = batchSpatial > 1
+                ? var * (float)batchSpatial / (float)(batchSpatial - 1)
+                : var;
+            runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * runVarUnbiased;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     } else {

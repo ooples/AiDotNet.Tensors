@@ -80,6 +80,31 @@ public sealed class GradientTape<T> : IDisposable
     private readonly Engines.DirectGpuTensorEngine? _snapshotEngine;
     private readonly long _activationSnapshot;
 
+    // GLOBAL tape-owned arena (extends #734). A top-level GradientTape with no
+    // arena already active (i.e. not created through a model base or Optimize()
+    // call site that opens its own TensorArena) CREATES and OWNS one for the
+    // duration of the tape. This gives EVERY backprop path — including custom
+    // training loops that go through none of those wrappers — zero-alloc training
+    // after warmup with no per-path wiring. On Dispose the owned arena is
+    // Dispose()d (pooling its large buffers to the cross-arena persistent pool and
+    // restoring the previous arena); an externally-owned long-lived arena is left
+    // to its owner and only Reset() per step (the pre-existing #1804 behaviour).
+    private bool _ownsArena;
+    private Helpers.TensorArena? _ownedArena;
+
+    // Opt-in (default OFF; #734). When enabled, a TOP-LEVEL tape with no arena already
+    // active creates+owns one for its lifetime — extending per-step arena recycling to
+    // custom training loops that go through no model base / Optimize() call site (which
+    // already open their own arena). DEFAULT OFF because a tape-owned arena's tensor ring
+    // pins activation WRAPPERS for reuse, which is fundamentally incompatible with
+    // ComputeGradientsStreaming's activation release (the streaming test asserts the
+    // released activation wrapper becomes collectable). Standard training via the model
+    // bases / Optimize() is UNAFFECTED — those open an explicit arena and still get the
+    // per-step reuse. Enable (AIDOTNET_TAPE_OWNED_ARENA=1) only for hand-rolled loops that
+    // use neither streaming nor gradient checkpointing.
+    internal static bool EnableTapeOwnedArena { get; set; }
+        = System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_OWNED_ARENA") == "1";
+
 
     /// <summary>
     /// Gets the number of operations recorded on this tape.
@@ -96,7 +121,28 @@ public sealed class GradientTape<T> : IDisposable
     internal void RemoveLastEntry()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (_entries.Count > 0)
+        {
+            ref var removed = ref _entries[_entries.Count - 1];
+            DifferentiableOps.UnpinSavedStateTensors<T>(ref removed);
+        }
         _entries.RemoveLast();
+    }
+
+    /// <summary>
+    /// Releases saved-state pins owned by the first <paramref name="entryCount"/> entries.
+    /// The per-entry ownership bit makes this safe when cleanup routes overlap or a persistent
+    /// tape is replayed. Entries appended by createGraph backward remain pinned for their own
+    /// later backward pass.
+    /// </summary>
+    private void ReleaseSavedStatePins(int entryCount)
+    {
+        int limit = Math.Min(entryCount, _entries.Count);
+        for (int i = 0; i < limit; i++)
+        {
+            ref var entry = ref _entries[i];
+            DifferentiableOps.UnpinSavedStateTensors<T>(ref entry);
+        }
     }
 
     /// <summary>
@@ -177,6 +223,21 @@ public sealed class GradientTape<T> : IDisposable
         _engine = AiDotNetEngine.Current;
         _engineExplicitlyBound = false;
         _parent = _current;
+
+        // GLOBAL tape-owned arena: a TOP-LEVEL tape (_parent is null) with NO arena
+        // already active on this thread opens one it owns. When an arena is already
+        // active (a model base / Optimize() call site opened it), we do NOT create
+        // our own — that arena stays externally owned and is only Reset() per step in
+        // Dispose (existing #1804 behaviour). Nested tapes (Hvp/Hessian) never own an
+        // arena. This is what extends zero-alloc training to backprop paths that go
+        // through none of the model bases or Optimize() call sites.
+        if (EnableTapeOwnedArena && _parent is null && !_options.SuppressArenaScope
+            && Helpers.TensorArena.Current is null)
+        {
+            _ownedArena = Helpers.TensorArena.Create();
+            _ownsArena = true;
+        }
+
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
 
         // Capture the activation-cache baseline for the OUTERMOST tape on a GPU engine.
@@ -263,7 +324,35 @@ public sealed class GradientTape<T> : IDisposable
             return; // Drop new entries when at capacity
         }
 
+        DifferentiableOps.PinSavedStateTensors<T>(ref entry);
         _entries.Add(entry);
+
+        // Graph-path visibility for MANUAL backward nodes. This public Record(entry) API is the
+        // manual-backward entry point (e.g. the neural-network layer library's
+        // RegisterManualBackwardNode, used for Conv im2col → col2im input-gradient wiring). Engine
+        // ops record via RecordSlot and additionally set output.GradFn so the graph-based backward
+        // fast path (ComputeGradientsViaGraph) — which traverses per-tensor GradFn links and does NOT
+        // walk the tape entry list — can reach them. A manual node that only appended a tape entry set
+        // NO GradFn, so the fast path treated its output as a leaf and silently DROPPED the node's
+        // input gradient (every Conv3D layer but the last was frozen during training). Mirror the
+        // RecordUnary GradFn wiring here so manual nodes are seen by BOTH backward paths. Only wire
+        // when the output has no GradFn yet (a fresh materialized tensor, e.g. im2col output) and the
+        // node actually has a backward to run.
+        var manualOutput = entry.Output;
+        if (manualOutput is not null && entry.Backward is not null && manualOutput.GradFn is null)
+        {
+            var node = GradNodePool<T>.Rent();
+            node.OwningTape = this;
+            node.Backward = entry.Backward;
+            node.Output = manualOutput;
+            node.Input0 = entry.Input0;
+            node.Input1 = entry.Input1;
+            node.Input2 = entry.Input2;
+            node.InputCount = entry.InputCount;
+            node.InputsOverflow = entry.InputsOverflow;
+            node.SavedState = entry.SavedState;
+            manualOutput.GradFn = node;
+        }
     }
 
     /// <summary>
@@ -275,7 +364,7 @@ public sealed class GradientTape<T> : IDisposable
     private TapeEntry<T> _discardSlot;
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    internal ref TapeEntry<T> RecordSlot()
+    internal ref TapeEntry<T> RecordSlot(out bool accepted)
     {
         // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording
         // entry point, so a streaming-released persistent tape must reject it too — otherwise a caller
@@ -285,9 +374,11 @@ public sealed class GradientTape<T> : IDisposable
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            accepted = false;
             _discardSlot = default;
             return ref _discardSlot;
         }
+        accepted = true;
         return ref _entries.AllocateSlot();
     }
 
@@ -386,6 +477,8 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.GradFn is null)
             throw new InvalidOperationException(
                 "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+
+        int recordedEntryCount = _entries.Count;
 
         var engine = _engine;
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
@@ -587,7 +680,11 @@ public sealed class GradientTape<T> : IDisposable
                             // is what otherwise pins the whole activation set for the backward's duration.
                             if (entrySlotOfOutput is not null
                                 && entrySlotOfOutput.TryGetValue(nodeOutput, out int slot))
+                            {
+                                ref var releasedEntry = ref _entries[slot];
+                                DifferentiableOps.UnpinSavedStateTensors<T>(ref releasedEntry);
                                 _entries[slot] = default;
+                            }
                         }
                         // This node's backward has already run, so it no longer needs its INPUTS.
                         // Drop the node's references to them: an activation is the output of one node and
@@ -625,6 +722,10 @@ public sealed class GradientTape<T> : IDisposable
         finally
         {
             SetCurrentTape(savedCurrent);
+            // Release every entry recorded before streaming began, including dead
+            // entries that were absent from the GradFn traversal. Entries already
+            // released while dropping activations are guarded by their ownership bit.
+            ReleaseSavedStatePins(recordedEntryCount);
             if (!_options.Persistent)
             {
                 // Non-persistent tapes drop the whole arena here, so they're safe to
@@ -673,6 +774,7 @@ public sealed class GradientTape<T> : IDisposable
         {
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         }
+        int recordedEntryCount = _entries.Count;
 
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
@@ -684,35 +786,42 @@ public sealed class GradientTape<T> : IDisposable
         bool hasHooksRegistered = (_hooks is not null && _hooks.Count > 0)
             || (_nodeHooks is not null && _nodeHooks.Count > 0)
             || (_nodePredicateHooks is not null && _nodePredicateHooks.Count > 0);
-        if (_options.Persistent && !createGraph && seedOverride is null)
+        if (_options.Persistent && seedOverride is null)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
             {
-                // Issue #283: suspend the tape during compiled-backward
-                // replay. Without this, engine ops invoked from BackwardFunctions
-                // (TensorMatMul/TensorTranspose/etc.) see Current != null and
-                // record fresh tape entries whose GradNodes hold the FORWARD
-                // intermediates as inputs. The compiled plan's cleanup only
-                // visits the forward _reachableEntryIndices — backward-
-                // recorded entries' GradFn chains are NEVER cleared, pinning
-                // ~7 forward intermediates × ~40KB each per iter (the
-                // 133KB-1MB/call signature in the GradientTapeLeakTests
-                // transformer-scale probes). The non-compiled path
-                // (ComputeGradientsViaGraph) already suspends — this is the
-                // missing parity. Same gating: createGraph=true intentionally
-                // keeps recording so higher-order ops (Hvp/Hessian) land in
-                // the outer tape, but the compiled-replay path is gated on
-                // !createGraph (line 249 above) so we always suspend here.
+                // Issue #283 / higher-order AD: the compiled backward normally
+                // suspends the tape during replay so BackwardFunctions' engine
+                // ops don't record fresh entries that pin forward intermediates
+                // (the leak the non-compiled path already handles). When
+                // createGraph=true we DO want the backward ops recorded on the
+                // outer tape so higher-order AD (Hvp / WGAN-GP gradient penalty)
+                // can differentiate them — so we keep the tape active and set
+                // _isBackwardCreateGraph so AccumulateGrad uses out-of-place
+                // TensorAdd (keeps the double-backward graph intact).
                 var savedCompiledReplayCurrent = _current;
-                SetCurrentTape(null);
+                var savedCompiledCg = DifferentiableOps._isBackwardCreateGraph;
+                if (createGraph)
+                {
+                    DifferentiableOps._isBackwardCreateGraph = true;
+                    // Keep the tape active — backward ops MUST record so the
+                    // outer tape's next backward can traverse them.
+                }
+                else
+                {
+                    SetCurrentTape(null);
+                }
                 try
                 {
                     return compiledBwd.Execute(loss);
                 }
                 finally
                 {
-                    SetCurrentTape(savedCompiledReplayCurrent);
+                    if (createGraph)
+                        DifferentiableOps._isBackwardCreateGraph = savedCompiledCg;
+                    else
+                        SetCurrentTape(savedCompiledReplayCurrent);
                 }
             }
         }
@@ -1053,6 +1162,11 @@ public sealed class GradientTape<T> : IDisposable
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
             }
+            // The slow tape walk may skip pruned or gradient-dead entries, but all
+            // entries acquired saved-state pins at record time. Release the original
+            // forward range exactly once; createGraph entries appended by backward
+            // belong to the next higher-order pass and remain pinned.
+            ReleaseSavedStatePins(recordedEntryCount);
         }
 
         // Tape-walk parity for the .Grad / .GradFn cleanup that ComputeGradientsViaGraph does.
@@ -1225,6 +1339,7 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
+        int recordedEntryCount = _entries.Count;
         // Suspend recording while backward runs so engine ops invoked from
         // backward funcs don't append to *this* tape (would shift bounded
         // tapes / corrupt persistent ones), and so backward fast paths that
@@ -1251,6 +1366,10 @@ public sealed class GradientTape<T> : IDisposable
         }
         finally
         {
+            // Graph traversal reaches only loss-connected nodes. Pin acquisition is
+            // per tape entry, so release the complete pre-backward entry range here;
+            // this also covers dead entries and cached-replay early returns.
+            ReleaseSavedStatePins(recordedEntryCount);
             if (suspendTape)
             {
                 SetCurrentTape(savedCurrent);
@@ -1609,7 +1728,6 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
-
                     // Input0 CAN be a leaf (no GradFn) or a foreign-tape intermediate
                     // (GradFn.OwningTape != this), or null when the streaming backward
                     // already released this node's inputs.
@@ -1738,7 +1856,6 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
-
                     // Issue #283 fix: destructive cleanup on Output AND on
                     // intermediate Inputs. Output is always an intermediate
                     // (leaves never appear as Output of an entry). Inputs
@@ -1928,6 +2045,7 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
 
+        ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
     }
 
@@ -2222,9 +2340,51 @@ public sealed class GradientTape<T> : IDisposable
             _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
         }
 
+        // A tape may be disposed before backward, or after a cleanup path that
+        // visited only reachable nodes. Release any entry-owned saved-state pins
+        // before the arena drops those references; already-cleaned entries no-op.
+        ReleaseSavedStatePins(_entries.Count);
+
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;
+
+        // Transparent per-step TensorArena recycling (AiDotNet #1804). When the
+        // OUTERMOST tape on this thread disposes, one training/compute step has
+        // completed — rewind the active TensorArena's scratch cursors so the
+        // next step reuses those backing arrays instead of GC-allocating fresh
+        // (this is the PyTorch caching-allocator parity that closes the ~25%
+        // per-op allocation gap on deep-model training). Any code that runs one
+        // GradientTape per step inside a TensorArena scope (e.g. the model
+        // training bases) gets zero-alloc training after warmup with NO
+        // per-model wiring. Guarded to the top-level tape (_parent is null) so
+        // nested / higher-order (Hvp/Hessian) tapes never reset mid-step.
+        // No-op when no arena is active (inference, non-arena callers).
+        // Contract: the optimizer step must run within the tape's scope so the
+        // gradient tensors (arena-backed) are consumed before this reset — the
+        // standard one-tape-per-step loop satisfies this; model weights and
+        // optimizer moments are plain-heap Tensors and are unaffected.
+        //
+        // GLOBAL tape-owned arena: if THIS tape created the arena (no arena was
+        // active at ctor and this is a top-level tape), Dispose it — that pools its
+        // large backing buffers to the cross-arena persistent pool and restores the
+        // previous arena, so the NEXT top-level tape reuses them (zero-alloc after
+        // warmup). Otherwise, if this is the top-level tape over an externally-owned
+        // long-lived arena, Reset() it per step (the pre-existing #1804 behaviour).
+        if (_ownsArena)
+        {
+            _ownedArena?.Dispose();
+        }
+        else if (_parent is null && !_options.SuppressArenaScope)
+        {
+            // #734: a transient INNER tape (the GradientCheckpointing recompute tape) is
+            // created mid-backward when the outer tape has nulled the thread-current tape,
+            // so it also sees _parent == null. It must NOT Reset() the arena here — that
+            // rewinds the OUTER tape's arena ring cursors mid-backward and the outer walk
+            // then reuses buffers still holding live gradients, corrupting them. Inner tapes
+            // set SuppressArenaScope so only the genuine step-boundary tape resets per step.
+            Helpers.TensorArena.Current?.Reset();
+        }
     }
 
     // ──────────────────────────────────────────────────────────────

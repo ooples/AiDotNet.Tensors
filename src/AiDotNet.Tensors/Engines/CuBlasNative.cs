@@ -55,6 +55,7 @@ public enum CudaResult
     NotMapped = 211,
     NotMappedAsArray = 212,
     NotMappedAsPointer = 213,
+    InvalidPtx = 218,
     LaunchFailed = 719,
     NotReady = 600,
     Unknown = 999
@@ -268,6 +269,24 @@ public static class CuBlasNative
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuCtxDestroy_v2")]
     public static extern CudaResult cuCtxDestroy(IntPtr context);
+
+    /// <summary>
+    /// Retains the device's PRIMARY context, creating it on first retain and bumping a refcount otherwise.
+    /// Unlike cuCtxCreate this does NOT reserve a fresh per-caller context (~200 MB); every retainer shares
+    /// the one primary context, so it is the memory-efficient way for a secondary consumer (e.g. the offload
+    /// allocator) to get a usable context without proliferating device memory. Balance with
+    /// cuDevicePrimaryCtxRelease. The returned context is NOT pushed onto the calling thread.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuDevicePrimaryCtxRetain")]
+    public static extern CudaResult cuDevicePrimaryCtxRetain(out IntPtr context, int device);
+
+    /// <summary>
+    /// Releases one reference to the device's primary context (obtained via cuDevicePrimaryCtxRetain). The
+    /// primary context is destroyed only when its retain count reaches zero, so this NEVER tears down a
+    /// context another consumer still holds — the counterpart to cuCtxDestroy for the retain/release model.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuDevicePrimaryCtxRelease_v2")]
+    public static extern CudaResult cuDevicePrimaryCtxRelease(int device);
 
     /// <summary>
     /// Pushes a context on the current CPU thread's stack.
@@ -538,6 +557,7 @@ public static class CuBlasNative
     // Math modes
     public const int CUBLAS_DEFAULT_MATH = 0;
     public const int CUBLAS_TENSOR_OP_MATH = 1;  // Allow tensor core acceleration
+    public const int CUBLAS_PEDANTIC_MATH = 2;   // Strict IEEE fp32 — forbids TF32 tensor-core rounding
     public const int CUBLAS_TF32_TENSOR_OP_MATH = 3;  // TF32 for Ampere+
 
     /// <summary>
@@ -573,6 +593,26 @@ public static class CuBlasNative
         int computeType,
         int algo);
 
+    /// <summary>
+    /// Mixed-precision strided-batched GEMM. This is the closest cuBLAS
+    /// comparison for a packed batch of attention heads because it performs
+    /// the entire Q*K^T fanout with one host launch.
+    /// </summary>
+    [DllImport(CublasLibrary, EntryPoint = "cublasGemmStridedBatchedEx")]
+    public static extern CublasStatus cublasGemmStridedBatchedEx(
+        IntPtr handle,
+        CublasOperation transa,
+        CublasOperation transb,
+        int m, int n, int k,
+        IntPtr alpha,
+        IntPtr A, int Atype, int lda, long strideA,
+        IntPtr B, int Btype, int ldb, long strideB,
+        IntPtr beta,
+        IntPtr C, int Ctype, int ldc, long strideC,
+        int batchCount,
+        int computeType,
+        int algo);
+
     // CUDA data types for cublasGemmEx
     public const int CUDA_R_16F = 2;   // __half
     public const int CUDA_R_32F = 0;   // float
@@ -582,6 +622,7 @@ public static class CuBlasNative
     // Compute types
     public const int CUBLAS_COMPUTE_16F = 64;
     public const int CUBLAS_COMPUTE_32F = 68;
+    public const int CUBLAS_COMPUTE_32F_PEDANTIC = 69;  // Strict fp32 — forbids TF32 in cublasGemmEx
     public const int CUBLAS_COMPUTE_32F_FAST_16F = 74;
     public const int CUBLAS_COMPUTE_32F_FAST_TF32 = 77;
 
@@ -628,6 +669,7 @@ public static class CuBlasNative
             CudaResult.NoDevice => "No CUDA device available",
             CudaResult.InvalidDevice => "Invalid device",
             CudaResult.InvalidContext => "Invalid context",
+            CudaResult.InvalidPtx => "Invalid PTX (JIT compilation failed)",
             CudaResult.LaunchFailed => "Kernel launch failed",
             CudaResult.NotReady => "Operation not ready (async operation still in progress)",
             _ => $"Unknown CUDA error ({(int)result})"
@@ -680,6 +722,23 @@ public static class CuBlasNative
     /// </summary>
     public static void CheckCublasStatus(CublasStatus status, string operation = "cuBLAS operation")
     {
+        // GPU-DISPATCH INSTRUMENTATION. GpuLaunchProbe.OnLaunch() fires at the cuLaunchKernel choke point,
+        // which misses every op implemented with cuBLAS — the residency probe then reports those as CPU
+        // fallbacks even though they run on-device. Instrumenting the individual gemm call sites proved
+        // fragile: they are checked with DIFFERENT message strings ("cublasSgemm" vs
+        // "cublasSgemm(MatMulTransposed)"), so a literal-matching pass instrumented 3 of 8 and left
+        // TensorMatMulTransposed and TensorInner reporting zero launches. This is the one choke point every
+        // cuBLAS call already passes through.
+        //
+        // Filtered to actual COMPUTE (gemm / gemv). Handle creation, cublasSetStream and math-mode calls are
+        // not dispatches and must not inflate the count — the probe's job is distinguishing "ran on the GPU"
+        // from "silently fell back to the CPU".
+        if (operation.IndexOf("gemm", StringComparison.OrdinalIgnoreCase) >= 0
+            || operation.IndexOf("gemv", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            DirectGpu.GpuLaunchProbe.OnLaunch();
+        }
+
         if (status != CublasStatus.Success)
             throw new InvalidOperationException($"{operation} failed: {GetCublasErrorString(status)}");
     }
