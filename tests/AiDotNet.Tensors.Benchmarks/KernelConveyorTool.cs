@@ -65,7 +65,8 @@ internal static class KernelConveyorTool
             Console.WriteLine("No catalog entry matches '" + selector + "'. Known kernels:");
             foreach (var e in CodegenKernelCatalog.All)
                 Console.WriteLine("  " + e.Name.PadRight(32) + e.Summary);
-            return;
+            KernelToolArgs.RequireNonEmptySelection(
+                selector, entries.Count, "kernel-" + stage);
         }
 
         switch (stage)
@@ -312,6 +313,12 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine("verify: " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
+        if (failed != 0 || passed != entries.Count)
+            throw new InvalidOperationException(
+                "Kernel verification failed closed: " +
+                passed.ToString(CultureInfo.InvariantCulture) + " of " +
+                entries.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected operations passed.");
     }
 
     /// <summary>
