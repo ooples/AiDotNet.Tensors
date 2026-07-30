@@ -1683,6 +1683,10 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
+                    // Issue #338 completion: release the pins on this op's savedState
+                    // tensors (mean/variance, attention weights, masks, ...) — the
+                    // backward has consumed them, so they may be pooled again.
+                    DifferentiableOps.UnpinSavedStateTensors<T>(node.SavedState);
 
                     // Input0 CAN be a leaf (no GradFn) or a foreign-tape intermediate
                     // (GradFn.OwningTape != this), or null when the streaming backward
@@ -1812,6 +1816,9 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
+                    // Issue #338 completion: release this op's savedState pins (see the
+                    // graph-walk cleanup above). Symmetric with the record-time pin.
+                    DifferentiableOps.UnpinSavedStateTensors<T>(node.SavedState);
 
                     // Issue #283 fix: destructive cleanup on Output AND on
                     // intermediate Inputs. Output is always an intermediate
@@ -1946,6 +1953,10 @@ public sealed class GradientTape<T> : IDisposable
                 foreach (var inp in entry.InputsOverflow)
                     CleanupCachedReplayInput(inp, sourceSet, intermediates);
             }
+            // Issue #338 completion: release this entry's savedState pins. Every
+            // entry in _entries was recorded by this tape, so its savedState pin is
+            // ours to clear — symmetric with the record-time pin in DifferentiableOps.
+            DifferentiableOps.UnpinSavedStateTensors<T>(entry.SavedState);
         }
     }
 

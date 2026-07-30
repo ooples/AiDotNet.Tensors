@@ -294,6 +294,10 @@ public sealed class CompiledBackwardGraph<T>
                         inp._pinnedByTape = false;
                     }
                 }
+                // Issue #338 completion: release this entry's savedState pins
+                // (mean/variance, attention weights, masks, ...) now the compiled
+                // backward has consumed them — symmetric with the record-time pin.
+                DifferentiableOps.UnpinSavedStateTensors<T>(e.SavedState);
 
                 // .GradFn / .Grad cleanup on this entry's output (every output is an
                 // intermediate — graph leaves never appear as outputs in the entries

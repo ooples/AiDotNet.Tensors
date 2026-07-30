@@ -232,6 +232,9 @@ internal sealed class OptimizedBackwardPlan<T>
                         inp._pinnedByTape = false;
                     }
                 }
+                // Issue #338 completion: release this entry's savedState pins now the
+                // optimized backward has consumed them — symmetric with record-time.
+                DifferentiableOps.UnpinSavedStateTensors<T>(e.SavedState);
 
                 // e.Output is always a graph intermediate; inputs may be
                 // leaves (parameters) so we don't touch their .Grad here.
