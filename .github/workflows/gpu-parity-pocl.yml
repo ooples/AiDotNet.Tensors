@@ -52,20 +52,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each entry is a --filter fragment run in its OWN job/runner (fresh POCL). Keep each group
-        # small enough to stay under POCL's per-process kernel-compile ceiling; split further if a
-        # group still exhausts. `name` is only for a readable job label.
+        # Each entry runs in its OWN job/runner (fresh POCL) so no single process compiles too many
+        # kernels. The two big classes are single [Theory]s over the op registry (~550 forward, ~430
+        # tape-gradient); AIDOTNET_PARITY_SHARD=k/N partitions each into sub-shards via ParityShard so
+        # each POCL process stays under its per-process kernel-compile ceiling. `name` is the job label.
         include:
-          - name: lstm
-            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence"
-          - name: missing-kernels
-            filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence"
-          - name: op-forward
-            filter: "FullyQualifiedName~Engines.OpParity.OpParityTests"
-          - name: tape-gradient
-            filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests"
-          - name: scan-kernels
-            filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests"
+          - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
+          - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
+          - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
+          - { name: op-forward-1, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "1/6" }
+          - { name: op-forward-2, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "2/6" }
+          - { name: op-forward-3, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "3/6" }
+          - { name: op-forward-4, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "4/6" }
+          - { name: op-forward-5, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "5/6" }
+          - { name: op-forward-6, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "6/6" }
+          - { name: tape-grad-1,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "1/6" }
+          - { name: tape-grad-2,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "2/6" }
+          - { name: tape-grad-3,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "3/6" }
+          - { name: tape-grad-4,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "4/6" }
+          - { name: tape-grad-5,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "5/6" }
+          - { name: tape-grad-6,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "6/6" }
     name: gpu-parity-pocl (${{ matrix.name }})
     steps:
     - uses: actions/checkout@v4
@@ -92,6 +98,8 @@ jobs:
       env:
         AIDOTNET_OPENCL_ALLOW_CPU: '1'
         AIDOTNET_REQUIRE_GPU_TESTS: '1'
+        # Empty for the non-partitioned shards (unset => full set); "k/N" for the op-registry sub-shards.
+        AIDOTNET_PARITY_SHARD: ${{ matrix.shard }}
         AIDOTNET_OPPARITY_REPORT_DIR: ${{ runner.temp }}/opparity
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
