@@ -1191,6 +1191,7 @@ internal static class KernelConveyorTool
                     var medians = new List<double>(Runs);
                     var tails = new List<double>(Runs);
                     int clockBefore = 0, clockAfter = 0;
+                    bool converged = false;
                     for (int attempt = 0; attempt < StabilityAttempts; attempt++)
                     {
                         clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
@@ -1211,14 +1212,19 @@ internal static class KernelConveyorTool
                             : double.MaxValue;
                         if (medians.Count == Runs &&
                             spreadNow <= StableTimer.StableSpread && drift <= 0.02)
+                        {
+                            converged = true;
                             break;
+                        }
                     }
                     double lo = medians.Min(), hi = medians.Max();
                     double reported = medians.OrderBy(value => value).ElementAt(medians.Count / 2);
                     double worstTail = tails.Max();
                     Console.WriteLine(entry.Name.PadRight(36) +
                         blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
-                        (reported * 1000.0).ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
+                        (converged
+                            ? (reported * 1000.0).ToString("F1", CultureInfo.InvariantCulture)
+                            : "UNSTABLE").PadLeft(13) +
                         worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
                         ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
                         GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
