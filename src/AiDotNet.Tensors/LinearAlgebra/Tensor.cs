@@ -3644,12 +3644,24 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastAdd(Tensor<T> other)
     {
-        // Route through engine for tape recording when called directly (not from engine)
-        // Check if shapes are already identical - use fast path
-        if (ShapeEquals(_shape, other._shape))
-        {
-            return Add(other);
-        }
+        // Equal shapes are handled by the stride-aware span path at the bottom of
+        // this method, NOT by delegating to Add(other).
+        //
+        // Add(other) dispatches to AiDotNetEngine.Current — the process-GLOBAL
+        // engine — regardless of which engine the caller actually invoked. On a
+        // GPU-auto-detect host AiDotNetEngine.Current is DirectGpuTensorEngine,
+        // which computes elementwise arithmetic in single precision on consumer
+        // GPUs. So CpuEngine.TensorBroadcastAdd — whose generic fallback calls
+        // this method — silently returned ~8 significant digits in a
+        // Tensor<double> even though the caller held an explicit CpuEngine.
+        // Delegating also recorded a spurious second "TensorAdd" tape entry for
+        // one logical broadcast op, because the callee records too.
+        //
+        // BroadcastElementwise coalesces an equal-shape pair into a single
+        // contiguous run and dispatches to typed SIMD (see ApplyInnerDouble), so
+        // this keeps the vectorisation while staying engine-free. BroadcastMultiply
+        // and BroadcastDivide already computed their equal-shape case locally;
+        // Add and Subtract were the only two that leaked.
 
         // Fast path: [N,M] + [1,M] or [N,M] + [M] — common bias addition
         if (Rank == 2 && (other.Rank == 2 || other.Rank == 1))
@@ -3727,12 +3739,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastSubtract(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path
-        if (ShapeEquals(_shape, other._shape))
-        {
-            return Subtract(other);
-        }
-
+        // Equal shapes fall through to the stride-aware span path below rather than
+        // delegating to Subtract(other), which would dispatch to the process-GLOBAL
+        // AiDotNetEngine.Current and compute in single precision on a GPU host.
+        // See BroadcastAdd for the full rationale — this was the defect behind
+        // TensorBroadcastSubtract<double> returning float-precision differences.
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = TensorAllocator.Rent<T>(broadcastShape);
         BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Subtract);
