@@ -23,6 +23,9 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     private const int MicroM = 8;
     private const int MicroTiles = 8;
     private const int PhysicalMicroTiles = 7;
+    private const int ReciprocalShift = 10;
+    private const int PhysicalMicroTilesReciprocal =
+        ((1 << ReciprocalShift) + PhysicalMicroTiles - 1) / PhysicalMicroTiles;
     private const int AccumulatorElements = MicroM * PhysicalMicroTiles;
     private const int MGroups = BlockM / MicroM;
     private const int TileGroups = BlockTiles / MicroTiles;
@@ -45,6 +48,19 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
 
     private readonly StringBuilder _body = new(131072);
 
+    static PtxOuterProductWinogradConv2DEmitter()
+    {
+        // The reciprocal is applied after pair/MicroM, so this is its complete
+        // emitted input range. Fail at type initialization if changed geometry
+        // makes the strength reduction inexact.
+        int maximum = (WorkspaceGroups * AccumulatorElements - 1) / MicroM;
+        for (int value = 0; value <= maximum; value++)
+            if (((value * PhysicalMicroTilesReciprocal) >> ReciprocalShift) !=
+                value / PhysicalMicroTiles)
+                throw new InvalidOperationException(
+                    "The Winograd reciprocal quotient is not exact for the emitted range.");
+    }
+
     public CodegenTiledConv2DPlan? Plan { get; private set; }
     public string? EntryPoint { get; private set; }
     public uint LaunchBlocks { get; private set; }
@@ -64,7 +80,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             plan.InputWidth != plan.OutputWidth ||
             (plan.OutputHeight & 1) != 0 || (plan.OutputWidth & 1) != 0 ||
             plan.M != BlockM || plan.ReductionChannels % BlockChannels != 0 ||
-            tileRows % 7 != 0 || tileColumns % 7 != 0 ||
+            tileRows % PhysicalMicroTiles != 0 ||
+            tileColumns % PhysicalMicroTiles != 0 ||
             plan.BiasInput.HasValue || spec.Activation != CodegenActivationKind.None)
             throw new NotSupportedException(
                 "The outer-product Winograd pass requires bias-free M32, C%8, " +
@@ -74,8 +91,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         // Keep the semantic spec's entry point so this lowering can be replayed by
         // the same conveyor path as every other autotune winner.
         EntryPoint = spec.Name;
-        int quadrantRows = tileRows / 7;
-        int quadrantColumns = tileColumns / 7;
+        int quadrantRows = tileRows / PhysicalMicroTiles;
+        int quadrantColumns = tileColumns / PhysicalMicroTiles;
         int quadrants = quadrantRows * quadrantColumns;
         LaunchBlocks = checked((uint)(plan.Batch * quadrants * TilePartitions));
         _body.Clear();
@@ -97,9 +114,11 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         EmitRemainder("%r8", "%r7", MGroups, "M group");
         EmitQuotient("%r9", "%r7", MGroups, "tile group");
         EmitQuotient("%r10", "%r4", quadrantColumns, null);
-        L("mul.lo.u32 %r10, %r10, 7;                 // quadrant tile row");
+        L($"mul.lo.u32 %r10, %r10, {I(PhysicalMicroTiles)};" +
+          "                 // quadrant tile row");
         EmitRemainder("%r11", "%r4", quadrantColumns, null);
-        L("mul.lo.u32 %r11, %r11, 7;                 // quadrant tile column");
+        L($"mul.lo.u32 %r11, %r11, {I(PhysicalMicroTiles)};" +
+          "                 // quadrant tile column");
         EmitVGeometry(plan);
         EmitUCoordinates(plan);
         L("mov.u32 %r12, 0;                           // C stage");
@@ -285,10 +304,10 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L("shr.u32 %r26, %r0, 5;                      // V producer C");
         L($"and.b32 %r27, %r0, {I(BlockTiles - 1)};    // V producer tile");
         L($"mad.lo.u32 %r28, %r2, {I(BlockTiles)}, %r27;");
-        L("shr.u32 %r29, %r28, 3;");
-        L("and.b32 %r30, %r28, 7;");
-        L("setp.lt.u32 %p4, %r29, 7;");
-        L("setp.lt.u32 %p13, %r30, 7;");
+        L($"shr.u32 %r29, %r28, {I(PowerOfTwoShift(MicroTiles))};");
+        L($"and.b32 %r30, %r28, {I(MicroTiles - 1)};");
+        L($"setp.lt.u32 %p4, %r29, {I(PhysicalMicroTiles)};");
+        L($"setp.lt.u32 %p13, %r30, {I(PhysicalMicroTiles)};");
         L("and.pred %p4, %p4, %p13;                  // physical tile");
         L("add.u32 %r29, %r10, %r29;");
         L("add.u32 %r30, %r11, %r30;");
@@ -417,9 +436,10 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
                 L($"setp.lt.u32 %p3, %r13, {I(outputPairs)};");
                 L($"@!%p3 bra OUTER_OUTPUT_PAIR_{I(pairWave)}_DONE;");
             }
-            L("shr.u32 %r14, %r13, 3;");
-            L("mul.lo.u32 %r14, %r14, 147;");
-            L("shr.u32 %r14, %r14, 10;           // group = pair / 56");
+            L($"shr.u32 %r14, %r13, {I(PowerOfTwoShift(MicroM))};");
+            L($"mul.lo.u32 %r14, %r14, {I(PhysicalMicroTilesReciprocal)};");
+            L($"shr.u32 %r14, %r14, {I(ReciprocalShift)};" +
+              $"           // group = pair / {I(AccumulatorElements)}");
             L($"mad.lo.s32 %r15, %r14, -{I(AccumulatorElements)}, %r13;");
             L($"mul.lo.u32 %r17, %r14, {I(WorkspaceGroupStride)};");
             L($"mad.lo.u32 %r16, %r15, {I(WorkspaceElementStride)}, %r17;");
@@ -445,17 +465,19 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             L("sub.rn.f32 %f67, %f67, %f87;");
 
             L($"and.b32 %r16, %r14, {I(MGroups - 1)}; // M group");
-            L("shr.u32 %r17, %r14, 2;             // tile group");
-            L("mul.lo.u32 %r18, %r15, 147;");
-            L("shr.u32 %r18, %r18, 10;            // M within group");
+            L($"shr.u32 %r17, %r14, {I(PowerOfTwoShift(MGroups))};" +
+              "             // tile group");
+            L($"mul.lo.u32 %r18, %r15, {I(PhysicalMicroTilesReciprocal)};");
+            L($"shr.u32 %r18, %r18, {I(ReciprocalShift)};" +
+              "            // M within group");
             L($"mad.lo.s32 %r19, %r18, -{I(PhysicalMicroTiles)}, %r15;");
             L($"mad.lo.u32 %r16, %r16, {I(MicroM)}, %r18;");
             L($"mad.lo.u32 %r17, %r17, {I(MicroTiles)}, %r19;");
             L($"mad.lo.u32 %r17, %r2, {I(BlockTiles)}, %r17;");
-            L("shr.u32 %r18, %r17, 3;");
-            L("and.b32 %r19, %r17, 7;");
-            L("setp.lt.u32 %p1, %r18, 7;");
-            L("setp.lt.u32 %p2, %r19, 7;");
+            L($"shr.u32 %r18, %r17, {I(PowerOfTwoShift(MicroTiles))};");
+            L($"and.b32 %r19, %r17, {I(MicroTiles - 1)};");
+            L($"setp.lt.u32 %p1, %r18, {I(PhysicalMicroTiles)};");
+            L($"setp.lt.u32 %p2, %r19, {I(PhysicalMicroTiles)};");
             L("and.pred %p1, %p1, %p2;");
             L("add.u32 %r18, %r10, %r18;");
             L("add.u32 %r19, %r11, %r19;");
