@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Globalization;
 using System.Text;
@@ -495,7 +496,10 @@ internal sealed class DirectPtxBuffer : IDisposable
 
 internal sealed class DirectPtxModule : IDisposable
 {
+    private const uint DefaultDynamicSharedMemoryLimitBytes = 48 * 1024;
     private readonly DirectPtxRuntime _runtime;
+    private readonly object _dynamicSharedMemoryLock = new();
+    private readonly Dictionary<IntPtr, int> _dynamicSharedMemoryLimits = new();
     private IntPtr _module;
     internal string JitInfoLog { get; }
     internal DirectPtxModuleImageKind ImageKind { get; }
@@ -552,6 +556,12 @@ internal sealed class DirectPtxModule : IDisposable
         uint sharedMemoryBytes,
         void** arguments)
     {
+        // CUDA requires a per-function opt-in above the portable 48 KiB default.
+        // Keep this at the common launch boundary so an emitter cannot expose a
+        // correct byte count while a caller accidentally omits the matching attribute.
+        if (sharedMemoryBytes > DefaultDynamicSharedMemoryLimitBytes)
+            SetMaxDynamicSharedMemory(function, checked((int)sharedMemoryBytes));
+
         using var _ = _runtime.Enter();
         DirectPtxRuntime.Check(
             CudaNativeBindings.cuLaunchKernel(
@@ -568,11 +578,19 @@ internal sealed class DirectPtxModule : IDisposable
     internal void SetMaxDynamicSharedMemory(IntPtr function, int bytes)
     {
         if (bytes < 0) throw new ArgumentOutOfRangeException(nameof(bytes));
-        using var _ = _runtime.Enter();
-        DirectPtxRuntime.Check(
-            CudaNativeBindings.cuFuncSetAttribute(
-                function, CudaFunctionAttribute.MaxDynamicSharedSizeBytes, bytes),
-            "cuFuncSetAttribute(MaxDynamicSharedSizeBytes)");
+        lock (_dynamicSharedMemoryLock)
+        {
+            if (_dynamicSharedMemoryLimits.TryGetValue(function, out int configured) &&
+                configured >= bytes)
+                return;
+
+            using var _ = _runtime.Enter();
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuFuncSetAttribute(
+                    function, CudaFunctionAttribute.MaxDynamicSharedSizeBytes, bytes),
+                "cuFuncSetAttribute(MaxDynamicSharedSizeBytes)");
+            _dynamicSharedMemoryLimits[function] = bytes;
+        }
     }
 
     internal int GetActiveBlocksPerMultiprocessor(

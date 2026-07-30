@@ -1,7 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Codegen;
@@ -59,6 +61,44 @@ public sealed class CodegenOuterProductWinogradConv2DTests
             () => new PtxOuterProductWinogradConv2DEmitter().Emit(verify, 8, 6));
         Assert.Throws<NotSupportedException>(
             () => new PtxOuterProductWinogradConv2DEmitter().Emit(bench, 7, 5));
+    }
+
+    [SkippableFact]
+    public unsafe void BackwardData_LaunchAutomaticallyOptsIntoLargeDynamicSharedMemory()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.If(runtime.ComputeCapabilityMajor < 8,
+            "The outer-product Winograd pass requires sm_80+.");
+
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var emitter = new PtxOuterProductWinogradConv2DEmitter();
+        string ptx = emitter.Emit(
+            spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+        IntPtr function = module.GetFunction(emitter.EntryPoint!);
+        using var matrix = runtime.AllocateBytes(
+            (nuint)(spec.Inputs[emitter.Plan!.MatrixInput].ElementCount * sizeof(float)));
+        using var stream = runtime.AllocateBytes(
+            (nuint)(spec.Inputs[emitter.Plan.StreamInput].ElementCount * sizeof(float)));
+        using var output = runtime.AllocateBytes(
+            (nuint)(spec.Output.ElementCount * sizeof(float)));
+        matrix.Upload<float>(new float[spec.Inputs[emitter.Plan.MatrixInput].ElementCount]);
+        stream.Upload<float>(new float[spec.Inputs[emitter.Plan.StreamInput].ElementCount]);
+
+        IntPtr p0 = matrix.Pointer, p1 = stream.Pointer, p2 = output.Pointer;
+        void** arguments = stackalloc void*[3];
+        arguments[spec.Inputs[emitter.Plan.MatrixInput].ParameterIndex] = &p0;
+        arguments[spec.Inputs[emitter.Plan.StreamInput].ParameterIndex] = &p1;
+        arguments[spec.Output.ParameterIndex] = &p2;
+        module.Launch(function, emitter.LaunchBlocks, 1, 1,
+            checked((uint)emitter.LaunchBlockThreads), 1, 1,
+            checked((uint)emitter.SharedMemoryBytes), arguments);
+        runtime.Synchronize();
+
+        var actual = new float[spec.Output.ElementCount];
+        output.Download<float>(actual);
+        Assert.All(actual, value => Assert.Equal(0f, value));
     }
 
     private static int Count(string text, string value) =>
