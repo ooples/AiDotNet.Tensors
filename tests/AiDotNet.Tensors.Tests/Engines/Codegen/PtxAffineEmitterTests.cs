@@ -210,14 +210,18 @@ public class PtxAffineEmitterTests
         runtime.Synchronize();
         var actual = new float[spec.Output.ElementCount];
         dOut.Download<float>(actual);
-        AssertClose(Oracle(input, weights, bias), actual, "first graph replay");
+        TiledPtxTestHelper.AssertClose(
+            Oracle(input, weights, bias), actual,
+            CodegenMeasurementProtocol.AccumulationTolerance, "first graph replay");
 
         Array.Clear(input, 0, input.Length);
         dIn.Upload<float>(input);
         graph.Launch();
         runtime.Synchronize();
         dOut.Download<float>(actual);
-        AssertClose(Oracle(input, weights, bias), actual, "replay after input update");
+        TiledPtxTestHelper.AssertClose(
+            Oracle(input, weights, bias), actual,
+            CodegenMeasurementProtocol.AccumulationTolerance, "replay after input update");
 
         graph.Dispose();
         Assert.Throws<ObjectDisposedException>(() => graph.Launch());
@@ -230,20 +234,6 @@ public class PtxAffineEmitterTests
         void** args = stackalloc void*[4];
         args[0] = &pa; args[1] = &pb; args[2] = &pc; args[3] = &pd;
         module.Launch(fn, blocks, 1, 1, PtxAffineEmitter.BlockThreads, 1, 1, 0, args);
-    }
-
-    private static void AssertClose(double[] expected, float[] actual, string label)
-    {
-        double worst = 0;
-        int at = 0;
-        for (int i = 0; i < actual.Length; i++)
-        {
-            double difference = Math.Abs(expected[i] - actual[i]);
-            if (difference > worst) { worst = difference; at = i; }
-        }
-        Assert.True(worst <= CodegenMeasurementProtocol.AccumulationTolerance,
-            $"{label} deviates by {worst:E3} at index {at}: " +
-            $"expected {expected[at]}, actual {actual[at]}");
     }
 
     /// <summary>

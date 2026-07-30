@@ -29,16 +29,22 @@ internal static class TiledPtxTestHelper
         double[] expected, float[] actual, double tolerance, string label,
         bool relative = false)
     {
+        Assert.Equal(expected.Length, actual.Length);
         double worst = 0;
-        int at = 0;
+        int at = -1;
         for (int i = 0; i < actual.Length; i++)
         {
+            Assert.False(double.IsNaN(expected[i]) || double.IsInfinity(expected[i]),
+                $"{label} has a non-finite reference value at {i}: {expected[i]}");
+            Assert.False(float.IsNaN(actual[i]) || float.IsInfinity(actual[i]),
+                $"{label} has a non-finite result at {i}: {actual[i]}");
             double difference = System.Math.Abs(expected[i] - actual[i]);
             if (relative)
                 difference /= System.Math.Max(1.0, System.Math.Abs(expected[i]));
             if (difference > worst) { worst = difference; at = i; }
         }
-        Assert.True(worst < tolerance,
+        if (worst <= tolerance) return;
+        Assert.Fail(
             $"{label} differs by {worst:E3} at {at}: " +
             $"expected {expected[at]}, actual {actual[at]}");
     }
