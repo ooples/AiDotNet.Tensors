@@ -401,7 +401,8 @@ internal static class KernelConveyorTool
                     : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
             : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal)
                 ? "tiled contraction"
-                : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal)
+                : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal) ||
+                  CodegenTiledConv2DSchedule.Find(Winner) is not null
                     ? "tiled conv2d"
                 : string.Equals(Winner, "depthwise-weight-gradient", StringComparison.Ordinal)
                     ? "coop dW"
@@ -444,11 +445,16 @@ internal static class KernelConveyorTool
             }
         }
 
-        if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
+        CodegenTiledConv2DSchedule? conv2DSchedule =
+            CodegenTiledConv2DSchedule.Find(winner);
+        if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal) ||
+            conv2DSchedule is not null)
         {
             try
             {
-                var tiled = new PtxTiledConv2DEmitter();
+                var tiled = conv2DSchedule is null
+                    ? new PtxTiledConv2DEmitter()
+                    : new PtxTiledConv2DEmitter(conv2DSchedule);
                 string text = tiled.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 return new TunedProgram(

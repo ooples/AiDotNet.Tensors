@@ -36,7 +36,8 @@ internal static class KernelAutotuneTool
         string Name, Action<PtxAffineEmitter>? Configure,
         bool TiledContraction = false, bool TiledConv2D = false,
         bool DepthwiseWeightGradient = false,
-        bool ParityTransposedConv2D = false);
+        bool ParityTransposedConv2D = false,
+        CodegenTiledConv2DSchedule? TiledConv2DSchedule = null);
 
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
@@ -53,7 +54,7 @@ internal static class KernelAutotuneTool
         internal CandidateProgram(
             string name, Action launch, DirectPtxBuffer output, int outputElements,
             List<IDisposable> resources, IReadOnlyList<CandidatePhase>? phases = null,
-            string? resourceSummary = null)
+            string? resourceSummary = null, bool promotable = true)
         {
             Name = name;
             Launch = launch;
@@ -62,12 +63,14 @@ internal static class KernelAutotuneTool
             _resources = resources;
             Phases = phases ?? Array.Empty<CandidatePhase>();
             ResourceSummary = resourceSummary;
+            Promotable = promotable;
         }
 
         internal string Name { get; }
         internal Action Launch { get; }
         internal IReadOnlyList<CandidatePhase> Phases { get; }
         internal string? ResourceSummary { get; }
+        internal bool Promotable { get; }
 
         internal float[] ReadOutput()
         {
@@ -149,7 +152,10 @@ internal static class KernelAutotuneTool
         Console.WriteLine("candidates: " +
             (string.IsNullOrWhiteSpace(candidateSelector)
                 ? string.Join(", ", Candidates.Select(c => c.Name)) +
+                    ", " + string.Join(", ", CodegenTiledConv2DSchedule.SearchSpace
+                        .Select(s => s.WinnerName)) +
                     ", library-winograd-fp32-bn16, library-winograd-fp32-bn32, " +
+                    "library-bwd-input-direct, " +
                     "split, tiled-split, tiled-chunked-split"
                 : candidateSelector));
         Console.WriteLine();
@@ -267,6 +273,36 @@ internal static class KernelAutotuneTool
             }
         }
 
+        foreach (CodegenTiledConv2DSchedule schedule in
+                 CodegenTiledConv2DSchedule.SearchSpace)
+        {
+            if (!CandidateEnabled(candidateSelector, schedule.WinnerName)) continue;
+            CandidateProgram? program = null;
+            try
+            {
+                var candidate = new Candidate(
+                    schedule.WinnerName, null, TiledConv2DSchedule: schedule);
+                program = CreateSingle(runtime, spec, candidate);
+            }
+            catch (NotSupportedException) { continue; }
+            using (program)
+            {
+                program.Launch();
+                runtime.Synchronize();
+                if (!Agrees(program.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + program.Name +
+                                      "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                    continue;
+                }
+                Consider(runtime, modelled, program, workUnits,
+                    ref hasStableTiming, ref bestName, ref bestUs,
+                    ref bestModelledUs, ref bestGain);
+            }
+        }
+
         // Point the oracle at the independently developed true-FP32 hand-written
         // Winograd pipeline. All four launches stay in the timed region because the
         // general kernel contract permits weights and inputs to change on every call.
@@ -290,6 +326,31 @@ internal static class KernelAutotuneTool
             Consider(runtime, modelled, library, workUnits,
                 ref hasStableTiming, ref bestName, ref bestUs,
                 ref bestModelledUs, ref bestGain);
+        }
+
+        // Measure the independently developed deterministic backward-input kernel too.
+        // It has no conveyor representation, so it is evidence about the algorithmic
+        // dataflow only and can never be recorded as a dispatch winner here.
+        using (CandidateProgram? library = TryCreateLibraryBackwardInput(runtime, spec))
+        {
+            if (library is not null && CandidateEnabled(candidateSelector, library.Name))
+            {
+                library.Launch();
+                runtime.Synchronize();
+                if (!Agrees(library.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + library.Name +
+                                      "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                }
+                else
+                {
+                    Consider(runtime, modelled, library, workUnits,
+                        ref hasStableTiming, ref bestName, ref bestUs,
+                        ref bestModelledUs, ref bestGain);
+                }
+            }
         }
 
         // Both split forms preserve the deterministic affine combine. The second changes
@@ -392,12 +453,22 @@ internal static class KernelAutotuneTool
             bestModelledUs = timing.A.Microseconds;
         }
 
+        // Hand-written multi-kernel diagnostics do not yet have a conveyor replay
+        // representation. They may explain an algorithmic gap, but recording one as a
+        // dispatch winner would make later stages silently run a different program.
+        if (!candidate.Promotable)
+        {
+            Console.WriteLine("      diagnostic only: no exact conveyor replay");
+            return;
+        }
+
         // A winner must clear both the observed paired spread and the protocol noise floor.
         // Merely having the smallest median is not a promotion criterion.
         double required = Math.Max(
             CodegenMeasurementProtocol.AutotuneGainNoiseFloor,
             1.0 + timing.RelativeSpread);
-        if (timing.Ratio <= required || timing.Ratio <= bestGain) return;
+        if (timing.Ratio <= required) return;
+        if (bestGain > 1.0 && timing.Ratio / bestGain <= required) return;
 
         bestName = candidate.Name;
         bestUs = timing.B.Microseconds;
@@ -437,9 +508,11 @@ internal static class KernelAutotuneTool
                 blockX = checked((uint)tiled.LaunchBlockThreads);
                 blockY = 1;
             }
-            else if (candidate.TiledConv2D)
+            else if (candidate.TiledConv2D || candidate.TiledConv2DSchedule is not null)
             {
-                var tiled = new PtxTiledConv2DEmitter();
+                var tiled = candidate.TiledConv2DSchedule is null
+                    ? new PtxTiledConv2DEmitter()
+                    : new PtxTiledConv2DEmitter(candidate.TiledConv2DSchedule);
                 ptx = tiled.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 blocks = tiled.LaunchBlocks;
@@ -756,7 +829,80 @@ internal static class KernelAutotuneTool
                         Math.Max(1L, 16L * plan.M * plan.ReductionChannels * tiles)),
                     new CandidatePhase("output-transform", LaunchOutput,
                         Math.Max(1L, plan.M * (long)tiles * 16)),
-                });
+                }, promotable: false);
+        }
+        catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch (ArgumentException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    private static CandidateProgram? TryCreateLibraryBackwardInput(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec)
+    {
+        if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out _)) return null;
+        CodegenTiledConv2DPlan plan = possible!;
+        if (plan.TapSign != -1 || plan.BiasInput.HasValue ||
+            spec.Activation != CodegenActivationKind.None)
+            return null;
+
+        var resources = new List<IDisposable>();
+        try
+        {
+            var kernel = new PtxConv2DBackwardInput3x3Kernel(
+                runtime, plan.Batch, plan.ReductionChannels, plan.M,
+                plan.InputHeight, plan.InputWidth);
+            resources.Add(kernel);
+
+            var uploaded = new DirectPtxBuffer[spec.Inputs.Count];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                CodegenTensorBinding binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buffer.Upload<float>(host);
+                uploaded[i] = buffer;
+            }
+
+            var output = runtime.AllocateBytes(
+                (nuint)(spec.Output.ElementCount * spec.Output.ElementBytes));
+            resources.Add(output);
+
+            void Launch() => kernel.Launch(
+                DirectPtxTensorView.CreateOwned(
+                    uploaded[plan.StreamInput], kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(
+                    uploaded[plan.MatrixInput], kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+
+            DirectPtxFunctionInfo info = kernel.FunctionInfo;
+            return new CandidateProgram(
+                "library-bwd-input-direct", Launch, output,
+                checked((int)spec.Output.ElementCount), resources,
+                resourceSummary: info.RegistersPerThread.ToString(
+                        CultureInfo.InvariantCulture) + " regs/thread, " +
+                    info.StaticSharedBytes.ToString(CultureInfo.InvariantCulture) +
+                        " B shared, " +
+                    info.LocalBytesPerThread.ToString(CultureInfo.InvariantCulture) +
+                        " B local/thread, " +
+                    kernel.Audit.ActiveBlocksPerMultiprocessor.ToString(
+                        CultureInfo.InvariantCulture) + " blocks/SM",
+                promotable: false);
         }
         catch (NotSupportedException)
         {

@@ -5,6 +5,50 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
+/// <summary>One exact, replayable tile geometry in the dense 3x3 search space.</summary>
+public sealed class CodegenTiledConv2DSchedule
+{
+    private static readonly IReadOnlyList<CodegenTiledConv2DSchedule> _searchSpace =
+        Array.AsReadOnly(new[]
+        {
+            // Row seven wins backward-data; row fourteen with a wider register tile
+            // wins forward. Tested slower geometries are not retained as default work.
+            new CodegenTiledConv2DSchedule(16, 7, 8, 4),
+            new CodegenTiledConv2DSchedule(16, 14, 8, 8),
+        });
+
+    public CodegenTiledConv2DSchedule(
+        int tileM, int tileRows, int tileChannels, int threadTileM)
+    {
+        TileM = tileM;
+        TileRows = tileRows;
+        TileChannels = tileChannels;
+        ThreadTileM = threadTileM;
+    }
+
+    public int TileM { get; }
+    public int TileRows { get; }
+    public int TileChannels { get; }
+    public int ThreadTileM { get; }
+    public int ThreadTileWidth => 4;
+
+    /// <summary>Stable name stored in autotune evidence and resolved by the conveyor.</summary>
+    public string WinnerName => FormattableString.Invariant(
+        $"tiled-conv2d:m{TileM}r{TileRows}c{TileChannels}tm{ThreadTileM}");
+
+    /// <summary>Finite schedule set shared by identity, measurement, and replay.</summary>
+    public static IReadOnlyList<CodegenTiledConv2DSchedule> SearchSpace => _searchSpace;
+
+    public static CodegenTiledConv2DSchedule? Find(string? winner)
+    {
+        if (string.IsNullOrWhiteSpace(winner)) return null;
+        foreach (CodegenTiledConv2DSchedule schedule in _searchSpace)
+            if (string.Equals(schedule.WinnerName, winner, StringComparison.Ordinal))
+                return schedule;
+        return null;
+    }
+}
+
 /// <summary>A cooperative same-row tile recovered from a dense 3x3 convolution spec.</summary>
 /// <remarks>
 /// One CTA owns <c>[TileM, outputWidth]</c> for a fixed batch and output row. Each
@@ -105,6 +149,20 @@ public sealed class CodegenTiledConv2DPlan
 
     public static bool TryCreate(
         CodegenKernelSpec spec, out CodegenTiledConv2DPlan? plan, out string reason)
+        => TryCreateCore(spec, null, out plan, out reason);
+
+    /// <summary>Recovers the convolution contract with an exact measured-candidate schedule.</summary>
+    public static bool TryCreate(
+        CodegenKernelSpec spec, CodegenTiledConv2DSchedule schedule,
+        out CodegenTiledConv2DPlan? plan, out string reason)
+    {
+        if (schedule is null) throw new ArgumentNullException(nameof(schedule));
+        return TryCreateCore(spec, schedule, out plan, out reason);
+    }
+
+    private static bool TryCreateCore(
+        CodegenKernelSpec spec, CodegenTiledConv2DSchedule? schedule,
+        out CodegenTiledConv2DPlan? plan, out string reason)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         plan = null;
@@ -210,16 +268,27 @@ public sealed class CodegenTiledConv2DPlan
             return false;
         }
         int channels = spec.Space.Axes[reductionChannel].Extent;
-        int tileM = LargestDivisorAtMost(m, reductionMajor ? 16 : 64, 4);
-        int tileRows = LargestDivisorAtMost(outputHeight, 4, 1);
-        int tileChannels = LargestDivisorAtMost(channels, reductionMajor ? 16 : 8, 4);
+        int tileM = schedule?.TileM ??
+            LargestDivisorAtMost(m, reductionMajor ? 16 : 64, 4);
+        int tileRows = schedule?.TileRows ??
+            LargestDivisorAtMost(outputHeight, 4, 1);
+        int tileChannels = schedule?.TileChannels ??
+            LargestDivisorAtMost(channels, reductionMajor ? 16 : 8, 4);
         if (tileM == 0 || tileRows == 0 || tileChannels == 0)
         {
             reason = "M, output rows, and reduction channels need supported whole tiles";
             return false;
         }
-        int threadTileM = tileM >= 32 ? 8 : tileM >= 16 ? 4 : 1;
+        int threadTileM = schedule?.ThreadTileM ??
+            (tileM >= 32 ? 8 : tileM >= 16 ? 4 : 1);
         const int threadTileWidth = 4;
+        if (tileM < 4 || tileRows < 1 || tileChannels < 4 || threadTileM < 1 ||
+            m % tileM != 0 || outputHeight % tileRows != 0 ||
+            channels % tileChannels != 0 || tileM % threadTileM != 0)
+        {
+            reason = "the exact schedule must divide M, rows, channels, and its thread tile";
+            return false;
+        }
         int stages = CodegenSharedMemoryBudget.DoubleBufferStages;
         long sharedBytes = stages *
             (tileM * (long)tileChannels * 9 +

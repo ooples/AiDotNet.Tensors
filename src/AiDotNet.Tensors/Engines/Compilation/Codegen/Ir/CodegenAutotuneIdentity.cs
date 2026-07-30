@@ -67,6 +67,14 @@ public sealed record CodegenAutotuneIdentity(
             static e => e.EnableInputStaging = true);
         AppendTiledCandidate(text, spec, computeMajor, computeMinor);
         AppendTiledConv2DCandidate(text, spec, computeMajor, computeMinor);
+        foreach (CodegenTiledConv2DSchedule schedule in
+                 CodegenTiledConv2DSchedule.SearchSpace)
+        {
+            AppendEmitterCandidate(text, schedule.WinnerName, spec,
+                computeMajor, computeMinor,
+                (candidate, major, minor) =>
+                    new PtxTiledConv2DEmitter(schedule).Emit(candidate, major, minor));
+        }
         AppendDepthwiseWeightGradientCandidate(text, spec, computeMajor, computeMinor);
         AppendParityTransposedConv2DCandidate(text, spec, computeMajor, computeMinor);
 

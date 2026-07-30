@@ -13,6 +13,7 @@ public sealed class PtxTiledConv2DEmitter
     private const int FixedR = 16;
     private const int FixedRd = 8;
     private const int FixedP = 4;
+    private readonly CodegenTiledConv2DSchedule? _schedule;
     private readonly StringBuilder _body = new();
     private int _r, _rd, _p, _f;
 
@@ -21,11 +22,24 @@ public sealed class PtxTiledConv2DEmitter
     public int LaunchBlockThreads => Plan?.BlockThreads ?? 0;
     public int SharedMemoryBytes => Plan?.SharedMemoryBytes ?? 0;
 
+    public PtxTiledConv2DEmitter()
+    {
+    }
+
+    public PtxTiledConv2DEmitter(CodegenTiledConv2DSchedule schedule) =>
+        _schedule = schedule ?? throw new ArgumentNullException(nameof(schedule));
+
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (computeMajor < 8)
             throw new NotSupportedException("The double-buffered dense-convolution tile requires cp.async on sm_80+.");
-        if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out string reason))
+        CodegenTiledConv2DPlan? possible;
+        string reason;
+        bool eligible = _schedule is null
+            ? CodegenTiledConv2DPlan.TryCreate(spec, out possible, out reason)
+            : CodegenTiledConv2DPlan.TryCreate(
+                spec, _schedule, out possible, out reason);
+        if (!eligible)
             throw new NotSupportedException("This spec cannot use the tiled dense convolution: " + reason);
         var plan = possible!;
 

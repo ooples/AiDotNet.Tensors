@@ -73,6 +73,48 @@ public sealed class CodegenTiledConv2DTests
     }
 
     [Fact]
+    public void ExactSchedule_IsNamedValidatedAndReplayed()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench;
+        const string winner = "tiled-conv2d:m16r7c8tm4";
+        CodegenTiledConv2DSchedule? schedule =
+            CodegenTiledConv2DSchedule.Find(winner);
+
+        Assert.NotNull(schedule);
+        Assert.Equal(winner, schedule!.WinnerName);
+        Assert.True(CodegenTiledConv2DPlan.TryCreate(
+            spec, schedule, out var plan, out string reason), reason);
+        Assert.NotNull(plan);
+        Assert.Equal((16, 7, 8, 4, 224, 128, 25344),
+            (plan!.TileM, plan.TileRows, plan.TileChannels, plan.ThreadTileM,
+             plan.BlockThreads, plan.Blocks, plan.SharedMemoryBytes));
+
+        var emitter = new PtxTiledConv2DEmitter(schedule);
+        string ptx = emitter.Emit(spec, 8, 6);
+        Assert.Equal(128u, emitter.LaunchBlocks);
+        Assert.Contains("fma.rn.f32", ptx);
+
+        CodegenTiledConv2DSchedule? forward = CodegenTiledConv2DSchedule.Find(
+            "tiled-conv2d:m16r14c8tm8");
+        Assert.NotNull(forward);
+        Assert.True(CodegenTiledConv2DPlan.TryCreate(
+            spec, forward!, out var forwardPlan, out string forwardReason),
+            forwardReason);
+        Assert.Equal((14, 8, 224, 64, 37888),
+            (forwardPlan!.TileRows, forwardPlan.ThreadTileM,
+             forwardPlan.BlockThreads, forwardPlan.Blocks,
+             forwardPlan.SharedMemoryBytes));
+
+        var invalid = new CodegenTiledConv2DSchedule(32, 3, 8, 4);
+        Assert.False(CodegenTiledConv2DPlan.TryCreate(
+            spec, invalid, out var rejected, out string rejectedReason));
+        Assert.Null(rejected);
+        Assert.Equal(
+            "the exact schedule must divide M, rows, channels, and its thread tile",
+            rejectedReason);
+    }
+
+    [Fact]
     public void DenseForward_RefusesStaticSharedMemoryOverBudget()
     {
         var source = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench;
