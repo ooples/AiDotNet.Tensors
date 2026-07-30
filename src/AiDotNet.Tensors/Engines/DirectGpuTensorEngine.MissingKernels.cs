@@ -4390,15 +4390,24 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.Spectrogram(waveform, nFft, hopLength, winLength, window); }
     }
 
+    // The 3-argument backward entry points are the adjoint of the 3-argument (narrow) GridSample
+    // forward, which uses torchvision's DEFAULTS: align_corners=false, padding_mode='zeros'.
+    // These passed alignCorners: true, matching the narrow CPU forward's old (size-1)/2 mapping.
+    // Once CpuEngine was corrected to the documented defaults these became the adjoint of a forward
+    // that no longer exists, which is what the OpParity oracle caught: CPU 6-71 ULP vs GPU ~1e9 ULP.
+    // The underlying GPU kernels need no change — they take alignCorners and paddingMode as runtime
+    // parameters and already implement both conventions, including gradMult = 0.5 * size for the
+    // align_corners=false branch.
+
     /// <inheritdoc/>
     Tensor<T> IEngine.GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape)
         => GridSampleBackwardInput(
-            gradOutput, grid, inputShape, GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: true);
+            gradOutput, grid, inputShape, GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false);
 
     /// <inheritdoc/>
     Tensor<T> IEngine.GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid)
         => GridSampleBackwardGrid(
-            gradOutput, input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: true);
+            gradOutput, input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false);
 
     /// <inheritdoc/>
     public override Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,

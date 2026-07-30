@@ -19952,8 +19952,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufGrid = GetOrAllocateBuffer(backend, grid);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
             // Match CpuEngine.GridSample (2-arg): align_corners=True + border/clamp padding.
+            // torchvision defaults, matching the corrected CpuEngine narrow forward:
+            // paddingMode 0 == zeros (the kernels treat 1 as border and anything else as zeros),
+            // alignCorners false. This previously passed border + alignCorners:true, which matched
+            // the old (size-1)/2 CPU mapping; the OpParity oracle scored that ~1e9 ULP off while the
+            // corrected CPU sits at 6-71 ULP. The kernels themselves are already general — both
+            // conventions are runtime branches inside them.
             backend.GridSample(bufIn.Buffer, bufGrid.Buffer, bufOut.Buffer,
-                batch, channels, inH, inW, outH, outW, paddingMode: 1, alignCorners: true);
+                batch, channels, inH, inW, outH, outW, paddingMode: 0, alignCorners: false);
             return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
         }
