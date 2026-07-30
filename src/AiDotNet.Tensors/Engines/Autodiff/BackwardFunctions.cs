@@ -6950,22 +6950,120 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
     }
 
-    /// <summary>Spectrogram backward — pipes through STFT's backward.</summary>
+    /// <summary>
+    /// Spectrogram backward — the true adjoint of <c>mag = |STFT(x)|</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This previously delegated to <c>ISTFT(gradOutput, phase, ..., length: origLength)</c>,
+    /// which is NOT the adjoint of the analysis and produced a gradient that disagreed with
+    /// finite differences by a factor of roughly 1/nFft, varying per sample. ISTFT is a
+    /// *synthesis* operator: it divides by the window-sum so that analysis followed by
+    /// synthesis reconstructs the signal. The adjoint must not do that.
+    /// </para>
+    /// <para>
+    /// Derivation. The forward builds frame <c>f[i] = xPadded[start + i] * window[i]</c>,
+    /// takes an unnormalized DFT <c>X[k] = Σ_i f[i] e^(-2πik i/N)</c> and reports the
+    /// one-sided magnitudes <c>mag[k] = |X[k]|</c> for <c>k = 0 .. N/2</c>. Hence
+    /// </para>
+    /// <para>
+    /// <c>∂mag[k]/∂f[i] = (Re[k] cos θ - Im[k] sin θ) / mag[k]</c>, θ = 2πki/N,
+    /// </para>
+    /// <para>
+    /// and summing the incoming gradient <c>g[k]</c> over the reported bins gives
+    /// <c>dL/df[i] = Re( Σ_k c[k] e^(+2πik i/N) )</c> with <c>c[k] = g[k] · e^(i·phase[k])</c>.
+    /// Three consequences, each of which ISTFT got wrong:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>no 1/N factor — the forward DFT is unnormalized, so its adjoint is too;</item>
+    /// <item>no window-sum division — that belongs to synthesis, not to the adjoint;</item>
+    /// <item>no Hermitian doubling of interior bins — only the one-sided magnitudes are
+    /// outputs, so the gradient flows through exactly those and no others.</item>
+    /// </list>
+    /// <para>
+    /// Writing <c>c[k]</c> from the SAVED PHASE rather than from <c>X[k]/|X[k]|</c> also
+    /// removes any divide-by-zero on silent bins, since <c>e^(iφ)</c> is already unit-modulus.
+    /// </para>
+    /// </remarks>
     internal static void SpectrogramBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Forward: Spectrogram = |STFT(x)|_magnitude. With magnitude-only
-        // output we lose the phase term. Proper backward requires the
-        // original phase; we save it in savedState. Grad wrt magnitude
-        // flows through ISTFT with the saved phase.
         var waveform = inputs[0];
         int nFft = (int)savedState[0];
         int hopLength = (int)savedState[1];
         var window = (Tensor<T>)savedState[2];
         var phase = (Tensor<T>)savedState[3];
         int origLength = (int)savedState[4];
-        var grad = engine.ISTFT(gradOutput, phase, nFft, hopLength, window, center: true, length: origLength);
-        DifferentiableOps.AccumulateGrad(grads, waveform, grad, engine);
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numFreqs = nFft / 2 + 1;
+        int numFrames = gradOutput._shape[^1];
+        int padAmount = nFft / 2;                 // Spectrogram always analyses with center: true
+        int paddedLength = origLength + 2 * padAmount;
+        int batchSize = gradOutput.Length / (numFreqs * numFrames);
+
+        var gradData = gradOutput.GetDataArray();
+        var phaseData = phase.GetDataArray();
+        var windowData = window.GetDataArray();
+
+        var result = new Tensor<T>(waveform._shape);
+        var resultData = result.GetDataArray();
+        var padded = new double[paddedLength];
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            Array.Clear(padded, 0, padded.Length);
+            int specOffset = b * numFreqs * numFrames;
+
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                // c[k] = g[k] * e^(i * phase[k]) over the reported one-sided bins.
+                var cReal = new Vector<T>(nFft);
+                var cImag = new Vector<T>(nFft);
+                for (int k = 0; k < numFreqs; k++)
+                {
+                    double g = numOps.ToDouble(gradData[specOffset + k * numFrames + frame]);
+                    double ph = numOps.ToDouble(phaseData[specOffset + k * numFrames + frame]);
+                    cReal[k] = numOps.FromDouble(g * Math.Cos(ph));
+                    cImag[k] = numOps.FromDouble(g * Math.Sin(ph));
+                }
+
+                // Unnormalized inverse transform: FFTCore only flips the twiddle sign, so this
+                // is exactly Σ_k c[k] e^(+2πik i/N) with no 1/N applied.
+                var (frameGrad, _) = CpuEngine.InverseTransformForSpectrogramAdjoint<T>(cReal, cImag);
+
+                int start = frame * hopLength;
+                for (int i = 0; i < nFft; i++)
+                {
+                    padded[start + i] +=
+                        numOps.ToDouble(frameGrad[i]) * numOps.ToDouble(windowData[i]);
+                }
+            }
+
+            // Adjoint of the reflection padding: every padded sample was a copy of a real
+            // sample, so its gradient folds back onto that sample.
+            int outOffset = b * origLength;
+            for (int i = 0; i < origLength; i++)
+                resultData[outOffset + i] = numOps.FromDouble(padded[padAmount + i]);
+
+            for (int i = 0; i < padAmount; i++)
+            {
+                // Forward: paddedData[i] = inputData[padAmount - i]
+                int src = padAmount - i;
+                if (src >= 0 && src < origLength)
+                    resultData[outOffset + src] = numOps.Add(
+                        resultData[outOffset + src], numOps.FromDouble(padded[i]));
+
+                // Forward: paddedData[padAmount + origLength + i] = inputData[origLength - 2 - i]
+                int srcEnd = origLength - 2 - i;
+                if (srcEnd >= 0 && srcEnd < origLength)
+                    resultData[outOffset + srcEnd] = numOps.Add(
+                        resultData[outOffset + srcEnd],
+                        numOps.FromDouble(padded[padAmount + origLength + i]));
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
 }

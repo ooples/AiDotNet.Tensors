@@ -37800,10 +37800,28 @@ public partial class CpuEngine : ITensorLevelEngine
         int numFreqs = magnitude._shape[^2];
         int numFrames = magnitude._shape[^1];
 
-        // Calculate output length
-        int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
-        if (center)
-            outputLength -= nFft; // Remove padding
+        // Calculate output length.
+        //
+        // An explicitly supplied length is honoured VERBATIM (librosa / torch semantics:
+        // istft(..., length: n) returns exactly n samples). The centering adjustment applies
+        // only to the DERIVED length, where it removes the nFft of analysis padding.
+        //
+        // Previously the `if (center)` subtraction ran unconditionally, so an explicit
+        // length came back nFft samples short. That silently broke SpectrogramBackward,
+        // which passes length: origLength — the gradient it returned was shaped
+        // [origLength - nFft] instead of [origLength], misaligning every sample and
+        // corrupting any objective built on a spectrogram (vocoder / TTS / RIR losses).
+        int outputLength;
+        if (length.HasValue)
+        {
+            outputLength = length.Value;
+        }
+        else
+        {
+            outputLength = (numFrames - 1) * hopLength + nFft;
+            if (center)
+                outputLength -= nFft; // Remove analysis padding
+        }
 
         // Output shape
         var outputShape = magnitude._shape.Take(magnitude._shape.Length - 2).ToArray();
@@ -38167,6 +38185,20 @@ public partial class CpuEngine : ITensorLevelEngine
             imagInput[i] = numOps.Zero;
         return FFTCore(realInput, imagInput, inverse);
     }
+
+    /// <summary>
+    /// Unnormalized complex inverse transform, exposed for the Spectrogram adjoint.
+    /// </summary>
+    /// <remarks>
+    /// Computes <c>Σ_k c[k] e^(+2πik n/N)</c> with NO 1/N factor — <see cref="FFTCore{T}(Vector{T}, Vector{T}, bool)"/>
+    /// only flips the twiddle sign for the inverse direction. That is precisely the adjoint of
+    /// the unnormalized forward DFT the STFT performs, which is what
+    /// <c>BackwardFunctions{T}.SpectrogramBackward</c> needs. Deliberately NOT ISTFT: ISTFT is a
+    /// synthesis operator that divides by the window-sum, which is not the adjoint.
+    /// </remarks>
+    internal static (Vector<T> real, Vector<T> imag) InverseTransformForSpectrogramAdjoint<T>(
+        Vector<T> realInput, Vector<T> imagInput)
+        => FFTCore<T>(realInput, imagInput, inverse: true);
 
     /// <summary>
     /// Core FFT computation using Cooley-Tukey algorithm with complex input.
