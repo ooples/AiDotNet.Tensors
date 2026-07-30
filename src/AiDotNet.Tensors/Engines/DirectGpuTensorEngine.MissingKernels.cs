@@ -5130,7 +5130,7 @@ public partial class DirectGpuTensorEngine
             // override is float-gated above).
             if (typeof(T) == typeof(float) && Autodiff.DifferentiableOps.IsRecording<float>())
             {
-                var gatesHost = backend.DownloadBuffer(bufGates);   // [S, B, 4*Hd]  (slot order f,i,g,o)
+                var gatesHost = backend.DownloadBuffer(bufGates);   // [S, B, Hd, 4]  (slot order i,f,g,o)
                 var allHHost = backend.DownloadBuffer(bufAllH);     // [(S+1), B, Hd] (kernel wrote first S)
                 var allCHost = backend.DownloadBuffer(bufAllC);     // [(S+1), B, Hd]
                 var h0Host = backend.DownloadBuffer(bufH0.Buffer);  // [B, Hd]
@@ -5232,7 +5232,25 @@ public partial class DirectGpuTensorEngine
         backend.Synchronize();
 
         void Accum(Tensor<float> key, IGpuBuffer gradBuf, int[] shape)
-            => Autodiff.DifferentiableOps.AccumulateGrad(grads, key, new Tensor<float>(backend.DownloadBuffer(gradBuf), shape), engine);
+        {
+            int n = 1;
+            for (int d = 0; d < shape.Length; d++) n *= shape[d];
+            // The buffer pool may hand back a buffer larger than the logical size, and DownloadBuffer
+            // returns the full pool-rounded capacity. Truncate to exactly n so the tensor shape matches
+            // ("number of values does not match the specified shape" otherwise).
+            var full = backend.DownloadBuffer(gradBuf);
+            float[] host;
+            if (full.Length == n)
+            {
+                host = full;
+            }
+            else
+            {
+                host = new float[n];
+                System.Array.Copy(full, host, n);
+            }
+            Autodiff.DifferentiableOps.AccumulateGrad(grads, key, new Tensor<float>(host, shape), engine);
+        }
 
         Accum(input, bufGradInput, new[] { B, S, In });
         Accum(wIh, bufDWih, new[] { G, In });

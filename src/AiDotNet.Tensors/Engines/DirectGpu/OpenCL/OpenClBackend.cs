@@ -183,7 +183,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // against the CPU runtime, costing 2-3 GB of process RSS for nothing.
             // AIDOTNET_DISABLE_OPENCL=1 forces this branch even on machines with a
             // real GPU. See AiDotNet.Tensors#436 (P2 — OpenCL kernel cache RSS).
-            if (!DirectOpenClContext.IsGpuAvailable)
+            //
+            // Opt-in CI escape: when AIDOTNET_OPENCL_ALLOW_CPU=1, proceed even if this
+            // GPU presence probe reports nothing, so a CPU OpenCL device (POCL) can back
+            // the parity lane. Deferring here is deliberate — DirectOpenClContext.Initialize
+            // below does the authoritative device selection (prefers a GPU, falls back to a
+            // CPU device, and throws if neither exists), so we must not let this earlier,
+            // redundant probe short-circuit the fallback. Default (flag unset) is unchanged:
+            // no GPU -> bail here without touching the kernel cache.
+            if (!DirectOpenClContext.IsGpuAvailable && !OpenClNativeBindings.AllowCpuOpenClDevice)
             {
                 IsAvailable = false;
                 DeviceName = "None";
@@ -13245,35 +13253,65 @@ KERNEL VARIANTS (A/B testing):
             if (hiddenSize <= 0)
                 throw new ArgumentException($"hiddenSize must be positive, got {hiddenSize}", nameof(hiddenSize));
 
-            if (!_kernelCache.TryGetValue("lstm_backward_sequence", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: lstm_backward_sequence");
+            // Correct race-free BPTT in two passes (see LstmKernels: lstm_backward_dgates /
+            // lstm_backward_dweights). Kernel A does the inherently-sequential reverse-time recurrence
+            // with ONE work-item per batch element (each independent -> no barriers/atomics) and emits
+            // the gate-preactivation grads dGates[S,B,4H], grad_input, and the initial-state grads
+            // (gradHInit/gradCInit double as the reverse-time carry). Kernel B sums dGates into the
+            // weight/bias grads with one work-item per output element. hInit/cInit are unused here -- the
+            // initial states are already in allH[0]/allC[0].
+            if (!_kernelCache.TryGetValue("lstm_backward_dgates", out var kGates))
+                throw new InvalidOperationException("OpenCL kernel not found: lstm_backward_dgates");
+            if (!_kernelCache.TryGetValue("lstm_backward_dweights", out var kWeights))
+                throw new InvalidOperationException("OpenCL kernel not found: lstm_backward_dweights");
 
-            int totalThreads = batch * hiddenSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
+            int gateCount = 4 * hiddenSize;
 
-            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)allH).Buffer.Handle);
-            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)allC).Buffer.Handle);
-            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)cacheGates).Buffer.Handle);
-            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)hInit).Buffer.Handle);
-            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)cInit).Buffer.Handle);
-            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)weightsIh).Buffer.Handle);
-            kernel.SetArg(7u, ((DirectOpenClGpuBuffer)weightsHh).Buffer.Handle);
-            kernel.SetArg(8u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            kernel.SetArg(9u, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            kernel.SetArg(10u, ((DirectOpenClGpuBuffer)gradHInit).Buffer.Handle);
-            kernel.SetArg(11u, ((DirectOpenClGpuBuffer)gradCInit).Buffer.Handle);
-            kernel.SetArg(12u, ((DirectOpenClGpuBuffer)gradWeightsIh).Buffer.Handle);
-            kernel.SetArg(13u, ((DirectOpenClGpuBuffer)gradWeightsHh).Buffer.Handle);
-            kernel.SetArg(14u, ((DirectOpenClGpuBuffer)gradBiasIh).Buffer.Handle);
-            kernel.SetArg(15u, ((DirectOpenClGpuBuffer)gradBiasHh).Buffer.Handle);
-            kernel.SetArg(16u, seqLen);
-            kernel.SetArg(17u, batch);
-            kernel.SetArg(18u, inputSize);
-            kernel.SetArg(19u, hiddenSize);
+            // Per-timestep gate-preactivation gradients [seqLen, batch, 4*hidden]. Written in full by
+            // kernel A (no zeroing needed) and consumed by kernel B. Pooled scratch; released on scope exit.
+            using var dGates = AllocateBuffer(seqLen * batch * gateCount);
 
-            int globalSize = ((totalThreads + localSize - 1) / localSize) * localSize;
-            kernel.Execute1D(globalSize, localSize);
+            // --- Kernel A: sequential BPTT recurrence, global size = batch ---
+            // (input is not read by kernel A — grad_input is Wih^T . dGates, no x needed.)
+            kGates.SetArg(0u, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            kGates.SetArg(1u, ((DirectOpenClGpuBuffer)allC).Buffer.Handle);
+            kGates.SetArg(2u, ((DirectOpenClGpuBuffer)cacheGates).Buffer.Handle);
+            kGates.SetArg(3u, ((DirectOpenClGpuBuffer)weightsIh).Buffer.Handle);
+            kGates.SetArg(4u, ((DirectOpenClGpuBuffer)weightsHh).Buffer.Handle);
+            kGates.SetArg(5u, ((DirectOpenClGpuBuffer)dGates).Buffer.Handle);
+            kGates.SetArg(6u, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            kGates.SetArg(7u, ((DirectOpenClGpuBuffer)gradHInit).Buffer.Handle);
+            kGates.SetArg(8u, ((DirectOpenClGpuBuffer)gradCInit).Buffer.Handle);
+            kGates.SetArg(9u, seqLen);
+            kGates.SetArg(10u, batch);
+            kGates.SetArg(11u, inputSize);
+            kGates.SetArg(12u, hiddenSize);
+
+            int localA = CalculateOptimalWorkGroupSize1D(batch);
+            int globalA = ((batch + localA - 1) / localA) * localA;
+            kGates.Execute1D(globalA, localA);
+
+            // --- Kernel B: weight/bias grads, global size = |dWih| + |dWhh| + |dBias| ---
+            // Both Execute1D calls enqueue on this backend's command queue, which is created
+            // in-order (CreateCommandQueue with CL_QUEUE_PROFILING_ENABLE only, never
+            // CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE), so kernel A is guaranteed to complete and its
+            // dGates writes are visible before kernel B begins reading them — no explicit barrier needed.
+            kWeights.SetArg(0u, ((DirectOpenClGpuBuffer)dGates).Buffer.Handle);
+            kWeights.SetArg(1u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kWeights.SetArg(2u, ((DirectOpenClGpuBuffer)allH).Buffer.Handle);
+            kWeights.SetArg(3u, ((DirectOpenClGpuBuffer)gradWeightsIh).Buffer.Handle);
+            kWeights.SetArg(4u, ((DirectOpenClGpuBuffer)gradWeightsHh).Buffer.Handle);
+            kWeights.SetArg(5u, ((DirectOpenClGpuBuffer)gradBiasIh).Buffer.Handle);
+            kWeights.SetArg(6u, ((DirectOpenClGpuBuffer)gradBiasHh).Buffer.Handle);
+            kWeights.SetArg(7u, seqLen);
+            kWeights.SetArg(8u, batch);
+            kWeights.SetArg(9u, inputSize);
+            kWeights.SetArg(10u, hiddenSize);
+
+            int weightThreads = gateCount * inputSize + gateCount * hiddenSize + gateCount;
+            int localB = CalculateOptimalWorkGroupSize1D(weightThreads);
+            int globalB = ((weightThreads + localB - 1) / localB) * localB;
+            kWeights.Execute1D(globalB, localB);
         }
 
         public void GruForwardSequence(
