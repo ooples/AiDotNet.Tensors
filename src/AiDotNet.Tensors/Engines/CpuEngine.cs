@@ -31494,21 +31494,37 @@ public partial class CpuEngine : ITensorLevelEngine
         var variance = ReduceVariance(input, axes, keepDims);
         var varianceData = variance.GetDataArray();
 
-        // Apply log(variance + epsilon)
+        // Apply log(variance + epsilon) into SEPARATE buffers.
+        //
+        // This used to write the log back over varianceData, which aliases `variance`'s own array.
+        // `variance` is then handed to the backward as saved state, so the backward — which needs
+        // the raw variance for 2*(x-mean)/(N*variance) — was dividing by LOG(variance). For
+        // variance < 1 that is negative, tripping the backward's "variance <= 0" guard which
+        // substitutes 1e-8 and inflated the gradient by variance/1e-8 (measured ~3e6 at variance
+        // ~0.03). For variance > 1 the guard never fires and the gradient is instead silently wrong
+        // by a data-dependent factor, which is why this never surfaced as a crash.
+        //
+        // The backward also needs variance + epsilon, not variance: d/dx log(variance + epsilon)
+        // has that sum as its denominator. Passing the raw variance was wrong by
+        // (variance + epsilon)/variance — negligible at the 1e-8 default, 17.5x at epsilon 0.5.
         T eps = numOps.FromDouble(epsilon);
+        var logVarData = new T[varianceData.Length];
+        var varPlusEpsData = new T[varianceData.Length];
         for (int i = 0; i < varianceData.Length; i++)
         {
-            varianceData[i] = numOps.Log(numOps.Add(varianceData[i], eps));
+            varPlusEpsData[i] = numOps.Add(varianceData[i], eps);
+            logVarData[i] = numOps.Log(varPlusEpsData[i]);
         }
 
-        var logVarResult = TensorAllocator.Rent<T>(variance._shape, varianceData);
+        var logVarResult = TensorAllocator.Rent<T>(variance._shape, logVarData);
+        var varianceForBackward = TensorAllocator.Rent<T>(variance._shape, varPlusEpsData);
         // Compute mean inside NoGradScope to avoid adding disconnected tape entries
         Tensor<T> mean;
         using (new NoGradScope<T>())
         {
             mean = ReduceMean(input, axes, keepDims);
         }
-        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, variance });
+        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, varianceForBackward });
         { var ci = input; var ca = axes; var ck = keepDims; var ce = epsilon; AutoTracer.RecordOp("ReduceLogVariance", logVarResult, eng => eng.ReduceLogVariance(ci, ca, ck, ce)); }
         return logVarResult;
     }
@@ -39498,13 +39514,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("RFFT", result, input, static (gradOutput, inputs, output, savedState, engine, grads) =>
-        {
-            // RFFT backward is IRFFT
-            var nFftSaved = (int)savedState[0];
-            var grad = engine.IRFFT(gradOutput, nFftSaved);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-        }, new object[] { n });
+        // RFFT backward is the ADJOINT of the forward transform, which is NOT IRFFT. IRFFT is the
+        // inverse: it carries a 1/nFft and doubles the interior Hermitian bins. Using it made the
+        // gradient uniformly too small by roughly the bin count — at n=16 the adjoint of an
+        // all-ones output gradient is 9 at j=0 while IRFFT returned 1. Derivation in
+        // BackwardFunctions<T>.RFFTAdjointBackward.
+        DifferentiableOps.RecordUnary("RFFT", result, input,
+            BackwardFunctions<T>.RFFTAdjointBackward, new object[] { n, nFft });
         { var ci = input; AutoTracer.RecordOp("RFFT", result, eng => eng.RFFT(ci)); }
         return result;
     }
@@ -39571,12 +39587,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 resultData[outputOffset + i] = numOps.Multiply(work[i].Real, scale);
         });
 
-        DifferentiableOps.RecordUnary("IRFFT", result, inputOrig, static (gradOutput, inputs, output, savedState, engine, grads) =>
-        {
-            // IRFFT backward is RFFT
-            var grad = engine.RFFT(gradOutput);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-        }, Array.Empty<object>());
+        // IRFFT backward is the ADJOINT, not RFFT. Beyond the missing 1/nFft and Hermitian
+        // weighting, RFFT returns 2*(nFft/2+1) interleaved values, so it could not even produce a
+        // gradient shaped like this op's input — that mismatch is how the defect first surfaced.
+        DifferentiableOps.RecordUnary("IRFFT", result, inputOrig,
+            BackwardFunctions<T>.IRFFTAdjointBackward,
+            new object[] { numFreqs, nFft, outputLength });
         { var ci = input; var col = outputLength; AutoTracer.RecordOp("IRFFT", result, eng => eng.IRFFT(ci, col)); }
         return result;
     }
@@ -40396,9 +40412,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>BackwardFunctions{T}.SpectrogramBackward</c> needs. Deliberately NOT ISTFT: ISTFT is a
     /// synthesis operator that divides by the window-sum, which is not the adjoint.
     /// </remarks>
-    internal static (Vector<T> real, Vector<T> imag) InverseTransformForSpectrogramAdjoint<T>(
-        Vector<T> realInput, Vector<T> imagInput)
-        => FFTCore<T>(realInput, imagInput, inverse: true);
+    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransformForAdjoint<T>(
+        Vector<T> realInput, Vector<T> imagInput, bool inverse)
+        => FFTCore<T>(realInput, imagInput, inverse);
 
     /// <summary>
     /// Core FFT computation using Cooley-Tukey algorithm with complex input.

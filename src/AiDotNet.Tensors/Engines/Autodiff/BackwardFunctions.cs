@@ -6549,8 +6549,17 @@ internal static class BackwardFunctions<T>
         int dim = (int)savedState[0];
         var a = inputs[0];
         var b = inputs[1];
-        var dA = engine.TensorCross(gradOutput, b, dim);
-        var dB = engine.TensorCross(a, gradOutput, dim);
+        // Both operand orders were reversed, negating both gradients — the cross product is
+        // anti-commutative, so g x b = -(b x g).
+        //
+        // For c = a x b, perturbing a gives dc = da x b, and the cyclic identity
+        // g·(da x b) = da·(b x g) means dL/da = b x g. Likewise g·(a x db) = db·(g x a), so
+        // dL/db = g x a. The previous code computed TensorCross(gradOutput, b) and
+        // TensorCross(a, gradOutput), i.e. exactly the negatives of both — which is why a
+        // finite-difference check saw analytical values that were the precise negation of the
+        // numerical ones rather than merely close to them.
+        var dA = engine.TensorCross(b, gradOutput, dim);
+        var dB = engine.TensorCross(gradOutput, a, dim);
         DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
         DifferentiableOps.AccumulateGrad(grads, b, dB, engine);
     }
@@ -7439,6 +7448,135 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Adjoint of <c>RFFT</c>: maps a gradient shaped like the interleaved one-sided spectrum back
+    /// onto the real input signal.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The forward zero-pads the signal to <c>nFft</c> and reports, for k = 0 .. nFft/2,
+    /// <c>Re[k] = Σ_j x_j cos(2πkj/nFft)</c> and <c>Im[k] = -Σ_j x_j sin(2πkj/nFft)</c>, interleaved.
+    /// Transposing that gives
+    /// </para>
+    /// <para>
+    /// <c>dL/dx_j = Σ_k ( gRe[k] cos(2πkj/nFft) - gIm[k] sin(2πkj/nFft) )
+    ///           = Re( Σ_k (gRe[k] + i·gIm[k]) e^(+2πik j/nFft) )</c>
+    /// </para>
+    /// <para>
+    /// i.e. one unnormalized inverse transform of the interleaved gradient read as a complex
+    /// sequence — no 1/nFft and no Hermitian doubling. This previously called <c>engine.IRFFT</c>,
+    /// which applies both, making the gradient too small by roughly the bin count.
+    /// </para>
+    /// </remarks>
+    internal static void RFFTAdjointBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        int n = (int)savedState[0];
+        int nFft = (int)savedState[1];
+        int numFreqs = nFft / 2 + 1;
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradData = gradOutput.GetDataArray();
+        int batchSize = gradOutput.Length / (numFreqs * 2);
+
+        var result = new Tensor<T>(input._shape);
+        var resultData = result.GetDataArray();
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int gOffset = b * numFreqs * 2;
+
+            var cReal = new Vector<T>(nFft);
+            var cImag = new Vector<T>(nFft);
+            for (int k = 0; k < numFreqs; k++)
+            {
+                cReal[k] = gradData[gOffset + k * 2];
+                cImag[k] = gradData[gOffset + k * 2 + 1];
+            }
+            for (int k = numFreqs; k < nFft; k++)
+            {
+                cReal[k] = numOps.Zero;
+                cImag[k] = numOps.Zero;
+            }
+
+            var (re, _) = CpuEngine.UnnormalizedTransformForAdjoint<T>(cReal, cImag, inverse: true);
+
+            int outOffset = b * n;
+            for (int j = 0; j < n; j++) resultData[outOffset + j] = re[j];
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    /// <summary>
+    /// Adjoint of <c>IRFFT</c>: maps a gradient shaped like the reconstructed real signal back onto
+    /// the interleaved one-sided spectrum.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The forward rebuilds a Hermitian full spectrum and inverse-transforms it with a 1/nFft, so
+    /// each interior bin contributes twice while DC and Nyquist contribute once. Transposing:
+    /// </para>
+    /// <para>
+    /// <c>gRe[k] = (c_k/nFft) · Re( Σ_j gy_j e^(-2πik j/nFft) )</c>,
+    /// <c>gIm[k] = (c_k/nFft) · Im( Σ_j gy_j e^(-2πik j/nFft) )</c>,
+    /// with <c>c_k = 1</c> for k = 0 and k = nFft/2, and <c>c_k = 2</c> otherwise.
+    /// </para>
+    /// <para>
+    /// Note the Nyquist bin's imaginary part has no effect on the forward output (sin(πj) = 0), so
+    /// its gradient is zero. This previously called <c>engine.RFFT</c>, which is the inverse rather
+    /// than the transpose and also returns the wrong shape entirely.
+    /// </para>
+    /// </remarks>
+    internal static void IRFFTAdjointBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var input = inputs[0];
+        int numFreqs = (int)savedState[0];
+        int nFft = (int)savedState[1];
+        int outputLength = (int)savedState[2];
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradData = gradOutput.GetDataArray();
+        int batchSize = gradOutput.Length / outputLength;
+
+        var result = new Tensor<T>(input._shape);
+        var resultData = result.GetDataArray();
+        double invN = 1.0 / nFft;
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int gOffset = b * outputLength;
+
+            var yReal = new Vector<T>(nFft);
+            var yImag = new Vector<T>(nFft);
+            for (int j = 0; j < nFft; j++)
+            {
+                yReal[j] = j < outputLength ? gradData[gOffset + j] : numOps.Zero;
+                yImag[j] = numOps.Zero;
+            }
+
+            var (re, im) = CpuEngine.UnnormalizedTransformForAdjoint<T>(yReal, yImag, inverse: false);
+
+            int outOffset = b * numFreqs * 2;
+            for (int k = 0; k < numFreqs; k++)
+            {
+                double ck = (k == 0 || k == numFreqs - 1) ? 1.0 : 2.0;
+                double scale = ck * invN;
+                resultData[outOffset + k * 2] = numOps.FromDouble(numOps.ToDouble(re[k]) * scale);
+                // The Nyquist bin's imaginary part does not influence the forward output.
+                resultData[outOffset + k * 2 + 1] = (k == numFreqs - 1)
+                    ? numOps.Zero
+                    : numOps.FromDouble(numOps.ToDouble(im[k]) * scale);
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    /// <summary>
     /// Validates a backward's savedState arity before any positional access.
     /// </summary>
     /// <remarks>
@@ -7540,7 +7678,7 @@ internal static class BackwardFunctions<T>
 
                 // Unnormalized inverse transform: FFTCore only flips the twiddle sign, so this
                 // is exactly Σ_k c[k] e^(+2πik i/N) with no 1/N applied.
-                var (frameGrad, _) = CpuEngine.InverseTransformForSpectrogramAdjoint<T>(cReal, cImag);
+                var (frameGrad, _) = CpuEngine.UnnormalizedTransformForAdjoint<T>(cReal, cImag, inverse: true);
 
                 int start = frame * hopLength;
                 for (int i = 0; i < nFft; i++)
