@@ -217,6 +217,10 @@ public sealed class CodegenTiledConv2DTests
 
         Assert.Contains("st.global.v4.f32", ptx);
         Assert.DoesNotContain("st.global.f32", ptx);
+        int vectorStores = ptx.Split(
+            new[] { "st.global.v4.f32" }, StringSplitOptions.None).Length - 1;
+        Assert.Equal(
+            emitter.Plan!.ThreadTileM * (emitter.Plan.ThreadTileWidth / 4), vectorStores);
     }
 
     [SkippableTheory]

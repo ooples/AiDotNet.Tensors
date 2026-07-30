@@ -13,6 +13,7 @@ public sealed class PtxTiledConv2DEmitter
     private const int FixedR = 16;
     private const int FixedRd = 8;
     private const int FixedP = 4;
+    private const int StoreVectorWidth = 4;
     private readonly CodegenTiledConv2DSchedule? _schedule;
     private readonly StringBuilder _body = new();
     private int _r, _rd, _p, _f;
@@ -42,6 +43,9 @@ public sealed class PtxTiledConv2DEmitter
         if (!eligible)
             throw new NotSupportedException("This spec cannot use the tiled dense convolution: " + reason);
         var plan = possible!;
+        if (plan.ThreadTileWidth != StoreVectorWidth)
+            throw new InvalidOperationException(
+                "The tiled dense-convolution emitter requires a four-wide thread tile.");
 
         Plan = plan;
         _body.Clear();
@@ -354,9 +358,6 @@ public sealed class PtxTiledConv2DEmitter
                 }
                 else
                 {
-                    if (plan.ThreadTileWidth != 4)
-                        throw new InvalidOperationException(
-                            "The immediate halo path requires the proven four-wide thread tile.");
                     streamWindow = new string[plan.ThreadTileWidth + 2];
                     for (int j = 0; j < plan.ThreadTileWidth; j++)
                     {
@@ -612,10 +613,14 @@ public sealed class PtxTiledConv2DEmitter
                 if (activation == CodegenActivationKind.ReLU)
                     L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
             }
-            L($"@%p2 st.global.v4.f32 [{outputBase}+" +
-              $"{I(i * plan.OutputHeight * plan.OutputWidth * sizeof(float))}], " +
-              $"{{{accumulators[i, 0]}, {accumulators[i, 1]}, " +
-              $"{accumulators[i, 2]}, {accumulators[i, 3]}}};");
+            for (int j = 0; j < plan.ThreadTileWidth; j += StoreVectorWidth)
+            {
+                int byteOffset =
+                    (i * plan.OutputHeight * plan.OutputWidth + j) * sizeof(float);
+                L($"@%p2 st.global.v4.f32 [{outputBase}+{I(byteOffset)}], " +
+                  $"{{{accumulators[i, j]}, {accumulators[i, j + 1]}, " +
+                  $"{accumulators[i, j + 2]}, {accumulators[i, j + 3]}}};");
+            }
         }
     }
 
