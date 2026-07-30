@@ -139,6 +139,7 @@ internal static class KernelAutotuneTool
 
         string selector = KernelToolArgs.Selector(args);
         string? candidateSelector = ValueOf(args, "--candidate");
+        ValidateCandidateSelector(candidateSelector);
         var entries = string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase)
             ? CodegenKernelCatalog.All
             : new[] { CodegenKernelCatalog.Find(selector)! }.Where(e => e != null).ToList();
@@ -179,7 +180,9 @@ internal static class KernelAutotuneTool
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
         var rows = LoadUnselectedCurrentRows(outputPath, runtime, entries);
+        if (File.Exists(outputPath)) File.Delete(outputPath);
         int improved = 0;
+        var failures = new List<string>();
         try
         {
             foreach (var entry in entries)
@@ -190,7 +193,8 @@ internal static class KernelAutotuneTool
                     if (result is null || !double.IsFinite(result.BestUs) ||
                         result.BestUs == double.MaxValue ||
                         !double.IsFinite(result.ModelledUs) || result.ModelledUs == double.MaxValue)
-                        continue;
+                        throw new InvalidOperationException(
+                            "no numerically valid, stable candidate completed");
 
                     double gain = result.Gain;
                     if (gain > CodegenMeasurementProtocol.AutotuneGainNoiseFloor) improved++;
@@ -217,10 +221,18 @@ internal static class KernelAutotuneTool
                 catch (Exception ex)
                 {
                     Console.WriteLine(entry.Name.PadRight(30) + "  ERROR " + ex.Message.Split('\n')[0]);
+                    failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
                 }
             }
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
+
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("autotune-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected kernel(s) failed autotuning; no winner artifact written. " +
+                string.Join("; ", failures));
 
         var text = new StringBuilder();
         text.AppendLine("# autotune winners, " + CodegenMeasurementProtocol.Tag + ": " +
@@ -229,7 +241,10 @@ internal static class KernelAutotuneTool
             "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter");
         foreach (CodegenCatalogEntry entry in CodegenKernelCatalog.All)
             if (rows.TryGetValue(entry.Name, out string? row)) text.AppendLine(row);
-        File.WriteAllText(outputPath, text.ToString());
+        string temporaryOutput = outputPath + ".tmp-" +
+            Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
+        File.WriteAllText(temporaryOutput, text.ToString());
+        File.Move(temporaryOutput, outputPath, overwrite: true);
 
         Console.WriteLine();
         double noiseFloorPercent =
@@ -633,6 +648,31 @@ internal static class KernelAutotuneTool
         string.IsNullOrWhiteSpace(selector) ||
         string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(selector, name, StringComparison.OrdinalIgnoreCase);
+
+    private static void ValidateCandidateSelector(string? selector)
+    {
+        if (string.IsNullOrWhiteSpace(selector) ||
+            string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase) ||
+            Candidates.Any(candidate => string.Equals(
+                selector, candidate.Name, StringComparison.OrdinalIgnoreCase)) ||
+            CodegenTiledContractionSchedule.SearchSpace.Any(schedule => string.Equals(
+                selector, schedule.WinnerName, StringComparison.OrdinalIgnoreCase)) ||
+            CodegenTiledConv2DSchedule.SearchSpace.Any(schedule => string.Equals(
+                selector, schedule.WinnerName, StringComparison.OrdinalIgnoreCase)) ||
+            CodegenTiledConv2DSplitSchedule.SearchSpace.Any(schedule => string.Equals(
+                selector, schedule.WinnerName, StringComparison.OrdinalIgnoreCase)) ||
+            string.Equals(selector, "library-winograd-fp32-bn16", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(selector, "library-winograd-fp32-bn32", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(selector, "inline-outer-winograd-conv2d", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(selector, "library-winograd-inline-adjoint-fp32", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(selector, "library-bwd-input-direct", StringComparison.OrdinalIgnoreCase) ||
+            selector.StartsWith("split:", StringComparison.OrdinalIgnoreCase) ||
+            selector.StartsWith("tiled-split:", StringComparison.OrdinalIgnoreCase) ||
+            selector.StartsWith("tiled-chunked-split:", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        throw new ArgumentException("Unknown autotune candidate '" + selector + "'.");
+    }
 
     private static void Consider(
         DirectPtxRuntime runtime,
