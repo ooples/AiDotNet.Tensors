@@ -2765,6 +2765,194 @@ internal static class BackwardFunctions<T>
 
     /// <summary>Cosine similarity backward</summary>
     /// <summary>
+    /// ScatterReduce backward for all five modes, honouring <c>includeSelf</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// REPLAYS the forward's decisions rather than deriving from the output, which is what keeps the
+    /// two consistent across every mode:
+    /// </para>
+    /// <para>
+    /// • <b>Sum</b> — every contributor receives the incoming gradient unchanged.<br/>
+    /// • <b>Mean</b> — divided by that slot's count, which is exactly the forward's divisor (and
+    ///   depends on <c>includeSelf</c>).<br/>
+    /// • <b>Prod</b> — each factor receives gradOutput times the product of the OTHER factors,
+    ///   computed from a non-zero product plus a zero count so a single zero factor does not collapse
+    ///   the whole slot (naive out/factor divides by zero).<br/>
+    /// • <b>AMin/AMax</b> — winner-takes-all. The forward replaces only on a STRICT comparison, so the
+    ///   FIRST occurrence of an extreme value wins and later ties receive nothing; the replay mirrors
+    ///   that tie-breaking exactly.
+    /// </para>
+    /// <para>
+    /// When <c>includeSelf</c> is false the forward resets every touched slot to the mode's identity, so
+    /// the destination value participates only at slots no index touched — where the op degenerates to a
+    /// plain copy and the gradient passes straight through.
+    /// </para>
+    /// </remarks>
+    internal static void ScatterReduceBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(ScatterReduceBackward), savedState, 4);
+        int dim = SavedInt(nameof(ScatterReduceBackward), savedState, 0, "dim");
+        var idxData = savedState[1] as int[]
+            ?? throw new ArgumentException(
+                $"{nameof(ScatterReduceBackward)}: savedState[1] (indices) must be an int[].", nameof(savedState));
+        int modeRaw = SavedInt(nameof(ScatterReduceBackward), savedState, 2, "mode");
+        bool includeSelf = SavedBool(nameof(ScatterReduceBackward), savedState, 3, "includeSelf");
+        var mode = (ScatterReduceMode)modeRaw;
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var tensor = inputs[0];
+        var source = inputs[1];
+        var shape = tensor._shape;
+        int rank = shape.Length;
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= shape[k];
+        int dstAxis = shape[dim];
+        int srcAxis = source._shape[dim];
+        int dstLen = tensor.Length;
+
+        // Pass A — reproduce `touched` so we know where the destination value survives.
+        var touched = new bool[dstLen];
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int outerBase = outer * dstAxis * innerSize;
+            for (int i = 0; i < srcAxis; i++)
+            {
+                int srcBase = outer * srcAxis * innerSize + i * innerSize;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int target = idxData[srcBase + inner];
+                    if (target < 0 || target >= dstAxis) continue;
+                    touched[outerBase + target * innerSize + inner] = true;
+                }
+            }
+        }
+        // The destination participates unless the forward reset that slot.
+        var selfParticipates = new bool[dstLen];
+        for (int i = 0; i < dstLen; i++) selfParticipates[i] = includeSelf || !touched[i];
+
+        // Pass B — per-slot statistics needed by the individual modes.
+        var counts = new int[dstLen];
+        for (int i = 0; i < dstLen; i++) counts[i] = selfParticipates[i] ? 1 : 0;
+        var prodNonZero = new double[dstLen];
+        var zeroCount = new int[dstLen];
+        var bestVal = new double[dstLen];
+        var winner = new int[dstLen];      // -1 == the destination value itself
+        bool isMinMax = mode == ScatterReduceMode.AMin || mode == ScatterReduceMode.AMax;
+
+        for (int i = 0; i < dstLen; i++)
+        {
+            prodNonZero[i] = 1.0;
+            winner[i] = -1;
+            double self = numOps.ToDouble(tensor[i]);
+            if (selfParticipates[i])
+            {
+                if (self == 0.0) zeroCount[i]++; else prodNonZero[i] *= self;
+                bestVal[i] = self;
+            }
+            else
+            {
+                bestVal[i] = mode == ScatterReduceMode.AMin ? double.PositiveInfinity : double.NegativeInfinity;
+            }
+        }
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int outerBase = outer * dstAxis * innerSize;
+            for (int i = 0; i < srcAxis; i++)
+            {
+                int srcBase = outer * srcAxis * innerSize + i * innerSize;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int flatSrc = srcBase + inner;
+                    int target = idxData[flatSrc];
+                    if (target < 0 || target >= dstAxis) continue;
+                    int dstPos = outerBase + target * innerSize + inner;
+                    double s = numOps.ToDouble(source[flatSrc]);
+
+                    if (mode == ScatterReduceMode.Sum || mode == ScatterReduceMode.Mean)
+                    {
+                        counts[dstPos]++;
+                    }
+                    else if (mode == ScatterReduceMode.Prod)
+                    {
+                        if (s == 0.0) zeroCount[dstPos]++; else prodNonZero[dstPos] *= s;
+                    }
+                    else if (isMinMax)
+                    {
+                        // Strict comparison, matching the forward: first extreme wins.
+                        bool wins = mode == ScatterReduceMode.AMin ? s < bestVal[dstPos] : s > bestVal[dstPos];
+                        if (wins) { bestVal[dstPos] = s; winner[dstPos] = flatSrc; }
+                    }
+                }
+            }
+        }
+
+        var gradTensor = TensorPool<T>.RentZeroed(shape);
+        var gradSource = TensorPool<T>.RentZeroed(source._shape);
+
+        // Destination contribution.
+        for (int i = 0; i < dstLen; i++)
+        {
+            if (!selfParticipates[i]) continue;
+            double g = numOps.ToDouble(gradOutput[i]);
+            double contrib = mode switch
+            {
+                ScatterReduceMode.Sum => g,
+                ScatterReduceMode.Mean => counts[i] > 0 ? g / counts[i] : 0.0,
+                ScatterReduceMode.Prod => g * ProductOfOthers(numOps.ToDouble(tensor[i]), prodNonZero[i], zeroCount[i]),
+                _ => winner[i] == -1 ? g : 0.0,
+            };
+            gradTensor[i] = numOps.FromDouble(contrib);
+        }
+
+        // Source contributions.
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            int outerBase = outer * dstAxis * innerSize;
+            for (int i = 0; i < srcAxis; i++)
+            {
+                int srcBase = outer * srcAxis * innerSize + i * innerSize;
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int flatSrc = srcBase + inner;
+                    int target = idxData[flatSrc];
+                    if (target < 0 || target >= dstAxis) continue;
+                    int dstPos = outerBase + target * innerSize + inner;
+                    double g = numOps.ToDouble(gradOutput[dstPos]);
+                    double s = numOps.ToDouble(source[flatSrc]);
+                    double contrib = mode switch
+                    {
+                        ScatterReduceMode.Sum => g,
+                        ScatterReduceMode.Mean => counts[dstPos] > 0 ? g / counts[dstPos] : 0.0,
+                        ScatterReduceMode.Prod => g * ProductOfOthers(s, prodNonZero[dstPos], zeroCount[dstPos]),
+                        _ => winner[dstPos] == flatSrc ? g : 0.0,
+                    };
+                    // Several source elements can target the same slot, so ACCUMULATE.
+                    gradSource[flatSrc] = numOps.Add(gradSource[flatSrc], numOps.FromDouble(contrib));
+                }
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
+        DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
+    }
+
+    /// <summary>
+    /// Product of every factor in a slot EXCEPT <paramref name="factor"/>, derived from the slot's
+    /// non-zero product and zero count so that a zero factor never causes a division by zero.
+    /// </summary>
+    private static double ProductOfOthers(double factor, double prodNonZero, int zeroCount)
+    {
+        if (factor == 0.0)
+            return zeroCount == 1 ? prodNonZero : 0.0;   // the only zero -> others' product; more zeros -> 0
+        return zeroCount == 0 ? prodNonZero / factor : 0.0;
+    }
+
+    /// <summary>
     /// SelectScatter backward: the output is the destination tensor with ONE slice along
     /// <c>dim</c> replaced by <c>source</c>.
     /// </summary>
@@ -4530,7 +4718,21 @@ internal static class BackwardFunctions<T>
             double logProbTotal = alpha[T_n - 1, S - 1];
             if (S >= 2) logProbTotal = LogSumExpHelper(logProbTotal, alpha[T_n - 1, S - 2]);
 
-            // Gradient: d(-logP)/d(logProbs[t,n,k]) = prob[t,k] - (1/P) * sum_s(alpha*beta for label s==k)
+            // Gradient with respect to LOG-PROBABILITIES:
+            //     d(-logP)/d(logProbs[t,n,k]) = -(1/P) * sum_{s : label_s == k} alpha[t,s]*beta[t,s]
+            //                                 = -posterior[t,k]
+            //
+            // This previously computed `prob[t,k] - posterior[t,k]`, which is the gradient with
+            // respect to the pre-softmax LOGITS — the familiar Graves-2006 form, correct only when
+            // you additionally chain through logProbs = log_softmax(logits), where
+            // d logProbs[t,j]/d logits[t,k] = delta_jk - prob[t,k] and sum_j posterior[t,j] = 1
+            // together contribute the extra prob[t,k] term.
+            //
+            // CpuEngine.TensorCTCLoss consumes logProbs DIRECTLY — it runs the forward-backward
+            // recursion in the log domain and never applies a log_softmax — so that extra term does
+            // not belong here. It made the reported gradient wrong by exactly prob[t,k] for every
+            // element, including a spurious NON-ZERO gradient for classes absent from the target
+            // (whose true posterior, and therefore true gradient, is 0).
             double gOut = ops.ToDouble(gradOutput.GetFlat(n));
             for (int t = 0; t < T_n; t++)
             {
@@ -4545,9 +4747,7 @@ internal static class BackwardFunctions<T>
 
                 for (int k = 0; k < numClasses; k++)
                 {
-                    double logProbTK = ops.ToDouble(logProbs[t, n, k]);
-                    double probTK = Math.Exp(logProbTK);
-                    double gradVal = probTK - Math.Exp(abSum[k] - logProbTotal);
+                    double gradVal = -Math.Exp(abSum[k] - logProbTotal);
                     grad[t, n, k] = ops.FromDouble(gOut * gradVal);
                 }
             }

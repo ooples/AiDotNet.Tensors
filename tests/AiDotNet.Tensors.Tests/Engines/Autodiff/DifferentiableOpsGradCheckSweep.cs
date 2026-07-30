@@ -109,7 +109,52 @@ public class DifferentiableOpsGradCheckSweep
         // --- elementwise binaries needing matched shapes ---
         ["TensorAddMany"] = r => [new[] { SafeTensor([4], r), SafeTensor([4], r), SafeTensor([4], r) }],
         ["TensorMultiplyMany"] = r => [new[] { SafeTensor([4], r), SafeTensor([4], r) }],
-        ["TensorLdexp"] = r => [SafeTensor([4], r), SafeTensor([4], r)],
+        // Ldexp's second operand is a Tensor<int> EXPONENT, not a float tensor — the previous entry
+        // passed two SafeTensors and threw.
+        ["TensorLdexp"] = r => [SafeTensor([4], r), IdxTensor([4], 3, r)],
+
+        // --- detection: IoU family takes [N,4] and [M,4] boxes in (x1,y1,x2,y2) order ---
+        ["BoxIou"] = r => [Boxes(2, r), Boxes(3, r)],
+        ["GeneralizedBoxIou"] = r => [Boxes(2, r), Boxes(3, r)],
+        ["DistanceBoxIou"] = r => [Boxes(2, r), Boxes(3, r)],
+        ["CompleteBoxIou"] = r => [Boxes(2, r), Boxes(3, r)],
+
+        // --- RoI ops: boxes are [K,5] = (batchIdx, x1, y1, x2, y2) ---
+        ["RoIAlign"] = r => [SafeTensor([1, 2, 4, 4], r), RoiBoxes(2), 2, 2, 1.0f, 2, false],
+        ["RoIPool"] = r => [SafeTensor([1, 2, 4, 4], r), RoiBoxes(2), 2, 2, 1.0f],
+        // Position-sensitive variants require C == outH * outW * outChannels (2*2*2 = 8).
+        ["PsRoIAlign"] = r => [SafeTensor([1, 8, 4, 4], r), RoiBoxes(2), 2, 2, 2, 1.0f, 2],
+        ["PsRoIPool"] = r => [SafeTensor([1, 8, 4, 4], r), RoiBoxes(2), 2, 2, 2, 1.0f],
+
+        // --- fused linear: out = act(input @ weight + bias), so weight is [in, out] ---
+        ["FusedLinearGELU"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
+        ["FusedLinearReLU"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
+        ["FusedLinearSigmoid"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
+        ["FusedLinearSwish"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
+        ["FusedLinearTanh"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
+        ["FusedLinearCrossEntropyWithLogits"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r),
+                                                      SafeTensor([4], r), IdxTensor([2], 4, r)],
+
+        // --- misc ---
+        ["TensorAddMM|T,T,T"] = r => [SafeTensor([2, 2], r), SafeTensor([2, 3], r), SafeTensor([3, 2], r)],
+        ["TensorAddMM|T,T,T,double,double"] = r => [SafeTensor([2, 2], r), SafeTensor([2, 3], r),
+                                                    SafeTensor([3, 2], r), 1.0, 1.0],
+        ["RBFKernel"] = r => [SafeTensor([2, 3], r), SafeTensor([4, 3], r), SafeTensor([4], r)],
+        // Octonions are 8-dimensional, so the feature axis must be a multiple of 8.
+        ["OctonionMatMulTensor"] = r => [SafeTensor([2, 8], r), SafeTensor([8, 8], r)],
+        // RoPE: [B, H, S, D] with cos/sin tables of [S, D/2] for the interleaved variant.
+        ["ApplyRoPEInterleaved"] = r => [SafeTensor([1, 1, 4, 4], r), SafeTensor([4, 2], r), SafeTensor([4, 2], r), 0],
+        ["PadNd"] = r => [SafeTensor([1, 1, 3, 3], r), new[] { 1, 1, 1, 1 }, PadMode.Constant, 0.0],
+        ["Interpolate"] = r => [SafeTensor([1, 2, 2, 2], r), new[] { 4, 4 }, InterpolateMode.Bilinear, false],
+        // Dropout at rate 0 is deterministic, so it CAN be gradient-checked (unlike TensorDropout,
+        // which is exempted as stochastic). training:true keeps the real code path.
+        ["Dropout"] = r => [SafeTensor([2, 3], r), 0.0, true, null!],
+        ["TensorTrilinearInterpolate"] = r => [SafeTensor([2, 2, 2], r), TrilinearPositions()],
+        ["TensorScatterReduce"] = r => [SafeTensor([3, 2], r), 0, IdxTensor([3, 2], 3, r),
+                                        SafeTensor([3, 2], r), ScatterReduceMode.Sum, true],
+        // CTC needs real log-probabilities and NON-BLANK targets (0 is the blank label).
+        ["CTCLoss"] = r => [LogProbs(4, 1, 3, r), CtcTargets(2, 3, r), new[] { 4 }, new[] { 2 }, 0],
+        ["TensorCTCLoss"] = r => [LogProbs(4, 1, 3, r), CtcTargets(2, 3, r), new[] { 4 }, new[] { 2 }, 0],
 
         // --- normalization: last-dim normalized shapes ---
         // These carry `out` parameters, which still need an args slot for Invoke: LayerNorm's
@@ -282,6 +327,90 @@ public class DifferentiableOpsGradCheckSweep
         // from 1 (acos/atanh edges), all strictly positive so domain-restricted ops are valid.
         var t = new Tensor<double>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = 0.35 + rng.NextDouble() * 0.6;
+        return t;
+    }
+
+    /// <summary>
+    /// Boxes as <c>[n, 4]</c> in (x1, y1, x2, y2) order with x2 &gt; x1 and y2 &gt; y1.
+    /// </summary>
+    /// <remarks>
+    /// SafeTensor's uniform [0.35, 0.95] values cannot be used for boxes: they would frequently give
+    /// x2 &lt; x1, producing degenerate/negative areas where the IoU formulae are not differentiable
+    /// (and often not even meaningful). Boxes are spread apart so intersections are non-degenerate and
+    /// finite differences do not straddle a kink.
+    /// </remarks>
+    private static Tensor<double> Boxes(int n, Random rng, double spread = 3.0)
+    {
+        var t = new Tensor<double>([n, 4]);
+        for (int i = 0; i < n; i++)
+        {
+            double x1 = i * spread + 0.25 + rng.NextDouble() * 0.2;
+            double y1 = i * spread + 0.35 + rng.NextDouble() * 0.2;
+            t[i * 4 + 0] = x1;
+            t[i * 4 + 1] = y1;
+            t[i * 4 + 2] = x1 + 1.5 + rng.NextDouble() * 0.3;   // strictly > x1
+            t[i * 4 + 3] = y1 + 1.6 + rng.NextDouble() * 0.3;   // strictly > y1
+        }
+        return t;
+    }
+
+    /// <summary>
+    /// Genuine log-probabilities of shape <c>[T, N, C]</c>: log-softmax over the class axis, so every
+    /// value is negative and each timestep's classes sum to 1 in probability space.
+    /// </summary>
+    /// <remarks>
+    /// CTC consumes LOG-probabilities. Feeding it SafeTensor's positive [0.35, 0.95] values puts it
+    /// outside its domain entirely, which is not a fair test of its gradient.
+    /// </remarks>
+    private static Tensor<double> LogProbs(int timeSteps, int batch, int classes, Random rng)
+    {
+        var t = new Tensor<double>([timeSteps, batch, classes]);
+        for (int i = 0; i < timeSteps * batch; i++)
+        {
+            var logits = new double[classes];
+            double max = double.NegativeInfinity;
+            for (int c = 0; c < classes; c++) { logits[c] = -1.0 + rng.NextDouble() * 2.0; max = Math.Max(max, logits[c]); }
+            double sumExp = 0;
+            for (int c = 0; c < classes; c++) sumExp += Math.Exp(logits[c] - max);
+            double lse = max + Math.Log(sumExp);
+            for (int c = 0; c < classes; c++) t[i * classes + c] = logits[c] - lse;
+        }
+        return t;
+    }
+
+    /// <summary>
+    /// CTC target labels in <c>[1, classes)</c> — index 0 is the BLANK and is not a legal target.
+    /// </summary>
+    private static Tensor<int> CtcTargets(int length, int classes, Random rng)
+    {
+        var t = new Tensor<int>([length]);
+        for (int i = 0; i < length; i++) t[i] = 1 + rng.Next(classes - 1);
+        return t;
+    }
+
+    /// <summary>
+    /// Sample positions strictly INSIDE a 2x2x2 grid, so trilinear interpolation stays in its smooth
+    /// interior rather than clamping at a boundary (where the gradient is one-sided).
+    /// </summary>
+    private static Tensor<double> TrilinearPositions()
+    {
+        var t = new Tensor<double>([1, 3]);
+        t[0] = 0.4; t[1] = 0.5; t[2] = 0.6;
+        return t;
+    }
+
+    /// <summary>RoI boxes as <c>[k, 5]</c> = (batchIndex, x1, y1, x2, y2), torchvision's layout.</summary>
+    private static Tensor<double> RoiBoxes(int k)
+    {
+        var t = new Tensor<double>([k, 5]);
+        for (int i = 0; i < k; i++)
+        {
+            t[i * 5 + 0] = 0;      // single-image batch
+            t[i * 5 + 1] = 0.5;
+            t[i * 5 + 2] = 0.5;
+            t[i * 5 + 3] = 2.5;
+            t[i * 5 + 4] = 2.5;
+        }
         return t;
     }
 

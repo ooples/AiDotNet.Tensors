@@ -2381,6 +2381,8 @@ public partial class CpuEngine
         }
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
+        var scatterTensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -2479,6 +2481,14 @@ public partial class CpuEngine
                     dst[i] = ops.Divide(dst[i], ops.FromDouble(counts[i]));
         }
 
+        // Tape registration — this op recorded nothing, so neither the destination nor the scattered
+        // source received a gradient. The index list, mode and includeSelf flag are snapshotted so the
+        // backward can replay the forward's per-slot decisions (which contributor won an AMin/AMax
+        // slot, each slot's Mean divisor, whether the destination value survived) exactly.
+        DifferentiableOps.RecordBinary(
+            "TensorScatterReduce", result, scatterTensorOrig, source,
+            BackwardFunctions<T>.ScatterReduceBackward,
+            savedState: new object[] { dim, indices.GetFlattenedData(), (int)mode, includeSelf });
         return result;
     }
 
