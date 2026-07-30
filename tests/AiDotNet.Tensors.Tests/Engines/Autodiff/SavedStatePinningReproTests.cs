@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// gradient is unaffected by a reissue attempt, and the pins are fully released afterward (no
 /// leak). The pre-fix behavior was the opposite on every count.
 /// </summary>
-[Collection("GradientTapeLeakTests")]
+[Collection("EngineCurrentGlobalState")]
 public class SavedStatePinningReproTests
 {
     private static Tensor<float> Fixed(int[] shape, float start, float step)
