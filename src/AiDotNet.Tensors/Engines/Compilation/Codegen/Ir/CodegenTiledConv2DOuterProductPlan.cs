@@ -20,7 +20,8 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         int mAxis, int nAxis, int tapRowAxis, int tapColumnAxis, int batchAxis,
         int outerReductionAxis, int innerReductionAxis,
         int m, int n, int tapRows, int tapColumns, int batch,
-        int outerReduction, int innerReduction, int inputHeight, int inputWidth,
+        int outerReduction, int innerReduction, int rowsPerPartial,
+        int inputHeight, int inputWidth,
         int tileM, int tileN, int threadTileM, int threadTileN, int stages)
     {
         DirectInput = directInput;
@@ -39,6 +40,7 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         Batch = batch;
         OuterReduction = outerReduction;
         InnerReduction = innerReduction;
+        RowsPerPartial = rowsPerPartial;
         InputHeight = inputHeight;
         InputWidth = inputWidth;
         TileM = tileM;
@@ -64,6 +66,7 @@ public sealed class CodegenTiledConv2DOuterProductPlan
     public int Batch { get; }
     public int OuterReduction { get; }
     public int InnerReduction { get; }
+    public int RowsPerPartial { get; }
     public int InputHeight { get; }
     public int InputWidth { get; }
     public int TileM { get; }
@@ -75,7 +78,7 @@ public sealed class CodegenTiledConv2DOuterProductPlan
     public int ThreadsN => TileN / ThreadTileN;
     public int BlockThreads => ThreadsM * ThreadsN;
     public int Steps => OuterReduction;
-    public int Blocks => Batch * TapRows * TapColumns * (M / TileM) * (N / TileN);
+    public int Blocks => Batch * TapRows * (M / TileM) * (N / TileN);
     public int DirectStageElements => TileM * InnerReduction;
     public int WindowStageElements => TileN * InputWidth;
     public int StageBytes => (DirectStageElements + WindowStageElements) * sizeof(float);
@@ -117,9 +120,9 @@ public sealed class CodegenTiledConv2DOuterProductPlan
             }
 
         int[] reductions = spec.Space.ReductionAxes;
-        if (reductions.Length != 2)
+        if (reductions.Length is not 2 and not 3)
         {
-            reason = "the split dense weight partial needs batch and column reductions";
+            reason = "the split dense weight partial needs batch/column reductions and an optional row chunk";
             return false;
         }
         if (!TryIdentityOutput(spec, out int[] outputAxes) || outputAxes.Length != 5 ||
@@ -131,10 +134,12 @@ public sealed class CodegenTiledConv2DOuterProductPlan
 
         int first = spec.ProductInputs[0], second = spec.ProductInputs[1];
         if (!MatchesOperands(spec, first, second, outputAxes, reductions,
-                out int outerReductionAxis, out int innerReductionAxis))
+                out int outerReductionAxis, out int innerReductionAxis,
+                out int rowsPerPartial))
         {
             if (!MatchesOperands(spec, second, first, outputAxes, reductions,
-                    out outerReductionAxis, out innerReductionAxis))
+                    out outerReductionAxis, out innerReductionAxis,
+                    out rowsPerPartial))
             {
                 reason = "operands are not direct-output and padded-input NCHW rows";
                 return false;
@@ -145,12 +150,13 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         int m = spec.Output.Shape[0];
         int n = spec.Output.Shape[1];
         int batch = spec.Output.Shape[4];
-        int outerReduction = spec.Space.Axes[outerReductionAxis].Extent;
+        int outerReduction = checked(
+            spec.Space.Axes[outerReductionAxis].Extent * rowsPerPartial);
         int innerReduction = spec.Space.Axes[innerReductionAxis].Extent;
         int inputHeight = spec.Inputs[second].Shape[2];
         int inputWidth = spec.Inputs[second].Shape[3];
-        if (inputHeight != batch || inputWidth != innerReduction ||
-            inputWidth % 4 != 0)
+        if (inputHeight != checked(batch * rowsPerPartial) ||
+            inputWidth != innerReduction || inputWidth % 4 != 0)
         {
             reason = "the split rows must be same-size and vectorizable by four";
             return false;
@@ -184,6 +190,7 @@ public sealed class CodegenTiledConv2DOuterProductPlan
             outerReductionAxis, innerReductionAxis,
             m, n, spec.Output.Shape[2], spec.Output.Shape[3],
             batch, outerReduction, innerReduction,
+            rowsPerPartial,
             inputHeight, inputWidth,
             tileM, tileN, threadTileM, threadTileN,
             stages: CodegenSharedMemoryBudget.DoubleBufferStages);
@@ -194,9 +201,11 @@ public sealed class CodegenTiledConv2DOuterProductPlan
     private static bool MatchesOperands(
         CodegenKernelSpec spec, int directInput, int windowInput,
         int[] outputAxes, int[] reductions,
-        out int outerReductionAxis, out int innerReductionAxis)
+        out int outerReductionAxis, out int innerReductionAxis,
+        out int rowsPerPartial)
     {
         outerReductionAxis = innerReductionAxis = -1;
+        rowsPerPartial = 0;
         CodegenTensorBinding direct = spec.Inputs[directInput];
         CodegenTensorBinding window = spec.Inputs[windowInput];
         if (direct.Shape.Count != 4 || direct.Map.Count != 4 ||
@@ -206,19 +215,39 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         if (!TryPlainAxis(direct.Map[0], out int outer) ||
             !Contains(reductions, outer) ||
             !TryPlainAxis(direct.Map[1], out int m) || m != outputAxes[0] ||
-            !TryPlainAxis(direct.Map[2], out int batch) || batch != outputAxes[4] ||
             !TryPlainAxis(direct.Map[3], out int inner) ||
             !Contains(reductions, inner) || inner == outer)
             return false;
 
-        int[] directAxes = { outer, m, batch, inner };
-        for (int d = 0; d < directAxes.Length; d++)
-            if (direct.Shape[d] != spec.Space.Axes[directAxes[d]].Extent)
+        int rowAxis;
+        bool chunked = !TryPlainAxis(direct.Map[2], out int directRow);
+        if (!chunked)
+        {
+            if (directRow != outputAxes[4]) return false;
+            rowAxis = directRow;
+            rowsPerPartial = 1;
+        }
+        else
+        {
+            rowAxis = RemainingReduction(reductions, outer, inner);
+            if (rowAxis < 0) return false;
+            rowsPerPartial = spec.Space.Axes[rowAxis].Extent;
+            if (!TryChunkedRow(direct.Map[2], rowAxis, outputAxes[4], rowsPerPartial))
                 return false;
+        }
+
+        if (direct.Shape[0] != spec.Space.Axes[outer].Extent ||
+            direct.Shape[1] != spec.Space.Axes[m].Extent ||
+            direct.Shape[2] != checked(spec.Space.Axes[outputAxes[4]].Extent * rowsPerPartial) ||
+            direct.Shape[3] != spec.Space.Axes[inner].Extent)
+            return false;
 
         if (!TryPlainAxis(window.Map[0], out int windowOuter) || windowOuter != outer ||
             !TryPlainAxis(window.Map[1], out int n) || n != outputAxes[1] ||
-            !TryWindow(window.Map[2], outputAxes[4], outputAxes[2]) ||
+            !(chunked
+                ? TryChunkedWindow(window.Map[2], rowAxis, outputAxes[4],
+                    rowsPerPartial, outputAxes[2])
+                : TryWindow(window.Map[2], outputAxes[4], outputAxes[2])) ||
             !TryWindow(window.Map[3], inner, outputAxes[3]) ||
             window.Shape[0] != spec.Space.Axes[outer].Extent ||
             window.Shape[1] != spec.Space.Axes[n].Extent)
@@ -227,6 +256,52 @@ public sealed class CodegenTiledConv2DOuterProductPlan
         outerReductionAxis = outer;
         innerReductionAxis = inner;
         return true;
+    }
+
+    private static int RemainingReduction(int[] reductions, int first, int second)
+    {
+        int remaining = -1;
+        foreach (int axis in reductions)
+            if (axis != first && axis != second)
+            {
+                if (remaining >= 0) return -1;
+                remaining = axis;
+            }
+        return remaining;
+    }
+
+    private static bool TryChunkedRow(
+        CodegenAffineExpr expression, int rowAxis, int chunkAxis, int chunkStride)
+    {
+        if (expression.Terms.Count != 2 || expression.Constant != 0 ||
+            expression.Divisor != 1 || expression.RequiresExactDivision)
+            return false;
+        bool row = false, chunk = false;
+        foreach (var term in expression.Terms)
+        {
+            if (term.Axis == rowAxis && term.Coefficient == 1) row = true;
+            else if (term.Axis == chunkAxis && term.Coefficient == chunkStride) chunk = true;
+            else return false;
+        }
+        return row && chunk;
+    }
+
+    private static bool TryChunkedWindow(
+        CodegenAffineExpr expression, int rowAxis, int chunkAxis,
+        int chunkStride, int tapAxis)
+    {
+        if (expression.Terms.Count != 3 || expression.Constant != -1 ||
+            expression.Divisor != 1 || expression.RequiresExactDivision)
+            return false;
+        bool row = false, chunk = false, tap = false;
+        foreach (var term in expression.Terms)
+        {
+            if (term.Axis == rowAxis && term.Coefficient == 1) row = true;
+            else if (term.Axis == chunkAxis && term.Coefficient == chunkStride) chunk = true;
+            else if (term.Axis == tapAxis && term.Coefficient == 1) tap = true;
+            else return false;
+        }
+        return row && chunk && tap;
     }
 
     private static bool TryWindow(

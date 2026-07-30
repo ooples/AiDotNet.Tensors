@@ -173,6 +173,33 @@ public static class CodegenSplitReduction
             chunkedPartial, chunkedCombine, chunkedPartial.Output.ElementCount, new[] { axis });
     }
 
+    /// <summary>
+    /// Builds a measured-candidate plan that chunks the highest-ranked reduction axis
+    /// even when other reduction axes remain.
+    /// </summary>
+    /// <remarks>
+    /// The default plan promotes that axis whole because it maximizes partial-pass
+    /// parallelism. Weight gradients can pay more for the enlarged temporary than they
+    /// gain from those extra blocks, so autotuning also needs deterministic chunk counts
+    /// that trade parallelism for less materialization traffic.
+    /// </remarks>
+    public static CodegenSplitPlan? TryPlanChunked(
+        CodegenKernelSpec spec, int splitFactor,
+        int multiprocessors = 68, int blockThreads = 256)
+    {
+        var ranked = ChooseAxes(spec, multiprocessors, blockThreads);
+        if (ranked.Count == 0) return null;
+
+        int axis = ranked[0];
+        int extent = spec.Space.Axes[axis].Extent;
+        if (splitFactor <= 1 || splitFactor >= extent || extent % splitFactor != 0)
+            return null;
+
+        var (partial, combine) = SplitChunked(spec, axis, splitFactor);
+        return new CodegenSplitPlan(
+            partial, combine, partial.Output.ElementCount, new[] { axis });
+    }
+
     /// <summary>Largest divisor of <paramref name="extent"/> not above <paramref name="cap"/>.</summary>
     private static int LargestDivisorAtMost(int extent, int cap)
     {

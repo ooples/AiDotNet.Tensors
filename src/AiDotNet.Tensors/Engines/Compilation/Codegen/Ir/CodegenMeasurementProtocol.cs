@@ -43,6 +43,11 @@
 //             Four default, two exhaustive, and one deterministic-heuristic fresh
 //             processes are searched; the fastest stable plan and its strategy are
 //             recorded per shape.
+//   v9 -> v10 recoverable stability windows. The stability loop accumulated a max-min
+//             spread over every attempt, so one WDDM preemption made convergence
+//             mathematically impossible: later clean samples could not remove the old
+//             maximum. It now requires three consecutive agreeing samples, preserving
+//             the 5% gate while allowing contaminated batches to age out.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -59,11 +64,14 @@ public static class CodegenMeasurementProtocol
     /// <summary>Smallest measured gain distinguishable from the harness noise floor.</summary>
     public const double AutotuneGainNoiseFloor = 1.0105;
 
+    /// <summary>Largest relative FP32 accumulation deviation accepted by shared gates.</summary>
+    public const double AccumulationTolerance = 2e-3;
+
     /// <summary>
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 9;
+    public const int Version = 10;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -73,7 +81,7 @@ public static class CodegenMeasurementProtocol
         "paired within-sample ratios; batched timed regions; clock-drift and <=5% spread gates; " +
         "true-fp32 CUDA-graph competitor; exact PTX-set autotune and dispatch-bound evidence; " +
         "exact competitor geometry; multi-strategy cuDNN plan search; " +
-        "phase-scoped counter profiles";
+        "phase-scoped counter profiles; recoverable consecutive stability windows";
 
     /// <summary>
     /// Human-readable stamp to put beside a number.

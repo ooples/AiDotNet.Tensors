@@ -26,7 +26,7 @@ public sealed class CodegenTiledConv2DOuterProductTests
         Assert.Equal((8, 8, 1, 1, 64),
             (verify.TileM, verify.TileN, verify.ThreadTileM,
              verify.ThreadTileN, verify.BlockThreads));
-        Assert.Equal(144, verify.Blocks);
+        Assert.Equal(48, verify.Blocks);
 
         Assert.True(CodegenTiledConv2DOuterProductPlan.TryCreate(
             benchSplit.Partial, out var bench, out string benchReason), benchReason);
@@ -37,8 +37,33 @@ public sealed class CodegenTiledConv2DOuterProductTests
         Assert.Equal((32, 16, 2, 2, 128),
             (bench.TileM, bench.TileN, bench.ThreadTileM,
              bench.ThreadTileN, bench.BlockThreads));
-        Assert.Equal(1008, bench.Blocks);
+        Assert.Equal(336, bench.Blocks);
         Assert.Equal(2 * 28 * (32 + 16) * sizeof(float), bench.SharedMemoryBytes);
+    }
+
+    [Fact]
+    public void DenseWeightGradientChunkedSplit_RecoversSeveralRowsPerPartial()
+    {
+        var original = CodegenKernelCatalog.Find("conv2d_3x3_bwd_weights")!.Bench;
+        var split = CodegenSplitReduction.TryPlanChunked(original, splitFactor: 4)!;
+
+        Assert.True(CodegenTiledConv2DOuterProductPlan.TryCreate(
+            split.Partial, out var plan, out string reason), reason);
+        Assert.NotNull(plan);
+        Assert.Equal((64, 32, 4, 56, 28, 7),
+            (plan!.M, plan.N, plan.Batch, plan.OuterReduction,
+             plan.InnerReduction, plan.RowsPerPartial));
+        Assert.Equal((48, 56), (plan.Blocks, plan.Steps));
+
+        var winningSplit = CodegenSplitReduction.TryPlanChunked(
+            original, splitFactor: 14)!;
+        Assert.True(CodegenTiledConv2DOuterProductPlan.TryCreate(
+            winningSplit.Partial, out var winning, out string winningReason),
+            winningReason);
+        Assert.NotNull(winning);
+        Assert.Equal((14, 16, 2, 168),
+            (winning!.Batch, winning.OuterReduction,
+             winning.RowsPerPartial, winning.Blocks));
     }
 
     [Fact]
@@ -79,7 +104,7 @@ public sealed class CodegenTiledConv2DOuterProductTests
 
         string ptx = emitter.Emit(spec, 8, 6);
 
-        Assert.Equal(1008u, emitter.LaunchBlocks);
+        Assert.Equal(336u, emitter.LaunchBlocks);
         Assert.Equal(128, emitter.LaunchBlockThreads);
         Assert.StartsWith(".version 7.5", ptx, StringComparison.Ordinal);
         Assert.Contains("cp.async.ca.shared.global", ptx);

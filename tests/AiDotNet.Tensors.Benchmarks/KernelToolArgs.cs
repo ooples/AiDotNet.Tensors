@@ -36,7 +36,7 @@ internal static class KernelToolArgs
     {
         "--ncu", "--out", "--nvdisasm", "--coarsen", "--max-lanes",
         "--competitor", "--limiter", "--runner-python", "--max-spread-pct",
-        "--competitor-python", "--ptxas", "--coverage-out",
+        "--competitor-python", "--ptxas", "--coverage-out", "--candidate",
     };
 
     /// <summary>The kernel selector, or "all" when none was given.</summary>

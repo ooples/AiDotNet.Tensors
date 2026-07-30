@@ -21,8 +21,8 @@ public sealed class CodegenTiledConv2DTests
         Assert.Equal((2, 8, 16, 16, 8),
             (verify!.Batch, verify.M, verify.OutputHeight,
              verify.OutputWidth, verify.ReductionChannels));
-        Assert.Equal((8, 4, 1, 4, 32),
-            (verify.TileM, verify.TileChannels, verify.ThreadTileM,
+        Assert.Equal((8, 4, 8, 1, 4, 128),
+            (verify.TileM, verify.TileRows, verify.TileChannels, verify.ThreadTileM,
              verify.ThreadTileWidth, verify.BlockThreads));
         Assert.Equal((1, -1), (verify.TapSign, verify.WindowConstant));
         Assert.False(verify.MatrixReductionMajor);
@@ -34,11 +34,11 @@ public sealed class CodegenTiledConv2DTests
         Assert.Equal((8, 64, 28, 28, 32),
             (bench!.Batch, bench.M, bench.OutputHeight,
              bench.OutputWidth, bench.ReductionChannels));
-        Assert.Equal((32, 4, 2, 4, 112),
-            (bench.TileM, bench.TileChannels, bench.ThreadTileM,
+        Assert.Equal((64, 4, 8, 8, 4, 224),
+            (bench.TileM, bench.TileRows, bench.TileChannels, bench.ThreadTileM,
              bench.ThreadTileWidth, bench.BlockThreads));
-        Assert.Equal(448, bench.Blocks);
-        Assert.Equal(2 * (32 * 4 * 9 + 4 * 3 * 28) * sizeof(float),
+        Assert.Equal(56, bench.Blocks);
+        Assert.Equal(2 * (64 * 8 * 9 + 8 * 6 * 28) * sizeof(float),
             bench.SharedMemoryBytes);
     }
 
@@ -63,10 +63,12 @@ public sealed class CodegenTiledConv2DTests
         Assert.Equal((8, 32, 28, 28, 64),
             (bench!.Batch, bench.M, bench.OutputHeight,
              bench.OutputWidth, bench.ReductionChannels));
-        Assert.Equal((32, 4, 2, 4, 112),
-            (bench.TileM, bench.TileChannels, bench.ThreadTileM,
+        Assert.Equal((16, 4, 16, 4, 4, 128),
+            (bench.TileM, bench.TileRows, bench.TileChannels, bench.ThreadTileM,
              bench.ThreadTileWidth, bench.BlockThreads));
-        Assert.Equal(224, bench.Blocks);
+        Assert.Equal(112, bench.Blocks);
+        Assert.Equal(2 * (16 * 16 * 9 + 16 * 6 * 28) * sizeof(float),
+            bench.SharedMemoryBytes);
         Assert.True(bench.MatrixReductionMajor);
     }
 
@@ -101,7 +103,7 @@ public sealed class CodegenTiledConv2DTests
             widened, out var plan, out string reason));
         Assert.Null(plan);
         Assert.Equal(
-            "58368 bytes of static shared memory exceed the 49152-byte budget",
+            "233472 bytes of static shared memory exceed the 49152-byte budget",
             reason);
     }
 
@@ -113,18 +115,31 @@ public sealed class CodegenTiledConv2DTests
 
         string ptx = emitter.Emit(spec, 8, 6);
 
-        Assert.Equal(448u, emitter.LaunchBlocks);
-        Assert.Equal(112, emitter.LaunchBlockThreads);
+        Assert.Equal(56u, emitter.LaunchBlocks);
+        Assert.Equal(224, emitter.LaunchBlockThreads);
         Assert.StartsWith(".version 7.5", ptx, StringComparison.Ordinal);
         Assert.Contains("cp.async.ca.shared.global", ptx);
         Assert.Contains(", 16, %p", ptx);
         Assert.Contains("cp.async.wait_group 0", ptx);
-        Assert.Contains("ld.shared.v2.f32", ptx);
         Assert.Contains("ld.shared.v4.f32", ptx);
         Assert.Contains("fma.rn.f32", ptx);
         Assert.Contains("add.rn.f32", ptx);
         Assert.Contains("max.f32", ptx);
+        Assert.Contains("st.global.f32", ptx);
+        Assert.DoesNotContain("st.global.v4.f32", ptx);
         Assert.DoesNotContain("mma.sync", ptx);
+    }
+
+    [Fact]
+    public void DenseBackwardData_VectorizesBiasFreeStores()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var emitter = new PtxTiledConv2DEmitter();
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Contains("st.global.v4.f32", ptx);
+        Assert.DoesNotContain("st.global.f32", ptx);
     }
 
     [SkippableTheory]

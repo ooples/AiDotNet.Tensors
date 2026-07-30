@@ -41,6 +41,8 @@ internal static class KernelAutotuneTool
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
 
+    private sealed record CandidatePhase(string Name, Action Launch, long WorkUnits);
+
     /// <summary>A loaded candidate kept alive while it is paired against the baseline.</summary>
     private sealed class CandidateProgram : IDisposable
     {
@@ -50,17 +52,22 @@ internal static class KernelAutotuneTool
 
         internal CandidateProgram(
             string name, Action launch, DirectPtxBuffer output, int outputElements,
-            List<IDisposable> resources)
+            List<IDisposable> resources, IReadOnlyList<CandidatePhase>? phases = null,
+            string? resourceSummary = null)
         {
             Name = name;
             Launch = launch;
             _output = output;
             _outputElements = outputElements;
             _resources = resources;
+            Phases = phases ?? Array.Empty<CandidatePhase>();
+            ResourceSummary = resourceSummary;
         }
 
         internal string Name { get; }
         internal Action Launch { get; }
+        internal IReadOnlyList<CandidatePhase> Phases { get; }
+        internal string? ResourceSummary { get; }
 
         internal float[] ReadOutput()
         {
@@ -127,6 +134,7 @@ internal static class KernelAutotuneTool
         }
 
         string selector = KernelToolArgs.Selector(args);
+        string? candidateSelector = ValueOf(args, "--candidate");
         var entries = string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase)
             ? CodegenKernelCatalog.All
             : new[] { CodegenKernelCatalog.Find(selector)! }.Where(e => e != null).ToList();
@@ -138,8 +146,12 @@ internal static class KernelAutotuneTool
 
         Console.WriteLine();
         Console.WriteLine("AUTOTUNE - measured candidate lowerings, protocol " + CodegenMeasurementProtocol.Tag);
-        Console.WriteLine("candidates: " + string.Join(", ", Candidates.Select(c => c.Name)) +
-                          ", split, tiled-split");
+        Console.WriteLine("candidates: " +
+            (string.IsNullOrWhiteSpace(candidateSelector)
+                ? string.Join(", ", Candidates.Select(c => c.Name)) +
+                    ", library-winograd-fp32-bn16, library-winograd-fp32-bn32, " +
+                    "split, tiled-split, tiled-chunked-split"
+                : candidateSelector));
         Console.WriteLine();
         Console.WriteLine("kernel                          modelled   best      winner        gain");
 
@@ -153,7 +165,7 @@ internal static class KernelAutotuneTool
             {
                 try
                 {
-                    TuneResult? result = TuneOne(runtime, entry);
+                    TuneResult? result = TuneOne(runtime, entry, candidateSelector);
                     if (result is null || !double.IsFinite(result.BestUs) ||
                         result.BestUs == double.MaxValue ||
                         !double.IsFinite(result.ModelledUs) || result.ModelledUs == double.MaxValue)
@@ -208,7 +220,7 @@ internal static class KernelAutotuneTool
     }
 
     private static TuneResult? TuneOne(
-        DirectPtxRuntime runtime, CodegenCatalogEntry entry)
+        DirectPtxRuntime runtime, CodegenCatalogEntry entry, string? candidateSelector)
     {
         CodegenKernelSpec spec = entry.Bench;
         long workUnits = WorkUnits(spec);
@@ -233,6 +245,7 @@ internal static class KernelAutotuneTool
 
         for (int i = 1; i < Candidates.Length; i++)
         {
+            if (!CandidateEnabled(candidateSelector, Candidates[i].Name)) continue;
             CandidateProgram? program = null;
             try { program = CreateSingle(runtime, spec, Candidates[i]); }
             catch (NotSupportedException) { continue; }
@@ -254,6 +267,31 @@ internal static class KernelAutotuneTool
             }
         }
 
+        // Point the oracle at the independently developed true-FP32 hand-written
+        // Winograd pipeline. All four launches stay in the timed region because the
+        // general kernel contract permits weights and inputs to change on every call.
+        int[] winogradBlockColumns = { 16, 32 };
+        foreach (int blockColumns in winogradBlockColumns)
+        {
+            using CandidateProgram? library = TryCreateLibraryWinograd(
+                runtime, spec, blockColumns);
+            if (library is null || !CandidateEnabled(candidateSelector, library.Name)) continue;
+
+            library.Launch();
+            runtime.Synchronize();
+            if (!Agrees(library.ReadOutput(), reference, out double deviation))
+            {
+                Console.WriteLine("    candidate '" + library.Name + "' disagrees by " +
+                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                  " relative; rejected");
+                continue;
+            }
+
+            Consider(runtime, modelled, library, workUnits,
+                ref hasStableTiming, ref bestName, ref bestUs,
+                ref bestModelledUs, ref bestGain);
+        }
+
         // Both split forms preserve the deterministic affine combine. The second changes
         // only the expensive partial pass to a cooperative outer-product tile. Each stays
         // paired against the live modelled program, with both launches in the timed region.
@@ -262,6 +300,7 @@ internal static class KernelAutotuneTool
             using CandidateProgram? split = TryCreateSplit(
                 runtime, spec, tiledPartial: splitKind == 1);
             if (split is null) continue;
+            if (!CandidateEnabled(candidateSelector, split.Name)) continue;
 
             split.Launch();
             runtime.Synchronize();
@@ -279,6 +318,28 @@ internal static class KernelAutotuneTool
             }
         }
 
+        int[] chunkFactors = { 2, 4, 7, 14 };
+        foreach (int chunkFactor in chunkFactors)
+        {
+            using CandidateProgram? split = TryCreateSplit(
+                runtime, spec, tiledPartial: true, chunkFactor: chunkFactor);
+            if (split is null || !CandidateEnabled(candidateSelector, split.Name)) continue;
+
+            split.Launch();
+            runtime.Synchronize();
+            if (!Agrees(split.ReadOutput(), reference, out double deviation))
+            {
+                Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
+                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                  " relative; rejected");
+                continue;
+            }
+
+            Consider(runtime, modelled, split, workUnits,
+                ref hasStableTiming, ref bestName, ref bestUs,
+                ref bestModelledUs, ref bestGain);
+        }
+
         if (!hasStableTiming)
         {
             Console.WriteLine("    no standalone or paired timing window stabilized; " +
@@ -287,6 +348,11 @@ internal static class KernelAutotuneTool
         }
         return new TuneResult(bestName, bestUs, bestModelledUs, bestGain);
     }
+
+    private static bool CandidateEnabled(string? selector, string name) =>
+        string.IsNullOrWhiteSpace(selector) ||
+        string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(selector, name, StringComparison.OrdinalIgnoreCase);
 
     private static void Consider(
         DirectPtxRuntime runtime,
@@ -304,6 +370,7 @@ internal static class KernelAutotuneTool
                               ", ratio +-" +
                               (timing.RelativeSpread * 100).ToString(
                                   "0.0", CultureInfo.InvariantCulture) + "%); rejected");
+            ReportPhases(runtime, candidate);
             return;
         }
 
@@ -312,6 +379,9 @@ internal static class KernelAutotuneTool
                           ", paired " + timing.DescribeRatio() + " +-" +
                           (timing.RelativeSpread * 100).ToString("0.0", CultureInfo.InvariantCulture) +
                           "%");
+        if (candidate.ResourceSummary is not null)
+            Console.WriteLine("      resources: " + candidate.ResourceSummary);
+        ReportPhases(runtime, candidate);
 
         // A stable pair is also valid baseline evidence. This lets an interrupted standalone
         // window recover without accepting a candidate whose own time or ratio was unstable.
@@ -333,6 +403,20 @@ internal static class KernelAutotuneTool
         bestUs = timing.B.Microseconds;
         bestModelledUs = timing.A.Microseconds;
         bestGain = timing.Ratio;
+    }
+
+    private static void ReportPhases(DirectPtxRuntime runtime, CandidateProgram candidate)
+    {
+        if (candidate.Phases.Count <= 1) return;
+
+        var descriptions = new List<string>(candidate.Phases.Count);
+        foreach (CandidatePhase phase in candidate.Phases)
+        {
+            StableTimer.Result timing = StableTimer.Measure(
+                runtime, phase.Launch, phase.WorkUnits);
+            descriptions.Add(phase.Name + " " + timing.Describe());
+        }
+        Console.WriteLine("      phases: " + string.Join(", ", descriptions));
     }
 
     private static CandidateProgram CreateSingle(
@@ -383,7 +467,10 @@ internal static class KernelAutotuneTool
             else
             {
                 var emitter = new PtxAffineEmitter();
-                candidate.Configure!(emitter);
+                if (candidate.Configure is null)
+                    throw new InvalidOperationException(
+                        "Affine candidate '" + candidate.Name + "' has no configurator.");
+                candidate.Configure(emitter);
                 ptx = emitter.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 blocks = emitter.LaunchBlocks;
@@ -392,7 +479,9 @@ internal static class KernelAutotuneTool
             }
             var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             resources.Add(module);
-            IntPtr fn = module.GetFunction(spec.Name, out _);
+            IntPtr fn = module.GetFunction(spec.Name, out DirectPtxFunctionInfo functionInfo);
+            int activeBlocks = module.GetActiveBlocksPerMultiprocessor(
+                fn, checked((int)(blockX * blockY)));
 
             var pointers = new IntPtr[spec.ParameterCount];
             for (int i = 0; i < spec.Inputs.Count; i++)
@@ -422,7 +511,14 @@ internal static class KernelAutotuneTool
 
             void Launch() => LaunchOne(module, fn, pointers, blocks, blockX, blockY);
             return new CandidateProgram(
-                candidate.Name, Launch, output, checked((int)spec.Output.ElementCount), resources);
+                candidate.Name, Launch, output, checked((int)spec.Output.ElementCount), resources,
+                resourceSummary: functionInfo.RegistersPerThread.ToString(
+                        CultureInfo.InvariantCulture) + " regs/thread, " +
+                    functionInfo.StaticSharedBytes.ToString(CultureInfo.InvariantCulture) +
+                        " B shared, " +
+                    functionInfo.LocalBytesPerThread.ToString(CultureInfo.InvariantCulture) +
+                        " B local/thread, " +
+                    activeBlocks.ToString(CultureInfo.InvariantCulture) + " blocks/SM");
         }
         catch
         {
@@ -432,10 +528,16 @@ internal static class KernelAutotuneTool
     }
 
     private static CandidateProgram? TryCreateSplit(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec, bool tiledPartial = false)
+        DirectPtxRuntime runtime, CodegenKernelSpec spec,
+        bool tiledPartial = false, int chunkFactor = 0)
     {
         CodegenSplitPlan? plan;
-        try { plan = CodegenSplitReduction.TryPlan(spec); }
+        try
+        {
+            plan = chunkFactor > 0
+                ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
+                : CodegenSplitReduction.TryPlan(spec);
+        }
         catch (NotSupportedException) { return null; }
         if (plan is null) return null;
         RequireFloat32(spec);
@@ -507,20 +609,161 @@ internal static class KernelAutotuneTool
                 combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
             combineArgs[combineArgs.Length - 1] = output.Pointer;
 
-            void Launch()
+            void LaunchPartial()
             {
                 LaunchOne(partialModule, partialFn, partialArgs,
                     partialBlocks, partialBlockX, partialBlockY);
+            }
+
+            void LaunchCombine()
+            {
                 LaunchOne(combineModule, combineFn, combineArgs, combineEmitter.LaunchBlocks,
                     (uint)combineEmitter.LaunchBlockX, (uint)combineEmitter.LaunchBlockY);
             }
 
-            string name = (tiledPartial ? "tiled-split:" : "split:") +
-                string.Join("+", plan.PromotedAxes);
+            void Launch()
+            {
+                LaunchPartial();
+                LaunchCombine();
+            }
+
+            string name = chunkFactor > 0
+                ? "tiled-chunked-split:" + string.Join("+", plan.PromotedAxes) +
+                    "x" + chunkFactor.ToString(CultureInfo.InvariantCulture)
+                : (tiledPartial ? "tiled-split:" : "split:") +
+                    string.Join("+", plan.PromotedAxes);
             return new CandidateProgram(
-                name, Launch, output, checked((int)spec.Output.ElementCount), resources);
+                name, Launch, output, checked((int)spec.Output.ElementCount), resources,
+                new[]
+                {
+                    new CandidatePhase("partial", LaunchPartial, WorkUnits(plan.Partial)),
+                    new CandidatePhase("combine", LaunchCombine, WorkUnits(plan.Combine)),
+                });
         }
         catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    private static CandidateProgram? TryCreateLibraryWinograd(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, int blockColumns)
+    {
+        if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out _)) return null;
+        CodegenTiledConv2DPlan plan = possible!;
+        if (plan.TapSign != 1 || !plan.BiasInput.HasValue ||
+            spec.Activation != CodegenActivationKind.ReLU ||
+            plan.M % 64 != 0 ||
+            plan.ReductionChannels % 8 != 0 ||
+            plan.OutputHeight % 2 != 0 || plan.OutputWidth % 2 != 0)
+            return null;
+
+        int tiles = plan.Batch * (plan.OutputHeight / 2) * (plan.OutputWidth / 2);
+        if (tiles % blockColumns != 0) return null;
+
+        var resources = new List<IDisposable>();
+        try
+        {
+            var filter = new PtxWinogradF23FilterTransformKernel(
+                runtime, plan.M, plan.ReductionChannels, positionMajor: true);
+            var inputTransform = new PtxWinogradF23InputTransformKernel(
+                runtime, plan.Batch, plan.ReductionChannels,
+                plan.InputHeight, plan.InputWidth);
+            var gemm = new PtxWinogradBatchedGemmKernel(
+                runtime, plan.M, plan.ReductionChannels, tiles,
+                blockM: 64, blockN: blockColumns, blockK: 8,
+                threadM: 4, threadN: 4);
+            var outputTransform = new PtxWinogradF23OutputTransformKernel(
+                runtime, plan.Batch, plan.OutputHeight, plan.OutputWidth, plan.M);
+            resources.Add(filter);
+            resources.Add(inputTransform);
+            resources.Add(gemm);
+            resources.Add(outputTransform);
+
+            var uploaded = new DirectPtxBuffer[spec.Inputs.Count];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                var binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buffer.Upload<float>(host);
+                uploaded[i] = buffer;
+            }
+
+            var transformedWeights = runtime.AllocateBytes((nuint)filter.TransformedBytes);
+            var transformedInput = runtime.AllocateBytes((nuint)inputTransform.TransformedBytes);
+            var transformedOutput = runtime.AllocateBytes((nuint)gemm.MBytes);
+            var output = runtime.AllocateBytes(
+                (nuint)(spec.Output.ElementCount * spec.Output.ElementBytes));
+            resources.Add(transformedWeights);
+            resources.Add(transformedInput);
+            resources.Add(transformedOutput);
+            resources.Add(output);
+
+            DirectPtxBuffer weights = uploaded[plan.MatrixInput];
+            DirectPtxBuffer input = uploaded[plan.StreamInput];
+            DirectPtxBuffer bias = uploaded[plan.BiasInput.Value];
+
+            void LaunchFilter() => filter.Launch(
+                DirectPtxTensorView.CreateOwned(weights, filter.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(
+                    transformedWeights, filter.Blueprint.Tensors[1]));
+            void LaunchInput() => inputTransform.Launch(
+                DirectPtxTensorView.CreateOwned(input, inputTransform.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(
+                    transformedInput, inputTransform.Blueprint.Tensors[1]));
+            void LaunchGemm() => gemm.Launch(
+                DirectPtxTensorView.CreateOwned(
+                    transformedWeights, gemm.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(
+                    transformedInput, gemm.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(
+                    transformedOutput, gemm.Blueprint.Tensors[2]));
+            void LaunchOutput() => outputTransform.Launch(
+                DirectPtxTensorView.CreateOwned(
+                    transformedOutput, outputTransform.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(bias, outputTransform.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, outputTransform.Blueprint.Tensors[2]));
+            void Launch()
+            {
+                LaunchFilter();
+                LaunchInput();
+                LaunchGemm();
+                LaunchOutput();
+            }
+
+            return new CandidateProgram(
+                "library-winograd-fp32-bn" +
+                    blockColumns.ToString(CultureInfo.InvariantCulture),
+                Launch, output, checked((int)spec.Output.ElementCount), resources,
+                new[]
+                {
+                    new CandidatePhase("filter-transform", LaunchFilter,
+                        Math.Max(1L, plan.M * (long)plan.ReductionChannels * 9)),
+                    new CandidatePhase("input-transform", LaunchInput,
+                        Math.Max(1L, inputTransform.Tiles * (long)plan.ReductionChannels * 16)),
+                    new CandidatePhase("winograd-gemm", LaunchGemm,
+                        Math.Max(1L, 16L * plan.M * plan.ReductionChannels * tiles)),
+                    new CandidatePhase("output-transform", LaunchOutput,
+                        Math.Max(1L, plan.M * (long)tiles * 16)),
+                });
+        }
+        catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch (ArgumentException)
         {
             for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
             return null;
@@ -576,7 +819,7 @@ internal static class KernelAutotuneTool
             scale = Math.Max(scale, Math.Abs((double)reference[e]));
         }
         deviation = scale > 0 ? worst / scale : worst;
-        return deviation <= 2e-3;
+        return deviation <= CodegenMeasurementProtocol.AccumulationTolerance;
     }
 
     private static unsafe void LaunchOne(

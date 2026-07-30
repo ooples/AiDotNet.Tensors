@@ -82,6 +82,21 @@ public sealed record CodegenAutotuneIdentity(
                 AppendTiledOuterProductCandidate(text, split.Partial,
                     computeMajor, computeMinor);
             }
+
+            int[] chunkFactors = { 2, 4, 7, 14 };
+            foreach (int chunkFactor in chunkFactors)
+            {
+                CodegenSplitPlan? chunked =
+                    CodegenSplitReduction.TryPlanChunked(spec, chunkFactor);
+                if (chunked is null) continue;
+
+                string label = chunkFactor.ToString(CultureInfo.InvariantCulture);
+                AppendTiledOuterProductCandidate(text, chunked.Partial,
+                    computeMajor, computeMinor,
+                    "tiled-chunked-split-" + label + "-partial");
+                AppendCandidate(text, "tiled-chunked-split-" + label + "-combine",
+                    chunked.Combine, computeMajor, computeMinor, static _ => { });
+            }
         }
         catch (NotSupportedException)
         {
@@ -122,9 +137,10 @@ public sealed record CodegenAutotuneIdentity(
     }
 
     private static void AppendTiledOuterProductCandidate(
-        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor)
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor,
+        string name = "tiled-split-partial")
     {
-        text.Append("candidate=tiled-split-partial;");
+        text.Append("candidate=").Append(name).Append(';');
         try
         {
             PtxTiledOuterProductProgram program = PtxTiledOuterProductDispatcher.Emit(

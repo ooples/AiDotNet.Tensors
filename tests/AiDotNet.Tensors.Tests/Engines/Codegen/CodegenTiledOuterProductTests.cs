@@ -97,7 +97,7 @@ public sealed class CodegenTiledOuterProductTests
 
         Assert.Contains("identity [M,N,batch]", program.OuterProductRefusal);
         Assert.Equal("output+input rows", program.StagedLabel);
-        Assert.Equal((1008, 128, 8, 28, 32, 16),
+        Assert.Equal((336, 128, 8, 28, 32, 16),
             (program.Blocks, program.BlockThreads, program.Steps,
              program.InnerReduction, program.TileM, program.TileN));
         Assert.Contains(

@@ -59,22 +59,22 @@ public sealed class PtxTiledConv2DOuterProductEmitter
         L($"div.u32 %r3, %r0, {I(tilesN)};");
         L($"rem.u32 %r4, %r3, {I(tilesM)};              // K tile");
         L($"div.u32 %r5, %r3, {I(tilesM)};");
-        L($"rem.u32 %r6, %r5, {I(plan.TapColumns)};     // kw");
-        L($"div.u32 %r7, %r5, {I(plan.TapColumns)};");
-        L($"rem.u32 %r8, %r7, {I(plan.TapRows)};        // kh");
-        L($"div.u32 %r9, %r7, {I(plan.TapRows)};        // promoted oh");
+        L($"rem.u32 %r8, %r5, {I(plan.TapRows)};        // kh");
+        L($"div.u32 %r9, %r5, {I(plan.TapRows)};        // promoted row/chunk");
         L($"rem.u32 %r10, %r1, {I(plan.ThreadsN)};      // thread C");
         L($"div.u32 %r11, %r1, {I(plan.ThreadsN)};      // thread K");
         L($"mul.lo.u32 %r12, %r4, {I(plan.TileM)};");
         L($"mul.lo.u32 %r13, %r2, {I(plan.TileN)};");
 
-        var accumulators = new string[plan.ThreadTileM, plan.ThreadTileN];
+        var accumulators = new string[
+            plan.ThreadTileM, plan.ThreadTileN, plan.TapColumns];
         for (int i = 0; i < plan.ThreadTileM; i++)
             for (int j = 0; j < plan.ThreadTileN; j++)
-            {
-                accumulators[i, j] = NextF();
-                L($"mov.f32 {accumulators[i, j]}, 0f00000000;");
-            }
+                for (int kw = 0; kw < plan.TapColumns; kw++)
+                {
+                    accumulators[i, j, kw] = NextF();
+                    L($"mov.f32 {accumulators[i, j, kw]}, 0f00000000;");
+                }
 
         L("mov.u32 %r14, 0;");
         L("mov.u32 %r15, 0;");
@@ -145,7 +145,8 @@ public sealed class PtxTiledConv2DOuterProductEmitter
         for (int pass = 0; pass < passes; pass++)
         {
             string index = NextR(), localM = NextR(), column = NextR();
-            string globalM = NextR(), element = NextR();
+            string globalM = NextR(), sourceBatch = NextR(), rowWithin = NextR();
+            string sourceRow = NextR(), element = NextR();
             string bytes = NextRd(), source = NextRd(), sharedBytes = NextRd();
             string destination = NextRd();
             string valid = NextP();
@@ -154,8 +155,11 @@ public sealed class PtxTiledConv2DOuterProductEmitter
             L($"div.u32 {localM}, {index}, {I(chunksPerRow)};");
             L($"rem.u32 {column}, {index}, {I(chunksPerRow)};");
             L($"add.u32 {globalM}, {localM}, %r12;");
-            L($"mad.lo.u32 {element}, {step}, {I(plan.M)}, {globalM};");
-            L($"mad.lo.u32 {element}, {element}, {I(plan.Batch)}, %r9;");
+            L($"div.u32 {sourceBatch}, {step}, {I(plan.RowsPerPartial)};");
+            L($"rem.u32 {rowWithin}, {step}, {I(plan.RowsPerPartial)};");
+            L($"mad.lo.u32 {sourceRow}, %r9, {I(plan.RowsPerPartial)}, {rowWithin};");
+            L($"mad.lo.u32 {element}, {sourceBatch}, {I(plan.M)}, {globalM};");
+            L($"mad.lo.u32 {element}, {element}, {I(plan.InputHeight)}, {sourceRow};");
             L($"mul.lo.u32 {element}, {element}, {I(plan.InnerReduction)};");
             L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
             L($"mul.wide.u32 {bytes}, {element}, 4;");
@@ -179,7 +183,8 @@ public sealed class PtxTiledConv2DOuterProductEmitter
         for (int pass = 0; pass < passes; pass++)
         {
             string index = NextR(), localN = NextR(), column = NextR();
-            string globalN = NextR(), sourceRow = NextR(), safeRow = NextR();
+            string globalN = NextR(), sourceBatch = NextR(), rowWithin = NextR();
+            string sourceRow = NextR(), safeRow = NextR();
             string element = NextR();
             string bytes = NextRd(), source = NextRd(), sharedBytes = NextRd();
             string destination = NextRd();
@@ -189,14 +194,17 @@ public sealed class PtxTiledConv2DOuterProductEmitter
             L($"div.u32 {localN}, {index}, {I(chunksPerRow)};");
             L($"rem.u32 {column}, {index}, {I(chunksPerRow)};");
             L($"add.u32 {globalN}, {localN}, %r13;");
-            L($"add.s32 {sourceRow}, %r9, %r8;");
+            L($"div.u32 {sourceBatch}, {step}, {I(plan.RowsPerPartial)};");
+            L($"rem.u32 {rowWithin}, {step}, {I(plan.RowsPerPartial)};");
+            L($"mad.lo.u32 {sourceRow}, %r9, {I(plan.RowsPerPartial)}, {rowWithin};");
+            L($"add.s32 {sourceRow}, {sourceRow}, %r8;");
             L($"add.s32 {sourceRow}, {sourceRow}, -1;");
             L($"setp.lt.s32 {below}, {sourceRow}, 0;");
             L($"setp.ge.s32 {above}, {sourceRow}, {I(plan.InputHeight)};");
             L($"or.pred {ignore}, {below}, {above};");
             L($"max.s32 {safeRow}, {sourceRow}, 0;");
             L($"min.s32 {safeRow}, {safeRow}, {I(plan.InputHeight - 1)};");
-            L($"mad.lo.u32 {element}, {step}, {I(plan.N)}, {globalN};");
+            L($"mad.lo.u32 {element}, {sourceBatch}, {I(plan.N)}, {globalN};");
             L($"mad.lo.u32 {element}, {element}, {I(plan.InputHeight)}, {safeRow};");
             L($"mul.lo.u32 {element}, {element}, {I(plan.InputWidth)};");
             L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
@@ -214,61 +222,64 @@ public sealed class PtxTiledConv2DOuterProductEmitter
     private void EmitCompute(
         CodegenTiledConv2DOuterProductPlan plan,
         string bufferBase,
-        string[,] accumulators)
+        string[,,] accumulators)
     {
-        int rightBase = plan.DirectStageElements * sizeof(float);
+        // The operand tiles are thread-stationary for the complete reduction step.
+        // Form each dynamic shared-memory base once so the hot loop contains only
+        // immediate-offset loads and FP32 FMAs, rather than one address chain per load.
+        string leftOffset = NextR(), rightOffset = NextR();
+        string leftOffset64 = NextRd(), rightOffset64 = NextRd();
+        string leftBase = NextRd(), rightBase = NextRd();
+        L($"mad.lo.u32 {leftOffset}, %r11, " +
+          $"{I(plan.ThreadTileM * plan.InnerReduction * sizeof(float))}, {bufferBase};");
+        L($"mad.lo.u32 {rightOffset}, %r10, " +
+          $"{I(plan.ThreadTileN * plan.InputWidth * sizeof(float))}, {bufferBase};");
+        L($"add.u32 {rightOffset}, {rightOffset}, " +
+          $"{I(plan.DirectStageElements * sizeof(float))};");
+        L($"cvt.u64.u32 {leftOffset64}, {leftOffset};");
+        L($"cvt.u64.u32 {rightOffset64}, {rightOffset};");
+        L($"add.u64 {leftBase}, %rd3, {leftOffset64};");
+        L($"add.u64 {rightBase}, %rd3, {rightOffset64};");
+
         for (int r = 0; r < plan.InnerReduction; r++)
         {
             var left = new string[plan.ThreadTileM];
-            var right = new string[plan.ThreadTileN];
+            var right = new string[plan.ThreadTileN, plan.TapColumns];
             for (int i = 0; i < left.Length; i++)
             {
                 left[i] = NextF();
-                int constant = (i * plan.InnerReduction + r) * sizeof(float);
-                string local = NextR(), local64 = NextRd(), address = NextRd();
-                L($"mad.lo.u32 {local}, %r11, " +
-                  $"{I(plan.ThreadTileM * plan.InnerReduction * sizeof(float))}, {I(constant)};");
-                L($"add.u32 {local}, {local}, {bufferBase};");
-                L($"cvt.u64.u32 {local64}, {local};");
-                L($"add.u64 {address}, %rd3, {local64};");
-                L($"ld.shared.f32 {left[i]}, [{address}];");
+                int offset = (i * plan.InnerReduction + r) * sizeof(float);
+                L($"ld.shared.f32 {left[i]}, [{leftBase}+{I(offset)}];");
             }
-            for (int j = 0; j < right.Length; j++)
-            {
-                string sourceColumn = NextR(), safeColumn = NextR(), local = NextR();
-                string local64 = NextRd(), address = NextRd();
-                string low = NextP(), high = NextP(), inRange = NextP();
-                string loaded = NextF();
-                right[j] = NextF();
-                int constant = rightBase + j * plan.InputWidth * sizeof(float);
-                L($"add.s32 {sourceColumn}, %r6, {I(r - 1)};");
-                L($"setp.ge.s32 {low}, {sourceColumn}, 0;");
-                L($"setp.lt.s32 {high}, {sourceColumn}, {I(plan.InputWidth)};");
-                L($"and.pred {inRange}, {low}, {high};");
-                L($"max.s32 {safeColumn}, {sourceColumn}, 0;");
-                L($"min.s32 {safeColumn}, {safeColumn}, {I(plan.InputWidth - 1)};");
-                L($"mad.lo.u32 {local}, %r10, " +
-                  $"{I(plan.ThreadTileN * plan.InputWidth * sizeof(float))}, {I(constant)};");
-                L($"mad.lo.u32 {local}, {safeColumn}, 4, {local};");
-                L($"add.u32 {local}, {local}, {bufferBase};");
-                L($"cvt.u64.u32 {local64}, {local};");
-                L($"add.u64 {address}, %rd3, {local64};");
-                L($"ld.shared.f32 {loaded}, [{address}];");
-                L($"selp.f32 {right[j]}, {loaded}, 0f00000000, {inRange};");
-            }
+            for (int j = 0; j < plan.ThreadTileN; j++)
+                for (int kw = 0; kw < plan.TapColumns; kw++)
+                {
+                    right[j, kw] = NextF();
+                    int sourceColumn = r + kw - 1;
+                    if (sourceColumn < 0 || sourceColumn >= plan.InputWidth)
+                    {
+                        L($"mov.f32 {right[j, kw]}, 0f00000000;");
+                        continue;
+                    }
+
+                    int offset = (j * plan.InputWidth + sourceColumn) * sizeof(float);
+                    L($"ld.shared.f32 {right[j, kw]}, [{rightBase}+{I(offset)}];");
+                }
             for (int i = 0; i < left.Length; i++)
-                for (int j = 0; j < right.Length; j++)
-                    L($"fma.rn.f32 {accumulators[i, j]}, {left[i]}, {right[j]}, " +
-                      $"{accumulators[i, j]};");
+                for (int j = 0; j < plan.ThreadTileN; j++)
+                    for (int kw = 0; kw < plan.TapColumns; kw++)
+                        L($"fma.rn.f32 {accumulators[i, j, kw]}, {left[i]}, {right[j, kw]}, " +
+                          $"{accumulators[i, j, kw]};");
         }
     }
 
     private void EmitStores(
-        CodegenTiledConv2DOuterProductPlan plan, string[,] accumulators)
+        CodegenTiledConv2DOuterProductPlan plan, string[,,] accumulators)
     {
         for (int i = 0; i < plan.ThreadTileM; i++)
             for (int j = 0; j < plan.ThreadTileN; j++)
-            {
+                for (int kw = 0; kw < plan.TapColumns; kw++)
+                {
                 string localM = NextR(), localN = NextR();
                 string globalM = NextR(), globalN = NextR(), element = NextR();
                 string bytes = NextRd(), address = NextRd();
@@ -278,12 +289,12 @@ public sealed class PtxTiledConv2DOuterProductEmitter
                 L($"add.u32 {globalN}, %r13, {localN};");
                 L($"mad.lo.u32 {element}, {globalM}, {I(plan.N)}, {globalN};");
                 L($"mad.lo.u32 {element}, {element}, {I(plan.TapRows)}, %r8;");
-                L($"mad.lo.u32 {element}, {element}, {I(plan.TapColumns)}, %r6;");
+                L($"mad.lo.u32 {element}, {element}, {I(plan.TapColumns)}, {I(kw)};");
                 L($"mad.lo.u32 {element}, {element}, {I(plan.Batch)}, %r9;");
                 L($"mul.wide.u32 {bytes}, {element}, 4;");
                 L($"add.u64 {address}, %rd2, {bytes};");
-                L($"st.global.f32 [{address}], {accumulators[i, j]};");
-            }
+                L($"st.global.f32 [{address}], {accumulators[i, j, kw]};");
+                }
     }
 
     private string NextR() => "%r" + I(_r++);

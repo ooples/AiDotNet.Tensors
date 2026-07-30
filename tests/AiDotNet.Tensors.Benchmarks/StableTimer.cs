@@ -98,7 +98,7 @@ internal static class StableTimer
     /// </param>
     /// <param name="maxAttempts">Samples to take before giving up on convergence.</param>
     internal static Result Measure(
-        DirectPtxRuntime runtime, Action launch, long workUnits, int maxAttempts = 7)
+        DirectPtxRuntime runtime, Action launch, long workUnits, int maxAttempts = 15)
     {
         if (runtime is null) throw new ArgumentNullException(nameof(runtime));
         if (launch is null) throw new ArgumentNullException(nameof(launch));
@@ -106,7 +106,7 @@ internal static class StableTimer
         int iterations = IterationsFor(workUnits);
         int warmup = Math.Max(3, iterations / 10);
 
-        var samples = new List<double>(maxAttempts);
+        var samples = new List<double>(3);
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
@@ -119,7 +119,7 @@ internal static class StableTimer
             // of impossible number that at least announces itself.
             float msPerLaunch = runtime.MeasureKernelMilliseconds(
                 launch, attempt == 0 ? warmup : 0, iterations);
-            samples.Add(msPerLaunch * 1000.0);
+            AddToConsecutiveWindow(samples, msPerLaunch * 1000.0);
 
             // Three samples is the fewest from which a spread means anything.
             if (samples.Count >= 3 && SpreadOf(samples) <= StableSpread) break;
@@ -139,7 +139,7 @@ internal static class StableTimer
         DirectPtxRuntime runtime,
         Action launchA, Action launchB,
         long workUnitsA, long workUnitsB,
-        int maxAttempts = 7)
+        int maxAttempts = 15)
     {
         if (runtime is null) throw new ArgumentNullException(nameof(runtime));
         if (launchA is null) throw new ArgumentNullException(nameof(launchA));
@@ -150,9 +150,9 @@ internal static class StableTimer
         int warmupA = Math.Max(3, iterationsA / 10);
         int warmupB = Math.Max(3, iterationsB / 10);
 
-        var samplesA = new List<double>(maxAttempts);
-        var samplesB = new List<double>(maxAttempts);
-        var ratios = new List<double>(maxAttempts);
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
@@ -160,9 +160,9 @@ internal static class StableTimer
                 launchA, attempt == 0 ? warmupA : 0, iterationsA) * 1000.0;
             double b = runtime.MeasureKernelMilliseconds(
                 launchB, attempt == 0 ? warmupB : 0, iterationsB) * 1000.0;
-            samplesA.Add(a);
-            samplesB.Add(b);
-            ratios.Add(a / b);
+            AddToConsecutiveWindow(samplesA, a);
+            AddToConsecutiveWindow(samplesB, b);
+            AddToConsecutiveWindow(ratios, a / b);
 
             if (samplesA.Count >= 3 &&
                 SpreadOf(samplesA) <= StableSpread &&
@@ -191,7 +191,7 @@ internal static class StableTimer
     /// methods.
     /// </remarks>
     internal static Result MeasureHost(
-        Action launch, Action synchronize, long workUnits, int maxAttempts = 7)
+        Action launch, Action synchronize, long workUnits, int maxAttempts = 15)
     {
         if (launch is null) throw new ArgumentNullException(nameof(launch));
         if (synchronize is null) throw new ArgumentNullException(nameof(synchronize));
@@ -200,10 +200,11 @@ internal static class StableTimer
 
         Warm(launch, synchronize, iterations);
 
-        var samples = new List<double>(maxAttempts);
+        var samples = new List<double>(3);
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            samples.Add(TimeHostBatch(launch, synchronize, iterations));
+            AddToConsecutiveWindow(
+                samples, TimeHostBatch(launch, synchronize, iterations));
 
             if (samples.Count >= 3 && SpreadOf(samples) <= StableSpread) break;
         }
@@ -229,7 +230,7 @@ internal static class StableTimer
     internal static PairResult MeasureHostPair(
         Action launchA, Action synchronizeA, long workUnitsA,
         Action launchB, Action synchronizeB, long workUnitsB,
-        int maxAttempts = 7)
+        int maxAttempts = 15)
     {
         if (launchA is null) throw new ArgumentNullException(nameof(launchA));
         if (synchronizeA is null) throw new ArgumentNullException(nameof(synchronizeA));
@@ -242,17 +243,17 @@ internal static class StableTimer
         Warm(launchA, synchronizeA, iterationsA);
         Warm(launchB, synchronizeB, iterationsB);
 
-        var samplesA = new List<double>(maxAttempts);
-        var samplesB = new List<double>(maxAttempts);
-        var ratios = new List<double>(maxAttempts);
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             double a = TimeHostBatch(launchA, synchronizeA, iterationsA);
             double b = TimeHostBatch(launchB, synchronizeB, iterationsB);
-            samplesA.Add(a);
-            samplesB.Add(b);
-            ratios.Add(a / b);
+            AddToConsecutiveWindow(samplesA, a);
+            AddToConsecutiveWindow(samplesB, b);
+            AddToConsecutiveWindow(ratios, a / b);
 
             if (samplesA.Count >= 3 &&
                 SpreadOf(samplesA) <= StableSpread &&
@@ -280,6 +281,18 @@ internal static class StableTimer
             Median(ratios), ratioSpread, ratios.Count);
     }
 
+    /// <summary>
+    /// Keeps the latest three consecutive samples. A max-min gate over every attempt can
+    /// never recover after one WDDM preemption because adding clean samples cannot lower
+    /// the historical maximum. A consecutive window still requires three agreeing
+    /// measurements, while letting later clean evidence replace a contaminated batch.
+    /// </summary>
+    private static void AddToConsecutiveWindow(List<double> samples, double sample)
+    {
+        samples.Add(sample);
+        if (samples.Count > 3) samples.RemoveAt(0);
+    }
+
     private static void Warm(Action launch, Action synchronize, int iterations)
     {
         for (int i = 0; i < Math.Max(3, iterations / 10); i++) launch();
@@ -300,7 +313,12 @@ internal static class StableTimer
     /// large kernel does not run for minutes.
     /// </summary>
     private static int IterationsFor(long workUnits) =>
-        (int)Math.Max(5, Math.Min(500, 20_000_000_000L / Math.Max(1, workUnits)));
+        // The old 20G/500 ceiling left a 35 us optimized convolution with only about
+        // 6 ms of device work per sample. One ordinary WDDM preemption then dominated
+        // that sample and permanently poisoned the strict max-min gate. Keep the gate
+        // unchanged, but give short kernels a long enough event-timed batch that host
+        // scheduling is amortized; large kernels still bottom out at five launches.
+        (int)Math.Max(5, Math.Min(2_000, 80_000_000_000L / Math.Max(1, workUnits)));
 
     /// <summary>(max - min) / median. Zero for a single sample, which is reported unstable.</summary>
     private static double SpreadOf(List<double> samples)

@@ -23,7 +23,8 @@ internal static class FrontEndCheckTool
     /// Upper limit for fp32 contraction tolerance. This matches the conveyor and
     /// autotuner, while the front-end check still scales its bound with reduction length.
     /// </summary>
-    private const double AccumulationTolerance = 2e-3;
+    private const double AccumulationTolerance =
+        CodegenMeasurementProtocol.AccumulationTolerance;
 
     /// <summary>
     /// Whether timings may be reported. Correctness does not care what else is on the

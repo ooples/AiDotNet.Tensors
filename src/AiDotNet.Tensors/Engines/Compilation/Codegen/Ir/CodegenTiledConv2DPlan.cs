@@ -22,7 +22,8 @@ public sealed class CodegenTiledConv2DPlan
         bool matrixReductionMajor, int tapSign, int windowConstant,
         int batch, int m, int outputHeight, int outputWidth,
         int reductionChannels, int inputHeight, int inputWidth,
-        int tileM, int tileChannels, int threadTileM, int threadTileWidth,
+        int tileM, int tileRows, int tileChannels,
+        int threadTileM, int threadTileWidth,
         int stages)
     {
         MatrixInput = matrixInput;
@@ -46,6 +47,7 @@ public sealed class CodegenTiledConv2DPlan
         InputHeight = inputHeight;
         InputWidth = inputWidth;
         TileM = tileM;
+        TileRows = tileRows;
         TileChannels = tileChannels;
         ThreadTileM = threadTileM;
         ThreadTileWidth = threadTileWidth;
@@ -73,19 +75,31 @@ public sealed class CodegenTiledConv2DPlan
     public int InputHeight { get; }
     public int InputWidth { get; }
     public int TileM { get; }
+    public int TileRows { get; }
     public int TileChannels { get; }
     public int ThreadTileM { get; }
     public int ThreadTileWidth { get; }
     public int Stages { get; }
     public int TapRows => 3;
     public int TapColumns => 3;
+    public int WindowRows => TileRows + TapRows - 1;
     public int ThreadsM => TileM / ThreadTileM;
-    public int ThreadsWidth => OutputWidth / ThreadTileWidth;
-    public int BlockThreads => ThreadsM * ThreadsWidth;
+    public int ThreadsWidth => (OutputWidth + ThreadTileWidth - 1) / ThreadTileWidth;
+    public int ThreadsSpatialLogical => TileRows * ThreadsWidth;
+    public int ThreadsSpatial
+    {
+        get
+        {
+            int logicalThreads = ThreadsM * ThreadsSpatialLogical;
+            int scheduledThreads = Math.Max(32, ((logicalThreads + 31) / 32) * 32);
+            return (scheduledThreads + ThreadsM - 1) / ThreadsM;
+        }
+    }
+    public int BlockThreads => ThreadsM * ThreadsSpatial;
     public int Steps => ReductionChannels / TileChannels;
-    public int Blocks => Batch * OutputHeight * (M / TileM);
+    public int Blocks => Batch * (OutputHeight / TileRows) * (M / TileM);
     public int MatrixStageElements => TileM * TileChannels * TapRows * TapColumns;
-    public int StreamStageElements => TileChannels * TapRows * InputWidth;
+    public int StreamStageElements => TileChannels * WindowRows * InputWidth;
     public int StageBytes => (MatrixStageElements + StreamStageElements) * sizeof(float);
     public int SharedMemoryBytes => Stages * StageBytes;
 
@@ -195,29 +209,37 @@ public sealed class CodegenTiledConv2DPlan
             reason = "input and output rows must vectorize by four";
             return false;
         }
-        int tileM = LargestDivisorAtMost(m, 32, 4);
         int channels = spec.Space.Axes[reductionChannel].Extent;
-        int tileChannels = LargestDivisorAtMost(channels, 4, 4);
-        if (tileM == 0 || tileChannels == 0)
+        int tileM = LargestDivisorAtMost(m, reductionMajor ? 16 : 64, 4);
+        int tileRows = LargestDivisorAtMost(outputHeight, 4, 1);
+        int tileChannels = LargestDivisorAtMost(channels, reductionMajor ? 16 : 8, 4);
+        if (tileM == 0 || tileRows == 0 || tileChannels == 0)
         {
-            reason = "M and reduction channels need supported whole tiles";
+            reason = "M, output rows, and reduction channels need supported whole tiles";
             return false;
         }
-        int threadTileM = tileM >= 16 ? 2 : 1;
+        int threadTileM = tileM >= 32 ? 8 : tileM >= 16 ? 4 : 1;
         const int threadTileWidth = 4;
-        long sharedBytes = CodegenSharedMemoryBudget.DoubleBufferStages *
+        int stages = CodegenSharedMemoryBudget.DoubleBufferStages;
+        long sharedBytes = stages *
             (tileM * (long)tileChannels * 9 +
-             tileChannels * 3L * inputWidth) * sizeof(float);
+             tileChannels * (long)(tileRows + 2) * inputWidth) * sizeof(float);
         if (!CodegenSharedMemoryBudget.Fits(sharedBytes, out reason))
             return false;
 
-        int threads = (tileM / threadTileM) * (outputWidth / threadTileWidth);
+        int logicalSpatialThreads = tileRows *
+            ((outputWidth + threadTileWidth - 1) / threadTileWidth);
+        int threadsM = tileM / threadTileM;
+        int logicalThreads = threadsM * logicalSpatialThreads;
+        int roundedThreads = Math.Max(32, ((logicalThreads + 31) / 32) * 32);
+        int scheduledSpatialThreads =
+            (roundedThreads + threadsM - 1) / threadsM;
+        int threads = threadsM * scheduledSpatialThreads;
         if (threads < 32 || threads > 256)
         {
             reason = "the selected row tile needs " + threads + " threads, outside [32,256]";
             return false;
         }
-
         plan = new CodegenTiledConv2DPlan(
             matrixInput, streamInput, spec.BiasInput,
             outputAxes[0], outputAxes[1], outputAxes[2], outputAxes[3],
@@ -225,8 +247,8 @@ public sealed class CodegenTiledConv2DPlan
             reductionMajor, tapSign, windowConstant,
             spec.Output.Shape[0], m, outputHeight, outputWidth,
             channels, inputHeight, inputWidth,
-            tileM, tileChannels, threadTileM, threadTileWidth,
-            stages: CodegenSharedMemoryBudget.DoubleBufferStages);
+            tileM, tileRows, tileChannels, threadTileM, threadTileWidth,
+            stages);
         reason = "eligible";
         return true;
     }
@@ -239,29 +261,42 @@ public sealed class CodegenTiledConv2DPlan
         reductionChannel = tapRow = tapColumn = -1;
         reductionMajor = false;
         if (binding.Shape.Count != 4 || binding.Map.Count != 4) return false;
-        var axes = new int[4];
-        for (int d = 0; d < axes.Length; d++)
-            if (!TryPlainAxis(binding.Map[d], out axes[d]) ||
-                binding.Shape[d] != spec.Space.Axes[axes[d]].Extent)
-                return false;
-        if (axes[0] == mAxis && Contains(reductions, axes[1]))
+        if (!TryPlainAxis(binding.Map[2], out int physicalTapRow) ||
+            !TryPlainAxis(binding.Map[3], out int physicalTapColumn))
+            return false;
+
+        bool firstIsPlain = TryPlainAxis(binding.Map[0], out int firstPlain);
+        bool secondIsPlain = TryPlainAxis(binding.Map[1], out int secondPlain);
+        bool firstIsReduction = firstIsPlain && Contains(reductions, firstPlain);
+        bool secondIsReduction = secondIsPlain && Contains(reductions, secondPlain);
+        if (firstIsPlain && firstPlain == mAxis && secondIsReduction)
         {
-            reductionChannel = axes[1];
+            reductionChannel = secondPlain;
             reductionMajor = false;
         }
-        else if (Contains(reductions, axes[0]) && axes[1] == mAxis)
+        else if (firstIsReduction && secondIsPlain && secondPlain == mAxis)
         {
-            reductionChannel = axes[0];
+            reductionChannel = firstPlain;
             reductionMajor = true;
         }
         else return false;
 
-        if (!Contains(reductions, axes[2]) || !Contains(reductions, axes[3]) ||
-            axes[2] == reductionChannel || axes[3] == reductionChannel ||
-            axes[2] == axes[3] || binding.Shape[2] != 3 || binding.Shape[3] != 3)
+        if (!Contains(reductions, physicalTapRow) ||
+            !Contains(reductions, physicalTapColumn) ||
+            physicalTapRow == reductionChannel || physicalTapColumn == reductionChannel ||
+            physicalTapRow == physicalTapColumn ||
+            binding.Shape[2] != 3 || binding.Shape[3] != 3)
             return false;
-        tapRow = axes[2];
-        tapColumn = axes[3];
+        int reductionDimension = reductionMajor ? 0 : 1;
+        int mDimension = reductionMajor ? 1 : 0;
+        if (binding.Shape[reductionDimension] !=
+                spec.Space.Axes[reductionChannel].Extent ||
+            binding.Shape[mDimension] != spec.Space.Axes[mAxis].Extent ||
+            binding.Shape[2] != spec.Space.Axes[physicalTapRow].Extent ||
+            binding.Shape[3] != spec.Space.Axes[physicalTapColumn].Extent)
+            return false;
+        tapRow = physicalTapRow;
+        tapColumn = physicalTapColumn;
         return true;
     }
 

@@ -461,7 +461,7 @@ internal static class HeadToHeadTool
             float[]? zeros = zeroOutput ? new float[spec.Output.ElementCount] : null;
             if (zeros is not null) output.Upload<float>(zeros);
 
-            void LaunchGenerated() => Launch(
+            void LaunchGenerated() => DirectPtxLaunchHelper.Launch(
                 module, fn, pointers, (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
 
             LaunchGenerated();
@@ -554,7 +554,7 @@ internal static class HeadToHeadTool
         // each generated thread loads its own element before storing it, so this is the same
         // memory contract rather than a separate-output approximation.
         var pointers = new[] { v.Pointer, g.Pointer, p.Pointer, v.Pointer, p.Pointer };
-        void LaunchMomentum() => Launch(
+        void LaunchMomentum() => DirectPtxLaunchHelper.Launch(
             module, fn, pointers, (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
 
         LaunchMomentum();
@@ -590,7 +590,7 @@ internal static class HeadToHeadTool
                 (nuint)(spec.Output.ElementCount * sizeof(float)));
             inputBuffer.Upload<float>(input);
             var pointers = new[] { inputBuffer.Pointer, outputBuffer.Pointer };
-            void LaunchDirect() => Launch(
+            void LaunchDirect() => DirectPtxLaunchHelper.Launch(
                 module, fn, pointers, (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX);
 
             LaunchDirect();
@@ -622,9 +622,9 @@ internal static class HeadToHeadTool
         var combineArgs = new[] { temporary.Pointer, outputGpu.Pointer };
         void LaunchSplit()
         {
-            Launch(partialModule, partialFn, partialArgs,
+            DirectPtxLaunchHelper.Launch(partialModule, partialFn, partialArgs,
                 (uint)partialEmitter.LaunchBlocks, (uint)partialEmitter.LaunchBlockX);
-            Launch(combineModule, combineFn, combineArgs,
+            DirectPtxLaunchHelper.Launch(combineModule, combineFn, combineArgs,
                 (uint)combineEmitter.LaunchBlocks, (uint)combineEmitter.LaunchBlockX);
         }
 
@@ -658,14 +658,4 @@ internal static class HeadToHeadTool
         return scale > 0 ? worst / scale : worst;
     }
 
-    private static unsafe void Launch(
-        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint threads)
-    {
-        fixed (IntPtr* pinned = pointers)
-        {
-            void** argv = stackalloc void*[pointers.Length];
-            for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, threads, 1, 1, 0, argv);
-        }
-    }
 }

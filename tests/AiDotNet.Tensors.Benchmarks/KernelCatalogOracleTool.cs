@@ -124,7 +124,7 @@ internal static class KernelCatalogOracleTool
                     "rerun --kernel-limiter before diagnosing it.");
 
             double ratio = competitorRow.Number("ratio");
-            string outcome = ratio < 0.91 ? "LOSS" : ratio < 1.10 ? "TIE" : "WIN";
+            string outcome = ratio <= 0.91 ? "LOSS" : ratio < 1.10 ? "TIE" : "WIN";
             if (!includeWins && outcome == "WIN") continue;
 
             CodegenKernelSpec spec = entry.Bench;

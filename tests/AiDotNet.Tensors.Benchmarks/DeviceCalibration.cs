@@ -103,7 +103,7 @@ internal static class DeviceCalibration
         long bytes = 2L * Elements * sizeof(float);
         var timing = StableTimer.Measure(
             runtime,
-            () => Launch(module, fn, pointers,
+            () => DirectPtxLaunchHelper.Launch(module, fn, pointers,
                 (uint)emitter.LaunchBlocks, (uint)emitter.LaunchBlockX),
             bytes);
         if (!timing.Stable)
@@ -160,7 +160,7 @@ internal static class DeviceCalibration
         long macs = (long)Size * Size * Size;
         var timing = StableTimer.Measure(
             runtime,
-            () => Launch(module, fn, pointers,
+            () => DirectPtxLaunchHelper.Launch(module, fn, pointers,
                 (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads),
             macs);
         return timing.Stable
@@ -168,14 +168,4 @@ internal static class DeviceCalibration
             : null;
     }
 
-    private static unsafe void Launch(
-        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint threads)
-    {
-        fixed (IntPtr* pinned = pointers)
-        {
-            void** argv = stackalloc void*[pointers.Length];
-            for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, threads, 1, 1, 0, argv);
-        }
-    }
 }

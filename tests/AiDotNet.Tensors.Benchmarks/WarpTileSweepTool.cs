@@ -149,7 +149,7 @@ internal static class WarpTileSweepTool
             uint blocks = (uint)emitter.BlockCount(plan!);
             uint threads = (uint)emitter.BlockThreads;
 
-            Launch(module, fn, pointers, blocks, threads);
+            DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
             runtime.Synchronize();
 
             // CORRECTNESS FIRST. Verified against the fp64 interpretation where the shape is
@@ -218,7 +218,7 @@ internal static class WarpTileSweepTool
             var refPointers = (IntPtr[])pointers.Clone();
             refPointers[2] = refBuffer.Pointer;
 
-            Launch(module, fn, refPointers,
+            DirectPtxLaunchHelper.Launch(module, fn, refPointers,
                 (uint)reference.BlockCount(plan!), (uint)reference.BlockThreads);
             runtime.Synchronize();
 
@@ -264,14 +264,16 @@ internal static class WarpTileSweepTool
         int iterations = (int)Math.Max(5, Math.Min(200, 20_000_000_000L / Math.Max(1, macs)));
         int warmup = Math.Max(2, iterations / 10);
 
-        for (int i = 0; i < warmup; i++) Launch(module, fn, pointers, blocks, threads);
+        for (int i = 0; i < warmup; i++)
+            DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
         runtime.Synchronize();
 
         double best = double.MaxValue;
         for (int attempt = 0; attempt < 3; attempt++)
         {
             var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iterations; i++) Launch(module, fn, pointers, blocks, threads);
+            for (int i = 0; i < iterations; i++)
+                DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
             runtime.Synchronize();
             sw.Stop();
             best = Math.Min(best, sw.Elapsed.TotalMilliseconds * 1000.0 / iterations);
@@ -333,17 +335,6 @@ internal static class WarpTileSweepTool
         finally
         {
             foreach (var b in buffers) b.Dispose();
-        }
-    }
-
-    private static unsafe void Launch(
-        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint threads)
-    {
-        fixed (IntPtr* pinned = pointers)
-        {
-            void** argv = stackalloc void*[pointers.Length];
-            for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, threads, 1, 1, 0, argv);
         }
     }
 

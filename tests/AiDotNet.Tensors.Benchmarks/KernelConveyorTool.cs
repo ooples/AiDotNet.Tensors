@@ -37,7 +37,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 internal static class KernelConveyorTool
 {
-    private const double Tolerance = 2e-3;
+    private const double Tolerance = CodegenMeasurementProtocol.AccumulationTolerance;
     private const int Warmup = 20;
     private const int Samples = 51;
     private const int LaunchesPerSample = 50;
@@ -350,6 +350,7 @@ internal static class KernelConveyorTool
             // the lowering the tuner measured as 17x slower.
             case not null when winner.StartsWith("split:", StringComparison.Ordinal):
             case not null when winner.StartsWith("tiled-split:", StringComparison.Ordinal):
+            case not null when winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal):
                 Console.WriteLine("    note: " + kernelName + " measured fastest as " + winner +
                                   ", a two-kernel split this stage cannot launch; " +
                                   "running the single-kernel lowering instead");
@@ -392,9 +393,12 @@ internal static class KernelConveyorTool
 
         /// <summary>How the stages label this lowering in their tables.</summary>
         internal string Label() => IsSplit
-            ? (Winner is not null && Winner.StartsWith("tiled-split:", StringComparison.Ordinal)
-                ? "tiled split x"
-                : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
+            ? (Winner is not null &&
+               Winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal)
+                ? "tiled chunked split x"
+                : Winner is not null && Winner.StartsWith("tiled-split:", StringComparison.Ordinal)
+                    ? "tiled split x"
+                    : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
             : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal)
                 ? "tiled contraction"
                 : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal)
@@ -517,18 +521,29 @@ internal static class KernelConveyorTool
 
         bool tiledSplit = winner is not null &&
             winner.StartsWith("tiled-split:", StringComparison.Ordinal);
+        bool tiledChunkedSplit = winner is not null &&
+            winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal);
         if (winner is not null &&
-            (winner.StartsWith("split:", StringComparison.Ordinal) || tiledSplit))
+            (winner.StartsWith("split:", StringComparison.Ordinal) || tiledSplit ||
+             tiledChunkedSplit))
         {
             CodegenSplitPlan? plan = null;
-            try { plan = CodegenSplitReduction.TryPlan(spec); }
+            try
+            {
+                if (tiledChunkedSplit)
+                    plan = TryParseChunkFactor(winner, out int chunkFactor)
+                        ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
+                        : null;
+                else
+                    plan = CodegenSplitReduction.TryPlan(spec);
+            }
             catch (NotSupportedException) { }
 
             if (plan is not null)
             {
                 var halves = new List<ProgramKernel>(2);
                 bool emitted = true;
-                if (tiledSplit)
+                if (tiledSplit || tiledChunkedSplit)
                 {
                     try
                     {
@@ -593,6 +608,15 @@ internal static class KernelConveyorTool
                     single.StagedOperands),
             },
             null, winner);
+    }
+
+    private static bool TryParseChunkFactor(string winner, out int chunkFactor)
+    {
+        chunkFactor = 0;
+        int marker = winner.LastIndexOf('x');
+        return marker >= 0 && marker + 1 < winner.Length &&
+            int.TryParse(winner.Substring(marker + 1), NumberStyles.None,
+                CultureInfo.InvariantCulture, out chunkFactor) && chunkFactor > 1;
     }
 
     /// <summary>A loaded, bound tuned program: one launch call whatever its shape.</summary>
