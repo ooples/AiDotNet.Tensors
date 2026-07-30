@@ -183,7 +183,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // against the CPU runtime, costing 2-3 GB of process RSS for nothing.
             // AIDOTNET_DISABLE_OPENCL=1 forces this branch even on machines with a
             // real GPU. See AiDotNet.Tensors#436 (P2 — OpenCL kernel cache RSS).
-            if (!DirectOpenClContext.IsGpuAvailable)
+            //
+            // Opt-in CI escape: when AIDOTNET_OPENCL_ALLOW_CPU=1, proceed even if this
+            // GPU presence probe reports nothing, so a CPU OpenCL device (POCL) can back
+            // the parity lane. Deferring here is deliberate — DirectOpenClContext.Initialize
+            // below does the authoritative device selection (prefers a GPU, falls back to a
+            // CPU device, and throws if neither exists), so we must not let this earlier,
+            // redundant probe short-circuit the fallback. Default (flag unset) is unchanged:
+            // no GPU -> bail here without touching the kernel cache.
+            if (!DirectOpenClContext.IsGpuAvailable && !OpenClNativeBindings.AllowCpuOpenClDevice)
             {
                 IsAvailable = false;
                 DeviceName = "None";
