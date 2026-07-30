@@ -72,11 +72,26 @@ public sealed class CodegenDepthwiseConv2DWeightGradientTests
         Assert.Equal(96, emitter.SharedMemoryBytes);
         Assert.StartsWith(".version 7.1", first, StringComparison.Ordinal);
         Assert.Contains("three kw accumulators share dOut", first);
-        Assert.Contains("shfl.sync.down.b32", first);
+        Assert.Contains("shfl.sync.down.b32 %r20, %r19, 16, 31, 0xffffffff", first);
         Assert.Contains("bar.sync 0", first);
         Assert.Contains("fma.rn.f32", first);
         Assert.DoesNotContain("atom", first);
         Assert.Throws<NotSupportedException>(() => emitter.Emit(spec, 6, 1));
+    }
+
+    [Fact]
+    public void ShuffleControl_EncodesClampAndSegmentMask()
+    {
+        Assert.Equal(0x001f,
+            PtxDepthwiseConv2DWeightGradientEmitter.ShuffleControlForWidth(32));
+        Assert.Equal(0x100f,
+            PtxDepthwiseConv2DWeightGradientEmitter.ShuffleControlForWidth(16));
+        Assert.Equal(0x1807,
+            PtxDepthwiseConv2DWeightGradientEmitter.ShuffleControlForWidth(8));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxDepthwiseConv2DWeightGradientEmitter.ShuffleControlForWidth(64));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxDepthwiseConv2DWeightGradientEmitter.ShuffleControlForWidth(12));
     }
 
     [SkippableFact]

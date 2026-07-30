@@ -206,13 +206,27 @@ public sealed class PtxDepthwiseConv2DWeightGradientEmitter
     {
         void L(string line) => body.Append("    ").Append(line).Append('\n');
         int warpSize = CodegenDepthwiseConv2DWeightGradientPlan.WarpSize;
+        int shuffleControl = ShuffleControlForWidth(warpSize);
         for (int offset = warpSize / 2; offset >= 1; offset >>= 1)
         {
             L($"mov.b32 %r19, %f{I(accumulator)};");
-            L($"shfl.sync.down.b32 %r20, %r19, {I(offset)}, {I(warpSize - 1)}, 0xffffffff;");
+            L($"shfl.sync.down.b32 %r20, %r19, {I(offset)}, {I(shuffleControl)}, 0xffffffff;");
             L($"mov.b32 %f{I(scratch)}, %r20;");
             L($"add.rn.f32 %f{I(accumulator)}, %f{I(accumulator)}, %f{I(scratch)};");
         }
+    }
+
+    /// <summary>Encodes PTX shfl clamp bits [4:0] and segment-mask bits [12:8].</summary>
+    internal static int ShuffleControlForWidth(int width)
+    {
+        const int ptxWarpSize = 32;
+        if (width <= 0 || width > ptxWarpSize || (width & (width - 1)) != 0)
+            throw new ArgumentOutOfRangeException(nameof(width),
+                "PTX shuffle widths must be powers of two no larger than the 32-lane warp.");
+
+        int clamp = width - 1;
+        int segmentMask = ptxWarpSize - width;
+        return (segmentMask << 8) | clamp;
     }
 
     private static int PowerOfTwoShift(int value)
