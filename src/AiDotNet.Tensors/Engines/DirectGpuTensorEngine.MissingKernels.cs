@@ -4294,7 +4294,13 @@ public partial class DirectGpuTensorEngine
             int nFreqV = numFrames, nFramesV = numFreqs, leading = batch;
             int outFrames = (int)System.Math.Floor(nFramesV / rate);
             int targetLen = (int)System.Math.Round((double)L / rate);
-            int outputLength = targetLen - nFft;   // ISTFT center subtracts nFft even when length is given
+            // CpuEngine.TimeStretch ends with ISTFT(..., center: true, length: targetLen), and an
+            // explicitly requested length is now honoured VERBATIM. This used to read
+            // `targetLen - nFft` to compensate for ISTFT subtracting nFft even when length was given —
+            // that subtraction was the ISTFT length bug fixed earlier in this branch, so the
+            // compensation now double-subtracts and truncates the output by nFft samples
+            // (TimeStretch[128;r1.5;n16] gave gpu=69 against cpu=85 and oracle=85).
+            int outputLength = targetLen;
             if (outFrames <= 0 || outputLength <= 0)
                 return base.TimeStretch(waveform, rate, nFft, hopLength);
 
