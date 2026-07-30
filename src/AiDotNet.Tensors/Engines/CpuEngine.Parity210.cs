@@ -677,6 +677,10 @@ public partial class CpuEngine
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn, so the
+        // tape records against the tensors the caller actually holds.
+        var x1Orig = x1;
+        var x2Orig = x2;
         if (!x1.IsContiguous) x1 = x1.Contiguous();
         if (!x2.IsContiguous) x2 = x2.Contiguous();
         var a = x1.AsSpan();
@@ -718,8 +722,19 @@ public partial class CpuEngine
             }
 
         // For 1-D inputs we produced a length-1 result; flatten to scalar.
-        if (rank == 1) return result.Reshape(new int[0]);
-        return result;
+        var final = rank == 1 ? result.Reshape(new int[0]) : result;
+
+        // Tape registration. This op recorded NOTHING, so x1/x2 received no gradient despite
+        // OpRegistry classifying TensorCosineSimilarity as differentiable. Note this uses
+        // CosineSimilarityDimBackward, NOT CosineSimilarityBackward — the latter belongs to
+        // TensorCosineSimilarityLoss, which is a whole-tensor SCALAR loss and would be wrong for
+        // any input carrying more than one similarity slice. Recorded against `final` (the tensor
+        // actually returned) so the tape's output identity matches what the caller receives.
+        DifferentiableOps.RecordBinary(
+            "TensorCosineSimilarity", final, x1Orig, x2Orig,
+            BackwardFunctions<T>.CosineSimilarityDimBackward,
+            savedState: new object[] { dim, eps });
+        return final;
     }
 
     private static T MaxScalar<T>(Interfaces.INumericOperations<T> ops, T a, T b)

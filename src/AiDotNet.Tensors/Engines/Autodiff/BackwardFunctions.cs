@@ -2764,6 +2764,101 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>Cosine similarity backward</summary>
+    /// <summary>
+    /// Backward for the DIM-AWARE <c>TensorCosineSimilarity(x1, x2, dim, eps)</c>, which reduces one
+    /// axis and returns a tensor.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately separate from <see cref="CosineSimilarityBackward"/>: that one serves
+    /// <c>TensorCosineSimilarityLoss</c>, a whole-tensor SCALAR loss, so it reads
+    /// <c>gradOutput[0]</c> and sums over every element. Reusing it here would be wrong for any input
+    /// with more than one similarity slice, and it also hardcodes eps = 1e-8 instead of honouring the
+    /// caller's value.
+    /// </para>
+    /// <para>
+    /// With na = ‖a‖, nb = ‖b‖ and cos = dot / (max(na,eps) · max(nb,eps)):
+    /// </para>
+    /// <para>
+    /// d cos/d a_i = [ b_i − cos·(nb/na)·a_i ] / (na·nb),  and symmetrically for b.
+    /// </para>
+    /// <para>
+    /// When a norm is below eps the forward's max() pins that factor to the constant eps, so it no
+    /// longer depends on the input and the self-normalising term vanishes: d cos/d a_i = b_i/(eps·nbEff).
+    /// Both clamp branches are handled explicitly so this is the exact derivative of the forward as
+    /// written, not of the idealised unclamped formula.
+    /// </para>
+    /// </remarks>
+    internal static void CosineSimilarityDimBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(CosineSimilarityDimBackward), savedState, 2);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int dim = SavedInt(nameof(CosineSimilarityDimBackward), savedState, 0, "dim");
+        double eps = savedState[1] is double e
+            ? e
+            : throw new ArgumentException(
+                $"{nameof(CosineSimilarityDimBackward)}: savedState[1] (eps) must be a double.", nameof(savedState));
+
+        var a = inputs[0];
+        var b = inputs[1];
+        var shape = a._shape;
+        int rank = shape.Length;
+
+        var gradA = TensorPool<T>.RentZeroed(shape);
+        var gradB = TensorPool<T>.RentZeroed(shape);
+
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= shape[k];
+        int axisLen = shape[dim];
+
+        int resCursor = 0;
+        for (int outer = 0; outer < outerSize; outer++)
+        for (int inner = 0; inner < innerSize; inner++)
+        {
+            double dot = 0, sumAA = 0, sumBB = 0;
+            for (int i = 0; i < axisLen; i++)
+            {
+                int pos = outer * axisLen * innerSize + i * innerSize + inner;
+                double av = numOps.ToDouble(a[pos]);
+                double bv = numOps.ToDouble(b[pos]);
+                dot += av * bv;
+                sumAA += av * av;
+                sumBB += bv * bv;
+            }
+            double na = Math.Sqrt(sumAA);
+            double nb = Math.Sqrt(sumBB);
+            // Mirror the forward's max(norm, eps) clamp exactly.
+            bool aClamped = !(na > eps);
+            bool bClamped = !(nb > eps);
+            double naEff = aClamped ? eps : na;
+            double nbEff = bClamped ? eps : nb;
+            double denom = naEff * nbEff;
+            double cos = dot / denom;
+            double g = numOps.ToDouble(gradOutput[resCursor++]);
+
+            for (int i = 0; i < axisLen; i++)
+            {
+                int pos = outer * axisLen * innerSize + i * innerSize + inner;
+                double av = numOps.ToDouble(a[pos]);
+                double bv = numOps.ToDouble(b[pos]);
+
+                // d cos/d a_i: the self-normalising term exists only while na is unclamped.
+                double dA = bv / denom;
+                if (!aClamped) dA -= cos * av / (na * na);
+                double dB = av / denom;
+                if (!bClamped) dB -= cos * bv / (nb * nb);
+
+                gradA[pos] = numOps.Add(gradA[pos], numOps.FromDouble(g * dA));
+                gradB[pos] = numOps.Add(gradB[pos], numOps.FromDouble(g * dB));
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, a, gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, gradB, engine);
+    }
+
     internal static void CosineSimilarityBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
