@@ -7427,15 +7427,57 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var waveform = inputs[0];
-        int nFft = (int)savedState[0];
-        int hopLength = (int)savedState[1];
-        var window = (Tensor<T>)savedState[2];
-        var phase = (Tensor<T>)savedState[3];
-        int origLength = (int)savedState[4];
+        RequireSavedState(nameof(SpectrogramBackward), savedState, 5);
+        int nFft = SavedInt(nameof(SpectrogramBackward), savedState, 0, "nFft");
+        int hopLength = SavedInt(nameof(SpectrogramBackward), savedState, 1, "hopLength");
+        var window = SavedTensor(nameof(SpectrogramBackward), savedState, 2, "window");
+        var phase = SavedTensor(nameof(SpectrogramBackward), savedState, 3, "phase");
+        int origLength = SavedInt(nameof(SpectrogramBackward), savedState, 4, "origLength");
 
         var result = MagnitudeStftAdjoint(gradOutput, phase, nFft, hopLength, window, origLength, waveform._shape);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
+
+    /// <summary>
+    /// Validates a backward's savedState arity before any positional access.
+    /// </summary>
+    /// <remarks>
+    /// The recorder and the backward agree on slot layout only by convention. Without these guards
+    /// a drift between them surfaces late as an <see cref="InvalidCastException"/> or
+    /// <see cref="IndexOutOfRangeException"/> from deep inside a gradient computation — or worse,
+    /// two same-shaped tensors swapped between slots produce a silently wrong gradient with no
+    /// exception at all. Failing at the boundary with the op and slot named is strictly better.
+    /// </remarks>
+    private static void RequireSavedState(string op, object[] savedState, int expected)
+    {
+        if (savedState is null)
+            throw new ArgumentNullException(nameof(savedState), $"{op}: savedState is null; expected {expected} entries.");
+        if (savedState.Length != expected)
+            throw new ArgumentException(
+                $"{op}: savedState has {savedState.Length} entries, expected {expected}. " +
+                "The recorder and this backward have drifted out of sync.", nameof(savedState));
+    }
+
+    private static int SavedInt(string op, object[] savedState, int slot, string name) =>
+        savedState[slot] is int v
+            ? v
+            : throw new ArgumentException(
+                $"{op}: savedState[{slot}] ({name}) is {Describe(savedState[slot])}, expected int.", nameof(savedState));
+
+    private static bool SavedBool(string op, object[] savedState, int slot, string name) =>
+        savedState[slot] is bool v
+            ? v
+            : throw new ArgumentException(
+                $"{op}: savedState[{slot}] ({name}) is {Describe(savedState[slot])}, expected bool.", nameof(savedState));
+
+    private static Tensor<T> SavedTensor(string op, object[] savedState, int slot, string name) =>
+        savedState[slot] is Tensor<T> v
+            ? v
+            : throw new ArgumentException(
+                $"{op}: savedState[{slot}] ({name}) is {Describe(savedState[slot])}, expected Tensor<{typeof(T).Name}>.",
+                nameof(savedState));
+
+    private static string Describe(object? o) => o is null ? "null" : o.GetType().Name;
 
     /// <summary>
     /// Adjoint of <c>mag = |STFT(x)|</c> with <c>center: true</c>: maps a gradient shaped like
@@ -7559,16 +7601,18 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var waveform = inputs[0];
-        int nFft = (int)savedState[0];
-        int hopLength = (int)savedState[1];
-        var window = (Tensor<T>)savedState[2];
-        var phase = (Tensor<T>)savedState[3];
-        int origLength = (int)savedState[4];
-        var magnitude = (Tensor<T>)savedState[5];
-        var melFilterbank = (Tensor<T>)savedState[6];
-        int nMels = (int)savedState[7];
-        bool powerToDb = (bool)savedState[8];
-        var linearMel = (Tensor<T>)savedState[9];   // pre-dB mel, needed for the log derivative
+        const string Op = nameof(MelSpectrogramBackward);
+        RequireSavedState(Op, savedState, 10);
+        int nFft = SavedInt(Op, savedState, 0, "nFft");
+        int hopLength = SavedInt(Op, savedState, 1, "hopLength");
+        var window = SavedTensor(Op, savedState, 2, "window");
+        var phase = SavedTensor(Op, savedState, 3, "phase");
+        int origLength = SavedInt(Op, savedState, 4, "origLength");
+        var magnitude = SavedTensor(Op, savedState, 5, "magnitude");
+        var melFilterbank = SavedTensor(Op, savedState, 6, "melFilterbank");
+        int nMels = SavedInt(Op, savedState, 7, "nMels");
+        bool powerToDb = SavedBool(Op, savedState, 8, "powerToDb");
+        var linearMel = SavedTensor(Op, savedState, 9, "linearMel");   // pre-dB mel, for the log derivative
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = nFft / 2 + 1;
