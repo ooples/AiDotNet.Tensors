@@ -18,6 +18,12 @@ internal static class KernelIdentityTool
             : new[] { CodegenKernelCatalog.Find(selector)! }.Where(e => e is not null).ToList();
         KernelToolArgs.RequireNonEmptySelection(selector, entries.Count, "kernel-identity");
 
+        if (!DirectPtxRuntime.IsAvailable)
+        {
+            Console.WriteLine(
+                "NVIDIA CUDA Driver API is unavailable; kernel identity needs a device fingerprint.");
+            return;
+        }
         using var runtime = new DirectPtxRuntime();
         Console.WriteLine("kernel\tdevice\ttarget\tspec\temitter");
         foreach (CodegenCatalogEntry entry in entries)
