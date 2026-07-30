@@ -6996,18 +6996,36 @@ internal static class BackwardFunctions<T>
         var phase = (Tensor<T>)savedState[3];
         int origLength = (int)savedState[4];
 
+        var result = MagnitudeStftAdjoint(gradOutput, phase, nFft, hopLength, window, origLength, waveform._shape);
+        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
+    }
+
+    /// <summary>
+    /// Adjoint of <c>mag = |STFT(x)|</c> with <c>center: true</c>: maps a gradient shaped like
+    /// the one-sided magnitude spectrogram back onto the waveform.
+    /// </summary>
+    /// <remarks>
+    /// Shared by <see cref="SpectrogramBackward"/> and <see cref="MelSpectrogramBackward"/> —
+    /// the mel path only differs in how it converts its own gradient into a magnitude gradient
+    /// before this point. See SpectrogramBackward's remarks for the derivation and for why this
+    /// is deliberately not ISTFT.
+    /// </remarks>
+    private static Tensor<T> MagnitudeStftAdjoint(
+        Tensor<T> gradMagnitude, Tensor<T> phase, int nFft, int hopLength,
+        Tensor<T> window, int origLength, int[] waveformShape)
+    {
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = nFft / 2 + 1;
-        int numFrames = gradOutput._shape[^1];
-        int padAmount = nFft / 2;                 // Spectrogram always analyses with center: true
+        int numFrames = gradMagnitude._shape[^1];
+        int padAmount = nFft / 2;                 // analysed with center: true
         int paddedLength = origLength + 2 * padAmount;
-        int batchSize = gradOutput.Length / (numFreqs * numFrames);
+        int batchSize = gradMagnitude.Length / (numFreqs * numFrames);
 
-        var gradData = gradOutput.GetDataArray();
+        var gradData = gradMagnitude.GetDataArray();
         var phaseData = phase.GetDataArray();
         var windowData = window.GetDataArray();
 
-        var result = new Tensor<T>(waveform._shape);
+        var result = new Tensor<T>(waveformShape);
         var resultData = result.GetDataArray();
         var padded = new double[paddedLength];
 
@@ -7064,6 +7082,102 @@ internal static class BackwardFunctions<T>
             }
         }
 
+        return result;
+    }
+
+    /// <summary>
+    /// MelSpectrogram backward.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The forward is <c>mel[m,t] = Σ_f W[m,f] · mag[f,t]²</c>, optionally followed by
+    /// <c>db = max(10·log10(max(mel, 1e-10)), -80)</c>. Chaining the three stages:
+    /// </para>
+    /// <list type="number">
+    /// <item>dB stage: <c>d(db)/d(mel) = 10 / (mel · ln 10)</c>, and zero wherever either clamp
+    /// was active (mel at or below the epsilon floor, or db at the -80 floor) — a clamped output
+    /// is locally constant, so no gradient flows.</item>
+    /// <item>filterbank + square: <c>dL/dmag[f,t] = Σ_m g[m,t] · W[m,f] · 2·mag[f,t]</c>.</item>
+    /// <item>magnitude to waveform: the shared STFT adjoint.</item>
+    /// </list>
+    /// <para>
+    /// This op was previously listed in OpRegistry.NonDifferentiableOps, so every mel-based
+    /// objective (vocoder, TTS) silently received no gradient at all.
+    /// </para>
+    /// </remarks>
+    internal static void MelSpectrogramBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var waveform = inputs[0];
+        int nFft = (int)savedState[0];
+        int hopLength = (int)savedState[1];
+        var window = (Tensor<T>)savedState[2];
+        var phase = (Tensor<T>)savedState[3];
+        int origLength = (int)savedState[4];
+        var magnitude = (Tensor<T>)savedState[5];
+        var melFilterbank = (Tensor<T>)savedState[6];
+        int nMels = (int)savedState[7];
+        bool powerToDb = (bool)savedState[8];
+        var linearMel = (Tensor<T>)savedState[9];   // pre-dB mel, needed for the log derivative
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numFreqs = nFft / 2 + 1;
+        int numFrames = magnitude._shape[^1];
+        int batchSize = magnitude.Length / (numFreqs * numFrames);
+
+        var gradData = gradOutput.GetDataArray();
+        var magData = magnitude.GetDataArray();
+        var filterData = melFilterbank.GetDataArray();
+        var linearMelData = linearMel.GetDataArray();
+
+        // Stage 1: undo the dB conversion, in place on a copy of the incoming gradient.
+        var gMel = new double[gradOutput.Length];
+        const double epsilonD = 1e-10;
+        const double minDbD = -80.0;
+        double invLn10 = 1.0 / Math.Log(10.0);
+        for (int i = 0; i < gMel.Length; i++)
+        {
+            double g = numOps.ToDouble(gradData[i]);
+            if (!powerToDb)
+            {
+                gMel[i] = g;
+                continue;
+            }
+
+            double linear = numOps.ToDouble(linearMelData[i]);
+            double clamped = Math.Max(linear, epsilonD);
+            double db = 10.0 * Math.Log10(clamped);
+            // Either clamp saturating means the output is locally constant.
+            gMel[i] = (linear <= epsilonD || db <= minDbD)
+                ? 0.0
+                : g * 10.0 * invLn10 / clamped;
+        }
+
+        // Stage 2: through the mel filterbank and the magnitude-squared.
+        var gradMag = new Tensor<T>(magnitude._shape);
+        var gradMagData = gradMag.GetDataArray();
+        for (int b = 0; b < batchSize; b++)
+        {
+            int magOffset = b * numFreqs * numFrames;
+            int melOffset = b * nMels * numFrames;
+            for (int f = 0; f < numFreqs; f++)
+            {
+                for (int t = 0; t < numFrames; t++)
+                {
+                    double acc = 0.0;
+                    for (int m = 0; m < nMels; m++)
+                        acc += gMel[melOffset + m * numFrames + t]
+                             * numOps.ToDouble(filterData[m * numFreqs + f]);
+
+                    double mag = numOps.ToDouble(magData[magOffset + f * numFrames + t]);
+                    gradMagData[magOffset + f * numFrames + t] = numOps.FromDouble(acc * 2.0 * mag);
+                }
+            }
+        }
+
+        // Stage 3: magnitude gradient back onto the waveform.
+        var result = MagnitudeStftAdjoint(gradMag, phase, nFft, hopLength, window, origLength, waveform._shape);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
 }

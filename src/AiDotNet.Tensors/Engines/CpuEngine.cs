@@ -37917,8 +37917,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Compute STFT
-        STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
+        // Compute STFT. The phase is retained (it used to be discarded) because the backward
+        // needs it to reconstruct the complex spectrum for the magnitude adjoint.
+        STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
+        int origLength = input._shape[^1];
 
         // Convert to power spectrum (magnitude squared)
         var powerSpec = TensorMultiply(magnitude, magnitude);
@@ -37959,6 +37961,27 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // The pre-dB mel is kept for the backward: the log derivative is 10/(mel·ln10), which
+        // needs the LINEAR value, and both clamps below have to be detectable to zero the
+        // gradient where the output saturates.
+        //
+        // Snapshotted into a fresh tensor by explicit element copy rather than Clone(): the dB
+        // loop below mutates melSpecData in place, and if Clone() shares storage (copy-on-write)
+        // the snapshot would be overwritten with dB values. Those can be negative, which made the
+        // backward divide by a negative number and flip the gradient's sign — caught by
+        // MelSpectrogram_Backward_MatchesFiniteDifferences(powerToDb: true).
+        Tensor<T> linearMel;
+        if (powerToDb)
+        {
+            linearMel = new Tensor<T>(melShape);
+            var linearMelData = linearMel.GetDataArray();
+            Array.Copy(melSpecData, linearMelData, melSpec.Length);
+        }
+        else
+        {
+            linearMel = melSpec;
+        }
+
         // Convert to dB scale if requested
         if (powerToDb)
         {
@@ -37974,6 +37997,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 melSpecData[i] = numOps.FromDouble(db);
             }
         }
+
+        // Record one tape node for the whole op. Previously MelSpectrogram was classified
+        // NonDifferentiable, so mel-based objectives (vocoder / TTS) received no gradient at all
+        // even though every stage — |STFT|, squaring, the filterbank matmul, the dB conversion —
+        // is differentiable.
+        DifferentiableOps.RecordUnary(
+            "MelSpectrogram", melSpec, input,
+            BackwardFunctions<T>.MelSpectrogramBackward,
+            new object[]
+            {
+                nFft, hopLength, window, phase, origLength,
+                magnitude, melFilterbank, nMels, powerToDb, linearMel,
+            });
 
         return melSpec;
     }

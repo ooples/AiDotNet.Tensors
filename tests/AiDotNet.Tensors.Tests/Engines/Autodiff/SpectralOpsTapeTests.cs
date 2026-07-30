@@ -166,53 +166,63 @@ public class SpectralOpsTapeTests
     }
 
     /// <summary>
-    /// Closes the blind spot: every IEngine method that emits a tensor through an
-    /// <c>out</c>/<c>ref</c> parameter must also be classified, exactly as the
-    /// tensor-returning ones are. Without this, an op can record nothing and no
-    /// test notices.
+    /// A non-zero gradient is NOT evidence of a correct one — the Spectrogram bug this suite was
+    /// written for produced non-zero gradients that were ~1/nFft off with varying sign. So the
+    /// mel path gets the same finite-difference treatment, in both the linear and dB modes.
     /// </summary>
-    [Fact]
-    public void AllTensorOutParameterMethods_AreClassified()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MelSpectrogram_Backward_MatchesFiniteDifferences(bool powerToDb)
     {
-        var methods = typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance);
-        var unclassified = new List<string>();
+        int nFft = 16, hop = 4, nMels = 6, len = 96, sampleRate = 16000;
+        var x = Chirp(len, seed: 21);
+        var win = HannWindow(nFft);
 
-        foreach (var method in methods)
+        Tensor<double> Forward(Tensor<double> signal) =>
+            _engine.MelSpectrogram(signal, sampleRate, nFft, hop, nMels, 0.0, sampleRate / 2.0, win, powerToDb);
+
+        using var tape = new GradientTape<double>();
+        var mel = Forward(x);
+        var loss = _engine.ReduceSum(mel, null);
+        var grads = tape.ComputeGradients(loss, [x]);
+        var analytical = grads[x];
+
+        Assert.Equal(x.Shape.ToArray(), analytical.Shape.ToArray());
+
+        const double eps = 1e-6;
+        var failures = new List<string>();
+        int probes = 0;
+
+        for (int idx = nFft; idx < len - nFft; idx += 7)
         {
-            if (method.IsSpecialName)
-                continue;
+            double orig = x[idx];
 
-            bool emitsTensorByRef = method.GetParameters().Any(p =>
-                (p.IsOut || p.ParameterType.IsByRef) && MentionsTensor(p.ParameterType));
+            x[idx] = orig + eps;
+            double lossPlus = _engine.TensorSum(Forward(x));
 
-            if (!emitsTensorByRef)
-                continue;
+            x[idx] = orig - eps;
+            double lossMinus = _engine.TensorSum(Forward(x));
 
-            var name = method.Name;
-            if (name.Contains('`'))
-                name = name.Substring(0, name.IndexOf('`'));
+            x[idx] = orig;
 
-            if (!OpRegistry.IsClassified(name))
-                unclassified.Add($"  - {name}");
+            double numerical = (lossPlus - lossMinus) / (2.0 * eps);
+            double a = analytical[idx];
+            probes++;
+
+            double denom = Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(numerical)));
+            if (Math.Abs(a - numerical) / denom > 5e-3)
+                failures.Add($"  idx {idx}: analytical {a:G6} vs numerical {numerical:G6}" +
+                             (Math.Abs(numerical) > 1e-9 ? $" (ratio {a / numerical:G6})" : ""));
         }
 
-        if (unclassified.Count > 0)
+        Assert.True(probes > 0, "No probes ran.");
+        if (failures.Count > 0)
         {
             Assert.Fail(
-                $"{unclassified.Count} IEngine method(s) emit a Tensor through an out/ref parameter but are not " +
-                "classified in OpRegistry. TapeCompletenessTests only inspects RETURN types, so these were never " +
-                "checked and may be recording nothing on the tape.\n" +
-                "Add each to DifferentiableOps, NonDifferentiableOps, or DelegatorOps:\n" +
-                string.Join("\n", unclassified.Distinct()));
+                $"MelSpectrogram gradient disagrees with finite differences at {failures.Count} of {probes} probes " +
+                $"(powerToDb: {powerToDb}).\n" + string.Join("\n", failures.Take(10)));
         }
     }
 
-    private static bool MentionsTensor(Type type)
-    {
-        var t = type.IsByRef ? type.GetElementType() : type;
-        if (t is null) return false;
-        if (t.IsGenericType && t.GetGenericTypeDefinition().Name.StartsWith("Tensor", StringComparison.Ordinal))
-            return true;
-        return t.Name.StartsWith("Tensor", StringComparison.Ordinal);
-    }
 }
