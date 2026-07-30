@@ -1951,7 +1951,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // upstream hasn't run yet would have had its placeholder-filled
         // backing pinned, leaking stale/zero bytes into every replay.
         var live = GetLiveBackingArrayOrNull();
-        if (live is not null) return live;
+        if (live is not null)
+        {
+            // Force any PENDING GPU download before handing the array out.
+            // DirectGpuTensorEngine.FinishGpuOp returns a GC.AllocateUninitializedArray and
+            // registers a DeferredArrayMaterializer keyed on it, documenting that the data is
+            // "populated lazily when code first accesses the data (via DeferredArrayMaterializer
+            // triggered by GetDataArray/AsSpan/indexer)". VectorBase.GetDataArray does call
+            // TryMaterialize; this accessor did NOT, so reading a deferred GPU result through the
+            // TENSOR accessor returned UNINITIALISED memory. Fresh pages read as zero, which is why
+            // 13 Parity210 GPU ops (Erfc, Lgamma, Erfinv, I0, Flip, Roll, CumSum, CumMax,
+            // LogCumSumExp, LogAddExp, Hypot, DiagEmbed, NanToNum) each reported gpu=0 against
+            // every CPU value. TryMaterialize is a no-op for arrays with nothing pending.
+            Helpers.DeferredArrayMaterializer.TryMaterialize(live);
+            return live;
+        }
         return ToArray();
     }
 
@@ -1972,7 +1986,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal T[] GetReadOnlyDataArray()
     {
         var live = GetLiveBackingArrayOrNull();
-        if (live is not null) return live;
+        if (live is not null)
+        {
+            // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
+            // has to see materialised data.
+            Helpers.DeferredArrayMaterializer.TryMaterialize(live);
+            return live;
+        }
         return ToArray();
     }
 
