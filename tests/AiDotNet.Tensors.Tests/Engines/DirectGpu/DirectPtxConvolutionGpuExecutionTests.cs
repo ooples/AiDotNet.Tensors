@@ -254,10 +254,10 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Winograd3x3_LinearReductionMajorFlipped_MatchesAdjointReference()
     {
-        if (!DirectPtxRuntime.IsAvailable) return;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
 
         const int n = 2, cch = 4, h = 8, w = 8, k = 4;
         var shape = new Conv2DWinogradShape(
@@ -272,9 +272,9 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         float[] expected = ReferenceLinearReductionMajorFlipped(
             input, weights, n, cch, h, w, k);
         using var runtime = new DirectPtxRuntime();
-        if (!DirectPtxArchitecture.HasExperimentalConvolution(
-                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
-            return;
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Experimental generated convolution is unavailable on this GPU architecture.");
 
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
