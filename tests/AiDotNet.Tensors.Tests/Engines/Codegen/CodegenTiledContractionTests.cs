@@ -143,6 +143,30 @@ public sealed class CodegenTiledContractionTests
     }
 
     [Fact]
+    public void RegisterPrefetchSchedule_LoadsTwoKFragmentsBeforeFirstFma()
+    {
+        const string winner = "tiled-contraction:m64n56k16tm8tn2:rp";
+        CodegenTiledContractionSchedule? schedule =
+            CodegenTiledContractionSchedule.Find(winner);
+        Assert.NotNull(schedule);
+        Assert.True(schedule!.RegisterPrefetch);
+        Assert.Equal(winner, schedule.WinnerName);
+
+        var spec = CodegenKernelCatalog.Find("conv2d_1x1_bwd_data")!.Bench;
+        var ordinary = new PtxTiledContractionEmitter(
+            new CodegenTiledContractionSchedule(64, 56, 16, 8, 2));
+        var prefetched = new PtxTiledContractionEmitter(schedule);
+        string ordinaryPtx = ordinary.Emit(spec, 8, 6);
+        string prefetchedPtx = prefetched.Emit(spec, 8, 6);
+
+        Assert.True(prefetched.Plan!.RegisterPrefetch);
+        Assert.Contains("register-prefetched", prefetchedPtx);
+        Assert.Equal(
+            2 * SharedLoadsBeforeFirstFma(ordinaryPtx),
+            SharedLoadsBeforeFirstFma(prefetchedPtx));
+    }
+
+    [Fact]
     public void ExactSchedule_RefusesNonDivisibleShape()
     {
         var schedule = new CodegenTiledContractionSchedule(64, 112, 8, 8, 4);
@@ -427,7 +451,10 @@ public sealed class CodegenTiledContractionTests
         first.Upload<float>(host[0]);
         second.Upload<float>(host[1]);
 
-        var tiled = new PtxTiledContractionEmitter();
+        var schedule = CodegenTiledContractionSchedule.Find(
+            "tiled-contraction:m64n56k16tm8tn2:rp");
+        Assert.NotNull(schedule);
+        var tiled = new PtxTiledContractionEmitter(schedule!);
         string tiledPtx = tiled.Emit(
             spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         using var tiledModule = runtime.LoadModule(tiledPtx, allowExperimentalJitFallback: true);
@@ -543,6 +570,14 @@ public sealed class CodegenTiledContractionTests
             spec.BiasInput, spec.ScaleInput, spec.Activation, spec.ReduceScale,
             spec.PreReduce, spec.PreBiasInput, spec.PreBiasScale, spec.Algebra,
             spec.ExtraOutputs.ToArray());
+    }
+
+    private static int SharedLoadsBeforeFirstFma(string ptx)
+    {
+        int firstFma = ptx.IndexOf("fma.rn.f32", System.StringComparison.Ordinal);
+        Assert.True(firstFma >= 0);
+        return ptx.Substring(0, firstFma).Split('\n').Count(line =>
+            line.Contains("ld.shared", System.StringComparison.Ordinal));
     }
 
     private static CodegenKernelSpec SimpleContraction(

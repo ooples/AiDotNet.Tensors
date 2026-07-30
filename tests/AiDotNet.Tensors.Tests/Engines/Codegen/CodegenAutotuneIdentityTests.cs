@@ -74,13 +74,16 @@ public class CodegenAutotuneIdentityTests
                 "depthwise", "no-tile", "10.0", "20.0", "2.0",
                 CodegenMeasurementProtocol.Tag,
                 identity.DeviceFingerprint, identity.Target,
-                identity.SpecFingerprint, identity.EmitterFingerprint);
+                identity.SpecFingerprint, identity.EmitterFingerprint, "full");
+            string probeRow = row.Replace("depthwise\t", "probe\t");
+            probeRow = probeRow.Substring(0, probeRow.Length - "full".Length) + "probe";
             File.WriteAllText(path,
-                "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\n" +
+                "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope\n" +
                 "legacy\tno-tile\t10.0\t20.0\t2.0\t" + CodegenMeasurementProtocol.Tag + "\n" +
+                probeRow + "\n" +
                 row + "\n");
             File.WriteAllText(secondPath,
-                "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\n" +
+                "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope\n" +
                 row.Replace("\tno-tile\t", "\tlanes4\t") + "\n");
 
             CodegenAutotuneCache.CachePath = path;
@@ -90,6 +93,7 @@ public class CodegenAutotuneIdentityTests
             Assert.Null(CodegenAutotuneCache.WinnerFor(
                 "depthwise", identity with { Target = "sm90" }));
             Assert.Null(CodegenAutotuneCache.WinnerFor("legacy", identity));
+            Assert.Null(CodegenAutotuneCache.WinnerFor("probe", identity));
 
             // Assigning another path must invalidate automatically; requiring callers to
             // remember Invalidate made tests and tools silently serve the previous file.

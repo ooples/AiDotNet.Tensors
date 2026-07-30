@@ -148,7 +148,8 @@ public sealed class PtxTiledContractionEmitter
             .Append("// tile ").Append(I(plan.TileM)).Append('x').Append(I(plan.TileN))
             .Append('x').Append(I(plan.TileK)).Append(", thread tile ")
             .Append(I(plan.ThreadTileM)).Append('x').Append(I(plan.ThreadTileN))
-            .Append(", double-buffered\n")
+            .Append(", double-buffered")
+            .Append(plan.RegisterPrefetch ? ", register-prefetched\n" : "\n")
             .Append("// ").Append(spec.Describe().Replace("\n", "\n// ")).Append('\n')
             .Append(".visible .entry ").Append(spec.Name).Append("(\n");
         for (int i = 0; i < spec.ParameterCount; i++)
@@ -232,69 +233,112 @@ public sealed class PtxTiledContractionEmitter
     {
         int bufferBase = buffer * plan.StageBytes;
         int streamBase = bufferBase + plan.TileK * plan.TileM * sizeof(float);
+        if (!plan.RegisterPrefetch)
+        {
+            for (int k = 0; k < plan.TileK; k++)
+            {
+                EmitFragmentLoads(
+                    plan, bufferBase, streamBase, k, out string[] matrix,
+                    out string[] stream);
+                EmitFragmentFmas(matrix, stream, accumulators);
+            }
+            return;
+        }
+
+        // Keep fragment k+1 live while fragment k executes. The ordinary schedule loads
+        // from shared only after the previous FMA chain, which exposes MIO dependency
+        // latency. This schedule axis deliberately trades registers for enough independent
+        // shared-memory work to let the scheduler overlap the two instruction streams.
+        EmitFragmentLoads(
+            plan, bufferBase, streamBase, 0, out string[] currentMatrix,
+            out string[] currentStream);
         for (int k = 0; k < plan.TileK; k++)
         {
-            var matrix = new string[plan.ThreadTileM];
-            var stream = new string[plan.ThreadTileN];
-            for (int i = 0; i < matrix.Length; i++) matrix[i] = NextF();
-            for (int j = 0; j < stream.Length; j++) stream[j] = NextF();
+            string[]? nextMatrix = null;
+            string[]? nextStream = null;
+            if (k + 1 < plan.TileK)
+                EmitFragmentLoads(
+                    plan, bufferBase, streamBase, k + 1,
+                    out nextMatrix, out nextStream);
 
-            if (plan.MatrixReductionMajor)
+            EmitFragmentFmas(currentMatrix, currentStream, accumulators);
+            if (nextMatrix is not null)
             {
-                // A [K,M] stage gives each thread's M fragment contiguous, naturally
-                // aligned values. Load the fragment as vectors: this removes up to seven
-                // shared-memory instructions and their address chains from every K step.
-                int vectorWidth = plan.ThreadTileM % 4 == 0
-                    ? 4
-                    : plan.ThreadTileM % 2 == 0 ? 2 : 1;
-                for (int i = 0; i < matrix.Length; i += vectorWidth)
-                {
-                    int constant = bufferBase + k * plan.TileM * sizeof(float) +
-                        i * sizeof(float);
-                    string local = NextR();
-                    string local64 = NextRd(), address = NextRd();
-                    L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * sizeof(float))}, {I(constant)};");
-                    L($"cvt.u64.u32 {local64}, {local};");
-                    L($"add.u64 {address}, %rd3, {local64};");
-                    EmitSharedLoad(matrix, i, vectorWidth, address);
-                }
+                currentMatrix = nextMatrix;
+                currentStream = nextStream!;
             }
-            else
-            {
-                // [M,K] values for fixed K are strided, so they remain scalar.
-                for (int i = 0; i < matrix.Length; i++)
-                {
-                    int constant = bufferBase + i * plan.TileK * sizeof(float) +
-                        k * sizeof(float);
-                    string local = NextR();
-                    string local64 = NextRd(), address = NextRd();
-                    L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * plan.TileK * sizeof(float))}, {I(constant)};");
-                    L($"cvt.u64.u32 {local64}, {local};");
-                    L($"add.u64 {address}, %rd3, {local64};");
-                    L($"ld.shared.f32 {matrix[i]}, [{address}];");
-                }
-            }
+        }
+    }
 
-            // N is contiguous for both operand layouts. Every retained schedule owns
-            // two or four values, so one vector instruction replaces the scalar loads.
-            int streamVectorWidth = plan.ThreadTileN % 4 == 0
+    private void EmitFragmentLoads(
+        CodegenTiledContractionPlan plan, int bufferBase, int streamBase, int k,
+        out string[] matrix, out string[] stream)
+    {
+        matrix = new string[plan.ThreadTileM];
+        stream = new string[plan.ThreadTileN];
+        for (int i = 0; i < matrix.Length; i++) matrix[i] = NextF();
+        for (int j = 0; j < stream.Length; j++) stream[j] = NextF();
+
+        if (plan.MatrixReductionMajor)
+        {
+            // A [K,M] stage gives each thread's M fragment contiguous, naturally
+            // aligned values. Load the fragment as vectors: this removes up to seven
+            // shared-memory instructions and their address chains from every K step.
+            int vectorWidth = plan.ThreadTileM % 4 == 0
                 ? 4
-                : plan.ThreadTileN % 2 == 0 ? 2 : 1;
-            for (int j = 0; j < stream.Length; j += streamVectorWidth)
+                : plan.ThreadTileM % 2 == 0 ? 2 : 1;
+            for (int i = 0; i < matrix.Length; i += vectorWidth)
             {
-                int constant = streamBase + k * plan.TileN * sizeof(float) +
-                    j * sizeof(float);
+                int constant = bufferBase + k * plan.TileM * sizeof(float) +
+                    i * sizeof(float);
                 string local = NextR();
                 string local64 = NextRd(), address = NextRd();
-                L($"mad.lo.u32 {local}, %r6, {I(plan.ThreadTileN * sizeof(float))}, {I(constant)};");
+                L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * sizeof(float))}, {I(constant)};");
                 L($"cvt.u64.u32 {local64}, {local};");
                 L($"add.u64 {address}, %rd3, {local64};");
-                EmitSharedLoad(stream, j, streamVectorWidth, address);
+                EmitSharedLoad(matrix, i, vectorWidth, address);
             }
-            for (int i = 0; i < matrix.Length; i++)
-                for (int j = 0; j < stream.Length; j++)
-                    L($"fma.rn.f32 {accumulators[i, j]}, {matrix[i]}, {stream[j]}, {accumulators[i, j]};");
         }
+        else
+        {
+            // [M,K] values for fixed K are strided, so they remain scalar.
+            for (int i = 0; i < matrix.Length; i++)
+            {
+                int constant = bufferBase + i * plan.TileK * sizeof(float) +
+                    k * sizeof(float);
+                string local = NextR();
+                string local64 = NextRd(), address = NextRd();
+                L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * plan.TileK * sizeof(float))}, {I(constant)};");
+                L($"cvt.u64.u32 {local64}, {local};");
+                L($"add.u64 {address}, %rd3, {local64};");
+                L($"ld.shared.f32 {matrix[i]}, [{address}];");
+            }
+        }
+
+        // N is contiguous for both operand layouts. Every retained schedule owns
+        // two or four values, so one vector instruction replaces the scalar loads.
+        int streamVectorWidth = plan.ThreadTileN % 4 == 0
+            ? 4
+            : plan.ThreadTileN % 2 == 0 ? 2 : 1;
+        for (int j = 0; j < stream.Length; j += streamVectorWidth)
+        {
+            int constant = streamBase + k * plan.TileN * sizeof(float) +
+                j * sizeof(float);
+            string local = NextR();
+            string local64 = NextRd(), address = NextRd();
+            L($"mad.lo.u32 {local}, %r6, {I(plan.ThreadTileN * sizeof(float))}, {I(constant)};");
+            L($"cvt.u64.u32 {local64}, {local};");
+            L($"add.u64 {address}, %rd3, {local64};");
+            EmitSharedLoad(stream, j, streamVectorWidth, address);
+        }
+    }
+
+    private void EmitFragmentFmas(
+        string[] matrix, string[] stream, string[,] accumulators)
+    {
+        for (int i = 0; i < matrix.Length; i++)
+            for (int j = 0; j < stream.Length; j++)
+                L($"fma.rn.f32 {accumulators[i, j]}, {matrix[i]}, {stream[j]}, {accumulators[i, j]};");
     }
 
     private void EmitSharedLoad(string[] values, int start, int width, string address)

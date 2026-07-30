@@ -9,7 +9,11 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 public sealed class CodegenTiledContractionSchedule
 {
     private static readonly IReadOnlyList<CodegenTiledContractionSchedule> _searchSpace =
-        Array.AsReadOnly(new[]
+        BuildSearchSpace();
+
+    private static IReadOnlyList<CodegenTiledContractionSchedule> BuildSearchSpace()
+    {
+        var geometries = new[]
         {
             // The model-selected tile is retained separately as "tiled-contraction".
             // These schedules test the two missing architectural levers identified by
@@ -23,16 +27,29 @@ public sealed class CodegenTiledContractionSchedule
             new CodegenTiledContractionSchedule(64, 112, 16, 8, 4),
             new CodegenTiledContractionSchedule(32, 56, 32, 4, 2),
             new CodegenTiledContractionSchedule(64, 56, 32, 8, 2),
-        });
+        };
+        var schedules = new List<CodegenTiledContractionSchedule>(geometries.Length * 2);
+        schedules.AddRange(geometries);
+        foreach (CodegenTiledContractionSchedule geometry in geometries)
+        {
+            schedules.Add(new CodegenTiledContractionSchedule(
+                geometry.TileM, geometry.TileN, geometry.TileK,
+                geometry.ThreadTileM, geometry.ThreadTileN,
+                registerPrefetch: true));
+        }
+        return schedules.AsReadOnly();
+    }
 
     public CodegenTiledContractionSchedule(
-        int tileM, int tileN, int tileK, int threadTileM, int threadTileN)
+        int tileM, int tileN, int tileK, int threadTileM, int threadTileN,
+        bool registerPrefetch = false)
     {
         TileM = tileM;
         TileN = tileN;
         TileK = tileK;
         ThreadTileM = threadTileM;
         ThreadTileN = threadTileN;
+        RegisterPrefetch = registerPrefetch;
     }
 
     public int TileM { get; }
@@ -40,8 +57,9 @@ public sealed class CodegenTiledContractionSchedule
     public int TileK { get; }
     public int ThreadTileM { get; }
     public int ThreadTileN { get; }
+    public bool RegisterPrefetch { get; }
     public string WinnerName => FormattableString.Invariant(
-        $"tiled-contraction:m{TileM}n{TileN}k{TileK}tm{ThreadTileM}tn{ThreadTileN}");
+        $"tiled-contraction:m{TileM}n{TileN}k{TileK}tm{ThreadTileM}tn{ThreadTileN}{(RegisterPrefetch ? ":rp" : string.Empty)}");
     public static IReadOnlyList<CodegenTiledContractionSchedule> SearchSpace => _searchSpace;
 
     public static CodegenTiledContractionSchedule? Find(string? winner)
@@ -78,7 +96,7 @@ public sealed class CodegenTiledContractionPlan
         int mAxis, int reductionAxis,
         int batch, int m, int n, int k, bool matrixReductionMajor,
         int tileM, int tileN, int tileK, int threadTileM, int threadTileN,
-        int stages)
+        int stages, bool registerPrefetch)
     {
         MatrixInput = matrixInput;
         StreamInput = streamInput;
@@ -97,6 +115,7 @@ public sealed class CodegenTiledContractionPlan
         ThreadTileM = threadTileM;
         ThreadTileN = threadTileN;
         Stages = stages;
+        RegisterPrefetch = registerPrefetch;
     }
 
     /// <summary>Product operand containing only the M and K axes.</summary>
@@ -149,6 +168,9 @@ public sealed class CodegenTiledContractionPlan
 
     /// <summary>Shared-memory buffers used by the contraction pipeline.</summary>
     public int Stages { get; }
+
+    /// <summary>Whether the next shared-memory K fragment is prefetched into registers.</summary>
+    public bool RegisterPrefetch { get; }
 
     /// <summary>Threads along the M side of the CTA tile.</summary>
     public int ThreadsM => TileM / ThreadTileM;
@@ -336,7 +358,7 @@ public sealed class CodegenTiledContractionPlan
             matrixInput, streamInput, spec.BiasInput, spec.ScaleInput,
             mAxis, reduction, batch, m, n, k,
             reductionMajor, tileM, tileN, tileK, threadTileM, threadTileN,
-            stages);
+            stages, schedule?.RegisterPrefetch ?? false);
         reason = "eligible";
         return true;
     }

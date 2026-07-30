@@ -106,10 +106,13 @@ public static class CodegenAutotuneCache
         {
             if (line.Length == 0 || line[0] == '#') continue;
             string[] cells = line.Split('\t');
-            // Legacy six-column rows have no device, target, spec or emitter identity. They
-            // are deliberately stale: accepting one would reinstall exactly the name-only
-            // cache this type exists to remove.
-            if (cells.Length < 10) continue;
+            // A promotable row must carry exact build identity and prove that every
+            // candidate in that identity's finite search was considered. Candidate-filtered
+            // probes are useful experiments, but accepting one as dispatch would let a
+            // hand-picked subset masquerade as autotuning.
+            if (cells.Length != 11 ||
+                !string.Equals(cells[10], "full", StringComparison.Ordinal))
+                continue;
             if (!string.Equals(cells[5], CodegenMeasurementProtocol.Tag, StringComparison.Ordinal))
                 continue;
 

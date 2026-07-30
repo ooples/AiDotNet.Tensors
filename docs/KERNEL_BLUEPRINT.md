@@ -171,6 +171,12 @@ records the winner. Two bugs it exposed are worth repeating because both were si
   every depthwise entry — so those kernels ran untuned while the cache reported them tuned.
   A cache miss is indistinguishable from "the modelled choice already won".
 
+A filtered `--candidate` run is a probe, not an autotune decision. Probe rows are written to
+`artifacts/autotune-probe.tsv` by default and carry `scope=probe`; the dispatch cache accepts
+only `scope=full` rows produced by the complete finite search. This prevents a hand-picked
+candidate subset from masquerading as the measured winner even when its spec, device, target,
+emitter fingerprint, and measurement protocol are otherwise current.
+
 ---
 
 ## 6. Promotion is per family, on that family's own evidence

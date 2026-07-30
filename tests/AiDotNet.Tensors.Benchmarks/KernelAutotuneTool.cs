@@ -154,8 +154,11 @@ internal static class KernelAutotuneTool
             return;
         }
 
-        string outputPath = ValueOf(args, "--out") ??
-            Path.Combine(Directory.GetCurrentDirectory(), "artifacts", "autotune.tsv");
+        string? requestedOutput = ValueOf(args, "--out");
+        string outputPath = requestedOutput ?? Path.Combine(
+            Directory.GetCurrentDirectory(), "artifacts",
+            candidateSelector is null ? "autotune.tsv" : "autotune-probe.tsv");
+        string searchScope = candidateSelector is null ? "full" : "probe";
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         Console.WriteLine();
@@ -216,7 +219,8 @@ internal static class KernelAutotuneTool
                         identity.DeviceFingerprint,
                         identity.Target,
                         identity.SpecFingerprint,
-                        identity.EmitterFingerprint);
+                        identity.EmitterFingerprint,
+                        searchScope);
                 }
                 catch (Exception ex)
                 {
@@ -238,7 +242,7 @@ internal static class KernelAutotuneTool
         text.AppendLine("# autotune winners, " + CodegenMeasurementProtocol.Tag + ": " +
                         CodegenMeasurementProtocol.Description);
         text.AppendLine(
-            "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter");
+            "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope");
         foreach (CodegenCatalogEntry entry in CodegenKernelCatalog.All)
             if (rows.TryGetValue(entry.Name, out string? row)) text.AppendLine(row);
         string temporaryOutput = outputPath + ".tmp-" +
@@ -252,7 +256,8 @@ internal static class KernelAutotuneTool
         Console.WriteLine(improved + " kernels improved past the " +
                           noiseFloorPercent.ToString("0.##", CultureInfo.InvariantCulture) +
                           "% noise floor");
-        Console.WriteLine("winners written to " + outputPath);
+        Console.WriteLine((candidateSelector is null ? "winners" : "probe results") +
+                          " written to " + outputPath);
         CodegenAutotuneCache.Invalidate();
     }
 
@@ -274,9 +279,10 @@ internal static class KernelAutotuneTool
         for (int i = 2; i < lines.Length; i++)
         {
             string[] cells = lines[i].Split('\t');
-            if (cells.Length != 10 || selected.Contains(cells[0]) ||
+            if (cells.Length != 11 || selected.Contains(cells[0]) ||
                 !string.Equals(cells[5], CodegenMeasurementProtocol.Tag,
-                    StringComparison.Ordinal))
+                    StringComparison.Ordinal) ||
+                !string.Equals(cells[10], "full", StringComparison.Ordinal))
                 continue;
 
             CodegenCatalogEntry? entry = CodegenKernelCatalog.Find(cells[0]);

@@ -373,6 +373,7 @@ internal static class KernelCatalogOracleTool
             doubleBuffered = plan.Stages > 1;
             vectorSharedLoads = true;
             features.Add("register-tiled");
+            if (plan.RegisterPrefetch) features.Add("register-prefetch");
             shape = plan.TileM + "x" + plan.TileN + "x" + plan.TileK +
                 ", matrix+stream";
         }
@@ -618,8 +619,11 @@ internal static class KernelCatalogOracleTool
                 schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
                 " shared bytes with " + schedule.Features + ".",
                 "Vector shared fragments and a cp.async double buffer are already active. " +
-                "Next measure warp-specialized producer/consumer roles or register " +
-                "double-buffering across K. Keep " +
+                (schedule.Features.Contains("register-prefetch", StringComparison.Ordinal)
+                    ? "Register prefetch across K is also active; next measure warp-specialized " +
+                      "producer/consumer roles. Keep "
+                    : "Register prefetch across K was included in the exact finite search and " +
+                      "did not win; next measure warp-specialized producer/consumer roles. Keep ") +
                 "geometry selection in the exact schedule search rather than hard-coding an " +
                 "operation-specific tile.");
         }
