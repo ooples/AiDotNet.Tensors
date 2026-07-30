@@ -1068,6 +1068,42 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGrid, engine);
     }
 
+    /// <summary>
+    /// GridSample backward for the (mode, padding, alignCorners) overload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// That overload previously recorded NOTHING, so a mode-aware GridSample silently produced no
+    /// gradient for either the input or the grid, while the 2-argument overload produced both.
+    /// </para>
+    /// <para>
+    /// The sampling parameters are forwarded to the mode-aware
+    /// <c>GridSampleBackwardInput</c>/<c>GridSampleBackwardGrid</c> entry points, which implement
+    /// Bilinear + Zeros + alignCorners=false and raise <see cref="NotSupportedException"/> for anything
+    /// else. Deliberately NOT routed to the default kernels unconditionally: Nearest is
+    /// piecewise-constant so its grid gradient is 0 rather than bilinear weights, and Border/Reflection
+    /// padding changes which source pixels a boundary sample reads. Silently returning the bilinear
+    /// gradient for those would be a wrong gradient, which is worse than a loud failure.
+    /// </para>
+    /// </remarks>
+    internal static void GridSampleModeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(GridSampleModeBackward), savedState, 3);
+        var mode = (GridSampleMode)SavedInt(nameof(GridSampleModeBackward), savedState, 0, "mode");
+        var padding = (GridSamplePadding)SavedInt(nameof(GridSampleModeBackward), savedState, 1, "padding");
+        bool alignCorners = SavedBool(nameof(GridSampleModeBackward), savedState, 2, "alignCorners");
+
+        var gradInput = engine.GridSampleBackwardInput(
+            gradOutput, inputs[1], inputs[0]._shape, mode, padding, alignCorners);
+        var gradGrid = engine.GridSampleBackwardGrid(
+            gradOutput, inputs[0], inputs[1], mode, padding, alignCorners);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGrid, engine);
+    }
+
     /// <summary>Unfold backward: fold the gradient back to input shape</summary>
     internal static void UnfoldBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

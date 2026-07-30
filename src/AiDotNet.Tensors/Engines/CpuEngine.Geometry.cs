@@ -600,6 +600,25 @@ public partial class CpuEngine
                 }
             }
         }
+
+        // NOT tape-registered, deliberately, pending the convention mismatch documented in
+        // GridSampleForwardConventionTests.
+        //
+        // Wiring this to BackwardFunctions.GridSampleModeBackward (which forwards to the mode-aware
+        // GridSampleBackwardInput/Grid entry points) was tried and REVERTED: finite differences
+        // rejected it even for Bilinear + Zeros + alignCorners=false, the one combination those
+        // entry points claim to support (analytical 0.0390 vs numerical 0.1862).
+        //
+        // The cause is not the backward but a FORWARD disagreement. The 2-argument
+        // GridSample(input, grid) shim computes its pixel mapping as (size - 1) / 2 — the
+        // alignCorners=TRUE convention — and clamps sample indices into [0, size-1], which is BORDER
+        // padding. This method uses NormalizedToPixel(..., alignCorners) and SampleSafe(..., padding),
+        // so at Bilinear/Zeros/alignCorners=false the two produce different outputs (0.5900 vs 0.5737
+        // on the same inputs). The GridSampleBackward* kernels implement the shim's convention, so
+        // they are not the adjoint of THIS forward.
+        //
+        // Recording no gradient keeps the gradcheck sweep reporting the gap honestly; recording a
+        // gradient that finite differences reject would hide it.
         return output;
     }
 

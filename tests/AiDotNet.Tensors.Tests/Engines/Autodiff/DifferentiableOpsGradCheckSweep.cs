@@ -246,10 +246,12 @@ public class DifferentiableOpsGradCheckSweep
 
         // --- gather / scatter / index: the index tensor must stay in range for its axis ---
         ["Gather"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), 1],
-        // Scatter / ScatterAdd's index+value form wants indices and values shaped like the DESTINATION,
-        // not a smaller slice — a [2,2] index grid against a [2,3] target indexed out of range.
-        ["Scatter"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 3], 3, r), SafeTensor([2, 3], r), 1],
-        ["ScatterAdd|T,Ti,T,int"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 3], 3, r), SafeTensor([2, 3], r), 1],
+        // Scatter / ScatterAdd's index+value form: `indices` is 1-D along the scatter axis (length
+        // <= that axis) and `values` is the input shape with the axis replaced by indices.Length —
+        // the loop walks `idx < indices.Length` against innerSize, so a full-size index grid overruns
+        // the values array.
+        ["Scatter"] = r => [SafeTensor([2, 3], r), IdxTensor([2], 3, r), SafeTensor([2, 2], r), 1],
+        ["ScatterAdd|T,Ti,T,int"] = r => [SafeTensor([2, 3], r), IdxTensor([2], 3, r), SafeTensor([2, 2], r), 1],
         // Segment-style scatter family: source rows are grouped by indices along dim.
         ["ScatterAdd|T,Ti,int,int?"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
         ["ScatterSoftmax"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
@@ -301,9 +303,11 @@ public class DifferentiableOpsGradCheckSweep
         // --- ops whose shapes are dictated by their own validation ---
         // Octonions: input [B, F, 8] and weight [O, F, 8] — rank-3 with last dim 8 and matching F.
         ["OctonionMatMulTensor"] = r => [SafeTensor([1, 2, 8], r), SafeTensor([3, 2, 8], r)],
-        // Locally-connected: rank-6 weights [outC, outH, outW, inC, kh, kw]; 4x4 input with a 3x3
-        // kernel at stride 1 gives outH = outW = 2.
-        ["LocallyConnectedConv2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([3, 2, 2, 2, 3, 3], r),
+        // Locally-connected: rank-6 weights lead with the OUTPUT SPATIAL dims —
+        // [outH, outW, outC, inC, kh, kw] — which the op's own error message confirms
+        // ("Calculated output dimensions (2x2) do not match weights dimensions (3x2)"). A 4x4 input
+        // with a 3x3 kernel at stride 1 gives outH = outW = 2.
+        ["LocallyConnectedConv2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([2, 2, 3, 2, 3, 3], r),
                                            null!, new[] { 1, 1 }],
         // Trilinear: grid is [D, H, W, C] and positions are [N, 3].
         ["TensorTrilinearInterpolate"] = r => [SafeTensor([2, 2, 2, 1], r), TrilinearPositions()],
@@ -316,8 +320,10 @@ public class DifferentiableOpsGradCheckSweep
         //     shaped [batch, seqLen, numHeads]; modelDim must divide by numHeads ---
         ["Rwkv4WkvForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                     SafeTensor([4], r), SafeTensor([4], r)],
+        // RWKV-7's decayLogit and iclRate are per-CHANNEL ([B, L, modelDim]), not per-head — unlike
+        // the GLA / GatedDeltaNet / xLSTM gates, which are [B, L, numHeads].
         ["Rwkv7SequenceForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
-                                         SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
+                                         SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), 2],
         ["GlaScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                    SafeTensor([1, 3, 2], r), 2],
         ["GatedDeltaNetScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
@@ -331,8 +337,12 @@ public class DifferentiableOpsGradCheckSweep
         // d [innerDim].
         ["MambaSelectiveScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([4, 2], r),
                                               SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([4], r)],
-        ["Mamba2SsdScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([4, 2], r),
-                                         SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([4], r), 2],
+        // Mamba-2 SSD is per-HEAD where Mamba S6 is per-channel: delta is [B, L, numHeads], and aLog
+        // and dParam are per-head SCALAR vectors of length numHeads rather than S6's
+        // [innerDim, stateDim] matrix and [innerDim] vector. That is the "scalar-decay"
+        // simplification SSD makes to obtain its matmul-based form.
+        ["Mamba2SsdScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 2], r), SafeTensor([2], r),
+                                         SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([2], r), 2],
         ["TensorMaskedScatter"] = r => [SafeTensor([2, 3], r), BitMask([2, 3]), SafeTensor([2, 3], r)],
         ["TensorMaskedSelect"] = r => [SafeTensor([2, 3], r), BitMask([2, 3])],
 
@@ -679,7 +689,13 @@ public class DifferentiableOpsGradCheckSweep
 
                 // Sanity: does it even run untaped on this shape?
                 try { _ = m.Invoke(_engine, CopyArgs(args)); }
-                catch (Exception ex) { lastSkip = $"{shape.Length}D threw {Inner(ex).GetType().Name}"; continue; }
+                // Include the exception MESSAGE, not just its type: these ops validate their own shape
+                // requirements and say precisely what they wanted, which is what a table entry needs.
+                catch (Exception ex)
+                {
+                    lastSkip = $"{shape.Length}D threw {Inner(ex).GetType().Name}: {Inner(ex).Message}";
+                    continue;
+                }
 
                 // Check EVERY tensor parameter, not just the first. Taking the first is wrong for
                 // ops whose leading tensor is not a differentiable input — TensorWhere's leading
