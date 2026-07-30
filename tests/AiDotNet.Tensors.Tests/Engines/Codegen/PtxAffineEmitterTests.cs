@@ -194,6 +194,14 @@ public class PtxAffineEmitterTests
         dW.Upload<float>(weights);
         dB.Upload<float>(bias);
 
+        Assert.Throws<InvalidOperationException>(() => runtime.CaptureGraph(() =>
+        {
+            LaunchFour(module, fn, dIn.Pointer, dW.Pointer, dB.Pointer, dOut.Pointer,
+                PtxAffineEmitter.GridBlocks(spec));
+            throw new InvalidOperationException("deliberate capture-body failure");
+        }));
+
+        // A failed capture must leave the stream reusable by the next capture.
         using DirectPtxGraph graph = runtime.CaptureGraph(() =>
             LaunchFour(module, fn, dIn.Pointer, dW.Pointer, dB.Pointer, dOut.Pointer,
                 PtxAffineEmitter.GridBlocks(spec)));

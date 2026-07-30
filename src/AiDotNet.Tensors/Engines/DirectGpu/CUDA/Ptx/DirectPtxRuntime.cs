@@ -231,9 +231,13 @@ internal sealed class DirectPtxRuntime : IDisposable
             _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
             "cuStreamBeginCapture");
         IntPtr graph = IntPtr.Zero;
+        bool endCaptureCalled = false;
         try
         {
             launch();
+            // EndCapture terminates the capture even when it reports an error. Mark
+            // the attempt first so no failure below can issue a second EndCapture.
+            endCaptureCalled = true;
             Check(CudaNativeBindings.cuStreamEndCapture(_stream, out graph),
                 "cuStreamEndCapture");
             Check(CudaNativeBindings.cuGraphInstantiate(
@@ -242,8 +246,11 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
         catch
         {
-            CudaNativeBindings.cuStreamEndCapture(_stream, out IntPtr aborted);
-            if (aborted != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(aborted);
+            if (!endCaptureCalled &&
+                CudaNativeBindings.cuStreamEndCapture(_stream, out IntPtr aborted) ==
+                    CudaResult.Success &&
+                aborted != IntPtr.Zero)
+                CudaNativeBindings.cuGraphDestroy(aborted);
             throw;
         }
         finally
