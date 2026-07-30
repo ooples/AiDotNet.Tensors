@@ -34017,6 +34017,15 @@ public partial class CpuEngine : ITensorLevelEngine
             dest[i] = isTrue ? xSpan[i] : ySpan[i];
         }
 
+        // Tape registration — condition is non-trainable; the gradient routes through x
+        // where the condition is true and through y otherwise. This overload previously
+        // recorded NOTHING, so TensorWhere(Tensor<T>, ...) silently produced no gradient
+        // for x or y even though it is classified differentiable in OpRegistry — the
+        // xOrig/yOrig/conditionOrig locals above were captured for a tape call that was
+        // never made. The Tensor<bool>/Tensor<Bit> overloads and the GPU override all
+        // record; only this one did not.
+        DifferentiableOps.RecordBinary("TensorWhere", result, xOrig, yOrig,
+            BackwardFunctions<T>.WhereBackward, new object[] { condition });
         return result;
     }
 

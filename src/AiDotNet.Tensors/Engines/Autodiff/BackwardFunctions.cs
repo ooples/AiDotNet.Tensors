@@ -2979,9 +2979,20 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         if (savedState[0] is Tensor<T> condTensor)
         {
-            var gradX = engine.TensorMultiply(gradOutput, condTensor);
-            var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(condTensor, numOps.Zero), numOps.One);
-            var invCond = engine.TensorSubtract(ones, condTensor);
+            // BINARISE the mask before using it as a gradient weight. The forward selects x
+            // whenever the condition is merely NON-ZERO (isTrue = !Equals(cond, Zero)), so
+            // using the raw values here is only correct for an exactly-0/1 mask: a mask entry
+            // of 2.0 would scale gradX by 2 and make gradY = (1 - 2) = -1, inventing gradient
+            // where the forward made a plain selection. Both the CpuEngine Tensor<T> overload
+            // and the DirectGpuTensorEngine override save the raw condition tensor, so this
+            // guard is what keeps them consistent with the forward they differentiate.
+            var mask = TensorPool<T>.RentZeroed(condTensor._shape);
+            for (int i = 0; i < condTensor.Length; i++)
+                mask[i] = numOps.Equals(condTensor[i], numOps.Zero) ? numOps.Zero : numOps.One;
+
+            var gradX = engine.TensorMultiply(gradOutput, mask);
+            var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(mask, numOps.Zero), numOps.One);
+            var invCond = engine.TensorSubtract(ones, mask);
             var gradY = engine.TensorMultiply(gradOutput, invCond);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
