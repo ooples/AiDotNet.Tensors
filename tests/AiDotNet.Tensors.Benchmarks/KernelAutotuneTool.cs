@@ -1455,24 +1455,9 @@ internal static class KernelAutotuneTool
         float[] candidate, float[] reference, out double deviation,
         out long worstIndex, out float actual, out float expected)
     {
-        double worst = 0, scale = 0;
-        worstIndex = -1;
-        actual = 0;
-        expected = 0;
-        for (long e = 0; e < candidate.Length; e++)
-        {
-            double difference = Math.Abs(candidate[e] - reference[e]);
-            if (difference > worst)
-            {
-                worst = difference;
-                worstIndex = e;
-                actual = candidate[e];
-                expected = reference[e];
-            }
-            scale = Math.Max(scale, Math.Abs((double)reference[e]));
-        }
-        deviation = scale > 0 ? worst / scale : worst;
-        return deviation <= CodegenMeasurementProtocol.AccumulationTolerance;
+        return CodegenOutputAgreement.Agrees(
+            candidate, reference, CodegenMeasurementProtocol.AccumulationTolerance,
+            out deviation, out worstIndex, out actual, out expected);
     }
 
     private static long ClosestIndex(float[] values, float target)
