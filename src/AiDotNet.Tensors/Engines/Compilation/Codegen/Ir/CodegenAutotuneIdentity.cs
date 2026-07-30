@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
@@ -24,6 +25,11 @@ public sealed record CodegenAutotuneIdentity(
     string SpecFingerprint,
     string EmitterFingerprint)
 {
+    private const int MaximumCachedIdentities = 256;
+    private static readonly object _identityCacheLock = new();
+    private static readonly Dictionary<IdentityCacheKey,
+        Lazy<CodegenAutotuneIdentity>> _identityCache = new();
+    private static readonly Queue<CachedIdentity> _identityInsertionOrder = new();
     private static readonly IReadOnlyList<int> _chunkedSplitFactors =
         Array.AsReadOnly(new[] { 2, 4, 7, 14 });
 
@@ -51,6 +57,45 @@ public sealed record CodegenAutotuneIdentity(
         if (computeMajor <= 0 || computeMinor < 0)
             throw new ArgumentOutOfRangeException(nameof(computeMajor));
 
+        string specFingerprint = Hash(CanonicalSpec(spec));
+        var key = new IdentityCacheKey(
+            specFingerprint, deviceFingerprint, computeMajor, computeMinor);
+        var candidate = new Lazy<CodegenAutotuneIdentity>(
+            () => CreateUncached(spec, deviceFingerprint, computeMajor, computeMinor,
+                specFingerprint),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        Lazy<CodegenAutotuneIdentity> cached = GetOrAddIdentity(key, candidate);
+
+        try
+        {
+            return cached.Value;
+        }
+        catch
+        {
+            RemoveIdentity(key, cached);
+            throw;
+        }
+    }
+
+    private static Lazy<CodegenAutotuneIdentity> GetOrAddIdentity(
+        IdentityCacheKey key, Lazy<CodegenAutotuneIdentity> candidate)
+    {
+        lock (_identityCacheLock)
+        {
+            if (_identityCache.TryGetValue(key, out Lazy<CodegenAutotuneIdentity>? cached))
+                return cached;
+
+            _identityCache.Add(key, candidate);
+            _identityInsertionOrder.Enqueue(new CachedIdentity(key, candidate));
+            TrimIdentityCache();
+            return candidate;
+        }
+    }
+
+    private static CodegenAutotuneIdentity CreateUncached(
+        CodegenKernelSpec spec, string deviceFingerprint, int computeMajor, int computeMinor,
+        string specFingerprint)
+    {
         // Fingerprint what the tuner can ACTUALLY emit for this spec. An assembly MVID is
         // too broad and too unstable: repository/build metadata changed it after a benchmark-
         // only commit, silently invalidating every winner even though no emitted instruction
@@ -61,9 +106,43 @@ public sealed record CodegenAutotuneIdentity(
             deviceFingerprint,
             "sm" + computeMajor.ToString(CultureInfo.InvariantCulture) +
                 computeMinor.ToString(CultureInfo.InvariantCulture),
-            Hash(CanonicalSpec(spec)),
+            specFingerprint,
             emitter);
     }
+
+    private static void TrimIdentityCache()
+    {
+        while (_identityCache.Count > MaximumCachedIdentities &&
+               _identityInsertionOrder.Count > 0)
+        {
+            CachedIdentity oldest = _identityInsertionOrder.Dequeue();
+            if (_identityCache.TryGetValue(
+                    oldest.Key, out Lazy<CodegenAutotuneIdentity>? current) &&
+                ReferenceEquals(current, oldest.Value))
+                _identityCache.Remove(oldest.Key);
+        }
+    }
+
+    private static void RemoveIdentity(
+        IdentityCacheKey key, Lazy<CodegenAutotuneIdentity> expected)
+    {
+        lock (_identityCacheLock)
+        {
+            if (_identityCache.TryGetValue(
+                    key, out Lazy<CodegenAutotuneIdentity>? current) &&
+                ReferenceEquals(current, expected))
+                _identityCache.Remove(key);
+        }
+    }
+
+    private readonly record struct IdentityCacheKey(
+        string SpecFingerprint,
+        string DeviceFingerprint,
+        int ComputeMajor,
+        int ComputeMinor);
+
+    private sealed record CachedIdentity(
+        IdentityCacheKey Key, Lazy<CodegenAutotuneIdentity> Value);
 
     private static string FingerprintEmitterSearchSpace(
         CodegenKernelSpec spec, int computeMajor, int computeMinor)

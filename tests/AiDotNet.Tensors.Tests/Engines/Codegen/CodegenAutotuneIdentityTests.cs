@@ -2,6 +2,8 @@
 
 using System;
 using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using Xunit;
 
@@ -25,7 +27,7 @@ public class CodegenAutotuneIdentityTests
     }
 
     [Fact]
-    public void Identity_IsStableForTheSameInputs_AndChangesWithTheSpec()
+    public async Task Identity_IsMemoizedForTheSameInputs_AndIsolatedBySpecAndDevice()
     {
         var first = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(1, 32, 16, 16);
         var changed = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(1, 64, 16, 16);
@@ -33,7 +35,20 @@ public class CodegenAutotuneIdentityTests
         var a = CodegenAutotuneIdentity.Create(first, "gpu-a-sm86-drv1", 8, 6);
         var b = CodegenAutotuneIdentity.Create(first, "gpu-a-sm86-drv1", 8, 6);
         var c = CodegenAutotuneIdentity.Create(changed, "gpu-a-sm86-drv1", 8, 6);
+        var d = CodegenAutotuneIdentity.Create(first, "gpu-b-sm86-drv1", 8, 6);
+        var e = CodegenAutotuneIdentity.Create(first, "gpu-a-sm86-drv1", 9, 0);
+        Task<CodegenAutotuneIdentity>[] concurrent = Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(() => CodegenAutotuneIdentity.Create(
+                first, "gpu-concurrent-sm86-drv1", 8, 6)))
+            .ToArray();
+        CodegenAutotuneIdentity[] concurrentResults = await Task.WhenAll(concurrent);
 
+        Assert.Same(a, b);
+        Assert.NotSame(a, c);
+        Assert.NotSame(a, d);
+        Assert.NotSame(a, e);
+        Assert.Equal("sm90", e.Target);
+        Assert.All(concurrentResults, identity => Assert.Same(concurrentResults[0], identity));
         Assert.Equal(a, b);
         Assert.NotEqual(a.SpecFingerprint, c.SpecFingerprint);
         Assert.Equal("sm86", a.Target);
