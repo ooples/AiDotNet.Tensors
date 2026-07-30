@@ -1053,16 +1053,14 @@ public partial class DirectGpuTensorEngine
             backend.Synchronize();
         });
 
-        // Same backward contract as CpuEngine.RFFT (grad flows back through IRFFT). RecordUnary is a no-op
-        // when no tape is active, so this costs nothing outside training while making the GPU path usable
-        // inside it. The grad-side IRFFT dispatches to the GPU override too.
+        // Same backward as CpuEngine.RFFT: the ADJOINT, not the inverse. This previously routed the
+        // gradient through engine.IRFFT, which is the INVERSE transform (1/N scaling plus Hermitian
+        // doubling) rather than the transpose — the same adjoint-vs-inverse confusion fixed on the CPU
+        // side earlier in this branch. RecordUnary is a no-op when no tape is active, so this costs
+        // nothing outside training.
         Autodiff.DifferentiableOps.RecordUnary("RFFT", gpuResult, input,
-            static (gradOutput, inputs, output, savedState, engine, grads) =>
-            {
-                var signalLengthSaved = (int)savedState[0];
-                var grad = engine.IRFFT(gradOutput, signalLengthSaved);
-                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-            }, new object[] { signalLength });
+            Autodiff.BackwardFunctions<T>.RFFTAdjointBackward,
+            new object[] { signalLength, nFft });
         return gpuResult;
     }
 
@@ -1112,13 +1110,13 @@ public partial class DirectGpuTensorEngine
             backend.Synchronize();
         });
 
-        // Mirrors CpuEngine.IRFFT: the backward of IRFFT is RFFT.
+        // Mirrors CpuEngine.IRFFT: the backward of IRFFT is its ADJOINT, not RFFT. Routing the
+        // gradient through engine.RFFT treated the inverse transform's transpose as a forward
+        // transform, dropping the 1/N scaling and the Hermitian-doubling structure — the same
+        // adjoint-vs-inverse defect fixed on the CPU side earlier in this branch.
         Autodiff.DifferentiableOps.RecordUnary("IRFFT", gpuResult, input,
-            static (gradOutput, inputs, output, savedState, engine, grads) =>
-            {
-                var grad = engine.RFFT(gradOutput);
-                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-            }, System.Array.Empty<object>());
+            Autodiff.BackwardFunctions<T>.IRFFTAdjointBackward,
+            new object[] { numFreqs, nFft, outputLength });
         return gpuResult;
     }
 
@@ -2019,7 +2017,7 @@ public partial class DirectGpuTensorEngine
             using var clampedB = backend.AllocateBuffer(batchSize);
             using var denominator = backend.AllocateBuffer(batchSize);
 
-            return DispatchDeferredGpuOp<T>(backend, batchSize, outShape, output =>
+            var cosRes = DispatchDeferredGpuOp<T>(backend, batchSize, outShape, output =>
             {
                 backend.Multiply(a.Buffer, b.Buffer, product, x1.Length);
                 backend.Multiply(a.Buffer, a.Buffer, squareA, x1.Length);
@@ -2034,6 +2032,12 @@ public partial class DirectGpuTensorEngine
                 backend.Multiply(clampedA, clampedB, denominator, batchSize);
                 backend.Divide(dot, denominator, output, batchSize);
             });
+            // Uses the DIM-AWARE backward, matching CpuEngine — CosineSimilarityBackward belongs to
+            // TensorCosineSimilarityLoss (a whole-tensor scalar loss) and would be wrong here.
+            DifferentiableOps.RecordBinary("TensorCosineSimilarity", cosRes, x1, x2,
+                BackwardFunctions<T>.CosineSimilarityDimBackward,
+                savedState: new object[] { dim < 0 ? dim + x1.Rank : dim, eps });
+            return cosRes;
         }
         catch (Exception) { return base.TensorCosineSimilarity(x1, x2, dim, eps); }
     }
@@ -3025,7 +3029,10 @@ public partial class DirectGpuTensorEngine
             }
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             foreach (var b in blockBufs) b.Dispose();
-            return new Tensor<T>(arr, new[] { totalRows, totalCols });
+            var res = new Tensor<T>(arr, new[] { totalRows, totalCols });
+            DifferentiableOps.RecordIfActive("TensorBlockDiag", res, matrices,
+                BackwardFunctions<T>.BlockDiagBackward);
+            return res;
         }
         catch (Exception) { return base.TensorBlockDiag(matrices); }
     }
@@ -3055,7 +3062,13 @@ public partial class DirectGpuTensorEngine
             for (int k = 0; k < m; k++) reshaped[k] = grids[k].Reshape(withOne);
             var stacked = TensorConcatenate(reshaped, gshape.Length);
             int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
-            return stacked.Reshape(new[] { prod, m });
+            var res = stacked.Reshape(new[] { prod, m });
+            // The meshgrid/concat/reshape composition above builds its own tape entries against the
+            // intermediate grids, not against `tensors`, so the caller's inputs get no gradient
+            // without this explicit record.
+            DifferentiableOps.RecordIfActive("TensorCartesianProd", res, tensors,
+                BackwardFunctions<T>.CartesianProdBackward);
+            return res;
         }
         catch (Exception) { return base.TensorCartesianProd(tensors); }
     }
@@ -3599,7 +3612,13 @@ public partial class DirectGpuTensorEngine
             var bufOut = AllocateOutputBuffer(backend, outN);
             backend.PDist(bufIn.Buffer, bufOut.Buffer, n, d, (float)p);
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
-            return new Tensor<T>(arr, new[] { outN });
+            var res = new Tensor<T>(arr, new[] { outN });
+            // Record against the ORIGINAL input, not the Contiguous() copy, and with the same
+            // backward the CPU path uses — otherwise the GPU override silently drops the gradient
+            // the CPU engine now provides.
+            DifferentiableOps.RecordUnary("TensorPDist", res, input,
+                BackwardFunctions<T>.PDistBackward, savedState: new object[] { p });
+            return res;
         }
         catch (Exception) { return base.TensorPDist(input, p); }
     }
@@ -3628,7 +3647,11 @@ public partial class DirectGpuTensorEngine
             var bufOut = AllocateOutputBuffer(backend, outN);
             backend.CDist(buf1.Buffer, buf2.Buffer, bufOut.Buffer, m, n, d, (float)p);
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
-            return new Tensor<T>(arr, new[] { m, n });
+            var res = new Tensor<T>(arr, new[] { m, n });
+            // Record against the ORIGINAL operands, not the Contiguous() copies.
+            DifferentiableOps.RecordBinary("TensorCDist", res, x1, x2,
+                BackwardFunctions<T>.CDistBackward, savedState: new object[] { p });
+            return res;
         }
         catch (Exception) { return base.TensorCDist(x1, x2, p); }
     }
@@ -4607,7 +4630,10 @@ public partial class DirectGpuTensorEngine
             var bufOut = AllocateOutputBuffer(backend, n);
             backend.NextAfter(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
             var arr = FinishGpuOp<T>(backend, bufOut, n);
-            return new Tensor<T>(arr, (int[])a._shape.Clone());
+            var res = new Tensor<T>(arr, (int[])a._shape.Clone());
+            DifferentiableOps.RecordBinary("TensorNextAfter", res, a, b,
+                BackwardFunctions<T>.NextAfterBackward);
+            return res;
         }
         catch (Exception) { return base.TensorNextAfter(a, b); }
     }
