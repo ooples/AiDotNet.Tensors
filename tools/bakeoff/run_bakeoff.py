@@ -22,8 +22,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 LANE_VERSION = "cudnn-graph-fp32-v5"
+GENERATED_LANE_ATTEMPTS = 15
 COMPETITOR_PLAN_STRATEGIES = (
     "default", "default", "default", "default",
     "exhaustive", "exhaustive", "heuristic",
@@ -89,24 +91,25 @@ def work_for_run():
     return work
 
 
-def run_ours(dll, selector):
-    """Parses --kernel-bench output into {kernel: (us, spread_pct)}."""
+def run_ours_once(dll, selector):
+    """Runs one generated-lane selector with contamination retries."""
     completed = None
     command = ["dotnet", dll, "--kernel-bench"]
-    if selector != "all":
-        command.append(selector)
-    for attempt in range(1, 4):
+    command.append(selector)
+    for attempt in range(1, GENERATED_LANE_ATTEMPTS + 1):
         completed = subprocess.run(command, capture_output=True, text=True)
         if completed.returncode == 0:
             break
         diagnostic = completed.stderr
         contaminated = ("Foreign GPU workload detected" in diagnostic or
                         "GPU is not benchmark-ready" in diagnostic)
-        if not contaminated or attempt == 3:
+        if not contaminated or attempt == GENERATED_LANE_ATTEMPTS:
             raise RuntimeError("generated lane command %r failed (%d): %s" %
                                (command, completed.returncode, diagnostic.strip()))
-        print("  generated lane attempt %d contaminated; retrying clean attempt" % attempt,
-              flush=True)
+        delay = min(attempt, 5)
+        print("  generated lane attempt %d contaminated; retrying after %ds" %
+              (attempt, delay), flush=True)
+        time.sleep(delay)
     assert completed is not None
     out = completed.stdout
     got = {}
@@ -116,6 +119,27 @@ def run_ours(dll, selector):
             got[m.group(1)] = (float(m.group(3)), float(m.group(5)))
     if not got:
         raise RuntimeError("generated lane succeeded but produced no parseable kernel rows")
+    return got
+
+
+def run_ours(dll, selector, kernel_names):
+    """Parses --kernel-bench output into {kernel: (us, spread_pct)}."""
+    if selector != "all":
+        return run_ours_once(dll, selector)
+
+    # A transient WDDM workload must invalidate the affected operation, but it need
+    # not discard clean evidence already collected for the other twelve. Keep the
+    # strict start/end contamination checks in each child and retry at operation
+    # granularity so the full acceptance suite is recoverable without weakening a gate.
+    got = {}
+    for index, name in enumerate(kernel_names, 1):
+        print("  generated operation %d/%d (%s)" %
+              (index, len(kernel_names), name), flush=True)
+        measured = run_ours_once(dll, name)
+        if name not in measured or len(measured) != 1:
+            raise RuntimeError("generated selector %r returned unexpected rows: %r" %
+                               (name, sorted(measured)))
+        got.update(measured)
     return got
 
 
@@ -228,7 +252,7 @@ def main():
                           "py", "run_codegen_bakeoff.py")
 
     print("measuring our generated kernels ...")
-    ours = run_ours(dll, args.selector)
+    ours = run_ours(dll, args.selector, sorted(work))
     print("measuring PyTorch/cuDNN (eager and CUDA-graph) ...")
     theirs, competitor_device = run_torch(
         python, script, args.max_spread_pct, args.selector)
@@ -308,9 +332,8 @@ def main():
     print("  wins at >=1.10x: %d    losses at <=0.91x: %d" % (wins, losses))
     print("  refused as unstable: %d (spread gate %.1f%%)" %
           (refused, args.max_spread_pct))
-    print("  Competitor is the CUDA-GRAPH lane -- the strongest form. Eager PyTorch")
-    print("  allocates an output tensor per call and pays full launch overhead, which")
-    print("  our fixed-buffer launch does not; graph replay removes both.")
+    print("  Both sides use CUDA-GRAPH replay over fixed buffers, so allocation and")
+    print("  eager-launch overhead are excluded from both timed regions.")
     print("  Cross-process, so this cannot be paired the way an in-process A/B is.")
     return 0
 

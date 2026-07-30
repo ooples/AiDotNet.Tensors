@@ -168,6 +168,53 @@ public class PtxAffineEmitterTests
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
 
+    [SkippableFact]
+    public void GeneratedPtx_CudaGraphReplaysCapturedLaunchAndLiveBuffers()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
+
+        var (input, weights, bias) = MakeData();
+        var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(N, C, H, W);
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Experimental generated convolution is unavailable on this GPU architecture.");
+        Assert.NotEqual(IntPtr.Zero, runtime.Stream);
+
+        string ptx = new PtxAffineEmitter().Emit(
+            spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+        IntPtr fn = module.GetFunction(spec.Name, out _);
+        using var dIn = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
+        using var dW = runtime.AllocateBytes((nuint)(weights.Length * sizeof(float)));
+        using var dB = runtime.AllocateBytes((nuint)(bias.Length * sizeof(float)));
+        using var dOut = runtime.AllocateBytes(
+            (nuint)(spec.Output.ElementCount * sizeof(float)));
+        dIn.Upload<float>(input);
+        dW.Upload<float>(weights);
+        dB.Upload<float>(bias);
+
+        using DirectPtxGraph graph = runtime.CaptureGraph(() =>
+            LaunchFour(module, fn, dIn.Pointer, dW.Pointer, dB.Pointer, dOut.Pointer,
+                PtxAffineEmitter.GridBlocks(spec)));
+
+        graph.Launch();
+        runtime.Synchronize();
+        var actual = new float[spec.Output.ElementCount];
+        dOut.Download<float>(actual);
+        AssertClose(Oracle(input, weights, bias), actual, "first graph replay");
+
+        Array.Clear(input, 0, input.Length);
+        dIn.Upload<float>(input);
+        graph.Launch();
+        runtime.Synchronize();
+        dOut.Download<float>(actual);
+        AssertClose(Oracle(input, weights, bias), actual, "replay after input update");
+
+        graph.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => graph.Launch());
+    }
+
     private static unsafe void LaunchFour(
         DirectPtxModule module, IntPtr fn, IntPtr a, IntPtr b, IntPtr c, IntPtr d, uint blocks)
     {
@@ -175,6 +222,20 @@ public class PtxAffineEmitterTests
         void** args = stackalloc void*[4];
         args[0] = &pa; args[1] = &pb; args[2] = &pc; args[3] = &pd;
         module.Launch(fn, blocks, 1, 1, PtxAffineEmitter.BlockThreads, 1, 1, 0, args);
+    }
+
+    private static void AssertClose(double[] expected, float[] actual, string label)
+    {
+        double worst = 0;
+        int at = 0;
+        for (int i = 0; i < actual.Length; i++)
+        {
+            double difference = Math.Abs(expected[i] - actual[i]);
+            if (difference > worst) { worst = difference; at = i; }
+        }
+        Assert.True(worst <= CodegenMeasurementProtocol.AccumulationTolerance,
+            $"{label} deviates by {worst:E3} at index {at}: " +
+            $"expected {expected[at]}, actual {actual[at]}");
     }
 
     /// <summary>

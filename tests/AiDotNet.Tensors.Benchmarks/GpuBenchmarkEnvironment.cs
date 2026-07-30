@@ -26,7 +26,7 @@ internal static class GpuBenchmarkEnvironment
         }
     }
 
-    internal static void RequireNoForeignCompute(string label)
+    internal static void RequireNoForeignCompute(string label, bool afterSuite = false)
     {
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
         int? trustedOrchestrator = int.TryParse(
@@ -35,7 +35,7 @@ internal static class GpuBenchmarkEnvironment
                 ? orchestratorId
                 : null;
         string[] conflicts = FindComputeWorkloadConflicts(
-            processMonitor, Environment.ProcessId, trustedOrchestrator);
+            processMonitor, Environment.ProcessId, trustedOrchestrator, afterSuite);
         if (conflicts.Length != 0)
             throw new InvalidOperationException(
                 $"[{label}] Foreign GPU workload detected; clean benchmark refused: {string.Join("; ", conflicts)}");
@@ -48,7 +48,8 @@ internal static class GpuBenchmarkEnvironment
     }
 
     internal static string[] FindComputeWorkloadConflicts(
-        string processMonitor, int currentProcessId, int? trustedOrchestratorId = null)
+        string processMonitor, int currentProcessId, int? trustedOrchestratorId = null,
+        bool afterSuite = false)
     {
         var conflicts = new List<string>();
         foreach (string line in processMonitor.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -82,7 +83,12 @@ internal static class GpuBenchmarkEnvironment
             // with a 0-1% sample. Treat a mixed process as competing compute only
             // when its measured SM use is material; the separate whole-device
             // guard still rejects >20% utilization at every suite boundary.
-            bool isActiveMixedCompute = processType.Contains('C') &&
+            // A single WDDM pmon sample can retain a C+G percentage after the timed
+            // work has ended, including values inconsistent with a quiet whole-device
+            // snapshot. Enforce mixed-process admission before every suite; afterward,
+            // the row-level spread/clock gates have already judged the timed region and
+            // every compute-only process remains an unconditional conflict.
+            bool isActiveMixedCompute = !afterSuite && processType.Contains('C') &&
                 int.TryParse(smUtilization, out int smPercent) &&
                 smPercent > MixedComputeConflictThresholdPercent;
             if (isComputeOnly || isActiveMixedCompute)

@@ -241,7 +241,7 @@ internal static class KernelLimiterTool
                 CodegenMeasurementProtocol.Tag));
         }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-limiter-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-limiter-end", afterSuite: true);
         if (failedProfiles != 0)
         {
             throw new InvalidOperationException(

@@ -22,6 +22,9 @@ internal readonly struct Conv2DWinogradShape
     internal int Height { get; }
     internal int Width { get; }
     internal int OutputChannels { get; }
+    internal bool Linear { get; }
+    internal bool ReductionMajor { get; }
+    internal bool InvertFilter { get; }
 
     /// <summary>When true the "weights" tensor is the precomputed filter transform
     /// U[K,C,4,4] (produced by <see cref="PtxWinogradF23FilterTransformKernel"/>),
@@ -30,14 +33,21 @@ internal readonly struct Conv2DWinogradShape
 
     internal Conv2DWinogradShape(
         int batch, int inputChannels, int height, int width, int outputChannels,
-        bool filterPretransformed = false)
+        bool filterPretransformed = false, bool linear = false,
+        bool reductionMajor = false, bool invertFilter = false)
     {
         if (batch <= 0 || inputChannels <= 0 || height <= 0 || width <= 0 || outputChannels <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
         if ((height & 1) != 0 || (width & 1) != 0)
             throw new ArgumentException("Winograd F(2,3) bakes an even H and W (whole 2x2 output tiling).");
+        if (filterPretransformed && (reductionMajor || invertFilter))
+            throw new ArgumentException(
+                "Reduction-major or inverted filters require the raw-filter Winograd path.");
         Batch = batch; InputChannels = inputChannels; Height = height; Width = width; OutputChannels = outputChannels;
         FilterPretransformed = filterPretransformed;
+        Linear = linear;
+        ReductionMajor = reductionMajor;
+        InvertFilter = invertFilter;
     }
 
     internal int TileRows => Height / 2;
@@ -49,9 +59,12 @@ internal readonly struct Conv2DWinogradShape
     internal long BiasBytes => (long)OutputChannels * sizeof(float);
     internal long OutputBytes => (long)Batch * OutputChannels * Height * Width * sizeof(float);
 
-    private string Suffix => FilterPretransformed ? "_pretf" : "";
+    private string Suffix => (FilterPretransformed ? "_pretf" : "") +
+        (Linear ? "_linear" : "_bias_relu") +
+        (ReductionMajor ? "_reduction_major" : "") +
+        (InvertFilter ? "_flip" : "");
     internal string EntryPoint => FormattableString.Invariant(
-        $"aidotnet_conv2d_n{Batch}_c{InputChannels}_h{Height}_w{Width}_k{OutputChannels}_3x3s1p1_winograd_f23{Suffix}_bias_relu");
+        $"aidotnet_conv2d_n{Batch}_c{InputChannels}_h{Height}_w{Width}_k{OutputChannels}_3x3s1p1_winograd_f23{Suffix}");
     internal string Variant => FormattableString.Invariant(
         $"n{Batch}-c{InputChannels}-h{Height}-w{Width}-k{OutputChannels}-r3-s1-p1-winograd-f23{Suffix}-fp32");
 }
@@ -112,11 +125,15 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
         var input = new DirectPtxExtent(shape.Batch, shape.InputChannels, shape.Height, shape.Width);
         var weights = shape.FilterPretransformed
             ? new DirectPtxExtent(shape.OutputChannels, shape.InputChannels, 4, 4)   // precomputed U
-            : new DirectPtxExtent(shape.OutputChannels, shape.InputChannels, 3, 3);  // raw g
+            : shape.ReductionMajor
+                ? new DirectPtxExtent(shape.InputChannels, shape.OutputChannels, 3, 3)
+                : new DirectPtxExtent(shape.OutputChannels, shape.InputChannels, 3, 3);  // raw g
         var bias = new DirectPtxExtent(shape.OutputChannels);
         var output = new DirectPtxExtent(shape.Batch, shape.OutputChannels, shape.Height, shape.Width);
         return new DirectPtxKernelBlueprint(
-            Operation: "conv2d-3x3-s1p1-bias-relu-winograd-f23",
+            Operation: shape.Linear
+                ? "conv2d-3x3-s1p1-linear-winograd-f23"
+                : "conv2d-3x3-s1p1-bias-relu-winograd-f23",
             Version: 1,
             Architecture: architecture,
             Variant: shape.Variant,
@@ -140,14 +157,17 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["equation"] = "relu(conv2d-3x3-same(input,weights)+bias)",
+                ["equation"] = shape.Linear
+                    ? "conv2d-3x3-same(input,weights)"
+                    : "relu(conv2d-3x3-same(input,weights)+bias)",
                 ["algorithm"] = "winograd-f23",
                 ["output-tile"] = "2x2",
                 ["input-tile"] = "4x4",
                 ["input"] = "fp32",
                 ["accumulator"] = "fp32-fma",
                 ["output"] = "fp32",
-                ["layout"] = "nchw/oihw",
+                ["layout"] = shape.ReductionMajor ? "nchw/iohw" : "nchw/oihw",
+                ["filter-orientation"] = shape.InvertFilter ? "inverted" : "as-stored",
                 ["padding"] = "same-1",
                 ["shape-selection"] = "host-only-exact-contract",
                 ["promotion"] = "experimental-pending-gpu-evidence"
@@ -207,7 +227,12 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
         int chw = c * h * w;      // input image stride
         int hw = h * w;           // input channel stride
         int wStride = w;          // input/output row stride
-        int wc9 = c * (filterPretransformed ? 16 : 9);  // weights (or U) per output channel
+        int weightsPerOutputChannel = shape.ReductionMajor
+            ? (filterPretransformed ? 16 : 9)
+            : c * (filterPretransformed ? 16 : 9);
+        int weightChannelStride = shape.ReductionMajor
+            ? k * (filterPretransformed ? 16 : 9) * sizeof(float)
+            : (filterPretransformed ? 16 : 9) * sizeof(float);
 
         var p = new StringBuilder(65536);
         p.AppendLine(".version 7.1");
@@ -249,7 +274,7 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
         p.AppendLine("    shl.b64 %rd4, %rd4, 2;");                          // *4 bytes
         p.AppendLine("    add.u64 %rd4, %rd0, %rd4;");                       // input + n image
         // weights base for this k: weights + k*C*9*4
-        p.AppendLine($"    mul.wide.u32 %rd5, %r7, {I(wc9)};");
+        p.AppendLine($"    mul.wide.u32 %rd5, %r7, {I(weightsPerOutputChannel)};");
         p.AppendLine("    shl.b64 %rd5, %rd5, 2;");
         p.AppendLine("    add.u64 %rd5, %rd1, %rd5;");                       // weights + k
         // zero M accumulators %f0..%f15
@@ -269,22 +294,25 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
         }
         else
         {
-            EmitLoadFilter3x3(p);                 // g into %f48..%f56
+            EmitLoadFilter3x3(p, shape.InvertFilter); // g into %f48..%f56
             EmitFilterTransform(p);               // U -> %f32..%f47
         }
         for (int i = 0; i < 16; i++)              // M += U*V
             p.AppendLine($"    fma.rn.f32 %f{I(i)}, %f{I(32 + i)}, %f{I(16 + i)}, %f{I(i)};");
         p.AppendLine($"    add.u64 %rd6, %rd6, {I(hw * 4)};");             // next channel input
-        p.AppendLine($"    add.u64 %rd7, %rd7, {I(filterPretransformed ? 64 : 36)};"); // next channel U(16*4) or g(9*4)
+        p.AppendLine($"    add.u64 %rd7, %rd7, {I(weightChannelStride)};");
         p.AppendLine("    add.u32 %r11, %r11, 1;");
         p.AppendLine($"    setp.lt.u32 %p0, %r11, {I(c)};");
         p.AppendLine("    @%p0 bra WINO_C_LOOP;");
         // output transform Y = A^T M A -> %f64..%f67 (2x2)
         EmitOutputTransform(p);
         // + bias[k], ReLU, store output[n,k, 2*ti+oi, 2*tj+oj]
-        p.AppendLine($"    mul.wide.u32 %rd8, %r7, 4;");
-        p.AppendLine("    add.u64 %rd8, %rd2, %rd8;");
-        p.AppendLine("    ld.global.nc.f32 %f70, [%rd8];");                // bias[k]
+        if (!shape.Linear)
+        {
+            p.AppendLine($"    mul.wide.u32 %rd8, %r7, 4;");
+            p.AppendLine("    add.u64 %rd8, %rd2, %rd8;");
+            p.AppendLine("    ld.global.nc.f32 %f70, [%rd8];");            // bias[k]
+        }
         // output base for (n,k): output + (n*K + k)*H*W*4 + (2*ti)*W*4 + (2*tj)*4
         p.AppendLine($"    mad.lo.u32 %r12, %r8, {I(k)}, %r7;");           // n*K + k
         p.AppendLine($"    mul.wide.u32 %rd9, %r12, {I(hw)};");
@@ -297,8 +325,11 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
             for (int oj = 0; oj < 2; oj++)
             {
                 int yreg = 64 + oi * 2 + oj;
-                p.AppendLine($"    add.rn.f32 %f{I(yreg)}, %f{I(yreg)}, %f70;");
-                p.AppendLine($"    max.f32 %f{I(yreg)}, %f{I(yreg)}, 0f00000000;");
+                if (!shape.Linear)
+                {
+                    p.AppendLine($"    add.rn.f32 %f{I(yreg)}, %f{I(yreg)}, %f70;");
+                    p.AppendLine($"    max.f32 %f{I(yreg)}, %f{I(yreg)}, 0f00000000;");
+                }
                 // linear offset = (oh+oi)*W + (ow+oj)
                 p.AppendLine($"    add.u32 %r15, %r13, {I(oi)};");
                 p.AppendLine($"    mul.lo.u32 %r15, %r15, {I(wStride)};");
@@ -370,14 +401,16 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
     }
 
     // Loads g[gi][gj] = weights[k,c,gi,gj] into %f48..%f56 via %rd7 (running weight ptr).
-    private static void EmitLoadFilter3x3(StringBuilder p)
+    private static void EmitLoadFilter3x3(StringBuilder p, bool invert)
     {
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
         for (int gi = 0; gi < 3; gi++)
             for (int gj = 0; gj < 3; gj++)
             {
                 int reg = 48 + gi * 3 + gj;
-                int off = (gi * 3 + gj) * 4;
+                int sourceGi = invert ? 2 - gi : gi;
+                int sourceGj = invert ? 2 - gj : gj;
+                int off = (sourceGi * 3 + sourceGj) * 4;
                 p.AppendLine($"    ld.global.nc.f32 %f{I(reg)}, [%rd7+{I(off)}];");
             }
     }

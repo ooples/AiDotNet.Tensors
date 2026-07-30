@@ -48,6 +48,17 @@
 //             mathematically impossible: later clean samples could not remove the old
 //             maximum. It now requires three consecutive agreeing samples, preserving
 //             the 5% gate while allowing contaminated batches to age out.
+//   v10 -> v11 cross-lane stability conformance. StableTimer implemented the consecutive
+//              window, but the conveyor and Python competitor lane still took exactly
+//              three runs; the conveyor also published the minimum while Python published
+//              the median. Both lanes now retry up to fifteen runs, retain the latest
+//              three, and publish their median under the same 5% gate. Full-suite generated
+//              evidence is collected and contamination-retried per operation, with a capped
+//              backoff, so one WDDM burst cannot discard twelve clean rows or phase-lock all
+//              immediate retries into the same foreign workload. Post-suite C+G handling now
+//              matches the release-evidence script: mixed-process admission is enforced before
+//              timing, while the post boundary rejects compute-only work and unsafe temperature
+//              without trusting WDDM's stale single-sample mixed-process percentage.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -71,7 +82,7 @@ public static class CodegenMeasurementProtocol
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 10;
+    public const int Version = 11;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -79,9 +90,9 @@ public static class CodegenMeasurementProtocol
     /// <summary>One-line description of what the current protocol requires.</summary>
     public const string Description =
         "paired within-sample ratios; batched timed regions; clock-drift and <=5% spread gates; " +
-        "true-fp32 CUDA-graph competitor; exact PTX-set autotune and dispatch-bound evidence; " +
+        "true-fp32 CUDA-graph replay on both lanes; exact PTX-set autotune and dispatch-bound evidence; " +
         "exact competitor geometry; multi-strategy cuDNN plan search; " +
-        "phase-scoped counter profiles; recoverable consecutive stability windows";
+        "phase-scoped counter profiles; recoverable per-operation stability windows";
 
     /// <summary>
     /// Human-readable stamp to put beside a number.

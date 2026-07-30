@@ -37,6 +37,7 @@ internal static class KernelAutotuneTool
         bool TiledContraction = false, bool TiledConv2D = false,
         bool DepthwiseWeightGradient = false,
         bool ParityTransposedConv2D = false,
+        CodegenTiledContractionSchedule? TiledContractionSchedule = null,
         CodegenTiledConv2DSchedule? TiledConv2DSchedule = null);
 
     private sealed record TuneResult(
@@ -143,6 +144,15 @@ internal static class KernelAutotuneTool
             : new[] { CodegenKernelCatalog.Find(selector)! }.Where(e => e != null).ToList();
         KernelToolArgs.RequireNonEmptySelection(selector, entries.Count, "kernel-autotune");
 
+        string? profileCandidate = ValueOf(args, "--profile-candidate");
+        if (!string.IsNullOrWhiteSpace(profileCandidate))
+        {
+            if (entries.Count != 1)
+                throw new ArgumentException("Counter profiling requires one exact kernel selector.");
+            ProfileOne(runtime, entries[0].Bench, profileCandidate);
+            return;
+        }
+
         string outputPath = ValueOf(args, "--out") ??
             Path.Combine(Directory.GetCurrentDirectory(), "artifacts", "autotune.tsv");
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
@@ -152,9 +162,14 @@ internal static class KernelAutotuneTool
         Console.WriteLine("candidates: " +
             (string.IsNullOrWhiteSpace(candidateSelector)
                 ? string.Join(", ", Candidates.Select(c => c.Name)) +
+                    ", " + string.Join(", ", CodegenTiledContractionSchedule.SearchSpace
+                        .Select(s => s.WinnerName)) +
                     ", " + string.Join(", ", CodegenTiledConv2DSchedule.SearchSpace
                         .Select(s => s.WinnerName)) +
+                    ", " + string.Join(", ", CodegenTiledConv2DSplitSchedule.SearchSpace
+                        .Select(s => s.WinnerName)) +
                     ", library-winograd-fp32-bn16, library-winograd-fp32-bn32, " +
+                    "inline-outer-winograd-conv2d, " +
                     "library-bwd-input-direct, " +
                     "split, tiled-split, tiled-chunked-split"
                 : candidateSelector));
@@ -163,7 +178,7 @@ internal static class KernelAutotuneTool
 
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
-        var rows = new List<string>();
+        var rows = LoadUnselectedCurrentRows(outputPath, runtime, entries);
         int improved = 0;
         try
         {
@@ -189,7 +204,7 @@ internal static class KernelAutotuneTool
                     var identity = CodegenAutotuneIdentity.Create(
                         entry.Bench, runtime.DeviceFingerprint,
                         runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                    rows.Add(string.Join("\t", entry.Name, result.Name,
+                    rows[entry.Name] = string.Join("\t", entry.Name, result.Name,
                         result.BestUs.ToString("F3", CultureInfo.InvariantCulture),
                         result.ModelledUs.ToString("F3", CultureInfo.InvariantCulture),
                         gain.ToString("F4", CultureInfo.InvariantCulture),
@@ -197,7 +212,7 @@ internal static class KernelAutotuneTool
                         identity.DeviceFingerprint,
                         identity.Target,
                         identity.SpecFingerprint,
-                        identity.EmitterFingerprint));
+                        identity.EmitterFingerprint);
                 }
                 catch (Exception ex)
                 {
@@ -212,7 +227,8 @@ internal static class KernelAutotuneTool
                         CodegenMeasurementProtocol.Description);
         text.AppendLine(
             "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter");
-        foreach (string row in rows) text.AppendLine(row);
+        foreach (CodegenCatalogEntry entry in CodegenKernelCatalog.All)
+            if (rows.TryGetValue(entry.Name, out string? row)) text.AppendLine(row);
         File.WriteAllText(outputPath, text.ToString());
 
         Console.WriteLine();
@@ -223,6 +239,98 @@ internal static class KernelAutotuneTool
                           "% noise floor");
         Console.WriteLine("winners written to " + outputPath);
         CodegenAutotuneCache.Invalidate();
+    }
+
+    private static Dictionary<string, string> LoadUnselectedCurrentRows(
+        string outputPath, DirectPtxRuntime runtime,
+        IReadOnlyList<CodegenCatalogEntry> selectedEntries)
+    {
+        var rows = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (selectedEntries.Count == CodegenKernelCatalog.All.Count ||
+            !File.Exists(outputPath))
+            return rows;
+
+        var selected = new HashSet<string>(
+            selectedEntries.Select(entry => entry.Name), StringComparer.Ordinal);
+        string[] lines = File.ReadAllLines(outputPath);
+        if (lines.Length < 2 || !lines[1].StartsWith("kernel\twinner\t", StringComparison.Ordinal))
+            return rows;
+
+        for (int i = 2; i < lines.Length; i++)
+        {
+            string[] cells = lines[i].Split('\t');
+            if (cells.Length != 10 || selected.Contains(cells[0]) ||
+                !string.Equals(cells[5], CodegenMeasurementProtocol.Tag,
+                    StringComparison.Ordinal))
+                continue;
+
+            CodegenCatalogEntry? entry = CodegenKernelCatalog.Find(cells[0]);
+            if (entry is null) continue;
+            CodegenAutotuneIdentity identity = CodegenAutotuneIdentity.Create(
+                entry.Bench, runtime.DeviceFingerprint,
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            if (!string.Equals(cells[6], identity.DeviceFingerprint, StringComparison.Ordinal) ||
+                !string.Equals(cells[7], identity.Target, StringComparison.Ordinal) ||
+                !string.Equals(cells[8], identity.SpecFingerprint, StringComparison.Ordinal) ||
+                !string.Equals(cells[9], identity.EmitterFingerprint, StringComparison.Ordinal))
+                continue;
+            rows[entry.Name] = lines[i];
+        }
+
+        Console.WriteLine("preserving " + rows.Count.ToString(CultureInfo.InvariantCulture) +
+                          " identity-current unselected autotune rows");
+        return rows;
+    }
+
+    private static void ProfileOne(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, string candidateName)
+    {
+        if (string.Equals(candidateName, "inline-outer-winograd-conv2d",
+                StringComparison.Ordinal))
+        {
+            using CandidateProgram? winograd =
+                TryCreateInlineOuterWinograd(runtime, spec);
+            if (winograd is null)
+                throw new ArgumentException(
+                    "The inline outer-product Winograd candidate does not support this spec.");
+            winograd.Launch();
+            runtime.Synchronize();
+            Console.WriteLine("profiled " + winograd.Name +
+                              (winograd.ResourceSummary is null
+                                  ? string.Empty
+                                  : ": " + winograd.ResourceSummary));
+            return;
+        }
+
+        Candidate? candidate = Candidates.FirstOrDefault(c =>
+            string.Equals(c.Name, candidateName, StringComparison.Ordinal));
+        if (candidate is null)
+        {
+            CodegenTiledContractionSchedule? contractionSchedule =
+                CodegenTiledContractionSchedule.Find(candidateName);
+            if (contractionSchedule is not null)
+                candidate = new Candidate(
+                    contractionSchedule.WinnerName, null,
+                    TiledContractionSchedule: contractionSchedule);
+        }
+        if (candidate is null)
+        {
+            CodegenTiledConv2DSchedule? schedule =
+                CodegenTiledConv2DSchedule.Find(candidateName);
+            if (schedule is not null)
+                candidate = new Candidate(
+                    schedule.WinnerName, null, TiledConv2DSchedule: schedule);
+        }
+        if (candidate is null)
+            throw new ArgumentException("Unknown profile candidate '" + candidateName + "'.");
+
+        using CandidateProgram program = CreateSingle(runtime, spec, candidate);
+        program.Launch();
+        runtime.Synchronize();
+        Console.WriteLine("profiled " + program.Name +
+                          (program.ResourceSummary is null
+                              ? string.Empty
+                              : ": " + program.ResourceSummary));
     }
 
     private static TuneResult? TuneOne(
@@ -273,6 +381,36 @@ internal static class KernelAutotuneTool
             }
         }
 
+        foreach (CodegenTiledContractionSchedule schedule in
+                 CodegenTiledContractionSchedule.SearchSpace)
+        {
+            if (!CandidateEnabled(candidateSelector, schedule.WinnerName)) continue;
+            CandidateProgram? program = null;
+            try
+            {
+                var candidate = new Candidate(
+                    schedule.WinnerName, null, TiledContractionSchedule: schedule);
+                program = CreateSingle(runtime, spec, candidate);
+            }
+            catch (NotSupportedException) { continue; }
+            using (program)
+            {
+                program.Launch();
+                runtime.Synchronize();
+                if (!Agrees(program.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + program.Name +
+                                      "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                    continue;
+                }
+                Consider(runtime, modelled, program, workUnits,
+                    ref hasStableTiming, ref bestName, ref bestUs,
+                    ref bestModelledUs, ref bestGain);
+            }
+        }
+
         foreach (CodegenTiledConv2DSchedule schedule in
                  CodegenTiledConv2DSchedule.SearchSpace)
         {
@@ -303,6 +441,31 @@ internal static class KernelAutotuneTool
             }
         }
 
+        // A cooperative tile's block count can be far below the scalar iteration
+        // space's apparent parallelism. Compose exact tiles with deterministic channel
+        // chunks so that schedule-hidden underfill is measured and replayable too.
+        foreach (CodegenTiledConv2DSplitSchedule schedule in
+                 CodegenTiledConv2DSplitSchedule.SearchSpace)
+        {
+            if (!CandidateEnabled(candidateSelector, schedule.WinnerName)) continue;
+            using CandidateProgram? split = TryCreateTiledConv2DSplit(
+                runtime, spec, schedule);
+            if (split is null) continue;
+
+            split.Launch();
+            runtime.Synchronize();
+            if (!Agrees(split.ReadOutput(), reference, out double deviation))
+            {
+                Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
+                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                  " relative; rejected");
+                continue;
+            }
+            Consider(runtime, modelled, split, workUnits,
+                ref hasStableTiming, ref bestName, ref bestUs,
+                ref bestModelledUs, ref bestGain);
+        }
+
         // Point the oracle at the independently developed true-FP32 hand-written
         // Winograd pipeline. All four launches stay in the timed region because the
         // general kernel contract permits weights and inputs to change on every call.
@@ -326,6 +489,63 @@ internal static class KernelAutotuneTool
             Consider(runtime, modelled, library, workUnits,
                 ref hasStableTiming, ref bestName, ref bestUs,
                 ref bestModelledUs, ref bestGain);
+        }
+
+        using (CandidateProgram? winograd = TryCreateInlineOuterWinograd(
+                   runtime, spec))
+        {
+            if (winograd is not null && CandidateEnabled(candidateSelector, winograd.Name))
+            {
+                winograd.Launch();
+                runtime.Synchronize();
+                if (!Agrees(winograd.ReadOutput(), reference, out double deviation,
+                        out long worstIndex, out float actual, out float expected))
+                {
+                    Console.WriteLine("    candidate '" + winograd.Name +
+                                      "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative at output[" +
+                                      worstIndex.ToString(CultureInfo.InvariantCulture) +
+                                      "]: actual " + actual.ToString("G9", CultureInfo.InvariantCulture) +
+                                      ", expected " + expected.ToString("G9", CultureInfo.InvariantCulture) +
+                                      ", nearest reference output[" +
+                                      ClosestIndex(reference, actual).ToString(
+                                          CultureInfo.InvariantCulture) + "]" +
+                                      "; rejected");
+                }
+                else
+                {
+                    Consider(runtime, modelled, winograd, workUnits,
+                        ref hasStableTiming, ref bestName, ref bestUs,
+                        ref bestModelledUs, ref bestGain);
+                }
+            }
+        }
+
+        // Probe the same true-FP32 Winograd dataflow as a linear adjoint. This is
+        // diagnostic until the oracle proves that it beats the generated lowering;
+        // a library-only result is never eligible for conveyor promotion.
+        using (CandidateProgram? library = TryCreateLibraryInlineWinogradBackward(
+                   runtime, spec))
+        {
+            if (library is not null && CandidateEnabled(candidateSelector, library.Name))
+            {
+                library.Launch();
+                runtime.Synchronize();
+                if (!Agrees(library.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + library.Name +
+                                      "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                }
+                else
+                {
+                    Consider(runtime, modelled, library, workUnits,
+                        ref hasStableTiming, ref bestName, ref bestUs,
+                        ref bestModelledUs, ref bestGain);
+                }
+            }
         }
 
         // Measure the independently developed deterministic backward-input kernel too.
@@ -499,9 +719,11 @@ internal static class KernelAutotuneTool
         {
             string ptx;
             uint blocks, blockX, blockY;
-            if (candidate.TiledContraction)
+            if (candidate.TiledContraction || candidate.TiledContractionSchedule is not null)
             {
-                var tiled = new PtxTiledContractionEmitter();
+                var tiled = candidate.TiledContractionSchedule is null
+                    ? new PtxTiledContractionEmitter()
+                    : new PtxTiledContractionEmitter(candidate.TiledContractionSchedule);
                 ptx = tiled.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 blocks = tiled.LaunchBlocks;
@@ -592,6 +814,108 @@ internal static class KernelAutotuneTool
                     functionInfo.LocalBytesPerThread.ToString(CultureInfo.InvariantCulture) +
                         " B local/thread, " +
                     activeBlocks.ToString(CultureInfo.InvariantCulture) + " blocks/SM");
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    private static CandidateProgram? TryCreateTiledConv2DSplit(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec,
+        CodegenTiledConv2DSplitSchedule schedule)
+    {
+        if (!CodegenTiledConv2DSplitPlan.TryCreate(
+                spec, schedule, out CodegenTiledConv2DSplitPlan? possible, out _))
+            return null;
+        CodegenSplitPlan plan = possible!.Split;
+        RequireFloat32(spec);
+
+        var resources = new List<IDisposable>();
+        try
+        {
+            var partialEmitter = new PtxTiledConv2DEmitter(schedule.Tile);
+            string partialPtx = partialEmitter.Emit(
+                plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            var combineEmitter = new PtxAffineEmitter();
+            string combinePtx = combineEmitter.Emit(
+                plan.Combine, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
+            var combineModule = runtime.LoadModule(combinePtx, allowExperimentalJitFallback: true);
+            resources.Add(partialModule);
+            resources.Add(combineModule);
+            IntPtr partialFn = partialModule.GetFunction(plan.Partial.Name, out var partialInfo);
+            IntPtr combineFn = combineModule.GetFunction(plan.Combine.Name, out var combineInfo);
+
+            var uploaded = new IntPtr[spec.Inputs.Count];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                CodegenTensorBinding binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buffer.Upload<float>(host);
+                uploaded[i] = buffer.Pointer;
+            }
+
+            var temporary = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
+            var output = runtime.AllocateBytes((nuint)(spec.Output.ElementCount * sizeof(float)));
+            resources.Add(temporary);
+            resources.Add(output);
+
+            var partialArgs = new IntPtr[plan.Partial.ParameterCount];
+            for (int i = 0; i < spec.ProductInputs.Count; i++)
+                partialArgs[i] = uploaded[spec.ProductInputs[i]];
+            partialArgs[^1] = temporary.Pointer;
+
+            var combineArgs = new IntPtr[plan.Combine.ParameterCount];
+            combineArgs[0] = temporary.Pointer;
+            if (plan.Combine.BiasInput is { } bias)
+                combineArgs[bias] = uploaded[spec.BiasInput!.Value];
+            if (plan.Combine.ScaleInput is { } scale)
+                combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
+            combineArgs[^1] = output.Pointer;
+
+            void LaunchPartial() => LaunchOne(
+                partialModule, partialFn, partialArgs,
+                partialEmitter.LaunchBlocks,
+                checked((uint)partialEmitter.LaunchBlockThreads), 1);
+            void LaunchCombine() => LaunchOne(
+                combineModule, combineFn, combineArgs,
+                combineEmitter.LaunchBlocks,
+                checked((uint)combineEmitter.LaunchBlockX),
+                checked((uint)combineEmitter.LaunchBlockY));
+            void Launch()
+            {
+                LaunchPartial();
+                LaunchCombine();
+            }
+
+            string summary = "partial " +
+                partialInfo.RegistersPerThread.ToString(CultureInfo.InvariantCulture) +
+                " regs/thread, " +
+                partialInfo.StaticSharedBytes.ToString(CultureInfo.InvariantCulture) +
+                " B shared; combine " +
+                combineInfo.RegistersPerThread.ToString(CultureInfo.InvariantCulture) +
+                " regs/thread";
+            return new CandidateProgram(
+                schedule.WinnerName, Launch, output,
+                checked((int)spec.Output.ElementCount), resources,
+                new[]
+                {
+                    new CandidatePhase("partial", LaunchPartial, WorkUnits(plan.Partial)),
+                    new CandidatePhase("combine", LaunchCombine, WorkUnits(plan.Combine)),
+                },
+                resourceSummary: summary);
+        }
+        catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
         }
         catch
         {
@@ -848,6 +1172,173 @@ internal static class KernelAutotuneTool
         }
     }
 
+    private static CandidateProgram? TryCreateInlineOuterWinograd(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec)
+    {
+        if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out _)) return null;
+        CodegenTiledConv2DPlan plan = possible!;
+        if (plan.TapSign != -1 || !plan.MatrixReductionMajor ||
+            plan.BiasInput.HasValue || spec.Activation != CodegenActivationKind.None)
+            return null;
+
+        var resources = new List<IDisposable>();
+        try
+        {
+            var mainEmitter = new PtxOuterProductWinogradConv2DEmitter();
+            string mainPtx = mainEmitter.Emit(
+                spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+            var mainModule = runtime.LoadModule(mainPtx, allowExperimentalJitFallback: true);
+            resources.Add(mainModule);
+            IntPtr mainFn = mainModule.GetFunction(mainEmitter.EntryPoint!, out var mainInfo);
+            mainModule.SetMaxDynamicSharedMemory(mainFn, mainEmitter.SharedMemoryBytes);
+
+            var uploaded = new DirectPtxBuffer[spec.Inputs.Count];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                CodegenTensorBinding binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buffer.Upload<float>(host);
+                uploaded[i] = buffer;
+            }
+
+            var output = runtime.AllocateBytes(
+                (nuint)(spec.Output.ElementCount * spec.Output.ElementBytes));
+            resources.Add(output);
+
+            var mainArgs = new IntPtr[spec.ParameterCount];
+            mainArgs[spec.Inputs[plan.MatrixInput].ParameterIndex] =
+                uploaded[plan.MatrixInput].Pointer;
+            mainArgs[spec.Inputs[plan.StreamInput].ParameterIndex] =
+                uploaded[plan.StreamInput].Pointer;
+            mainArgs[spec.Output.ParameterIndex] = output.Pointer;
+
+            void LaunchMain() => LaunchOne(
+                mainModule, mainFn, mainArgs, mainEmitter.LaunchBlocks,
+                checked((uint)mainEmitter.LaunchBlockThreads), 1,
+                checked((uint)mainEmitter.SharedMemoryBytes));
+
+            int activeBlocks = mainModule.GetActiveBlocksPerMultiprocessor(
+                mainFn, mainEmitter.LaunchBlockThreads,
+                checked((nuint)mainEmitter.SharedMemoryBytes));
+            return new CandidateProgram(
+                "inline-outer-winograd-conv2d", LaunchMain, output,
+                checked((int)spec.Output.ElementCount), resources,
+                new[]
+                {
+                    new CandidatePhase("inline-winograd", LaunchMain,
+                        Math.Max(1L, 16L * plan.M * plan.ReductionChannels *
+                            plan.Batch * (plan.OutputHeight / 2) * (plan.OutputWidth / 2))),
+                },
+                resourceSummary: "main " + mainInfo.RegistersPerThread.ToString(CultureInfo.InvariantCulture) +
+                    " regs/thread, " + mainEmitter.SharedMemoryBytes.ToString(
+                        CultureInfo.InvariantCulture) + " B dynamic shared, " +
+                    mainInfo.LocalBytesPerThread.ToString(CultureInfo.InvariantCulture) +
+                    " B local/thread, " + activeBlocks.ToString(
+                        CultureInfo.InvariantCulture) + " blocks/SM",
+                promotable: true);
+        }
+        catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch (ArgumentException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    private static CandidateProgram? TryCreateLibraryInlineWinogradBackward(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec)
+    {
+        if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out _)) return null;
+        CodegenTiledConv2DPlan plan = possible!;
+        if (plan.TapSign != -1 || !plan.MatrixReductionMajor ||
+            plan.BiasInput.HasValue || spec.Activation != CodegenActivationKind.None ||
+            plan.InputHeight != plan.OutputHeight ||
+            plan.InputWidth != plan.OutputWidth ||
+            (plan.OutputHeight & 1) != 0 || (plan.OutputWidth & 1) != 0)
+            return null;
+
+        var resources = new List<IDisposable>();
+        try
+        {
+            var shape = new Conv2DWinogradShape(
+                plan.Batch, plan.ReductionChannels,
+                plan.OutputHeight, plan.OutputWidth, plan.M,
+                linear: true, reductionMajor: true, invertFilter: true);
+            var kernel = new PtxConv2DNchw3x3WinogradF23Kernel(runtime, shape);
+            resources.Add(kernel);
+
+            var uploaded = new DirectPtxBuffer[spec.Inputs.Count];
+            for (int i = 0; i < spec.Inputs.Count; i++)
+            {
+                CodegenTensorBinding binding = spec.Inputs[i];
+                var buffer = runtime.AllocateBytes(
+                    (nuint)(binding.ElementCount * binding.ElementBytes));
+                resources.Add(buffer);
+                var host = new float[binding.ElementCount];
+                for (long e = 0; e < host.LongLength; e++)
+                    host[e] = (float)((((e * 37 + i * 101) % 97) - 48) / 64.0);
+                buffer.Upload<float>(host);
+                uploaded[i] = buffer;
+            }
+
+            var dummyBias = runtime.AllocateBytes((nuint)shape.BiasBytes);
+            var output = runtime.AllocateBytes((nuint)shape.OutputBytes);
+            resources.Add(dummyBias);
+            resources.Add(output);
+
+            void Launch() => kernel.Launch(
+                DirectPtxTensorView.CreateOwned(
+                    uploaded[plan.StreamInput], kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(
+                    uploaded[plan.MatrixInput], kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(dummyBias, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+
+            DirectPtxFunctionInfo info = kernel.FunctionInfo;
+            return new CandidateProgram(
+                "library-winograd-inline-adjoint-fp32", Launch, output,
+                checked((int)spec.Output.ElementCount), resources,
+                resourceSummary: info.RegistersPerThread.ToString(
+                        CultureInfo.InvariantCulture) + " regs/thread, " +
+                    info.StaticSharedBytes.ToString(CultureInfo.InvariantCulture) +
+                        " B shared, " +
+                    info.LocalBytesPerThread.ToString(CultureInfo.InvariantCulture) +
+                        " B local/thread, " +
+                    kernel.Audit.ActiveBlocksPerMultiprocessor.ToString(
+                        CultureInfo.InvariantCulture) + " blocks/SM",
+                promotable: false);
+        }
+        catch (NotSupportedException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch (ArgumentException)
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
     private static CandidateProgram? TryCreateLibraryBackwardInput(
         DirectPtxRuntime runtime, CodegenKernelSpec spec)
     {
@@ -958,24 +1449,57 @@ internal static class KernelAutotuneTool
     /// </remarks>
     private static bool Agrees(float[] candidate, float[] reference, out double deviation)
     {
+        return Agrees(candidate, reference, out deviation, out _, out _, out _);
+    }
+
+    private static bool Agrees(
+        float[] candidate, float[] reference, out double deviation,
+        out long worstIndex, out float actual, out float expected)
+    {
         double worst = 0, scale = 0;
+        worstIndex = -1;
+        actual = 0;
+        expected = 0;
         for (long e = 0; e < candidate.Length; e++)
         {
-            worst = Math.Max(worst, Math.Abs(candidate[e] - reference[e]));
+            double difference = Math.Abs(candidate[e] - reference[e]);
+            if (difference > worst)
+            {
+                worst = difference;
+                worstIndex = e;
+                actual = candidate[e];
+                expected = reference[e];
+            }
             scale = Math.Max(scale, Math.Abs((double)reference[e]));
         }
         deviation = scale > 0 ? worst / scale : worst;
         return deviation <= CodegenMeasurementProtocol.AccumulationTolerance;
     }
 
+    private static long ClosestIndex(float[] values, float target)
+    {
+        long closest = -1;
+        double distance = double.MaxValue;
+        for (long i = 0; i < values.LongLength; i++)
+        {
+            double candidate = Math.Abs(values[i] - target);
+            if (candidate >= distance) continue;
+            distance = candidate;
+            closest = i;
+        }
+        return closest;
+    }
+
     private static unsafe void LaunchOne(
-        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)
+        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX,
+        uint blockY, uint dynamicSharedMemoryBytes = 0)
     {
         fixed (IntPtr* pinned = pointers)
         {
             void** argv = stackalloc void*[pointers.Length];
             for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, blockX, blockY, 1, 0, argv);
+            module.Launch(
+                fn, blocks, 1, 1, blockX, blockY, 1, dynamicSharedMemoryBytes, argv);
         }
     }
 

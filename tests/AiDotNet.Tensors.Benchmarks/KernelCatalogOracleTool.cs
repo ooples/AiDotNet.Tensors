@@ -173,7 +173,8 @@ internal static class KernelCatalogOracleTool
                 limiterRow["phase"], phaseCount, phaseShare, diagnosis));
         }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("catalog-oracle-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "catalog-oracle-end", afterSuite: true);
         if (results.Count == 0 && !includeWins)
         {
             Console.WriteLine("All selected catalog kernels are wins; nothing to diagnose.");
@@ -201,9 +202,17 @@ internal static class KernelCatalogOracleTool
         double? predictedUs = 0.0;
         string shape;
 
-        if (winner is not null && winner.StartsWith("tiled-split:", StringComparison.Ordinal))
+        bool tiledChunkedSplit = winner is not null &&
+            winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal);
+        if (winner is not null &&
+            (winner.StartsWith("tiled-split:", StringComparison.Ordinal) || tiledChunkedSplit))
         {
-            CodegenSplitPlan? split = CodegenSplitReduction.TryPlan(entry.Bench);
+            int chunkFactor = 0;
+            CodegenSplitPlan? split = tiledChunkedSplit
+                ? TryParseChunkFactor(winner, out chunkFactor)
+                    ? CodegenSplitReduction.TryPlanChunked(entry.Bench, chunkFactor)
+                    : null
+                : CodegenSplitReduction.TryPlan(entry.Bench);
             if (split is null)
                 throw new InvalidOperationException(
                     entry.Name + " records " + winner + " but no split can be rebuilt.");
@@ -238,8 +247,50 @@ internal static class KernelCatalogOracleTool
                 combinePrediction.HasComputeCeiling
                     ? partialUs + combinePrediction.PredictedMicroseconds
                     : null;
-            shape = "tiled split x2, " + tiledM + "x" + tiledN +
-                " over " + tiledInnerReduction;
+            shape = (tiledChunkedSplit
+                    ? "tiled chunked split " + chunkFactor.ToString(CultureInfo.InvariantCulture) +
+                      "x2, "
+                    : "tiled split x2, ") +
+                tiledM + "x" + tiledN + " over " + tiledInnerReduction;
+        }
+        else if (CodegenTiledConv2DSplitSchedule.Find(winner) is { } splitSchedule)
+        {
+            if (!CodegenTiledConv2DSplitPlan.TryCreate(
+                    entry.Bench, splitSchedule,
+                    out CodegenTiledConv2DSplitPlan? exact, out string reason))
+                throw new InvalidOperationException(
+                    entry.Name + " records " + winner + " but cannot rebuild it: " + reason);
+
+            CodegenSplitPlan split = exact!.Split;
+            var partialEmitter = new PtxTiledConv2DEmitter(splitSchedule.Tile);
+            _ = partialEmitter.Emit(split.Partial, major, minor);
+            CodegenTiledConv2DPlan partialPlan = partialEmitter.Plan!;
+            var partialSemantic = CodegenPerformanceModel.Predict(
+                split.Partial, split.Partial.Space.TotalThreads, 0,
+                machine, partialEmitter.LaunchBlockThreads);
+            long scalarLoads = checked((long)partialPlan.Blocks * partialPlan.Steps *
+                (partialPlan.MatrixStageElements + partialPlan.StreamStageElements));
+            long partialWarpLoads = partialPlan.DirectStream
+                ? partialSemantic.WarpLoadInstructions
+                : (scalarLoads + 31) / 32;
+
+            var combineEmitter = new PtxAffineEmitter();
+            _ = combineEmitter.Emit(split.Combine, major, minor);
+            long combineThreads = split.Combine.Space.TotalThreads /
+                Math.Max(1, combineEmitter.CoarsenedLanes);
+            var combinePrediction = CodegenPerformanceModel.Predict(
+                split.Combine, combineThreads, combineEmitter.DynamicLoadsPerThread,
+                machine, combineEmitter.LaunchBlockThreads);
+
+            uniqueBytes = checked(partialSemantic.UniqueBytes + combinePrediction.UniqueBytes);
+            warpLoads = checked(partialWarpLoads + combinePrediction.WarpLoadInstructions);
+            double? partialCeiling = Ceiling(partialSemantic);
+            predictedUs = partialCeiling is double partialUs &&
+                combinePrediction.HasComputeCeiling
+                    ? partialUs + combinePrediction.PredictedMicroseconds
+                    : null;
+            shape = "tiled conv2d split x2, " + partialPlan.TileM + "x" +
+                partialPlan.TileRows + "x" + partialPlan.TileChannels;
         }
         else if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
         {
@@ -264,9 +315,14 @@ internal static class KernelCatalogOracleTool
             }
             shape = "split x2";
         }
-        else if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal))
+        else if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal) ||
+                 CodegenTiledContractionSchedule.Find(winner) is { })
         {
-            var emitter = new PtxTiledContractionEmitter();
+            CodegenTiledContractionSchedule? contractionSchedule =
+                CodegenTiledContractionSchedule.Find(winner);
+            var emitter = contractionSchedule is null
+                ? new PtxTiledContractionEmitter()
+                : new PtxTiledContractionEmitter(contractionSchedule);
             _ = emitter.Emit(entry.Bench, major, minor);
             var plan = emitter.Plan!;
 
@@ -313,6 +369,28 @@ internal static class KernelCatalogOracleTool
             predictedUs = Ceiling(semantic);
             shape = "one input per thread, deterministic 2x2 output parity tile";
         }
+        else if (string.Equals(
+            winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal))
+        {
+            var emitter = new PtxOuterProductWinogradConv2DEmitter();
+            _ = emitter.Emit(entry.Bench, major, minor);
+            var plan = emitter.Plan!;
+
+            // Each C8 stage issues, per warp, twelve input-patch loads (the two
+            // always-valid centre columns are one v2 instruction) and nine raw
+            // filter loads. All eight warps participate. Boundary predicates reduce
+            // traffic but not the issued instruction stream represented here.
+            const int channelsPerStage = 8;
+            const int warpsPerBlock = 8;
+            const int inputLoadsPerWarp = 12;
+            const int filterLoadsPerWarp = 9;
+            long stages = plan.ReductionChannels / channelsPerStage;
+            warpLoads = checked((long)emitter.LaunchBlocks * stages *
+                warpsPerBlock * (inputLoadsPerWarp + filterLoadsPerWarp));
+            uniqueBytes = semantic.UniqueBytes;
+            predictedUs = Ceiling(semantic);
+            shape = "Winograd F(2,3), M32 x 32 tiles, C8 staged 8x8 outer product";
+        }
         else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
         {
             var emitter = new PtxTiledConv2DEmitter();
@@ -353,6 +431,15 @@ internal static class KernelCatalogOracleTool
             ReuseText(entry.Bench));
     }
 
+    private static bool TryParseChunkFactor(string winner, out int chunkFactor)
+    {
+        chunkFactor = 0;
+        int marker = winner.LastIndexOf('x');
+        return marker >= 0 && marker + 1 < winner.Length &&
+            int.TryParse(winner.Substring(marker + 1), NumberStyles.None,
+                CultureInfo.InvariantCulture, out chunkFactor) && chunkFactor > 1;
+    }
+
     private static Diagnosis Diagnose(
         CodegenKernelSpec spec,
         string outcome,
@@ -375,6 +462,10 @@ internal static class KernelCatalogOracleTool
         bool atRoofline = string.Equals(
             limiterStatus, "at-roofline", StringComparison.OrdinalIgnoreCase);
         bool exactDivision = HasExactDivision(spec);
+        bool tiledSplit = schedule.Winner.StartsWith(
+            "tiled-split:", StringComparison.Ordinal);
+        bool tiledChunkedSplit = schedule.Winner.StartsWith(
+            "tiled-chunked-split:", StringComparison.Ordinal);
         string phaseContext = phaseCount > 1
             ? "The dominant phase " + profiledPhase + " accounts for " + F(phaseShare) +
               "% of profiled program time. "
@@ -392,6 +483,21 @@ internal static class KernelCatalogOracleTool
                 "cannot move an already saturated issue path.");
         }
 
+        if (atRoofline && (limiter == "L1" || limiter == "L2") &&
+            (tiledSplit || tiledChunkedSplit))
+        {
+            return new Diagnosis(
+                phaseContext + limiter + " is saturated at " + F(limiterPct) +
+                "% in the exact two-pass outer-product program while semantic efficiency " +
+                "is " + F(semanticEfficiency) + "%. The partial pass owns the reusable " +
+                "operands and dominates program time; the deterministic combine is not the gap.",
+                (tiledChunkedSplit
+                    ? "Search outer-product CTA/thread fragments jointly with chunk count and " +
+                      "asynchronously stage the partial operands; keep the combine unchanged."
+                    : "Increase operand reuse inside the tiled partial pass with a wider " +
+                      "measured fragment or asynchronous staging; keep the combine unchanged."));
+        }
+
         if (atRoofline && (limiter == "L1" || limiter == "L2"))
         {
             return new Diagnosis(
@@ -403,7 +509,67 @@ internal static class KernelCatalogOracleTool
                 " thread-loads/MAC; long-scoreboard stalls are " + F(longSb) + "%.",
                 "Increase cross-output operand reuse with a GEMM-style shared/register tile " +
                 "or cp.async prefetch across " + schedule.Reuse +
-                "; the vendor lead comes from doing less on-chip load work, not from DRAM peak.");
+                "; any remaining speedup must do less on-chip load work, not chase DRAM peak.");
+        }
+
+        if (!atRoofline && string.Equals(
+                schedule.Winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal))
+        {
+            return new Diagnosis(
+                phaseContext + "The exact Winograd F(2,3) outer-product program is " +
+                "under-filled: " + limiter + " is " + F(limiterPct) +
+                "%, long-scoreboard is " + F(longSb) + "%, and wait is " + F(wait) +
+                "%. Its 73,728-byte shared tile permits only one resident CTA/SM, so " +
+                "neither L1 nor issue capacity can be filled by another block.",
+                "Reduce the live transform/accumulator or shared-tile footprint enough for " +
+                "two resident CTAs, or create more independent warp tiles inside the CTA. " +
+                "A generic direct/implicit-GEMM recommendation is inapplicable because the " +
+                "winning dispatch is already Winograd.");
+        }
+
+        if (!atRoofline && schedule.Winner.StartsWith(
+                "tiled-contraction", StringComparison.Ordinal))
+        {
+            return new Diagnosis(
+                phaseContext + "The exact contraction winner " + schedule.Shape +
+                " remains under-filled after measured M/N/K tile search: " + limiter +
+                " is " + F(limiterPct) + "%, LSU dependency stalls are " + F(mio) +
+                "%, and long-scoreboard is " + F(longSb) + "%. This is not evidence that " +
+                "an unmeasured larger scalar tile will win.",
+                "Vector fragments are already active. Next measure a warp-specialized " +
+                "async-copy/compute pipeline or register double-buffering across K. Keep " +
+                "geometry selection in the exact schedule search rather than hard-coding an " +
+                "operation-specific tile.");
+        }
+
+        if (!atRoofline && schedule.Winner.StartsWith(
+                "tiled-conv2d", StringComparison.Ordinal))
+        {
+            return new Diagnosis(
+                phaseContext + "The measured dense-Conv2D schedule is under-filled at " +
+                F(limiterPct) + "% " + limiter + " after the finite search already covered " +
+                "M/row/channel tiles, warp-halo, direct-stream, asymmetric staging, and " +
+                "reduction splits. Long-scoreboard is " + F(longSb) + "% and wait is " +
+                F(wait) + "%, so no single existing pipe is the bottleneck.",
+                "Add a genuinely different dataflow candidate—inline Winograd, implicit GEMM, " +
+                "or a warp-specialized asynchronous pipeline—and let the same numerical and " +
+                "paired-timing gates choose it. More tuning of the existing local knobs is " +
+                "not the indicated lever.");
+        }
+
+        if (!atRoofline && (tiledSplit || tiledChunkedSplit))
+        {
+            return new Diagnosis(
+                phaseContext + "The exact two-pass outer-product program is under-filled: " +
+                limiter + " is " + F(limiterPct) + "%, long-scoreboard is " + F(longSb) +
+                "%, wait is " + F(wait) + "%, and shared/LSU dependency stalls are " +
+                F(mio) + "%. The partial pass, not the deterministic combine, is the " +
+                "optimization target.",
+                (tiledChunkedSplit
+                    ? "Search outer-product CTA/thread fragments jointly with chunk count and " +
+                      "add asynchronous operand staging to the partial pass; keep the combine unchanged."
+                    : "Expand the outer-product fragment search and vectorize/stage the partial " +
+                      "pass operands; keep the deterministic combine unchanged."));
         }
 
         if (!atRoofline && longSb >= 20.0 && wait >= 15.0)

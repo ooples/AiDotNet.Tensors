@@ -20,7 +20,15 @@ public sealed class PtxTiledContractionEmitter
     private const int FixedRd = 8;
     private const int FixedP = 4;
     private readonly StringBuilder _body = new();
+    private readonly CodegenTiledContractionSchedule? _schedule;
     private int _r, _rd, _p, _f;
+
+    public PtxTiledContractionEmitter() { }
+
+    public PtxTiledContractionEmitter(CodegenTiledContractionSchedule schedule)
+    {
+        _schedule = schedule ?? throw new ArgumentNullException(nameof(schedule));
+    }
 
     /// <summary>Plan used by the last emission.</summary>
     public CodegenTiledContractionPlan? Plan { get; private set; }
@@ -39,7 +47,8 @@ public sealed class PtxTiledContractionEmitter
     {
         if (computeMajor < 8)
             throw new NotSupportedException("The double-buffered tiled path requires cp.async on sm_80+.");
-        if (!CodegenTiledContractionPlan.TryCreate(spec, out var possible, out string reason))
+        if (!CodegenTiledContractionPlan.TryCreate(
+                spec, _schedule, out var possible, out string reason))
             throw new NotSupportedException("This spec cannot use the tiled contraction: " + reason);
         var plan = possible!;
         AssertAsyncCopyInvariants(plan);
@@ -65,6 +74,11 @@ public sealed class PtxTiledContractionEmitter
         {
             int biasParam = spec.Inputs[plan.BiasInput.Value].ParameterIndex;
             L($"ld.param.u64 %rd4, [p{I(biasParam)}];");
+        }
+        if (plan.ScaleInput.HasValue)
+        {
+            int scaleParam = spec.Inputs[plan.ScaleInput.Value].ParameterIndex;
+            L($"ld.param.u64 %rd5, [p{I(scaleParam)}];");
         }
         L("mov.u32 %r0, %ctaid.x;");
         L("mov.u32 %r1, %tid.x;");
@@ -222,37 +236,77 @@ public sealed class PtxTiledContractionEmitter
         {
             var matrix = new string[plan.ThreadTileM];
             var stream = new string[plan.ThreadTileN];
-            for (int i = 0; i < matrix.Length; i++)
+            for (int i = 0; i < matrix.Length; i++) matrix[i] = NextF();
+            for (int j = 0; j < stream.Length; j++) stream[j] = NextF();
+
+            if (plan.MatrixReductionMajor)
             {
-                matrix[i] = NextF();
-                int constant = plan.MatrixReductionMajor
-                    ? bufferBase + k * plan.TileM * sizeof(float) + i * sizeof(float)
-                    : bufferBase + i * plan.TileK * sizeof(float) + k * sizeof(float);
-                int threadStride = plan.MatrixReductionMajor
-                    ? plan.ThreadTileM * sizeof(float)
-                    : plan.ThreadTileM * plan.TileK * sizeof(float);
-                string local = NextR();
-                string local64 = NextRd(), address = NextRd();
-                L($"mad.lo.u32 {local}, %r7, {I(threadStride)}, {I(constant)};");
-                L($"cvt.u64.u32 {local64}, {local};");
-                L($"add.u64 {address}, %rd3, {local64};");
-                L($"ld.shared.f32 {matrix[i]}, [{address}];");
+                // A [K,M] stage gives each thread's M fragment contiguous, naturally
+                // aligned values. Load the fragment as vectors: this removes up to seven
+                // shared-memory instructions and their address chains from every K step.
+                int vectorWidth = plan.ThreadTileM % 4 == 0
+                    ? 4
+                    : plan.ThreadTileM % 2 == 0 ? 2 : 1;
+                for (int i = 0; i < matrix.Length; i += vectorWidth)
+                {
+                    int constant = bufferBase + k * plan.TileM * sizeof(float) +
+                        i * sizeof(float);
+                    string local = NextR();
+                    string local64 = NextRd(), address = NextRd();
+                    L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * sizeof(float))}, {I(constant)};");
+                    L($"cvt.u64.u32 {local64}, {local};");
+                    L($"add.u64 {address}, %rd3, {local64};");
+                    EmitSharedLoad(matrix, i, vectorWidth, address);
+                }
             }
-            for (int j = 0; j < stream.Length; j++)
+            else
             {
-                stream[j] = NextF();
-                int constant = streamBase + k * plan.TileN * sizeof(float) + j * sizeof(float);
+                // [M,K] values for fixed K are strided, so they remain scalar.
+                for (int i = 0; i < matrix.Length; i++)
+                {
+                    int constant = bufferBase + i * plan.TileK * sizeof(float) +
+                        k * sizeof(float);
+                    string local = NextR();
+                    string local64 = NextRd(), address = NextRd();
+                    L($"mad.lo.u32 {local}, %r7, {I(plan.ThreadTileM * plan.TileK * sizeof(float))}, {I(constant)};");
+                    L($"cvt.u64.u32 {local64}, {local};");
+                    L($"add.u64 {address}, %rd3, {local64};");
+                    L($"ld.shared.f32 {matrix[i]}, [{address}];");
+                }
+            }
+
+            // N is contiguous for both operand layouts. Every retained schedule owns
+            // two or four values, so one vector instruction replaces the scalar loads.
+            int streamVectorWidth = plan.ThreadTileN % 4 == 0
+                ? 4
+                : plan.ThreadTileN % 2 == 0 ? 2 : 1;
+            for (int j = 0; j < stream.Length; j += streamVectorWidth)
+            {
+                int constant = streamBase + k * plan.TileN * sizeof(float) +
+                    j * sizeof(float);
                 string local = NextR();
                 string local64 = NextRd(), address = NextRd();
                 L($"mad.lo.u32 {local}, %r6, {I(plan.ThreadTileN * sizeof(float))}, {I(constant)};");
                 L($"cvt.u64.u32 {local64}, {local};");
                 L($"add.u64 {address}, %rd3, {local64};");
-                L($"ld.shared.f32 {stream[j]}, [{address}];");
+                EmitSharedLoad(stream, j, streamVectorWidth, address);
             }
             for (int i = 0; i < matrix.Length; i++)
                 for (int j = 0; j < stream.Length; j++)
                     L($"fma.rn.f32 {accumulators[i, j]}, {matrix[i]}, {stream[j]}, {accumulators[i, j]};");
         }
+    }
+
+    private void EmitSharedLoad(string[] values, int start, int width, string address)
+    {
+        if (width == 1)
+        {
+            L($"ld.shared.f32 {values[start]}, [{address}];");
+            return;
+        }
+
+        L($"ld.shared.v{I(width)}.f32 {{" +
+          string.Join(", ", values, start, width) + $"}}, [{address}];");
     }
 
     private void EmitStores(
@@ -273,12 +327,26 @@ public sealed class PtxTiledContractionEmitter
                 L($"add.u64 {biasAddress}, %rd4, {biasBytes};");
                 L($"ld.global.f32 {bias}, [{biasAddress}];");
             }
+            string? scale = null;
+            if (plan.ScaleInput.HasValue)
+            {
+                string localM = NextR(), globalM = NextR();
+                string scaleBytes = NextRd(), scaleAddress = NextRd();
+                scale = NextF();
+                L($"mad.lo.u32 {localM}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
+                L($"add.u32 {globalM}, %r8, {localM};");
+                L($"mul.wide.u32 {scaleBytes}, {globalM}, 4;");
+                L($"add.u64 {scaleAddress}, %rd5, {scaleBytes};");
+                L($"ld.global.f32 {scale}, [{scaleAddress}];");
+            }
             for (int j = 0; j < plan.ThreadTileN; j++)
             {
                 string m = NextR(), n = NextR(), element = NextR();
                 string bytes = NextRd(), address = NextRd();
                 if (bias is not null)
                     L($"add.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {bias};");
+                if (scale is not null)
+                    L($"mul.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {scale};");
                 if (activation == CodegenActivationKind.ReLU)
                     L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
                 L($"mad.lo.u32 {m}, %r7, {I(plan.ThreadTileM)}, {I(i)};");

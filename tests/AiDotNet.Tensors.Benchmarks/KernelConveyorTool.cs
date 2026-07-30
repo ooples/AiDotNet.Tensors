@@ -42,9 +42,7 @@ internal static class KernelConveyorTool
     private const int Samples = 51;
     private const int LaunchesPerSample = 50;
     private const int Runs = 3;
-
-    /// <summary>Attempts allowed to obtain a measurement taken at a steady SM clock.</summary>
-    private const int ClockRetries = 4;
+    private const int StabilityAttempts = 15;
 
     /// <summary>
     /// Forces per-dimension activation staging on, for the correctness gate and for
@@ -374,7 +372,8 @@ internal static class KernelConveyorTool
     /// <summary>One kernel of a tuned program, with everything needed to launch it.</summary>
     private sealed record ProgramKernel(
         CodegenKernelSpec Spec, string Ptx, uint Blocks, uint BlockX, uint BlockY,
-        int LoopedAxes, int ElidedGuards, string StagedOperands);
+        int LoopedAxes, int ElidedGuards, string StagedOperands,
+        uint DynamicSharedMemoryBytes = 0);
 
     /// <summary>What the tuner says to run for a catalog entry.</summary>
     /// <param name="Spec">
@@ -398,8 +397,11 @@ internal static class KernelConveyorTool
                 ? "tiled chunked split x"
                 : Winner is not null && Winner.StartsWith("tiled-split:", StringComparison.Ordinal)
                     ? "tiled split x"
+                : CodegenTiledConv2DSplitSchedule.Find(Winner) is not null
+                    ? "tiled conv2d split x"
                     : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
-            : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal)
+            : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal) ||
+              CodegenTiledContractionSchedule.Find(Winner) is not null
                 ? "tiled contraction"
                 : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal) ||
                   CodegenTiledConv2DSchedule.Find(Winner) is not null
@@ -420,11 +422,42 @@ internal static class KernelConveyorTool
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         string? winner = CodegenAutotuneCache.WinnerFor(catalogName, identity);
 
-        if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal))
+        if (string.Equals(winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal))
         {
             try
             {
-                var tiled = new PtxTiledContractionEmitter();
+                var winograd = new PtxOuterProductWinogradConv2DEmitter();
+                string text = winograd.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, winograd.LaunchBlocks,
+                            checked((uint)winograd.LaunchBlockThreads), 1,
+                            0, 0, "weights+input tiles",
+                            checked((uint)winograd.SharedMemoryBytes)),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName +
+                                  " recorded inline-outer-winograd-conv2d but it could not " +
+                                  "be rebuilt (" + ex.Message + "); using the affine kernel");
+            }
+        }
+
+        CodegenTiledContractionSchedule? contractionSchedule =
+            CodegenTiledContractionSchedule.Find(winner);
+        if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal) ||
+            contractionSchedule is not null)
+        {
+            try
+            {
+                var tiled = contractionSchedule is null
+                    ? new PtxTiledContractionEmitter()
+                    : new PtxTiledContractionEmitter(contractionSchedule);
                 string text = tiled.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 return new TunedProgram(
@@ -439,9 +472,55 @@ internal static class KernelConveyorTool
             }
             catch (NotSupportedException ex)
             {
-                Console.WriteLine("    note: " + catalogName + " recorded tiled-contraction " +
+                Console.WriteLine("    note: " + catalogName + " recorded " + winner + " " +
                                   "but it could not be rebuilt (" + ex.Message +
                                   "); using the affine kernel");
+            }
+        }
+
+        CodegenTiledConv2DSplitSchedule? conv2DSplitSchedule =
+            CodegenTiledConv2DSplitSchedule.Find(winner);
+        if (conv2DSplitSchedule is not null)
+        {
+            try
+            {
+                if (!CodegenTiledConv2DSplitPlan.TryCreate(
+                        spec, conv2DSplitSchedule,
+                        out CodegenTiledConv2DSplitPlan? exact, out string reason))
+                    throw new NotSupportedException(reason);
+
+                CodegenSplitPlan split = exact!.Split;
+                var partial = new PtxTiledConv2DEmitter(conv2DSplitSchedule.Tile);
+                string partialText = partial.Emit(
+                    split.Partial, runtime.ComputeCapabilityMajor,
+                    runtime.ComputeCapabilityMinor);
+                var combine = new PtxAffineEmitter();
+                string combineText = combine.Emit(
+                    split.Combine, runtime.ComputeCapabilityMajor,
+                    runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(split.Partial, partialText,
+                            partial.LaunchBlocks,
+                            checked((uint)partial.LaunchBlockThreads), 1,
+                            split.Partial.Space.ReductionAxes.Length, 0,
+                            "weights+three input rows"),
+                        new ProgramKernel(split.Combine, combineText,
+                            combine.LaunchBlocks,
+                            checked((uint)combine.LaunchBlockX),
+                            checked((uint)combine.LaunchBlockY),
+                            combine.LoopedAxes, combine.ElidedGuards,
+                            combine.StagedOperands),
+                    },
+                    split, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName + " recorded " + winner +
+                                  " but its tiled Conv2D split could not be rebuilt (" +
+                                  ex.Message + "); using the single-kernel lowering");
             }
         }
 
@@ -630,7 +709,9 @@ internal static class KernelConveyorTool
     {
         private readonly List<DirectPtxModule> _modules = new();
         private readonly List<DirectPtxBuffer> _buffers = new();
-        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args, uint Blocks, uint X, uint Y)> _steps = new();
+        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args,
+            uint Blocks, uint X, uint Y, uint DynamicSharedMemoryBytes)> _steps = new();
+        private DirectPtxGraph? _graph;
         private DirectPtxBuffer _output = null!;
 
         /// <summary>Highest register count across the program's kernels.</summary>
@@ -703,6 +784,11 @@ internal static class KernelConveyorTool
                     it.Add(runtime, program.Kernels[0], args);
                 }
 
+                // The competitor's accepted lane is CUDA-graph replay. Capture the exact
+                // tuned program too, so every catalog kernel gets the same launch-overhead
+                // treatment and a one- versus two-kernel lowering remains comparable.
+                it._graph = runtime.CaptureGraph(it.LaunchDirect);
+
                 return it;
             }
             catch
@@ -717,21 +803,32 @@ internal static class KernelConveyorTool
             var module = runtime.LoadModule(kernel.Ptx, allowExperimentalJitFallback: true);
             _modules.Add(module);
             IntPtr fn = module.GetFunction(kernel.Spec.Name, out DirectPtxFunctionInfo info);
+            if (kernel.DynamicSharedMemoryBytes != 0)
+                module.SetMaxDynamicSharedMemory(
+                    fn, checked((int)kernel.DynamicSharedMemoryBytes));
             RegistersPerThread = Math.Max(RegistersPerThread, info.RegistersPerThread);
-            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY));
+            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY,
+                kernel.DynamicSharedMemoryBytes));
         }
 
         /// <summary>Runs the whole program in order; the combine depends on the partial.</summary>
+        private void LaunchDirect()
+        {
+            foreach (var (module, fn, args, blocks, x, y, dynamicSharedMemoryBytes) in _steps)
+                LaunchSpec(module, fn, args, blocks, x, y, dynamicSharedMemoryBytes);
+        }
+
         internal void Launch()
         {
-            foreach (var (module, fn, args, blocks, x, y) in _steps)
-                LaunchSpec(module, fn, args, blocks, x, y);
+            if (_graph is not null) _graph.Launch();
+            else LaunchDirect();
         }
 
         internal void DownloadOutput(float[] destination) => _output.Download<float>(destination);
 
         public void Dispose()
         {
+            _graph?.Dispose();
             foreach (var b in _buffers) b.Dispose();
             foreach (var m in _modules) m.Dispose();
         }
@@ -1033,7 +1130,8 @@ internal static class KernelConveyorTool
             Console.WriteLine("CONVEYOR STAGE 3 - bench with the Phase 0.5 calibrated protocol");
             Console.WriteLine("device-filling shapes, " + LaunchesPerSample +
                               " launches per timed region, paired within-sample ratio, " +
-                              Runs + " runs");
+                              "up to " + StabilityAttempts + " attempts with a latest-" +
+                              Runs + " stability window");
             Console.WriteLine("harness noise floor measured at 1.05%; differences under ~3% are not claimable");
             Console.WriteLine("protocol " + CodegenMeasurementProtocol.Stamp(
                 "RTX 3080, clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
@@ -1085,59 +1183,44 @@ internal static class KernelConveyorTool
                     uint blocks = program.Kernels[0].Blocks;
 
                     using var launchable = TunedLaunchable.Create(runtime, program);
-                        void Launch() => launchable.Launch();
-                        int bestClockBefore = 0, bestClockAfter = 0;
-
-                        // RETRY ON CLOCK DRIFT. The SM clock was observed swinging
-                        // 2025 -> 1770 MHz (-12.6%) inside a single kernel's three runs,
-                        // and the rows whose clock held still had low spread while every
-                        // drifting row was elevated. That, not the kernel, is what
-                        // produced the intermittent 7.5% spreads. Locking clocks needs
-                        // administrator rights that are not available here, so instead
-                        // the measurement is repeated and the least-contaminated attempt
-                        // is the one reported.
-                        var medians = new double[Runs];
-                        double worstTail = 0;
-                        int clockBefore = 0, clockAfter = 0;
-                        double bestDrift = double.MaxValue;
-                        var bestMedians = new double[Runs];
-                        double bestTail = 0;
-                        for (int attempt = 0; attempt < ClockRetries; attempt++)
+                    void Launch() => launchable.Launch();
+                    // p11: both cross-process lanes retain the latest three runs.
+                    // A WDDM preemption ages out instead of poisoning a max/min over
+                    // all history, and both sides publish the MEDIAN of that window.
+                    var medians = new List<double>(Runs);
+                    var tails = new List<double>(Runs);
+                    int clockBefore = 0, clockAfter = 0;
+                    for (int attempt = 0; attempt < StabilityAttempts; attempt++)
+                    {
+                        clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                        Dist d = Measure(runtime.Synchronize, Launch);
+                        clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                        medians.Add(d.Median);
+                        tails.Add(d.Median > 0 ? d.P95 / d.Median : double.NaN);
+                        if (medians.Count > Runs)
                         {
-                            clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
-                            worstTail = 0;
-                            for (int run = 0; run < Runs; run++)
-                            {
-                                var d = Measure(runtime.Synchronize, Launch);
-                                medians[run] = d.Median;
-                                worstTail = Math.Max(worstTail, d.Median > 0 ? d.P95 / d.Median : double.NaN);
-                            }
-                            clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
-
-                            double drift = clockBefore > 0
-                                ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
-                                : double.MaxValue;
-                            if (attempt == 0 || drift < bestDrift)
-                            {
-                                bestDrift = drift;
-                                Array.Copy(medians, bestMedians, Runs);
-                                bestTail = worstTail;
-                                bestClockBefore = clockBefore;
-                                bestClockAfter = clockAfter;
-                            }
-                            if (drift <= 0.02) break;   // clean enough; stop retrying
+                            medians.RemoveAt(0);
+                            tails.RemoveAt(0);
                         }
-                        Array.Copy(bestMedians, medians, Runs);
-                        worstTail = bestTail;
-                        clockBefore = bestClockBefore;
-                        clockAfter = bestClockAfter;
-                        double lo = medians.Min(), hi = medians.Max();
-                        Console.WriteLine(entry.Name.PadRight(36) +
-                            blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
-                            (lo * 1000.0).ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
-                            worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
-                            ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
-                            GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
+
+                        double loNow = medians.Min(), hiNow = medians.Max();
+                        double spreadNow = loNow > 0 ? hiNow / loNow - 1.0 : double.MaxValue;
+                        double drift = clockBefore > 0
+                            ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
+                            : double.MaxValue;
+                        if (medians.Count == Runs &&
+                            spreadNow <= StableTimer.StableSpread && drift <= 0.02)
+                            break;
+                    }
+                    double lo = medians.Min(), hi = medians.Max();
+                    double reported = medians.OrderBy(value => value).ElementAt(medians.Count / 2);
+                    double worstTail = tails.Max();
+                    Console.WriteLine(entry.Name.PadRight(36) +
+                        blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
+                        (reported * 1000.0).ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
+                        worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
+                        ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
+                        GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
                 }
                 catch (Exception ex)
                 {
@@ -1147,7 +1230,7 @@ internal static class KernelConveyorTool
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-end", afterSuite: true);
     }
 
     /// <summary>
@@ -1395,13 +1478,16 @@ internal static class KernelConveyorTool
         return total;
     }
 
-    private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)
+    private static unsafe void LaunchSpec(
+        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks,
+        uint blockX, uint blockY, uint dynamicSharedMemoryBytes = 0)
     {
         fixed (IntPtr* pinned = pointers)
         {
             void** argv = stackalloc void*[pointers.Length];
             for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, blockX, blockY, 1, 0, argv);
+            module.Launch(
+                fn, blocks, 1, 1, blockX, blockY, 1, dynamicSharedMemoryBytes, argv);
         }
     }
 }

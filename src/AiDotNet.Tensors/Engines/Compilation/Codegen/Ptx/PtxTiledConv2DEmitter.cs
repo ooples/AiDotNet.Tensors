@@ -71,13 +71,36 @@ public sealed class PtxTiledConv2DEmitter
         L($"div.u32 %r3, %r0, {I(tilesM)};");
         L($"rem.u32 %r4, %r3, {I(rowTiles)};           // output-row tile");
         L($"div.u32 %r5, %r3, {I(rowTiles)};");
+        if (plan.IsChunkedPartial)
+        {
+            L($"div.u32 %r13, %r5, {I(plan.Batch)};    // reduction chunk");
+            L($"rem.u32 %r5, %r5, {I(plan.Batch)};     // batch");
+        }
         L($"mul.lo.u32 %r4, %r4, {I(plan.TileRows)};   // output-row origin");
-        L($"rem.u32 %r6, %r1, {I(plan.ThreadsSpatial)};");
-        L($"div.u32 %r7, %r1, {I(plan.ThreadsSpatial)}; // thread M");
-        L($"setp.lt.u32 %p2, %r6, {I(plan.ThreadsSpatialLogical)};");
-        L("selp.u32 %r6, %r6, 0, %p2;                 // safe padding lane");
-        L($"div.u32 %r14, %r6, {I(plan.ThreadsWidth)}; // local output row");
-        L($"rem.u32 %r6, %r6, {I(plan.ThreadsWidth)};  // thread column");
+        if (plan.WarpHalo)
+        {
+            // One warp owns one output row. M varies fastest, so equal activation
+            // fragments form native shared broadcasts and adjacent fragments of the
+            // same M lane sit exactly ThreadsM lanes apart for halo shuffles.
+            L($"rem.u32 %r7, %r1, {I(plan.ThreadsM)};  // thread M");
+            L($"div.u32 %r6, %r1, {I(plan.ThreadsM)};");
+            L($"div.u32 %r14, %r6, {I(plan.ScheduledThreadsWidth)}; // local output row");
+            L($"rem.u32 %r6, %r6, {I(plan.ScheduledThreadsWidth)};  // thread column");
+            L($"setp.lt.u32 %p2, %r6, {I(plan.ThreadsWidth)};");
+            L("selp.u32 %r6, %r6, 0, %p2;                 // safe padding lane");
+        }
+        else
+        {
+            // Interleave M lanes so every warp sees one activation fragment as a
+            // native shared broadcast across ThreadsM consumers. The same mapping
+            // also gives each M lane its distinct, conflict-free weight fragment.
+            L($"rem.u32 %r7, %r1, {I(plan.ThreadsM)};  // thread M");
+            L($"div.u32 %r6, %r1, {I(plan.ThreadsM)};");
+            L($"setp.lt.u32 %p2, %r6, {I(plan.ThreadsSpatialLogical)};");
+            L("selp.u32 %r6, %r6, 0, %p2;                 // safe padding lane");
+            L($"div.u32 %r14, %r6, {I(plan.ThreadsWidth)}; // local output row");
+            L($"rem.u32 %r6, %r6, {I(plan.ThreadsWidth)};  // thread column");
+        }
         L("add.u32 %r15, %r4, %r14;                    // output row");
         L($"mul.lo.u32 %r8, %r2, {I(plan.TileM)};      // M origin");
 
@@ -100,13 +123,23 @@ public sealed class PtxTiledConv2DEmitter
         L("TILED_CONV_REDUCE:");
         L("add.u32 %r11, %r9, 1;");
         L($"setp.lt.u32 %p0, %r11, {I(plan.Steps)};");
-        L($"xor.b32 %r12, %r10, {I(plan.StageBytes)};");
+        L($"xor.b32 %r12, %r10, {I(plan.BufferToggleBytes)};");
         L("@!%p0 bra TILED_CONV_COMPUTE;");
-        EmitAsyncStage(plan, "%r11", "%r12");
+        EmitAsyncStage(plan, "%r11", "%r12",
+            includeMatrix: !plan.AsymmetricStages, includeStream: true);
         L("cp.async.commit_group;");
         L("TILED_CONV_COMPUTE:");
-        EmitCompute(plan, "%r10", accumulators);
+        EmitCompute(plan, "%r10", "%r9", accumulators);
         L("@!%p0 bra TILED_CONV_DONE;");
+        if (plan.AsymmetricStages)
+        {
+            // The current weight slab can be overwritten only after its consumers have
+            // finished. The larger activation slab was already copied concurrently.
+            L("bar.sync 0;");
+            EmitAsyncStage(plan, "%r11", "%r12",
+                includeMatrix: true, includeStream: false);
+            L("cp.async.commit_group;");
+        }
         L("cp.async.wait_group 0;");
         L("bar.sync 0;");
         L("mov.u32 %r9, %r11;");
@@ -148,7 +181,8 @@ public sealed class PtxTiledConv2DEmitter
     }
 
     private void EmitAsyncStage(
-        CodegenTiledConv2DPlan plan, string step, string bufferBase)
+        CodegenTiledConv2DPlan plan, string step, string bufferBase,
+        bool includeMatrix = true, bool includeStream = true)
     {
         const int ValuesPerCopy = 4;
         int streamBase = plan.MatrixStageElements * sizeof(float);
@@ -159,93 +193,107 @@ public sealed class PtxTiledConv2DEmitter
         // let every compute thread replace two hot shared loads with one aligned v2 load.
         int matrixElements = plan.MatrixStageElements;
         int matrixPasses = (matrixElements + plan.BlockThreads - 1) / plan.BlockThreads;
-        for (int pass = 0; pass < matrixPasses; pass++)
+        if (includeMatrix)
         {
-            string index = NextR(), localChannel = NextR(), inner = NextR();
-            string tap = NextR(), localM = NextR(), globalChannel = NextR();
-            string globalM = NextR(), element = NextR(), destinationElement = NextR();
-            string bytes = NextRd(), source = NextRd(), sharedBytes = NextRd(), destination = NextRd();
-            string valid = NextP();
-            L($"add.u32 {index}, %r1, {I(pass * plan.BlockThreads)};");
-            L($"setp.lt.u32 {valid}, {index}, {I(matrixElements)};");
-            // Assign lanes in physical source order so each warp reads contiguous
-            // weights, then transpose only the shared destination to [C,tap,M].
-            if (plan.MatrixReductionMajor)
+            for (int pass = 0; pass < matrixPasses; pass++)
             {
-                L($"div.u32 {localChannel}, {index}, {I(9 * plan.TileM)};");
-                L($"rem.u32 {inner}, {index}, {I(9 * plan.TileM)};");
-                L($"div.u32 {localM}, {inner}, 9;");
-                L($"rem.u32 {tap}, {inner}, 9;");
+                string index = NextR(), localChannel = NextR(), inner = NextR();
+                string tap = NextR(), localM = NextR(), globalChannel = NextR();
+                string globalM = NextR(), element = NextR(), destinationElement = NextR();
+                string bytes = NextRd(), source = NextRd(), sharedBytes = NextRd(), destination = NextRd();
+                string valid = NextP();
+                L($"add.u32 {index}, %r1, {I(pass * plan.BlockThreads)};");
+                L($"setp.lt.u32 {valid}, {index}, {I(matrixElements)};");
+                // Assign lanes in physical source order so each warp reads contiguous
+                // weights, then transpose only the shared destination to [C,tap,M].
+                if (plan.MatrixReductionMajor)
+                {
+                    L($"div.u32 {localChannel}, {index}, {I(9 * plan.TileM)};");
+                    L($"rem.u32 {inner}, {index}, {I(9 * plan.TileM)};");
+                    L($"div.u32 {localM}, {inner}, 9;");
+                    L($"rem.u32 {tap}, {inner}, 9;");
+                }
+                else
+                {
+                    L($"div.u32 {localM}, {index}, {I(9 * plan.TileChannels)};");
+                    L($"rem.u32 {inner}, {index}, {I(9 * plan.TileChannels)};");
+                    L($"div.u32 {localChannel}, {inner}, 9;");
+                    L($"rem.u32 {tap}, {inner}, 9;");
+                }
+                L($"mad.lo.u32 {globalChannel}, {step}, {I(plan.TileChannels)}, {localChannel};");
+                if (plan.IsChunkedPartial)
+                    L($"mad.lo.u32 {globalChannel}, %r13, {I(plan.ReductionChannels)}, {globalChannel};");
+                L($"add.u32 {globalM}, {localM}, %r8;");
+                if (plan.MatrixReductionMajor)
+                {
+                    L($"mad.lo.u32 {element}, {globalChannel}, {I(plan.M)}, {globalM};");
+                }
+                else
+                {
+                    L($"mad.lo.u32 {element}, {globalM}, {I(plan.PhysicalReductionChannels)}, {globalChannel};");
+                }
+                L($"mad.lo.u32 {element}, {element}, 9, {tap};");
+                L($"mul.wide.u32 {bytes}, {element}, 4;");
+                L($"add.u64 {source}, %rd0, {bytes};");
+                L($"mad.lo.u32 {destinationElement}, {localChannel}, 9, {tap};");
+                L($"mad.lo.u32 {destinationElement}, {destinationElement}, {I(plan.TileM)}, {localM};");
+                L($"mul.wide.u32 {sharedBytes}, {destinationElement}, 4;");
+                L($"add.u64 {destination}, %rd3, {sharedBytes};");
+                if (!plan.AsymmetricStages)
+                {
+                    L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
+                    L($"add.u64 {destination}, {destination}, {sharedBytes};");
+                }
+                L($"@{valid} cp.async.ca.shared.global [{destination}], [{source}], 4;");
             }
-            else
-            {
-                L($"div.u32 {localM}, {index}, {I(9 * plan.TileChannels)};");
-                L($"rem.u32 {inner}, {index}, {I(9 * plan.TileChannels)};");
-                L($"div.u32 {localChannel}, {inner}, 9;");
-                L($"rem.u32 {tap}, {inner}, 9;");
-            }
-            L($"mad.lo.u32 {globalChannel}, {step}, {I(plan.TileChannels)}, {localChannel};");
-            L($"add.u32 {globalM}, {localM}, %r8;");
-            if (plan.MatrixReductionMajor)
-            {
-                L($"mad.lo.u32 {element}, {globalChannel}, {I(plan.M)}, {globalM};");
-            }
-            else
-            {
-                L($"mad.lo.u32 {element}, {globalM}, {I(plan.ReductionChannels)}, {globalChannel};");
-            }
-            L($"mad.lo.u32 {element}, {element}, 9, {tap};");
-            L($"mul.wide.u32 {bytes}, {element}, 4;");
-            L($"add.u64 {source}, %rd0, {bytes};");
-            L($"mad.lo.u32 {destinationElement}, {localChannel}, 9, {tap};");
-            L($"mad.lo.u32 {destinationElement}, {destinationElement}, {I(plan.TileM)}, {localM};");
-            L($"mul.wide.u32 {sharedBytes}, {destinationElement}, 4;");
-            L($"add.u64 {destination}, %rd3, {sharedBytes};");
-            L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
-            L($"add.u64 {destination}, {destination}, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global [{destination}], [{source}], 4;");
         }
 
-        int chunksPerInputRow = plan.InputWidth / ValuesPerCopy;
-        int inputChunks = plan.StreamStageElements / ValuesPerCopy;
-        int inputPasses = (inputChunks + plan.BlockThreads - 1) / plan.BlockThreads;
-        for (int pass = 0; pass < inputPasses; pass++)
+        if (includeStream && !plan.DirectStream)
         {
-            string index = NextR(), row = NextR(), column = NextR();
-            string localChannel = NextR(), windowRow = NextR(), globalChannel = NextR();
-            string sourceRow = NextR(), safeRow = NextR(), element = NextR();
-            string bytes = NextRd(), source = NextRd(), sharedBytes = NextRd(), destination = NextRd();
-            string valid = NextP(), below = NextP(), above = NextP(), ignore = NextP();
-            L($"add.u32 {index}, %r1, {I(pass * plan.BlockThreads)};");
-            L($"setp.lt.u32 {valid}, {index}, {I(inputChunks)};");
-            L($"div.u32 {row}, {index}, {I(chunksPerInputRow)};");
-            L($"rem.u32 {column}, {index}, {I(chunksPerInputRow)};");
-            L($"div.u32 {localChannel}, {row}, {I(plan.WindowRows)};");
-            L($"rem.u32 {windowRow}, {row}, {I(plan.WindowRows)};");
-            L($"mad.lo.u32 {globalChannel}, {step}, {I(plan.TileChannels)}, {localChannel};");
-            L($"add.s32 {sourceRow}, %r4, {windowRow};");
-            L($"add.s32 {sourceRow}, {sourceRow}, -1;");
-            L($"setp.lt.s32 {below}, {sourceRow}, 0;");
-            L($"setp.ge.s32 {above}, {sourceRow}, {I(plan.InputHeight)};");
-            L($"or.pred {ignore}, {below}, {above};");
-            L($"max.s32 {safeRow}, {sourceRow}, 0;");
-            L($"min.s32 {safeRow}, {safeRow}, {I(plan.InputHeight - 1)};");
-            L($"mad.lo.u32 {element}, %r5, {I(plan.ReductionChannels)}, {globalChannel};");
-            L($"mad.lo.u32 {element}, {element}, {I(plan.InputHeight)}, {safeRow};");
-            L($"mul.lo.u32 {element}, {element}, {I(plan.InputWidth)};");
-            L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
-            L($"mul.wide.u32 {bytes}, {element}, 4;");
-            L($"add.u64 {source}, %rd1, {bytes};");
-            L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
-            L($"add.u64 {destination}, %rd3, {sharedBytes};");
-            L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
-            L($"add.u64 {destination}, {destination}, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global [{destination}+{I(streamBase)}], [{source}], 16, {ignore};");
+            int chunksPerInputRow = plan.InputWidth / ValuesPerCopy;
+            int inputChunks = plan.StreamStageElements / ValuesPerCopy;
+            int inputPasses = (inputChunks + plan.BlockThreads - 1) / plan.BlockThreads;
+            for (int pass = 0; pass < inputPasses; pass++)
+            {
+                string index = NextR(), row = NextR(), column = NextR();
+                string localChannel = NextR(), windowRow = NextR(), globalChannel = NextR();
+                string sourceRow = NextR(), safeRow = NextR(), element = NextR();
+                string bytes = NextRd(), source = NextRd(), sharedBytes = NextRd(), destination = NextRd();
+                string valid = NextP(), below = NextP(), above = NextP(), ignore = NextP();
+                L($"add.u32 {index}, %r1, {I(pass * plan.BlockThreads)};");
+                L($"setp.lt.u32 {valid}, {index}, {I(inputChunks)};");
+                L($"div.u32 {row}, {index}, {I(chunksPerInputRow)};");
+                L($"rem.u32 {column}, {index}, {I(chunksPerInputRow)};");
+                L($"div.u32 {localChannel}, {row}, {I(plan.WindowRows)};");
+                L($"rem.u32 {windowRow}, {row}, {I(plan.WindowRows)};");
+                L($"mad.lo.u32 {globalChannel}, {step}, {I(plan.TileChannels)}, {localChannel};");
+                if (plan.IsChunkedPartial)
+                    L($"mad.lo.u32 {globalChannel}, %r13, {I(plan.ReductionChannels)}, {globalChannel};");
+                L($"add.s32 {sourceRow}, %r4, {windowRow};");
+                L($"add.s32 {sourceRow}, {sourceRow}, -1;");
+                L($"setp.lt.s32 {below}, {sourceRow}, 0;");
+                L($"setp.ge.s32 {above}, {sourceRow}, {I(plan.InputHeight)};");
+                L($"or.pred {ignore}, {below}, {above};");
+                L($"max.s32 {safeRow}, {sourceRow}, 0;");
+                L($"min.s32 {safeRow}, {safeRow}, {I(plan.InputHeight - 1)};");
+                L($"mad.lo.u32 {element}, %r5, {I(plan.PhysicalReductionChannels)}, {globalChannel};");
+                L($"mad.lo.u32 {element}, {element}, {I(plan.InputHeight)}, {safeRow};");
+                L($"mul.lo.u32 {element}, {element}, {I(plan.InputWidth)};");
+                L($"mad.lo.u32 {element}, {column}, {I(ValuesPerCopy)}, {element};");
+                L($"mul.wide.u32 {bytes}, {element}, 4;");
+                L($"add.u64 {source}, %rd1, {bytes};");
+                L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
+                L($"add.u64 {destination}, %rd3, {sharedBytes};");
+                L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
+                L($"add.u64 {destination}, {destination}, {sharedBytes};");
+                L($"@{valid} cp.async.ca.shared.global [{destination}+{I(streamBase)}], [{source}], 16, {ignore};");
+            }
         }
     }
 
     private void EmitCompute(
-        CodegenTiledConv2DPlan plan, string bufferBase, string[,] accumulators)
+        CodegenTiledConv2DPlan plan, string bufferBase, string step,
+        string[,] accumulators)
     {
         int streamBase = plan.MatrixStageElements * sizeof(float);
 
@@ -256,8 +304,12 @@ public sealed class PtxTiledConv2DEmitter
         string matrixOffset64 = NextRd(), streamRowOffset64 = NextRd();
         string streamColumnBytes = NextRd();
         string matrixBase = NextRd(), streamRowBase = NextRd(), streamThreadBase = NextRd();
-        L($"mad.lo.u32 {matrixOffset}, %r7, " +
-          $"{I(plan.ThreadTileM * sizeof(float))}, {bufferBase};");
+        if (plan.AsymmetricStages)
+            L($"mul.lo.u32 {matrixOffset}, %r7, " +
+              $"{I(plan.ThreadTileM * sizeof(float))};");
+        else
+            L($"mad.lo.u32 {matrixOffset}, %r7, " +
+              $"{I(plan.ThreadTileM * sizeof(float))}, {bufferBase};");
         L($"mad.lo.u32 {streamRowOffset}, %r14, " +
           $"{I(plan.InputWidth * sizeof(float))}, {bufferBase};");
         L($"add.u32 {streamRowOffset}, {streamRowOffset}, {I(streamBase)};");
@@ -269,40 +321,79 @@ public sealed class PtxTiledConv2DEmitter
         L($"add.u64 {streamRowBase}, %rd3, {streamRowOffset64};");
         L($"add.u64 {streamThreadBase}, {streamRowBase}, {streamColumnBytes};");
 
+        string? sharedHasLeft = null, sharedHasRight = null;
+        string? sharedLeftBase = null, sharedRightBase = null;
+        if (!plan.DirectStream && !plan.WarpHalo)
+        {
+            sharedHasLeft = NextP();
+            sharedHasRight = NextP();
+            sharedLeftBase = NextRd();
+            sharedRightBase = NextRd();
+            L($"setp.gt.u32 {sharedHasLeft}, %r6, 0;");
+            L($"setp.lt.u32 {sharedHasRight}, %r6, {I(plan.ThreadsWidth - 1)};");
+            L($"sub.u64 {sharedLeftBase}, {streamThreadBase}, 4;");
+            L($"add.u64 {sharedRightBase}, {streamThreadBase}, " +
+              $"{I(plan.ThreadTileWidth * sizeof(float))};");
+        }
+
         for (int c = 0; c < plan.TileChannels; c++)
             for (int kh = 0; kh < plan.TapRows; kh++)
             {
                 // Four adjacent outputs across all three column taps need only the six
                 // activation values [ow-1, ow..ow+3, ow+4]. Load that window once per
                 // channel/input-row and reuse overlapping values for every tap.
-                var streamWindow = new string[plan.ThreadTileWidth + 2];
                 int windowTap = plan.TapSign == 1
                     ? kh
                     : plan.TapRows - 1 - kh;
                 int rowBase = (c * plan.WindowRows + windowTap) * plan.InputWidth;
-                streamWindow[0] = EmitScalarStream(
-                    plan, streamRowBase, rowBase, columnConstant: -1);
-                for (int j = 0; j < plan.ThreadTileWidth; j++)
-                    streamWindow[j + 1] = NextF();
-                int loadedMiddle = 0;
-                while (loadedMiddle < plan.ThreadTileWidth)
+                string[] streamWindow;
+                if (plan.DirectStream)
                 {
-                    string lastColumn = NextR(), validVector = NextP();
-                    L($"mad.lo.u32 {lastColumn}, %r6, {I(plan.ThreadTileWidth)}, " +
-                      $"{I(loadedMiddle + 3)};");
-                    L($"setp.lt.u32 {validVector}, {lastColumn}, {I(plan.InputWidth)};");
-                    for (int j = 0; j < 4; j++)
-                        L($"mov.f32 {streamWindow[loadedMiddle + j + 1]}, 0f00000000;");
-                    L($"@{validVector} ld.shared.v4.f32 " +
-                      $"{{{streamWindow[loadedMiddle + 1]}, {streamWindow[loadedMiddle + 2]}, " +
-                      $"{streamWindow[loadedMiddle + 3]}, {streamWindow[loadedMiddle + 4]}}}, " +
-                      $"[{streamThreadBase}+" +
-                      $"{I((rowBase + loadedMiddle) * sizeof(float))}];");
-                    loadedMiddle += 4;
+                    streamWindow = EmitDirectStreamWindow(
+                        plan, step, c, windowTap);
                 }
-                streamWindow[^1] = EmitScalarStream(
-                    plan, streamRowBase, rowBase,
-                    columnConstant: plan.ThreadTileWidth);
+                else
+                {
+                    streamWindow = new string[plan.ThreadTileWidth + 2];
+                    for (int j = 0; j < plan.ThreadTileWidth; j++)
+                    {
+                        streamWindow[j + 1] = NextF();
+                    }
+                    L($"ld.shared.v4.f32 " +
+                      $"{{{streamWindow[1]}, {streamWindow[2]}, " +
+                      $"{streamWindow[3]}, {streamWindow[4]}}}, " +
+                      $"[{streamThreadBase}+{I(rowBase * sizeof(float))}];");
+                    if (plan.ThreadTileWidth != 4)
+                        throw new InvalidOperationException(
+                            "The immediate halo path requires the proven four-wide thread tile.");
+                    if (!plan.WarpHalo)
+                    {
+                        streamWindow[0] = NextF();
+                        streamWindow[^1] = NextF();
+                        L($"mov.f32 {streamWindow[0]}, 0f00000000;");
+                        L($"mov.f32 {streamWindow[^1]}, 0f00000000;");
+                        int byteOffset = rowBase * sizeof(float);
+                        L($"@{sharedHasLeft} ld.shared.f32 {streamWindow[0]}, " +
+                          $"[{sharedLeftBase}+{I(byteOffset)}];");
+                        L($"@{sharedHasRight} ld.shared.f32 {streamWindow[^1]}, " +
+                          $"[{sharedRightBase}+{I(byteOffset)}];");
+                    }
+                    if (plan.WarpHalo)
+                    {
+                        string hasLeft = NextP(), hasRight = NextP();
+                        streamWindow[0] = NextF();
+                        streamWindow[^1] = NextF();
+                        L($"shfl.sync.up.b32 {streamWindow[0]}, " +
+                          $"{streamWindow[plan.ThreadTileWidth]}, " +
+                          $"{I(plan.ThreadsM)}, 0, 0xffffffff;");
+                        L($"shfl.sync.down.b32 {streamWindow[^1]}, {streamWindow[1]}, " +
+                          $"{I(plan.ThreadsM)}, 31, 0xffffffff;");
+                        L($"setp.gt.u32 {hasLeft}, %r6, 0;");
+                        L($"setp.lt.u32 {hasRight}, %r6, {I(plan.ThreadsWidth - 1)};");
+                        L($"selp.f32 {streamWindow[0]}, {streamWindow[0]}, 0f00000000, {hasLeft};");
+                        L($"selp.f32 {streamWindow[^1]}, {streamWindow[^1]}, 0f00000000, {hasRight};");
+                    }
+                }
 
                 for (int kw = 0; kw < plan.TapColumns; kw++)
                 {
@@ -370,6 +461,103 @@ public sealed class PtxTiledConv2DEmitter
         return result;
     }
 
+    private string[] EmitDirectStreamWindow(
+        CodegenTiledConv2DPlan plan, string step, int localChannel, int windowTap)
+    {
+        var window = new string[plan.ThreadTileWidth + 2];
+        string globalChannel = NextR(), sourceRow = NextR(), safeRow = NextR();
+        string rowElement = NextR(), column = NextR();
+        string rowBytes = NextRd(), rowBase = NextRd(), columnBytes = NextRd();
+        string threadBase = NextRd();
+        string below = NextP(), above = NextP(), rowValid = NextP();
+
+        L($"mad.lo.u32 {globalChannel}, {step}, {I(plan.TileChannels)}, {I(localChannel)};");
+        if (plan.IsChunkedPartial)
+            L($"mad.lo.u32 {globalChannel}, %r13, {I(plan.ReductionChannels)}, {globalChannel};");
+        L($"add.s32 {sourceRow}, %r15, {I(windowTap - 1)};");
+        L($"setp.ge.s32 {below}, {sourceRow}, 0;");
+        L($"setp.lt.s32 {above}, {sourceRow}, {I(plan.InputHeight)};");
+        L($"and.pred {rowValid}, {below}, {above};");
+        L($"max.s32 {safeRow}, {sourceRow}, 0;");
+        L($"min.s32 {safeRow}, {safeRow}, {I(plan.InputHeight - 1)};");
+        L($"mad.lo.u32 {rowElement}, %r5, {I(plan.PhysicalReductionChannels)}, {globalChannel};");
+        L($"mad.lo.u32 {rowElement}, {rowElement}, {I(plan.InputHeight)}, {safeRow};");
+        L($"mul.lo.u32 {rowElement}, {rowElement}, {I(plan.InputWidth)};");
+        L($"mul.wide.u32 {rowBytes}, {rowElement}, 4;");
+        L($"add.u64 {rowBase}, %rd1, {rowBytes};");
+        L($"mul.lo.u32 {column}, %r6, {I(plan.ThreadTileWidth)};");
+        L($"mul.wide.u32 {columnBytes}, {column}, 4;");
+        L($"add.u64 {threadBase}, {rowBase}, {columnBytes};");
+
+        for (int j = 0; j < plan.ThreadTileWidth; j++)
+        {
+            window[j + 1] = NextF();
+            L($"mov.f32 {window[j + 1]}, 0f00000000;");
+        }
+        if (plan.WarpHalo)
+        {
+            string isLoader = NextP(), loadValid = NextP();
+            string sourceLane = NextR();
+            L($"setp.eq.u32 {isLoader}, %r7, 0;");
+            L($"and.pred {loadValid}, {rowValid}, {isLoader};");
+            L($"@{loadValid} ld.global.ca.v4.f32 " +
+              $"{{{window[1]}, {window[2]}, {window[3]}, {window[4]}}}, [{threadBase}];");
+            L($"mul.lo.u32 {sourceLane}, %r6, {I(plan.ThreadsM)};");
+            // Multiple scheduled rows can share one warp. shfl.idx names an absolute
+            // lane within that warp, so include the packed row's warp-local base before
+            // broadcasting the one loader's fragment across its M consumers.
+            L($"mad.lo.u32 {sourceLane}, %r14, " +
+              $"{I(plan.ThreadsM * plan.ScheduledThreadsWidth)}, {sourceLane};");
+            L($"and.b32 {sourceLane}, {sourceLane}, 31;");
+            for (int j = 1; j <= plan.ThreadTileWidth; j++)
+                L($"shfl.sync.idx.b32 {window[j]}, {window[j]}, {sourceLane}, 31, 0xffffffff;");
+
+            string hasLeft = NextP(), hasRight = NextP();
+            window[0] = NextF();
+            window[^1] = NextF();
+            L($"shfl.sync.up.b32 {window[0]}, {window[plan.ThreadTileWidth]}, " +
+              $"{I(plan.ThreadsM)}, 0, 0xffffffff;");
+            L($"shfl.sync.down.b32 {window[^1]}, {window[1]}, " +
+              $"{I(plan.ThreadsM)}, 31, 0xffffffff;");
+            L($"setp.gt.u32 {hasLeft}, %r6, 0;");
+            L($"setp.lt.u32 {hasRight}, %r6, {I(plan.ThreadsWidth - 1)};");
+            L($"selp.f32 {window[0]}, {window[0]}, 0f00000000, {hasLeft};");
+            L($"selp.f32 {window[^1]}, {window[^1]}, 0f00000000, {hasRight};");
+        }
+        else
+        {
+            L($"@{rowValid} ld.global.ca.v4.f32 " +
+              $"{{{window[1]}, {window[2]}, {window[3]}, {window[4]}}}, [{threadBase}];");
+            window[0] = EmitDirectScalarStream(
+                plan, rowBase, rowValid, columnConstant: -1);
+            window[^1] = EmitDirectScalarStream(
+                plan, rowBase, rowValid, columnConstant: plan.ThreadTileWidth);
+        }
+        return window;
+    }
+
+    private string EmitDirectScalarStream(
+        CodegenTiledConv2DPlan plan, string rowBase, string rowValid,
+        int columnConstant)
+    {
+        string sourceColumn = NextR(), safeColumn = NextR();
+        string columnBytes = NextRd(), address = NextRd();
+        string low = NextP(), high = NextP(), columnValid = NextP(), valid = NextP();
+        string loaded = NextF(), result = NextF();
+        L($"mad.lo.s32 {sourceColumn}, %r6, {I(plan.ThreadTileWidth)}, {I(columnConstant)};");
+        L($"setp.ge.s32 {low}, {sourceColumn}, 0;");
+        L($"setp.lt.s32 {high}, {sourceColumn}, {I(plan.InputWidth)};");
+        L($"and.pred {columnValid}, {low}, {high};");
+        L($"and.pred {valid}, {rowValid}, {columnValid};");
+        L($"max.s32 {safeColumn}, {sourceColumn}, 0;");
+        L($"min.s32 {safeColumn}, {safeColumn}, {I(plan.InputWidth - 1)};");
+        L($"mul.wide.u32 {columnBytes}, {safeColumn}, 4;");
+        L($"add.u64 {address}, {rowBase}, {columnBytes};");
+        L($"ld.global.ca.f32 {loaded}, [{address}];");
+        L($"selp.f32 {result}, {loaded}, 0f00000000, {valid};");
+        return result;
+    }
+
     private void EmitStores(
         CodegenTiledConv2DPlan plan, CodegenActivationKind activation,
         string[,] accumulators)
@@ -385,8 +573,27 @@ public sealed class PtxTiledConv2DEmitter
         L($"mad.lo.u32 {element}, %r5, {I(plan.M)}, {globalM};");
         L($"mad.lo.u32 {element}, {element}, {I(plan.OutputHeight)}, %r15;");
         L($"mad.lo.u32 {element}, {element}, {I(plan.OutputWidth)}, {column};");
+        if (plan.IsChunkedPartial)
+            L($"mad.lo.u32 {element}, {element}, {I(plan.SplitFactor)}, %r13;");
         L($"mul.wide.u32 {bytes}, {element}, 4;");
         L($"add.u64 {outputBase}, %rd2, {bytes};");
+
+        if (plan.IsChunkedPartial)
+        {
+            // The generic deterministic combine wants the chunk as the trailing,
+            // contiguous reduction dimension. Partial columns are therefore strided by
+            // SplitFactor; scalar stores preserve that layout without a transpose pass.
+            for (int i = 0; i < plan.ThreadTileM; i++)
+                for (int j = 0; j < plan.ThreadTileWidth; j++)
+                {
+                    int byteOffset =
+                        (i * plan.OutputHeight * plan.OutputWidth + j) *
+                        plan.SplitFactor * sizeof(float);
+                    L($"@%p2 st.global.f32 [{outputBase}+{I(byteOffset)}], " +
+                      $"{accumulators[i, j]};");
+                }
+            return;
+        }
 
         if (plan.BiasInput.HasValue)
         {
@@ -441,4 +648,5 @@ public sealed class PtxTiledConv2DEmitter
     private string NextF() => "%f" + I(_f++);
     private void L(string line) => _body.Append("    ").Append(line).Append('\n');
     private static string I(int value) => value.ToString(CultureInfo.InvariantCulture);
+
 }

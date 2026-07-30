@@ -56,6 +56,20 @@ public sealed class CodegenTiledContractionTests
         Assert.Equal((32, 56, 8), (bench.TileM, bench.TileN, bench.TileK));
     }
 
+    /// <summary>The same semantic tile accepts a per-M post-bias scale.</summary>
+    [Fact]
+    public void DeepEpilogue_RecoversBiasScaleReluContraction()
+    {
+        var entry = CodegenKernelCatalog.Find("conv2d_1x1_deep_epilogue")!;
+
+        Assert.True(CodegenTiledContractionPlan.TryCreate(
+            entry.Bench, out var plan, out string reason), reason);
+        Assert.NotNull(plan);
+        Assert.Equal(entry.Bench.BiasInput, plan!.BiasInput);
+        Assert.Equal(entry.Bench.ScaleInput, plan.ScaleInput);
+        Assert.Equal((32, 56, 8), (plan.TileM, plan.TileN, plan.TileK));
+    }
+
     /// <summary>A depthwise stencil is not silently reinterpreted as a dense matrix product.</summary>
     [Fact]
     public void DepthwiseStencil_IsRefusedWithReason()
@@ -88,6 +102,7 @@ public sealed class CodegenTiledContractionTests
     [Theory]
     [InlineData("conv2d_1x1_bias_relu")]
     [InlineData("conv2d_1x1_bwd_data")]
+    [InlineData("conv2d_1x1_deep_epilogue")]
     public void SelectedTiles_AreWholeAndCpAsyncAligned(string kernel)
     {
         var entry = CodegenKernelCatalog.Find(kernel)!;
@@ -105,6 +120,40 @@ public sealed class CodegenTiledContractionTests
         }
     }
 
+    /// <summary>Measured schedules have stable names and preserve whole-copy invariants.</summary>
+    [Fact]
+    public void ExactSchedule_RebuildsTheNamedTile()
+    {
+        const string winner = "tiled-contraction:m64n56k16tm8tn2";
+        CodegenTiledContractionSchedule? schedule =
+            CodegenTiledContractionSchedule.Find(winner);
+        Assert.NotNull(schedule);
+        var spec = CodegenKernelCatalog.Find("conv2d_1x1_bias_relu")!.Bench;
+
+        Assert.True(CodegenTiledContractionPlan.TryCreate(
+            spec, schedule, out var plan, out string reason), reason);
+        Assert.NotNull(plan);
+        Assert.Equal((64, 56, 16, 8, 2),
+            (plan!.TileM, plan.TileN, plan.TileK, plan.ThreadTileM, plan.ThreadTileN));
+
+        var emitter = new PtxTiledContractionEmitter(schedule!);
+        string ptx = emitter.Emit(spec, 8, 6);
+        Assert.Contains("tile 64x56x16, thread tile 8x2", ptx);
+        Assert.Equal((uint)plan.Blocks, emitter.LaunchBlocks);
+    }
+
+    [Fact]
+    public void ExactSchedule_RefusesNonDivisibleShape()
+    {
+        var schedule = new CodegenTiledContractionSchedule(64, 112, 8, 8, 4);
+        var spec = CodegenKernelCatalog.Find("conv2d_1x1_bias_relu")!.Verify;
+
+        Assert.False(CodegenTiledContractionPlan.TryCreate(
+            spec, schedule, out var plan, out string reason));
+        Assert.Null(plan);
+        Assert.Contains("whole, 16-byte-aligned", reason);
+    }
+
     [Fact]
     public void UnsupportedActivation_IsRefused()
     {
@@ -113,7 +162,7 @@ public sealed class CodegenTiledContractionTests
         Assert.False(CodegenTiledContractionPlan.TryCreate(
             spec, out var plan, out string reason));
         Assert.Null(plan);
-        Assert.Contains("optional M bias and ReLU", reason);
+        Assert.Contains("optional M bias/scale and ReLU", reason);
     }
 
     [Fact]
@@ -141,6 +190,8 @@ public sealed class CodegenTiledContractionTests
         Assert.Contains("cp.async.ca.shared.global", ptx);
         Assert.Contains("cp.async.wait_group 0", ptx);
         Assert.Contains("fma.rn.f32", ptx);
+        Assert.Contains("ld.shared.v4.f32", ptx);
+        Assert.Contains("ld.shared.v2.f32", ptx);
         Assert.DoesNotContain("mma.sync", ptx);
         Assert.DoesNotContain("wmma", ptx);
     }
@@ -161,6 +212,24 @@ public sealed class CodegenTiledContractionTests
         Assert.Contains("add.rn.f32", ptx);
         Assert.Contains("max.f32", ptx);
         Assert.Contains("cp.async.ca.shared.global", ptx);
+        Assert.Contains("ld.shared.v2.f32", ptx);
+    }
+
+    /// <summary>The tiled epilogue preserves bias, then scale, then activation ordering.</summary>
+    [Fact]
+    public void DeepEpilogue_EmitsBiasThenScaleThenRelu()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_1x1_deep_epilogue")!.Bench;
+        var emitter = new PtxTiledContractionEmitter();
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Contains("ld.param.u64 %rd4, [p2]", ptx);
+        Assert.Contains("ld.param.u64 %rd5, [p3]", ptx);
+        int bias = ptx.LastIndexOf("add.rn.f32", System.StringComparison.Ordinal);
+        int scale = ptx.LastIndexOf("mul.rn.f32", System.StringComparison.Ordinal);
+        int relu = ptx.LastIndexOf("max.f32", System.StringComparison.Ordinal);
+        Assert.True(bias >= 0 && bias < scale && scale < relu);
     }
 
     /// <summary>The assembled device program agrees with the spec interpreter.</summary>

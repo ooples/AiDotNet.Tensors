@@ -164,7 +164,7 @@ internal static class ResidentProgramSpike
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("resident-spike-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("resident-spike-end", afterSuite: true);
     }
 
     private static void Report(string name, double us) =>

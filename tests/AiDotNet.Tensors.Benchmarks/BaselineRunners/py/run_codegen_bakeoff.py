@@ -7,7 +7,8 @@
 #     per-call sync latency is amortised instead of dominating (the C# harness measured
 #     a 21.5 us launch floor and a 5.5 P95/median ratio without this);
 #   * SAMPLES samples per run, median reported;
-#   * RUNS runs, and the full spread is printed rather than the best.
+#   * up to STABILITY_ATTEMPTS runs, retaining the latest RUNS until they agree;
+#     the median and full spread of that accepted window are printed.
 #
 # Fairness note that the numbers cannot show on their own: our kernels are FUSED
 # (conv + bias + ReLU in one kernel). PyTorch runs conv+bias through cuDNN and then a
@@ -26,6 +27,8 @@ WARMUP = 20
 SAMPLES = 51
 LAUNCHES_PER_SAMPLE = 50
 RUNS = 3
+STABILITY_ATTEMPTS = 15
+STABLE_SPREAD_PCT = 5.0
 
 
 def conv_transpose_contract():
@@ -64,16 +67,25 @@ def time_op(fn):
 
 
 def best_of_runs(fn):
-    """Median of the RUNS medians, plus the observed spread across runs."""
+    """Median of the latest three agreeing runs, with contaminated runs aged out."""
     medians = []
-    worst_tail = 0.0
-    for _ in range(RUNS):
+    tails = []
+    for _ in range(STABILITY_ATTEMPTS):
         mid, p95 = time_op(fn)
         medians.append(mid)
-        worst_tail = max(worst_tail, p95 / mid if mid > 0 else float("nan"))
-    medians.sort()
-    spread = (medians[-1] / medians[0] - 1.0) * 100.0 if medians[0] > 0 else float("nan")
-    return medians[len(medians) // 2], worst_tail, spread
+        tails.append(p95 / mid if mid > 0 else float("nan"))
+        if len(medians) > RUNS:
+            medians.pop(0)
+            tails.pop(0)
+        if len(medians) == RUNS:
+            spread = ((max(medians) / min(medians) - 1.0) * 100.0
+                      if min(medians) > 0 else float("nan"))
+            if spread <= STABLE_SPREAD_PCT:
+                break
+    ordered = sorted(medians)
+    spread = ((ordered[-1] / ordered[0] - 1.0) * 100.0
+              if ordered[0] > 0 else float("nan"))
+    return ordered[len(ordered) // 2], max(tails), spread
 
 
 def emit(name, fn, note=""):

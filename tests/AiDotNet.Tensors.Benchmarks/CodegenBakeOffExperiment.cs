@@ -107,7 +107,7 @@ internal static class CodegenBakeOffExperiment
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("codegen-bakeoff-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("codegen-bakeoff-end", afterSuite: true);
     }
 
     private static void Report(string name, Dist d) =>

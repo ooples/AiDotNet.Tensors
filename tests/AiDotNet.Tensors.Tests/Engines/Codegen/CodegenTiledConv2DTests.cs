@@ -115,6 +115,41 @@ public sealed class CodegenTiledConv2DTests
     }
 
     [Fact]
+    public void ExactSplitSchedule_RebuildsBothPromotableKernels()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench;
+        const string winner = "tiled-conv2d:m16r7c8tm4:sk2";
+        CodegenTiledConv2DSplitSchedule? schedule =
+            CodegenTiledConv2DSplitSchedule.Find(winner);
+
+        Assert.NotNull(schedule);
+        Assert.Equal(winner, schedule!.WinnerName);
+        Assert.True(CodegenTiledConv2DSplitPlan.TryCreate(
+            spec, schedule, out var exact, out string reason), reason);
+        Assert.NotNull(exact);
+        Assert.Equal((2, 16, 32, 256),
+            (exact!.PartialPlan.SplitFactor,
+             exact.PartialPlan.ReductionChannels,
+             exact.PartialPlan.PhysicalReductionChannels,
+             exact.PartialPlan.Blocks));
+        Assert.Equal(2, exact.Split.Partial.Output.Shape[^1]);
+
+        var partial = new PtxTiledConv2DEmitter(schedule.Tile);
+        string partialPtx = partial.Emit(exact.Split.Partial, 8, 6);
+        var combine = new PtxAffineEmitter();
+        string combinePtx = combine.Emit(exact.Split.Combine, 8, 6);
+        Assert.Contains("fma.rn.f32", partialPtx);
+        Assert.Contains("ld.global.nc.f32", combinePtx);
+        Assert.Contains("add.rn.f32", combinePtx);
+        Assert.Contains("max.f32", combinePtx);
+
+        CodegenAutotuneIdentity identity = CodegenAutotuneIdentity.Create(
+            spec, "test-device", 8, 6);
+        Assert.StartsWith("ptxset-sha256-", identity.EmitterFingerprint,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void DenseForward_RefusesStaticSharedMemoryOverBudget()
     {
         var source = CodegenKernelCatalog.Find("conv2d_3x3_bias_relu")!.Bench;
@@ -229,9 +264,11 @@ public sealed class CodegenTiledConv2DTests
     }
 
     [SkippableTheory]
-    [InlineData("conv2d_3x3_bias_relu")]
-    [InlineData("conv2d_3x3_bwd_data")]
-    public unsafe void DenseWindow_DoubleBufferMatchesAffineAtBenchShape(string kernel)
+    [InlineData("conv2d_3x3_bias_relu", null)]
+    [InlineData("conv2d_3x3_bwd_data", null)]
+    [InlineData("conv2d_3x3_bias_relu", "tiled-conv2d:m16r7c8tm4:wh:ds")]
+    public unsafe void DenseWindow_DoubleBufferMatchesAffineAtBenchShape(
+        string kernel, string? exactWinner)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
         var spec = CodegenKernelCatalog.Find(kernel)!.Bench;
@@ -248,7 +285,14 @@ public sealed class CodegenTiledConv2DTests
         first.Upload<float>(host[0]);
         second.Upload<float>(host[1]);
 
-        var tiled = new PtxTiledConv2DEmitter();
+        CodegenTiledConv2DSchedule? exact = exactWinner is null
+            ? null
+            : CodegenTiledConv2DSchedule.Find(exactWinner);
+        Assert.True(exactWinner is null || exact is not null,
+            "The requested exact schedule must remain in the measured search space.");
+        var tiled = exact is null
+            ? new PtxTiledConv2DEmitter()
+            : new PtxTiledConv2DEmitter(exact);
         string tiledPtx = tiled.Emit(
             spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         using var tiledModule = runtime.LoadModule(tiledPtx, allowExperimentalJitFallback: true);
@@ -287,7 +331,8 @@ public sealed class CodegenTiledConv2DTests
         affineOutput.Download<float>(expected);
         tiledOutput.Download<float>(actual);
         AssertClose(expected, actual, 5e-5,
-            kernel + " benchmark tiled 3x3", relative: true);
+            kernel + " benchmark tiled 3x3 " + (exactWinner ?? "modelled"),
+            relative: true);
     }
 
 }

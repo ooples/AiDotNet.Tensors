@@ -66,7 +66,19 @@ public sealed record CodegenAutotuneIdentity(
         AppendCandidate(text, "input-staging", spec, computeMajor, computeMinor,
             static e => e.EnableInputStaging = true);
         AppendTiledCandidate(text, spec, computeMajor, computeMinor);
+        foreach (CodegenTiledContractionSchedule schedule in
+                 CodegenTiledContractionSchedule.SearchSpace)
+        {
+            AppendEmitterCandidate(text, schedule.WinnerName, spec,
+                computeMajor, computeMinor,
+                (candidate, major, minor) =>
+                    new PtxTiledContractionEmitter(schedule).Emit(candidate, major, minor));
+        }
         AppendTiledConv2DCandidate(text, spec, computeMajor, computeMinor);
+        AppendEmitterCandidate(text, "inline-outer-winograd-conv2d", spec,
+            computeMajor, computeMinor,
+            static (candidate, major, minor) =>
+                new PtxOuterProductWinogradConv2DEmitter().Emit(candidate, major, minor));
         foreach (CodegenTiledConv2DSchedule schedule in
                  CodegenTiledConv2DSchedule.SearchSpace)
         {
@@ -75,6 +87,10 @@ public sealed record CodegenAutotuneIdentity(
                 (candidate, major, minor) =>
                     new PtxTiledConv2DEmitter(schedule).Emit(candidate, major, minor));
         }
+        foreach (CodegenTiledConv2DSplitSchedule schedule in
+                 CodegenTiledConv2DSplitSchedule.SearchSpace)
+            AppendTiledConv2DSplitCandidate(
+                text, spec, computeMajor, computeMinor, schedule);
         AppendDepthwiseWeightGradientCandidate(text, spec, computeMajor, computeMinor);
         AppendParityTransposedConv2DCandidate(text, spec, computeMajor, computeMinor);
 
@@ -176,6 +192,35 @@ public sealed record CodegenAutotuneIdentity(
         AppendEmitterCandidate(text, "tiled-conv2d", spec, computeMajor, computeMinor,
             static (candidate, major, minor) =>
                 new PtxTiledConv2DEmitter().Emit(candidate, major, minor));
+    }
+
+    private static void AppendTiledConv2DSplitCandidate(
+        StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor,
+        CodegenTiledConv2DSplitSchedule schedule)
+    {
+        text.Append("candidate=").Append(schedule.WinnerName).Append(';');
+        try
+        {
+            if (!CodegenTiledConv2DSplitPlan.TryCreate(
+                    spec, schedule, out CodegenTiledConv2DSplitPlan? exact, out string reason))
+            {
+                text.Append("unsupported=").Append(reason);
+            }
+            else
+            {
+                var partial = new PtxTiledConv2DEmitter(schedule.Tile);
+                text.Append("partial=").Append(partial.Emit(
+                    exact!.Split.Partial, computeMajor, computeMinor));
+                var combine = new PtxAffineEmitter();
+                text.Append(";combine=").Append(combine.Emit(
+                    exact.Split.Combine, computeMajor, computeMinor));
+            }
+        }
+        catch (NotSupportedException ex)
+        {
+            text.Append("unsupported=").Append(ex.Message);
+        }
+        text.Append(";end-candidate;");
     }
 
     private static void AppendDepthwiseWeightGradientCandidate(

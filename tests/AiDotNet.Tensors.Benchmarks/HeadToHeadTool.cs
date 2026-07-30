@@ -92,7 +92,7 @@ internal static class HeadToHeadTool
         ReportUnavailable("Adam / AdamW",
             "generator cannot express grad^2 plus m/v/param updates yet");
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("head-to-head-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("head-to-head-end", afterSuite: true);
         Console.WriteLine();
         Console.WriteLine("ratio > 1 means the generated kernel is faster. A promotion needs BOTH");
         Console.WriteLine("sides stable and a ratio clear of the noise floor -- 1.05x from samples");

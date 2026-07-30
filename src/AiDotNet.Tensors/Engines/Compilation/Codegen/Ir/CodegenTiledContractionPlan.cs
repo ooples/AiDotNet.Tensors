@@ -5,6 +5,55 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
+/// <summary>One exact, replayable SIMT contraction tile in the measured search space.</summary>
+public sealed class CodegenTiledContractionSchedule
+{
+    private static readonly IReadOnlyList<CodegenTiledContractionSchedule> _searchSpace =
+        Array.AsReadOnly(new[]
+        {
+            // The model-selected tile is retained separately as "tiled-contraction".
+            // These schedules test the two missing architectural levers identified by
+            // counters: more output reuse per CTA and fewer synchronization points in K.
+            new CodegenTiledContractionSchedule(64, 56, 8, 8, 2),
+            new CodegenTiledContractionSchedule(32, 112, 8, 4, 4),
+            new CodegenTiledContractionSchedule(64, 112, 8, 8, 4),
+            new CodegenTiledContractionSchedule(32, 56, 16, 4, 2),
+            new CodegenTiledContractionSchedule(64, 56, 16, 8, 2),
+            new CodegenTiledContractionSchedule(32, 112, 16, 4, 4),
+            new CodegenTiledContractionSchedule(64, 112, 16, 8, 4),
+            new CodegenTiledContractionSchedule(32, 56, 32, 4, 2),
+            new CodegenTiledContractionSchedule(64, 56, 32, 8, 2),
+        });
+
+    public CodegenTiledContractionSchedule(
+        int tileM, int tileN, int tileK, int threadTileM, int threadTileN)
+    {
+        TileM = tileM;
+        TileN = tileN;
+        TileK = tileK;
+        ThreadTileM = threadTileM;
+        ThreadTileN = threadTileN;
+    }
+
+    public int TileM { get; }
+    public int TileN { get; }
+    public int TileK { get; }
+    public int ThreadTileM { get; }
+    public int ThreadTileN { get; }
+    public string WinnerName => FormattableString.Invariant(
+        $"tiled-contraction:m{TileM}n{TileN}k{TileK}tm{ThreadTileM}tn{ThreadTileN}");
+    public static IReadOnlyList<CodegenTiledContractionSchedule> SearchSpace => _searchSpace;
+
+    public static CodegenTiledContractionSchedule? Find(string? winner)
+    {
+        if (string.IsNullOrWhiteSpace(winner)) return null;
+        foreach (CodegenTiledContractionSchedule schedule in _searchSpace)
+            if (string.Equals(schedule.WinnerName, winner, StringComparison.Ordinal))
+                return schedule;
+        return null;
+    }
+}
+
 /// <summary>
 /// A SIMT FP32 output tile recovered from a semantic contraction, independently of its name.
 /// </summary>
@@ -25,7 +74,8 @@ public sealed class CodegenTiledContractionPlan
     private const int WideMThreadTile = 8;
 
     private CodegenTiledContractionPlan(
-        int matrixInput, int streamInput, int? biasInput, int mAxis, int reductionAxis,
+        int matrixInput, int streamInput, int? biasInput, int? scaleInput,
+        int mAxis, int reductionAxis,
         int batch, int m, int n, int k, bool matrixReductionMajor,
         int tileM, int tileN, int tileK, int threadTileM, int threadTileN,
         int stages)
@@ -33,6 +83,7 @@ public sealed class CodegenTiledContractionPlan
         MatrixInput = matrixInput;
         StreamInput = streamInput;
         BiasInput = biasInput;
+        ScaleInput = scaleInput;
         MAxis = mAxis;
         ReductionAxis = reductionAxis;
         Batch = batch;
@@ -56,6 +107,9 @@ public sealed class CodegenTiledContractionPlan
 
     /// <summary>Optional one-dimensional fp32 bias broadcast over M.</summary>
     public int? BiasInput { get; }
+
+    /// <summary>Optional one-dimensional fp32 post-bias scale broadcast over M.</summary>
+    public int? ScaleInput { get; }
 
     /// <summary>The spec axis represented by M.</summary>
     public int MAxis { get; }
@@ -123,6 +177,12 @@ public sealed class CodegenTiledContractionPlan
     /// </summary>
     public static bool TryCreate(
         CodegenKernelSpec spec, out CodegenTiledContractionPlan? plan, out string reason)
+        => TryCreate(spec, null, out plan, out reason);
+
+    /// <summary>Recovers the contraction and applies an exact measured schedule.</summary>
+    public static bool TryCreate(
+        CodegenKernelSpec spec, CodegenTiledContractionSchedule? schedule,
+        out CodegenTiledContractionPlan? plan, out string reason)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         plan = null;
@@ -136,12 +196,11 @@ public sealed class CodegenTiledContractionPlan
         }
 
         if (spec.PreBiasInput.HasValue || spec.ReduceScale != 1.0 ||
-            spec.ScaleInput.HasValue ||
             (spec.Activation != CodegenActivationKind.None &&
              spec.Activation != CodegenActivationKind.ReLU) ||
             spec.SecondaryOutput is not null || spec.ExtraOutputs.Count != 0)
         {
-            reason = "the tiled path accepts only an optional M bias and ReLU epilogue";
+            reason = "the tiled path accepts only optional M bias/scale and ReLU epilogue";
             return false;
         }
 
@@ -216,6 +275,12 @@ public sealed class CodegenTiledContractionPlan
             reason = "the tiled epilogue bias must be a one-dimensional fp32 broadcast over M";
             return false;
         }
+        if (spec.ScaleInput.HasValue &&
+            !IsMBias(spec.Inputs[spec.ScaleInput.Value], mAxis, spec.Space.Axes[mAxis].Extent))
+        {
+            reason = "the tiled epilogue scale must be a one-dimensional fp32 broadcast over M";
+            return false;
+        }
 
         int batch = 1, n = 1;
         for (int d = 0; d < mDimension; d++) batch = checked(batch * spec.Output.Shape[d]);
@@ -227,22 +292,35 @@ public sealed class CodegenTiledContractionPlan
         // A [K,M] matrix exposes a contiguous M row to each async copy. Owning the full
         // 64-wide row halves the CTA count and amortizes each streamed value across twice
         // as many outputs; [M,K] retains the smaller tile because its copies run along K.
-        int tileM = LargestDivisorAtMost(m,
+        int tileM = schedule?.TileM ?? LargestDivisorAtMost(m,
             reductionMajor ? ReductionMajorMaximumTileM : DefaultMaximumTileM, 4);
-        int tileN = LargestDivisorAtMost(n, 64, 4);
+        int tileN = schedule?.TileN ?? LargestDivisorAtMost(n, 64, 4);
         // A physically [M,K] matrix is copied along K, so each async copy needs four
         // adjacent values.  [K,M] copies along M and has no corresponding K constraint.
-        int tileK = LargestDivisorAtMost(k, 8, reductionMajor ? 1 : 4);
-        if (tileM == 0 || tileN == 0 || tileK == 0)
+        int tileK = schedule?.TileK ??
+            LargestDivisorAtMost(k, 8, reductionMajor ? 1 : 4);
+        bool matrixCopyAligned = reductionMajor ? tileM % 4 == 0 : tileK % 4 == 0;
+        if (tileM <= 0 || tileN <= 0 || tileK <= 0 ||
+            m % tileM != 0 || n % tileN != 0 || k % tileK != 0 ||
+            tileN % 4 != 0 || !matrixCopyAligned)
         {
-            reason = "the output or contraction extent has no supported whole tile";
+            reason = schedule is null
+                ? "the output or contraction extent has no supported whole tile"
+                : "the requested schedule is not a whole, 16-byte-aligned tile";
             return false;
         }
 
-        int threadTileM = tileM >= ReductionMajorMaximumTileM
-            ? WideMThreadTile
-            : tileM >= 16 ? 4 : tileM >= 4 ? 2 : 1;
-        int threadTileN = tileN >= 8 ? 2 : 1;
+        int threadTileM = schedule?.ThreadTileM ??
+            (tileM >= ReductionMajorMaximumTileM
+                ? WideMThreadTile
+                : tileM >= 16 ? 4 : tileM >= 4 ? 2 : 1);
+        int threadTileN = schedule?.ThreadTileN ?? (tileN >= 8 ? 2 : 1);
+        if (threadTileM <= 0 || threadTileN <= 0 ||
+            tileM % threadTileM != 0 || tileN % threadTileN != 0)
+        {
+            reason = "the requested thread tile does not divide the CTA tile";
+            return false;
+        }
         int threads = (tileM / threadTileM) * (tileN / threadTileN);
         if (threads < 32 || threads > 256)
         {
@@ -251,7 +329,8 @@ public sealed class CodegenTiledContractionPlan
         }
 
         plan = new CodegenTiledContractionPlan(
-            matrixInput, streamInput, spec.BiasInput, mAxis, reduction, batch, m, n, k,
+            matrixInput, streamInput, spec.BiasInput, spec.ScaleInput,
+            mAxis, reduction, batch, m, n, k,
             reductionMajor, tileM, tileN, tileK, threadTileM, threadTileN,
             stages: 2);
         reason = "eligible";
