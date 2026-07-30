@@ -354,6 +354,9 @@ public sealed class PtxTiledConv2DEmitter
                 }
                 else
                 {
+                    if (plan.ThreadTileWidth != 4)
+                        throw new InvalidOperationException(
+                            "The immediate halo path requires the proven four-wide thread tile.");
                     streamWindow = new string[plan.ThreadTileWidth + 2];
                     for (int j = 0; j < plan.ThreadTileWidth; j++)
                     {
@@ -363,9 +366,6 @@ public sealed class PtxTiledConv2DEmitter
                       $"{{{streamWindow[1]}, {streamWindow[2]}, " +
                       $"{streamWindow[3]}, {streamWindow[4]}}}, " +
                       $"[{streamThreadBase}+{I(rowBase * sizeof(float))}];");
-                    if (plan.ThreadTileWidth != 4)
-                        throw new InvalidOperationException(
-                            "The immediate halo path requires the proven four-wide thread tile.");
                     if (!plan.WarpHalo)
                     {
                         streamWindow[0] = NextF();
