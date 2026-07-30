@@ -7,6 +7,7 @@
 // torchvision-default shims that route through here.
 
 using System;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -601,24 +602,18 @@ public partial class CpuEngine
             }
         }
 
-        // NOT tape-registered, deliberately, pending the convention mismatch documented in
-        // GridSampleForwardConventionTests.
+        // Tape registration. This overload previously recorded NOTHING, so a mode-aware GridSample
+        // produced no gradient for either operand while the narrow overload produced both.
         //
-        // Wiring this to BackwardFunctions.GridSampleModeBackward (which forwards to the mode-aware
-        // GridSampleBackwardInput/Grid entry points) was tried and REVERTED: finite differences
-        // rejected it even for Bilinear + Zeros + alignCorners=false, the one combination those
-        // entry points claim to support (analytical 0.0390 vs numerical 0.1862).
-        //
-        // The cause is not the backward but a FORWARD disagreement. The 2-argument
-        // GridSample(input, grid) shim computes its pixel mapping as (size - 1) / 2 — the
-        // alignCorners=TRUE convention — and clamps sample indices into [0, size-1], which is BORDER
-        // padding. This method uses NormalizedToPixel(..., alignCorners) and SampleSafe(..., padding),
-        // so at Bilinear/Zeros/alignCorners=false the two produce different outputs (0.5900 vs 0.5737
-        // on the same inputs). The GridSampleBackward* kernels implement the shim's convention, so
-        // they are not the adjoint of THIS forward.
-        //
-        // Recording no gradient keeps the gradcheck sweep reporting the gap honestly; recording a
-        // gradient that finite differences reject would hide it.
+        // The sampling parameters are forwarded so the backward can use the mode-aware
+        // GridSampleBackwardInput/Grid entry points, which implement Bilinear + Zeros +
+        // alignCorners=false and raise NotSupportedException for anything else. They are deliberately
+        // NOT used unconditionally: Nearest is piecewise-constant, so its grid gradient is 0 rather
+        // than bilinear weights, and Border/Reflection padding changes which source pixels a boundary
+        // sample reads. A loud failure beats a plausible wrong number.
+        DifferentiableOps.RecordBinary("GridSample", output, input, grid,
+            BackwardFunctions<T>.GridSampleModeBackward,
+            savedState: new object[] { (int)mode, (int)padding, alignCorners });
         return output;
     }
 

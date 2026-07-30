@@ -19476,8 +19476,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gridBaseIdx = ((b * outHeight + oh) * outWidth + ow) * 2;
                     double gx = numOps.ToDouble(gridData[gridBaseIdx]);
                     double gy = numOps.ToDouble(gridData[gridBaseIdx + 1]);
-                    double srcH = (gy + 1) / 2 * (height - 1);
-                    double srcW = (gx + 1) / 2 * (width - 1);
+                    // align_corners=false mapping, matching the forward: ((g + 1) * size - 1) / 2.
+                    // Was (g + 1) / 2 * (size - 1) — the align_corners=TRUE form — so this kernel was
+                    // not the adjoint of the forward it serves.
+                    double srcH = ((gy + 1) * height - 1) / 2.0;
+                    double srcW = ((gx + 1) * width - 1) / 2.0;
                     if (srcH <= -1 || srcH >= height || srcW <= -1 || srcW >= width) continue;
 
                     int h0 = (int)Math.Floor(srcH), h1 = h0 + 1;
@@ -19555,9 +19558,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     double gx = numOps.ToDouble(gridData[gridBaseIdx]);
                     double gy = numOps.ToDouble(gridData[gridBaseIdx + 1]);
 
-                    // Convert to pixel coordinates
-                    double srcH = (gy + 1) / 2 * (height - 1);
-                    double srcW = (gx + 1) / 2 * (width - 1);
+                    // Convert to pixel coordinates — align_corners=false, matching the forward.
+                    double srcH = ((gy + 1) * height - 1) / 2.0;
+                    double srcW = ((gx + 1) * width - 1) / 2.0;
 
                     // Compute d(output)/d(gx) and d(output)/d(gy) by summing over all channels
                     T gradGx = numOps.Zero;
@@ -19573,10 +19576,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         int plane = (b * channels + c) * height * width;
                         var (dH, dW) = BilinearGradientNCHW(inputData, plane, height, width, srcH, srcW, numOps);
 
-                        // Chain rule: d/dgx = d/dw * dw/dgx where dw/dgx = (width-1)/2
-                        // Chain rule: d/dgy = d/dh * dh/dgy where dh/dgy = (height-1)/2
-                        T scaledDW = numOps.Multiply(dW, numOps.FromDouble((width - 1) / 2.0));
-                        T scaledDH = numOps.Multiply(dH, numOps.FromDouble((height - 1) / 2.0));
+                        // Chain rule: d/dgx = d/dw * dw/dgx where, for align_corners=false
+                        // (w = ((gx + 1) * width - 1) / 2), dw/dgx = width/2 — NOT (width-1)/2, which
+                        // is the align_corners=true derivative and did not match the forward.
+                        T scaledDW = numOps.Multiply(dW, numOps.FromDouble(width / 2.0));
+                        T scaledDH = numOps.Multiply(dH, numOps.FromDouble(height / 2.0));
 
                         gradGx = numOps.Add(gradGx, numOps.Multiply(gradOutVal, scaledDW));
                         gradGy = numOps.Add(gradGy, numOps.Multiply(gradOutVal, scaledDH));
@@ -32196,8 +32200,15 @@ public partial class CpuEngine : ITensorLevelEngine
         var inData = input.GetDataArray();
         var gridData = grid.GetDataArray();
         var outData = output.GetDataArray();
-        double widthScaleD = (inW - 1) / 2.0;
-        double heightScaleD = (inH - 1) / 2.0;
+        // torchvision / PyTorch DEFAULT convention: align_corners=false, padding_mode='zeros'.
+        //   src = ((g + 1) * size - 1) / 2  ==  (g + 1) * (size / 2) - 0.5
+        // This previously used (size - 1) / 2, which is the align_corners=TRUE mapping, and clamped
+        // the four sample indices into [0, size-1], which is BORDER padding — so despite this file
+        // documenting the narrow overload as a torchvision-default shim it implemented neither
+        // default. It disagreed with GridSample(..., Bilinear, Zeros, alignCorners:false) by 5.553e-2
+        // on interior coordinates. See GridSampleForwardConventionTests.
+        double widthScaleD = inW / 2.0;
+        double heightScaleD = inH / 2.0;
         long totalWork = (long)batch * outH * outW * channels;
         int lInH = inH, lInW = inW, lOutH = outH, lOutW = outW, lCh = channels;
 
@@ -32212,19 +32223,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int w = 0; w < lOutW; w++)
                 {
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
-                    double srcX = (gr[gBase] + 1.0) * widthScaleD;
-                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD;
-                    int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
-                    int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
+                    double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
+                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
+                    int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     double wx1 = srcX - x0, wx0 = 1.0 - wx1, wy1 = srcY - y0, wy0 = 1.0 - wy1;
+                    // Zeros padding: an out-of-range corner contributes nothing (rather than being
+                    // clamped to the border pixel). The gates are channel-independent, so they are
+                    // computed once per output pixel and the inner loop stays branch-predictable.
+                    bool okX0 = x0 >= 0 && x0 < lInW, okX1 = x1 >= 0 && x1 < lInW;
+                    bool okY0 = y0 >= 0 && y0 < lInH, okY1 = y1 >= 0 && y1 < lInH;
                     int outSpatial = h * lOutW + w;
                     int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
                     {
                         int inPlane = (b * lCh + c) * lInH * lInW;
-                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] =
-                            (inp[inPlane + s00] * wx0 * wy0 + inp[inPlane + s01] * wx1 * wy0)
-                          + (inp[inPlane + s10] * wx0 * wy1 + inp[inPlane + s11] * wx1 * wy1);
+                        double acc = 0.0;
+                        if (okY0 & okX0) acc += inp[inPlane + s00] * wx0 * wy0;
+                        if (okY0 & okX1) acc += inp[inPlane + s01] * wx1 * wy0;
+                        if (okY1 & okX0) acc += inp[inPlane + s10] * wx0 * wy1;
+                        if (okY1 & okX1) acc += inp[inPlane + s11] * wx1 * wy1;
+                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] = acc;
                     }
                 }
             });
@@ -32240,19 +32259,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int w = 0; w < lOutW; w++)
                 {
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
-                    double srcX = (gr[gBase] + 1.0) * widthScaleD;
-                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD;
-                    int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
-                    int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
+                    double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
+                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
+                    int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     float fwx1 = (float)(srcX - x0), fwx0 = 1f - fwx1, fwy1 = (float)(srcY - y0), fwy0 = 1f - fwy1;
+                    // Zeros padding — see the double branch above.
+                    bool okX0 = x0 >= 0 && x0 < lInW, okX1 = x1 >= 0 && x1 < lInW;
+                    bool okY0 = y0 >= 0 && y0 < lInH, okY1 = y1 >= 0 && y1 < lInH;
                     int outSpatial = h * lOutW + w;
                     int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
                     {
                         int inPlane = (b * lCh + c) * lInH * lInW;
-                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] =
-                            (inp[inPlane + s00] * fwx0 * fwy0 + inp[inPlane + s01] * fwx1 * fwy0)
-                          + (inp[inPlane + s10] * fwx0 * fwy1 + inp[inPlane + s11] * fwx1 * fwy1);
+                        float acc = 0f;
+                        if (okY0 & okX0) acc += inp[inPlane + s00] * fwx0 * fwy0;
+                        if (okY0 & okX1) acc += inp[inPlane + s01] * fwx1 * fwy0;
+                        if (okY1 & okX0) acc += inp[inPlane + s10] * fwx0 * fwy1;
+                        if (okY1 & okX1) acc += inp[inPlane + s11] * fwx1 * fwy1;
+                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] = acc;
                     }
                 }
             });
@@ -32265,22 +32290,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int w = 0; w < lOutW; w++)
                 {
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
-                    double srcX = (numOps.ToDouble(gridData[gBase]) + 1.0) * widthScaleD;
-                    double srcY = (numOps.ToDouble(gridData[gBase + 1]) + 1.0) * heightScaleD;
-                    int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
-                    int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
+                    double srcX = (numOps.ToDouble(gridData[gBase]) + 1.0) * widthScaleD - 0.5;
+                    double srcY = (numOps.ToDouble(gridData[gBase + 1]) + 1.0) * heightScaleD - 0.5;
+                    int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
+                    int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     T twx1 = numOps.FromDouble(srcX - x0), twx0 = numOps.Subtract(numOps.One, twx1);
                     T twy1 = numOps.FromDouble(srcY - y0), twy0 = numOps.Subtract(numOps.One, twy1);
+                    // Zeros padding — see the double branch above.
+                    bool okX0 = x0 >= 0 && x0 < lInW, okX1 = x1 >= 0 && x1 < lInW;
+                    bool okY0 = y0 >= 0 && y0 < lInH, okY1 = y1 >= 0 && y1 < lInH;
                     int outSpatial = h * lOutW + w;
                     int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
                     {
                         int inPlane = (b * lCh + c) * lInH * lInW;
-                        outData[(b * lCh + c) * lOutH * lOutW + outSpatial] = numOps.Add(
-                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[inPlane + s00], twx0), twy0),
-                                       numOps.Multiply(numOps.Multiply(inData[inPlane + s01], twx1), twy0)),
-                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[inPlane + s10], twx0), twy1),
-                                       numOps.Multiply(numOps.Multiply(inData[inPlane + s11], twx1), twy1)));
+                        T acc = numOps.Zero;
+                        if (okY0 & okX0) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s00], twx0), twy0));
+                        if (okY0 & okX1) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s01], twx1), twy0));
+                        if (okY1 & okX0) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s10], twx0), twy1));
+                        if (okY1 & okX1) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s11], twx1), twy1));
+                        outData[(b * lCh + c) * lOutH * lOutW + outSpatial] = acc;
                     }
                 }
             });
