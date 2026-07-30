@@ -155,6 +155,19 @@ public sealed class CodegenTiledContractionTests
     }
 
     [Fact]
+    public void ExactSchedule_RefusesOverBudgetSharedMemory()
+    {
+        var schedule = new CodegenTiledContractionSchedule(64, 112, 64, 8, 4);
+        var spec = CodegenKernelCatalog.Find("conv2d_1x1_bias_relu")!.Bench;
+
+        Assert.False(CodegenTiledContractionPlan.TryCreate(
+            spec, schedule, out var plan, out string reason));
+        Assert.Null(plan);
+        Assert.Contains("90112 bytes", reason);
+        Assert.Contains("49152-byte budget", reason);
+    }
+
+    [Fact]
     public void UnsupportedActivation_IsRefused()
     {
         var spec = SimpleContraction(8, CodegenActivationKind.Sigmoid);

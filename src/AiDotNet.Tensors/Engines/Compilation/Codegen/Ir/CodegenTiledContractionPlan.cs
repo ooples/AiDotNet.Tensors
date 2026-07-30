@@ -327,12 +327,16 @@ public sealed class CodegenTiledContractionPlan
             reason = "the selected whole tile needs " + threads + " threads, outside [32,256]";
             return false;
         }
+        int stages = CodegenSharedMemoryBudget.DoubleBufferStages;
+        long sharedBytes = stages * tileK * ((long)tileM + tileN) * sizeof(float);
+        if (!CodegenSharedMemoryBudget.Fits(sharedBytes, out reason))
+            return false;
 
         plan = new CodegenTiledContractionPlan(
             matrixInput, streamInput, spec.BiasInput, spec.ScaleInput,
             mAxis, reduction, batch, m, n, k,
             reductionMajor, tileM, tileN, tileK, threadTileM, threadTileN,
-            stages: 2);
+            stages);
         reason = "eligible";
         return true;
     }
