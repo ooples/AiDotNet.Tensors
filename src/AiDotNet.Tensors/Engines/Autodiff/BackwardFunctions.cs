@@ -2765,6 +2765,132 @@ internal static class BackwardFunctions<T>
 
     /// <summary>Cosine similarity backward</summary>
     /// <summary>
+    /// SelectScatter backward: the output is the destination tensor with ONE slice along
+    /// <c>dim</c> replaced by <c>source</c>.
+    /// </summary>
+    /// <remarks>
+    /// An overwrite splits the gradient cleanly: the overwritten positions came entirely from
+    /// <c>source</c>, so the destination gets the incoming gradient with those positions ZEROED, and
+    /// <c>source</c> gets exactly them. Forgetting to zero would double-count the overwritten region.
+    /// </remarks>
+    internal static void SelectScatterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(SelectScatterBackward), savedState, 2);
+        int dim = SavedInt(nameof(SelectScatterBackward), savedState, 0, "dim");
+        int index = SavedInt(nameof(SelectScatterBackward), savedState, 1, "index");
+
+        var tensor = inputs[0];
+        var source = inputs[1];
+        var shape = tensor._shape;
+        int rank = shape.Length;
+        int axisSize = shape[dim];
+
+        var gradTensor = TensorPool<T>.RentZeroed(shape);
+        for (int i = 0; i < gradOutput.Length; i++) gradTensor[i] = gradOutput[i];
+        var gradSource = TensorPool<T>.RentZeroed(source._shape);
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                int dstPos = outer * axisSize * innerSize + index * innerSize + inner;
+                int srcPos = outer * innerSize + inner;
+                gradSource[srcPos] = gradOutput[dstPos];
+                gradTensor[dstPos] = numOps.Zero;
+            }
+
+        DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
+        DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
+    }
+
+    /// <summary>
+    /// SliceScatter backward: as <see cref="SelectScatterBackward"/> but over a
+    /// <c>[start, start+length)</c> range along <c>dim</c>.
+    /// </summary>
+    internal static void SliceScatterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(SliceScatterBackward), savedState, 3);
+        int dim = SavedInt(nameof(SliceScatterBackward), savedState, 0, "dim");
+        int start = SavedInt(nameof(SliceScatterBackward), savedState, 1, "start");
+        int length = SavedInt(nameof(SliceScatterBackward), savedState, 2, "length");
+
+        var tensor = inputs[0];
+        var source = inputs[1];
+        var shape = tensor._shape;
+        int rank = shape.Length;
+        int dstAxis = shape[dim];
+
+        var gradTensor = TensorPool<T>.RentZeroed(shape);
+        for (int i = 0; i < gradOutput.Length; i++) gradTensor[i] = gradOutput[i];
+        var gradSource = TensorPool<T>.RentZeroed(source._shape);
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= shape[k];
+        int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= shape[k];
+
+        for (int outer = 0; outer < outerSize; outer++)
+            for (int i = 0; i < length; i++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    int dstPos = outer * dstAxis * innerSize + (start + i) * innerSize + inner;
+                    int srcPos = outer * length * innerSize + i * innerSize + inner;
+                    gradSource[srcPos] = gradOutput[dstPos];
+                    gradTensor[dstPos] = numOps.Zero;
+                }
+
+        DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
+        DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
+    }
+
+    /// <summary>
+    /// Put backward: flat-indexed overwrite, <c>tensor[indices] = source</c>.
+    /// </summary>
+    /// <remarks>
+    /// DUPLICATE indices matter. The forward writes in order, so the LAST write to a position wins and
+    /// only that source element influenced the output — earlier writers to the same position were
+    /// overwritten and must receive 0. Handing every duplicate the same gradient would invent
+    /// gradient for values the forward discarded.
+    /// </remarks>
+    internal static void PutBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(PutBackward), savedState, 1);
+        var indices = savedState[0] as int[]
+            ?? throw new ArgumentException(
+                $"{nameof(PutBackward)}: savedState[0] (indices) must be an int[].", nameof(savedState));
+
+        var tensor = inputs[0];
+        var source = inputs[1];
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
+        for (int i = 0; i < gradOutput.Length; i++) gradTensor[i] = gradOutput[i];
+        var gradSource = TensorPool<T>.RentZeroed(source._shape);
+
+        // Last write to each position wins, matching the forward's sequential overwrite.
+        var winner = new Dictionary<int, int>(indices.Length);
+        for (int i = 0; i < indices.Length; i++) winner[indices[i]] = i;
+
+        for (int i = 0; i < indices.Length; i++)
+        {
+            int pos = indices[i];
+            gradTensor[pos] = numOps.Zero;
+            gradSource[i] = winner[pos] == i ? gradOutput[pos] : numOps.Zero;
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
+        DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
+    }
+
+    /// <summary>
     /// BlockDiag backward: each input matrix is copied verbatim into its own diagonal block, so its
     /// gradient is exactly that block of the incoming gradient.
     /// </summary>

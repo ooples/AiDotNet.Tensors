@@ -1911,6 +1911,9 @@ public partial class CpuEngine
             srcDim++;
         }
 
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var selTensorOrig = tensor;
+        var selSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -1928,6 +1931,13 @@ public partial class CpuEngine
                 int srcPos = outer * innerSize + inner;
                 dst[dstPos] = src[srcPos];
             }
+
+        // Tape registration — recorded nothing, so neither the destination nor the scattered
+        // source received a gradient. Surfaced once the sweep could construct valid arguments.
+        DifferentiableOps.RecordBinary(
+            "TensorSelectScatter", result, selTensorOrig, selSourceOrig,
+            BackwardFunctions<T>.SelectScatterBackward,
+            savedState: new object[] { dim, index });
         return result;
     }
 
@@ -2277,6 +2287,9 @@ public partial class CpuEngine
                     $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
         }
 
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var sliceTensorOrig = tensor;
+        var sliceSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -2296,6 +2309,12 @@ public partial class CpuEngine
                     int srcPos = outer * length * innerSize + i * innerSize + inner;
                     dst[dstPos] = src[srcPos];
                 }
+
+        // Tape registration — see TensorSelectScatter above.
+        DifferentiableOps.RecordBinary(
+            "TensorSliceScatter", result, sliceTensorOrig, sliceSourceOrig,
+            BackwardFunctions<T>.SliceScatterBackward,
+            savedState: new object[] { dim, start, length });
         return result;
     }
 
@@ -3622,6 +3641,8 @@ public partial class CpuEngine
         if (indices.Length != source.Length)
             throw new ArgumentException("indices and source must have the same element count");
 
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
+        var putTensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = (Tensor<T>)tensor.Clone();
         var dst = result.AsWritableSpan();
@@ -3636,6 +3657,13 @@ public partial class CpuEngine
                     $"indices[{i}]={pos} out of range for flattened length {total}");
             dst[pos] = src[i];
         }
+
+        // Tape registration — recorded nothing. The index list is snapshotted so the backward can
+        // resolve last-write-wins for duplicate indices without re-reading a mutable tensor.
+        DifferentiableOps.RecordBinary(
+            "TensorPut", result, putTensorOrig, source,
+            BackwardFunctions<T>.PutBackward,
+            savedState: new object[] { indices.GetFlattenedData() });
         return result;
     }
 

@@ -112,8 +112,66 @@ public class DifferentiableOpsGradCheckSweep
         ["TensorLdexp"] = r => [SafeTensor([4], r), SafeTensor([4], r)],
 
         // --- normalization: last-dim normalized shapes ---
-        ["LayerNorm"] = r => [SafeTensor([2, 4], r), SafeTensor([4], r), SafeTensor([4], r), 1e-5],
-        ["RMSNorm"] = r => [SafeTensor([2, 4], r), SafeTensor([4], r), 1e-6],
+        // These carry `out` parameters, which still need an args slot for Invoke: LayerNorm's
+        // signature is (input, gamma, beta, epsilon, out mean, out variance) = 6, and RMSNorm's is
+        // (input, gamma, epsilon, out rms) = 4. The previous 4- and 3-argument entries threw
+        // TargetParameterCountException, so both ops were silently unchecked.
+        ["LayerNorm"] = r => [SafeTensor([2, 4], r), SafeTensor([4], r), SafeTensor([4], r), 1e-5, null!, null!],
+        ["RMSNorm"] = r => [SafeTensor([2, 4], r), SafeTensor([4], r), 1e-6, null!],
+
+        // --- normalization over NCHW, all with trailing out-params ---
+        ["BatchNorm"] = r => [SafeTensor([2, 3, 2, 2], r), SafeTensor([3], r), SafeTensor([3], r), 1e-5, null!, null!],
+        ["InstanceNorm"] = r => [SafeTensor([2, 3, 2, 2], r), SafeTensor([3], r), SafeTensor([3], r), 1e-5, null!, null!],
+        ["GroupNorm"] = r => [SafeTensor([2, 4, 2, 2], r), 2, SafeTensor([4], r), SafeTensor([4], r), 1e-5, null!, null!],
+        // BatchNormAffine takes mean/variance as INPUTS (no out-params). SafeTensor is already
+        // strictly positive ([0.35, 0.95]), so it is a valid variance.
+        ["BatchNormAffine"] = r => [SafeTensor([2, 3, 2, 2], r), SafeTensor([3], r), SafeTensor([3], r),
+                                    SafeTensor([3], r), SafeTensor([3], r), 1e-5],
+
+        // --- convolutions: NCHW/NCL/NCDHW input with a matching OIHW-style kernel ---
+        // Conv2D/Conv3D/AvgPool2D/AvgPool3D each have two same-arity overloads differing only in
+        // int vs int[], so these are keyed by parameter fingerprint.
+        ["Conv1D|T,T,int,int,int"] = r => [SafeTensor([1, 2, 6], r), SafeTensor([3, 2, 3], r), 1, 0, 1],
+        ["Conv2D|T,T,int,int,int"] = r => [SafeTensor([1, 2, 5, 5], r), SafeTensor([3, 2, 3, 3], r), 1, 0, 1],
+        ["Conv2D|T,T,int[],int[],int[]"] = r => [SafeTensor([1, 2, 5, 5], r), SafeTensor([3, 2, 3, 3], r),
+                                                 new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }],
+        ["Conv3D|T,T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4, 4], r), SafeTensor([2, 2, 2, 2, 2], r), 1, 0, 1],
+        ["Conv3D|T,T,int[],int[],int[]"] = r => [SafeTensor([1, 2, 4, 4, 4], r), SafeTensor([2, 2, 2, 2, 2], r),
+                                                 new[] { 1, 1, 1 }, new[] { 0, 0, 0 }, new[] { 1, 1, 1 }],
+        ["ConvTranspose2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([2, 3, 3, 3], r),
+                                    new[] { 1, 1 }, new[] { 0, 0 }, new[] { 0, 0 }],
+        ["ConvTranspose3D"] = r => [SafeTensor([1, 2, 3, 3, 3], r), SafeTensor([2, 2, 2, 2, 2], r),
+                                    new[] { 1, 1, 1 }, new[] { 0, 0, 0 }, new[] { 0, 0, 0 }],
+        // Depthwise: one kernel per input channel (groups == channels).
+        ["DepthwiseConv1D"] = r => [SafeTensor([1, 3, 6], r), SafeTensor([3, 1, 3], r), 1, 0],
+        ["DepthwiseConv2D"] = r => [SafeTensor([1, 3, 5, 5], r), SafeTensor([3, 1, 3, 3], r),
+                                    new[] { 1, 1 }, new[] { 0, 0 }],
+        ["LocallyConnectedConv2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([1, 2, 2, 3, 3, 3], r),
+                                           null!, new[] { 1, 1 }],
+
+        // --- pooling ---
+        ["MaxPool2D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2, 0],
+        ["AvgPool2D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2, 0],
+        ["AvgPool2D|T,int[],int[]"] = r => [SafeTensor([1, 2, 4, 4], r), new[] { 2, 2 }, new[] { 2, 2 }],
+        ["AvgPool3D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4, 4], r), 2, 2, 0],
+        ["AvgPool3D|T,int[],int[],int[]"] = r => [SafeTensor([1, 2, 4, 4, 4], r),
+                                                  new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, new[] { 0, 0, 0 }],
+        ["AdaptiveAvgPool2D"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2],
+
+        // --- resampling / spatial rearrangement ---
+        ["PixelShuffle"] = r => [SafeTensor([1, 4, 2, 2], r), 2],   // C must be divisible by r^2
+        ["Upsample3D"] = r => [SafeTensor([1, 2, 2, 2, 2], r), 2, 2, 2],
+        ["TensorUpsampleBilinear"] = r => [SafeTensor([1, 2, 2, 2], r), new[] { 4, 4 }],
+        ["Crop"] = r => [SafeTensor([1, 2, 4, 4], r), 1, 1, 2, 2],
+        ["Unfold"] = r => [SafeTensor([1, 2, 4, 4], r), new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }],
+        // Fold is Unfold's inverse: input is the [N, C*prod(kernel), L] column matrix.
+        ["Fold"] = r => [SafeTensor([1, 2 * 2 * 2, 9], r), new[] { 4, 4 }, new[] { 2, 2 },
+                         new[] { 1, 1 }, new[] { 0, 0 }],
+
+        // --- sampling grids: grid is [N, H, W, 2] for 2-D, theta is [N, 2, 3] ---
+        ["GridSample|T,T"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([1, 3, 3, 2], r)],
+        ["AffineGrid"] = r => [SafeTensor([1, 2, 3], r), 3, 3],
+        ["AffineGrid3D"] = r => [SafeTensor([1, 3, 4], r), 2, 2, 2, false],
 
         // --- shape ops: the target shape must be consistent with the input ---
         ["Reshape"] = r => [SafeTensor([2, 3], r), new[] { 3, 2 }],
@@ -135,9 +193,79 @@ public class DifferentiableOpsGradCheckSweep
         ["IRFFT"] = r => [SafeTensor([2 * (8 / 2 + 1)], r), 8],
         ["Spectrogram"] = r => [SafeTensor([64], r), 16, 4, 16, HannWindowFor(16)],
 
-        // --- reductions with explicit axes ---
-        ["ReduceMax"] = r => [SafeTensor([2, 3], r), new[] { 1 }, false],
+        // --- reductions with explicit axes. ReduceMax is overloaded 3-param / 4-param
+        //     (the latter with `out int[] maxIndices`), hence the arity-keyed pair. ---
+        ["ReduceMax/3"] = r => [SafeTensor([2, 3], r), new[] { 1 }, false],
+        ["ReduceMax/4"] = r => [SafeTensor([2, 3], r), new[] { 1 }, false, null!],
+        ["ReduceMaxWithTensorIndices"] = r => [SafeTensor([2, 3], r), new[] { 1 }, false, null!],
+
+        // --- gather / scatter / index: the index tensor must stay in range for its axis ---
+        ["Gather"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), 1],
+        ["Scatter"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), SafeTensor([2, 2], r), 1],
+        ["ScatterAdd|T,Ti,T,int"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), SafeTensor([2, 2], r), 1],
+        // Segment-style scatter family: source rows are grouped by indices along dim.
+        ["ScatterAdd|T,Ti,int,Nullable`1"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
+        ["ScatterSoftmax"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
+        ["ScatterMax"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), null!, 0, 3],
+        ["ScatterMean"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), null!, 0, 3],
+        ["TensorIndexAdd"] = r => [SafeTensor([3, 2], r), 0, IdxRange(3), SafeTensor([3, 2], r)],
+        ["TensorIndexCopy"] = r => [SafeTensor([3, 2], r), 0, IdxRange(3), SafeTensor([3, 2], r)],
+        ["TensorIndexFill"] = r => [SafeTensor([3, 2], r), 0, IdxRange(2), 0.5],
+        ["TensorIndexSelect"] = r => [SafeTensor([3, 2], r), IdxRange(2), 0],
+        ["TensorIndexPut"] = r => [SafeTensor([3, 2], r), new[] { IdxRange(2) }, SafeTensor([2, 2], r), false],
+        ["TensorTake"] = r => [SafeTensor([2, 3], r), IdxRange(4)],
+        ["TensorTakeAlongDim"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 3], 3, r), 1],
+        ["TensorPut"] = r => [SafeTensor([2, 3], r), IdxRange(3), SafeTensor([3], r)],
+        ["TensorSelectScatter"] = r => [SafeTensor([3, 2], r), SafeTensor([2], r), 0, 1],
+        ["TensorSliceScatter"] = r => [SafeTensor([4, 2], r), SafeTensor([2, 2], r), 0, 1, 2],
+        ["Embedding"] = r => [IdxTensor([2, 3], 5, r), SafeTensor([5, 4], r)],
+
+        // --- masked ops. Three TensorMaskedFill overloads share arity 3 and differ only in the
+        //     mask type, so all three are keyed by fingerprint. ---
+        ["TensorMaskedFill|T,BooleanTensor`1,Double"] = r => [SafeTensor([2, 3], r), BoolMask([2, 3]), 0.25],
+        ["TensorMaskedFill|T,Tensor`1,Double"] = r => [SafeTensor([2, 3], r), BitMask([2, 3]), 0.25],
+        ["TensorMaskedFill|T,Boolean[],Double"] = r => [SafeTensor([2, 3], r), new[] { true, false, true, false, true, false }, 0.25],
+        ["TensorMaskedScatter"] = r => [SafeTensor([2, 3], r), BitMask([2, 3]), SafeTensor([2, 3], r)],
+        ["TensorMaskedSelect"] = r => [SafeTensor([2, 3], r), BitMask([2, 3])],
+
+        // --- variadic shape ops needing consistent member shapes ---
+        ["TensorDStack"] = r => [new[] { SafeTensor([2, 2], r), SafeTensor([2, 2], r) }],
+        // MultiDot chains matmuls, so adjacent inner dimensions must agree: (2x3)(3x4)(4x2).
+        ["TensorMultiDot"] = r => [new[] { SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4, 2], r) }],
     };
+
+    /// <summary>
+    /// Compact parameter-type fingerprint used to key table entries to a SPECIFIC overload,
+    /// e.g. <c>T,T,int[],int[],int[]</c>. <c>T</c> denotes <c>Tensor&lt;double&gt;</c>.
+    /// </summary>
+    private static string ParamFingerprint(MethodInfo m)
+        => string.Join(",", m.GetParameters().Select(p => TypeToken(p.ParameterType)));
+
+    /// <summary>
+    /// Stable short token per parameter type. Generic tensors MUST be distinguished by their element
+    /// type — <c>Tensor&lt;bool&gt;</c> and <c>Tensor&lt;Bit&gt;</c> both render as "Tensor`1" under
+    /// <c>Type.Name</c>, which would collide and make the three TensorMaskedFill overloads
+    /// indistinguishable.
+    /// </summary>
+    private static string TypeToken(Type t)
+    {
+        if (t.IsByRef) t = t.GetElementType()!;
+        if (t.IsArray && t.GetElementType() is { } el && el != typeof(int) && el != typeof(bool))
+            return TypeToken(el) + "[]";
+        if (t == typeof(Tensor<double>)) return "T";
+        if (t == typeof(Tensor<int>)) return "Ti";
+        if (t == typeof(Tensor<bool>)) return "Tb";
+        if (t == typeof(Tensor<Bit>)) return "TBit";
+        if (t == typeof(int)) return "int";
+        if (t == typeof(int[])) return "int[]";
+        if (t == typeof(bool)) return "bool";
+        if (t == typeof(bool[])) return "bool[]";
+        if (t == typeof(double)) return "double";
+        if (t == typeof(int?)) return "int?";
+        if (t == typeof(double?)) return "double?";
+        if (t.IsGenericType) return t.Name + "<" + string.Join(",", t.GetGenericArguments().Select(TypeToken)) + ">";
+        return t.Name;
+    }
 
     /// <summary>Hann window of exactly nFft samples, matching CpuEngine's own definition.</summary>
     private static Tensor<double> HannWindowFor(int nFft)
@@ -154,6 +282,38 @@ public class DifferentiableOpsGradCheckSweep
         // from 1 (acos/atanh edges), all strictly positive so domain-restricted ops are valid.
         var t = new Tensor<double>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = 0.35 + rng.NextDouble() * 0.6;
+        return t;
+    }
+
+    /// <summary>Index tensor with every value in [0, maxExclusive) — valid for gather/scatter axes.</summary>
+    private static Tensor<int> IdxTensor(int[] shape, int maxExclusive, Random rng)
+    {
+        var t = new Tensor<int>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = rng.Next(maxExclusive);
+        return t;
+    }
+
+    /// <summary>Index tensor covering 0..n-1 exactly once, for ops requiring a permutation-like map.</summary>
+    private static Tensor<int> IdxRange(int n)
+    {
+        var t = new Tensor<int>([n]);
+        for (int i = 0; i < n; i++) t[i] = i;
+        return t;
+    }
+
+    /// <summary>Alternating Bit mask — guarantees both branches are exercised and is deterministic.</summary>
+    private static Tensor<Bit> BitMask(int[] shape)
+    {
+        var t = new Tensor<Bit>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = i % 2 == 0;   // implicit bool -> Bit
+        return t;
+    }
+
+    /// <summary>Alternating bool mask, for the Tensor&lt;bool&gt; overloads.</summary>
+    private static Tensor<bool> BoolMask(int[] shape)
+    {
+        var t = new Tensor<bool>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = i % 2 == 0;
         return t;
     }
 
@@ -268,7 +428,21 @@ public class DifferentiableOpsGradCheckSweep
 
             // The per-op table wins over reflective synthesis: it is the only way to express shape
             // relationships (matmul inner dims, spectrum/transform-length coupling, NCHW layouts).
-            bool hasTable = OpCases.TryGetValue(name, out var caseFactory);
+            // Overload-aware lookup, most specific first:
+            //   1. "Conv2D|T,T,int[],int[],int[]"  — exact parameter-type fingerprint
+            //   2. "ReduceMax/4"                   — arity
+            //   3. "TensorMatMul"                  — bare name
+            //
+            // A name-only key cannot serve an overloaded op. ReduceMax has a 3-param form and a
+            // 4-param form taking `out int[] maxIndices`; LayerNorm/BatchNorm/GroupNorm/InstanceNorm
+            // carry `out` params that still need an Invoke slot each (their entries were short and
+            // died with TargetParameterCountException, so those ops went silently unchecked); and
+            // Conv2D, Conv3D and AvgPool2D/3D each have TWO overloads of the SAME arity that differ
+            // only in int-vs-int[] parameters, which arity cannot distinguish.
+            string fingerprint = $"{name}|{ParamFingerprint(m)}";
+            bool hasTable = OpCases.TryGetValue(fingerprint, out var caseFactory)
+                         || OpCases.TryGetValue($"{name}/{m.GetParameters().Length}", out caseFactory)
+                         || OpCases.TryGetValue(name, out caseFactory);
             var shapesToTry = hasTable ? new[] { Array.Empty<int>() } : shapes;
 
             foreach (var shape in shapesToTry)
@@ -378,7 +552,9 @@ public class DifferentiableOpsGradCheckSweep
                 break;
             }
 
-            if (!handled) skipped.Add($"{name}: {lastSkip}");
+            // Include the fingerprint so a table entry can be keyed to this EXACT overload without
+            // guessing at the token spelling.
+            if (!handled) skipped.Add($"{name}|{ParamFingerprint(m)}: {lastSkip}");
         }
 
         _out.WriteLine($"gradient-checked OK : {checkedOk.Count}");
