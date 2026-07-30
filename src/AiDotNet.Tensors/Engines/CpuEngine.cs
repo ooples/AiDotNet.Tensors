@@ -6792,6 +6792,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Preserve the caller's tensor/view for transparent replay. The eager copy below
+        // may need a contiguous snapshot, but closing over that snapshot would freeze a
+        // non-contiguous view at trace time instead of observing later source mutations.
+        var tracedInput = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Copy data to a new tensor with no tape connection.
@@ -6800,7 +6804,7 @@ public partial class CpuEngine : ITensorLevelEngine
         tensor.AsSpan().CopyTo(result.AsWritableSpan());
         // Transparent inference tracing has the same forward-dependency contract as
         // GraphMode, while remaining outside the autodiff tape.
-        { var c = tensor; AutoTracer.RecordOp("StopGradient", result, eng => eng.StopGradient(c)); }
+        { var c = tracedInput; AutoTracer.RecordOp("StopGradient", result, eng => eng.StopGradient(c)); }
         return result;
     }
 
