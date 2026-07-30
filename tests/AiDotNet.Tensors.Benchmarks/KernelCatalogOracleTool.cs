@@ -43,6 +43,8 @@ internal static class KernelCatalogOracleTool
         string Reuse,
         int SharedMemoryBytes,
         int BlockThreads,
+        int Blocks,
+        int Multiprocessors,
         bool AsyncCopy,
         bool DoubleBuffered,
         bool VectorSharedLoads,
@@ -210,6 +212,7 @@ internal static class KernelCatalogOracleTool
         string shape;
         int sharedMemoryBytes = 0;
         int blockThreads = 0;
+        int blocks = 0;
         bool asyncCopy = false;
         bool doubleBuffered = false;
         bool vectorSharedLoads = false;
@@ -241,6 +244,7 @@ internal static class KernelCatalogOracleTool
             int tiledBlockThreads = tiled.BlockThreads;
             sharedMemoryBytes = tiled.SharedMemoryBytes;
             blockThreads = tiledBlockThreads;
+            blocks = tiledBlocks;
             asyncCopy = true;
             doubleBuffered = true;
             features.Add("split-reduction");
@@ -287,6 +291,7 @@ internal static class KernelCatalogOracleTool
             CodegenTiledConv2DPlan partialPlan = partialEmitter.Plan!;
             sharedMemoryBytes = partialEmitter.SharedMemoryBytes;
             blockThreads = partialEmitter.LaunchBlockThreads;
+            blocks = partialPlan.Blocks;
             asyncCopy = true;
             doubleBuffered = partialPlan.Stages > 1;
             vectorSharedLoads = true;
@@ -337,6 +342,7 @@ internal static class KernelCatalogOracleTool
                     machine, emitter.LaunchBlockThreads);
                 sharedMemoryBytes = Math.Max(sharedMemoryBytes, emitter.SharedMemoryBytes);
                 blockThreads = Math.Max(blockThreads, emitter.LaunchBlockThreads);
+                blocks = Math.Max(blocks, checked((int)emitter.LaunchBlocks));
                 uniqueBytes = checked(uniqueBytes + prediction.UniqueBytes);
                 warpLoads = checked(warpLoads + prediction.WarpLoadInstructions);
                 predictedUs = predictedUs is double total && prediction.HasComputeCeiling
@@ -369,6 +375,7 @@ internal static class KernelCatalogOracleTool
             predictedUs = Ceiling(semantic);
             sharedMemoryBytes = emitter.SharedMemoryBytes;
             blockThreads = emitter.LaunchBlockThreads;
+            blocks = plan.Blocks;
             asyncCopy = true;
             doubleBuffered = plan.Stages > 1;
             vectorSharedLoads = true;
@@ -393,6 +400,7 @@ internal static class KernelCatalogOracleTool
             predictedUs = Ceiling(semantic);
             sharedMemoryBytes = emitter.SharedMemoryBytes;
             blockThreads = emitter.LaunchBlockThreads;
+            blocks = plan.Blocks;
             softwarePrefetch = true;
             features.Add("cooperative-warp-reduction");
             shape = "cooperative (channel,kh), three kw, 256-thread tree";
@@ -411,13 +419,17 @@ internal static class KernelCatalogOracleTool
             uniqueBytes = semantic.UniqueBytes;
             predictedUs = Ceiling(semantic);
             blockThreads = emitter.LaunchBlockThreads;
+            blocks = checked((int)emitter.LaunchBlocks);
             features.Add("output-reuse-4x");
             shape = "one input per thread, deterministic 2x2 output parity tile";
         }
         else if (string.Equals(
-            winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal))
+                     winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal) ||
+                 string.Equals(
+                     winner, "inline-outer-winograd-conv2d-compact", StringComparison.Ordinal))
         {
-            var emitter = new PtxOuterProductWinogradConv2DEmitter();
+            bool compact = winner!.EndsWith("-compact", StringComparison.Ordinal);
+            var emitter = new PtxOuterProductWinogradConv2DEmitter(compact);
             _ = emitter.Emit(entry.Bench, major, minor);
             var plan = emitter.Plan!;
 
@@ -436,10 +448,16 @@ internal static class KernelCatalogOracleTool
             predictedUs = Ceiling(semantic);
             sharedMemoryBytes = emitter.SharedMemoryBytes;
             blockThreads = emitter.LaunchBlockThreads;
-            asyncCopy = true;
-            doubleBuffered = true;
+            blocks = checked((int)emitter.LaunchBlocks);
+            doubleBuffered = !compact;
             features.Add("winograd-f2x3");
             features.Add("register-tiled");
+            features.Add("register-prefetched-global");
+            if (compact)
+            {
+                features.Add("compact-shared");
+                features.Add("single-shared-buffer");
+            }
             shape = "Winograd F(2,3), M32 x 32 tiles, C8 staged 8x8 outer product";
         }
         else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal) ||
@@ -460,6 +478,7 @@ internal static class KernelCatalogOracleTool
             predictedUs = Ceiling(semantic);
             sharedMemoryBytes = emitter.SharedMemoryBytes;
             blockThreads = emitter.LaunchBlockThreads;
+            blocks = plan.Blocks;
             asyncCopy = true;
             doubleBuffered = plan.Stages > 1;
             vectorSharedLoads = true;
@@ -482,6 +501,7 @@ internal static class KernelCatalogOracleTool
             predictedUs = prediction.PredictedMicroseconds;
             sharedMemoryBytes = emitter.SharedMemoryBytes;
             blockThreads = emitter.LaunchBlockThreads;
+            blocks = checked((int)emitter.LaunchBlocks);
             features.Add("affine");
             if (!string.Equals(emitter.StagedOperands, "none", StringComparison.Ordinal))
                 features.Add("shared-staged");
@@ -501,6 +521,7 @@ internal static class KernelCatalogOracleTool
         return new ScheduleEvidence(
             winner ?? "modelled", shape, traffic, loadsPerMac, predictedUs,
             ReuseText(entry.Bench), sharedMemoryBytes, blockThreads,
+            blocks, machine.Multiprocessors,
             asyncCopy, doubleBuffered, vectorSharedLoads, softwarePrefetch,
             string.Join(",", features.Distinct(StringComparer.Ordinal)));
     }
@@ -590,18 +611,29 @@ internal static class KernelCatalogOracleTool
                 "; any remaining speedup must do less on-chip load work, not chase DRAM peak.");
         }
 
-        if (!atRoofline && string.Equals(
-                schedule.Winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal))
+        if (!atRoofline && schedule.Winner.StartsWith(
+                "inline-outer-winograd-conv2d", StringComparison.Ordinal))
         {
             return new Diagnosis(
                 phaseContext + "The exact Winograd F(2,3) outer-product program is " +
                 "under-filled: " + limiter + " is " + F(limiterPct) +
                 "%, long-scoreboard is " + F(longSb) + "%, and wait is " + F(wait) +
-                "%. Its " + schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
-                "-byte shared tile permits only one resident CTA/SM, so " +
-                "neither L1 nor issue capacity can be filled by another block.",
-                "Reduce the live transform/accumulator or shared-tile footprint enough for " +
-                "two resident CTAs, or create more independent warp tiles inside the CTA. " +
+                "%. Its grid has only " +
+                schedule.Blocks.ToString(CultureInfo.InvariantCulture) + " CTAs for " +
+                schedule.Multiprocessors.ToString(CultureInfo.InvariantCulture) +
+                " SMs. Its " + schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
+                (schedule.Features.Contains("compact-shared", StringComparison.Ordinal)
+                    ? "-byte compact tile permits two resident CTAs, but the grid has no " +
+                      "second CTA for most SMs."
+                    : "-byte shared tile also permits only one resident CTA/SM."),
+                (schedule.Features.Contains("compact-shared", StringComparison.Ordinal)
+                    ? "The compact candidate removed the residency limit; next increase output " +
+                      "partition count with a smaller measured block tile. "
+                    : "The compact single-buffer/two-wave candidate was included in the exact " +
+                      "search and did not win because it left the " +
+                      schedule.Blocks.ToString(CultureInfo.InvariantCulture) +
+                      "-CTA grid unchanged. Next " +
+                      "increase output partition count with a smaller measured block tile. ") +
                 "A generic direct/implicit-GEMM recommendation is inapplicable because the " +
                 "winning dispatch is already Winograd.");
         }
@@ -753,7 +785,11 @@ internal static class KernelCatalogOracleTool
             Console.WriteLine("  features: " + row.Schedule.Features + ", shared " +
                               row.Schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
                               " B, " + row.Schedule.BlockThreads.ToString(CultureInfo.InvariantCulture) +
-                              " threads");
+                              " threads, " +
+                              row.Schedule.Blocks.ToString(CultureInfo.InvariantCulture) +
+                              " CTAs / " +
+                              row.Schedule.Multiprocessors.ToString(CultureInfo.InvariantCulture) +
+                              " SMs");
             Console.WriteLine("  cause: " + row.Diagnosis.Cause);
             Console.WriteLine("  next:  " + row.Diagnosis.Action);
         }
@@ -768,7 +804,7 @@ internal static class KernelCatalogOracleTool
                         "\tcompetitor_plan_strategy\tcompetitor_plan_spread_pct" +
                         "\tsemantic_efficiency_pct\twinner\tschedule\tprogram_traffic_x" +
                         "\tthread_loads_per_mac\tmodel_us\tfeatures\tshared_bytes" +
-                        "\tblock_threads\tlimiter\tlimiter_pct" +
+                        "\tblock_threads\tblocks\tmultiprocessors\tlimiter\tlimiter_pct" +
                         "\tstall_long_sb\tstall_wait\tstall_mio\talu_share_pct" +
                         "\tfma_share_pct\tlsu_share_pct\tcontrol_share_pct\tprofiled_phase" +
                         "\tphase_count\tphase_share_pct\treuse\tcause\taction\tprotocol");
@@ -783,6 +819,8 @@ internal static class KernelCatalogOracleTool
                 N(row.Schedule.PredictedMicroseconds), row.Schedule.Features,
                 row.Schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture),
                 row.Schedule.BlockThreads.ToString(CultureInfo.InvariantCulture),
+                row.Schedule.Blocks.ToString(CultureInfo.InvariantCulture),
+                row.Schedule.Multiprocessors.ToString(CultureInfo.InvariantCulture),
                 row.Limiter, N(row.LimiterPct),
                 N(row.LongScoreboard), N(row.Wait), N(row.Mio),
                 N(row.AluShare), N(row.FmaShare), N(row.LsuShare), N(row.ControlShare),

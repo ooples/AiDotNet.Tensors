@@ -173,7 +173,7 @@ internal static class KernelAutotuneTool
                     ", " + string.Join(", ", CodegenTiledConv2DSplitSchedule.SearchSpace
                         .Select(s => s.WinnerName)) +
                     ", library-winograd-fp32-bn16, library-winograd-fp32-bn32, " +
-                    "inline-outer-winograd-conv2d, " +
+                    "inline-outer-winograd-conv2d, inline-outer-winograd-conv2d-compact, " +
                     "library-bwd-input-direct, " +
                     "split, tiled-split, tiled-chunked-split"
                 : candidateSelector));
@@ -307,10 +307,13 @@ internal static class KernelAutotuneTool
         DirectPtxRuntime runtime, CodegenKernelSpec spec, string candidateName)
     {
         if (string.Equals(candidateName, "inline-outer-winograd-conv2d",
+                StringComparison.Ordinal) ||
+            string.Equals(candidateName, "inline-outer-winograd-conv2d-compact",
                 StringComparison.Ordinal))
         {
+            bool compact = candidateName.EndsWith("-compact", StringComparison.Ordinal);
             using CandidateProgram? winograd =
-                TryCreateInlineOuterWinograd(runtime, spec);
+                TryCreateInlineOuterWinograd(runtime, spec, compact);
             if (winograd is null)
                 throw new ArgumentException(
                     "The inline outer-product Winograd candidate does not support this spec.");
@@ -512,35 +515,33 @@ internal static class KernelAutotuneTool
                 ref bestModelledUs, ref bestGain);
         }
 
-        using (CandidateProgram? winograd = TryCreateInlineOuterWinograd(
-                   runtime, spec))
+        foreach (bool compact in new[] { false, true })
         {
-            if (winograd is not null && CandidateEnabled(candidateSelector, winograd.Name))
+            using CandidateProgram? winograd = TryCreateInlineOuterWinograd(
+                runtime, spec, compact);
+            if (winograd is null || !CandidateEnabled(candidateSelector, winograd.Name))
+                continue;
+            winograd.Launch();
+            runtime.Synchronize();
+            if (!Agrees(winograd.ReadOutput(), reference, out double deviation,
+                    out long worstIndex, out float actual, out float expected))
             {
-                winograd.Launch();
-                runtime.Synchronize();
-                if (!Agrees(winograd.ReadOutput(), reference, out double deviation,
-                        out long worstIndex, out float actual, out float expected))
-                {
-                    Console.WriteLine("    candidate '" + winograd.Name +
-                                      "' disagrees by " +
-                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
-                                      " relative at output[" +
-                                      worstIndex.ToString(CultureInfo.InvariantCulture) +
-                                      "]: actual " + actual.ToString("G9", CultureInfo.InvariantCulture) +
-                                      ", expected " + expected.ToString("G9", CultureInfo.InvariantCulture) +
-                                      ", nearest reference output[" +
-                                      ClosestIndex(reference, actual).ToString(
-                                          CultureInfo.InvariantCulture) + "]" +
-                                      "; rejected");
-                }
-                else
-                {
-                    Consider(runtime, modelled, winograd, workUnits,
-                        ref hasStableTiming, ref bestName, ref bestUs,
-                        ref bestModelledUs, ref bestGain);
-                }
+                Console.WriteLine("    candidate '" + winograd.Name +
+                                  "' disagrees by " +
+                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                  " relative at output[" +
+                                  worstIndex.ToString(CultureInfo.InvariantCulture) +
+                                  "]: actual " + actual.ToString("G9", CultureInfo.InvariantCulture) +
+                                  ", expected " + expected.ToString("G9", CultureInfo.InvariantCulture) +
+                                  ", nearest reference output[" +
+                                  ClosestIndex(reference, actual).ToString(
+                                      CultureInfo.InvariantCulture) + "]" +
+                                  "; rejected");
+                continue;
             }
+            Consider(runtime, modelled, winograd, workUnits,
+                ref hasStableTiming, ref bestName, ref bestUs,
+                ref bestModelledUs, ref bestGain);
         }
 
         // Probe the same true-FP32 Winograd dataflow as a linear adjoint. This is
@@ -670,6 +671,7 @@ internal static class KernelAutotuneTool
             string.Equals(selector, "library-winograd-fp32-bn16", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "library-winograd-fp32-bn32", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "inline-outer-winograd-conv2d", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(selector, "inline-outer-winograd-conv2d-compact", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "library-winograd-inline-adjoint-fp32", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "library-bwd-input-direct", StringComparison.OrdinalIgnoreCase) ||
             selector.StartsWith("split:", StringComparison.OrdinalIgnoreCase) ||
@@ -1218,7 +1220,7 @@ internal static class KernelAutotuneTool
     }
 
     private static CandidateProgram? TryCreateInlineOuterWinograd(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec)
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, bool compactShared = false)
     {
         if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out _)) return null;
         CodegenTiledConv2DPlan plan = possible!;
@@ -1229,7 +1231,7 @@ internal static class KernelAutotuneTool
         var resources = new List<IDisposable>();
         try
         {
-            var mainEmitter = new PtxOuterProductWinogradConv2DEmitter();
+            var mainEmitter = new PtxOuterProductWinogradConv2DEmitter(compactShared);
             string mainPtx = mainEmitter.Emit(
                 spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
             var mainModule = runtime.LoadModule(mainPtx, allowExperimentalJitFallback: true);
@@ -1271,7 +1273,10 @@ internal static class KernelAutotuneTool
                 mainFn, mainEmitter.LaunchBlockThreads,
                 checked((nuint)mainEmitter.SharedMemoryBytes));
             return new CandidateProgram(
-                "inline-outer-winograd-conv2d", LaunchMain, output,
+                compactShared
+                    ? "inline-outer-winograd-conv2d-compact"
+                    : "inline-outer-winograd-conv2d",
+                LaunchMain, output,
                 checked((int)spec.Output.ElementCount), resources,
                 new[]
                 {

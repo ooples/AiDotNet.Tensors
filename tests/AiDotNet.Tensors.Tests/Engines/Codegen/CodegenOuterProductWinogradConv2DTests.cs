@@ -52,6 +52,23 @@ public sealed class CodegenOuterProductWinogradConv2DTests
     }
 
     [Fact]
+    public void CompactSchedule_HalvesStageStorageAndReusesOutputWorkspaceInTwoWaves()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var emitter = new PtxOuterProductWinogradConv2DEmitter(compactShared: true);
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Equal(36864, emitter.SharedMemoryBytes);
+        Assert.Contains("compact single shared stage and two-wave output transpose", ptx);
+        Assert.Contains("OUTER_OUTPUT_P0_STORE_DONE", ptx);
+        Assert.Contains("OUTER_OUTPUT_P1_STORE_DONE", ptx);
+        Assert.Contains("output workspace reuse", ptx);
+        Assert.Contains(".maxnreg 128", ptx);
+        Assert.DoesNotContain("next stage buffer", ptx);
+    }
+
+    [Fact]
     public void UnsupportedShapeAndArchitecture_AreRejectedBeforeEmission()
     {
         var verify = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Verify;

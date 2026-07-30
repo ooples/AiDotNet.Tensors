@@ -429,11 +429,13 @@ internal static class KernelConveyorTool
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         string? winner = CodegenAutotuneCache.WinnerFor(catalogName, identity);
 
-        if (string.Equals(winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal))
+        if (string.Equals(winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal) ||
+            string.Equals(winner, "inline-outer-winograd-conv2d-compact", StringComparison.Ordinal))
         {
             try
             {
-                var winograd = new PtxOuterProductWinogradConv2DEmitter();
+                bool compact = winner!.EndsWith("-compact", StringComparison.Ordinal);
+                var winograd = new PtxOuterProductWinogradConv2DEmitter(compact);
                 string text = winograd.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 return new TunedProgram(
@@ -450,7 +452,7 @@ internal static class KernelConveyorTool
             catch (NotSupportedException ex)
             {
                 Console.WriteLine("    note: " + catalogName +
-                                  " recorded inline-outer-winograd-conv2d but it could not " +
+                                  " recorded " + winner + " but it could not " +
                                   "be rebuilt (" + ex.Message + "); using the affine kernel");
             }
         }

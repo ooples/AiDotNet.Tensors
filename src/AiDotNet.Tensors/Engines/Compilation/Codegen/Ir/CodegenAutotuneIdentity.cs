@@ -175,6 +175,11 @@ public sealed record CodegenAutotuneIdentity(
             computeMajor, computeMinor,
             static (candidate, major, minor) =>
                 new PtxOuterProductWinogradConv2DEmitter().Emit(candidate, major, minor));
+        AppendEmitterCandidate(text, "inline-outer-winograd-conv2d-compact", spec,
+            computeMajor, computeMinor,
+            static (candidate, major, minor) =>
+                new PtxOuterProductWinogradConv2DEmitter(compactShared: true).Emit(
+                    candidate, major, minor));
         foreach (CodegenTiledConv2DSchedule schedule in
                  CodegenTiledConv2DSchedule.SearchSpace)
         {
