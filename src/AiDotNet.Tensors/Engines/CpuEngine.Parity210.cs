@@ -753,6 +753,8 @@ public partial class CpuEngine
         if (n == 0) return new Tensor<T>(new[] { 0 });
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
+        var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
         var src = input.AsSpan();
         int pairs = n * (n - 1) / 2;
@@ -764,6 +766,13 @@ public partial class CpuEngine
             {
                 dst[cursor++] = PNorm(ops, src, i * d, j * d, d, p);
             }
+
+        // Tape registration — this op recorded nothing, so the input received no gradient
+        // despite OpRegistry classifying TensorPDist as differentiable.
+        DifferentiableOps.RecordUnary(
+            "TensorPDist", result, inputOrig,
+            BackwardFunctions<T>.PDistBackward,
+            savedState: new object[] { p });
         return result;
     }
 
@@ -779,6 +788,9 @@ public partial class CpuEngine
             throw new ArgumentException("CDist: feature dim must match");
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var x1Orig = x1;
+        var x2Orig = x2;
         if (!x1.IsContiguous) x1 = x1.Contiguous();
         if (!x2.IsContiguous) x2 = x2.Contiguous();
         var a = x1.AsSpan();
@@ -790,6 +802,13 @@ public partial class CpuEngine
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
                 dst[i * n + j] = PNormCross(ops, a, i * d, b, j * d, d, p);
+
+        // Tape registration — this op recorded nothing, so neither input received a gradient
+        // despite OpRegistry classifying TensorCDist as differentiable.
+        DifferentiableOps.RecordBinary(
+            "TensorCDist", result, x1Orig, x2Orig,
+            BackwardFunctions<T>.CDistBackward,
+            savedState: new object[] { p });
         return result;
     }
 

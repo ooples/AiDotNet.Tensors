@@ -2765,6 +2765,112 @@ internal static class BackwardFunctions<T>
 
     /// <summary>Cosine similarity backward</summary>
     /// <summary>
+    /// Per-term derivative of a p-norm distance with respect to one coordinate of the FIRST operand.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// For dist = (Σ|d_k|^p)^(1/p), the chain rule gives
+    /// d dist / d a_k = |d_k|^(p−1) · sign(d_k) · dist^(1−p).
+    /// </para>
+    /// <para>
+    /// At dist = 0 every coordinate coincides and the p-norm has a kink, so there is no derivative —
+    /// only a subgradient set containing 0. Returns 0 there, matching PyTorch. Individual zero
+    /// coordinates with p &gt; 1 already fall out to 0 via |0|^(p−1); the explicit guard also keeps
+    /// p &lt; 1 from producing an infinity.
+    /// </para>
+    /// </remarks>
+    private static double PNormTermGrad(double diff, double dist, double p)
+    {
+        if (dist == 0.0) return 0.0;          // kink: choose the 0 subgradient
+        if (diff == 0.0) return 0.0;
+        if (p == 2.0) return diff / dist;     // |d|·sign(d)·dist^-1 == d/dist
+        if (p == 1.0) return diff > 0 ? 1.0 : -1.0;
+        double mag = Math.Pow(Math.Abs(diff), p - 1.0) * Math.Pow(dist, 1.0 - p);
+        return diff > 0 ? mag : -mag;
+    }
+
+    /// <summary>
+    /// PDist backward: pairwise p-norm over the n rows of an [n, d] input, output ordered
+    /// (0,1),(0,2),… like torch.pdist. Row i and row j receive equal and opposite gradient.
+    /// </summary>
+    internal static void PDistBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(PDistBackward), savedState, 1);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double p = savedState[0] is double pv
+            ? pv
+            : throw new ArgumentException(
+                $"{nameof(PDistBackward)}: savedState[0] (p) must be a double.", nameof(savedState));
+
+        var input = inputs[0];
+        int n = input._shape[0], d = input._shape[1];
+        var gradIn = TensorPool<T>.RentZeroed(input._shape);
+
+        int cursor = 0;
+        for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+        {
+            double dist = numOps.ToDouble(output[cursor]);
+            double g = numOps.ToDouble(gradOutput[cursor]);
+            cursor++;
+            if (g == 0.0) continue;
+            for (int k = 0; k < d; k++)
+            {
+                double diff = numOps.ToDouble(input[i * d + k]) - numOps.ToDouble(input[j * d + k]);
+                double s = g * PNormTermGrad(diff, dist, p);
+                if (s == 0.0) continue;
+                gradIn[i * d + k] = numOps.Add(gradIn[i * d + k], numOps.FromDouble(s));
+                gradIn[j * d + k] = numOps.Subtract(gradIn[j * d + k], numOps.FromDouble(s));
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, input, gradIn, engine);
+    }
+
+    /// <summary>
+    /// CDist backward: output[i, j] = ‖x1[i] − x2[j]‖_p, so x1[i] and x2[j] receive equal and
+    /// opposite gradient, each accumulated over the whole opposing set.
+    /// </summary>
+    internal static void CDistBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(CDistBackward), savedState, 1);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double p = savedState[0] is double pv
+            ? pv
+            : throw new ArgumentException(
+                $"{nameof(CDistBackward)}: savedState[0] (p) must be a double.", nameof(savedState));
+
+        var x1 = inputs[0];
+        var x2 = inputs[1];
+        int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+        var gradX1 = TensorPool<T>.RentZeroed(x1._shape);
+        var gradX2 = TensorPool<T>.RentZeroed(x2._shape);
+
+        for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++)
+        {
+            double dist = numOps.ToDouble(output[i * n + j]);
+            double g = numOps.ToDouble(gradOutput[i * n + j]);
+            if (g == 0.0) continue;
+            for (int k = 0; k < d; k++)
+            {
+                double diff = numOps.ToDouble(x1[i * d + k]) - numOps.ToDouble(x2[j * d + k]);
+                double s = g * PNormTermGrad(diff, dist, p);
+                if (s == 0.0) continue;
+                gradX1[i * d + k] = numOps.Add(gradX1[i * d + k], numOps.FromDouble(s));
+                gradX2[j * d + k] = numOps.Subtract(gradX2[j * d + k], numOps.FromDouble(s));
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, x1, gradX1, engine);
+        DifferentiableOps.AccumulateGrad(grads, x2, gradX2, engine);
+    }
+
+    /// <summary>
     /// Backward for the DIM-AWARE <c>TensorCosineSimilarity(x1, x2, dim, eps)</c>, which reduces one
     /// axis and returns a tensor.
     /// </summary>
