@@ -10,7 +10,7 @@ internal sealed class PtxTiledOuterProductProgram
 {
     internal PtxTiledOuterProductProgram(
         string text, int blocks, int blockThreads, int steps,
-        int innerReduction, int tileM, int tileN, string stagedLabel,
+        int innerReduction, int tileM, int tileN, int sharedMemoryBytes, string stagedLabel,
         string? outerProductRefusal)
     {
         Text = text;
@@ -20,6 +20,7 @@ internal sealed class PtxTiledOuterProductProgram
         InnerReduction = innerReduction;
         TileM = tileM;
         TileN = tileN;
+        SharedMemoryBytes = sharedMemoryBytes;
         StagedLabel = stagedLabel;
         OuterProductRefusal = outerProductRefusal;
     }
@@ -32,6 +33,7 @@ internal sealed class PtxTiledOuterProductProgram
     internal int InnerReduction { get; }
     internal int TileM { get; }
     internal int TileN { get; }
+    internal int SharedMemoryBytes { get; }
     internal string StagedLabel { get; }
 
     /// <summary>Why the generic emitter refused when the Conv2D fallback won.</summary>
@@ -65,6 +67,7 @@ internal static class PtxTiledOuterProductDispatcher
             return new PtxTiledOuterProductProgram(
                 text, plan.Blocks, emitter.LaunchBlockThreads,
                 plan.Steps, plan.InnerReduction, plan.TileM, plan.TileN,
+                emitter.SharedMemoryBytes,
                 "left+right rows", outerProductRefusal: null);
         }
         catch (NotSupportedException outerProduct)
@@ -77,6 +80,7 @@ internal static class PtxTiledOuterProductDispatcher
                 return new PtxTiledOuterProductProgram(
                     text, plan.Blocks, emitter.LaunchBlockThreads,
                     plan.Steps, plan.InnerReduction, plan.TileM, plan.TileN,
+                    emitter.SharedMemoryBytes,
                     "output+input rows", outerProduct.Message);
             }
             catch (NotSupportedException fallback)

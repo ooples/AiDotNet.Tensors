@@ -40,7 +40,14 @@ internal static class KernelCatalogOracleTool
         double MinimumTrafficAmplification,
         double WarpLoadsPerMac,
         double? PredictedMicroseconds,
-        string Reuse);
+        string Reuse,
+        int SharedMemoryBytes,
+        int BlockThreads,
+        bool AsyncCopy,
+        bool DoubleBuffered,
+        bool VectorSharedLoads,
+        bool SoftwarePrefetch,
+        string Features);
 
     private sealed record Diagnosis(string Cause, string Action);
 
@@ -201,6 +208,13 @@ internal static class KernelCatalogOracleTool
         long warpLoads = 0;
         double? predictedUs = 0.0;
         string shape;
+        int sharedMemoryBytes = 0;
+        int blockThreads = 0;
+        bool asyncCopy = false;
+        bool doubleBuffered = false;
+        bool vectorSharedLoads = false;
+        bool softwarePrefetch = false;
+        var features = new List<string>();
 
         bool tiledChunkedSplit = winner is not null &&
             winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal);
@@ -225,6 +239,12 @@ internal static class KernelCatalogOracleTool
             int tiledM = tiled.TileM;
             int tiledN = tiled.TileN;
             int tiledBlockThreads = tiled.BlockThreads;
+            sharedMemoryBytes = tiled.SharedMemoryBytes;
+            blockThreads = tiledBlockThreads;
+            asyncCopy = true;
+            doubleBuffered = true;
+            features.Add("split-reduction");
+            features.Add("register-tiled");
             long partialThreads = split.Partial.Space.TotalThreads;
             var partialSemantic = CodegenPerformanceModel.Predict(
                 split.Partial, partialThreads, 0, machine, tiledBlockThreads);
@@ -265,6 +285,14 @@ internal static class KernelCatalogOracleTool
             var partialEmitter = new PtxTiledConv2DEmitter(splitSchedule.Tile);
             _ = partialEmitter.Emit(split.Partial, major, minor);
             CodegenTiledConv2DPlan partialPlan = partialEmitter.Plan!;
+            sharedMemoryBytes = partialEmitter.SharedMemoryBytes;
+            blockThreads = partialEmitter.LaunchBlockThreads;
+            asyncCopy = true;
+            doubleBuffered = partialPlan.Stages > 1;
+            vectorSharedLoads = true;
+            features.Add("split-reduction");
+            features.Add("register-tiled");
+            if (partialPlan.DirectStream) features.Add("direct-stream");
             var partialSemantic = CodegenPerformanceModel.Predict(
                 split.Partial, split.Partial.Space.TotalThreads, 0,
                 machine, partialEmitter.LaunchBlockThreads);
@@ -307,12 +335,16 @@ internal static class KernelCatalogOracleTool
                 var prediction = CodegenPerformanceModel.Predict(
                     half, threads, emitter.DynamicLoadsPerThread,
                     machine, emitter.LaunchBlockThreads);
+                sharedMemoryBytes = Math.Max(sharedMemoryBytes, emitter.SharedMemoryBytes);
+                blockThreads = Math.Max(blockThreads, emitter.LaunchBlockThreads);
                 uniqueBytes = checked(uniqueBytes + prediction.UniqueBytes);
                 warpLoads = checked(warpLoads + prediction.WarpLoadInstructions);
                 predictedUs = predictedUs is double total && prediction.HasComputeCeiling
                     ? total + prediction.PredictedMicroseconds
                     : null;
             }
+            features.Add("split-reduction");
+            features.Add("affine");
             shape = "split x2";
         }
         else if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal) ||
@@ -335,6 +367,12 @@ internal static class KernelCatalogOracleTool
             uniqueBytes = semantic.UniqueBytes;
             warpLoads = (scalarLoads + 31) / 32;
             predictedUs = Ceiling(semantic);
+            sharedMemoryBytes = emitter.SharedMemoryBytes;
+            blockThreads = emitter.LaunchBlockThreads;
+            asyncCopy = true;
+            doubleBuffered = plan.Stages > 1;
+            vectorSharedLoads = true;
+            features.Add("register-tiled");
             shape = plan.TileM + "x" + plan.TileN + "x" + plan.TileK +
                 ", matrix+stream";
         }
@@ -352,6 +390,10 @@ internal static class KernelCatalogOracleTool
             warpLoads = checked((long)plan.Blocks * reductionWarps * 4L);
             uniqueBytes = semantic.UniqueBytes;
             predictedUs = Ceiling(semantic);
+            sharedMemoryBytes = emitter.SharedMemoryBytes;
+            blockThreads = emitter.LaunchBlockThreads;
+            softwarePrefetch = true;
+            features.Add("cooperative-warp-reduction");
             shape = "cooperative (channel,kh), three kw, 256-thread tree";
         }
         else if (string.Equals(winner, "parity-transposed", StringComparison.Ordinal))
@@ -367,6 +409,8 @@ internal static class KernelCatalogOracleTool
             warpLoads = checked(warps * 13L);
             uniqueBytes = semantic.UniqueBytes;
             predictedUs = Ceiling(semantic);
+            blockThreads = emitter.LaunchBlockThreads;
+            features.Add("output-reuse-4x");
             shape = "one input per thread, deterministic 2x2 output parity tile";
         }
         else if (string.Equals(
@@ -389,11 +433,22 @@ internal static class KernelCatalogOracleTool
                 warpsPerBlock * (inputLoadsPerWarp + filterLoadsPerWarp));
             uniqueBytes = semantic.UniqueBytes;
             predictedUs = Ceiling(semantic);
+            sharedMemoryBytes = emitter.SharedMemoryBytes;
+            blockThreads = emitter.LaunchBlockThreads;
+            asyncCopy = true;
+            doubleBuffered = true;
+            features.Add("winograd-f2x3");
+            features.Add("register-tiled");
             shape = "Winograd F(2,3), M32 x 32 tiles, C8 staged 8x8 outer product";
         }
-        else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal))
+        else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal) ||
+                 CodegenTiledConv2DSchedule.Find(winner) is { })
         {
-            var emitter = new PtxTiledConv2DEmitter();
+            CodegenTiledConv2DSchedule? convSchedule =
+                CodegenTiledConv2DSchedule.Find(winner);
+            var emitter = convSchedule is null
+                ? new PtxTiledConv2DEmitter()
+                : new PtxTiledConv2DEmitter(convSchedule);
             _ = emitter.Emit(entry.Bench, major, minor);
             var plan = emitter.Plan!;
 
@@ -402,6 +457,13 @@ internal static class KernelCatalogOracleTool
             uniqueBytes = semantic.UniqueBytes;
             warpLoads = (scalarLoads + 31) / 32;
             predictedUs = Ceiling(semantic);
+            sharedMemoryBytes = emitter.SharedMemoryBytes;
+            blockThreads = emitter.LaunchBlockThreads;
+            asyncCopy = true;
+            doubleBuffered = plan.Stages > 1;
+            vectorSharedLoads = true;
+            features.Add("register-tiled");
+            if (plan.DirectStream) features.Add("direct-stream");
             shape = plan.TileM + "x" + plan.OutputWidth + "x" + plan.TileChannels +
                 ", weights+three input rows";
         }
@@ -417,6 +479,11 @@ internal static class KernelCatalogOracleTool
             uniqueBytes = prediction.UniqueBytes;
             warpLoads = prediction.WarpLoadInstructions;
             predictedUs = prediction.PredictedMicroseconds;
+            sharedMemoryBytes = emitter.SharedMemoryBytes;
+            blockThreads = emitter.LaunchBlockThreads;
+            features.Add("affine");
+            if (!string.Equals(emitter.StagedOperands, "none", StringComparison.Ordinal))
+                features.Add("shared-staged");
             shape = emitter.TileDescription + ", " + emitter.StagedOperands;
         }
 
@@ -426,9 +493,15 @@ internal static class KernelCatalogOracleTool
         double traffic = semantic.UniqueBytes > 0
             ? uniqueBytes / (double)semantic.UniqueBytes
             : 1.0;
+        if (asyncCopy) features.Add("cp.async");
+        if (doubleBuffered) features.Add("double-buffered");
+        if (vectorSharedLoads) features.Add("vector-shared-loads");
+        if (softwarePrefetch) features.Add("software-prefetch-2x");
         return new ScheduleEvidence(
             winner ?? "modelled", shape, traffic, loadsPerMac, predictedUs,
-            ReuseText(entry.Bench));
+            ReuseText(entry.Bench), sharedMemoryBytes, blockThreads,
+            asyncCopy, doubleBuffered, vectorSharedLoads, softwarePrefetch,
+            string.Join(",", features.Distinct(StringComparer.Ordinal)));
     }
 
     private static bool TryParseChunkFactor(string winner, out int chunkFactor)
@@ -491,12 +564,15 @@ internal static class KernelCatalogOracleTool
                 phaseContext + limiter + " is saturated at " + F(limiterPct) +
                 "% in the exact two-pass outer-product program while semantic efficiency " +
                 "is " + F(semanticEfficiency) + "%. The partial pass owns the reusable " +
-                "operands and dominates program time; the deterministic combine is not the gap.",
+                "operands and dominates program time; the deterministic combine is not the gap. " +
+                "Active lowering features: " + schedule.Features + ".",
                 (tiledChunkedSplit
-                    ? "Search outer-product CTA/thread fragments jointly with chunk count and " +
-                      "asynchronously stage the partial operands; keep the combine unchanged."
-                    : "Increase operand reuse inside the tiled partial pass with a wider " +
-                      "measured fragment or asynchronous staging; keep the combine unchanged."));
+                    ? "The partial is already asynchronously double-buffered. Search CTA/thread " +
+                      "fragments jointly with chunk count, vectorize shared fragments, and measure " +
+                      "a longer prefetch distance; keep the combine unchanged."
+                    : "The partial is already asynchronously double-buffered. Increase operand " +
+                      "reuse with a wider measured fragment or warp-specialized producer/consumer " +
+                      "roles; keep the combine unchanged."));
         }
 
         if (atRoofline && (limiter == "L1" || limiter == "L2"))
@@ -520,7 +596,8 @@ internal static class KernelCatalogOracleTool
                 phaseContext + "The exact Winograd F(2,3) outer-product program is " +
                 "under-filled: " + limiter + " is " + F(limiterPct) +
                 "%, long-scoreboard is " + F(longSb) + "%, and wait is " + F(wait) +
-                "%. Its 73,728-byte shared tile permits only one resident CTA/SM, so " +
+                "%. Its " + schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
+                "-byte shared tile permits only one resident CTA/SM, so " +
                 "neither L1 nor issue capacity can be filled by another block.",
                 "Reduce the live transform/accumulator or shared-tile footprint enough for " +
                 "two resident CTAs, or create more independent warp tiles inside the CTA. " +
@@ -536,9 +613,13 @@ internal static class KernelCatalogOracleTool
                 " remains under-filled after measured M/N/K tile search: " + limiter +
                 " is " + F(limiterPct) + "%, LSU dependency stalls are " + F(mio) +
                 "%, and long-scoreboard is " + F(longSb) + "%. This is not evidence that " +
-                "an unmeasured larger scalar tile will win.",
-                "Vector fragments are already active. Next measure a warp-specialized " +
-                "async-copy/compute pipeline or register double-buffering across K. Keep " +
+                "an unmeasured larger scalar tile will win. The current " +
+                schedule.BlockThreads.ToString(CultureInfo.InvariantCulture) + "-thread CTA uses " +
+                schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
+                " shared bytes with " + schedule.Features + ".",
+                "Vector shared fragments and a cp.async double buffer are already active. " +
+                "Next measure warp-specialized producer/consumer roles or register " +
+                "double-buffering across K. Keep " +
                 "geometry selection in the exact schedule search rather than hard-coding an " +
                 "operation-specific tile.");
         }
@@ -551,7 +632,8 @@ internal static class KernelCatalogOracleTool
                 F(limiterPct) + "% " + limiter + " after the finite search already covered " +
                 "M/row/channel tiles, warp-halo, direct-stream, asymmetric staging, and " +
                 "reduction splits. Long-scoreboard is " + F(longSb) + "% and wait is " +
-                F(wait) + "%, so no single existing pipe is the bottleneck.",
+                F(wait) + "%, so no single existing pipe is the bottleneck. The winner already " +
+                "uses " + schedule.Features + ".",
                 "Add a genuinely different dataflow candidate—inline Winograd, implicit GEMM, " +
                 "or a warp-specialized asynchronous pipeline—and let the same numerical and " +
                 "paired-timing gates choose it. More tuning of the existing local knobs is " +
@@ -565,12 +647,14 @@ internal static class KernelCatalogOracleTool
                 limiter + " is " + F(limiterPct) + "%, long-scoreboard is " + F(longSb) +
                 "%, wait is " + F(wait) + "%, and shared/LSU dependency stalls are " +
                 F(mio) + "%. The partial pass, not the deterministic combine, is the " +
-                "optimization target.",
+                "optimization target. Active lowering features: " + schedule.Features + ".",
                 (tiledChunkedSplit
-                    ? "Search outer-product CTA/thread fragments jointly with chunk count and " +
-                      "add asynchronous operand staging to the partial pass; keep the combine unchanged."
-                    : "Expand the outer-product fragment search and vectorize/stage the partial " +
-                      "pass operands; keep the deterministic combine unchanged."));
+                    ? "The partial is already asynchronously double-buffered. Search " +
+                      "CTA/thread fragments jointly with chunk count, vectorize shared loads, or " +
+                      "increase the measured prefetch distance; keep the combine unchanged."
+                    : "The partial is already asynchronously double-buffered. Expand the " +
+                      "outer-product fragment search and vectorize its shared loads; keep the " +
+                      "deterministic combine unchanged."));
         }
 
         if (!atRoofline && longSb >= 20.0 && wait >= 15.0)
@@ -588,6 +672,17 @@ internal static class KernelCatalogOracleTool
 
         if (!atRoofline && longSb >= 20.0)
         {
+            if (schedule.SoftwarePrefetch)
+            {
+                return new Diagnosis(
+                    phaseContext + "No unit is saturated (largest is " + limiter + " at " +
+                    F(limiterPct) + "%), while long-scoreboard stalls consume " + F(longSb) +
+                    "%. The current two-position software pipeline is active, so this is " +
+                    "residual latency after prefetch rather than a missing prefetch stage.",
+                    "Measure a deeper grid-stride prefetch distance and a mapping with multiple " +
+                    "independent channel/tap groups per CTA; retain only variants that improve " +
+                    "the paired timing and stability gates.");
+            }
             return new Diagnosis(
                 phaseContext + "No unit is saturated (largest is " + limiter + " at " +
                 F(limiterPct) +
@@ -651,6 +746,10 @@ internal static class KernelCatalogOracleTool
             Console.WriteLine("  competitor plan: " + row.CompetitorPlanStrategy +
                               ", cross-plan spread " + F(row.CompetitorPlanSpread) + "%");
             Console.WriteLine("  reuse: " + row.Schedule.Reuse);
+            Console.WriteLine("  features: " + row.Schedule.Features + ", shared " +
+                              row.Schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
+                              " B, " + row.Schedule.BlockThreads.ToString(CultureInfo.InvariantCulture) +
+                              " threads");
             Console.WriteLine("  cause: " + row.Diagnosis.Cause);
             Console.WriteLine("  next:  " + row.Diagnosis.Action);
         }
@@ -664,7 +763,8 @@ internal static class KernelCatalogOracleTool
         text.AppendLine("kernel\toutcome\tratio\tours_us\tcompetitor_us\tsemantic_ceiling_us" +
                         "\tcompetitor_plan_strategy\tcompetitor_plan_spread_pct" +
                         "\tsemantic_efficiency_pct\twinner\tschedule\tprogram_traffic_x" +
-                        "\tthread_loads_per_mac\tmodel_us\tlimiter\tlimiter_pct" +
+                        "\tthread_loads_per_mac\tmodel_us\tfeatures\tshared_bytes" +
+                        "\tblock_threads\tlimiter\tlimiter_pct" +
                         "\tstall_long_sb\tstall_wait\tstall_mio\talu_share_pct" +
                         "\tfma_share_pct\tlsu_share_pct\tcontrol_share_pct\tprofiled_phase" +
                         "\tphase_count\tphase_share_pct\treuse\tcause\taction\tprotocol");
@@ -676,7 +776,10 @@ internal static class KernelCatalogOracleTool
                 row.CompetitorPlanStrategy, N(row.CompetitorPlanSpread),
                 N(row.SemanticEfficiency), row.Schedule.Winner, Clean(row.Schedule.Shape),
                 N(row.Schedule.MinimumTrafficAmplification), N(row.Schedule.WarpLoadsPerMac),
-                N(row.Schedule.PredictedMicroseconds), row.Limiter, N(row.LimiterPct),
+                N(row.Schedule.PredictedMicroseconds), row.Schedule.Features,
+                row.Schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture),
+                row.Schedule.BlockThreads.ToString(CultureInfo.InvariantCulture),
+                row.Limiter, N(row.LimiterPct),
                 N(row.LongScoreboard), N(row.Wait), N(row.Mio),
                 N(row.AluShare), N(row.FmaShare), N(row.LsuShare), N(row.ControlShare),
                 row.ProfiledPhase, row.PhaseCount.ToString(CultureInfo.InvariantCulture),
