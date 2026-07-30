@@ -57,8 +57,9 @@
 //              backoff, so one WDDM burst cannot discard twelve clean rows or phase-lock all
 //              immediate retries into the same foreign workload. Post-suite C+G handling now
 //              matches the release-evidence script: mixed-process admission is enforced before
-//              timing, while the post boundary rejects compute-only work and unsafe temperature
-//              without trusting WDDM's stale single-sample mixed-process percentage.
+//              timing, while the post boundary rejects compute-only work, unsafe temperature,
+//              and sustained whole-device utilization. A bounded quiescence window prevents the
+//              benchmark's own trailing NVIDIA utilization sample from becoming a false refusal.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not

@@ -7,6 +7,8 @@ internal static class GpuBenchmarkEnvironment
 {
     private const int MixedComputeConflictThresholdPercent = 5;
     private const int DeviceUtilizationCeilingPercent = 20;
+    private const int PostSuiteUtilizationAttempts = 6;
+    private const int PostSuiteUtilizationDelayMilliseconds = 250;
     private const int DeviceMemoryCeilingMegabytes = 2048;
     private const int DeviceTemperatureCeilingCelsius = 75;
 
@@ -54,15 +56,33 @@ internal static class GpuBenchmarkEnvironment
                 $"{DeviceTemperatureCeilingCelsius} C evidence ceiling.");
 
         if (afterSuite)
+            RequirePostSuiteDeviceQuiescence(label);
+    }
+
+    private static void RequirePostSuiteDeviceQuiescence(string label)
+    {
+        int utilizationPercent = 0;
+        for (int attempt = 0; attempt < PostSuiteUtilizationAttempts; attempt++)
         {
             string utilization = RunNvidiaSmi(
                 "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits");
-            if (int.TryParse(utilization, out int utilizationPercent) &&
-                utilizationPercent > DeviceUtilizationCeilingPercent)
-                throw new InvalidOperationException(
-                    $"[{label}] GPU utilization {utilizationPercent}% exceeds the " +
-                    $"{DeviceUtilizationCeilingPercent}% evidence ceiling after the timed region.");
+            if (!int.TryParse(utilization, out utilizationPercent) ||
+                utilizationPercent <= DeviceUtilizationCeilingPercent)
+                return;
+
+            // NVIDIA reports utilization over a trailing sample window. Immediately
+            // after our own synchronized launches, the first snapshot can therefore
+            // describe work that has already finished. Give that sample a bounded
+            // opportunity to age out; sustained foreign work remains above the ceiling
+            // and still fails closed after the final sample.
+            if (attempt + 1 < PostSuiteUtilizationAttempts)
+                System.Threading.Thread.Sleep(PostSuiteUtilizationDelayMilliseconds);
         }
+
+        throw new InvalidOperationException(
+            $"[{label}] GPU utilization remains {utilizationPercent}% after " +
+            $"{PostSuiteUtilizationAttempts} post-suite quiescence samples, above the " +
+            $"{DeviceUtilizationCeilingPercent}% evidence ceiling.");
     }
 
     internal static string[] FindComputeWorkloadConflicts(
