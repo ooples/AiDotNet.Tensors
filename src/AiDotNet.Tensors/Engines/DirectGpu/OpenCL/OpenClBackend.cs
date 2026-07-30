@@ -13264,27 +13264,30 @@ KERNEL VARIANTS (A/B testing):
             using var dGates = AllocateBuffer(seqLen * batch * gateCount);
 
             // --- Kernel A: sequential BPTT recurrence, global size = batch ---
+            // (input is not read by kernel A — grad_input is Wih^T . dGates, no x needed.)
             kGates.SetArg(0u, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             kGates.SetArg(1u, ((DirectOpenClGpuBuffer)allC).Buffer.Handle);
             kGates.SetArg(2u, ((DirectOpenClGpuBuffer)cacheGates).Buffer.Handle);
             kGates.SetArg(3u, ((DirectOpenClGpuBuffer)weightsIh).Buffer.Handle);
             kGates.SetArg(4u, ((DirectOpenClGpuBuffer)weightsHh).Buffer.Handle);
-            kGates.SetArg(5u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            kGates.SetArg(6u, ((DirectOpenClGpuBuffer)dGates).Buffer.Handle);
-            kGates.SetArg(7u, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            kGates.SetArg(8u, ((DirectOpenClGpuBuffer)gradHInit).Buffer.Handle);
-            kGates.SetArg(9u, ((DirectOpenClGpuBuffer)gradCInit).Buffer.Handle);
-            kGates.SetArg(10u, seqLen);
-            kGates.SetArg(11u, batch);
-            kGates.SetArg(12u, inputSize);
-            kGates.SetArg(13u, hiddenSize);
+            kGates.SetArg(5u, ((DirectOpenClGpuBuffer)dGates).Buffer.Handle);
+            kGates.SetArg(6u, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            kGates.SetArg(7u, ((DirectOpenClGpuBuffer)gradHInit).Buffer.Handle);
+            kGates.SetArg(8u, ((DirectOpenClGpuBuffer)gradCInit).Buffer.Handle);
+            kGates.SetArg(9u, seqLen);
+            kGates.SetArg(10u, batch);
+            kGates.SetArg(11u, inputSize);
+            kGates.SetArg(12u, hiddenSize);
 
             int localA = CalculateOptimalWorkGroupSize1D(batch);
             int globalA = ((batch + localA - 1) / localA) * localA;
             kGates.Execute1D(globalA, localA);
 
             // --- Kernel B: weight/bias grads, global size = |dWih| + |dWhh| + |dBias| ---
-            // The in-order command queue guarantees kernel A completes before kernel B reads dGates.
+            // Both Execute1D calls enqueue on this backend's command queue, which is created
+            // in-order (CreateCommandQueue with CL_QUEUE_PROFILING_ENABLE only, never
+            // CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE), so kernel A is guaranteed to complete and its
+            // dGates writes are visible before kernel B begins reading them — no explicit barrier needed.
             kWeights.SetArg(0u, ((DirectOpenClGpuBuffer)dGates).Buffer.Handle);
             kWeights.SetArg(1u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kWeights.SetArg(2u, ((DirectOpenClGpuBuffer)allH).Buffer.Handle);

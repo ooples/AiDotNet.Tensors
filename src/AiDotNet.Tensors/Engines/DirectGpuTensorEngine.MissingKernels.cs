@@ -5130,7 +5130,7 @@ public partial class DirectGpuTensorEngine
             // override is float-gated above).
             if (typeof(T) == typeof(float) && Autodiff.DifferentiableOps.IsRecording<float>())
             {
-                var gatesHost = backend.DownloadBuffer(bufGates);   // [S, B, 4*Hd]  (slot order f,i,g,o)
+                var gatesHost = backend.DownloadBuffer(bufGates);   // [S, B, Hd, 4]  (slot order i,f,g,o)
                 var allHHost = backend.DownloadBuffer(bufAllH);     // [(S+1), B, Hd] (kernel wrote first S)
                 var allCHost = backend.DownloadBuffer(bufAllC);     // [(S+1), B, Hd]
                 var h0Host = backend.DownloadBuffer(bufH0.Buffer);  // [B, Hd]

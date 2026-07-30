@@ -244,15 +244,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             // Find devices of a given type across all platforms and select by global index.
             // GPU is always attempted first; the CPU pass below runs only under the opt-in
-            // flag when no GPU exists, so production selection is unchanged.
-            bool TrySelectDevice(ulong deviceType)
+            // flag when no GPU DEVICE EXISTS AT ALL, so production selection is unchanged.
+            // anyDevicesOfType reports whether the platform exposed >=1 device of the type, which
+            // is distinct from "the requested index was in range" — an out-of-range index against
+            // an existing GPU must NOT silently fall through to a CPU device.
+            bool TrySelectDevice(ulong deviceType, out bool anyDevicesOfType)
             {
+                anyDevicesOfType = false;
                 int currentIndex = 0;
                 foreach (var platform in platforms)
                 {
                     int e = OpenClNativeBindings.GetDeviceIDs(platform, deviceType, 0, null, out uint numDevices);
                     if (e == OpenClNativeBindings.CL_SUCCESS && numDevices > 0)
                     {
+                        anyDevicesOfType = true;
                         var devices = new IntPtr[numDevices];
                         e = OpenClNativeBindings.GetDeviceIDs(platform, deviceType, numDevices, devices, out _);
                         if (e == OpenClNativeBindings.CL_SUCCESS)
@@ -271,12 +276,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return false;
             }
 
-            if (!TrySelectDevice(OpenClNativeBindings.CL_DEVICE_TYPE_GPU)
-                && OpenClNativeBindings.AllowCpuOpenClDevice)
+            bool gpuSelected = TrySelectDevice(OpenClNativeBindings.CL_DEVICE_TYPE_GPU, out bool anyGpu);
+            if (!gpuSelected && !anyGpu && OpenClNativeBindings.AllowCpuOpenClDevice)
             {
-                // No GPU present, but AIDOTNET_OPENCL_ALLOW_CPU=1 — bind a CPU OpenCL device
-                // (e.g. POCL) so the DirectGpu kernels EXECUTE for CPU-vs-GPU parity in CI.
-                TrySelectDevice(OpenClNativeBindings.CL_DEVICE_TYPE_CPU);
+                // No GPU device exists AT ALL, but AIDOTNET_OPENCL_ALLOW_CPU=1 — bind a CPU OpenCL
+                // device (e.g. POCL) so the DirectGpu kernels EXECUTE for CPU-vs-GPU parity in CI.
+                // Guarded by !anyGpu so an out-of-range index on a real GPU throws below instead of
+                // silently binding a CPU device.
+                TrySelectDevice(OpenClNativeBindings.CL_DEVICE_TYPE_CPU, out _);
             }
 
             if (_device == IntPtr.Zero)

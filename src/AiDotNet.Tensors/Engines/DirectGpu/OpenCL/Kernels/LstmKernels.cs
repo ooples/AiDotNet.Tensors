@@ -394,7 +394,6 @@ __kernel void lstm_backward_dgates(
     __global const float* cacheGates,  // [seqLen, batch, hidden, 4]   (slots: i,f,g,o)
     __global const float* weightsIh,   // [4*hidden, inputSize]
     __global const float* weightsHh,   // [4*hidden, hidden]
-    __global const float* input,       // [batch, seqLen, inputSize] (batch-major) -- unused here
     __global float* dGates,            // [seqLen, batch, 4*hidden]  (out: gate-preact grads)
     __global float* gradInput,         // [batch, seqLen, inputSize] (batch-major, out)
     __global float* gradHInit,         // [batch, hidden] (out; also the reverse-time dH carry)
