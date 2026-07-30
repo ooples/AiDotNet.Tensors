@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.120.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.4...v0.120.5) (2026-07-30)
+
+
+### Bug Fixes
+
+* **autodiff:** pin savedState tensors against pool/arena reuse (Issue [#338](https://github.com/ooples/AiDotNet.Tensors/issues/338) completion) ([#906](https://github.com/ooples/AiDotNet.Tensors/issues/906)) ([bb56e31](https://github.com/ooples/AiDotNet.Tensors/commit/bb56e313ca09d2ffad3189d6bc810058e1b408fd))
+* **gpu:** correct LSTM forward+backward GPU kernels + POCL cpu-opencl parity gate ([#907](https://github.com/ooples/AiDotNet.Tensors/issues/907)) ([e54f99f](https://github.com/ooples/AiDotNet.Tensors/commit/e54f99f9ccec7dbbf76fd0cdee83b4199c9c1e95))
+
 ## [0.120.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.3...v0.120.4) (2026-07-30)
 
 
