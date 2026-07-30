@@ -6,6 +6,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class GpuBenchmarkEnvironment
 {
     private const int MixedComputeConflictThresholdPercent = 5;
+    private const int DeviceUtilizationCeilingPercent = 20;
+    private const int DeviceMemoryCeilingMegabytes = 2048;
+    private const int DeviceTemperatureCeilingCelsius = 75;
 
     internal static void RequireIdleGpu(string label)
     {
@@ -18,7 +21,9 @@ internal static class GpuBenchmarkEnvironment
         if (cells.Length >= 3 && int.TryParse(cells[0], out int utilization)
             && int.TryParse(cells[1], out int usedMegabytes)
             && int.TryParse(cells[2], out int temperatureCelsius)
-            && (utilization > 20 || usedMegabytes > 2048 || temperatureCelsius > 75))
+            && (utilization > DeviceUtilizationCeilingPercent ||
+                usedMegabytes > DeviceMemoryCeilingMegabytes ||
+                temperatureCelsius > DeviceTemperatureCeilingCelsius))
         {
             throw new InvalidOperationException(
                 $"[{label}] GPU is not benchmark-ready (utilization={utilization}%, " +
@@ -42,9 +47,22 @@ internal static class GpuBenchmarkEnvironment
 
         string temperature = RunNvidiaSmi(
             "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits");
-        if (int.TryParse(temperature, out int temperatureCelsius) && temperatureCelsius > 75)
+        if (int.TryParse(temperature, out int temperatureCelsius) &&
+            temperatureCelsius > DeviceTemperatureCeilingCelsius)
             throw new InvalidOperationException(
-                $"[{label}] GPU temperature {temperatureCelsius} C exceeds the 75 C evidence ceiling.");
+                $"[{label}] GPU temperature {temperatureCelsius} C exceeds the " +
+                $"{DeviceTemperatureCeilingCelsius} C evidence ceiling.");
+
+        if (afterSuite)
+        {
+            string utilization = RunNvidiaSmi(
+                "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits");
+            if (int.TryParse(utilization, out int utilizationPercent) &&
+                utilizationPercent > DeviceUtilizationCeilingPercent)
+                throw new InvalidOperationException(
+                    $"[{label}] GPU utilization {utilizationPercent}% exceeds the " +
+                    $"{DeviceUtilizationCeilingPercent}% evidence ceiling after the timed region.");
+        }
     }
 
     internal static string[] FindComputeWorkloadConflicts(
