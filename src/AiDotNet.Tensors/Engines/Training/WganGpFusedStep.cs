@@ -138,7 +138,7 @@ public sealed class WganGpFusedStep<T> : IDisposable
             if (_plan is null)
             {
                 using var arenaSuspend = TensorArena.Suspend();
-                using var scope = GraphMode.Enable();
+                using var scope = GraphMode.EnableTraining(_cachedParameters);
                 var loss = BuildWganGpLoss(discForward, gradientPenaltyWeight);
                 _plan = scope.CompileTraining(_cachedParameters, loss);
             }

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.120.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.3...v0.120.4) (2026-07-30)
+
+
+### Bug Fixes
+
+* **compilation:** replay stop-gradient forward values ([#903](https://github.com/ooples/AiDotNet.Tensors/issues/903)) ([b80e21a](https://github.com/ooples/AiDotNet.Tensors/commit/b80e21a685cf510b0bb7383dc862ce02052a4ad0))
+
+## [0.120.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.2...v0.120.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* **compilation:** preserve COW parameter views and FP64 training ([#901](https://github.com/ooples/AiDotNet.Tensors/issues/901)) ([da337a4](https://github.com/ooples/AiDotNet.Tensors/commit/da337a469278100b72f79817ec1e5046cdb53522))
+
+## [0.120.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.1...v0.120.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **autodiff:** elementwise backwards threw on a rank-0 operand vs a rank-1 seed gradient ([#898](https://github.com/ooples/AiDotNet.Tensors/issues/898)) ([ff15edc](https://github.com/ooples/AiDotNet.Tensors/commit/ff15edcc0eca4e44cf101a262421d0a33e03b67d))
+* preserve COW isolation in compiled training ([#899](https://github.com/ooples/AiDotNet.Tensors/issues/899)) ([f74c0eb](https://github.com/ooples/AiDotNet.Tensors/commit/f74c0eb91bbf1c507815962a81b662c07ffa2d36))
+
 ## [0.120.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.0...v0.120.1) (2026-07-28)
 
 

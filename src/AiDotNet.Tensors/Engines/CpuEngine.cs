@@ -6766,13 +6766,45 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+
+        // Detaching blocks BACKWARD traversal; it does not make the value a
+        // compile-time constant. Keep the input in the lazy forward graph and
+        // deliberately omit a backward function so replay refreshes the value
+        // while gradient propagation terminates at this node.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                scope.BindEngineIfUnset(this);
+                var captured = tensor;
+                return scope.RecordUnary(
+                    LazyNodeType.Custom,
+                    "StopGradient",
+                    tensor,
+                    tensor._shape,
+                    (eng, output) =>
+                    {
+                        var source = captured.IsContiguous ? captured : captured.Contiguous();
+                        DirectGpuTensorEngine.CopyResultInto(eng, source, output);
+                    },
+                    backwardFn: null);
+            }
+        }
+
+        // Preserve the caller's tensor/view for transparent replay. The eager copy below
+        // may need a contiguous snapshot, but closing over that snapshot would freeze a
+        // non-contiguous view at trace time instead of observing later source mutations.
+        var tracedInput = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Copy data to a new tensor with no tape connection.
         // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         tensor.AsSpan().CopyTo(result.AsWritableSpan());
+        // Transparent inference tracing has the same forward-dependency contract as
+        // GraphMode, while remaining outside the autodiff tape.
+        { var c = tracedInput; AutoTracer.RecordOp("StopGradient", result, eng => eng.StopGradient(c)); }
         return result;
     }
 
@@ -30798,6 +30830,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Match ReduceSum and the eager reduction contract: null means reduce
+        // every axis. Normalize before graph-shape construction so tracing does
+        // not enumerate a null array even though the eager path supports it.
+        axes ??= Enumerable.Range(0, input.Rank).ToArray();
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -43723,7 +43760,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Narrow", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        var result = tensor.Slice(dim, start, start + length);
+        var result = tensor.CreateNarrowView(dim, start, start + length, recordAutodiff: false);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
         AutoTracer.RecordOp("Narrow", result, eng => eng.TensorNarrow(tensor, dim, start, length));

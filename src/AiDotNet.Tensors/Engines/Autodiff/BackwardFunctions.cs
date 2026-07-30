@@ -1,4 +1,4 @@
-﻿using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -110,6 +110,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // See AlignGradRank: a rank-0 operand paired with a rank-1 [1] seed would otherwise throw.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+
         var gradA = engine.TensorMultiply(gradOutput, inputs[1]);
         var gradB = engine.TensorMultiply(gradOutput, inputs[0]);
         if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], gradA, engine))
@@ -119,10 +122,37 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>d(a/b)/da = grad/b, d(a/b)/db = -grad*a/(b*b)</summary>
+    /// <summary>
+    /// Reshapes an upstream gradient to an operand's shape when the two describe the SAME number of
+    /// elements but different ranks, e.g. a rank-1 <c>[1]</c> seed against a rank-0 <c>[]</c> operand.
+    /// </summary>
+    /// <remarks>
+    /// Elementwise backward functions divide/multiply the upstream gradient by an operand directly,
+    /// which requires matching shapes. A rank-0 result (any full reduction with
+    /// <c>keepDims: false</c>) receives a rank-1 <c>[1]</c> seed gradient from the tape, so those ops
+    /// threw "Tensor shapes must match. Got [1] and []" from inside ComputeGradients -- turning a
+    /// perfectly valid loss into an exception mid-training-step. Because the element count is
+    /// identical, a reshape is exact and loses nothing; anything that is NOT a pure rank mismatch is
+    /// left untouched so genuine shape errors still surface.
+    /// </remarks>
+    private static Tensor<T> AlignGradRank(IEngine engine, Tensor<T> grad, Tensor<T> operand)
+    {
+        if (grad.Shape.Length == operand.Shape.Length || grad.Length != operand.Length)
+        {
+            return grad;
+        }
+
+        return engine.Reshape(grad, (int[])operand._shape.Clone());
+    }
+
     internal static void DivideBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // The forward divide requires a and b to share a shape, so aligning against inputs[0] is
+        // enough to make every product/quotient below shape-consistent.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+
         var gradA = engine.TensorDivide(gradOutput, inputs[1]);
         var bSquared = engine.TensorMultiply(inputs[1], inputs[1]);
         var posGradA = engine.TensorMultiply(gradOutput, inputs[0]);
@@ -145,6 +175,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        gradOutput = AlignGradRank(engine, gradOutput, output);
         var grad = engine.TensorMultiply(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -154,6 +185,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
         var grad = engine.TensorDivide(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -4480,6 +4512,9 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var two = numOps.FromDouble(2.0);
+        // See AlignGradRank: same rank-0-operand / rank-1-seed hazard as the other elementwise
+        // backwards. Found by sweeping all 245 backward functions for this pattern.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
         var gradReal = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[0]), two);
         var gradImag = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[1]), two);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradReal, engine);
