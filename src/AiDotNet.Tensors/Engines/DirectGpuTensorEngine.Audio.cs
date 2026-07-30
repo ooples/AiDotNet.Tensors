@@ -4,6 +4,7 @@
 // inherited CpuEngine path since they internally call the already
 // GPU-accelerated STFT).
 
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -29,7 +30,15 @@ public partial class DirectGpuTensorEngine
                     audio.AmplitudeToDB(inBuf.Buffer, outBuf.Buffer, len,
                         minAmplitude, 0.0f, clipTopDb: false);
                     var arr = FinishGpuOp<T>(backend, outBuf, len);
-                    return new Tensor<T>(arr, (int[])input._shape.Clone());
+                    var gpuResult = new Tensor<T>(arr, (int[])input._shape.Clone());
+                    // Must mirror the base CpuEngine recording. Returning here without it made
+                    // the GPU path silently non-differentiable for an op that OpRegistry
+                    // classifies as differentiable — the tape simply had no node, so gradients
+                    // were zero with no error anywhere.
+                    DifferentiableOps.RecordUnary("AmplitudeToDB", gpuResult, input,
+                        BackwardFunctions<T>.AmplitudeToDBBackward,
+                        new object[] { minAmplitude });
+                    return gpuResult;
                 }
                 catch { outBuf.Dispose(); throw; }
             }
@@ -117,7 +126,12 @@ public partial class DirectGpuTensorEngine
                 {
                     audio.ComputeDeltas(inBuf.Buffer, outBuf.Buffer, leading, timeAxis, winLength);
                     var arr = FinishGpuOp<T>(backend, outBuf, input.Length);
-                    return new Tensor<T>(arr, (int[])input._shape.Clone());
+                    var gpuResult = new Tensor<T>(arr, (int[])input._shape.Clone());
+                    // Mirror the base CpuEngine recording — see AmplitudeToDB above.
+                    DifferentiableOps.RecordUnary("ComputeDeltas", gpuResult, input,
+                        BackwardFunctions<T>.ComputeDeltasBackward,
+                        new object[] { winLength });
+                    return gpuResult;
                 }
                 catch { outBuf.Dispose(); throw; }
             }
@@ -168,7 +182,12 @@ public partial class DirectGpuTensorEngine
                     var arr = FinishGpuOp<T>(backend, outBuf, outTotal);
                     var outShape = (int[])waveform._shape.Clone();
                     outShape[waveform.Rank - 1] = outLen;
-                    return new Tensor<T>(arr, outShape);
+                    var gpuResult = new Tensor<T>(arr, outShape);
+                    // Mirror the base CpuEngine recording — see AmplitudeToDB above.
+                    DifferentiableOps.RecordUnary("Resample", gpuResult, waveform,
+                        BackwardFunctions<T>.ResampleBackward,
+                        new object[] { origRate, newRate });
+                    return gpuResult;
                 }
                 catch { outBuf.Dispose(); throw; }
             }

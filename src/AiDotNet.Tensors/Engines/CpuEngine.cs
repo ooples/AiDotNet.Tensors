@@ -37693,6 +37693,20 @@ public partial class CpuEngine : ITensorLevelEngine
         if (center)
         {
             int padAmount = nFft / 2;
+
+            // Reflection needs a strictly longer signal than the pad: the start pad reads
+            // input[padAmount - i], whose first access is input[padAmount]. Without this check
+            // that access runs off the end and surfaces as an opaque IndexOutOfRangeException
+            // from inside the padding loop. It also mattered for the adjoint — the backward
+            // folds padded gradient back only where the source index is in range, so a
+            // too-short signal would have silently dropped gradient contributions rather than
+            // failing. Validate once, here, so forward and backward agree on the domain.
+            if (signalLength <= padAmount)
+                throw new ArgumentException(
+                    $"Signal length {signalLength} must be greater than nFft/2 ({padAmount}) when " +
+                    $"center is true, because reflection padding reflects across the signal. " +
+                    $"Either pass center: false or use nFft < {2 * signalLength}.",
+                    nameof(input));
             var paddedShape = input.Shape.ToArray();
             paddedShape[^1] = signalLength + 2 * padAmount;
             paddedInput = AutoTensorCache.RentOrAllocate<T>(paddedShape);
@@ -37985,8 +37999,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Convert to dB scale if requested
         if (powerToDb)
         {
-            double minDbD = -80.0;
-            double epsilonD = 1e-10;
+            // Shared with MelSpectrogramBackward so the backward zeroes the gradient at exactly
+            // the thresholds the forward clamps at.
+            const double minDbD = Audio.MelSpectrogramConstants.MinDb;
+            const double epsilonD = Audio.MelSpectrogramConstants.PowerFloor;
 
             for (int i = 0; i < melSpec.Length; i++)
             {

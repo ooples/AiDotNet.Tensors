@@ -7029,6 +7029,14 @@ internal static class BackwardFunctions<T>
         var resultData = result.GetDataArray();
         var padded = new double[paddedLength];
 
+        // Hoisted out of the frame loop: one pair per (batch, frame) would churn thousands of
+        // short-lived vectors on long audio. Reused across frames, and fully rewritten each
+        // frame — bins [0, numFreqs) are assigned below and the tail above numFreqs must stay
+        // zero for the one-sided inverse sum to be correct, so both are set explicitly rather
+        // than relying on the previous frame's contents.
+        var cReal = new Vector<T>(nFft);
+        var cImag = new Vector<T>(nFft);
+
         for (int b = 0; b < batchSize; b++)
         {
             Array.Clear(padded, 0, padded.Length);
@@ -7036,9 +7044,13 @@ internal static class BackwardFunctions<T>
 
             for (int frame = 0; frame < numFrames; frame++)
             {
+                for (int k = numFreqs; k < nFft; k++)
+                {
+                    cReal[k] = numOps.Zero;
+                    cImag[k] = numOps.Zero;
+                }
+
                 // c[k] = g[k] * e^(i * phase[k]) over the reported one-sided bins.
-                var cReal = new Vector<T>(nFft);
-                var cImag = new Vector<T>(nFft);
                 for (int k = 0; k < numFreqs; k++)
                 {
                     double g = numOps.ToDouble(gradData[specOffset + k * numFrames + frame]);
@@ -7133,8 +7145,10 @@ internal static class BackwardFunctions<T>
 
         // Stage 1: undo the dB conversion, in place on a copy of the incoming gradient.
         var gMel = new double[gradOutput.Length];
-        const double epsilonD = 1e-10;
-        const double minDbD = -80.0;
+        // Shared with CpuEngine.MelSpectrogram — see MelSpectrogramConstants for why these must
+        // not be redeclared per call site.
+        const double epsilonD = Audio.MelSpectrogramConstants.PowerFloor;
+        const double minDbD = Audio.MelSpectrogramConstants.MinDb;
         double invLn10 = 1.0 / Math.Log(10.0);
         for (int i = 0; i < gMel.Length; i++)
         {
@@ -7155,26 +7169,33 @@ internal static class BackwardFunctions<T>
         }
 
         // Stage 2: through the mel filterbank and the magnitude-squared.
+        //
+        // Parallelized over the flattened (batch, frequency) rows rather than left as a triple
+        // scalar loop. Each output element still accumulates sequentially over m, so the result
+        // is bit-identical to the serial version — the parallelism is purely over disjoint
+        // output rows, which is what keeps this deterministic. Expressing it as a TensorMatMul
+        // would also work but would reassociate the sum over m and change the low bits.
         var gradMag = new Tensor<T>(magnitude._shape);
         var gradMagData = gradMag.GetDataArray();
-        for (int b = 0; b < batchSize; b++)
+        int rows = batchSize * numFreqs;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * numFrames * nMels, row =>
         {
+            int b = row / numFreqs;
+            int f = row - b * numFreqs;
             int magOffset = b * numFreqs * numFrames;
             int melOffset = b * nMels * numFrames;
-            for (int f = 0; f < numFreqs; f++)
-            {
-                for (int t = 0; t < numFrames; t++)
-                {
-                    double acc = 0.0;
-                    for (int m = 0; m < nMels; m++)
-                        acc += gMel[melOffset + m * numFrames + t]
-                             * numOps.ToDouble(filterData[m * numFreqs + f]);
 
-                    double mag = numOps.ToDouble(magData[magOffset + f * numFrames + t]);
-                    gradMagData[magOffset + f * numFrames + t] = numOps.FromDouble(acc * 2.0 * mag);
-                }
+            for (int t = 0; t < numFrames; t++)
+            {
+                double acc = 0.0;
+                for (int m = 0; m < nMels; m++)
+                    acc += gMel[melOffset + m * numFrames + t]
+                         * numOps.ToDouble(filterData[m * numFreqs + f]);
+
+                double mag = numOps.ToDouble(magData[magOffset + f * numFrames + t]);
+                gradMagData[magOffset + f * numFrames + t] = numOps.FromDouble(acc * 2.0 * mag);
             }
-        }
+        });
 
         // Stage 3: magnitude gradient back onto the waveform.
         var result = MagnitudeStftAdjoint(gradMag, phase, nFft, hopLength, window, origLength, waveform._shape);
