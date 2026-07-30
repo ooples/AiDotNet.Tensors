@@ -74,15 +74,10 @@ jobs:
         AIDOTNET_OPPARITY_REPORT_DIR: ${{ runner.temp }}/opparity
       run: |
         # Scope: the suites that actually run a DirectGpuTensorEngine against the CPU oracle.
-        #
-        # EXCLUSION — LstmSequenceBackward: its OpenCL BPTT kernel is a known-incomplete
-        # implementation (C#/kernel arg-order mismatch, missing recurrent weight-gradient
-        # terms, and a non-atomic gradHInit accumulation race). Its rewrite is tracked
-        # separately; the LSTM *forward* parity is fixed and runs here. Remove this
-        # `!~LstmSequenceBackward` clause when the backward rewrite lands so the gate covers it.
+        # LSTM forward AND backward are both fixed and covered here -- no ops are excluded.
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
           --configuration Release --no-build --framework net10.0 \
-          --filter "(FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.OpParity|FullyQualifiedName~GpuParity|FullyQualifiedName~TapeGradientParity)&FullyQualifiedName!~LstmSequenceBackward&Category!=Benchmark&Category!=Performance" \
+          --filter "(FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.OpParity|FullyQualifiedName~GpuParity|FullyQualifiedName~TapeGradientParity)&Category!=Benchmark&Category!=Performance" \
           --blame-hang --blame-hang-timeout 600s --blame-crash
 
     - name: Upload parity divergence report
