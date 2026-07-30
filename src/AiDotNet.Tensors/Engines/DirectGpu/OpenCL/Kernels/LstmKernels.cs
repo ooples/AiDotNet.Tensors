@@ -166,8 +166,11 @@ __kernel void lstm_forward_sequence(
             float sumG = biasIh[2 * hiddenSize + h] + biasHh[2 * hiddenSize + h];
             float sumO = biasIh[3 * hiddenSize + h] + biasHh[3 * hiddenSize + h];
 
-            // Input contribution at this timestep
-            int inputOffset = t * batch * inputSize + b * inputSize;
+            // Input contribution at this timestep. The engine feeds the input in its native
+            // [batch, seq, in] (batch-major) layout — element (b, t) is at (b*seqLen + t) — so the
+            // offset must be batch-major too. It was seq-major (t*batch + b), which reads the wrong
+            // element whenever batch != seq and grossly corrupted the forward output.
+            int inputOffset = (b * seqLen + t) * inputSize;
             for (int j = 0; j < inputSize; j++) {
                 float inVal = input[inputOffset + j];
                 sumI += inVal * weightsIh[h * inputSize + j];
@@ -197,8 +200,11 @@ __kernel void lstm_forward_sequence(
             // Hidden state update
             float newH = o * tanh(newC);
 
-            // Store output
-            int outIdx = t * batch * hiddenSize + gid;
+            // Store output in the engine's native [batch, seq, hidden] (batch-major) layout —
+            // element (b, t, h) at (b*seqLen + t)*hidden + h — matching how the C# side reads bufOut
+            // as [B, S, Hd] with no permute. The previous seq-major index (t*batch + b) transposed
+            // the sequence whenever batch != seq.
+            int outIdx = (b * seqLen + t) * hiddenSize + h;
             output[outIdx] = newH;
 
             // Store all states for backward pass
