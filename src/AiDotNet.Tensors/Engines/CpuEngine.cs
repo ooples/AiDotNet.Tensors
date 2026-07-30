@@ -40077,6 +40077,24 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
         var windowSumData = windowSum.GetDataArray();
 
+        // ZERO the accumulators. Both are overlap-ADD targets (resultData[idx] += ...,
+        // windowSumData[idx] += ...), but AutoTensorCache.RentOrAllocate hands back POOLED memory
+        // whose contents are arbitrary — it does not zero-fill, precisely so callers that fully
+        // overwrite their output pay nothing. An accumulator is not such a caller.
+        //
+        // Reading a recycled buffer that happened to contain NaN (or any stale float) poisoned the
+        // whole reconstruction: ISTFT(STFT(x)) returned RMS NaN for a clean sine whose STFT magnitude
+        // had RMS 6.89. The window-sum guard below (winSumD > 1e-8) does not help — a NaN windowSum
+        // fails that comparison, so the already-poisoned sample is simply left unnormalised.
+        //
+        // This was latent until the explicit-length fix earlier in this branch: ISTFT used to subtract
+        // nFft from a caller-requested length, returning a shorter span that happened to avoid the
+        // stale region often enough to look correct. It is what made TimeStretch appear "silent" (a
+        // NaN output has no detectable dominant frequency) and made the pitch test flaky run to run,
+        // since the reading depended on whatever the pool last held.
+        System.Array.Clear(resultData, 0, resultData.Length);
+        System.Array.Clear(windowSumData, 0, windowSumData.Length);
+
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
         for (int batchIdx = 0; batchIdx < batchSize; batchIdx++)
