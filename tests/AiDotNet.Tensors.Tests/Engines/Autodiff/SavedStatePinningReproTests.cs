@@ -1,5 +1,7 @@
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -24,6 +26,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// gradient is unaffected by a reissue attempt, and the pins are fully released afterward (no
 /// leak). The pre-fix behavior was the opposite on every count.
 /// </summary>
+[Collection("GradientTapeLeakTests")]
 public class SavedStatePinningReproTests
 {
     private static Tensor<float> Fixed(int[] shape, float start, float step)
@@ -45,6 +48,25 @@ public class SavedStatePinningReproTests
         var a = new float[t.Length];
         for (int i = 0; i < t.Length; i++) a[i] = t.GetFlat(i);
         return a;
+    }
+
+    private static void PassThroughBackward(
+        Tensor<float> gradOutput,
+        Tensor<float>[] inputs,
+        Tensor<float> output,
+        object[] savedState,
+        IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+    }
+
+    private static void AssertReleasedAndPoolable(Tensor<float> saved, string route)
+    {
+        Assert.False(saved._pinnedByTape, $"{route} leaked a saved-state pin");
+        TensorPool<float>.Return(saved);
+        var rerented = TensorPool<float>.Rent(ShapeOf(saved));
+        Assert.Same(saved, rerented);
     }
 
     /// <summary>
@@ -197,5 +219,275 @@ public class SavedStatePinningReproTests
         var clean = RunGradient(attemptReissue: false);
         var afterAttempt = RunGradient(attemptReissue: true);
         Assert.Equal(clean, afterAttempt);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void BoundedTape_RejectedRecorder_DoesNotCreateNodeOrPins(int arity)
+    {
+        TensorPool<float>.Clear();
+        using var tape = new GradientTape<float>(new GradientTapeOptions
+        {
+            Persistent = false,
+            MaxEntries = 1
+        });
+
+        var acceptedInput = Fixed(new[] { 2 }, 1f, 1f);
+        var acceptedOutput = Fixed(new[] { 2 }, 2f, 1f);
+        var acceptedSaved = Fixed(new[] { 2 }, 3f, 1f);
+        DifferentiableOps.RecordUnary(
+            "Accepted", acceptedOutput, acceptedInput, PassThroughBackward,
+            new object[] { acceptedSaved });
+        Assert.Equal(1, tape.EntryCount);
+        Assert.True(acceptedSaved._pinnedByTape);
+
+        var rejectedOutput = Fixed(new[] { 2 }, 4f, 1f);
+        var rejectedSaved = Fixed(new[] { 2 }, 5f, 1f);
+        var rejectedInputs = Enumerable.Range(0, arity)
+            .Select(i => Fixed(new[] { 2 }, 10f + i, 1f))
+            .ToArray();
+
+        if (arity == 1)
+        {
+            DifferentiableOps.RecordUnary(
+                "RejectedUnary", rejectedOutput, rejectedInputs[0], PassThroughBackward,
+                new object[] { rejectedSaved });
+        }
+        else if (arity == 2)
+        {
+            DifferentiableOps.RecordBinary(
+                "RejectedBinary", rejectedOutput, rejectedInputs[0], rejectedInputs[1],
+                PassThroughBackward, new object[] { rejectedSaved });
+        }
+        else
+        {
+            DifferentiableOps.RecordIfActive(
+                "RejectedVariadic", rejectedOutput, rejectedInputs, PassThroughBackward,
+                new object[] { rejectedSaved });
+        }
+
+        Assert.Equal(1, tape.EntryCount);
+        Assert.Null(rejectedOutput.GradFn);
+        Assert.False(rejectedSaved._pinnedByTape);
+        Assert.All(rejectedInputs, input => Assert.False(input._pinnedByTape));
+    }
+
+    [Fact]
+    public void ManualTapeEntry_SavedState_IsPinnedAndReleased()
+    {
+        TensorPool<float>.Clear();
+        var engine = new CpuEngine();
+        var input = Fixed(new[] { 2 }, 1f, 1f);
+        var output = Fixed(new[] { 2 }, 3f, 1f);
+        var saved = Fixed(new[] { 2 }, 5f, 1f);
+
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        tape.Record(new TapeEntry<float>
+        {
+            OperationName = "ManualSavedState",
+            Output = output,
+            Input0 = input,
+            InputCount = 1,
+            Backward = PassThroughBackward,
+            SavedState = new object[] { saved }
+        });
+
+        Assert.True(saved._pinnedByTape);
+        Assert.NotNull(output.GradFn);
+        var loss = engine.ReduceSum(output, null);
+        var grads = tape.ComputeGradients(loss, new[] { input });
+        Assert.True(grads.ContainsKey(input));
+        AssertReleasedAndPoolable(saved, "manual TapeEntry cleanup");
+    }
+
+    [Fact]
+    public void StandardTapeWalk_ReleasesSavedStateForExecutedAndDeadEntries()
+    {
+        TensorPool<float>.Clear();
+        var engine = new CpuEngine();
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        tape.DetectAnomaly = true; // Forces the standard tape walk instead of the GradFn fast path.
+
+        var deadInput = Fixed(new[] { 2, 8 }, 0.2f, 0.03f);
+        var deadGamma = Fixed(new[] { 8 }, 1f, 0.01f);
+        _ = engine.RMSNorm(deadInput, deadGamma, 1e-5, out var deadRms);
+
+        var input = Fixed(new[] { 2, 8 }, 0.3f, 0.11f);
+        var gamma = Fixed(new[] { 8 }, 1f, 0.05f);
+        var output = engine.RMSNorm(input, gamma, 1e-5, out var liveRms);
+        var loss = engine.ReduceSum(output, null);
+        tape.ComputeGradients(loss, new[] { input });
+
+        Assert.False(liveRms._pinnedByTape);
+        AssertReleasedAndPoolable(deadRms, "standard tape-walk dead-entry cleanup");
+    }
+
+    [Fact]
+    public void CompiledBackward_ReleasesSavedStateForExecutedAndEliminatedEntries()
+    {
+        TensorPool<float>.Clear();
+        TensorCodecOptions.SetCurrent(new TensorCodecOptions { EnableAlgebraicBackward = false });
+        try
+        {
+            var engine = new CpuEngine();
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+
+            var deadInput = Fixed(new[] { 2, 8 }, 0.2f, 0.03f);
+            var deadGamma = Fixed(new[] { 8 }, 1f, 0.01f);
+            _ = engine.RMSNorm(deadInput, deadGamma, 1e-5, out var deadRms);
+
+            var input = Fixed(new[] { 2, 8 }, 0.3f, 0.11f);
+            var gamma = Fixed(new[] { 8 }, 1f, 0.05f);
+            var output = engine.RMSNorm(input, gamma, 1e-5, out var liveRms);
+            var loss = engine.ReduceSum(output, null);
+            var compiled = tape.CompileBackward(loss, new[] { input, gamma });
+
+            Assert.True(compiled.EliminatedEntryCount > 0);
+            var grads = compiled.Execute();
+            Assert.True(grads.ContainsKey(input));
+            Assert.False(liveRms._pinnedByTape);
+            AssertReleasedAndPoolable(deadRms, "compiled eliminated-entry cleanup");
+        }
+        finally
+        {
+            TensorCodecOptions.SetCurrent(null);
+        }
+    }
+
+    [Fact]
+    public void AlgebraicOptimizedBackward_ReleasesAllSavedStatePins()
+    {
+        TensorPool<float>.Clear();
+        TensorCodecOptions.SetCurrent(new TensorCodecOptions { EnableAlgebraicBackward = true });
+        try
+        {
+            var engine = new CpuEngine();
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+            var input = Fixed(new[] { 2, 4 }, 0.3f, 0.11f);
+            var w1 = Fixed(new[] { 4, 4 }, 0.2f, 0.03f);
+            var w2 = Fixed(new[] { 4, 4 }, 0.4f, 0.02f);
+            var gamma = Fixed(new[] { 4 }, 1f, 0.05f);
+            var hidden = engine.TensorMatMul(input, w1);
+            var projected = engine.TensorMatMul(hidden, w2);
+            var output = engine.RMSNorm(projected, gamma, 1e-5, out var rms);
+            var loss = engine.ReduceSum(output, null);
+            var compiled = tape.CompileBackward(loss, new[] { input, w1, w2, gamma });
+
+            var grads = compiled.Execute(); // Two reachable MatMuls force OptimizedBackwardPlan.
+            Assert.True(grads.ContainsKey(input));
+            AssertReleasedAndPoolable(rms, "algebraic optimized backward cleanup");
+        }
+        finally
+        {
+            TensorCodecOptions.SetCurrent(null);
+        }
+    }
+
+    [Fact]
+    public void PersistentReplay_ReleasesEntryOnce_WithoutStealingAnotherTapePin()
+    {
+        TensorPool<float>.Clear();
+        var engine = new CpuEngine();
+        var input = Fixed(new[] { 2, 8 }, 0.3f, 0.11f);
+        var gamma = Fixed(new[] { 8 }, 1f, 0.05f);
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+        var output = engine.RMSNorm(input, gamma, 1e-5, out var rms);
+        var loss = engine.ReduceSum(output, null);
+
+        var first = tape.ComputeGradients(loss, new[] { input });
+        Assert.False(rms._pinnedByTape);
+
+        using (var otherTape = new GradientTape<float>(new GradientTapeOptions { Persistent = false }))
+        {
+            otherTape.Record(new TapeEntry<float>
+            {
+                OperationName = "OtherTapeOwner",
+                Output = Fixed(new[] { 2 }, 7f, 1f),
+                Input0 = Fixed(new[] { 2 }, 9f, 1f),
+                InputCount = 1,
+                Backward = PassThroughBackward,
+                SavedState = new object[] { rms }
+            });
+            Assert.True(rms._pinnedByTape);
+
+            var second = tape.ComputeGradients(loss, new[] { input });
+            Assert.Equal(Flat(first[input]), Flat(second[input]));
+            Assert.True(rms._pinnedByTape,
+                "persistent replay released the same entry twice and consumed another tape's pin");
+        }
+
+        Assert.False(rms._pinnedByTape);
+    }
+
+    [Fact]
+    public void CachedReplay_ReleasesSavedStateAndKeepsGradientsStable()
+    {
+        TensorPool<float>.Clear();
+        RebindablePlanCache<float>.ResetForTests();
+
+        (float[] Gradient, Tensor<float> Saved) Run(bool expectCachedSignature)
+        {
+            var engine = new CpuEngine();
+            var input = Fixed(new[] { 2, 8 }, 0.3f, 0.11f);
+            var gamma = Fixed(new[] { 8 }, 1f, 0.05f);
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+            var output = engine.RMSNorm(input, gamma, 1e-5, out var rms);
+            var loss = engine.ReduceSum(output, null);
+
+            if (expectCachedSignature)
+            {
+                long hash = AutoTrainingCompiler.ComputeStructureHash(tape.Entries, tape.EntryCount);
+                Assert.True(RebindablePlanCache<float>.TrySignature(hash, tape.EntryCount));
+            }
+
+            var grads = tape.ComputeGradients(loss, new[] { input });
+            Assert.False(rms._pinnedByTape);
+            return (Flat(grads[input]), rms);
+        }
+
+        var first = Run(expectCachedSignature: false);
+        Assert.False(RebindablePlanCache<float>.IsEmpty);
+        var replay = Run(expectCachedSignature: true);
+
+        Assert.Equal(first.Gradient, replay.Gradient);
+        AssertReleasedAndPoolable(replay.Saved, "rebindable cached replay cleanup");
+    }
+
+    [Fact]
+    public void StreamingBackward_ReleasesSavedStateForExecutedAndDeadEntries()
+    {
+        TensorPool<float>.Clear();
+        bool previousReleaseSetting = GradientTape<float>.ReleaseStreamingActivations;
+        GradientTape<float>.ReleaseStreamingActivations = true;
+        try
+        {
+            var engine = new CpuEngine();
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+            var deadInput = Fixed(new[] { 2, 8 }, 0.2f, 0.03f);
+            var deadGamma = Fixed(new[] { 8 }, 1f, 0.01f);
+            _ = engine.RMSNorm(deadInput, deadGamma, 1e-5, out var deadRms);
+
+            var input = Fixed(new[] { 2, 8 }, 0.3f, 0.11f);
+            var gamma = Fixed(new[] { 8 }, 1f, 0.05f);
+            var output = engine.RMSNorm(input, gamma, 1e-5, out var liveRms);
+            var loss = engine.ReduceSum(output, null);
+            bool emitted = false;
+            tape.ComputeGradientsStreaming(loss, new[] { input }, (source, gradient) =>
+            {
+                emitted = true;
+                Assert.Same(input, source);
+                Assert.Equal(input.Length, gradient.Length);
+            });
+
+            Assert.True(emitted);
+            Assert.False(liveRms._pinnedByTape);
+            AssertReleasedAndPoolable(deadRms, "streaming dead-entry cleanup");
+        }
+        finally
+        {
+            GradientTape<float>.ReleaseStreamingActivations = previousReleaseSetting;
+        }
     }
 }

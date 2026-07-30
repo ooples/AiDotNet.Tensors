@@ -217,7 +217,8 @@ internal static class DifferentiableOps
         // is populated as a fallback. The compiled backward is used at ComputeGradients time
         // (see GradientTape.ComputeGradients), not here.
 
-        ref var slot = ref tape.RecordSlot();
+        ref var slot = ref tape.RecordSlot(out bool accepted);
+        if (!accepted) return;
         slot.OperationName = opName;
         slot.Output = output;
         slot.Backward = backward;
@@ -283,7 +284,7 @@ internal static class DifferentiableOps
         // tensors recycled before the backward walk consumes them.
         for (int i = 0; i < inputs.Length; i++)
             inputs[i]._pinnedByTape = true;
-        PinSavedStateTensors<T>(savedState);
+        PinSavedStateTensors<T>(ref slot);
     }
 
     /// <summary>
@@ -302,7 +303,8 @@ internal static class DifferentiableOps
         if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
-        ref var slot = ref tape.RecordSlot();
+        ref var slot = ref tape.RecordSlot(out bool accepted);
+        if (!accepted) return;
         slot.OperationName = opName;
         slot.Output = output;
         slot.Backward = backward;
@@ -328,7 +330,7 @@ internal static class DifferentiableOps
         // produced and may be safely pooled if the consumer drops it before
         // backward runs.
         input._pinnedByTape = true;
-        PinSavedStateTensors<T>(savedState);
+        PinSavedStateTensors<T>(ref slot);
     }
 
     /// <summary>
@@ -347,7 +349,8 @@ internal static class DifferentiableOps
         if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
-        ref var slot = ref tape.RecordSlot();
+        ref var slot = ref tape.RecordSlot(out bool accepted);
+        if (!accepted) return;
         slot.OperationName = opName;
         slot.Output = output;
         slot.Backward = backward;
@@ -373,12 +376,12 @@ internal static class DifferentiableOps
         // inputs since the binary backward consumes both.
         a._pinnedByTape = true;
         b._pinnedByTape = true;
-        PinSavedStateTensors<T>(savedState);
+        PinSavedStateTensors<T>(ref slot);
     }
 
     /// <summary>
     /// Issue #338 completion: pins every <see cref="Tensor{T}"/> stored in a recorded op's
-    /// <paramref name="savedState"/> against pool/arena reuse, exactly as Record* pins the op's
+    /// saved state against pool/arena reuse, exactly as Record* pins the op's
     /// inputs. Many backward functions read tensors OUT of savedState rather than from the op's
     /// inputs — LayerNorm/BatchNorm/RMSNorm mean/variance/rms, attention weights and softmax
     /// stats, dropout masks, RoPE cos/sin, fused pre-activations. Those buffers are live for the
@@ -386,32 +389,44 @@ internal static class DifferentiableOps
     /// same-shape allocation could reissue and overwrite one before its backward consumed it,
     /// silently corrupting the gradient (the failure <c>SavedStatePinningReproTests</c> and the
     /// consumer's <c>Gru_ArenaOnEqualsOff</c> surface). Non-tensor entries (epsilon, axes, flags)
-    /// are skipped. Near-free no-op when <paramref name="savedState"/> is null — the common case
+    /// are skipped. Near-free no-op when the saved state is null — the common case
     /// for elementwise ops that need no captured state.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void PinSavedStateTensors<T>(object[]? savedState)
+    internal static void PinSavedStateTensors<T>(ref TapeEntry<T> entry)
     {
+        if (entry.SavedStatePinsHeld) return;
+        var savedState = entry.SavedState;
         if (savedState is null) return;
+        bool pinnedAny = false;
         for (int i = 0; i < savedState.Length; i++)
             if (savedState[i] is Tensor<T> saved)
+            {
                 saved._pinnedByTape = true; // ref-counted increment (see TensorBase._pinnedByTape)
+                pinnedAny = true;
+            }
+        entry.SavedStatePinsHeld = pinnedAny;
     }
 
     /// <summary>
-    /// Reverses <see cref="PinSavedStateTensors{T}"/>. Called from every backward-cleanup walk
-    /// that clears the input pins, so each record-time savedState pin nets to exactly one
-    /// decrement. The pin refcount clamps at zero (see TensorBase), so a savedState tensor that is
-    /// ALSO an input (double-pinned) stays balanced, and a harmless re-visit from an overlapping
-    /// cleanup walk is absorbed rather than under-flowing an unrelated tape's pin.
+    /// Reverses <see cref="PinSavedStateTensors{T}"/> exactly once for a recorded entry.
+    /// The entry-owned lifecycle bit prevents a persistent/cached second cleanup from consuming
+    /// a pin owned by another tape that happens to reference the same tensor.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void UnpinSavedStateTensors<T>(object[]? savedState)
+    internal static void UnpinSavedStateTensors<T>(ref TapeEntry<T> entry)
     {
-        if (savedState is null) return;
+        if (!entry.SavedStatePinsHeld) return;
+        var savedState = entry.SavedState;
+        if (savedState is null)
+        {
+            entry.SavedStatePinsHeld = false;
+            return;
+        }
         for (int i = 0; i < savedState.Length; i++)
             if (savedState[i] is Tensor<T> saved)
                 saved._pinnedByTape = false; // ref-counted decrement, clamped at zero
+        entry.SavedStatePinsHeld = false;
     }
 
     /// <summary>
