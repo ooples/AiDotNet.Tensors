@@ -64,6 +64,13 @@ public struct TapeEntry<T>
     /// <summary>Optional extra state saved during the forward pass (e.g., dropout mask, max indices).</summary>
     public object[]? SavedState;
 
+    /// <summary>
+    /// Whether this entry currently owns the tape pins acquired for tensor values in
+    /// <see cref="SavedState"/>. Cleanup paths use this bit to release each recorded
+    /// entry exactly once, including dead entries and persistent/cached replays.
+    /// </summary>
+    internal bool SavedStatePinsHeld;
+
     /// <summary>Name of the operation (for debugging and profiling).</summary>
     public string OperationName;
 
