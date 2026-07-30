@@ -3038,6 +3038,57 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// IndexPut backward: advanced multi-axis indexing, <c>tensor[i0, i1, …] = source</c> (or
+    /// <c>+=</c> when accumulating).
+    /// </summary>
+    /// <remarks>
+    /// The forward's resolved flat positions are saved, so this does not re-derive strides. The two
+    /// modes differ fundamentally: ACCUMULATE adds to the existing value, so the destination keeps its
+    /// full gradient everywhere; OVERWRITE replaces it, so written positions lose theirs — and among
+    /// duplicate writes to one position only the LAST survives, exactly as in
+    /// <see cref="PutBackward"/>.
+    /// </remarks>
+    internal static void IndexPutBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        RequireSavedState(nameof(IndexPutBackward), savedState, 2);
+        var positions = savedState[0] as int[]
+            ?? throw new ArgumentException(
+                $"{nameof(IndexPutBackward)}: savedState[0] (positions) must be an int[].", nameof(savedState));
+        bool accumulate = SavedBool(nameof(IndexPutBackward), savedState, 1, "accumulate");
+
+        var tensor = inputs[0];
+        var source = inputs[1];
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
+        for (int i = 0; i < gradOutput.Length; i++) gradTensor[i] = gradOutput[i];
+        var gradSource = TensorPool<T>.RentZeroed(source._shape);
+
+        if (accumulate)
+        {
+            // output = tensor + (scattered source): both keep the full gradient.
+            for (int i = 0; i < positions.Length; i++)
+                gradSource[i] = gradOutput[positions[i]];
+        }
+        else
+        {
+            var winner = new Dictionary<int, int>(positions.Length);
+            for (int i = 0; i < positions.Length; i++) winner[positions[i]] = i;
+            for (int i = 0; i < positions.Length; i++)
+            {
+                int pos = positions[i];
+                gradTensor[pos] = numOps.Zero;
+                gradSource[i] = winner[pos] == i ? gradOutput[pos] : numOps.Zero;
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
+        DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
+    }
+
+    /// <summary>
     /// Put backward: flat-indexed overwrite, <c>tensor[indices] = source</c>.
     /// </summary>
     /// <remarks>

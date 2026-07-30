@@ -246,10 +246,12 @@ public class DifferentiableOpsGradCheckSweep
 
         // --- gather / scatter / index: the index tensor must stay in range for its axis ---
         ["Gather"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), 1],
-        ["Scatter"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), SafeTensor([2, 2], r), 1],
-        ["ScatterAdd|T,Ti,T,int"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 2], 3, r), SafeTensor([2, 2], r), 1],
+        // Scatter / ScatterAdd's index+value form wants indices and values shaped like the DESTINATION,
+        // not a smaller slice — a [2,2] index grid against a [2,3] target indexed out of range.
+        ["Scatter"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 3], 3, r), SafeTensor([2, 3], r), 1],
+        ["ScatterAdd|T,Ti,T,int"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 3], 3, r), SafeTensor([2, 3], r), 1],
         // Segment-style scatter family: source rows are grouped by indices along dim.
-        ["ScatterAdd|T,Ti,int,Nullable`1"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
+        ["ScatterAdd|T,Ti,int,int?"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
         ["ScatterSoftmax"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
         ["ScatterMax"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), null!, 0, 3],
         ["ScatterMean"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), null!, 0, 3],
@@ -267,9 +269,70 @@ public class DifferentiableOpsGradCheckSweep
 
         // --- masked ops. Three TensorMaskedFill overloads share arity 3 and differ only in the
         //     mask type, so all three are keyed by fingerprint. ---
-        ["TensorMaskedFill|T,BooleanTensor`1,Double"] = r => [SafeTensor([2, 3], r), BoolMask([2, 3]), 0.25],
-        ["TensorMaskedFill|T,Tensor`1,Double"] = r => [SafeTensor([2, 3], r), BitMask([2, 3]), 0.25],
-        ["TensorMaskedFill|T,Boolean[],Double"] = r => [SafeTensor([2, 3], r), new[] { true, false, true, false, true, false }, 0.25],
+        ["TensorMaskedFill|T,Tb,double"] = r => [SafeTensor([2, 3], r), BoolMask([2, 3]), 0.25],
+        ["TensorMaskedFill|T,TBit,double"] = r => [SafeTensor([2, 3], r), BitMask([2, 3]), 0.25],
+        ["TensorMaskedFill|T,bool[],double"] = r => [SafeTensor([2, 3], r), AltBools(6), 0.25],
+
+        // --- TensorWhere: the MASK is the leading parameter, so all four overloads differ in slot 0 ---
+        ["TensorWhere|Tb,T,T"] = r => [BoolMask([2, 3]), SafeTensor([2, 3], r), SafeTensor([2, 3], r)],
+        ["TensorWhere|TBit,T,T"] = r => [BitMask([2, 3]), SafeTensor([2, 3], r), SafeTensor([2, 3], r)],
+        ["TensorWhere|bool[],T,T"] = r => [AltBools(6), SafeTensor([2, 3], r), SafeTensor([2, 3], r)],
+
+        // --- pooling variants returning indices. The index buffer is an `out` parameter, so it only
+        //     needs a slot; MaxPool2DWithIndices' is a 5-DIMENSIONAL int array that no heuristic
+        //     could ever synthesize. ---
+        ["MaxPool2DWithIndices"] = r => [SafeTensor([1, 2, 4, 4], r), new[] { 2, 2 }, new[] { 2, 2 }, null!],
+        ["MaxPool2DWithTensorIndices"] = r => [SafeTensor([1, 2, 4, 4], r), new[] { 2, 2 }, new[] { 2, 2 }, null!],
+        ["MaxPool3DWithIndices"] = r => [SafeTensor([1, 2, 4, 4, 4], r), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, null!],
+        ["MaxPool3DWithTensorIndices"] = r => [SafeTensor([1, 2, 4, 4, 4], r), new[] { 2, 2, 2 }, new[] { 2, 2, 2 }, null!],
+
+        // --- GridSample's mode/padding overload ---
+        ["GridSample|T,T,GridSampleMode,GridSamplePadding,bool"] = r =>
+            [SafeTensor([1, 2, 4, 4], r), SafeTensor([1, 3, 3, 2], r),
+             GridSampleMode.Bilinear, GridSamplePadding.Zeros, false],
+
+        // --- fused linear cross-entropy: one overload takes class INDICES, the other a float
+        //     target distribution over classes ---
+        ["FusedLinearCrossEntropyWithLogits|T,T,T,Ti"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r),
+                                                               SafeTensor([4], r), IdxTensor([2], 4, r)],
+        ["FusedLinearCrossEntropyWithLogits|T,T,T,T"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r),
+                                                              SafeTensor([4], r), RowNormalized([2, 4], r)],
+
+        // --- ops whose shapes are dictated by their own validation ---
+        // Octonions: input [B, F, 8] and weight [O, F, 8] — rank-3 with last dim 8 and matching F.
+        ["OctonionMatMulTensor"] = r => [SafeTensor([1, 2, 8], r), SafeTensor([3, 2, 8], r)],
+        // Locally-connected: rank-6 weights [outC, outH, outW, inC, kh, kw]; 4x4 input with a 3x3
+        // kernel at stride 1 gives outH = outW = 2.
+        ["LocallyConnectedConv2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([3, 2, 2, 2, 3, 3], r),
+                                           null!, new[] { 1, 1 }],
+        // Trilinear: grid is [D, H, W, C] and positions are [N, 3].
+        ["TensorTrilinearInterpolate"] = r => [SafeTensor([2, 2, 2, 1], r), TrilinearPositions()],
+        // IndexPut takes ONE index tensor PER DIMENSION (indices.Length == rank), so a rank-2 target
+        // needs two, and they jointly address source.Length points.
+        ["TensorIndexPut"] = r => [SafeTensor([3, 2], r), new[] { IdxRange(2), IdxRange(2) },
+                                   SafeTensor([2], r), false],
+
+        // --- fused sequence-scan kernels: rank-3 [batch, seqLen, modelDim] with per-head gates
+        //     shaped [batch, seqLen, numHeads]; modelDim must divide by numHeads ---
+        ["Rwkv4WkvForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                    SafeTensor([4], r), SafeTensor([4], r)],
+        ["Rwkv7SequenceForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                         SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
+        ["GlaScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                   SafeTensor([1, 3, 2], r), 2],
+        ["GatedDeltaNetScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                             SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
+        ["XLstmScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                     SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
+        // RgLru: [batch, seqLen, recDim] with a per-recDim decay vector.
+        ["RgLruScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                     SafeTensor([4], r)],
+        // Mamba S6: x/delta [B, L, innerDim]; aLog [innerDim, stateDim]; b/c [B, L, stateDim];
+        // d [innerDim].
+        ["MambaSelectiveScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([4, 2], r),
+                                              SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([4], r)],
+        ["Mamba2SsdScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([4, 2], r),
+                                         SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([4], r), 2],
         ["TensorMaskedScatter"] = r => [SafeTensor([2, 3], r), BitMask([2, 3]), SafeTensor([2, 3], r)],
         ["TensorMaskedSelect"] = r => [SafeTensor([2, 3], r), BitMask([2, 3])],
 
@@ -435,6 +498,31 @@ public class DifferentiableOpsGradCheckSweep
     {
         var t = new Tensor<Bit>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = i % 2 == 0;   // implicit bool -> Bit
+        return t;
+    }
+
+    /// <summary>Alternating raw bool[] mask, for the overloads taking a plain array.</summary>
+    private static bool[] AltBools(int n)
+    {
+        var m = new bool[n];
+        for (int i = 0; i < n; i++) m[i] = i % 2 == 0;
+        return m;
+    }
+
+    /// <summary>
+    /// Rows that sum to 1 — a valid target DISTRIBUTION for the soft-label cross-entropy overload.
+    /// </summary>
+    private static Tensor<double> RowNormalized(int[] shape, Random rng)
+    {
+        var t = new Tensor<double>(shape);
+        int cols = shape[shape.Length - 1];
+        int rows = t.Length / cols;
+        for (int r0 = 0; r0 < rows; r0++)
+        {
+            double sum = 0;
+            for (int c = 0; c < cols; c++) { t[r0 * cols + c] = 0.1 + rng.NextDouble(); sum += t[r0 * cols + c]; }
+            for (int c = 0; c < cols; c++) t[r0 * cols + c] /= sum;
+        }
         return t;
     }
 

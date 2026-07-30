@@ -37260,6 +37260,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = value;
         }
 
+        // Eager tape registration. This overload recorded for GraphMode and AutoTracer but never
+        // called DifferentiableOps.Record*, so a Bit-masked fill produced NO gradient while the
+        // Tensor<bool> overload above produced one. The mask is converted to bool[] because
+        // MaskedFillBackward handles Tensor<T>, Tensor<bool> and bool[] but not Tensor<Bit> — reusing
+        // the already-tested bool[] branch rather than adding a fourth.
+        {
+            var maskBools = new bool[maskSpan.Length];
+            for (int i = 0; i < maskSpan.Length; i++) maskBools[i] = (bool)maskSpan[i];
+            DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensorOrig,
+                BackwardFunctions<T>.MaskedFillBackward, new object[] { maskBools });
+        }
         { var ct = tensor; var cm = mask; var cv = value; AutoTracer.RecordOp("MaskedFill", result, eng => eng.TensorMaskedFill(ct, cm, cv)); }
         return result;
     }

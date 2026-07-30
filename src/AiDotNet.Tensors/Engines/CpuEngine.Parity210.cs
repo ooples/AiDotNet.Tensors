@@ -2063,6 +2063,9 @@ public partial class CpuEngine
             throw new ArgumentException($"source length {source.Length} must match index length {n}");
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var putIndexTensorOrig = tensor;
+        var putIndexSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -2072,6 +2075,7 @@ public partial class CpuEngine
 
         // Contiguous row-major strides over tensor.Shape.
         var strides = ComputeRowMajorStrides(tensor._shape);
+        var resolvedPositions = new int[n];
         for (int i = 0; i < n; i++)
         {
             int pos = 0;
@@ -2083,8 +2087,18 @@ public partial class CpuEngine
                         $"indices[{k}][{i}]={idx} out of range for axis size {tensor._shape[k]}");
                 pos += idx * strides[k];
             }
+            resolvedPositions[i] = pos;
             dst[pos] = accumulate ? ops.Add(dst[pos], srcData[i]) : srcData[i];
         }
+
+        // Tape registration — this op recorded nothing, so neither the destination nor the scattered
+        // source received a gradient. The RESOLVED flat positions are saved so the backward need not
+        // re-derive strides, and the accumulate flag selects between add (destination keeps its full
+        // gradient) and overwrite (written positions lose it, last write wins).
+        DifferentiableOps.RecordBinary(
+            "TensorIndexPut", result, putIndexTensorOrig, putIndexSourceOrig,
+            BackwardFunctions<T>.IndexPutBackward,
+            savedState: new object[] { resolvedPositions, accumulate });
         return result;
     }
 
