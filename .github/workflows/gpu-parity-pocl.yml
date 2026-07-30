@@ -2,30 +2,28 @@ name: GPU Parity (POCL / CPU-OpenCL)
 
 # Why this lane exists
 # --------------------
-# The CPU-vs-GPU op-parity suites (Engines.OpParity.*, GpuMissingKernelsParityTests,
-# TapeGradientParity, *GpuParityTests) construct a real DirectGpuTensorEngine and compare
-# every op against the trusted CPU oracle. On a GPU-less runner they *skip* — which is why a
-# genuine GPU kernel bug (the LSTM seq-major-vs-batch-major layout defect) shipped in a
-# release: nothing ever executed the kernels in CI.
+# The CPU-vs-GPU op-parity suites construct a real DirectGpuTensorEngine and compare every op
+# against the trusted CPU oracle. On a GPU-less runner they *skip* — which is why a genuine GPU
+# kernel bug (the LSTM seq-major-vs-batch-major layout defect) shipped in a release: nothing ever
+# executed the kernels in CI. POCL (Portable Computing Language) exposes a CPU OpenCL device, so
+# the DirectGpu OpenCL kernels can actually EXECUTE and be parity-checked on a stock ubuntu runner.
+#   * AIDOTNET_OPENCL_ALLOW_CPU=1  — lets the OpenCL backend bind a CPU device as a fallback when no
+#                                    GPU is present (default off; GPU always preferred).
+#   * AIDOTNET_REQUIRE_GPU_TESTS=1 — turns "no GPU device" from a silent Skip into a hard failure.
 #
-# POCL (Portable Computing Language) exposes a CPU OpenCL device, so the DirectGpu OpenCL
-# kernels can actually EXECUTE and be parity-checked on a stock ubuntu runner with no GPU
-# hardware. Two opt-in env flags make the backend use it:
-#   * AIDOTNET_OPENCL_ALLOW_CPU=1  — lets the OpenCL backend bind a CPU device as a fallback
-#                                    when no GPU is present (default off; GPU always preferred,
-#                                    so this changes nothing on real-GPU machines).
-#   * AIDOTNET_REQUIRE_GPU_TESTS=1 — turns "no GPU device" from a silent Skip into a hard
-#                                    failure, so a broken POCL setup fails loudly here instead
-#                                    of quietly skipping the whole gate.
+# SHARDED: a single-process run of the full parity surface exhausts POCL partway through (it
+# JIT-compiles every kernel it touches; after ~150 the OpenCL context is lost and later tests fail
+# "no DirectGpu backend available"). So each parity class group runs as its OWN matrix job — a fresh
+# runner + fresh POCL process per shard, so POCL never accumulates across groups. Only the
+# backend-agnostic OpenCL-routed classes are included; the other GPU backends (Cuda/Hip/Metal/
+# Vulkan/WebGpu) and the GPU-feature-specific OpenCL kernels (FlashDecode/PagedAttention/QuantGemm/
+# RopeGqa) are excluded — POCL can't provide those devices/features, so they'd fail "unavailable".
 #
-# STATUS: informational / experimental, NOT a required check. On GitHub-hosted runners POCL has
-# proven unreliable as a hard gate: (1) a single-process run of the full parity surface exhausts it
-# partway (it JIT-compiles every kernel it touches; after ~150 the OpenCL context is lost), and
-# (2) even a tiny scoped run intermittently fails DirectGpu init outright ("no GPU available"),
-# unreproducibly. So the parity step is `continue-on-error` — it runs and uploads a divergence
-# report for diagnostics, but never blocks. The RELIABLE gate for GPU-vs-CPU parity is real GPU
-# hardware (the LSTM parity passes 234/234 on a local AMD RX 5500 XT); promoting this to required
-# needs either a self-hosted GPU runner or the run sharded across fresh POCL processes.
+# STATUS: informational (continue-on-error), NOT required. POCL has also shown intermittent
+# DirectGpu-init failures on hosted runners that are unreproducible without POCL hardware locally.
+# This runs + uploads a per-shard divergence report but never blocks. Promote a shard to required
+# in branch protection only once it is reliably green here. The fully reliable gate remains real GPU
+# hardware (the LSTM parity passes 234/234 on a local AMD RX 5500 XT).
 
 on:
   push:
@@ -37,9 +35,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: this lane only needs to read the repo to check out + build + test. It never
-# writes to the repo, comments, or touches deployments, so the GITHUB_TOKEN is read-only. This
-# matters most on pull_request runs of fork/untrusted branches.
+# Least privilege: this lane only reads the repo to check out + build + test.
 permissions:
   contents: read
 
@@ -50,12 +46,27 @@ env:
 
 jobs:
   gpu-parity-pocl:
-    # Skip on the release-please Release PR and on the release merge-commit push — the code is
-    # identical to the feature PRs that already ran this gate (mirrors build.yml). A job skipped
-    # via an `if:` conditional reports SUCCESS to branch protection, so a future required check
-    # is still satisfied on the Release PR.
+    # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
     if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each entry is a --filter fragment run in its OWN job/runner (fresh POCL). Keep each group
+        # small enough to stay under POCL's per-process kernel-compile ceiling; split further if a
+        # group still exhausts. `name` is only for a readable job label.
+        include:
+          - name: lstm
+            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence"
+          - name: missing-kernels
+            filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence"
+          - name: op-forward
+            filter: "FullyQualifiedName~Engines.OpParity.OpParityTests"
+          - name: tape-gradient
+            filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests"
+          - name: scan-kernels
+            filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests"
+    name: gpu-parity-pocl (${{ matrix.name }})
     steps:
     - uses: actions/checkout@v4
 
@@ -68,56 +79,30 @@ jobs:
     - name: Install POCL (CPU OpenCL device) + ICD loader
       run: |
         sudo apt-get update
-        # ocl-icd-opencl-dev provides libOpenCL.so (the ICD loader + unversioned symlink that
-        # [DllImport("OpenCL")] resolves to); pocl-opencl-icd registers a CPU device under
-        # /etc/OpenCL/vendors/pocl.icd; clinfo lets us confirm discovery in the log.
         sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd clinfo
-        echo "=== clinfo: OpenCL platforms/devices visible to the ICD loader ==="
-        clinfo || echo "::warning::clinfo failed — POCL may not be registered; the parity step will fail loudly (AIDOTNET_REQUIRE_GPU_TESTS=1)."
+        echo "=== clinfo: OpenCL platforms/devices ==="
+        clinfo || echo "::warning::clinfo failed — POCL may not be registered."
 
     - name: Build tests (net10.0)
       run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
-    - name: Run CPU-vs-GPU parity on the POCL CPU device
-      # Informational only: POCL is unreliable as a hard gate on hosted runners (see the header).
-      # This step runs the parity + uploads a divergence report, but does not block the PR.
+    - name: Run CPU-vs-GPU parity on POCL (shard ${{ matrix.name }})
+      # Informational only: POCL is not yet reliable as a hard gate on hosted runners (see header).
       continue-on-error: true
       env:
         AIDOTNET_OPENCL_ALLOW_CPU: '1'
         AIDOTNET_REQUIRE_GPU_TESTS: '1'
         AIDOTNET_OPPARITY_REPORT_DIR: ${{ runner.temp }}/opparity
       run: |
-        # Scope: the LSTM forward+backward CPU-vs-GPU parity — the exact regression this lane guards
-        # (a GPU LSTM kernel bug that shipped because GPU parity SKIPS on GPU-less CI). These run the
-        # DirectGpuTensorEngine (OpenCL -> POCL here) against the trusted CPU oracle.
-        #
-        # Why not the full parity surface yet: a single-process run of ALL GPU parity classes
-        # exhausts POCL partway through (it JIT-compiles every kernel it touches and the process runs
-        # out of resources after ~150 distinct kernels, after which the OpenCL context goes away and
-        # every later test fails "no DirectGpu backend available" — a POCL process-scale limit, NOT a
-        # parity divergence: the ops that ran matched the CPU oracle). Broadening this gate to the full
-        # surface needs the run sharded across fresh processes so POCL never accumulates past its limit;
-        # tracked as a follow-up. This LSTM-scoped gate compiles only a handful of kernels and stays
-        # well under that limit, so it is reliably green while still catching the class of bug it exists for.
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
           --configuration Release --no-build --framework net10.0 \
-          --filter "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" \
+          --filter "(${{ matrix.filter }})&Category!=Benchmark&Category!=Performance" \
           --blame-hang --blame-hang-timeout 600s --blame-crash
 
     - name: Upload parity divergence report
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: opparity-pocl-report
+        name: opparity-pocl-${{ matrix.name }}
         path: ${{ runner.temp }}/opparity/**
-        if-no-files-found: ignore
-
-    - name: Upload hang/crash dumps
-      uses: actions/upload-artifact@v4
-      if: failure()
-      with:
-        name: pocl-blame-dumps
-        path: |
-          **/*.dmp
-          **/Sequence_*.xml
         if-no-files-found: ignore
