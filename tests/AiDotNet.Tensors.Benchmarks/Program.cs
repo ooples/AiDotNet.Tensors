@@ -1293,6 +1293,7 @@ class Program
         Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
         Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
+        Console.WriteLine("  --kernel-identity: print the four-fingerprint autotune identity per catalog kernel");
         Console.WriteLine("  --kernel-arch-validate: assemble catalog PTX for SM80/86/89/90/100/120");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
