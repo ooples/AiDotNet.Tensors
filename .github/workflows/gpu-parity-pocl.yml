@@ -1,0 +1,104 @@
+name: GPU Parity (POCL / CPU-OpenCL)
+
+# Why this lane exists
+# --------------------
+# The CPU-vs-GPU op-parity suites (Engines.OpParity.*, GpuMissingKernelsParityTests,
+# TapeGradientParity, *GpuParityTests) construct a real DirectGpuTensorEngine and compare
+# every op against the trusted CPU oracle. On a GPU-less runner they *skip* — which is why a
+# genuine GPU kernel bug (the LSTM seq-major-vs-batch-major layout defect) shipped in a
+# release: nothing ever executed the kernels in CI.
+#
+# POCL (Portable Computing Language) exposes a CPU OpenCL device, so the DirectGpu OpenCL
+# kernels can actually EXECUTE and be parity-checked on a stock ubuntu runner with no GPU
+# hardware. Two opt-in env flags make the backend use it:
+#   * AIDOTNET_OPENCL_ALLOW_CPU=1  — lets the OpenCL backend bind a CPU device as a fallback
+#                                    when no GPU is present (default off; GPU always preferred,
+#                                    so this changes nothing on real-GPU machines).
+#   * AIDOTNET_REQUIRE_GPU_TESTS=1 — turns "no GPU device" from a silent Skip into a hard
+#                                    failure, so a broken POCL setup fails loudly here instead
+#                                    of quietly skipping the whole gate.
+#
+# Not yet a required check. Promote it in branch protection only after the first green run
+# confirms POCL compiles + runs the kernel cache in CI; until then it is a live, diagnostic
+# gate whose job status reflects real CPU-vs-GPU divergence.
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  gpu-parity-pocl:
+    # Skip on the release-please Release PR and on the release merge-commit push — the code is
+    # identical to the feature PRs that already ran this gate (mirrors build.yml). A job skipped
+    # via an `if:` conditional reports SUCCESS to branch protection, so a future required check
+    # is still satisfied on the Release PR.
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Install POCL (CPU OpenCL device) + ICD loader
+      run: |
+        sudo apt-get update
+        # ocl-icd-opencl-dev provides libOpenCL.so (the ICD loader + unversioned symlink that
+        # [DllImport("OpenCL")] resolves to); pocl-opencl-icd registers a CPU device under
+        # /etc/OpenCL/vendors/pocl.icd; clinfo lets us confirm discovery in the log.
+        sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd clinfo
+        echo "=== clinfo: OpenCL platforms/devices visible to the ICD loader ==="
+        clinfo || echo "::warning::clinfo failed — POCL may not be registered; the parity step will fail loudly (AIDOTNET_REQUIRE_GPU_TESTS=1)."
+
+    - name: Build tests (net10.0)
+      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+
+    - name: Run CPU-vs-GPU parity on the POCL CPU device
+      env:
+        AIDOTNET_OPENCL_ALLOW_CPU: '1'
+        AIDOTNET_REQUIRE_GPU_TESTS: '1'
+        AIDOTNET_OPPARITY_REPORT_DIR: ${{ runner.temp }}/opparity
+      run: |
+        # Scope: the suites that actually run a DirectGpuTensorEngine against the CPU oracle.
+        #
+        # EXCLUSION — LstmSequenceBackward: its OpenCL BPTT kernel is a known-incomplete
+        # implementation (C#/kernel arg-order mismatch, missing recurrent weight-gradient
+        # terms, and a non-atomic gradHInit accumulation race). Its rewrite is tracked
+        # separately; the LSTM *forward* parity is fixed and runs here. Remove this
+        # `!~LstmSequenceBackward` clause when the backward rewrite lands so the gate covers it.
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "(FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.OpParity|FullyQualifiedName~GpuParity|FullyQualifiedName~TapeGradientParity)&FullyQualifiedName!~LstmSequenceBackward&Category!=Benchmark&Category!=Performance" \
+          --blame-hang --blame-hang-timeout 600s --blame-crash
+
+    - name: Upload parity divergence report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: opparity-pocl-report
+        path: ${{ runner.temp }}/opparity/**
+        if-no-files-found: ignore
+
+    - name: Upload hang/crash dumps
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: pocl-blame-dumps
+        path: |
+          **/*.dmp
+          **/Sequence_*.xml
+        if-no-files-found: ignore
