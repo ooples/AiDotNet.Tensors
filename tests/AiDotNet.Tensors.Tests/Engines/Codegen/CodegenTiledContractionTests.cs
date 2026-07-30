@@ -243,6 +243,47 @@ public sealed class CodegenTiledContractionTests
         int scale = ptx.LastIndexOf("mul.rn.f32", System.StringComparison.Ordinal);
         int relu = ptx.LastIndexOf("max.f32", System.StringComparison.Ordinal);
         Assert.True(bias >= 0 && bias < scale && scale < relu);
+        string rowPattern = ", %r7, " + emitter.Plan!.ThreadTileM + ",";
+        Assert.Equal(emitter.Plan.ThreadTileM,
+            ptx.Split('\n').Count(line =>
+                line.Contains("mad.lo.u32", System.StringComparison.Ordinal) &&
+                line.Contains(rowPattern, System.StringComparison.Ordinal)));
+    }
+
+    [SkippableFact]
+    public unsafe void DeepEpilogue_MatchesInterpreterOnDevice()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
+        var spec = CodegenKernelCatalog.Find("conv2d_1x1_deep_epilogue")!.Verify;
+        double[][] inputs = TiledPtxTestHelper.CreateInputs(spec, out float[][] host);
+        double[] expected = spec.Interpret(inputs);
+
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(runtime.ComputeCapabilityMajor >= 8, "cp.async requires sm_80 or later.");
+        using var first = runtime.AllocateBytes((nuint)(host[0].Length * sizeof(float)));
+        using var second = runtime.AllocateBytes((nuint)(host[1].Length * sizeof(float)));
+        using var bias = runtime.AllocateBytes((nuint)(host[2].Length * sizeof(float)));
+        using var scale = runtime.AllocateBytes((nuint)(host[3].Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        first.Upload<float>(host[0]);
+        second.Upload<float>(host[1]);
+        bias.Upload<float>(host[2]);
+        scale.Upload<float>(host[3]);
+
+        var emitter = new PtxTiledContractionEmitter();
+        string ptx = emitter.Emit(
+            spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+        IntPtr function = module.GetFunction(spec.Name, out _);
+        TiledPtxTestHelper.LaunchFive(module, function,
+            first.Pointer, second.Pointer, bias.Pointer, scale.Pointer, output.Pointer,
+            emitter.LaunchBlocks, checked((uint)emitter.LaunchBlockThreads), 1);
+        runtime.Synchronize();
+
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        TiledPtxTestHelper.AssertClose(
+            expected, actual, 2e-4, "deep tiled epilogue verify shape");
     }
 
     /// <summary>The assembled device program agrees with the spec interpreter.</summary>

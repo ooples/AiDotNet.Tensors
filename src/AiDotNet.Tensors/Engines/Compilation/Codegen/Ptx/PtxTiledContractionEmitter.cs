@@ -315,33 +315,35 @@ public sealed class PtxTiledContractionEmitter
     {
         for (int i = 0; i < plan.ThreadTileM; i++)
         {
+            string localM = NextR();
+            L($"mad.lo.u32 {localM}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
+            string? rowBytes = null;
+            if (plan.BiasInput.HasValue || plan.ScaleInput.HasValue)
+            {
+                string globalM = NextR();
+                rowBytes = NextRd();
+                L($"add.u32 {globalM}, %r8, {localM};");
+                L($"mul.wide.u32 {rowBytes}, {globalM}, 4;");
+            }
             string? bias = null;
             if (plan.BiasInput.HasValue)
             {
-                string localM = NextR(), globalM = NextR();
-                string biasBytes = NextRd(), biasAddress = NextRd();
+                string biasAddress = NextRd();
                 bias = NextF();
-                L($"mad.lo.u32 {localM}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
-                L($"add.u32 {globalM}, %r8, {localM};");
-                L($"mul.wide.u32 {biasBytes}, {globalM}, 4;");
-                L($"add.u64 {biasAddress}, %rd4, {biasBytes};");
+                L($"add.u64 {biasAddress}, %rd4, {rowBytes!};");
                 L($"ld.global.f32 {bias}, [{biasAddress}];");
             }
             string? scale = null;
             if (plan.ScaleInput.HasValue)
             {
-                string localM = NextR(), globalM = NextR();
-                string scaleBytes = NextRd(), scaleAddress = NextRd();
+                string scaleAddress = NextRd();
                 scale = NextF();
-                L($"mad.lo.u32 {localM}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
-                L($"add.u32 {globalM}, %r8, {localM};");
-                L($"mul.wide.u32 {scaleBytes}, {globalM}, 4;");
-                L($"add.u64 {scaleAddress}, %rd5, {scaleBytes};");
+                L($"add.u64 {scaleAddress}, %rd5, {rowBytes!};");
                 L($"ld.global.f32 {scale}, [{scaleAddress}];");
             }
             for (int j = 0; j < plan.ThreadTileN; j++)
             {
-                string m = NextR(), n = NextR(), element = NextR();
+                string n = NextR(), element = NextR();
                 string bytes = NextRd(), address = NextRd();
                 if (bias is not null)
                     L($"add.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {bias};");
@@ -349,9 +351,8 @@ public sealed class PtxTiledContractionEmitter
                     L($"mul.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {scale};");
                 if (activation == CodegenActivationKind.ReLU)
                     L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
-                L($"mad.lo.u32 {m}, %r7, {I(plan.ThreadTileM)}, {I(i)};");
                 L($"mad.lo.u32 {n}, %r6, {I(plan.ThreadTileN)}, {I(j)};");
-                L($"mad.lo.u32 {element}, {m}, {I(plan.N)}, %r11;");
+                L($"mad.lo.u32 {element}, {localM}, {I(plan.N)}, %r11;");
                 L($"add.u32 {element}, {element}, {n};");
                 L($"mul.wide.u32 {bytes}, {element}, 4;");
                 L($"add.u64 {address}, %rd2, {bytes};");

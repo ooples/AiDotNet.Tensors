@@ -79,6 +79,21 @@ internal static class TiledPtxTestHelper
         module.Launch(function, blocks, 1, 1, blockX, blockY, 1, 0, arguments);
     }
 
+    internal static unsafe void LaunchFive(
+        DirectPtxModule module, IntPtr function,
+        IntPtr first, IntPtr second, IntPtr third, IntPtr fourth, IntPtr output,
+        uint blocks, uint blockX, uint blockY)
+    {
+        IntPtr p0 = first, p1 = second, p2 = third, p3 = fourth, p4 = output;
+        void** arguments = stackalloc void*[5];
+        arguments[0] = &p0;
+        arguments[1] = &p1;
+        arguments[2] = &p2;
+        arguments[3] = &p3;
+        arguments[4] = &p4;
+        module.Launch(function, blocks, 1, 1, blockX, blockY, 1, 0, arguments);
+    }
+
     internal static CodegenAxis[] CopyAxes(CodegenKernelSpec spec)
     {
         var axes = new CodegenAxis[spec.Space.Axes.Count];
