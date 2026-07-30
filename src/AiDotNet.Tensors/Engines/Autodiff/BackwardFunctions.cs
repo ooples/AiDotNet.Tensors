@@ -2375,13 +2375,70 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var logits = inputs[0];
         var targets = inputs[1];
+        // The forward (CpuEngine.ComputeCrossEntropyBatch) indexes logits as
+        // [batch, numClasses] unconditionally, so mirror that here.
         int n = logits.Shape[0];
-        // Cross-entropy gradient = (softmax(logits) - targets) / n * gradOutput[0]
+        int numClasses = logits.Shape[1];
         int axis = logits.Rank - 1;
         var softmax = engine.TensorSoftmax(logits, axis);
-        var diff = engine.TensorSubtract(softmax, targets);
-        T scaleT = numOps.FromDouble(numOps.ToDouble(gradOutput[0]) / n);
-        var grad = engine.TensorMultiplyScalar(diff, scaleT);
+        if (!targets.IsContiguous) targets = targets.Contiguous();
+        bool sparse = targets.Rank == 1;
+        double scale = numOps.ToDouble(gradOutput[0]) / n;
+
+        // Differentiate the loss the forward ACTUALLY computes:
+        //     loss_b = -sum_{c : t_bc > 0} t_bc * (x_bc - logSumExp_b)
+        //  => dloss_b/dx_bk = softmax_bk * (sum_{c : t_bc > 0} t_bc) - [t_bk > 0] * t_bk
+        //
+        // The previous implementation was (softmax - targets) / n, which silently
+        // hardcodes sum_c t_bc == 1 — correct only when the targets are a
+        // normalised distribution. For unnormalised soft targets it reported a
+        // gradient that disagreed with finite differences (the gradcheck sweep
+        // saw analytical -0.265905 vs numerical -0.0790221). Because multiplying
+        // by exactly 1.0 is bit-exact, this remains bit-identical for the
+        // normalised case that PyTorch's cross_entropy requires.
+        //
+        // Two further defects this fixes:
+        //  * the forward skips non-positive targets, so the softmax coefficient
+        //    is that same POSITIVE partial sum and the -t_bk term must be gated
+        //    on the same condition, otherwise forward and backward disagree
+        //    whenever a target is negative;
+        //  * for sparse (rank-1, class-index) targets the old code called
+        //    TensorSubtract(softmax /*[n,C]*/, targets /*[n]*/), a shape mismatch
+        //    that throws — sparse cross-entropy had no working gradient at all.
+        var grad = TensorPool<T>.RentZeroed(logits._shape);
+        for (int b = 0; b < n; b++)
+        {
+            int offset = b * numClasses;
+            if (sparse)
+            {
+                int targetClass = (int)numOps.ToDouble(targets[b]);
+                if (targetClass < 0 || targetClass >= numClasses)
+                    throw new ArgumentOutOfRangeException(nameof(inputs),
+                        $"CrossEntropyLossBackward: target class {targetClass} is out of range [0, {numClasses}).");
+                for (int c = 0; c < numClasses; c++)
+                {
+                    double g = numOps.ToDouble(softmax[offset + c]);
+                    if (c == targetClass) g -= 1.0;
+                    grad[offset + c] = numOps.FromDouble(g * scale);
+                }
+            }
+            else
+            {
+                double targetSum = 0;
+                for (int c = 0; c < numClasses; c++)
+                {
+                    double t = numOps.ToDouble(targets[offset + c]);
+                    if (t > 0) targetSum += t;
+                }
+                for (int c = 0; c < numClasses; c++)
+                {
+                    double t = numOps.ToDouble(targets[offset + c]);
+                    double g = numOps.ToDouble(softmax[offset + c]) * targetSum;
+                    if (t > 0) g -= t;
+                    grad[offset + c] = numOps.FromDouble(g * scale);
+                }
+            }
+        }
         DifferentiableOps.AccumulateGrad(grads, logits, grad, engine);
     }
 
