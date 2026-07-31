@@ -655,10 +655,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
+        /// Whether a CPU OpenCL device (e.g. POCL, the Intel/AMD CPU runtimes) may stand in
+        /// for a GPU when no GPU device is present. Controlled by
+        /// <c>AIDOTNET_OPENCL_ALLOW_CPU=1</c>; default <see langword="false"/>, so production
+        /// never binds the OpenCL backend to a CPU runtime (which would compile the whole
+        /// kernel cache against the CPU for no benefit). Enabled only in GPU-less CI so the
+        /// DirectGpu kernels actually EXECUTE on a CPU OpenCL device and CPU-vs-GPU parity can
+        /// gate releases — see the <c>gpu-parity-pocl</c> lane in <c>build.yml</c>. GPU is
+        /// still preferred everywhere; a CPU device is used only as a fallback when the GPU
+        /// scan finds nothing, so real-GPU machines are unaffected whether or not the flag is set.
+        /// </summary>
+        internal static bool AllowCpuOpenClDevice =>
+            string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_OPENCL_ALLOW_CPU"), "1", StringComparison.Ordinal);
+
+        /// <summary>
         /// Checks if a real GPU device is exposed by any OpenCL platform on this system.
         /// Returns false on CPU-only machines that happen to have an OpenCL ICD installed
         /// (Intel CPU runtime, AMD APP CPU runtime, POCL), preventing the OpenCL backend
-        /// from compiling its ~591-kernel cache on hardware that has no use for it.
+        /// from compiling its ~591-kernel cache on hardware that has no use for it — UNLESS
+        /// <c>AIDOTNET_OPENCL_ALLOW_CPU=1</c> is set (see <see cref="AllowCpuOpenClDevice"/>),
+        /// in which case a CPU OpenCL device is accepted as a fallback so GPU kernels can be
+        /// parity-checked on a CPU OpenCL runtime in CI.
         /// Honors <c>AIDOTNET_DISABLE_OPENCL=1</c> as a manual opt-out for users who want
         /// to force the CPU path even on machines with a GPU.
         /// </summary>
@@ -691,6 +708,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         {
                             Trace.WriteLine($"[OpenCL Diagnostics] Found {numDevices} GPU device(s) on platform {p}.");
                             return true;
+                        }
+                    }
+                    // Opt-in CI/software fallback: no GPU was found, but AIDOTNET_OPENCL_ALLOW_CPU=1
+                    // lets a CPU OpenCL device (POCL) stand in so the GPU kernels can execute and be
+                    // parity-checked on GPU-less CI. Never reached in production (flag unset).
+                    if (AllowCpuOpenClDevice)
+                    {
+                        for (uint p = 0; p < numPlatforms; p++)
+                        {
+                            int cpuErr = GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_CPU, 0, null, out uint numCpu);
+                            if (cpuErr == CL_SUCCESS && numCpu > 0)
+                            {
+                                Trace.WriteLine($"[OpenCL Diagnostics] AIDOTNET_OPENCL_ALLOW_CPU=1 — accepting {numCpu} CPU OpenCL device(s) on platform {p} (no GPU present).");
+                                return true;
+                            }
                         }
                     }
                     Trace.WriteLine("[OpenCL Diagnostics] No GPU devices found across any OpenCL platform.");
