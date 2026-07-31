@@ -39,7 +39,10 @@ internal static class StableTimer
     /// <param name="RelativeSpread">
     /// (max - min) / median across samples. The headline uncertainty.
     /// </param>
-    /// <param name="Samples">How many samples were taken.</param>
+    /// <param name="Samples">
+    /// Number of timing attempts performed, not the size of the retained three-sample
+    /// convergence window.
+    /// </param>
     /// <param name="Stable">Whether the spread came within tolerance.</param>
     internal readonly record struct Result(
         double Microseconds, double RelativeSpread, int Samples, bool Stable)
@@ -63,7 +66,10 @@ internal static class StableTimer
     /// <param name="B">Second timed operation.</param>
     /// <param name="Ratio">Median of A/B for each paired sample.</param>
     /// <param name="RelativeSpread">Spread of the paired ratios.</param>
-    /// <param name="Samples">Number of paired samples.</param>
+    /// <param name="Samples">
+    /// Number of paired timing attempts performed, not the size of the retained
+    /// three-sample convergence window.
+    /// </param>
     internal readonly record struct PairResult(
         Result A, Result B, double Ratio, double RelativeSpread, int Samples,
         int IterationsA, int IterationsB)
@@ -98,7 +104,7 @@ internal static class StableTimer
     /// is wrong at both ends: too few for a 20 us kernel to escape launch noise, and minutes
     /// of wall clock for a 100 ms one.
     /// </param>
-    /// <param name="maxAttempts">Samples to take before giving up on convergence.</param>
+    /// <param name="maxAttempts">Timing attempts to make before giving up on convergence.</param>
     internal static Result Measure(
         DirectPtxRuntime runtime, Action launch, long workUnits, int maxAttempts = 15)
     {
