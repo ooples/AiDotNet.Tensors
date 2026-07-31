@@ -321,14 +321,36 @@ public sealed class DirectPtxVisionBoxIouTests
     [Fact]
     public void FeatureOverrides_AreThreadLocalAndRestoreDisabledState()
     {
+        static (bool? Experiment, bool? Route, bool Enabled) ObserveOnNewThread()
+        {
+            var observed = (Experiment: (bool?)true, Route: (bool?)true, Enabled: false);
+            var worker = new System.Threading.Thread(() => observed = (
+                DirectPtxFeatureGate.VisionExperimentOverride,
+                DirectPtxFeatureGate.VisionGateOverride,
+                DirectPtxFeatureGate.IsVisionBoxIouEnabled));
+            worker.Start();
+            worker.Join();
+            return observed;
+        }
+
         bool? oldExperiment = DirectPtxFeatureGate.VisionExperimentOverride;
         bool? oldRoute = DirectPtxFeatureGate.VisionGateOverride;
         try
         {
+            var baseline = ObserveOnNewThread();
+            Assert.Null(baseline.Experiment);
+            Assert.Null(baseline.Route);
+
             DirectPtxFeatureGate.VisionExperimentOverride = true;
             Assert.True(DirectPtxFeatureGate.IsVisionBoxIouEnabled);
             Assert.True(DirectPtxFeatureGate.IsVisionOperationEnabled(
                 DirectPtxVisionOperation.RoiAlign));
+
+            var otherThread = ObserveOnNewThread();
+            Assert.Null(otherThread.Experiment);
+            Assert.Null(otherThread.Route);
+            Assert.Equal(baseline.Enabled, otherThread.Enabled);
+
             DirectPtxFeatureGate.VisionGateOverride = false;
             Assert.False(DirectPtxFeatureGate.IsVisionBoxIouEnabled);
             Assert.False(DirectPtxFeatureGate.IsVisionOperationEnabled(
