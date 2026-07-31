@@ -40,16 +40,33 @@ public static class GpuAutotuneMeasurement
         }
         Array.Sort(sorted);
 
-        double median = sorted.Length % 2 == 0
-            ? ((double)sorted[(sorted.Length / 2) - 1] + sorted[sorted.Length / 2]) / 2.0
-            : sorted[sorted.Length / 2];
-        int p95Index = Math.Max(0, (int)Math.Ceiling(sorted.Length * 0.95) - 1);
-        double p95ToMedian = sorted[p95Index] / median;
+        (double median, double p95) = SortedDistributionStatistics(sorted);
+        double p95ToMedian = p95 / median;
         if (p95ToMedian > maxP95ToMedian)
             throw new InvalidOperationException(
                 $"GPU timing is unstable: p95/median={p95ToMedian:F4}, limit={maxP95ToMedian:F4}.");
 
         return median;
+    }
+
+    /// <summary>
+    /// Returns the conventional median and nearest-rank p95 for an ascending
+    /// timing distribution. Kept in one place so diagnostics and the stability
+    /// gate cannot report different percentiles for the same samples.
+    /// </summary>
+    internal static (double Median, double P95) SortedDistributionStatistics(
+        IReadOnlyList<float> sorted)
+    {
+        if (sorted is null) throw new ArgumentNullException(nameof(sorted));
+        if (sorted.Count == 0)
+            throw new ArgumentException("At least one timing sample is required.", nameof(sorted));
+
+        int middle = sorted.Count / 2;
+        double median = sorted.Count % 2 == 0
+            ? ((double)sorted[middle - 1] + sorted[middle]) / 2.0
+            : sorted[middle];
+        int p95Index = Math.Max(0, (int)Math.Ceiling(sorted.Count * 0.95) - 1);
+        return (median, sorted[p95Index]);
     }
 
     /// <summary>Converts a stable median time and operation count to GFLOP/s.</summary>

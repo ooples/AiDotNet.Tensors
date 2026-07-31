@@ -743,9 +743,8 @@ public sealed class DirectPtxConvolutionPerfProbe
                         launch, warmup: 3, samples: 20, launchesPerSample);
                     var attempt = (float[])acceptedSamples.Clone();
                     Array.Sort(attempt);
-                    double attemptMedian =
-                        ((double)attempt[9] + attempt[10]) / 2.0;
-                    double attemptP95 = attempt[18];
+                    (double attemptMedian, double attemptP95) =
+                        GpuAutotuneMeasurement.SortedDistributionStatistics(attempt);
                     _out.WriteLine(
                         $"{label} group={launchesPerSample}: " +
                         $"median={attemptMedian * 1000.0:F2}us " +
@@ -756,7 +755,7 @@ public sealed class DirectPtxConvolutionPerfProbe
             double median = GpuAutotuneMeasurement.StableMedianMilliseconds(acceptedSamples!);
             var sorted = (float[])acceptedSamples!.Clone();
             Array.Sort(sorted);
-            double p95 = sorted[(int)Math.Ceiling(sorted.Length * 0.95) - 1];
+            double p95 = GpuAutotuneMeasurement.SortedDistributionStatistics(sorted).P95;
             _out.WriteLine(
                 $"{label}: median={median * 1000.0:F2}us p95={p95 * 1000.0:F2}us " +
                 $"ratio={p95 / median:F4} {gflops:F1} GFLOP/s group={acceptedLaunches}");

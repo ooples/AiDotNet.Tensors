@@ -18,6 +18,22 @@ public sealed class GpuAutotuneMeasurementTests
     }
 
     [Fact]
+    public void SortedDistributionStatistics_DerivesMedianAndP95FromLength()
+    {
+        (double oddMedian, double oddP95) =
+            GpuAutotuneMeasurement.SortedDistributionStatistics(new[] { 1f, 2f, 3f, 4f, 5f });
+        var even = new float[20];
+        for (int i = 0; i < even.Length; i++) even[i] = i + 1;
+        (double evenMedian, double evenP95) =
+            GpuAutotuneMeasurement.SortedDistributionStatistics(even);
+
+        Assert.Equal(3.0, oddMedian);
+        Assert.Equal(5.0, oddP95);
+        Assert.Equal(10.5, evenMedian);
+        Assert.Equal(19.0, evenP95);
+    }
+
+    [Fact]
     public void StableMedianMilliseconds_RejectsNoisyCandidate()
     {
         InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
