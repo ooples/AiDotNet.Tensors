@@ -612,7 +612,9 @@ __kernel void istft_from_spectrum(__global const float* specRe, __global const f
     int outIdx = idx % outputLength; int b = idx / outputLength;
     float resultAcc = 0.0f; float windowAcc = 0.0f;
     for (int frame = 0; frame < numFrames; frame++) {
-        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop;
+        // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+        // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8.
+        int writeStart = center ? frame*hop - nFft/2 : frame*hop;
         int i = outIdx - writeStart;
         if (i >= 0 && i < nFft) {
             int specOff = (b*numFrames + frame) * nFft;

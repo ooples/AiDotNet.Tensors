@@ -179,7 +179,9 @@ void main() {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*outputLength; if (idx >= total) return;
     int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0; float windowAcc = 0.0;
     for (int frame = 0; frame < numFrames; frame++) {
-        int writeStart = center != 0 ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+        // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8.
+        int writeStart = center != 0 ? frame*hop - nFft/2 : frame*hop; int i = outIdx - writeStart;
         if (i >= 0 && i < nFft) {
             int specOff = (b*numFrames + frame) * nFft; float acc = 0.0;
             for (int k = 0; k < nFft; k++) { float a = 2.0*float(M_PI)*float(k)*float(i)/float(nFft); acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }

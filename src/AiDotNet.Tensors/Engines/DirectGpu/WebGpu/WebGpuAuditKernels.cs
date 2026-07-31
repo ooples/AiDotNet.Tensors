@@ -530,7 +530,10 @@ struct P { batch: i32, numFrames: i32, nFft: i32, hop: i32, outputLength: i32, c
   let idx = i32(gid.x); let total = pc.batch * pc.outputLength; if (idx >= total) { return; }
   let outIdx = idx % pc.outputLength; let b = idx / pc.outputLength; var resultAcc = 0.0; var windowAcc = 0.0;
   for (var frame = 0; frame < pc.numFrames; frame = frame + 1) {
-    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = max(0, frame * pc.hop - pc.nFft / 2); }
+    // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+    // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8. writeStart is
+    // i32 here (idx is i32(gid.x)), so a negative start is representable and the i >= 0 test trims it.
+    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = frame * pc.hop - pc.nFft / 2; }
     let i = outIdx - writeStart;
     if (i >= 0 && i < pc.nFft) {
       let specOff = (b * pc.numFrames + frame) * pc.nFft; var acc = 0.0;

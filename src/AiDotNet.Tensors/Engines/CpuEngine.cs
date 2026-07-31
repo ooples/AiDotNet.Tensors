@@ -40148,8 +40148,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 var (realOut, _) = FFTCore<T>(realIn, imagIn, inverse: true);
                 T scale = numOps.FromDouble(1.0 / nFft);
 
-                // Overlap-add
-                int writeStart = center ? Math.Max(0, frame * hopLength - nFft / 2) : frame * hopLength;
+                // Overlap-add.
+                // With center: true, STFT frames the PADDED signal, so analysis frame `frame` starts at
+                // frame*hopLength in the padded signal and therefore at frame*hopLength - nFft/2 in the
+                // ORIGINAL signal. Synthesis must place it there and let the bounds check below TRIM the
+                // part that falls before sample 0.
+                //
+                // This previously read Math.Max(0, frame * hopLength - nFft / 2). Clamping the start and
+                // then indexing writeStart + i does not trim the frame, it SHIFTS it right: for frame 0
+                // (start -nFft/2) window sample 0 landed on output sample 0 instead of window sample
+                // nFft/2 landing there. Every frame whose centre precedes sample 0 was displaced, so the
+                // first nFft output samples were reconstructed from the wrong window positions
+                // (measured: ISTFT(STFT(x)) reproduced the interior to 5.55e-16 but the head was wrong by
+                // 0.985 on a signal bounded by 1).
+                //
+                // It also destroyed the CONDITIONING of the normalisation below: output 0 should sit at
+                // the window's centre, where win[nFft/2] is approximately 1, giving a window sum of O(1);
+                // the shift aligned win[0] = 0 with output 0 instead, collapsing the sum to ~1e-8. That
+                // near-zero divisor amplified fp32 differences by ~1e7 and was the reason CPU and GPU
+                // TimeStretch differed by 1e-1 at index 3 while every kernel was algorithmically
+                // identical (amplification measured at 1.46e7-4.38e7 across rates 0.5-2.0).
+                int writeStart = center ? frame * hopLength - nFft / 2 : frame * hopLength;
 
                 for (int i = 0; i < nFft; i++)
                 {

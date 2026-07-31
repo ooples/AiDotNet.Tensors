@@ -85,4 +85,65 @@ public class StftRoundTripTests
         _out.WriteLine($"magRms={Rms(mag):F6} shape=[{string.Join(",", mag.Shape.ToArray())}]");
         Assert.True(Rms(mag) > 1e-6, $"STFT magnitude is all but zero (RMS {Rms(mag):E3}).");
     }
+
+    /// <summary>
+    /// The round trip must reconstruct x SAMPLE-WISE, including the first nFft/2 samples.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The energy-based tests above pass while the head is wrong, because total energy is blind to a
+    /// time shift. With <c>center: true</c>, analysis frame f is taken at f*hop in the PADDED signal,
+    /// i.e. at f*hop - nFft/2 in the original, so synthesis must place it there — trimming the part
+    /// that falls before sample 0. ISTFT instead used <c>writeStart = max(0, f*hop - nFft/2)</c> and
+    /// then <c>outIdx = writeStart + i</c>, which SHIFTS those frames right instead of trimming them.
+    /// </para>
+    /// <para>
+    /// Two consequences, both measured: the head is reconstructed from misplaced samples, and the
+    /// accumulated window sum there collapses to ~1e-8 (it should be O(1), since output 0 sits at the
+    /// window's centre where win[nFft/2] is approximately 1). Dividing by that near-zero sum amplifies
+    /// fp32 differences by ~1e7, which is what made CPU/GPU TimeStretch differ by 1e-1 at index 3 while
+    /// every kernel was algorithmically identical.
+    /// </para>
+    /// <para>
+    /// hop = nFft/4 gives a unity-overlap window sum in the interior, so any residual here is the
+    /// alignment defect and not windowing.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(256, 64)]
+    [InlineData(128, 32)]
+    public void IstftOfStft_ReconstructsSamplesIncludingHead(int nFft, int hop)
+    {
+        int n = 1024;
+        var x = new Tensor<double>([n]);
+        var rng = new Random(11);
+        for (int i = 0; i < n; i++) x[i] = rng.NextDouble() * 2 - 1;
+
+        var w = new Tensor<double>([nFft]);
+        for (int i = 0; i < nFft; i++) w[i] = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / (nFft - 1));
+
+        _cpu.STFT(x, nFft, hop, w, center: true, out var mag, out var phase);
+        var y = _cpu.ISTFT(mag, phase, nFft, hop, w, center: true, length: n);
+
+        double headWorst = 0, interiorWorst = 0;
+        int headWorstAt = -1;
+        for (int i = 0; i < n; i++)
+        {
+            double d = Math.Abs(x[i] - y[i]);
+            if (i < nFft)
+            {
+                if (d > headWorst) { headWorst = d; headWorstAt = i; }
+            }
+            else interiorWorst = Math.Max(interiorWorst, d);
+        }
+        _out.WriteLine($"nFft={nFft} hop={hop} headWorst={headWorst:E3} at={headWorstAt} " +
+                       $"interiorWorst={interiorWorst:E3}");
+
+        Assert.True(interiorWorst < 1e-9,
+            $"interior reconstruction is wrong by {interiorWorst:E3} (nFft={nFft}, hop={hop}).");
+        Assert.True(headWorst < 1e-9,
+            $"the first {nFft} samples are not reconstructed: worst {headWorst:E3} at index {headWorstAt} " +
+            $"(interior is fine at {interiorWorst:E3}), so synthesis is misplacing the frames whose " +
+            $"centre falls before sample 0 rather than trimming them.");
+    }
 }

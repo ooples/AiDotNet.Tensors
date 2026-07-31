@@ -120,6 +120,104 @@ public class TimeStretchStageDiffTests : IDisposable
         Assert.True(dp < 5e-3, $"STFT phase diverges beyond fp32 expectations (mod 2pi): {dp:E3}");
     }
 
+    /// <summary>
+    /// Quantifies the CONDITIONING of the ISTFT overlap-add normalisation at these arguments.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every structural difference between the CPU and GPU paths is eliminated: identical Hann window
+    /// (0.5-0.5cos(2*pi*i/(nFft-1))), identical vocoder arithmetic, identical clamped writeStart, and an
+    /// identical 1e-8 window-sum guard. The one remaining difference is that the GPU evaluates a direct
+    /// per-bin DFT in fp32 while the CPU uses FFTCore.
+    /// </para>
+    /// <para>
+    /// ISTFT divides by the accumulated window sum, so wherever that sum is small the difference is
+    /// amplified. This computes the sum from pure geometry — no engine involved — so the amplification
+    /// factor is a fact about the ARGUMENTS, independent of either implementation.
+    /// </para>
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(0.5)]
+    [InlineData(0.75)]
+    [InlineData(1.5)]
+    [InlineData(2.0)]
+    public void IstftWindowSum_Conditioning(double rate)
+    {
+        const int NumFrames = 3;                       // (257 + 512 - 512)/128 + 1
+        int outFrames = Math.Max(1, (int)Math.Floor(NumFrames / rate));
+        int outputLength = (int)Math.Round(L / rate);
+
+        var win = new double[NFft];
+        for (int i = 0; i < NFft; i++) win[i] = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / (NFft - 1));
+
+        // The Hann endpoints are exactly zero, so the global minimum is always 0 and is SKIPPED by the
+        // guard. What actually amplifies is the smallest sum that PASSES the guard and is divided by.
+        double minDivisor = double.MaxValue;
+        int minDivisorAt = -1, belowGuard = 0;
+        for (int outIdx = 0; outIdx < outputLength; outIdx++)
+        {
+            double sum = 0;
+            for (int frame = 0; frame < outFrames; frame++)
+            {
+                int writeStart = Math.Max(0, frame * Hop - NFft / 2);
+                int i = outIdx - writeStart;
+                if (i >= 0 && i < NFft) sum += win[i] * win[i];
+            }
+            if (sum <= 1e-8) { belowGuard++; continue; }
+            if (sum < minDivisor) { minDivisor = sum; minDivisorAt = outIdx; }
+        }
+
+        _out.WriteLine($"rate={rate,4} outFrames={outFrames} len={outputLength} belowGuard={belowGuard} " +
+                       $"minDivisor={minDivisor:E3} at={minDivisorAt} " +
+                       $"amplification={1.0 / minDivisor:E3}");
+        Assert.True(true, "measurement only — the printed conditioning is the result");
+    }
+
+    /// <summary>
+    /// Characterises the vocoder divergence by RATE. STFT and ISTFT are now measured to agree
+    /// (3.6e-4 and 3.1e-4), so the phase vocoder stage is the only remaining suspect.
+    /// </summary>
+    /// <remarks>
+    /// rate &lt; 1 EXPANDS (outFrames &gt; numFrames, so the vocoder extrapolates past the available
+    /// frames and t0 clamps); rate &gt; 1 COMPRESSES. The dedicated tests that pass use rate=1.5, and
+    /// the failing harness case uses rate=0.5, so the split is the thing to measure.
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(0.5)]
+    [InlineData(0.75)]
+    [InlineData(1.0)]
+    [InlineData(1.5)]
+    [InlineData(2.0)]
+    public void TimeStretchDivergence_ByRate(double rate)
+    {
+        Skip.If(!_available, "GPU backend not available");
+        var x = Signal();
+        var c = _cpu.TimeStretch(x, rate, NFft, Hop);
+        var g = _gpu!.TimeStretch(x, rate, NFft, Hop);
+
+        int outFrames = (int)Math.Floor(3 / rate);
+        if (c.Length != g.Length)
+        {
+            _out.WriteLine($"rate={rate,4} outFrames={outFrames} LENGTH cpu={c.Length} gpu={g.Length}");
+            return;
+        }
+        double worst = 0;
+        int worstAt = -1;
+        for (int i = 0; i < c.Length; i++)
+        {
+            double d = Math.Abs((double)c[i] - g[i]);
+            if (d > worst) { worst = d; worstAt = i; }
+        }
+        // Report the tail separately: if the divergence lives at the first few samples (where the
+        // centred overlap-add window sum is ~1e-8) and the bulk agrees, the cause is the ill-conditioned
+        // normalisation, not the kernels.
+        double worstTail = 0;
+        for (int i = 8; i < c.Length; i++) worstTail = Math.Max(worstTail, Math.Abs((double)c[i] - g[i]));
+        _out.WriteLine($"rate={rate,4} outFrames={outFrames} len={c.Length} " +
+                       $"maxAbsDiff={worst:E3} at={worstAt} maxAbsDiff[8..]={worstTail:E3}");
+        Assert.True(true, "measurement only — the printed trend is the result");
+    }
+
     /// <summary>Stage 2 — the whole op, for reference against the harness's reported error.</summary>
     [SkippableFact]
     public void Stage2_TimeStretch_CpuMatchesGpu()
