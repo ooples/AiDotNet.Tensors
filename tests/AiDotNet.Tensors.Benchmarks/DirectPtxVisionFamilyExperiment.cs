@@ -166,12 +166,13 @@ internal static class DirectPtxVisionFamilyExperiment
 
         WorkModel model = Model(spec, definition, pairedDefinition);
         IntPtr directGraph = backend.CaptureGraph(cell.LaunchDirect);
-        IntPtr currentGraph = backend.CaptureGraph(cell.LaunchCurrent);
-        if (directGraph == IntPtr.Zero || currentGraph == IntPtr.Zero)
-            throw new InvalidOperationException(
-                $"Graph capture failed after prewarm for {spec.Operation}.");
+        IntPtr currentGraph = IntPtr.Zero;
         try
         {
+            currentGraph = backend.CaptureGraph(cell.LaunchCurrent);
+            if (directGraph == IntPtr.Zero || currentGraph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    $"Graph capture failed after prewarm for {spec.Operation}.");
             StableTimer.PairResult launchComparison = StableTimer.MeasureDevicePair(
                 backend, cell.LaunchDirect, cell.LaunchCurrent);
             PrintComparison(run, spec, pairedSpec is not null,

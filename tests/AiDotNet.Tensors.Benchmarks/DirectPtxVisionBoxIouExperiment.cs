@@ -117,12 +117,14 @@ internal static class DirectPtxVisionBoxIouExperiment
 
         DirectPtxFeatureGate.VisionGateOverride = true;
         IntPtr directGraph = backend.CaptureGraph(DirectLaunch);
-        DirectPtxFeatureGate.VisionGateOverride = false;
-        IntPtr currentGraph = backend.CaptureGraph(CurrentLaunch);
-        if (directGraph == IntPtr.Zero || currentGraph == IntPtr.Zero)
-            throw new InvalidOperationException("Both public routes must be CUDA-graph capturable after prewarm.");
+        IntPtr currentGraph = IntPtr.Zero;
         try
         {
+            DirectPtxFeatureGate.VisionGateOverride = false;
+            currentGraph = backend.CaptureGraph(CurrentLaunch);
+            if (directGraph == IntPtr.Zero || currentGraph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    "Both public routes must be CUDA-graph capturable after prewarm.");
             void DirectGraphLaunch() => backend.EnqueueCapturedGraph(directGraph);
             void CurrentGraphLaunch() => backend.EnqueueCapturedGraph(currentGraph);
             var cells = new List<Evidence>(4);
