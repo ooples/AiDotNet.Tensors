@@ -42,11 +42,11 @@ internal static class DirectPtxVisionFamilyExperiment
     internal static void Run(int independentRuns = 3, string? operation = null)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
-        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
         var correctnessFailures = new List<string>();
         try
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+            DirectPtxFeatureGate.VisionExperimentOverride = true;
             for (int run = 1; run <= independentRuns; run++)
             {
                 GpuBenchmarkEnvironment.RequireNoForeignCompute(
@@ -108,7 +108,7 @@ internal static class DirectPtxVisionFamilyExperiment
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
         }
     }
 
@@ -661,8 +661,8 @@ internal static class DirectPtxVisionFamilyExperiment
 
         internal void LaunchCurrent()
         {
-            bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = false;
+            bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+            DirectPtxFeatureGate.VisionExperimentOverride = false;
             try
             {
                 switch (_spec.Operation)
@@ -749,7 +749,7 @@ internal static class DirectPtxVisionFamilyExperiment
             }
             finally
             {
-                DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+                DirectPtxFeatureGate.VisionExperimentOverride = old;
             }
         }
 

@@ -59,23 +59,23 @@ internal static class DirectPtxFeatureGate
     internal static bool ConvolutionExperimentOverride { get; set; }
 
     [ThreadStatic]
-    private static bool? _visionBoxIouExperimentOverride;
+    private static bool? _visionExperimentOverride;
 
     [ThreadStatic]
-    private static bool? _visionBoxIouGateOverride;
+    private static bool? _visionGateOverride;
 
     /// <summary>Thread-isolated static/driver-test opt-in for the unpromoted specialization.</summary>
-    internal static bool? VisionBoxIouExperimentOverride
+    internal static bool? VisionExperimentOverride
     {
-        get => _visionBoxIouExperimentOverride;
-        set => _visionBoxIouExperimentOverride = value;
+        get => _visionExperimentOverride;
+        set => _visionExperimentOverride = value;
     }
 
     /// <summary>Benchmark-only route selector; false forces the established backend.</summary>
-    internal static bool? VisionBoxIouGateOverride
+    internal static bool? VisionGateOverride
     {
-        get => _visionBoxIouGateOverride;
-        set => _visionBoxIouGateOverride = value;
+        get => _visionGateOverride;
+        set => _visionGateOverride = value;
     }
 
     internal static bool IsEnabled => IsAttentionEnabled;
@@ -104,12 +104,12 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
-    internal static bool IsVisionBoxIouEnabled => VisionBoxIouGateOverride ??
-        VisionBoxIouExperimentOverride ?? TestOverride ??
+    internal static bool IsVisionBoxIouEnabled => VisionGateOverride ??
+        VisionExperimentOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentVisionEnabled || EnvironmentVisionBoxIouEnabled);
 
     internal static bool IsVisionOperationEnabled(DirectPtxVisionOperation operation) =>
-        VisionBoxIouExperimentOverride ?? TestOverride ??
+        VisionGateOverride ?? VisionExperimentOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentVisionEnabled ||
          EnvironmentVisionOperationEnabled[(int)operation]);
     internal static bool IsConvolutionEnabled => TestOverride ??

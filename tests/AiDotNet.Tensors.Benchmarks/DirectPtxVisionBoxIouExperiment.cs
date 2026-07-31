@@ -35,9 +35,9 @@ internal static class DirectPtxVisionBoxIouExperiment
     internal static void Run(int independentRuns = 3)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
-        bool? oldExperiment = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-        bool? oldRoute = DirectPtxFeatureGate.VisionBoxIouGateOverride;
-        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        bool? oldExperiment = DirectPtxFeatureGate.VisionExperimentOverride;
+        bool? oldRoute = DirectPtxFeatureGate.VisionGateOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
         try
         {
             Console.WriteLine(
@@ -71,8 +71,8 @@ internal static class DirectPtxVisionBoxIouExperiment
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouGateOverride = oldRoute;
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = oldExperiment;
+            DirectPtxFeatureGate.VisionGateOverride = oldRoute;
+            DirectPtxFeatureGate.VisionExperimentOverride = oldExperiment;
         }
     }
 
@@ -86,7 +86,7 @@ internal static class DirectPtxVisionBoxIouExperiment
         using var directOutput = backend.AllocateBuffer(checked(shape.N * shape.M));
         using var currentOutput = backend.AllocateBuffer(checked(shape.N * shape.M));
 
-        DirectPtxFeatureGate.VisionBoxIouGateOverride = true;
+        DirectPtxFeatureGate.VisionGateOverride = true;
         if (!backend.PrewarmDirectPtxVisionBoxIou(shape.N, shape.M))
             throw new InvalidOperationException(
                 $"Direct PTX prewarm failed: {backend.DirectPtxLastError ?? "unknown"}");
@@ -97,7 +97,7 @@ internal static class DirectPtxVisionBoxIouExperiment
         if (!backend.TryGetDirectPtxVisionBoxIouAudit(shape.N, shape.M, out var audit))
             throw new InvalidOperationException("No audit was retained for the measured direct-PTX module.");
 
-        DirectPtxFeatureGate.VisionBoxIouGateOverride = false;
+        DirectPtxFeatureGate.VisionGateOverride = false;
         void CurrentLaunch() => backend.BoxIou(a, b, currentOutput, shape.N, shape.M);
         CurrentLaunch();
         backend.Synchronize();
@@ -115,9 +115,9 @@ internal static class DirectPtxVisionBoxIouExperiment
             throw new InvalidOperationException(
                 $"Established BoxIoU error {currentError:G9} exceeds the 2e-6 oracle gate.");
 
-        DirectPtxFeatureGate.VisionBoxIouGateOverride = true;
+        DirectPtxFeatureGate.VisionGateOverride = true;
         IntPtr directGraph = backend.CaptureGraph(DirectLaunch);
-        DirectPtxFeatureGate.VisionBoxIouGateOverride = false;
+        DirectPtxFeatureGate.VisionGateOverride = false;
         IntPtr currentGraph = backend.CaptureGraph(CurrentLaunch);
         if (directGraph == IntPtr.Zero || currentGraph == IntPtr.Zero)
             throw new InvalidOperationException("Both public routes must be CUDA-graph capturable after prewarm.");
@@ -126,10 +126,10 @@ internal static class DirectPtxVisionBoxIouExperiment
             void DirectGraphLaunch() => backend.EnqueueCapturedGraph(directGraph);
             void CurrentGraphLaunch() => backend.EnqueueCapturedGraph(currentGraph);
             var cells = new List<Evidence>(4);
-            DirectPtxFeatureGate.VisionBoxIouGateOverride = true;
+            DirectPtxFeatureGate.VisionGateOverride = true;
             cells.Add(Measure(backend, run, shape, "Direct PTX", DirectLaunch, 0, directError, audit));
             cells.Add(Measure(backend, run, shape, "Direct PTX CUDA graph", DirectGraphLaunch, 0, directError, audit));
-            DirectPtxFeatureGate.VisionBoxIouGateOverride = false;
+            DirectPtxFeatureGate.VisionGateOverride = false;
             cells.Add(Measure(backend, run, shape, "AiDotNet NVRTC", CurrentLaunch, 0, currentError, null));
             cells.Add(Measure(backend, run, shape, "AiDotNet NVRTC graph", CurrentGraphLaunch, 0, currentError, null));
             return cells;

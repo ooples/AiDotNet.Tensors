@@ -310,19 +310,23 @@ public sealed class DirectPtxVisionBoxIouTests
     [Fact]
     public void FeatureOverrides_AreThreadLocalAndRestoreDisabledState()
     {
-        bool? oldExperiment = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-        bool? oldRoute = DirectPtxFeatureGate.VisionBoxIouGateOverride;
+        bool? oldExperiment = DirectPtxFeatureGate.VisionExperimentOverride;
+        bool? oldRoute = DirectPtxFeatureGate.VisionGateOverride;
         try
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+            DirectPtxFeatureGate.VisionExperimentOverride = true;
             Assert.True(DirectPtxFeatureGate.IsVisionBoxIouEnabled);
-            DirectPtxFeatureGate.VisionBoxIouGateOverride = false;
+            Assert.True(DirectPtxFeatureGate.IsVisionOperationEnabled(
+                DirectPtxVisionOperation.RoiAlign));
+            DirectPtxFeatureGate.VisionGateOverride = false;
             Assert.False(DirectPtxFeatureGate.IsVisionBoxIouEnabled);
+            Assert.False(DirectPtxFeatureGate.IsVisionOperationEnabled(
+                DirectPtxVisionOperation.RoiAlign));
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouGateOverride = oldRoute;
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = oldExperiment;
+            DirectPtxFeatureGate.VisionGateOverride = oldRoute;
+            DirectPtxFeatureGate.VisionExperimentOverride = oldExperiment;
         }
     }
 
@@ -455,8 +459,8 @@ public sealed class DirectPtxVisionBoxIouTests
     {
         var spec = (DirectPtxVisionSpec)value;
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
         try
         {
             using var backend = new CudaBackend();
@@ -501,7 +505,7 @@ public sealed class DirectPtxVisionBoxIouTests
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
         }
     }
 
@@ -512,8 +516,8 @@ public sealed class DirectPtxVisionBoxIouTests
     public void DriverOnly_CompleteBoxIouMatchesFp64Oracle()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
         try
         {
             const int n = 256, m = 256;
@@ -536,7 +540,7 @@ public sealed class DirectPtxVisionBoxIouTests
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
         }
     }
 
@@ -544,8 +548,8 @@ public sealed class DirectPtxVisionBoxIouTests
     public void DriverOnly_PublicNmsRouteInitializesScratchAndUnusedOutput()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
         try
         {
             const int length = 256;
@@ -579,7 +583,7 @@ public sealed class DirectPtxVisionBoxIouTests
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
         }
     }
 
@@ -591,8 +595,8 @@ public sealed class DirectPtxVisionBoxIouTests
     public void DriverOnly_PublicRoutePrewarmsCapturesAndMatchesOracle(int n, int m)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
-        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
         try
         {
             using var backend = new CudaBackend();
@@ -624,7 +628,7 @@ public sealed class DirectPtxVisionBoxIouTests
         }
         finally
         {
-            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
         }
     }
 
