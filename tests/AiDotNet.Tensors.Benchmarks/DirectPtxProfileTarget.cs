@@ -344,7 +344,8 @@ internal static class DirectPtxProfileTarget
                 foreach (DirectPtxBuffer? buffer in buffers) buffer?.Dispose();
             }
         }
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-vision-box-iou-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-vision-box-iou-end", afterSuite: true);
     }
 
     private static IEnumerable<DirectPtxVisionSpec> VisionProfileSpecs()
