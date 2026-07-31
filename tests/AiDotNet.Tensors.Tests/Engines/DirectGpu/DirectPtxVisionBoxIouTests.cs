@@ -151,7 +151,7 @@ public sealed class DirectPtxVisionBoxIouTests
         Assert.True(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(256, 256));
         Assert.True(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(1024, 1024));
         Assert.False(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(257, 256));
-        Assert.False(PtxFusedPairwiseBoxIouF32Kernel.IsPromotedShape(256, 256));
+        Assert.False(PtxFusedPairwiseBoxIouF32Kernel.AnyShapePromoted);
         Assert.Throws<NotSupportedException>(() =>
             PtxFusedPairwiseBoxIouF32Kernel.EmitPtx(8, 9, 256, 256));
         Assert.Throws<NotSupportedException>(() => PtxVisionEmitter.Emit(

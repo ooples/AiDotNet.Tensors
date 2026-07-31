@@ -28,7 +28,8 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
     internal static bool IsSupportedShape(int n, int m) =>
         (n, m) is (256, 256) or (1024, 256) or (1024, 1024) or (4096, 256);
 
-    internal static bool IsPromotedShape(int n, int m) => false;
+    /// <summary>No shape is promoted until the resident SM86 evidence is complete.</summary>
+    internal const bool AnyShapePromoted = false;
 
     internal PtxFusedPairwiseBoxIouF32Kernel(DirectPtxRuntime runtime, int n, int m)
     {
