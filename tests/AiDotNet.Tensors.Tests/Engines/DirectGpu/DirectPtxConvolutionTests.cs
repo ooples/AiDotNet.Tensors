@@ -167,6 +167,8 @@ public sealed class DirectPtxConvolutionTests
         Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
             new AutotuneCandidate("tile-7"), 64, 64, 256, out _));
         Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new AutotuneCandidate("tile-32"), 64, 64, 48, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
             new AutotuneCandidate("unknown"), 64, 64, 256, out _));
         Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
             candidates[0], 0, 64, 256, out _));
