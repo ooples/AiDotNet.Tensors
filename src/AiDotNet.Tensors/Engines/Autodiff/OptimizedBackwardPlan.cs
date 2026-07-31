@@ -18,6 +18,7 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 internal sealed class OptimizedBackwardPlan<T>
 {
     private readonly TapeEntryArena<T> _entries;
+    private readonly int _entryCount;
     private readonly int[] _reachableIndices;
     private readonly Tensor<T> _loss;
     private readonly Tensor<T>[]? _sources;
@@ -47,6 +48,7 @@ internal sealed class OptimizedBackwardPlan<T>
         HashSet<Tensor<T>>? retainGrad = null)
     {
         _entries = entries;
+        _entryCount = entries.Count;
         _reachableIndices = reachableIndices;
         _loss = loss;
         _sources = sources;
@@ -174,6 +176,17 @@ internal sealed class OptimizedBackwardPlan<T>
             // CompiledBackwardGraph.Execute for the leak-test rationale).
             BackwardInputBuffers<T>.Clear();
 
+            // The optimized walk intentionally skips eliminated entries, but those
+            // entries acquired saved-state pins when recorded. Balance the complete
+            // construction-time range; the per-entry ownership bit prevents replay
+            // or an outer compiled cleanup from releasing the same pin twice.
+            int releaseCount = Math.Min(_entryCount, _entries.Count);
+            for (int i = 0; i < releaseCount; i++)
+            {
+                ref var entry = ref _entries[i];
+                DifferentiableOps.UnpinSavedStateTensors<T>(ref entry);
+            }
+
             // Parity with CompiledBackwardGraph.Execute's finally block:
             // a consumer-side cache that retains a forward intermediate
             // (e.g. a layer's `_lastInput`) would otherwise pin one full
@@ -232,7 +245,6 @@ internal sealed class OptimizedBackwardPlan<T>
                         inp._pinnedByTape = false;
                     }
                 }
-
                 // e.Output is always a graph intermediate; inputs may be
                 // leaves (parameters) so we don't touch their .Grad here.
                 // GradFn cleanup parity with the recording path — see the

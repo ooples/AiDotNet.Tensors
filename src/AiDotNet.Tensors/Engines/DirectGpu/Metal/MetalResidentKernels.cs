@@ -1329,7 +1329,7 @@ kernel void lstm_forward_sequence(
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= batch) return; uint stateSize = batch * hiddenSize;
-    for (uint t = 0; t < sequence; ++t) { uint inputOffset = t * batch * inputSize + gid * inputSize, previousOffset = t * stateSize + gid * hiddenSize, currentOffset = (t + 1u) * stateSize + gid * hiddenSize, outputOffset = t * stateSize + gid * hiddenSize, gateOffset = (t * batch + gid) * hiddenSize * 4u;
+    for (uint t = 0; t < sequence; ++t) { uint inputOffset = (gid * sequence + t) * inputSize, previousOffset = t * stateSize + gid * hiddenSize, currentOffset = (t + 1u) * stateSize + gid * hiddenSize, outputOffset = (gid * sequence + t) * hiddenSize, gateOffset = (t * batch + gid) * hiddenSize * 4u;
         for (uint h = 0; h < hiddenSize; ++h) { float activated[4];
             for (uint gate = 0; gate < 4u; ++gate) { uint gateRow = gate * hiddenSize + h; float sum = biasIh[gateRow] + biasHh[gateRow]; for (uint i = 0; i < inputSize; ++i) sum += weightsIh[gateRow * inputSize + i] * input[inputOffset + i]; for (uint hp = 0; hp < hiddenSize; ++hp) sum += weightsHh[gateRow * hiddenSize + hp] * allH[previousOffset + hp]; activated[gate] = gate == 2u ? tanh(sum) : resident_stable_sigmoid(sum); }
             for (uint gate = 0; gate < 4u; ++gate) gates[gateOffset + h * 4u + gate] = activated[gate];
@@ -1352,12 +1352,12 @@ kernel void lstm_backward_sequence_serial(
     for (uint i = 0; i < sequence * batch * inputSize; ++i) gradInput[i] = 0.0f;
     for (uint i = 0; i < stateSize; ++i) { gradHInit[i] = 0.0f; gradCInit[i] = 0.0f; nextH[i] = 0.0f; nextC[i] = 0.0f; }
     for (uint i = 0; i < gateRows * inputSize; ++i) gradWeightsIh[i] = 0.0f; for (uint i = 0; i < gateRows * hiddenSize; ++i) gradWeightsHh[i] = 0.0f; for (uint i = 0; i < gateRows; ++i) gradBias[i] = 0.0f;
-    for (int time = int(sequence) - 1; time >= 0; --time) { uint t = uint(time), inputOffsetBase = t * batch * inputSize, previousBase = t * stateSize, currentBase = (t + 1u) * stateSize, outputBase = t * stateSize, gateBase = t * batch * hiddenSize * 4u;
+    for (int time = int(sequence) - 1; time >= 0; --time) { uint t = uint(time), previousBase = t * stateSize, currentBase = (t + 1u) * stateSize, gateBase = t * batch * hiddenSize * 4u;
         for (uint b = 0; b < batch; ++b) for (uint h = 0; h < hiddenSize; ++h) { uint cache = gateBase + b * hiddenSize * 4u + h * 4u, state = b * hiddenSize + h; float inputGate = gates[cache], forgetGate = gates[cache + 1u], candidate = gates[cache + 2u], outputGate = gates[cache + 3u], previousCell = allC[previousBase + state], currentCell = allC[currentBase + state];
-            float dHidden = gradOutput[outputBase + state] + nextH[state], tanhCell = tanh(currentCell), dOutput = dHidden * tanhCell, dCell = dHidden * outputGate * (1.0f - tanhCell * tanhCell) + nextC[state];
+            float dHidden = gradOutput[(b * sequence + t) * hiddenSize + h] + nextH[state], tanhCell = tanh(currentCell), dOutput = dHidden * tanhCell, dCell = dHidden * outputGate * (1.0f - tanhCell * tanhCell) + nextC[state];
             float raw[4] = { dCell * candidate * inputGate * (1.0f - inputGate), dCell * previousCell * forgetGate * (1.0f - forgetGate), dCell * inputGate * (1.0f - candidate * candidate), dOutput * outputGate * (1.0f - outputGate) };
-            for (uint gate = 0; gate < 4u; ++gate) { uint row = gate * hiddenSize + h; gradBias[row] += raw[gate]; for (uint i = 0; i < inputSize; ++i) gradWeightsIh[row * inputSize + i] += raw[gate] * input[inputOffsetBase + b * inputSize + i]; for (uint hp = 0; hp < hiddenSize; ++hp) gradWeightsHh[row * hiddenSize + hp] += raw[gate] * allH[previousBase + b * hiddenSize + hp]; }
-            for (uint i = 0; i < inputSize; ++i) { float sum = 0.0f; for (uint gate = 0; gate < 4u; ++gate) sum += raw[gate] * weightsIh[(gate * hiddenSize + h) * inputSize + i]; gradInput[inputOffsetBase + b * inputSize + i] += sum; }
+            for (uint gate = 0; gate < 4u; ++gate) { uint row = gate * hiddenSize + h; gradBias[row] += raw[gate]; for (uint i = 0; i < inputSize; ++i) gradWeightsIh[row * inputSize + i] += raw[gate] * input[(b * sequence + t) * inputSize + i]; for (uint hp = 0; hp < hiddenSize; ++hp) gradWeightsHh[row * hiddenSize + hp] += raw[gate] * allH[previousBase + b * hiddenSize + hp]; }
+            for (uint i = 0; i < inputSize; ++i) { float sum = 0.0f; for (uint gate = 0; gate < 4u; ++gate) sum += raw[gate] * weightsIh[(gate * hiddenSize + h) * inputSize + i]; gradInput[(b * sequence + t) * inputSize + i] += sum; }
             for (uint hp = 0; hp < hiddenSize; ++hp) { float sum = 0.0f; for (uint gate = 0; gate < 4u; ++gate) sum += raw[gate] * weightsHh[(gate * hiddenSize + hp) * hiddenSize + h]; if (t > 0u) nextH[b * hiddenSize + hp] = sum; else gradHInit[b * hiddenSize + hp] += sum; }
             float previousCellGradient = dCell * forgetGate; if (t > 0u) nextC[state] = previousCellGradient; else gradCInit[state] = previousCellGradient;
         }

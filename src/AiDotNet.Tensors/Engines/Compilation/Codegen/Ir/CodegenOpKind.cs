@@ -44,103 +44,128 @@ public enum CodegenOpKind
     // ─── Pointwise arithmetic ─────────────────────────────────────────
 
     /// <summary>Load the i-th element from a graph input tensor.</summary>
-    LoadInput,
+    LoadInput = 0,
     /// <summary>Write the i-th accumulator to a graph output tensor.</summary>
-    StoreOutput,
+    StoreOutput = 1,
     /// <summary>Materialize a compile-time scalar constant.</summary>
-    Constant,
+    Constant = 2,
 
     // ─── Binary arithmetic (elementwise) ──────────────────────────────
 
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Max,
-    Min,
-    Pow,
+    Add = 3,
+    Sub = 4,
+    Mul = 5,
+    Div = 6,
+    Max = 7,
+    Min = 8,
+    Pow = 9,
 
     // ─── Unary arithmetic (elementwise) ───────────────────────────────
 
-    Negate,
-    Reciprocal,
-    Sqrt,
-    Rsqrt,
-    Exp,
-    Log,
-    Sin,
-    Cos,
-    Tan,
-    Tanh,
-    Abs,
-    Floor,
-    Ceil,
-    Round,
+    Negate = 10,
+    Reciprocal = 11,
+    Sqrt = 12,
+    Rsqrt = 13,
+    Exp = 14,
+    Log = 15,
+    Sin = 16,
+    Cos = 17,
+    Tan = 18,
+    Tanh = 19,
+    Abs = 20,
+    Floor = 21,
+    Ceil = 22,
+    Round = 23,
 
     // ─── Activation functions (elementwise, often fused as epilogue) ──
 
-    ReLU,
-    Sigmoid,
-    GELU,
-    Swish,
-    LeakyReLU,
-    ELU,
-    SoftPlus,
-    HardSwish,
+    ReLU = 24,
+    Sigmoid = 25,
+    GELU = 26,
+    Swish = 27,
+    LeakyReLU = 28,
+    ELU = 29,
+    SoftPlus = 30,
+    HardSwish = 31,
 
     // ─── Comparison (elementwise, produces Bool) ──────────────────────
 
-    Equal,
-    NotEqual,
-    Greater,
-    GreaterEqual,
-    Less,
-    LessEqual,
+    Equal = 32,
+    NotEqual = 33,
+    Greater = 34,
+    GreaterEqual = 35,
+    Less = 36,
+    LessEqual = 37,
 
     // ─── Reductions ───────────────────────────────────────────────────
 
     /// <summary>Σ along one or more axes.</summary>
-    ReduceSum,
+    ReduceSum = 38,
     /// <summary>arithmetic mean along one or more axes.</summary>
-    ReduceMean,
+    ReduceMean = 39,
     /// <summary>max along one or more axes (non-differentiable at ties).</summary>
-    ReduceMax,
+    ReduceMax = 40,
     /// <summary>min along one or more axes (non-differentiable at ties).</summary>
-    ReduceMin,
+    ReduceMin = 41,
     /// <summary>Σ xᵢ²</summary>
-    ReduceSumOfSquares,
+    ReduceSumOfSquares = 42,
 
     // ─── Linear algebra ───────────────────────────────────────────────
 
     /// <summary>C = A · B. Emitters produce tiled GEMM.</summary>
-    MatMul,
+    MatMul = 43,
     /// <summary>C = Aᵀ · B. Lowered to MatMul with transpose flag.</summary>
-    MatMulTransposeA,
+    MatMulTransposeA = 44,
     /// <summary>C = A · Bᵀ.</summary>
-    MatMulTransposeB,
+    MatMulTransposeB = 45,
     /// <summary>Batched MatMul: <c>C[b] = A[b] · B[b]</c>.</summary>
-    BatchMatMul,
+    BatchMatMul = 46,
+
+    // ─── Convolution ──────────────────────────────────────────────────
+    //
+    // Convolution had no op kind at all, so it arrived as Opaque or not at all. That put
+    // the whole catalog of measured convolution kernels out of reach of every graph: the
+    // index-map layer expresses convolution exactly and CodegenAdjoint already derives
+    // its backward maps, but nothing upstream could ASK for one.
+    //
+    // The attribute is a CodegenConvAttributes. Operands are [input, weights].
+
+    /// <summary>
+    /// Dense 2-D cross-correlation, <c>out[n,k,oh,ow] = Σ_{c,kh,kw} in[n,c,·,·]·w[k,c,kh,kw]</c>.
+    /// </summary>
+    Conv2D = 56,
+
+    /// <summary>
+    /// Depthwise 2-D convolution: one filter per channel, no summation over channels.
+    /// </summary>
+    DepthwiseConv2D = 57,
+
+    /// <summary>
+    /// Transposed ("fractionally strided") 2-D convolution — the adjoint of
+    /// <see cref="Conv2D"/> with respect to its input.
+    /// </summary>
+    ConvTranspose2D = 58,
 
     // ─── Softmax (reduction + pointwise, fused as one op for numerical stability) ──
 
     /// <summary>Numerically stable <c>softmax(x) = exp(x - max(x)) / Σ exp(x - max(x))</c>.</summary>
-    Softmax,
+    Softmax = 47,
     /// <summary>Log-softmax — same as <see cref="Softmax"/> with a log epilogue.</summary>
-    LogSoftmax,
+    LogSoftmax = 48,
 
     // ─── Attention ────────────────────────────────────────────────────
 
     /// <summary>Scaled dot-product attention. Emitters produce
     /// flash-attention-style tiled kernels.</summary>
-    ScaledDotProductAttention,
+    ScaledDotProductAttention = 49,
 
     // ─── Layout / movement (usually pre-lowered away by the optimizer) ───
 
-    Transpose,
-    Reshape,
-    Concat,
-    Split,
-    Broadcast,
+    Transpose = 50,
+    Reshape = 51,
+    Concat = 52,
+    Split = 53,
+    Broadcast = 54,
 
     // ─── Escape hatch ─────────────────────────────────────────────────
 
@@ -151,7 +176,7 @@ public enum CodegenOpKind
     /// opaque nodes; the surrounding pattern matcher treats them as
     /// fusion boundaries so we can still fuse everything around them.
     /// </summary>
-    Opaque,
+    Opaque = 55,
 }
 
 /// <summary>
@@ -168,6 +193,8 @@ public enum CodegenOpCategory
     Matmul,
     /// <summary>Flash-attention-style — custom kernel per emitter.</summary>
     Attention,
+    /// <summary>Sliding-window contraction — a reduction with windowed index maps.</summary>
+    Convolution,
     /// <summary>Layout/movement ops that don't need codegen (handled by optimizer).</summary>
     Movement,
     /// <summary>Escape hatch.</summary>
@@ -214,6 +241,10 @@ public static class CodegenOpKinds
         CodegenOpKind.MatMul or CodegenOpKind.MatMulTransposeA or
         CodegenOpKind.MatMulTransposeB or CodegenOpKind.BatchMatMul
             => CodegenOpCategory.Matmul,
+
+        CodegenOpKind.Conv2D or CodegenOpKind.DepthwiseConv2D or
+        CodegenOpKind.ConvTranspose2D
+            => CodegenOpCategory.Convolution,
 
         CodegenOpKind.ScaledDotProductAttention
             => CodegenOpCategory.Attention,
