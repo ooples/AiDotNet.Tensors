@@ -234,9 +234,10 @@ internal static class KernelCatalogOracleTool
                 throw new InvalidOperationException(
                     entry.Name + " records " + winner + " but no split can be rebuilt.");
 
+            CodegenTiledOuterProductSchedule outerSchedule =
+                CodegenTiledOuterProductSchedule.FindForWinner(winner);
             PtxTiledOuterProductProgram tiled = PtxTiledOuterProductDispatcher.Emit(
-                split.Partial, major, minor,
-                CodegenTiledOuterProductSchedule.FindForWinner(winner));
+                split.Partial, major, minor, outerSchedule);
             int tiledBlocks = tiled.Blocks;
             int tiledSteps = tiled.Steps;
             int tiledInnerReduction = tiled.InnerReduction;
@@ -250,6 +251,7 @@ internal static class KernelCatalogOracleTool
             doubleBuffered = true;
             features.Add("split-reduction");
             features.Add("register-tiled");
+            if (!outerSchedule.IsDefault) features.Add("wide-output-fragment");
             long partialThreads = split.Partial.Space.TotalThreads;
             var partialSemantic = CodegenPerformanceModel.Predict(
                 split.Partial, partialThreads, 0, machine, tiledBlockThreads);
@@ -701,9 +703,15 @@ internal static class KernelCatalogOracleTool
                     ? "The partial is already asynchronously double-buffered. Search " +
                       "CTA/thread fragments jointly with chunk count, vectorize shared loads, or " +
                       "increase the measured prefetch distance; keep the combine unchanged."
-                    : "The partial is already asynchronously double-buffered. Expand the " +
-                      "outer-product fragment search and vectorize its shared loads; keep the " +
-                      "deterministic combine unchanged."));
+                    : schedule.Features.Contains(
+                        "wide-output-fragment", StringComparison.Ordinal)
+                        ? "The exact search already includes the default 16x16/2x2 fragment " +
+                          "and the winning 32x16/4x2 fragment. Next vectorize its shared loads " +
+                          "or measure producer/consumer roles; keep the deterministic combine " +
+                          "unchanged."
+                        : "The partial is already asynchronously double-buffered. Expand the " +
+                          "outer-product fragment search and vectorize its shared loads; keep " +
+                          "the deterministic combine unchanged."));
         }
 
         if (!atRoofline && longSb >= 20.0 && wait >= 15.0)

@@ -166,7 +166,6 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L($"mul.lo.u32 %r11, %r11, {I(PhysicalMicroTiles)};" +
           "                 // quadrant tile column");
         EmitVGeometry(plan);
-        EmitUCoordinates(plan);
         L("mov.u32 %r12, 0;                           // C stage");
         L($"mov.u32 %r36, {I(plan.ReductionChannels / BlockChannels - 1)}; // final pipelined stage");
         L("mov.u64 %rd10, stage;                      // current stage buffer");
@@ -461,27 +460,6 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         }
     }
 
-    private void EmitUCoordinates(CodegenTiledConv2DPlan plan)
-    {
-        // Every thread loads four consecutive transform components. Hoist the
-        // stage-invariant source and destination offsets once, then XOR-skew
-        // each component group's eight-wide M chunk. The skew keeps the U
-        // consumer's v4 loads aligned while assigning all 32 producer lanes
-        // to distinct shared-memory banks.
-        L("and.b32 %r13, %r0, 3;                     // U component group");
-        L("shr.u32 %r14, %r0, 2;");
-        L($"and.b32 %r14, %r14, {I(BlockM - 1)};      // U logical M");
-        L($"shr.u32 %r15, %r0, {I(PowerOfTwoShift(BlockM * 4))}; // U local C");
-        L($"mad.lo.u32 %r34, %r14, {I(plan.ReductionChannels)}, %r15;");
-        L("mul.lo.u32 %r34, %r34, 16;");
-        L("mad.lo.u32 %r34, %r13, 4, %r34;          // invariant U source word");
-        L("shl.b32 %r16, %r13, 3;");
-        L("xor.b32 %r16, %r14, %r16;                // conflict-free U transpose slot");
-        L("mad.lo.u32 %r17, %r15, 4, %r13;");
-        L("shl.b32 %r17, %r17, 2;                   // first component row");
-        L($"mad.lo.u32 %r35, %r17, {I(UStride)}, %r16; // invariant U shared word");
-    }
-
     private void EmitOuterProducts(string bufferBase, string doneLabel)
     {
         if (ActiveComputeThreads < BlockThreads || _schedule.DenseVProducers ||
@@ -489,7 +467,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             L($"@!%p15 bra {doneLabel};");
         L($"mul.lo.u32 %r13, %r8, {I(MicroM)};");
         L("shr.u32 %r14, %r6, 2;");
-        L("shl.b32 %r14, %r14, 3;");
+        L($"shl.b32 %r14, %r14, {I(PowerOfTwoShift(MicroM))};");
         L("xor.b32 %r13, %r13, %r14;                // recover transposed U chunk");
         L($"mad.lo.u32 %r13, %r6, {I(UStride)}, %r13;");
         L("mul.wide.u32 %rd4, %r13, 4;");

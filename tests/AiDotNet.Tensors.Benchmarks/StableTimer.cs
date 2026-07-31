@@ -139,11 +139,15 @@ internal static class StableTimer
         DirectPtxRuntime runtime,
         Action launchA, Action launchB,
         long workUnitsA, long workUnitsB,
-        int maxAttempts = 15)
+        int maxAttempts = 15,
+        double targetSpread = StableSpread)
     {
         if (runtime is null) throw new ArgumentNullException(nameof(runtime));
         if (launchA is null) throw new ArgumentNullException(nameof(launchA));
         if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (targetSpread <= 0 || targetSpread > StableSpread ||
+            double.IsNaN(targetSpread))
+            throw new ArgumentOutOfRangeException(nameof(targetSpread));
 
         int iterationsA = IterationsFor(workUnitsA);
         int iterationsB = IterationsFor(workUnitsB);
@@ -165,9 +169,9 @@ internal static class StableTimer
             AddToConsecutiveWindow(ratios, a / b);
 
             if (samplesA.Count >= 3 &&
-                SpreadOf(samplesA) <= StableSpread &&
-                SpreadOf(samplesB) <= StableSpread &&
-                SpreadOf(ratios) <= StableSpread)
+                SpreadOf(samplesA) <= targetSpread &&
+                SpreadOf(samplesB) <= targetSpread &&
+                SpreadOf(ratios) <= targetSpread)
             {
                 break;
             }

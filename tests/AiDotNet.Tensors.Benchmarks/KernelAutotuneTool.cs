@@ -43,7 +43,7 @@ internal static class KernelAutotuneTool
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
 
-    private sealed class TuneState
+    private sealed class TuneState : IDisposable
     {
         internal TuneState(StableTimer.Result baseline)
         {
@@ -57,7 +57,20 @@ internal static class KernelAutotuneTool
         internal double BestUs { get; set; }
         internal double BestModelledUs { get; set; }
         internal double BestGain { get; set; } = 1.0;
-        internal double BestRelativeSpread { get; set; }
+        internal CandidateProgram? BestProgram { get; private set; }
+
+        internal void Adopt(CandidateProgram candidate)
+        {
+            BestProgram?.Release();
+            candidate.Retain();
+            BestProgram = candidate;
+        }
+
+        public void Dispose()
+        {
+            BestProgram?.Release();
+            BestProgram = null;
+        }
     }
 
     private sealed record CandidatePhase(string Name, Action Launch, long WorkUnits);
@@ -68,6 +81,9 @@ internal static class KernelAutotuneTool
         private readonly List<IDisposable> _resources;
         private readonly DirectPtxBuffer _output;
         private readonly int _outputElements;
+        private bool _retained;
+        private bool _disposeRequested;
+        private bool _disposed;
 
         internal CandidateProgram(
             string name, Action launch, DirectPtxBuffer output, int outputElements,
@@ -97,8 +113,32 @@ internal static class KernelAutotuneTool
             return values;
         }
 
+        internal void Retain()
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(CandidateProgram));
+            _retained = true;
+        }
+
+        internal void Release()
+        {
+            _retained = false;
+            if (_disposeRequested) DisposeCore();
+        }
+
         public void Dispose()
         {
+            if (_retained)
+            {
+                _disposeRequested = true;
+                return;
+            }
+            DisposeCore();
+        }
+
+        private void DisposeCore()
+        {
+            if (_disposed) return;
+            _disposed = true;
             for (int i = _resources.Count - 1; i >= 0; i--)
                 _resources[i].Dispose();
         }
@@ -391,7 +431,7 @@ internal static class KernelAutotuneTool
                               "; trying independently gated paired windows");
         }
 
-        var state = new TuneState(baseline);
+        using var state = new TuneState(baseline);
 
         for (int i = 1; i < Candidates.Length; i++)
         {
@@ -736,31 +776,57 @@ internal static class KernelAutotuneTool
 
         // A winner must clear both the observed paired spread and the protocol noise floor.
         // Merely having the smallest median is not a promotion criterion.
-        double required = Math.Max(
-            CodegenMeasurementProtocol.AutotuneGainNoiseFloor,
-            1.0 + timing.RelativeSpread);
+        double required =
+            CodegenMeasurementProtocol.RequiredDirectCandidateGain(timing.RelativeSpread);
         if (timing.Ratio <= required) return;
         if (state.BestGain > 1.0)
         {
             if (timing.Ratio <= state.BestGain) return;
-            required = CodegenMeasurementProtocol.RequiredIndependentCandidateGain(
-                state.BestRelativeSpread, timing.RelativeSpread);
-            if (timing.Ratio / state.BestGain <= required)
+
+            // Independent ratios through the modelled baseline are deliberately
+            // conservative but become order-dependent for close finalists. Replay the
+            // actual incumbent and challenger beside each other, asking for a tighter
+            // window proportional to their observed separation.
+            CandidateProgram incumbent = state.BestProgram ??
+                throw new InvalidOperationException(
+                    "An accepted autotune winner has no retained replay program.");
+            double expectedGain = timing.Ratio / state.BestGain;
+            double targetSpread = Math.Min(
+                StableTimer.StableSpread,
+                Math.Max(
+                    CodegenMeasurementProtocol.AutotuneGainNoiseFloor - 1.0,
+                    (expectedGain - 1.0) / 2.0));
+            StableTimer.PairResult finalist = StableTimer.MeasurePair(
+                runtime, incumbent.Launch, candidate.Launch, workUnits, workUnits,
+                maxAttempts: 30, targetSpread: targetSpread);
+            required =
+                CodegenMeasurementProtocol.RequiredDirectCandidateGain(
+                    finalist.RelativeSpread);
+            Console.WriteLine("      finalist replay against '" + state.BestName +
+                              "': incumbent " + finalist.A.Describe() +
+                              ", challenger " + finalist.B.Describe() +
+                              ", paired " + finalist.DescribeRatio() + " +-" +
+                              (finalist.RelativeSpread * 100).ToString(
+                                  "0.0", CultureInfo.InvariantCulture) + "%");
+            if (!finalist.Stable || finalist.Ratio <= required)
             {
                 Console.WriteLine("      cannot displace '" + state.BestName +
-                                  "': independent winner/challenger windows require " +
+                                  "': direct finalist replay requires " +
                                   required.ToString("0.000", CultureInfo.InvariantCulture) +
-                                  "x, observed " + (timing.Ratio / state.BestGain).ToString(
+                                  "x, observed " + finalist.Ratio.ToString(
                                       "0.000", CultureInfo.InvariantCulture) + "x");
                 return;
             }
+
+            state.BestUs = finalist.B.Microseconds;
         }
 
+        state.Adopt(candidate);
         state.BestName = candidate.Name;
-        state.BestUs = timing.B.Microseconds;
+        if (state.BestGain <= 1.0)
+            state.BestUs = timing.B.Microseconds;
         state.BestModelledUs = timing.A.Microseconds;
         state.BestGain = timing.Ratio;
-        state.BestRelativeSpread = timing.RelativeSpread;
     }
 
     private static void ReportPhases(DirectPtxRuntime runtime, CandidateProgram candidate)

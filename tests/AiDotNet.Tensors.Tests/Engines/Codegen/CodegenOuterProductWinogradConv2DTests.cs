@@ -31,6 +31,8 @@ public sealed class CodegenOuterProductWinogradConv2DTests
         Assert.Contains("M32 x 32 tiles x F(2,3)", ptx);
         Assert.Contains("fma.rn.f32", ptx);
         Assert.DoesNotContain(".maxnreg", ptx);
+        Assert.DoesNotContain("%r34", ptx);
+        Assert.DoesNotContain("%r35", ptx);
         Assert.DoesNotContain("mma.sync", ptx);
         Assert.DoesNotContain("atom", ptx);
     }
@@ -102,6 +104,7 @@ public sealed class CodegenOuterProductWinogradConv2DTests
         Assert.Equal(28672, emitter.SharedMemoryBytes);
         Assert.Contains("component-owned 4x8 outer product", ptx);
         Assert.DoesNotContain("active outer-product owner", ptx);
+        Assert.Contains("shl.b32 %r14, %r14, 2;", ptx);
     }
 
     [Fact]

@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // A version stamp for how a number was measured.
 //
-// The measurement protocol changed eleven times during this project, and each change
+// The measurement protocol changed twelve times during this project, and each change
 // silently invalidated every number recorded before it:
 //
 //   v1 -> v2  the estimator. median(A)/median(B) let clock drift during a run leak into
@@ -65,6 +65,11 @@
 //              clearing only its own paired spread. Independent ratio windows now combine the
 //              incumbent and challenger spreads before changing a recorded schedule, so a 3%
 //              median difference between two 2-4% windows remains evidence of a tie.
+//   v12 -> v13 direct adaptive finalist replay. Combining independent spreads removed unsafe
+//              promotions but made close selection depend on which stable candidate appeared
+//              first. The tuner now retains only the incumbent, directly interleaves it with
+//              each nominally faster challenger, and samples toward a tighter spread target
+//              before applying the same noise-floor and measured-uncertainty requirements.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -88,7 +93,7 @@ public static class CodegenMeasurementProtocol
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 12;
+    public const int Version = 13;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -99,24 +104,20 @@ public static class CodegenMeasurementProtocol
         "true-fp32 CUDA-graph replay on both lanes; exact PTX-set autotune and dispatch-bound evidence; " +
         "exact competitor geometry; multi-strategy cuDNN plan search; " +
         "phase-scoped counter profiles; recoverable per-operation stability windows; " +
-        "uncertainty-aware autotune winner arbitration";
+        "direct adaptive finalist replay for autotune winner arbitration";
 
     /// <summary>
-    /// Minimum ratio-of-ratios required for an independently measured challenger to
-    /// displace the current autotune winner.
+    /// Minimum paired ratio required for a directly replayed challenger to displace
+    /// the current autotune winner.
     /// </summary>
-    public static double RequiredIndependentCandidateGain(
-        double incumbentRelativeSpread, double challengerRelativeSpread)
+    public static double RequiredDirectCandidateGain(double relativeSpread)
     {
-        if (double.IsNaN(incumbentRelativeSpread) ||
-            double.IsInfinity(incumbentRelativeSpread) || incumbentRelativeSpread < 0)
-            throw new ArgumentOutOfRangeException(nameof(incumbentRelativeSpread));
-        if (double.IsNaN(challengerRelativeSpread) ||
-            double.IsInfinity(challengerRelativeSpread) || challengerRelativeSpread < 0)
-            throw new ArgumentOutOfRangeException(nameof(challengerRelativeSpread));
+        if (double.IsNaN(relativeSpread) ||
+            double.IsInfinity(relativeSpread) || relativeSpread < 0)
+            throw new ArgumentOutOfRangeException(nameof(relativeSpread));
         return Math.Max(
             AutotuneGainNoiseFloor,
-            1.0 + incumbentRelativeSpread + challengerRelativeSpread);
+            1.0 + relativeSpread);
     }
 
     /// <summary>
