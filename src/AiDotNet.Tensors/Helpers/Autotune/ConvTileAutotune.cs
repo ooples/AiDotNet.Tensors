@@ -70,10 +70,7 @@ public static class ConvTileAutotune
         IReadOnlyList<int>? tileEdges = null,
         int maxThreadsPerBlock = 1024)
     {
-        if (outputChannels <= 0) throw new ArgumentOutOfRangeException(nameof(outputChannels));
-        if (inputChannels <= 0) throw new ArgumentOutOfRangeException(nameof(inputChannels));
-        if (spatial <= 0) throw new ArgumentOutOfRangeException(nameof(spatial));
-        if (maxThreadsPerBlock <= 0) throw new ArgumentOutOfRangeException(nameof(maxThreadsPerBlock));
+        ValidateLaunchArguments(outputChannels, inputChannels, spatial, maxThreadsPerBlock);
 
         IReadOnlyList<int> edges = tileEdges ?? DefaultTileEdges;
         var result = new List<AutotuneCandidate>(edges.Count);
@@ -81,8 +78,8 @@ public static class ConvTileAutotune
         foreach (int t in edges)
         {
             if (t <= 0 || !seen.Add(t)) continue;                 // ignore junk / duplicates
-            if ((long)t * t > maxThreadsPerBlock) continue;       // block would exceed thread limit
-            if (outputChannels % t != 0 || inputChannels % t != 0 || spatial % t != 0) continue; // needs exact division
+            if (!IsLaunchableTile(t, outputChannels, inputChannels, spatial, maxThreadsPerBlock))
+                continue;
             result.Add(CandidateFor(t));
         }
         return result;
@@ -91,8 +88,34 @@ public static class ConvTileAutotune
     /// <summary>True when at least one offered tile can launch this contract.</summary>
     public static bool HasLaunchableTile(
         int outputChannels, int inputChannels, int spatial,
-        IReadOnlyList<int>? tileEdges = null, int maxThreadsPerBlock = 1024) =>
-        Candidates(outputChannels, inputChannels, spatial, tileEdges, maxThreadsPerBlock).Count > 0;
+        IReadOnlyList<int>? tileEdges = null, int maxThreadsPerBlock = 1024)
+    {
+        ValidateLaunchArguments(outputChannels, inputChannels, spatial, maxThreadsPerBlock);
+
+        IReadOnlyList<int> edges = tileEdges ?? DefaultTileEdges;
+        for (int i = 0; i < edges.Count; i++)
+            if (IsLaunchableTile(
+                    edges[i], outputChannels, inputChannels, spatial, maxThreadsPerBlock))
+                return true;
+        return false;
+    }
+
+    private static void ValidateLaunchArguments(
+        int outputChannels, int inputChannels, int spatial, int maxThreadsPerBlock)
+    {
+        if (outputChannels <= 0) throw new ArgumentOutOfRangeException(nameof(outputChannels));
+        if (inputChannels <= 0) throw new ArgumentOutOfRangeException(nameof(inputChannels));
+        if (spatial <= 0) throw new ArgumentOutOfRangeException(nameof(spatial));
+        if (maxThreadsPerBlock <= 0) throw new ArgumentOutOfRangeException(nameof(maxThreadsPerBlock));
+    }
+
+    private static bool IsLaunchableTile(
+        int tile, int outputChannels, int inputChannels, int spatial, int maxThreadsPerBlock) =>
+        tile > 0 &&
+        (long)tile * tile <= maxThreadsPerBlock &&
+        outputChannels % tile == 0 &&
+        inputChannels % tile == 0 &&
+        spatial % tile == 0;
 
     /// <summary>Builds the candidate for a specific tile edge.</summary>
     public static AutotuneCandidate CandidateFor(int tile)

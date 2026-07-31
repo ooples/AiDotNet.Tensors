@@ -73,6 +73,15 @@ public sealed class ConvTileAutotuneTests : IDisposable
     }
 
     [Fact]
+    public void HasLaunchableTile_EvaluatesEligibilityAndStopsAtFirstMatch()
+    {
+        Assert.True(ConvTileAutotune.HasLaunchableTile(
+            64, 64, 256, new[] { -1, 8, 7 }, maxThreadsPerBlock: 64));
+        Assert.False(ConvTileAutotune.HasLaunchableTile(
+            64, 64, 256, new[] { -1, 7, 32 }, maxThreadsPerBlock: 64));
+    }
+
+    [Fact]
     public void Candidates_RespectThreadPerBlockLimit()
     {
         // With a 256-thread cap, tile-32 (1024 threads) is excluded even though it divides.
