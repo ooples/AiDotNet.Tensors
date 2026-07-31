@@ -903,9 +903,10 @@ internal static class DirectPtxVisionFamilyExperiment
                     {
                         if ((_spec.Flags & 1) != 0)
                             classes = HostInt(_direct[2], _spec.D0);
+                        double threshold = BitConverter.Int32BitsToSingle(_spec.ScalarBits);
                         using Tensor<int> indices = classes is null
-                            ? cpu.Nms(boxes, scores, 0.5)
-                            : cpu.BatchedNms(boxes, scores, classes, 0.5);
+                            ? cpu.Nms(boxes, scores, threshold)
+                            : cpu.BatchedNms(boxes, scores, classes, threshold);
                         var output = new double[_spec.D0];
                         ReadOnlySpan<int> kept = indices.AsSpan();
                         for (int i = 0; i < kept.Length; i++) output[i] = kept[i];
