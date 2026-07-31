@@ -50,7 +50,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    sub.rn.f32 %f19, %f17, %f15; sub.rn.f32 %f20, %f18, %f16; setp.gt.f32 %p5, %f19, 0f00000000; setp.gt.f32 %p6, %f20, 0f00000000; and.pred %p5, %p5, %p6; mov.f32 %f21, 0f00000000; @%p5 mul.rn.f32 %f21, %f19, %f20;");
         ptx.AppendLine("    min.f32 %f22, %f7, %f17; max.f32 %f23, %f5, %f15; sub.rn.f32 %f22, %f22, %f23; max.f32 %f22, %f22, 0f00000000;");
         ptx.AppendLine("    min.f32 %f23, %f8, %f18; max.f32 %f24, %f6, %f16; sub.rn.f32 %f23, %f23, %f24; max.f32 %f23, %f23, 0f00000000; mul.rn.f32 %f25, %f22, %f23;");
-        ptx.AppendLine("    add.rn.f32 %f26, %f11, %f21; sub.rn.f32 %f26, %f26, %f25; setp.gt.f32 %p7, %f26, 0f00000000; @!%p7 bra NMS_SUPPRESS_NEXT; div.rn.f32 %f27, %f25, %f26;");
+        ptx.AppendLine("    add.rn.f32 %f26, %f11, %f21; sub.rn.f32 %f26, %f26, %f25; setp.gt.f32 %p7, %f26, 0f00000000; @!%p7 bra NMS_SUPPRESS_NEXT; div.approx.f32 %f27, %f25, %f26;");
         ptx.AppendLine($"    setp.gt.f32 %p8, %f27, {F(threshold)}; @%p8 st.global.f32 [%rd17], %f3;");
         ptx.AppendLine("NMS_SUPPRESS_NEXT: add.u32 %r7, %r7, 1; bra NMS_SUPPRESS;");
         ptx.AppendLine("NMS_NEXT_ITERATION: add.u32 %r4, %r4, 1; bra NMS_ITERATION;");

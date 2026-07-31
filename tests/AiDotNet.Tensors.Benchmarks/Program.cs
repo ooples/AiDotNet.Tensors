@@ -82,7 +82,10 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-vision-family")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
-            DirectPtxVisionFamilyExperiment.Run(runs);
+            string? operation = args.Length > 1 && !int.TryParse(args[1], out _)
+                ? args[1]
+                : args.Length > 2 ? args[2] : null;
+            DirectPtxVisionFamilyExperiment.Run(runs, operation);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
@@ -1293,7 +1296,7 @@ class Program
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
         Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
-        Console.WriteLine("  --direct-ptx-vision-family [runs]: resident vision/detection/ROI/geometry evidence matrix");
+        Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
         Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");

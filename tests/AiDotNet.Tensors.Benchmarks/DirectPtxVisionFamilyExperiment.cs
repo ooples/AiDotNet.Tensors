@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using AiDotNet.Tensors;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -25,12 +26,24 @@ internal static class DirectPtxVisionFamilyExperiment
         double Mean, double Median, double P95, double P99);
 
     private readonly record struct WorkModel(
-        double Units, double Flops, double Bytes, long TemporaryDeviceBytes);
+        double Units, double Flops, double Bytes, long TemporaryDeviceBytes,
+        bool Serial = false);
 
-    internal static void Run(int independentRuns = 3)
+    private readonly record struct MeasurementProtocol(
+        int Warmups, int Samples, int Launches)
+    {
+        internal static MeasurementProtocol For(WorkModel model) => model.Serial
+            ? new(5, 31, 1)
+            : new(DirectPtxVisionFamilyExperiment.Warmups,
+                DirectPtxVisionFamilyExperiment.Samples,
+                DirectPtxVisionFamilyExperiment.Launches);
+    }
+
+    internal static void Run(int independentRuns = 3, string? operation = null)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
         bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
+        var correctnessFailures = new List<string>();
         try
         {
             DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
@@ -49,12 +62,49 @@ internal static class DirectPtxVisionFamilyExperiment
                     samples = Samples,
                     launches_per_device_sample = Launches
                 }));
-                foreach (DirectPtxVisionSpec spec in Specs())
-                    RunCell(backend, run, spec);
+                DirectPtxVisionSpec[] specs = Specs()
+                    .Where(spec => operation is null ||
+                        string.Equals(spec.Operation.ToString(), operation,
+                            StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(OperationLabel(spec, PairedSpec(spec) is not null), operation,
+                            StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (specs.Length == 0)
+                    throw new ArgumentException(
+                        $"Unknown vision-family operation selector '{operation}'.",
+                        nameof(operation));
+                foreach (DirectPtxVisionSpec spec in specs)
+                {
+                    string label = OperationLabel(spec, PairedSpec(spec) is not null);
+                    try
+                    {
+                        if (!RunCell(backend, run, spec))
+                            correctnessFailures.Add($"run {run}: {label}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("vision_family_finding_json=" + JsonSerializer.Serialize(new
+                        {
+                            status = "execution-failure",
+                            run,
+                            operation = label,
+                            exception = ex.GetType().Name,
+                            message = ex.Message
+                        }));
+                        correctnessFailures.Add($"run {run}: {label} ({ex.GetType().Name})");
+                        // A CUDA launch failure may poison the context. Preserve the first
+                        // exact finding instead of manufacturing secondary failures.
+                        break;
+                    }
+                }
                 backend.Synchronize();
                 GpuBenchmarkEnvironment.RequireNoForeignCompute(
                     $"vision-family-run-{run}-end");
             }
+            if (correctnessFailures.Count != 0)
+                throw new InvalidOperationException(
+                    "Vision-family correctness gate failed: " +
+                    string.Join("; ", correctnessFailures));
         }
         finally
         {
@@ -62,7 +112,7 @@ internal static class DirectPtxVisionFamilyExperiment
         }
     }
 
-    private static void RunCell(CudaBackend backend, int run, DirectPtxVisionSpec spec)
+    private static bool RunCell(CudaBackend backend, int run, DirectPtxVisionSpec spec)
     {
         DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
             spec, DirectPtxArchitectureFamily.Ampere, 8, 6);
@@ -87,9 +137,23 @@ internal static class DirectPtxVisionFamilyExperiment
         double error = Math.Max(establishedRouteError, directOracleError ?? 0);
         double tolerance = CorrectnessTolerance(spec);
         if (!double.IsFinite(error) || error > tolerance)
-            throw new InvalidOperationException(
-                $"Direct PTX {OperationLabel(spec, pairedSpec is not null)} error " +
-                $"{error:G9} exceeds the {tolerance:G9} established-route gate.");
+        {
+            Console.WriteLine("vision_family_finding_json=" + JsonSerializer.Serialize(new
+            {
+                status = "correctness-failure",
+                run,
+                operation = OperationLabel(spec, pairedSpec is not null),
+                tolerance,
+                maximum_error = error,
+                established_route_error = establishedRouteError,
+                direct_oracle_error = directOracleError,
+                current_oracle_error = currentOracleError,
+                diagnosis = currentOracleError is double currentError && currentError > tolerance
+                    ? "established-route-or-oracle-contract"
+                    : "direct-ptx-correctness"
+            }));
+            return false;
+        }
         if (!backend.TryGetDirectPtxVisionAudit(spec, out DirectPtxKernelAudit audit))
             throw new InvalidOperationException($"Missing PTX audit for {spec.Operation}.");
         DirectPtxKernelAudit? pairedAudit = null;
@@ -108,6 +172,17 @@ internal static class DirectPtxVisionFamilyExperiment
                 $"Graph capture failed after prewarm for {spec.Operation}.");
         try
         {
+            StableTimer.PairResult launchComparison = StableTimer.MeasureDevicePair(
+                backend, cell.LaunchDirect, cell.LaunchCurrent);
+            PrintComparison(run, spec, pairedSpec is not null,
+                "launch", launchComparison);
+            StableTimer.PairResult graphComparison = StableTimer.MeasureDevicePair(
+                backend,
+                () => backend.EnqueueCapturedGraph(directGraph),
+                () => backend.EnqueueCapturedGraph(currentGraph));
+            PrintComparison(run, spec, pairedSpec is not null,
+                "cuda-graph", graphComparison);
+
             MeasureAndPrint(backend, run, spec, "Direct PTX", cell.LaunchDirect,
                 error, establishedRouteError, directOracleError,
                 model, audit, pairedAudit);
@@ -125,6 +200,42 @@ internal static class DirectPtxVisionFamilyExperiment
             backend.DestroyCapturedGraph(directGraph);
             backend.DestroyCapturedGraph(currentGraph);
         }
+        return true;
+    }
+
+    private static void PrintComparison(
+        int run,
+        DirectPtxVisionSpec spec,
+        bool paired,
+        string mode,
+        StableTimer.PairResult timing)
+    {
+        double incumbentOverDirect = 1.0 / timing.Ratio;
+        double requiredGain = CodegenMeasurementProtocol.RequiredDirectCandidateGain(
+            timing.RelativeSpread);
+        double promotionGain = Math.Max(1.10, requiredGain);
+        string verdict = !timing.Stable ? "not-measurable" :
+            incumbentOverDirect >= promotionGain ? "direct-win" :
+            timing.Ratio >= promotionGain ? "direct-loss" :
+            "tie-within-noise-floor";
+        Console.WriteLine("vision_family_comparison_json=" + JsonSerializer.Serialize(new
+        {
+            status = timing.Stable ? "ok" : "unstable",
+            run,
+            operation = OperationLabel(spec, paired),
+            mode,
+            verdict,
+            direct_median_us = timing.A.Microseconds,
+            incumbent_median_us = timing.B.Microseconds,
+            incumbent_over_direct = incumbentOverDirect,
+            paired_ratio_relative_spread = timing.RelativeSpread,
+            required_gain = requiredGain,
+            promotion_gain = promotionGain,
+            samples = timing.Samples,
+            direct_launches_per_sample = timing.IterationsA,
+            incumbent_launches_per_sample = timing.IterationsB,
+            protocol = CodegenMeasurementProtocol.Tag
+        }));
     }
 
     private static void MeasureAndPrint(
@@ -140,9 +251,10 @@ internal static class DirectPtxVisionFamilyExperiment
         DirectPtxKernelAudit? audit,
         DirectPtxKernelAudit? pairedAudit = null)
     {
-        Distribution device = Device(backend, launch);
-        Distribution e2e = EndToEnd(backend, launch);
-        long managed = Allocated(backend, launch);
+        MeasurementProtocol protocol = MeasurementProtocol.For(model);
+        Distribution device = Device(backend, launch, protocol);
+        Distribution e2e = EndToEnd(backend, launch, protocol);
+        long managed = Allocated(backend, launch, protocol);
         double gflops = model.Flops == 0 ? 0 :
             model.Units * model.Flops / (device.Median * 1000.0);
         double gbps = model.Units * model.Bytes / (device.Median * 1000.0);
@@ -167,6 +279,9 @@ internal static class DirectPtxVisionFamilyExperiment
             algorithmic_gbps = gbps,
             managed_bytes_per_call = managed,
             temporary_device_bytes = model.TemporaryDeviceBytes,
+            timing_warmups = protocol.Warmups,
+            timing_samples = protocol.Samples,
+            timing_launches_per_device_sample = protocol.Launches,
             maximum_error = error,
             established_route_error = establishedRouteError,
             high_precision_oracle_error = highPrecisionOracleError,
@@ -202,27 +317,29 @@ internal static class DirectPtxVisionFamilyExperiment
         }));
     }
 
-    private static Distribution Device(CudaBackend backend, Action launch)
+    private static Distribution Device(
+        CudaBackend backend, Action launch, MeasurementProtocol protocol)
     {
-        Warm(backend, launch);
-        var values = new double[Samples];
+        Warm(backend, launch, protocol.Warmups);
+        var values = new double[protocol.Samples];
         using IGpuEvent start = backend.CreateEvent(enableTiming: true);
         using IGpuEvent end = backend.CreateEvent(enableTiming: true);
         for (int i = 0; i < values.Length; i++)
         {
             backend.RecordEvent(start, backend.DefaultStream);
-            for (int j = 0; j < Launches; j++) launch();
+            for (int j = 0; j < protocol.Launches; j++) launch();
             backend.RecordEvent(end, backend.DefaultStream);
             end.Synchronize();
-            values[i] = backend.GetEventElapsedTime(start, end) * 1000.0 / Launches;
+            values[i] = backend.GetEventElapsedTime(start, end) * 1000.0 / protocol.Launches;
         }
         return Summary(values);
     }
 
-    private static Distribution EndToEnd(CudaBackend backend, Action launch)
+    private static Distribution EndToEnd(
+        CudaBackend backend, Action launch, MeasurementProtocol protocol)
     {
-        Warm(backend, launch);
-        var values = new double[Samples];
+        Warm(backend, launch, protocol.Warmups);
+        var values = new double[protocol.Samples];
         double scale = 1_000_000.0 / Stopwatch.Frequency;
         for (int i = 0; i < values.Length; i++)
         {
@@ -234,19 +351,20 @@ internal static class DirectPtxVisionFamilyExperiment
         return Summary(values);
     }
 
-    private static long Allocated(CudaBackend backend, Action launch)
+    private static long Allocated(
+        CudaBackend backend, Action launch, MeasurementProtocol protocol)
     {
-        Warm(backend, launch);
+        Warm(backend, launch, protocol.Warmups);
         long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < Samples; i++) launch();
-        long bytes = (GC.GetAllocatedBytesForCurrentThread() - before) / Samples;
+        for (int i = 0; i < protocol.Samples; i++) launch();
+        long bytes = (GC.GetAllocatedBytesForCurrentThread() - before) / protocol.Samples;
         backend.Synchronize();
         return bytes;
     }
 
-    private static void Warm(CudaBackend backend, Action launch)
+    private static void Warm(CudaBackend backend, Action launch, int warmups)
     {
-        for (int i = 0; i < Warmups; i++) launch();
+        for (int i = 0; i < warmups; i++) launch();
         backend.Synchronize();
     }
 
@@ -267,7 +385,8 @@ internal static class DirectPtxVisionFamilyExperiment
     private static string OperationLabel(DirectPtxVisionSpec spec, bool paired) =>
         !paired ? spec.Operation.ToString() : spec.Operation switch
         {
-            DirectPtxVisionOperation.IouFamilyBackwardA => "IouFamilyBackward(A+B)",
+            DirectPtxVisionOperation.IouFamilyBackwardA =>
+                $"IouFamilyBackward(A+B,v{spec.D2})",
             DirectPtxVisionOperation.Meshgrid2D =>
                 $"Meshgrid2D({(((spec.Flags & 2) != 0) ? "xy" : "ij")},both-outputs)",
             _ => spec.Operation.ToString()
@@ -278,6 +397,9 @@ internal static class DirectPtxVisionFamilyExperiment
         {
             DirectPtxVisionOperation.CompleteBoxIou or
             DirectPtxVisionOperation.CIoULoss => 2e-3,
+            // Areas in this matrix reach O(10^2); 2e-6 is below one fp32 ULP.
+            // Direct PTX and the incumbent are bit-identical for this cell.
+            DirectPtxVisionOperation.BoxArea => 2e-5,
             DirectPtxVisionOperation.IoULossBackward or
             DirectPtxVisionOperation.GIoULossBackward or
             DirectPtxVisionOperation.DIoULossBackward or
@@ -305,6 +427,7 @@ internal static class DirectPtxVisionFamilyExperiment
             DirectPtxVisionOperation.Cross3 => (double)spec.D0 * spec.D1,
             DirectPtxVisionOperation.Meshgrid2D => (double)spec.D0 * spec.D1 * 2,
             DirectPtxVisionOperation.IouFamilyBackwardA => (double)spec.D0 * spec.D1,
+            DirectPtxVisionOperation.Nms => (double)spec.D0 * spec.D0,
             _ => spec.D0
         };
         double flops = spec.Operation switch
@@ -334,7 +457,8 @@ internal static class DirectPtxVisionFamilyExperiment
         long temporaryDeviceBytes = spec.Operation == DirectPtxVisionOperation.Nms
             ? checked((long)spec.D0 * sizeof(float))
             : 0;
-        return new(units, flops, totalBytes / Math.Max(units, 1), temporaryDeviceBytes);
+        return new(units, flops, totalBytes / Math.Max(units, 1),
+            temporaryDeviceBytes, Serial: spec.Operation == DirectPtxVisionOperation.Nms);
     }
 
     private static DirectPtxVisionSpec? PairedSpec(DirectPtxVisionSpec spec)
@@ -369,6 +493,9 @@ internal static class DirectPtxVisionFamilyExperiment
         yield return new(DirectPtxVisionOperation.DIoULossBackward, 4096);
         yield return new(DirectPtxVisionOperation.CIoULossBackward, 4096);
         yield return new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 1);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 2);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 3);
         yield return new(DirectPtxVisionOperation.Nms, 256,
             Flags: 0, ScalarBits: BitConverter.SingleToInt32Bits(.5f));
         yield return new(DirectPtxVisionOperation.Nms, 256,
@@ -503,7 +630,7 @@ internal static class DirectPtxVisionFamilyExperiment
         internal void LaunchDirect()
         {
             if (_spec.Operation == DirectPtxVisionOperation.Nms)
-                _backend.Fill(_direct[3], 0f, _spec.D0);
+                _backend.MemsetBuffer(_direct[3], 0, checked(_spec.D0 * sizeof(float)));
             if (_spec.Operation == DirectPtxVisionOperation.IouFamilyBackwardA)
             {
                 if (!DirectPtxVisionSpecializations.TryPairwiseBackward(
@@ -574,7 +701,8 @@ internal static class DirectPtxVisionFamilyExperiment
                         break;
                     }
                     case DirectPtxVisionOperation.Nms:
-                        _backend.Fill(_current[3], 0f, _spec.D0);
+                        _backend.MemsetBuffer(
+                            _current[3], 0, checked(_spec.D0 * sizeof(float)));
                         _backend.Nms(_current[0], _current[1], _current[2], _current[3],
                             _current[4], _current[5], _spec.D0,
                             BitConverter.Int32BitsToSingle(_spec.ScalarBits), _spec.Flags & 1); break;

@@ -355,6 +355,35 @@ public sealed class DirectPtxVisionBoxIouTests
         }
     }
 
+    [Fact]
+    public void BackwardEmitter_UsesSharedAnalyticFastMathAndHoistsOwnerBox()
+    {
+        DirectPtxVisionDefinition aligned = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.CIoULossBackward, 256),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Contains("deterministic-analytic", aligned.Blueprint.Variant,
+            StringComparison.Ordinal);
+        Assert.Equal("analytical reverse mode; CIoU alpha detached",
+            aligned.Blueprint.Semantics["method"]);
+        Assert.Contains("rcp.approx.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("div.rn.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("0.001", aligned.Ptx, StringComparison.Ordinal);
+
+        DirectPtxVisionDefinition pair = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        int ownerLoad = pair.Ptx.IndexOf(
+            "ld.global.v4.f32 {%f0,%f1,%f2,%f3}", StringComparison.Ordinal);
+        int loop = pair.Ptx.IndexOf("PAIR_GRAD_LOOP:", StringComparison.Ordinal);
+        int opposingLoad = pair.Ptx.IndexOf(
+            "ld.global.v4.f32 {%f4,%f5,%f6,%f7}", loop,
+            StringComparison.Ordinal);
+        Assert.InRange(ownerLoad, 0, loop - 1);
+        Assert.True(opposingLoad > loop);
+        Assert.DoesNotContain("finite difference",
+            pair.Blueprint.Semantics["method"], StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void AssertPtxRegisterAndLabelClosure(string ptx)
     {
         var limits = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -461,6 +490,38 @@ public sealed class DirectPtxVisionBoxIouTests
     private static IGpuBuffer? At(IGpuBuffer[] buffers, int index) =>
         index < buffers.Length ? buffers[index] : null;
 
+    [SkippableFact]
+    public void DriverOnly_CompleteBoxIouMatchesFp64Oracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
+        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        try
+        {
+            const int n = 256, m = 256;
+            var spec = new DirectPtxVisionSpec(
+                DirectPtxVisionOperation.CompleteBoxIou, n, m);
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.PrewarmDirectPtxVisionKernel(spec),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+            float[] a = Boxes(n, 851_017);
+            float[] b = Boxes(m, 851_031);
+            using var aBuffer = backend.AllocateBuffer(a);
+            using var bBuffer = backend.AllocateBuffer(b);
+            using var output = backend.AllocateBuffer(checked(n * m));
+            Assert.True(backend.TryDirectPtxVisionKernel(
+                spec, aBuffer, bBuffer, output), backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.True(
+                MaximumCompleteBoxIouError(a, b, backend.DownloadBuffer(output), n, m) <= 5e-5,
+                "CompleteBoxIoU exceeded its fp64 oracle tolerance.");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(256, 256)]
     [InlineData(1024, 256)]
@@ -537,6 +598,40 @@ public sealed class DirectPtxVisionBoxIouTests
             double union = areaA + areaB - intersection;
             double expected = union > 0 ? intersection / union : 0;
             error = Math.Max(error, Math.Abs(expected - actual[i * m + j]));
+        }
+        return error;
+    }
+
+    private static double MaximumCompleteBoxIouError(
+        float[] a, float[] b, float[] actual, int n, int m)
+    {
+        double error = 0;
+        for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++)
+        {
+            double ax1 = a[i * 4], ay1 = a[i * 4 + 1], ax2 = a[i * 4 + 2], ay2 = a[i * 4 + 3];
+            double bx1 = b[j * 4], by1 = b[j * 4 + 1], bx2 = b[j * 4 + 2], by2 = b[j * 4 + 3];
+            double aw = Math.Max(ax2 - ax1, 0), ah = Math.Max(ay2 - ay1, 0);
+            double bw = Math.Max(bx2 - bx1, 0), bh = Math.Max(by2 - by1, 0);
+            double intersection = Math.Max(Math.Min(ax2, bx2) - Math.Max(ax1, bx1), 0) *
+                Math.Max(Math.Min(ay2, by2) - Math.Max(ay1, by1), 0);
+            double union = aw * ah + bw * bh - intersection;
+            double iou = union > 0 ? intersection / union : 0;
+            double dx = (ax1 + ax2 - bx1 - bx2) * 0.5;
+            double dy = (ay1 + ay2 - by1 - by2) * 0.5;
+            double ew = Math.Max(ax2, bx2) - Math.Min(ax1, bx1);
+            double eh = Math.Max(ay2, by2) - Math.Min(ay1, by1);
+            double diagonal = ew * ew + eh * eh;
+            double diou = diagonal > 0 ? iou - (dx * dx + dy * dy) / diagonal : iou;
+            double v = 0, alpha = 0;
+            if (ah > 0 && bh > 0)
+            {
+                double aspect = Math.Atan(aw / ah) - Math.Atan(bw / bh);
+                v = 4 / (Math.PI * Math.PI) * aspect * aspect;
+                double denominator = 1 - iou + v;
+                alpha = denominator > 0 ? v / denominator : 0;
+            }
+            error = Math.Max(error, Math.Abs(diou - alpha * v - actual[i * m + j]));
         }
         return error;
     }

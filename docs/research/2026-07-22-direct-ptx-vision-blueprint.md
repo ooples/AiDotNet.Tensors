@@ -111,10 +111,15 @@ pay for tiling, that becomes a new separately measured blueprint version.
   zero. NMS NaNs and equal scores retain the established lower-index ordering.
 - Pairwise owner gradients use one thread per owner and a fixed ascending
   other-index order, avoiding atomics.
-- Aligned and pairwise backward v1 differentiates the emitted metric with a
-  symmetric register-only `0.001` perturbation. This eliminates temporary
-  tensors and nondeterministic atomics, but remains unpromoted until its error
-  matrix passes against the established analytical CUDA route.
+- Aligned and pairwise backward v1 use the same analytical coordinate-level
+  reverse pass as the CPU and CUDA oracles. CIoU treats alpha as a
+  stop-gradient, min/max ties are owned by A, and pairwise reductions retain a
+  fixed ascending order. This eliminates eight finite-difference forward
+  evaluations per cell as well as temporary tensors and atomics.
+- Vision-family division uses PTX approximate fp32 division, matching the
+  established CUDA route's `--use_fast_math` contract. Promotion still
+  requires each specialization to pass both the established-route and
+  high-precision correctness gates.
 - Empty masks produce `[0,0,0,0]`. ROI invalid batch rows and empty bins write
   zero. RoIPool emits CUDA `roundf` halfway-away-from-zero semantics rather
   than PTX ties-to-even conversion. Meshgrid exactly preserves `ij` and `xy`
@@ -162,11 +167,21 @@ separate Python runner covers eligible torchvision/PyTorch implementations and
 checks each result against an untimed FP64 CPU oracle without mixing framework
 contexts. CPU, MKL, and OpenBLAS performance results are excluded.
 
-Each cell uses 30 warmups, 101 samples, 25 launches per CUDA-event sample, and
-three independent runs. JSON records device and E2E mean/median/P95/P99,
-modeled GFLOPS and algorithmic GB/s, managed bytes/call, temporary or peak
-device bytes, maximum error, registers, shared/local bytes, occupancy, hash,
-and the environment fingerprint.
+Each head-to-head first uses the shared stability timer. A calibration chooses
+an equal launch count targeting 50 ms per lane, every sample executes adjacent
+AB then BA batches, and up to 15 attempts seek three consecutive timings and
+within-sample ratios with at most 5% spread. Unstable ratios are emitted as
+`not-measurable`; they are never converted into wins or losses. A valid win
+must also clear the larger of the observed noise floor and the blueprint's
+1.10x promotion floor.
+
+The distribution record remains 30 warmups, 101 samples, and 25 launches per
+CUDA-event sample (serial NMS uses its separately reported 5/31/1 protocol),
+across three independent runs. JSON records the paired verdict and exact batch
+counts alongside device and E2E mean/median/P95/P99, modeled GFLOPS and
+algorithmic GB/s, managed bytes/call, temporary or peak device bytes, maximum
+error, registers, shared/local bytes, occupancy, hash, and environment
+fingerprint.
 
 ## Grouped evidence table -- pending GPU execution
 
@@ -192,6 +207,9 @@ only after three complete runs and all correctness/resource gates pass.
 $env:AIDOTNET_DIRECT_PTX_VISION = '1'
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -- --direct-ptx-vision-box-iou 3
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -- --direct-ptx-vision-family 3
+
+# Isolate one failing cell without replaying the whole matrix.
+dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -- --direct-ptx-vision-family 1 Nms
 python tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_vision_box_iou_competitors.py --runs 3
 python tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_vision_competitors.py --runs 3
 tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 -Target vision-box-iou

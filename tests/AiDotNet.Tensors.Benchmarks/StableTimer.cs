@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -64,7 +65,8 @@ internal static class StableTimer
     /// <param name="RelativeSpread">Spread of the paired ratios.</param>
     /// <param name="Samples">Number of paired samples.</param>
     internal readonly record struct PairResult(
-        Result A, Result B, double Ratio, double RelativeSpread, int Samples)
+        Result A, Result B, double Ratio, double RelativeSpread, int Samples,
+        int IterationsA, int IterationsB)
     {
         /// <summary>
         /// A comparison is actionable only when both timings and their paired ratio
@@ -107,9 +109,11 @@ internal static class StableTimer
         int warmup = Math.Max(3, iterations / 10);
 
         var samples = new List<double>(3);
+        int attempts = 0;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
+            attempts++;
             // Warm up on the FIRST attempt only. Later attempts follow immediately, so the
             // clocks and caches are already where the measurement wants them; re-warming would
             // just spend time re-reaching the same state.
@@ -127,7 +131,7 @@ internal static class StableTimer
 
         double spread = SpreadOf(samples);
         return new Result(
-            Median(samples), spread, samples.Count,
+            Median(samples), spread, attempts,
             samples.Count >= 3 && spread <= StableSpread);
     }
 
@@ -157,9 +161,11 @@ internal static class StableTimer
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
         var ratios = new List<double>(3);
+        int attempts = 0;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
+            attempts++;
             double a = runtime.MeasureKernelMilliseconds(
                 launchA, attempt == 0 ? warmupA : 0, iterationsA) * 1000.0;
             double b = runtime.MeasureKernelMilliseconds(
@@ -177,7 +183,103 @@ internal static class StableTimer
             }
         }
 
-        return Pair(samplesA, samplesB, ratios);
+        return Pair(samplesA, samplesB, ratios, attempts, iterationsA, iterationsB);
+    }
+
+    /// <summary>
+    /// Event-times two launches on the same async backend as adjacent AB/BA
+    /// batches. A short calibration chooses enough launches for roughly 50 ms of
+    /// device work, avoiding both launch-noise-sized regions and pathological fixed
+    /// batches for serial kernels such as NMS.
+    /// </summary>
+    internal static PairResult MeasureDevicePair(
+        IAsyncGpuBackend backend,
+        Action launchA,
+        Action launchB,
+        int warmups = 5,
+        int maxAttempts = 15,
+        double targetBatchMilliseconds = 50.0)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (!backend.SupportsEvents)
+            throw new NotSupportedException("Device-paired timing requires GPU events.");
+        if (warmups < 0) throw new ArgumentOutOfRangeException(nameof(warmups));
+        if (maxAttempts < 3) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+        if (!(targetBatchMilliseconds > 0) ||
+            double.IsInfinity(targetBatchMilliseconds))
+            throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
+
+        for (int i = 0; i < warmups; i++)
+        {
+            launchA();
+            launchB();
+        }
+
+        using IGpuEvent start = backend.CreateEvent(enableTiming: true);
+        using IGpuEvent end = backend.CreateEvent(enableTiming: true);
+        // Five launches make the calibration usable even for kernels close to
+        // the event timer's resolution. The final batches are independently
+        // normalized, so asymmetric kernel costs remain a fair comparison.
+        const int calibrationLaunches = 5;
+        double calibrationA = double.PositiveInfinity;
+        double calibrationB = double.PositiveInfinity;
+        for (int i = 0; i < 3; i++)
+        {
+            calibrationA = Math.Min(calibrationA, TimeDeviceBatch(
+                backend, start, end, launchA, calibrationLaunches));
+            calibrationB = Math.Min(calibrationB, TimeDeviceBatch(
+                backend, start, end, launchB, calibrationLaunches));
+        }
+        // Equal launch counts make interference exposure symmetric and keep the
+        // ratio independent of calibration error. Size the common batch from
+        // the slower side so a serial loss cannot make one sample unbounded.
+        int iterationsA = CalibratedIterations(
+            Math.Max(calibrationA, calibrationB), targetBatchMilliseconds);
+        int iterationsB = iterationsA;
+
+        using IGpuEvent startA = backend.CreateEvent(enableTiming: true);
+        using IGpuEvent endA = backend.CreateEvent(enableTiming: true);
+        using IGpuEvent startB = backend.CreateEvent(enableTiming: true);
+        using IGpuEvent endB = backend.CreateEvent(enableTiming: true);
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
+        int attempts = 0;
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            attempts++;
+            // AB then BA inside every sample removes first/second-order bias
+            // without pretending it is kernel speed. Average each lane's two
+            // positions before forming the within-sample ratio.
+            EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
+            EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
+            endB.Synchronize();
+            double aFirst = backend.GetEventElapsedTime(startA, endA);
+            double bSecond = backend.GetEventElapsedTime(startB, endB);
+
+            EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
+            EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
+            endA.Synchronize();
+            double bFirst = backend.GetEventElapsedTime(startB, endB);
+            double aSecond = backend.GetEventElapsedTime(startA, endA);
+
+            double a = (aFirst + aSecond) * 500.0 / iterationsA;
+            double b = (bFirst + bSecond) * 500.0 / iterationsB;
+            AddToConsecutiveWindow(samplesA, a);
+            AddToConsecutiveWindow(samplesB, b);
+            AddToConsecutiveWindow(ratios, a / b);
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios, attempts, iterationsA, iterationsB);
     }
 
     /// <summary>
@@ -205,8 +307,10 @@ internal static class StableTimer
         Warm(launch, synchronize, iterations);
 
         var samples = new List<double>(3);
+        int attempts = 0;
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
+            attempts++;
             AddToConsecutiveWindow(
                 samples, TimeHostBatch(launch, synchronize, iterations));
 
@@ -215,7 +319,7 @@ internal static class StableTimer
 
         double spread = SpreadOf(samples);
         return new Result(
-            Median(samples), spread, samples.Count,
+            Median(samples), spread, attempts,
             samples.Count >= 3 && spread <= StableSpread);
     }
 
@@ -250,9 +354,11 @@ internal static class StableTimer
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
         var ratios = new List<double>(3);
+        int attempts = 0;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
+            attempts++;
             double a = TimeHostBatch(launchA, synchronizeA, iterationsA);
             double b = TimeHostBatch(launchB, synchronizeB, iterationsB);
             AddToConsecutiveWindow(samplesA, a);
@@ -268,21 +374,23 @@ internal static class StableTimer
             }
         }
 
-        return Pair(samplesA, samplesB, ratios);
+        return Pair(samplesA, samplesB, ratios, attempts, iterationsA, iterationsB);
     }
 
     private static PairResult Pair(
-        List<double> samplesA, List<double> samplesB, List<double> ratios)
+        List<double> samplesA, List<double> samplesB, List<double> ratios,
+        int attempts, int iterationsA, int iterationsB)
     {
         double spreadA = SpreadOf(samplesA);
         double spreadB = SpreadOf(samplesB);
         double ratioSpread = SpreadOf(ratios);
         return new PairResult(
-            new Result(Median(samplesA), spreadA, samplesA.Count,
+            new Result(Median(samplesA), spreadA, attempts,
                 samplesA.Count >= 3 && spreadA <= StableSpread),
-            new Result(Median(samplesB), spreadB, samplesB.Count,
+            new Result(Median(samplesB), spreadB, attempts,
                 samplesB.Count >= 3 && spreadB <= StableSpread),
-            Median(ratios), ratioSpread, ratios.Count);
+            Median(ratios), ratioSpread, attempts,
+            iterationsA, iterationsB);
     }
 
     /// <summary>
@@ -310,6 +418,44 @@ internal static class StableTimer
         synchronize();
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds * 1000.0 / iterations;
+    }
+
+    private static double TimeDeviceBatch(
+        IAsyncGpuBackend backend,
+        IGpuEvent start,
+        IGpuEvent end,
+        Action launch,
+        int iterations)
+    {
+        backend.RecordEvent(start, backend.DefaultStream);
+        for (int i = 0; i < iterations; i++) launch();
+        backend.RecordEvent(end, backend.DefaultStream);
+        end.Synchronize();
+        return backend.GetEventElapsedTime(start, end) / iterations;
+    }
+
+    private static void EnqueueDeviceBatch(
+        IAsyncGpuBackend backend,
+        IGpuEvent start,
+        IGpuEvent end,
+        Action launch,
+        int iterations)
+    {
+        backend.RecordEvent(start, backend.DefaultStream);
+        for (int i = 0; i < iterations; i++) launch();
+        backend.RecordEvent(end, backend.DefaultStream);
+    }
+
+    private static int CalibratedIterations(
+        double millisecondsPerLaunch,
+        double targetBatchMilliseconds)
+    {
+        if (!(millisecondsPerLaunch > 0) ||
+            double.IsInfinity(millisecondsPerLaunch))
+            return 4_096;
+        return (int)Math.Clamp(
+            Math.Ceiling(targetBatchMilliseconds / millisecondsPerLaunch),
+            1, 4_096);
     }
 
     /// <summary>
