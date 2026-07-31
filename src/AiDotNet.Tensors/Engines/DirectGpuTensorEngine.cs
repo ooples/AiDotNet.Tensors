@@ -15629,7 +15629,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> b,
         Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> operation)
     {
-        if (!TryGetBackend(out var backend) || !CanBroadcast(a.Shape._dims, b.Shape._dims))
+        if (!TryGetBackend(out var backend))
+            return null;
+
+        // GetOrAllocateBuffer and every TileAxis expansion below may allocate synchronously. CUDA
+        // forbids those allocations after cuStreamBeginCapture (CUDA 906), so decline the composed
+        // path before touching either input and let the established caller fallback own the case.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing())
+            return null;
+
+        if (!CanBroadcast(a.Shape._dims, b.Shape._dims))
             return null;
 
         int rank = Math.Max(a.Rank, b.Rank);
