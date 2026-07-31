@@ -156,6 +156,7 @@ def build_cases() -> tuple[list[Case], list[dict[str, str]]]:
                       lambda: ops.box_convert(boxes_area.cpu().double(), "xyxy", "cxcywh")))
 
     loss_predicted = boxes(4096, 854).requires_grad_(True)
+    loss_forward_input = loss_predicted.detach()
     loss_target = boxes(4096, 855)
     grad_output = torch.linspace(0.25, 1.0, 4096, device="cuda")
     loss_families = (
@@ -181,7 +182,7 @@ def build_cases() -> tuple[list[Case], list[dict[str, str]]]:
             ))
             continue
         cases.append(Case(family, "N=4096", f"torchvision.ops.{name}",
-                          lambda fn=function: fn(loss_predicted, loss_target, reduction="none"),
+                          lambda fn=function: fn(loss_forward_input, loss_target, reduction="none"),
                           4096.0, flops, 36.0,
                           lambda fn=function: fn(loss_predicted.detach().cpu().double(),
                                                  loss_target.cpu().double(), reduction="none")))
