@@ -103,10 +103,11 @@ def measure_e2e(fn):
 
 
 def run_cell(run, shape_name, n, m, method, fn, reference):
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     actual = fn()
     torch.cuda.synchronize()
-    baseline = torch.cuda.memory_allocated()
     device = measure_device(fn)
     e2e = measure_e2e(fn)
     peak = max(0, torch.cuda.max_memory_allocated() - baseline)
