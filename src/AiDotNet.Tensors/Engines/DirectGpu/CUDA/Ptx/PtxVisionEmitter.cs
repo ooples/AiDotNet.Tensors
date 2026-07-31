@@ -90,7 +90,8 @@ internal static partial class PtxVisionEmitter
         int maxRegisters = 64,
         int minBlocksPerSm = 2,
         uint blockThreads = 256,
-        uint dynamicSharedBytes = 0)
+        uint dynamicSharedBytes = 0,
+        int maxStaticSharedBytes = 0)
     {
         if (totalThreads <= 0) throw new ArgumentOutOfRangeException(nameof(totalThreads));
         uint grid = checked((uint)((totalThreads + blockThreads - 1) / blockThreads));
@@ -101,7 +102,7 @@ internal static partial class PtxVisionEmitter
             Variant: variant,
             Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
-                maxRegisters, 0, 0, minBlocksPerSm),
+                maxRegisters, maxStaticSharedBytes, 0, minBlocksPerSm),
             Semantics: semantics);
         return new DirectPtxVisionDefinition(
             blueprint, ptx, grid, 1, 1, blockThreads, 1, 1, dynamicSharedBytes);

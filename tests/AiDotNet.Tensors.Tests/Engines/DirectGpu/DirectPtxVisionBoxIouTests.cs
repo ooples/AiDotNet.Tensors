@@ -439,6 +439,29 @@ public sealed class DirectPtxVisionBoxIouTests
         }
     }
 
+    [Fact]
+    public void NmsEmitter_UsesDeterministicCooperativeBlock()
+    {
+        DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.Nms, 1024, Flags: 1,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f)),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+
+        Assert.Equal(1u, definition.GridX);
+        Assert.Equal(256u, definition.BlockX);
+        Assert.Equal(2048,
+            definition.Blueprint.ResourceBudget.MaxStaticSharedBytes);
+        Assert.Equal(
+            "deterministic cooperative block: parallel argmax and suppression",
+            definition.Blueprint.Semantics["execution"]);
+        Assert.Contains("NMS_FIND_LOCAL:", definition.Ptx, StringComparison.Ordinal);
+        Assert.Contains("NMS_SUPPRESS_LOCAL:", definition.Ptx, StringComparison.Ordinal);
+        Assert.Contains("bar.sync 0", definition.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("single deterministic controller thread",
+            definition.Ptx, StringComparison.Ordinal);
+        AssertPtxRegisterAndLabelClosure(definition.Ptx);
+    }
+
     private static void AssertPtxRegisterAndLabelClosure(string ptx)
     {
         var limits = new Dictionary<string, int>(StringComparer.Ordinal);
