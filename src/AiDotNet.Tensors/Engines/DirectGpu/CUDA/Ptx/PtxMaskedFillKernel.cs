@@ -14,8 +14,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// </summary>
 internal sealed class PtxMaskedFillKernel : IDisposable
 {
-    internal const int BlockThreads = 256;
-    internal const int MaxCount = 2048 * 4096;
+    internal const int BlockThreads = PtxElementwiseShape.BlockThreads;
+    internal const int MaxCount = PtxElementwiseShape.MaxCount;
     internal const string EntryPoint = "aidotnet_masked_fill";
 
     private readonly DirectPtxModule _module;
@@ -34,7 +34,7 @@ internal sealed class PtxMaskedFillKernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in masked-fill specialization is measured only on GA10x/SM86.");
-        ValidateShape(count);
+        PtxElementwiseShape.Validate(count, "Masked fill");
         Count = count;
         FillValue = fillValue;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, count);
@@ -50,9 +50,9 @@ internal sealed class PtxMaskedFillKernel : IDisposable
     internal unsafe void Launch(
         DirectPtxTensorView input, DirectPtxTensorView mask, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(mask, Blueprint.Tensors[1], nameof(mask));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        PtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        PtxAbiGuard.Require(mask, Blueprint.Tensors[1], nameof(mask));
+        PtxAbiGuard.Require(output, Blueprint.Tensors[2], nameof(output));
 
         IntPtr inputPointer = input.Pointer;
         IntPtr maskPointer = mask.Pointer;
@@ -70,7 +70,7 @@ internal sealed class PtxMaskedFillKernel : IDisposable
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int count)
     {
-        ValidateShape(count);
+        PtxElementwiseShape.Validate(count, "Masked fill");
         var ptx = new StringBuilder(4_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -142,25 +142,7 @@ internal sealed class PtxMaskedFillKernel : IDisposable
             });
     }
 
-    internal static bool IsSupportedCount(int count) =>
-        count > 0 && count % BlockThreads == 0 && count <= MaxCount;
+    internal static bool IsSupportedCount(int count) => PtxElementwiseShape.IsSupported(count);
 
-    internal static bool IsPromotedCount(int count) => false;
-
-    private static void ValidateShape(int count)
-    {
-        if (!IsSupportedCount(count))
-            throw new ArgumentOutOfRangeException(
-                nameof(count),
-                $"Masked fill supports a positive element count that is a multiple of {BlockThreads} up to {MaxCount}.");
-    }
-
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
+    internal static bool IsPromotedCount(int count) => PtxElementwiseShape.IsPromoted(count);
 }

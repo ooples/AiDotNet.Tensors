@@ -48,6 +48,27 @@ internal static class PtxRowShape
     }
 }
 
+/// <summary>Shared launch bounds for flat softmax-family elementwise kernels.</summary>
+internal static class PtxElementwiseShape
+{
+    internal const int BlockThreads = PtxRowShape.BlockThreads;
+    internal const int MaxCount = 2048 * 4096;
+
+    internal static bool IsSupported(int count) =>
+        count > 0 && count % BlockThreads == 0 && count <= MaxCount;
+
+    internal static bool IsPromoted(int count) => false;
+
+    internal static void Validate(int count, string operation)
+    {
+        if (!IsSupported(count))
+            throw new ArgumentOutOfRangeException(
+                nameof(count),
+                $"{operation} supports a positive element count that is a multiple of " +
+                $"{BlockThreads} up to {MaxCount}.");
+    }
+}
+
 /// <summary>Shared exact tensor-view ABI validation for direct-PTX launches.</summary>
 internal static class PtxAbiGuard
 {

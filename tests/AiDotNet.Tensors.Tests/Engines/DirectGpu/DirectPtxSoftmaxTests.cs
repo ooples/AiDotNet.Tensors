@@ -125,6 +125,15 @@ public class DirectPtxSoftmaxTests
         }
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxRowReduce.Emit(new StringBuilder(), "mul.rn.f32"));
+
+        Assert.Equal(PtxRowShape.BlockThreads, PtxElementwiseShape.BlockThreads);
+        Assert.True(PtxElementwiseShape.IsSupported(PtxElementwiseShape.BlockThreads));
+        Assert.True(PtxElementwiseShape.IsSupported(PtxElementwiseShape.MaxCount));
+        Assert.False(PtxElementwiseShape.IsSupported(PtxElementwiseShape.BlockThreads + 1));
+        Assert.False(PtxElementwiseShape.IsSupported(PtxElementwiseShape.MaxCount + 256));
+        Assert.False(PtxElementwiseShape.IsPromoted(1024));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxElementwiseShape.Validate(257, "Test elementwise operation"));
     }
 
     [Fact]
