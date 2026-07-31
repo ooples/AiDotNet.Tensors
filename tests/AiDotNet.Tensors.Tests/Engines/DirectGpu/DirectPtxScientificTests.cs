@@ -387,7 +387,12 @@ public class DirectPtxScientificTests
         Type[] backends =
         [
             typeof(CudaBackend), typeof(HipBackend), typeof(MetalBackend),
-            typeof(OpenClBackend), typeof(VulkanBackend), typeof(WebGpuBackend)
+            typeof(OpenClBackend), typeof(VulkanBackend),
+#if !NETFRAMEWORK
+            // WebGpuBackend is only compiled for .NET 7+; net471 verifies the five
+            // backends available on that target, while net10 verifies all six.
+            typeof(WebGpuBackend)
+#endif
         ];
         Type[] parameterTypes =
         [
@@ -409,7 +414,10 @@ public class DirectPtxScientificTests
         Type[] backends =
         [
             typeof(CudaBackend), typeof(HipBackend), typeof(MetalBackend),
-            typeof(OpenClBackend), typeof(VulkanBackend), typeof(WebGpuBackend)
+            typeof(OpenClBackend), typeof(VulkanBackend),
+#if !NETFRAMEWORK
+            typeof(WebGpuBackend)
+#endif
         ];
         Type buffer = typeof(IGpuBuffer);
         Type integer = typeof(int);
