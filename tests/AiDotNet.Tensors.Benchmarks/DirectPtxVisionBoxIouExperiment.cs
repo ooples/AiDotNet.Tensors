@@ -21,7 +21,7 @@ internal static class DirectPtxVisionBoxIouExperiment
     private readonly record struct Evidence(
         int Run, Shape Shape, string Method,
         Distribution Device, Distribution EndToEnd,
-        long ManagedBytes, long TemporaryDeviceBytes,
+        long ManagedBytes, long? TemporaryDeviceBytes,
         double MaximumError, DirectPtxKernelAudit? Audit);
 
     private static readonly Shape[] Shapes =
@@ -132,8 +132,8 @@ internal static class DirectPtxVisionBoxIouExperiment
             cells.Add(Measure(backend, run, shape, "Direct PTX", DirectLaunch, 0, directError, audit));
             cells.Add(Measure(backend, run, shape, "Direct PTX CUDA graph", DirectGraphLaunch, 0, directError, audit));
             DirectPtxFeatureGate.VisionGateOverride = false;
-            cells.Add(Measure(backend, run, shape, "AiDotNet NVRTC", CurrentLaunch, 0, currentError, null));
-            cells.Add(Measure(backend, run, shape, "AiDotNet NVRTC graph", CurrentGraphLaunch, 0, currentError, null));
+            cells.Add(Measure(backend, run, shape, "AiDotNet NVRTC", CurrentLaunch, null, currentError, null));
+            cells.Add(Measure(backend, run, shape, "AiDotNet NVRTC graph", CurrentGraphLaunch, null, currentError, null));
             return cells;
         }
         finally
@@ -145,7 +145,7 @@ internal static class DirectPtxVisionBoxIouExperiment
 
     private static Evidence Measure(
         CudaBackend backend, int run, Shape shape, string method, Action action,
-        long temporaryDeviceBytes, double error, DirectPtxKernelAudit? audit) =>
+        long? temporaryDeviceBytes, double error, DirectPtxKernelAudit? audit) =>
         new(run, shape, method,
             MeasureDevice(backend, action), MeasureEndToEnd(backend, action),
             MeasureAllocation(backend, action), temporaryDeviceBytes, error, audit);
@@ -227,11 +227,12 @@ internal static class DirectPtxVisionBoxIouExperiment
         int shared = cell.Audit?.Function.StaticSharedBytes ?? -1;
         int local = cell.Audit?.Function.LocalBytesPerThread ?? -1;
         int blocks = cell.Audit?.ActiveBlocksPerMultiprocessor ?? -1;
+        string temporaryDeviceBytes = cell.TemporaryDeviceBytes?.ToString() ?? "-";
         Console.WriteLine(
             $"{cell.Run,3} {cell.Shape.Name,-13} {cell.Method,-24} " +
             $"{cell.Device.Mean,9:F2} {cell.Device.Median,9:F2} {cell.Device.P95,9:F2} {cell.Device.P99,9:F2} " +
             $"{cell.EndToEnd.Median,9:F2} {gflops,9:F2} {bandwidth,9:F2} " +
-            $"{cell.ManagedBytes,10} {cell.TemporaryDeviceBytes,8} {cell.MaximumError,10:G4} " +
+            $"{cell.ManagedBytes,10} {temporaryDeviceBytes,8} {cell.MaximumError,10:G4} " +
             $"{Dash(registers),5} {Dash(shared),7} {Dash(local),5} {Dash(blocks),9}");
         Console.WriteLine("vision_iou_evidence_json=" + JsonSerializer.Serialize(new
         {
