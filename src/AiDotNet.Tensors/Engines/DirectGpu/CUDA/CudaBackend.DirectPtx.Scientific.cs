@@ -20,6 +20,8 @@ public sealed partial class CudaBackend
 
     private readonly record struct SciCountKey(int Count);
     private readonly record struct SciVectorKey(int Batch, int Dim, int ExtraBits);
+    internal readonly record struct SciPoincareProjectKey(
+        int Batch, int Dim, int CurvatureBits, int EpsilonBits);
     private readonly record struct SciRbfKey(int Batch, int NumCenters, int InputDim);
     private readonly record struct SciPairwiseKey(int M, int N, int Dim, bool Squared);
     private readonly record struct SciMatVecKey(int Batch, int Dim);
@@ -48,7 +50,7 @@ public sealed partial class CudaBackend
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareDistanceKernel> _sciPoincareDist =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
-    private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareProjectKernel> _sciPoincareProj =
+    private readonly DirectPtxKernelCache<SciPoincareProjectKey, PtxPoincareProjectKernel> _sciPoincareProj =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareExpMapKernel> _sciPoincareExp =
         new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
@@ -204,10 +206,16 @@ public sealed partial class CudaBackend
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("poincare-project-extent");
         return SciDispatch(() =>
         {
-            var k = _sciPoincareProj.GetOrAdd(new SciVectorKey(batch, dim, Bits(curvature) ^ Bits(epsilon)), () => new PtxPoincareProjectKernel(_directPtxRuntime!, batch, dim, curvature, epsilon));
+            var k = _sciPoincareProj.GetOrAdd(
+                PoincareProjectCacheKey(batch, dim, curvature, epsilon),
+                () => new PtxPoincareProjectKernel(_directPtxRuntime!, batch, dim, curvature, epsilon));
             Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
         });
     }
+
+    internal static SciPoincareProjectKey PoincareProjectCacheKey(
+        int batch, int dim, float curvature, float epsilon) =>
+        new(batch, dim, Bits(curvature), Bits(epsilon));
 
     internal bool TryDirectPtxPoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangent, IGpuBuffer output, int batch, int dim, float curvature)
     {

@@ -1944,6 +1944,15 @@ public class DirectPtxScientificTests
         Assert.False(PtxPoincareProjectKernel.IsPromotedShape(256, 64));
     }
 
+    [Fact]
+    public void PoincareProjectCacheKey_DistinguishesSwappedParameters()
+    {
+        var first = CudaBackend.PoincareProjectCacheKey(256, 64, 0.5f, 1e-5f);
+        var swapped = CudaBackend.PoincareProjectCacheKey(256, 64, 1e-5f, 0.5f);
+
+        Assert.NotEqual(first, swapped);
+    }
+
     [SkippableTheory]
     [InlineData(256, 32)]
     [InlineData(256, 128)]
