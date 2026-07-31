@@ -110,7 +110,7 @@ internal sealed class PtxComplexPhaseKernel : IDisposable
         ptx.AppendLine("    min.f32 %f5, %f2, %f3;");          // mn
         // a = mn / mx (guarded); base r = a*poly(a^2).
         ptx.AppendLine($"    setp.lt.f32 %p0, %f4, {tiny};");   // mx ~ 0
-        ptx.AppendLine("    rcp.approx.f32 %f6, %f4;");
+        ptx.AppendLine("    rcp.rn.f32 %f6, %f4;");
         ptx.AppendLine("    mul.rn.f32 %f7, %f5, %f6;");        // a
         ptx.AppendLine("    mul.rn.f32 %f8, %f7, %f7;");        // t = a^2
         ptx.AppendLine($"    mov.f32 %f9, {c4};");

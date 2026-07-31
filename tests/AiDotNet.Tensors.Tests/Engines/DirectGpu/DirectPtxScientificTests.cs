@@ -68,6 +68,8 @@ public class DirectPtxScientificTests
         Assert.Equal(2, Count(ptx, "abs.f32"));             // |re|, |im|
         Assert.Contains("max.f32 %f4", ptx);
         Assert.Contains("min.f32 %f5", ptx);
+        Assert.Contains("rcp.rn.f32 %f6, %f4", ptx);       // correctly rounded mn / mx
+        Assert.DoesNotContain("rcp.approx.f32 %f6, %f4", ptx, StringComparison.Ordinal);
         Assert.Equal(4, Count(ptx, "selp.f32"));            // quadrant + degenerate folding
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
