@@ -200,6 +200,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         totalDevices += (int)numDevices;
                     }
                 }
+                // Opt-in CI fallback: count CPU OpenCL devices (POCL) only when no GPU exists
+                // and AIDOTNET_OPENCL_ALLOW_CPU=1, matching the selection fallback in Initialize.
+                if (totalDevices == 0 && OpenClNativeBindings.AllowCpuOpenClDevice)
+                {
+                    foreach (var platform in platforms)
+                    {
+                        err = OpenClNativeBindings.GetDeviceIDs(platform, OpenClNativeBindings.CL_DEVICE_TYPE_CPU, 0, null, out uint numCpu);
+                        if (err == OpenClNativeBindings.CL_SUCCESS)
+                        {
+                            totalDevices += (int)numCpu;
+                        }
+                    }
+                }
                 return totalDevices;
             }
             catch
@@ -229,31 +242,55 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to get OpenCL platforms: {err}");
 
-            // Find GPU devices across all platforms and select by index
-            int currentIndex = 0;
-            foreach (var platform in platforms)
+            // Find devices of a given type across all platforms and select by global index.
+            // GPU is always attempted first; the CPU pass below runs only under the opt-in
+            // flag when no GPU DEVICE EXISTS AT ALL, so production selection is unchanged.
+            // anyDevicesOfType reports whether the platform exposed >=1 device of the type, which
+            // is distinct from "the requested index was in range" — an out-of-range index against
+            // an existing GPU must NOT silently fall through to a CPU device.
+            bool TrySelectDevice(ulong deviceType, out bool anyDevicesOfType)
             {
-                err = OpenClNativeBindings.GetDeviceIDs(platform, OpenClNativeBindings.CL_DEVICE_TYPE_GPU, 0, null, out uint numDevices);
-                if (err == OpenClNativeBindings.CL_SUCCESS && numDevices > 0)
+                anyDevicesOfType = false;
+                int currentIndex = 0;
+                foreach (var platform in platforms)
                 {
-                    var devices = new IntPtr[numDevices];
-                    err = OpenClNativeBindings.GetDeviceIDs(platform, OpenClNativeBindings.CL_DEVICE_TYPE_GPU, numDevices, devices, out _);
-                    if (err == OpenClNativeBindings.CL_SUCCESS)
+                    int e = OpenClNativeBindings.GetDeviceIDs(platform, deviceType, 0, null, out uint numDevices);
+                    if (e == OpenClNativeBindings.CL_SUCCESS && numDevices > 0)
                     {
-                        // Check if the requested device index is within this platform's devices
-                        if (deviceIndex >= currentIndex && deviceIndex < currentIndex + (int)numDevices)
+                        anyDevicesOfType = true;
+                        var devices = new IntPtr[numDevices];
+                        e = OpenClNativeBindings.GetDeviceIDs(platform, deviceType, numDevices, devices, out _);
+                        if (e == OpenClNativeBindings.CL_SUCCESS)
                         {
-                            _platform = platform;
-                            _device = devices[deviceIndex - currentIndex];
-                            break;
+                            // Check if the requested device index is within this platform's devices
+                            if (deviceIndex >= currentIndex && deviceIndex < currentIndex + (int)numDevices)
+                            {
+                                _platform = platform;
+                                _device = devices[deviceIndex - currentIndex];
+                                return true;
+                            }
+                            currentIndex += (int)numDevices;
                         }
-                        currentIndex += (int)numDevices;
                     }
                 }
+                return false;
+            }
+
+            bool gpuSelected = TrySelectDevice(OpenClNativeBindings.CL_DEVICE_TYPE_GPU, out bool anyGpu);
+            if (!gpuSelected && !anyGpu && OpenClNativeBindings.AllowCpuOpenClDevice)
+            {
+                // No GPU device exists AT ALL, but AIDOTNET_OPENCL_ALLOW_CPU=1 — bind a CPU OpenCL
+                // device (e.g. POCL) so the DirectGpu kernels EXECUTE for CPU-vs-GPU parity in CI.
+                // Guarded by !anyGpu so an out-of-range index on a real GPU throws below instead of
+                // silently binding a CPU device.
+                TrySelectDevice(OpenClNativeBindings.CL_DEVICE_TYPE_CPU, out _);
             }
 
             if (_device == IntPtr.Zero)
-                throw new InvalidOperationException("No GPU devices found");
+                throw new InvalidOperationException(
+                    OpenClNativeBindings.AllowCpuOpenClDevice
+                        ? "No OpenCL GPU or CPU devices found"
+                        : "No GPU devices found");
 
             // Get device info
             DeviceName = OpenClNativeBindings.GetDeviceInfoString(_device, OpenClNativeBindings.CL_DEVICE_NAME);

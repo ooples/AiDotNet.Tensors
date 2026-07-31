@@ -64,7 +64,8 @@ internal static class DirectPtxResidualRmsNormExperiment
         GpuBenchmarkEnvironment.RequireIdleGpu("residual-rmsnorm-framework-baselines");
         RunAiDotNet(rowCounts, results);
         RunPyTorch(rowCounts, results);
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("residual-rmsnorm-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "residual-rmsnorm-end", afterSuite: true);
 
         Console.WriteLine("NVIDIA GPU-only fused residual + RMSNorm D=64 (resident FP32 tensors)");
         Console.WriteLine("Correctness max-absolute tolerance: 5e-5 for both normalized output and saved RMS.");

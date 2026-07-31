@@ -59,6 +59,24 @@ public sealed class GradientTape<T> : IDisposable
     private readonly GradientTapeOptions _options;
     private IEngine _engine;
     private bool _engineExplicitlyBound;
+
+    // ResolveEngineFromData can redirect a tape created while the process default is a GPU
+    // engine back to CPU. CpuEngine is safe to share (AiDotNetEngine.Current does the same),
+    // so retain one fallback per closed GradientTape<T> instead of allocating per tape/backward.
+    private static readonly CpuEngine CpuFallbackEngine = new();
+
+    /// <summary>
+    /// Set when any tensor recorded onto this tape had its data on a GPU at record time.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes the backward FOLLOW THE DATA instead of guessing. Only 36 of the ~365
+    /// differentiable CpuEngine ops call <see cref="BindEngineIfUnset"/>, so roughly nine in ten tapes
+    /// were left on the constructor default of <c>AiDotNetEngine.Current</c> — the DirectGpu engine on
+    /// any auto-detect host. A caller explicitly holding a <c>CpuEngine</c> and working in
+    /// <c>double</c> therefore got its backward run on the GPU in fp32. Adding the missing 329 binding
+    /// calls would fix it once and rot immediately, since every new op would have to remember.
+    /// </remarks>
+    private bool _sawGpuResidentData;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
     // Set true once a streaming backward (ComputeGradientsStreaming) has
@@ -121,7 +139,28 @@ public sealed class GradientTape<T> : IDisposable
     internal void RemoveLastEntry()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (_entries.Count > 0)
+        {
+            ref var removed = ref _entries[_entries.Count - 1];
+            DifferentiableOps.UnpinSavedStateTensors<T>(ref removed);
+        }
         _entries.RemoveLast();
+    }
+
+    /// <summary>
+    /// Releases saved-state pins owned by the first <paramref name="entryCount"/> entries.
+    /// The per-entry ownership bit makes this safe when cleanup routes overlap or a persistent
+    /// tape is replayed. Entries appended by createGraph backward remain pinned for their own
+    /// later backward pass.
+    /// </summary>
+    private void ReleaseSavedStatePins(int entryCount)
+    {
+        int limit = Math.Min(entryCount, _entries.Count);
+        for (int i = 0; i < limit; i++)
+        {
+            ref var entry = ref _entries[i];
+            DifferentiableOps.UnpinSavedStateTensors<T>(ref entry);
+        }
     }
 
     /// <summary>
@@ -142,6 +181,37 @@ public sealed class GradientTape<T> : IDisposable
     /// call this with <c>this</c> so the backward walk dispatches to the same
     /// engine instance the user invoked the forward op on. Closes #350.
     /// </summary>
+    /// <summary>
+    /// Records where a tensor's data lived when it was taped, so the backward can be dispatched to the
+    /// device that actually holds it.
+    /// </summary>
+    /// <remarks>
+    /// Called from the three <c>DifferentiableOps.Record*</c> entry points, which every differentiable
+    /// op funnels through — one place instead of a binding call per op. An engine that binds itself
+    /// explicitly always wins; this only decides the case where nothing did.
+    /// </remarks>
+    internal void NoteDataDevice(Tensor<T>? tensor)
+    {
+        if (_engineExplicitlyBound || _sawGpuResidentData || tensor is null) return;
+        if (tensor.HasPendingGpuData) _sawGpuResidentData = true;
+    }
+
+    /// <summary>
+    /// Picks the backward engine from where the taped data lives, unless an engine bound itself.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT <c>AiDotNetEngine.Current</c> as a blanket default. Current reflects what the
+    /// process auto-detected, not what this computation used, and defaulting to it silently moved
+    /// CPU-resident double workloads onto a fp32 GPU backward. When GPU-resident data WAS taped,
+    /// Current is the engine that produced it and staying there avoids a round trip.
+    /// </remarks>
+    private void ResolveEngineFromData()
+    {
+        if (_engineExplicitlyBound) return;
+        if (_sawGpuResidentData) return;   // Current is the GPU engine that produced the data.
+        if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
+    }
+
     public void BindEngineIfUnset(IEngine engine)
     {
         if (_engineExplicitlyBound) return;
@@ -303,6 +373,7 @@ public sealed class GradientTape<T> : IDisposable
             return; // Drop new entries when at capacity
         }
 
+        DifferentiableOps.PinSavedStateTensors<T>(ref entry);
         _entries.Add(entry);
 
         // Graph-path visibility for MANUAL backward nodes. This public Record(entry) API is the
@@ -342,7 +413,7 @@ public sealed class GradientTape<T> : IDisposable
     private TapeEntry<T> _discardSlot;
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    internal ref TapeEntry<T> RecordSlot()
+    internal ref TapeEntry<T> RecordSlot(out bool accepted)
     {
         // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording
         // entry point, so a streaming-released persistent tape must reject it too — otherwise a caller
@@ -352,9 +423,11 @@ public sealed class GradientTape<T> : IDisposable
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            accepted = false;
             _discardSlot = default;
             return ref _discardSlot;
         }
+        accepted = true;
         return ref _entries.AllocateSlot();
     }
 
@@ -446,6 +519,7 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
         ThrowIfStreamingReleased();
+        ResolveEngineFromData();
         if (sources is null) throw new ArgumentNullException(nameof(sources));
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
         if (_entries.Count == 0)
@@ -453,6 +527,8 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.GradFn is null)
             throw new InvalidOperationException(
                 "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+
+        int recordedEntryCount = _entries.Count;
 
         var engine = _engine;
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
@@ -654,7 +730,11 @@ public sealed class GradientTape<T> : IDisposable
                             // is what otherwise pins the whole activation set for the backward's duration.
                             if (entrySlotOfOutput is not null
                                 && entrySlotOfOutput.TryGetValue(nodeOutput, out int slot))
+                            {
+                                ref var releasedEntry = ref _entries[slot];
+                                DifferentiableOps.UnpinSavedStateTensors<T>(ref releasedEntry);
                                 _entries[slot] = default;
+                            }
                         }
                         // This node's backward has already run, so it no longer needs its INPUTS.
                         // Drop the node's references to them: an activation is the output of one node and
@@ -692,6 +772,10 @@ public sealed class GradientTape<T> : IDisposable
         finally
         {
             SetCurrentTape(savedCurrent);
+            // Release every entry recorded before streaming began, including dead
+            // entries that were absent from the GradFn traversal. Entries already
+            // released while dropping activations are guarded by their ownership bit.
+            ReleaseSavedStatePins(recordedEntryCount);
             if (!_options.Persistent)
             {
                 // Non-persistent tapes drop the whole arena here, so they're safe to
@@ -735,11 +819,13 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
         ThrowIfStreamingReleased();
+        ResolveEngineFromData();
 
         if (_entries.Count == 0)
         {
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         }
+        int recordedEntryCount = _entries.Count;
 
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
@@ -1127,6 +1213,11 @@ public sealed class GradientTape<T> : IDisposable
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
             }
+            // The slow tape walk may skip pruned or gradient-dead entries, but all
+            // entries acquired saved-state pins at record time. Release the original
+            // forward range exactly once; createGraph entries appended by backward
+            // belong to the next higher-order pass and remain pinned.
+            ReleaseSavedStatePins(recordedEntryCount);
         }
 
         // Tape-walk parity for the .Grad / .GradFn cleanup that ComputeGradientsViaGraph does.
@@ -1299,6 +1390,7 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
+        int recordedEntryCount = _entries.Count;
         // Suspend recording while backward runs so engine ops invoked from
         // backward funcs don't append to *this* tape (would shift bounded
         // tapes / corrupt persistent ones), and so backward fast paths that
@@ -1325,6 +1417,10 @@ public sealed class GradientTape<T> : IDisposable
         }
         finally
         {
+            // Graph traversal reaches only loss-connected nodes. Pin acquisition is
+            // per tape entry, so release the complete pre-backward entry range here;
+            // this also covers dead entries and cached-replay early returns.
+            ReleaseSavedStatePins(recordedEntryCount);
             if (suspendTape)
             {
                 SetCurrentTape(savedCurrent);
@@ -1683,7 +1779,6 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
-
                     // Input0 CAN be a leaf (no GradFn) or a foreign-tape intermediate
                     // (GradFn.OwningTape != this), or null when the streaming backward
                     // already released this node's inputs.
@@ -1812,7 +1907,6 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
-
                     // Issue #283 fix: destructive cleanup on Output AND on
                     // intermediate Inputs. Output is always an intermediate
                     // (leaves never appear as Output of an entry). Inputs
@@ -2002,6 +2096,7 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
 
+        ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
     }
 
@@ -2149,6 +2244,9 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.Length != 1)
             throw new ArgumentException($"CompileBackward requires a scalar loss tensor (length 1), got length {loss.Length}.", nameof(loss));
 
+        // A caller that compiles directly never goes through ComputeGradients, so without this the
+        // compiled graph captures the constructor default instead of the data-derived engine.
+        ResolveEngineFromData();
         return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine, _retainGrad);
     }
 
@@ -2281,10 +2379,20 @@ public sealed class GradientTape<T> : IDisposable
         // which is a strict superset of the old per-Output walk and bounds memory
         // to ~one step. Entries created before the tape are preserved, so the
         // cross-tape inference-reuse scenarios the old walk protected still hold.
-        // Guard on the SAME engine instance the snapshot came from (CPU<->GPU
-        // rebind, #350); the byte/managed caps remain as a backstop either way.
-        if (_parent is null && _snapshotEngine is not null
-            && ReferenceEquals(_snapshotEngine, _engine))
+        // Pair against the constructor-captured engine, independently of the dispatch engine.
+        // ResolveEngineFromData may intentionally redirect a CPU-resident tape's backward to
+        // CpuFallbackEngine, but that must not strand the suspend taken from _snapshotEngine.
+        //
+        // This used to require ReferenceEquals(_snapshotEngine, _engine), which was ALREADY latently
+        // wrong before ResolveEngineFromData existed: the ctor suspends UNCONDITIONALLY, so any tape
+        // whose dispatch engine later differed — a BindEngineIfUnset rebind just as much as a CPU
+        // redirect — skipped the resume and left the suspend depth permanently raised, disabling
+        // byte-cap eviction on that GPU engine for the rest of the process. One leak per tape, silent.
+        //
+        // Evicting is still right when the backward dispatched to CPU: the activations created after
+        // the snapshot are this step's GPU intermediates either way, so they are garbage once the tape
+        // ends.
+        if (_parent is null && _snapshotEngine is not null)
         {
             // Pair the SuspendActivationEviction taken in the ctor BEFORE the
             // deterministic eviction below. ResumeActivationEviction first so
@@ -2295,6 +2403,11 @@ public sealed class GradientTape<T> : IDisposable
             _snapshotEngine.ResumeActivationEviction();
             _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
         }
+
+        // A tape may be disposed before backward, or after a cleanup path that
+        // visited only reachable nodes. Release any entry-owned saved-state pins
+        // before the arena drops those references; already-cleaned entries no-op.
+        ReleaseSavedStatePins(_entries.Count);
 
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();

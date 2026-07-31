@@ -1661,6 +1661,45 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return result;
     }
 
+    /// <summary>
+    /// Reads an integer buffer back to the host.
+    /// </summary>
+    /// <remarks>
+    /// The counterpart to <see cref="AllocateIntBuffer(int)"/>, which existed with no way
+    /// to read what it held. Max-pool indices are the first caller that needs it: they
+    /// route every gradient in the backward pass, so verifying them requires reading them.
+    /// </remarks>
+    public void DownloadIntBuffer(IGpuBuffer buffer, int[] destination)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its download (issue #226).");
+        if (destination.Length < buffer.Size)
+            throw new ArgumentException("Destination array is too small.", nameof(destination));
+
+        using var _ = PushContext();
+
+        // Same stream-ordering hazard as the float path: kernels run on _stream while
+        // cuMemcpyDtoH issues on the null stream, which does not implicitly wait for it.
+        AuditSyncIO("DtoH-download-int", (long)buffer.Size * sizeof(int));
+        LogCaptureBlockerIfCapturing("DtoH-download-int", (long)buffer.Size * sizeof(int));
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download-int)");
+
+        ulong byteSize = (ulong)(buffer.Size * sizeof(int));
+        unsafe
+        {
+            fixed (int* dst = destination)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemcpyDtoH((IntPtr)dst, buffer.Handle, byteSize),
+                    "cuMemcpyDtoH(int download)");
+            }
+        }
+    }
+
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
@@ -6049,6 +6088,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        // The generated depthwise kernel measured 2.08x-2.99x against cuDNN and sits at an
+        // L1 roofline. It takes over only for the exact geometry that evidence covers and
+        // only when the family is promoted; anything else falls through to the kernel below.
+        if (TryDirectPtxDepthwiseConv2D(input, kernel, output, batch, channels,
+                inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW))
+            return;
+
         if (!_kernelCache.TryGetValue("depthwise_conv2d", out var cudaKernel))
             throw new InvalidOperationException("CUDA kernel not found: depthwise_conv2d");
 
@@ -6639,6 +6686,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        // The generated max pool measured 1.41x against cuDNN and sits at a DRAM roofline.
+        // It writes the argmax indices in the same convention maxpool2d_backward decodes,
+        // and declines outright when no indices buffer is supplied rather than guessing.
+        if (TryDirectPtxMaxPool2D(input, output, indices, batch, channels,
+                inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW))
+            return;
+
         if (!_kernelCache.TryGetValue("maxpool2d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: maxpool2d");
 
@@ -11485,15 +11540,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
     }
-    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
         using var _ = PushContext();
         int __total = batch*numHeads; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
-        void** args = stackalloc void*[12];
-        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        IntPtr la0 = r.Handle; IntPtr la1 = kappa.Handle; IntPtr la2 = kTilde.Handle; IntPtr la3 = v.Handle; IntPtr la4 = decayLogit.Handle; IntPtr la5 = iclRate.Handle; IntPtr la6 = output.Handle; IntPtr la7 = sbuf.Handle; int la8 = batch; int la9 = seqLen; int la10 = modelDim; int la11 = numHeads; int la12 = headDim;
+        void** args = stackalloc void*[13];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11; args[12] = &la12;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
     }
     public unsafe void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
@@ -11584,13 +11639,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
-    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
         var kernel = ResolveParity210Kernel("parity210_phase_vocoder");
         using var _ = PushContext();
-        int __total = leading*nFreqV; if (__total <= 0) return;
+        int __total = leading*numFreqs; if (__total <= 0) return;
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = nFramesV; int la6 = nFreqV; int la7 = outFrames; float la8 = rate;
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = numFrames; int la6 = numFreqs; int la7 = outFrames; float la8 = rate;
         void** args = stackalloc void*[9];
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);

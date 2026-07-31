@@ -40,7 +40,7 @@ internal static class DirectPtxProfileTarget
             Console.WriteLine(kernel.Audit.ToJson());
         }
         runtime.Synchronize();
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-end", afterSuite: true);
     }
 
     internal static void RunResidualRmsNorm()
@@ -67,7 +67,8 @@ internal static class DirectPtxProfileTarget
             runtime.Synchronize();
             Console.WriteLine(kernel.Audit.ToJson());
         }
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-residual-rmsnorm-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-residual-rmsnorm-end", afterSuite: true);
     }
 
     internal static void RunDecode()
@@ -109,7 +110,7 @@ internal static class DirectPtxProfileTarget
         runtime.Synchronize();
         Console.WriteLine(dense.Audit.ToJson());
         Console.WriteLine(paged.Audit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-decode-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-decode-end", afterSuite: true);
     }
 
     internal static void RunPagedPrefill()
@@ -139,7 +140,8 @@ internal static class DirectPtxProfileTarget
         launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-paged-prefill-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-paged-prefill-end", afterSuite: true);
     }
 
     internal static void RunAttentionBackward()
@@ -177,7 +179,8 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.RowDeltaAudit.ToJson());
         Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
         Console.WriteLine(kernel.GradQueryAudit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-backward-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-attention-backward-end", afterSuite: true);
     }
 
     internal static void RunFlashAttentionBackward()
@@ -218,7 +221,8 @@ internal static class DirectPtxProfileTarget
         runtime.Synchronize();
         Console.WriteLine(kernel.GradQueryAudit.ToJson());
         Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-flash-attention-backward-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-flash-attention-backward-end", afterSuite: true);
     }
 
     internal static void RunQkvRopeCache()
@@ -261,7 +265,31 @@ internal static class DirectPtxProfileTarget
             runtime.Synchronize();
             Console.WriteLine(kernel.Audit.ToJson());
         }
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-qkv-rope-cache-end", afterSuite: true);
+    }
+
+    internal static void RunConvolution()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-convolution-start");
+        using var runtime = new DirectPtxRuntime();
+        using var kernel = new PtxFusedConv2DNchwK1Kernel(runtime);
+        using var input = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.OutputBytes);
+        input.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.InputBytes / sizeof(float)]);
+        weights.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.WeightBytes / sizeof(float)]);
+        bias.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.BiasBytes / sizeof(float)]);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-convolution-end", afterSuite: true);
     }
 
     internal static void RunVisionBoxIou()

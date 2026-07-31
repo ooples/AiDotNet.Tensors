@@ -36,7 +36,11 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine($"    rem.u32 %r3, %r2, {outW}; div.u32 %r4, %r2, {outW}; rem.u32 %r5, %r4, {outH}; div.u32 %r6, %r4, {outH}; rem.u32 %r7, %r6, {outputC}; div.u32 %r8, %r6, {outputC};");
         ptx.AppendLine("    mul.wide.u32 %rd3, %r8, 20; add.u64 %rd4, %rd1, %rd3; ld.global.f32 %f0, [%rd4]; cvt.rzi.s32.f32 %r9, %f0;");
         ptx.AppendLine($"    setp.lt.s32 %p1, %r9, 0; setp.ge.s32 %p2, %r9, {n}; or.pred %p3, %p1, %p2; @%p3 bra ROI_ZERO;");
-        ptx.AppendLine("    ld.global.v4.f32 {%f1,%f2,%f3,%f4}, [%rd4+4];");
+        // Each ROI row is five floats (20 bytes), so neither the row base nor
+        // its coordinate payload at +4 is guaranteed to satisfy a v4 load's
+        // 16-byte alignment. Scalar loads preserve the packed [batch,x1,y1,x2,y2]
+        // ABI and avoid a sticky CUDA_ERROR_MISALIGNED_ADDRESS fault.
+        ptx.AppendLine("    ld.global.f32 %f1, [%rd4+4]; ld.global.f32 %f2, [%rd4+8]; ld.global.f32 %f3, [%rd4+12]; ld.global.f32 %f4, [%rd4+16];");
         ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {F(spatialScale)}; mul.rn.f32 %f2, %f2, {F(spatialScale)}; mul.rn.f32 %f3, %f3, {F(spatialScale)}; mul.rn.f32 %f4, %f4, {F(spatialScale)};");
         if (align && aligned)
         {

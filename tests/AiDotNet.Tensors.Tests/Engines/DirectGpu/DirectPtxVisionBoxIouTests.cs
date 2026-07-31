@@ -249,6 +249,9 @@ public sealed class DirectPtxVisionBoxIouTests
                 1, 256, 56, 56, 256, 7, 7, 256, 0,
                 BitConverter.SingleToInt32Bits(0.25f)),
             DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.DoesNotContain("ld.global.v4.f32", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.Contains("ld.global.f32 %f1, [%rd4+4]", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.Contains("ld.global.f32 %f4, [%rd4+16]", roiPool.Ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("cvt.rni.s32.f32", roiPool.Ptx, StringComparison.Ordinal);
         Assert.Contains("cvt.rmi.s32.f32", roiPool.Ptx, StringComparison.Ordinal);
         Assert.Contains("cvt.rpi.s32.f32", roiPool.Ptx, StringComparison.Ordinal);
