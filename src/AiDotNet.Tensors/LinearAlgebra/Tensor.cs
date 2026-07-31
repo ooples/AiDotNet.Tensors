@@ -563,6 +563,105 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Returns a zero-copy view of this tensor stretched to <paramref name="targetShape"/>.
+    /// </summary>
+    /// <param name="targetShape">The shape to stretch to. Must be broadcast-compatible with this tensor's.</param>
+    /// <returns>
+    /// A stride-0 view sharing this tensor's storage, or <c>this</c> when the shapes already match.
+    /// </returns>
+    /// <exception cref="ArgumentException">
+    /// Thrown when a dimension is neither equal to the target nor 1, or when the target has lower rank.
+    /// </exception>
+    /// <remarks>
+    /// <para>
+    /// This is the mechanism behind broadcasting, and it copies nothing. An axis being stretched gets
+    /// a stride of <b>0</b>, so every position along it reads the same stored element — a <c>[4,1]</c>
+    /// column viewed as <c>[4,3]</c> is still four numbers in memory. This is what NumPy's
+    /// <c>broadcast_to</c> and PyTorch's <c>expand</c> do, and it is why broadcasting a bias across a
+    /// batch costs no memory.
+    /// </para>
+    /// <para>
+    /// The returned view reports <c>IsContiguous == false</c>, so <see cref="TensorBase{T}.AsSpan"/>
+    /// throws on it rather than handing back a span that is shorter than the logical length. That is
+    /// deliberate: a silently-misread expanded view would produce plausible numbers from the wrong
+    /// memory. Kernels that cannot walk strides should call <see cref="Contiguous"/>, which
+    /// materializes the stretch honestly and visibly.
+    /// </para>
+    /// <para><b>For Beginners:</b> "Stretching" here never duplicates data. Picture one row of numbers
+    /// and a set of instructions saying "pretend this row repeats 10 times". Reading row 7 quietly
+    /// re-reads the only row there is. That is a stride of zero — move forward zero steps when the
+    /// index advances.</para>
+    /// </remarks>
+    public Tensor<T> ExpandTo(int[] targetShape)
+    {
+        if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
+
+        // The overwhelmingly common case in an element-wise op is that no stretch is needed. Return
+        // the receiver untouched so the shape-equal hot path allocates neither view nor descriptors.
+        if (ShapeEquals(_shape, targetShape)) return this;
+
+        int targetRank = targetShape.Length;
+        if (targetRank < Rank)
+            throw new ArgumentException(
+                $"Cannot expand a rank-{Rank} tensor [{string.Join(",", _shape)}] to the lower-rank " +
+                $"shape [{string.Join(",", targetShape)}].", nameof(targetShape));
+
+        // Right-align: NumPy pads the SMALLER shape with leading 1s, so this tensor's axis j
+        // corresponds to target axis j + offset.
+        int offset = targetRank - Rank;
+        var newStrides = new int[targetRank];
+
+        for (int i = 0; i < targetRank; i++)
+        {
+            int target = targetShape[i];
+            if (target < 0)
+                throw new ArgumentException(
+                    $"Target shape [{string.Join(",", targetShape)}] has a negative extent at axis {i}.",
+                    nameof(targetShape));
+
+            int j = i - offset;
+            if (j < 0)
+            {
+                // A padded leading axis: this tensor has no such dimension, so every position along
+                // it reads the same underlying data.
+                newStrides[i] = 0;
+                continue;
+            }
+
+            int mine = _shape[j];
+            if (mine == target)
+            {
+                newStrides[i] = _strides[j];
+            }
+            else if (mine == 1)
+            {
+                newStrides[i] = 0;
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Cannot expand [{string.Join(",", _shape)}] to [{string.Join(",", targetShape)}]: " +
+                    $"axis {i} is {mine} and cannot stretch to {target}. Only axes of extent 1 stretch — " +
+                    "this usually means an operand is transposed or an axis is off by one.",
+                    nameof(targetShape));
+            }
+        }
+
+        var shapeCopy = (int[])targetShape.Clone();
+        var view = CreateStorageView(shapeCopy, newStrides, _storageOffset);
+
+        if (!IsDifferentiableRecordingActive) return view;
+
+        var originalShape = (int[])_shape.Clone();
+        return FinalizeDifferentiableView(
+            view,
+            Engines.Compilation.LazyNodeType.Expand,
+            "Expand",
+            Engines.Autodiff.BackwardFunctions<T>.ExpandBackward,
+            new object[] { originalShape });
+    }
+
+    /// <summary>
     /// Removes a size-1 dimension at the specified axis. O(1) view — no data copy.
     /// </summary>
     /// <param name="axis">The dimension to remove (must have size 1).</param>
@@ -2404,44 +2503,45 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int aOff = maxRank - aRank;
         int bOff = maxRank - bRank;
 
-        // Materialize both operands as zero-offset contiguous buffers so we
-        // can index by flat offset. A contiguous VIEW can still have a
-        // non-zero _storageOffset (e.g. a slice of a larger tensor with row-
-        // major layout); reading _data.AsSpan() from index 0 would then
-        // return garbage from before the view's start. Force offset==0 via
-        // Contiguous() in that case, and slice the resulting span by
-        // (offset, logical length) to also handle ArrayPool-backed buffers
-        // that over-allocate past Length.
-        var aContig = (a.IsContiguous && a._storageOffset == 0) ? a : a.Contiguous();
-        var bContig = (b.IsContiguous && b._storageOffset == 0) ? b : b.Contiguous();
-        var aSpan = aContig._data.AsSpan().Slice(aContig._storageOffset, aContig.Length);
-        var bSpan = bContig._data.AsSpan().Slice(bContig._storageOffset, bContig.Length);
+        // Operands are addressed by explicit per-axis stride, so a non-contiguous view — a
+        // transpose, a slice, or the stride-0 view ExpandTo returns — is consumed exactly where it
+        // lies. Materializing here instead would turn every stretched operand into a full-size
+        // temporary, which is precisely the cost broadcasting exists to avoid.
+        //
+        // Sparse is the one layout this walk cannot address, so it still densifies. Everything else
+        // is handled by starting each operand's index at its own _storageOffset (rather than
+        // forcing offset 0) and indexing the FULL backing span, since an arbitrary stride pattern
+        // is not confined to the [offset, offset + Length) window a contiguous slice would occupy.
+        var aSrc = a.IsSparse ? a.Contiguous() : a;
+        var bSrc = b.IsSparse ? b.Contiguous() : b;
+        aSrc.EnsureMaterialized();
+        bSrc.EnsureMaterialized();
+        ReadOnlySpan<T> aSpan = aSrc._data.AsSpan();
+        ReadOnlySpan<T> bSpan = bSrc._data.AsSpan();
         var rSpan = result._data.AsWritableSpan();
+        int aOrigin = aSrc._storageOffset;
+        int bOrigin = bSrc._storageOffset;
 
         int total = result.Length;
         if (total == 0) return;
-        if (maxRank == 0) { rSpan[0] = ApplyScalar(op, aSpan[0], bSpan[0]); return; }
+        if (maxRank == 0) { rSpan[0] = ApplyScalar(op, aSpan[aOrigin], bSpan[bOrigin]); return; }
 
-        // Broadcast stride per axis: operand's row-major stride if its dim
-        // matches the broadcast dim, or 0 if the dim is 1 (broadcast axis).
-        // Preceding-axes (the extra leading 1s we implicitly added) have
-        // stride 0 as well.
+        // Broadcast stride per axis: the operand's OWN stride for that axis, or 0 where the axis is
+        // stretched (extent 1) or padded in by right-alignment.
+        //
+        // Reading the stored stride rather than re-deriving a row-major one is the whole point. A
+        // derived stride describes the layout the operand WOULD have if it were freshly allocated;
+        // for a transposed or sliced view that is not the layout it actually has, so the walk would
+        // read the right memory in the wrong order and return numbers that look entirely reasonable.
         Span<int> aBroadStride = stackalloc int[maxRank];
         Span<int> bBroadStride = stackalloc int[maxRank];
-        int aRowStride = 1;
-        for (int i = aRank - 1; i >= 0; i--)
+        for (int i = 0; i < maxRank; i++)
         {
-            aBroadStride[aOff + i] = a._shape[i] == 1 ? 0 : aRowStride;
-            aRowStride *= a._shape[i];
+            int j = i - aOff;
+            aBroadStride[i] = (j < 0 || aSrc._shape[j] == 1) ? 0 : aSrc._strides[j];
+            int k = i - bOff;
+            bBroadStride[i] = (k < 0 || bSrc._shape[k] == 1) ? 0 : bSrc._strides[k];
         }
-        for (int i = 0; i < aOff; i++) aBroadStride[i] = 0;
-        int bRowStride = 1;
-        for (int i = bRank - 1; i >= 0; i--)
-        {
-            bBroadStride[bOff + i] = b._shape[i] == 1 ? 0 : bRowStride;
-            bRowStride *= b._shape[i];
-        }
-        for (int i = 0; i < bOff; i++) bBroadStride[i] = 0;
 
         // Coalesce trailing dims into one vectorizable inner block. The
         // innermost result dim has result-stride 1; extend the block leftward
@@ -2457,8 +2557,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int outerRank = maxRank - 1;
         for (int d = maxRank - 2; d >= 0; d--)
         {
-            int expectedA = aStride == 0 ? 0 : innerLen;
-            int expectedB = bStride == 0 ? 0 : innerLen;
+            // A dim continues the inner block only if stepping it advances by exactly one whole
+            // block at the operand's own per-element stride. With a derived row-major stride that
+            // is always innerLen; with a real stride it scales by it.
+            int expectedA = aStride == 0 ? 0 : aStride * innerLen;
+            int expectedB = bStride == 0 ? 0 : bStride * innerLen;
             if (aBroadStride[d] == expectedA && bBroadStride[d] == expectedB)
             {
                 innerLen *= broadcastShape[d];
@@ -2480,7 +2583,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 coord[d] = remaining % broadcastShape[d];
                 remaining /= broadcastShape[d];
             }
-            int aBase = 0, bBase = 0;
+            int aBase = aOrigin, bBase = bOrigin;
             for (int d = 0; d < outerRank; d++)
             {
                 aBase += coord[d] * aBroadStride[d];
@@ -2550,9 +2653,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // net471 (and non-float/double T): tight scalar+enum loop. Still avoids
         // the per-element Func<T,T,T> delegate and benefits from the collapsed
         // inner block (coordinate math runs per-block, not per-element).
+        //
+        // The multiply by stride is what makes an already-strided operand — a transpose or a slice
+        // arriving unmaterialized — read correctly. Treating stride as merely zero-or-not would
+        // walk it one element at a time in storage order and return plausible, wrong numbers.
         for (int i = 0; i < len; i++)
-            r[rBase + i] = ApplyScalar(op,
-                a[aBase + (aStride == 0 ? 0 : i)], b[bBase + (bStride == 0 ? 0 : i)]);
+            r[rBase + i] = ApplyScalar(op, a[aBase + i * aStride], b[bBase + i * bStride]);
     }
 
 #if NET6_0_OR_GREATER
@@ -2594,9 +2700,18 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
             for (; i < len; i++) r[rBase + i] = ScalarFloat(op, as0, b[bBase + i]);
         }
-        else
+        else if (aStride == 0 && bStride == 0)
         {
             r.Slice(rBase, len).Fill(ScalarFloat(op, a[aBase], b[bBase]));
+        }
+        else
+        {
+            // Both operands strided by something other than 0 or 1 — a transposed or sliced view
+            // consumed where it lies rather than materialized. Scalar on purpose: vectorizing this
+            // needs gather, and the branches above already cover every layout that broadcasting
+            // itself produces, so this runs only for genuinely non-unit-stride inputs.
+            for (; i < len; i++)
+                r[rBase + i] = ScalarFloat(op, a[aBase + i * aStride], b[bBase + i * bStride]);
         }
     }
 
@@ -2638,9 +2753,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
             for (; i < len; i++) r[rBase + i] = ScalarDouble(op, as0, b[bBase + i]);
         }
-        else
+        else if (aStride == 0 && bStride == 0)
         {
             r.Slice(rBase, len).Fill(ScalarDouble(op, a[aBase], b[bBase]));
+        }
+        else
+        {
+            // See ApplyInnerFloat: general strided walk for operands consumed unmaterialized.
+            for (; i < len; i++)
+                r[rBase + i] = ScalarDouble(op, a[aBase + i * aStride], b[bBase + i * bStride]);
         }
     }
 

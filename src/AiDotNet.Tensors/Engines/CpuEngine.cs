@@ -3013,7 +3013,17 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!ShapesMatch(a._shape, b._shape))
         {
             if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
-                return TensorBroadcastAdd(a, b);
+            {
+                // Stretch both operands to the common shape as zero-copy stride-0 views, then take
+                // the ordinary equal-shape path. Nothing is materialized: ExpandTo returns a view
+                // that shares storage, and the kernel below reads operand strides directly.
+                //
+                // This recurses exactly once. The expanded operands have identical shapes, so the
+                // mismatch branch cannot be re-entered — and ExpandTo returns the receiver itself
+                // when no stretch is needed, so the equal-shape hot path stays allocation-free.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return TensorAdd(a.ExpandTo(broadcastShape), b.ExpandTo(broadcastShape));
+            }
 
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
@@ -5335,7 +5345,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!ShapesMatch(a._shape, b._shape))
         {
             if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
-                return TensorBroadcastSubtract(a, b);
+            {
+                // See TensorAdd: expand to stride-0 views, then recurse once onto the equal-shape path.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return TensorSubtract(a.ExpandTo(broadcastShape), b.ExpandTo(broadcastShape));
+            }
 
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
@@ -5499,7 +5513,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!ShapesMatch(a._shape, b._shape))
         {
             if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
-                return TensorBroadcastMultiply(a, b);
+            {
+                // See TensorAdd: expand to stride-0 views, then recurse once onto the equal-shape path.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return TensorMultiply(a.ExpandTo(broadcastShape), b.ExpandTo(broadcastShape));
+            }
 
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
@@ -6226,7 +6244,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!ShapesMatch(a._shape, b._shape))
         {
             if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
-                return TensorBroadcastDivide(a, b);
+            {
+                // See TensorAdd: expand to stride-0 views, then recurse once onto the equal-shape path.
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return TensorDivide(a.ExpandTo(broadcastShape), b.ExpandTo(broadcastShape));
+            }
 
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."

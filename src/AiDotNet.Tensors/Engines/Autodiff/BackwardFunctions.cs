@@ -908,6 +908,26 @@ internal static class BackwardFunctions<T>
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>d(broadcast_add(a,b))/da = reduce_grad(grad, a.shape), d/db = reduce_grad(grad, b.shape)</summary>
+    /// <summary>
+    /// d(expand(a))/da = sum of the gradient over every axis that was stretched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This single unary rule replaces the reduction that the four binary broadcast backwards each
+    /// perform on their own. An expand is a stride-0 view: one stored element is read once per
+    /// position along the stretched axis, so its gradient is the sum of the gradient at all those
+    /// positions. Leaving the sum out is the classic broadcasting bug — every forward value stays
+    /// correct while the operand's gradient comes back too small by exactly the stretch factor.
+    /// </para>
+    /// </remarks>
+    internal static void ExpandBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var grad = ReduceGradToShape(gradOutput, inputs[0]._shape, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     internal static void BroadcastAddBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
