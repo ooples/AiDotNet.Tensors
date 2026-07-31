@@ -69,6 +69,42 @@ public sealed class CodegenOuterProductWinogradConv2DTests
     }
 
     [Fact]
+    public void FineOutputPartitionSchedule_DoublesGridAndBalancesPhysicalTiles()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var schedule = new CodegenOuterProductWinogradSchedule(
+            blockTiles: 16, compactShared: true);
+        var emitter = new PtxOuterProductWinogradConv2DEmitter(schedule);
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Equal("inline-outer-winograd-conv2d-t16-compact", schedule.WinnerName);
+        Assert.Equal(128U, emitter.LaunchBlocks);
+        Assert.Equal(28672, emitter.SharedMemoryBytes);
+        Assert.Contains("M32 x 16 tiles", ptx);
+        Assert.Contains("active outer-product owner", ptx);
+        Assert.Contains("mad.lo.u32 %r28, %r28, 4, %r2", ptx);
+        Assert.Contains("setp.lt.u32 %p4, %r28, 49", ptx);
+    }
+
+    [Fact]
+    public void FineRegisterFragmentSchedule_KeepsEveryWarpInTheOuterProduct()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var schedule = new CodegenOuterProductWinogradSchedule(
+            blockTiles: 16, threadTileM: 4, compactShared: true);
+        var emitter = new PtxOuterProductWinogradConv2DEmitter(schedule);
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Equal("inline-outer-winograd-conv2d-t16-tm4-compact", schedule.WinnerName);
+        Assert.Equal(128U, emitter.LaunchBlocks);
+        Assert.Equal(28672, emitter.SharedMemoryBytes);
+        Assert.Contains("component-owned 4x8 outer product", ptx);
+        Assert.DoesNotContain("active outer-product owner", ptx);
+    }
+
+    [Fact]
     public void UnsupportedShapeAndArchitecture_AreRejectedBeforeEmission()
     {
         var verify = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Verify;

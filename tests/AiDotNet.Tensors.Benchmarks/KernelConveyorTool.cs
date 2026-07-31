@@ -429,13 +429,13 @@ internal static class KernelConveyorTool
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         string? winner = CodegenAutotuneCache.WinnerFor(catalogName, identity);
 
-        if (string.Equals(winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal) ||
-            string.Equals(winner, "inline-outer-winograd-conv2d-compact", StringComparison.Ordinal))
+        CodegenOuterProductWinogradSchedule? winogradSchedule =
+            CodegenOuterProductWinogradSchedule.Find(winner);
+        if (winogradSchedule is not null)
         {
             try
             {
-                bool compact = winner!.EndsWith("-compact", StringComparison.Ordinal);
-                var winograd = new PtxOuterProductWinogradConv2DEmitter(compact);
+                var winograd = new PtxOuterProductWinogradConv2DEmitter(winogradSchedule);
                 string text = winograd.Emit(
                     spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                 return new TunedProgram(

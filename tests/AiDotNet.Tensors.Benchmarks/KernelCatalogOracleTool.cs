@@ -423,13 +423,10 @@ internal static class KernelCatalogOracleTool
             features.Add("output-reuse-4x");
             shape = "one input per thread, deterministic 2x2 output parity tile";
         }
-        else if (string.Equals(
-                     winner, "inline-outer-winograd-conv2d", StringComparison.Ordinal) ||
-                 string.Equals(
-                     winner, "inline-outer-winograd-conv2d-compact", StringComparison.Ordinal))
+        else if (CodegenOuterProductWinogradSchedule.Find(winner) is
+                 CodegenOuterProductWinogradSchedule winogradSchedule)
         {
-            bool compact = winner!.EndsWith("-compact", StringComparison.Ordinal);
-            var emitter = new PtxOuterProductWinogradConv2DEmitter(compact);
+            var emitter = new PtxOuterProductWinogradConv2DEmitter(winogradSchedule);
             _ = emitter.Emit(entry.Bench, major, minor);
             var plan = emitter.Plan!;
 
@@ -449,16 +446,27 @@ internal static class KernelCatalogOracleTool
             sharedMemoryBytes = emitter.SharedMemoryBytes;
             blockThreads = emitter.LaunchBlockThreads;
             blocks = checked((int)emitter.LaunchBlocks);
-            doubleBuffered = !compact;
+            doubleBuffered = !winogradSchedule.CompactShared;
             features.Add("winograd-f2x3");
             features.Add("register-tiled");
             features.Add("register-prefetched-global");
-            if (compact)
+            features.Add("active-outer-warps-" +
+                (emitter.ActiveOuterProductThreads / 32).ToString(
+                    CultureInfo.InvariantCulture));
+            if (winogradSchedule.BlockTiles < 32)
+                features.Add("fine-output-partitions");
+            if (winogradSchedule.ThreadTileM < 8)
+                features.Add("fine-register-fragments");
+            if (winogradSchedule.CompactShared)
             {
                 features.Add("compact-shared");
                 features.Add("single-shared-buffer");
             }
-            shape = "Winograd F(2,3), M32 x 32 tiles, C8 staged 8x8 outer product";
+            shape = "Winograd F(2,3), M32 x " +
+                winogradSchedule.BlockTiles.ToString(CultureInfo.InvariantCulture) +
+                " tiles, C8 staged " +
+                winogradSchedule.ThreadTileM.ToString(CultureInfo.InvariantCulture) +
+                "x8 outer product";
         }
         else if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal) ||
                  CodegenTiledConv2DSchedule.Find(winner) is { })
@@ -623,17 +631,19 @@ internal static class KernelCatalogOracleTool
                 schedule.Multiprocessors.ToString(CultureInfo.InvariantCulture) +
                 " SMs. Its " + schedule.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) +
                 (schedule.Features.Contains("compact-shared", StringComparison.Ordinal)
-                    ? "-byte compact tile permits two resident CTAs, but the grid has no " +
-                      "second CTA for most SMs."
+                    ? "-byte compact tile permits two resident CTAs, but the grid supplies " +
+                      "fewer than two CTAs per SM."
                     : "-byte shared tile also permits only one resident CTA/SM."),
-                (schedule.Features.Contains("compact-shared", StringComparison.Ordinal)
-                    ? "The compact candidate removed the residency limit; next increase output " +
-                      "partition count with a smaller measured block tile. "
-                    : "The compact single-buffer/two-wave candidate was included in the exact " +
-                      "search and did not win because it left the " +
-                      schedule.Blocks.ToString(CultureInfo.InvariantCulture) +
-                      "-CTA grid unchanged. Next " +
-                      "increase output partition count with a smaller measured block tile. ") +
+                (schedule.Features.Contains("fine-output-partitions", StringComparison.Ordinal)
+                    ? "Fine output partitions are already active. Next measure a separately " +
+                      "pretransformed filter phase that can be reused across those partitions, " +
+                      "or a warp-specialized producer/consumer pipeline. "
+                    : "The exact search includes compact shared storage plus balanced 16-tile " +
+                      "partitions with both 8x7 and 4x7 register fragments. None won: added " +
+                      "residency and a 128-CTA grid did not repay duplicated filter transforms " +
+                      "and CTA barriers. Next measure a separately pretransformed filter phase " +
+                      "that can be reused across output partitions, or a warp-specialized " +
+                      "producer/consumer pipeline. ") +
                 "A generic direct/implicit-GEMM recommendation is inapplicable because the " +
                 "winning dispatch is already Winograd.");
         }

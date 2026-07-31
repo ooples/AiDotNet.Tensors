@@ -27,6 +27,22 @@ public class CodegenAutotuneIdentityTests
     }
 
     [Fact]
+    public void Protocol_CombinesIndependentWinnerAndChallengerUncertainty()
+    {
+        Assert.Equal(
+            CodegenMeasurementProtocol.AutotuneGainNoiseFloor,
+            CodegenMeasurementProtocol.RequiredIndependentCandidateGain(0, 0));
+        Assert.Equal(
+            1.07,
+            CodegenMeasurementProtocol.RequiredIndependentCandidateGain(0.03, 0.04),
+            precision: 12);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            CodegenMeasurementProtocol.RequiredIndependentCandidateGain(-0.01, 0.02));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            CodegenMeasurementProtocol.RequiredIndependentCandidateGain(0.01, double.NaN));
+    }
+
+    [Fact]
     public async Task Identity_IsMemoizedForTheSameInputs_AndIsolatedBySpecAndDevice()
     {
         var first = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(1, 32, 16, 16);

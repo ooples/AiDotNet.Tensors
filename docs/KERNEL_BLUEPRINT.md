@@ -177,6 +177,12 @@ only `scope=full` rows produced by the complete finite search. This prevents a h
 candidate subset from masquerading as the measured winner even when its spec, device, target,
 emitter fingerprint, and measurement protocol are otherwise current.
 
+Candidates are paired with the same live modelled baseline, but different candidates are still
+measured in independent windows. A challenger therefore has to clear the sum of its paired-ratio
+spread and the current winner's spread before it can replace that winner. Comparing only their
+medians allowed a 3% schedule change between windows carrying 2.4% and 3.7% spread; protocol p12
+treats that result as the tie the evidence supports.
+
 ---
 
 ## 6. Promotion is per family, on that family's own evidence

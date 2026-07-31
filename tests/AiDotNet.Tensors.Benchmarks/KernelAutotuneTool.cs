@@ -43,6 +43,23 @@ internal static class KernelAutotuneTool
     private sealed record TuneResult(
         string Name, double BestUs, double ModelledUs, double Gain);
 
+    private sealed class TuneState
+    {
+        internal TuneState(StableTimer.Result baseline)
+        {
+            HasStableTiming = baseline.Stable;
+            BestUs = baseline.Stable ? baseline.Microseconds : double.MaxValue;
+            BestModelledUs = BestUs;
+        }
+
+        internal bool HasStableTiming { get; set; }
+        internal string BestName { get; set; } = "modelled";
+        internal double BestUs { get; set; }
+        internal double BestModelledUs { get; set; }
+        internal double BestGain { get; set; } = 1.0;
+        internal double BestRelativeSpread { get; set; }
+    }
+
     private sealed record CandidatePhase(string Name, Action Launch, long WorkUnits);
 
     /// <summary>A loaded candidate kept alive while it is paired against the baseline.</summary>
@@ -173,7 +190,8 @@ internal static class KernelAutotuneTool
                     ", " + string.Join(", ", CodegenTiledConv2DSplitSchedule.SearchSpace
                         .Select(s => s.WinnerName)) +
                     ", library-winograd-fp32-bn16, library-winograd-fp32-bn32, " +
-                    "inline-outer-winograd-conv2d, inline-outer-winograd-conv2d-compact, " +
+                    string.Join(", ", CodegenOuterProductWinogradSchedule.SearchSpace
+                        .Select(s => s.WinnerName)) + ", " +
                     "library-bwd-input-direct, " +
                     "split, tiled-split, tiled-chunked-split"
                 : candidateSelector));
@@ -306,14 +324,12 @@ internal static class KernelAutotuneTool
     private static void ProfileOne(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, string candidateName)
     {
-        if (string.Equals(candidateName, "inline-outer-winograd-conv2d",
-                StringComparison.Ordinal) ||
-            string.Equals(candidateName, "inline-outer-winograd-conv2d-compact",
-                StringComparison.Ordinal))
+        CodegenOuterProductWinogradSchedule? winogradSchedule =
+            CodegenOuterProductWinogradSchedule.Find(candidateName);
+        if (winogradSchedule is not null)
         {
-            bool compact = candidateName.EndsWith("-compact", StringComparison.Ordinal);
             using CandidateProgram? winograd =
-                TryCreateInlineOuterWinograd(runtime, spec, compact);
+                TryCreateInlineOuterWinograd(runtime, spec, winogradSchedule);
             if (winograd is null)
                 throw new ArgumentException(
                     "The inline outer-product Winograd candidate does not support this spec.");
@@ -369,17 +385,13 @@ internal static class KernelAutotuneTool
         float[] reference = modelled.ReadOutput();
 
         StableTimer.Result baseline = StableTimer.Measure(runtime, modelled.Launch, workUnits);
-        bool hasStableTiming = baseline.Stable;
         if (!baseline.Stable)
         {
             Console.WriteLine("    modelled lowering " + baseline.Describe() +
                               "; trying independently gated paired windows");
         }
 
-        string bestName = "modelled";
-        double bestUs = baseline.Stable ? baseline.Microseconds : double.MaxValue;
-        double bestModelledUs = bestUs;
-        double bestGain = 1.0;
+        var state = new TuneState(baseline);
 
         for (int i = 1; i < Candidates.Length; i++)
         {
@@ -399,9 +411,7 @@ internal static class KernelAutotuneTool
                     continue;
                 }
 
-                Consider(runtime, modelled, program, workUnits,
-                    ref hasStableTiming, ref bestName, ref bestUs,
-                    ref bestModelledUs, ref bestGain);
+                Consider(runtime, modelled, program, workUnits, state);
             }
         }
 
@@ -429,9 +439,7 @@ internal static class KernelAutotuneTool
                                       " relative; rejected");
                     continue;
                 }
-                Consider(runtime, modelled, program, workUnits,
-                    ref hasStableTiming, ref bestName, ref bestUs,
-                    ref bestModelledUs, ref bestGain);
+                Consider(runtime, modelled, program, workUnits, state);
             }
         }
 
@@ -459,9 +467,7 @@ internal static class KernelAutotuneTool
                                       " relative; rejected");
                     continue;
                 }
-                Consider(runtime, modelled, program, workUnits,
-                    ref hasStableTiming, ref bestName, ref bestUs,
-                    ref bestModelledUs, ref bestGain);
+                Consider(runtime, modelled, program, workUnits, state);
             }
         }
 
@@ -485,9 +491,7 @@ internal static class KernelAutotuneTool
                                   " relative; rejected");
                 continue;
             }
-            Consider(runtime, modelled, split, workUnits,
-                ref hasStableTiming, ref bestName, ref bestUs,
-                ref bestModelledUs, ref bestGain);
+            Consider(runtime, modelled, split, workUnits, state);
         }
 
         // Point the oracle at the independently developed true-FP32 hand-written
@@ -510,15 +514,14 @@ internal static class KernelAutotuneTool
                 continue;
             }
 
-            Consider(runtime, modelled, library, workUnits,
-                ref hasStableTiming, ref bestName, ref bestUs,
-                ref bestModelledUs, ref bestGain);
+            Consider(runtime, modelled, library, workUnits, state);
         }
 
-        foreach (bool compact in new[] { false, true })
+        foreach (CodegenOuterProductWinogradSchedule schedule in
+                 CodegenOuterProductWinogradSchedule.SearchSpace)
         {
             using CandidateProgram? winograd = TryCreateInlineOuterWinograd(
-                runtime, spec, compact);
+                runtime, spec, schedule);
             if (winograd is null || !CandidateEnabled(candidateSelector, winograd.Name))
                 continue;
             winograd.Launch();
@@ -539,9 +542,7 @@ internal static class KernelAutotuneTool
                                   "; rejected");
                 continue;
             }
-            Consider(runtime, modelled, winograd, workUnits,
-                ref hasStableTiming, ref bestName, ref bestUs,
-                ref bestModelledUs, ref bestGain);
+            Consider(runtime, modelled, winograd, workUnits, state);
         }
 
         // Probe the same true-FP32 Winograd dataflow as a linear adjoint. This is
@@ -563,9 +564,7 @@ internal static class KernelAutotuneTool
                 }
                 else
                 {
-                    Consider(runtime, modelled, library, workUnits,
-                        ref hasStableTiming, ref bestName, ref bestUs,
-                        ref bestModelledUs, ref bestGain);
+                    Consider(runtime, modelled, library, workUnits, state);
                 }
             }
         }
@@ -588,9 +587,7 @@ internal static class KernelAutotuneTool
                 }
                 else
                 {
-                    Consider(runtime, modelled, library, workUnits,
-                        ref hasStableTiming, ref bestName, ref bestUs,
-                        ref bestModelledUs, ref bestGain);
+                    Consider(runtime, modelled, library, workUnits, state);
                 }
             }
         }
@@ -615,9 +612,7 @@ internal static class KernelAutotuneTool
             }
             else
             {
-                Consider(runtime, modelled, split, workUnits,
-                    ref hasStableTiming, ref bestName, ref bestUs,
-                    ref bestModelledUs, ref bestGain);
+                Consider(runtime, modelled, split, workUnits, state);
             }
         }
 
@@ -637,18 +632,17 @@ internal static class KernelAutotuneTool
                 continue;
             }
 
-            Consider(runtime, modelled, split, workUnits,
-                ref hasStableTiming, ref bestName, ref bestUs,
-                ref bestModelledUs, ref bestGain);
+            Consider(runtime, modelled, split, workUnits, state);
         }
 
-        if (!hasStableTiming)
+        if (!state.HasStableTiming)
         {
             Console.WriteLine("    no standalone or paired timing window stabilized; " +
                               "no winner recorded");
             return null;
         }
-        return new TuneResult(bestName, bestUs, bestModelledUs, bestGain);
+        return new TuneResult(
+            state.BestName, state.BestUs, state.BestModelledUs, state.BestGain);
     }
 
     private static bool CandidateEnabled(string? selector, string name) =>
@@ -668,10 +662,10 @@ internal static class KernelAutotuneTool
                 selector, schedule.WinnerName, StringComparison.OrdinalIgnoreCase)) ||
             CodegenTiledConv2DSplitSchedule.SearchSpace.Any(schedule => string.Equals(
                 selector, schedule.WinnerName, StringComparison.OrdinalIgnoreCase)) ||
+            CodegenOuterProductWinogradSchedule.SearchSpace.Any(schedule => string.Equals(
+                selector, schedule.WinnerName, StringComparison.OrdinalIgnoreCase)) ||
             string.Equals(selector, "library-winograd-fp32-bn16", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "library-winograd-fp32-bn32", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(selector, "inline-outer-winograd-conv2d", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(selector, "inline-outer-winograd-conv2d-compact", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "library-winograd-inline-adjoint-fp32", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(selector, "library-bwd-input-direct", StringComparison.OrdinalIgnoreCase) ||
             selector.StartsWith("split:", StringComparison.OrdinalIgnoreCase) ||
@@ -685,8 +679,7 @@ internal static class KernelAutotuneTool
     private static void Consider(
         DirectPtxRuntime runtime,
         CandidateProgram modelled, CandidateProgram candidate, long workUnits,
-        ref bool hasStableTiming,
-        ref string bestName, ref double bestUs, ref double bestModelledUs, ref double bestGain)
+        TuneState state)
     {
         StableTimer.PairResult timing = StableTimer.MeasurePair(
             runtime, modelled.Launch, candidate.Launch, workUnits, workUnits);
@@ -713,11 +706,11 @@ internal static class KernelAutotuneTool
 
         // A stable pair is also valid baseline evidence. This lets an interrupted standalone
         // window recover without accepting a candidate whose own time or ratio was unstable.
-        if (!hasStableTiming)
+        if (!state.HasStableTiming)
         {
-            hasStableTiming = true;
-            bestUs = timing.A.Microseconds;
-            bestModelledUs = timing.A.Microseconds;
+            state.HasStableTiming = true;
+            state.BestUs = timing.A.Microseconds;
+            state.BestModelledUs = timing.A.Microseconds;
         }
 
         // Hand-written multi-kernel diagnostics do not yet have a conveyor replay
@@ -735,12 +728,27 @@ internal static class KernelAutotuneTool
             CodegenMeasurementProtocol.AutotuneGainNoiseFloor,
             1.0 + timing.RelativeSpread);
         if (timing.Ratio <= required) return;
-        if (bestGain > 1.0 && timing.Ratio / bestGain <= required) return;
+        if (state.BestGain > 1.0)
+        {
+            if (timing.Ratio <= state.BestGain) return;
+            required = CodegenMeasurementProtocol.RequiredIndependentCandidateGain(
+                state.BestRelativeSpread, timing.RelativeSpread);
+            if (timing.Ratio / state.BestGain <= required)
+            {
+                Console.WriteLine("      cannot displace '" + state.BestName +
+                                  "': independent winner/challenger windows require " +
+                                  required.ToString("0.000", CultureInfo.InvariantCulture) +
+                                  "x, observed " + (timing.Ratio / state.BestGain).ToString(
+                                      "0.000", CultureInfo.InvariantCulture) + "x");
+                return;
+            }
+        }
 
-        bestName = candidate.Name;
-        bestUs = timing.B.Microseconds;
-        bestModelledUs = timing.A.Microseconds;
-        bestGain = timing.Ratio;
+        state.BestName = candidate.Name;
+        state.BestUs = timing.B.Microseconds;
+        state.BestModelledUs = timing.A.Microseconds;
+        state.BestGain = timing.Ratio;
+        state.BestRelativeSpread = timing.RelativeSpread;
     }
 
     private static void ReportPhases(DirectPtxRuntime runtime, CandidateProgram candidate)
@@ -1220,7 +1228,8 @@ internal static class KernelAutotuneTool
     }
 
     private static CandidateProgram? TryCreateInlineOuterWinograd(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec, bool compactShared = false)
+        DirectPtxRuntime runtime, CodegenKernelSpec spec,
+        CodegenOuterProductWinogradSchedule schedule)
     {
         if (!CodegenTiledConv2DPlan.TryCreate(spec, out var possible, out _)) return null;
         CodegenTiledConv2DPlan plan = possible!;
@@ -1231,7 +1240,7 @@ internal static class KernelAutotuneTool
         var resources = new List<IDisposable>();
         try
         {
-            var mainEmitter = new PtxOuterProductWinogradConv2DEmitter(compactShared);
+            var mainEmitter = new PtxOuterProductWinogradConv2DEmitter(schedule);
             string mainPtx = mainEmitter.Emit(
                 spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
             var mainModule = runtime.LoadModule(mainPtx, allowExperimentalJitFallback: true);
@@ -1273,9 +1282,7 @@ internal static class KernelAutotuneTool
                 mainFn, mainEmitter.LaunchBlockThreads,
                 checked((nuint)mainEmitter.SharedMemoryBytes));
             return new CandidateProgram(
-                compactShared
-                    ? "inline-outer-winograd-conv2d-compact"
-                    : "inline-outer-winograd-conv2d",
+                schedule.WinnerName,
                 LaunchMain, output,
                 checked((int)spec.Output.ElementCount), resources,
                 new[]
@@ -1288,7 +1295,9 @@ internal static class KernelAutotuneTool
                     " regs/thread, " + mainEmitter.SharedMemoryBytes.ToString(
                         CultureInfo.InvariantCulture) + " B dynamic shared, " +
                     mainInfo.LocalBytesPerThread.ToString(CultureInfo.InvariantCulture) +
-                    " B local/thread, " + activeBlocks.ToString(
+                    " B local/thread, " + mainEmitter.ActiveOuterProductThreads.ToString(
+                        CultureInfo.InvariantCulture) + " active outer-product threads, " +
+                    activeBlocks.ToString(
                         CultureInfo.InvariantCulture) + " blocks/SM",
                 promotable: true);
         }

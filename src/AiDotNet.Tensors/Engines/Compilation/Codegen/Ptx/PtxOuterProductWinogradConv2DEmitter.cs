@@ -8,8 +8,8 @@ using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
 /// <summary>
-/// True-fp32 Winograd F(2,3) main pass with an 8x8 register outer product.
-/// Each thread owns one transform component and one 8x8 (M,tile) microtile;
+/// True-fp32 Winograd F(2,3) main pass with a measured register outer product.
+/// Each thread owns one transform component and one (M,tile) microtile;
 /// the CTA transposes completed components through shared memory before the
 /// inverse transform. This gives every staged operand four-way register reuse.
 /// The compact variant reuses one input stage and half of the output workspace;
@@ -19,53 +19,64 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
 {
     private const int BlockM = 32;
     private const int BlockChannels = 8;
-    private const int BlockTiles = 32;
-    private const int TilePartitions = 64 / BlockTiles;
     private const int TransformElements = 16;
-    private const int MicroM = 8;
     private const int MicroTiles = 8;
     private const int PhysicalMicroTiles = 7;
-    private const int ReciprocalShift = 10;
+    private const int PhysicalTilesPerQuadrant =
+        PhysicalMicroTiles * PhysicalMicroTiles;
+    private const int ReciprocalShift = 16;
     private const int PhysicalMicroTilesReciprocal =
         ((1 << ReciprocalShift) + PhysicalMicroTiles - 1) / PhysicalMicroTiles;
-    private const int AccumulatorElements = MicroM * PhysicalMicroTiles;
-    private const int MGroups = BlockM / MicroM;
-    private const int TileGroups = BlockTiles / MicroTiles;
-    private const int MicroGroups = MGroups * TileGroups;
     private const int UStride = 36;
-    private const int VStride = 36;
     private const int BlockThreads = 256;
     private const int UElements = BlockChannels * TransformElements * UStride;
-    private const int VElements = BlockChannels * TransformElements * VStride;
-    private const int VByteOffset = UElements * sizeof(float);
-    private const int BufferBytes = (UElements + VElements) * sizeof(float);
-    private const int DoubleBufferBytes = BufferBytes * 2;
-    private const int WorkspaceGroups = MicroGroups;
-    private const int CompactWorkspaceGroups = WorkspaceGroups / 2;
     private const int WorkspaceElementStride = 17;
-    private const int WorkspaceGroupStride = AccumulatorElements * WorkspaceElementStride + 10;
-    private const int WorkspaceBytes = WorkspaceGroups * WorkspaceGroupStride * sizeof(float);
-    private const int CompactWorkspaceBytes =
-        CompactWorkspaceGroups * WorkspaceGroupStride * sizeof(float);
-    private const int SharedBytes = DoubleBufferBytes > WorkspaceBytes
-        ? DoubleBufferBytes
-        : WorkspaceBytes;
-    private const int CompactSharedBytes = BufferBytes > CompactWorkspaceBytes
-        ? BufferBytes
-        : CompactWorkspaceBytes;
 
     private readonly StringBuilder _body = new(131072);
-    private readonly bool _compactShared;
+    private readonly CodegenOuterProductWinogradSchedule _schedule;
 
-    public PtxOuterProductWinogradConv2DEmitter(bool compactShared = false) =>
-        _compactShared = compactShared;
+    public PtxOuterProductWinogradConv2DEmitter()
+        : this(CodegenOuterProductWinogradSchedule.Default)
+    {
+    }
+
+    public PtxOuterProductWinogradConv2DEmitter(bool compactShared)
+        : this(new CodegenOuterProductWinogradSchedule(32, compactShared))
+    {
+    }
+
+    public PtxOuterProductWinogradConv2DEmitter(
+        CodegenOuterProductWinogradSchedule schedule) =>
+        _schedule = schedule ?? throw new ArgumentNullException(nameof(schedule));
+
+    private int BlockTiles => _schedule.BlockTiles;
+    private int MicroM => _schedule.ThreadTileM;
+    private int AccumulatorElements => MicroM * PhysicalMicroTiles;
+    private int MGroups => BlockM / MicroM;
+    private int TilePartitions => _schedule.TilePartitions;
+    private int TileGroups => BlockTiles / MicroTiles;
+    private int MicroGroups => MGroups * TileGroups;
+    private int ActiveComputeThreads => TransformElements * MicroGroups;
+    private int VStride => BlockTiles + 4;
+    private int VElements => BlockChannels * TransformElements * VStride;
+    private int VByteOffset => UElements * sizeof(float);
+    private int BufferBytes => (UElements + VElements) * sizeof(float);
+    private int DoubleBufferBytes => BufferBytes * 2;
+    private int WorkspaceGroups => MicroGroups;
+    private int CompactWorkspaceGroups => WorkspaceGroups / 2;
+    private int WorkspaceGroupStride => AccumulatorElements * WorkspaceElementStride + 10;
+    private int WorkspaceBytes => WorkspaceGroups * WorkspaceGroupStride * sizeof(float);
+    private int CompactWorkspaceBytes =>
+        CompactWorkspaceGroups * WorkspaceGroupStride * sizeof(float);
+    private int SharedBytes => Math.Max(DoubleBufferBytes, WorkspaceBytes);
+    private int CompactSharedBytes => Math.Max(BufferBytes, CompactWorkspaceBytes);
 
     static PtxOuterProductWinogradConv2DEmitter()
     {
         // The reciprocal is applied after pair/MicroM, so this is its complete
         // emitted input range. Fail at type initialization if changed geometry
         // makes the strength reduction inexact.
-        int maximum = (WorkspaceGroups * AccumulatorElements - 1) / MicroM;
+        const int maximum = 255;
         for (int value = 0; value <= maximum; value++)
             if (((value * PhysicalMicroTilesReciprocal) >> ReciprocalShift) !=
                 value / PhysicalMicroTiles)
@@ -77,7 +88,10 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     public string? EntryPoint { get; private set; }
     public uint LaunchBlocks { get; private set; }
     public int LaunchBlockThreads => BlockThreads;
-    public int SharedMemoryBytes => _compactShared ? CompactSharedBytes : SharedBytes;
+    public int ActiveOuterProductThreads => ActiveComputeThreads;
+    public int SharedMemoryBytes => _schedule.CompactShared
+        ? CompactSharedBytes
+        : SharedBytes;
 
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
@@ -117,12 +131,14 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L($"ld.param.u64 %rd2, [p{I(outputParam)}];");
         L("mov.u32 %r0, %tid.x;");
         L("mov.u32 %r1, %ctaid.x;");
+        if (ActiveComputeThreads < BlockThreads)
+            L($"setp.lt.u32 %p15, %r0, {I(ActiveComputeThreads)}; // active outer-product owner");
         EmitRemainder("%r2", "%r1", TilePartitions, "tile partition");
         EmitQuotient("%r3", "%r1", TilePartitions, null);
         EmitRemainder("%r4", "%r3", quadrants, "quadrant");
         EmitQuotient("%r5", "%r3", quadrants, "batch");
-        L("shr.u32 %r6, %r0, 4;                       // transform component");
-        L("and.b32 %r7, %r0, 15;                      // 8x8 microtile group");
+        EmitQuotient("%r6", "%r0", MicroGroups, "transform component");
+        EmitRemainder("%r7", "%r0", MicroGroups, "8x8 microtile group");
         EmitRemainder("%r8", "%r7", MGroups, "M group");
         EmitQuotient("%r9", "%r7", MGroups, "tile group");
         EmitQuotient("%r10", "%r4", quadrantColumns, null);
@@ -137,7 +153,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L($"mov.u32 %r36, {I(plan.ReductionChannels / BlockChannels - 1)}; // final pipelined stage");
         L("mov.u64 %rd10, stage;                      // current stage buffer");
         L("mov.u64 %rd11, stage;");
-        if (!_compactShared)
+        if (!_schedule.CompactShared)
             L($"add.u64 %rd11, %rd11, {I(BufferBytes)};   // next stage buffer");
         for (int f = 0; f < AccumulatorElements; f++)
             L($"mov.f32 %f{I(f)}, 0f00000000;");
@@ -149,8 +165,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L("OUTER_WINO_PIPELINE:");
         L("add.u32 %r33, %r12, 1;                    // stage being prefetched");
         EmitStagePreloads(plan, "%r33", "OUTER_NEXT");
-        EmitOuterProducts("%rd10");
-        if (_compactShared)
+        EmitOuterProducts("%rd10", "OUTER_CURRENT_DONE");
+        if (_schedule.CompactShared)
         {
             // Reuse one shared stage. The first barrier proves every warp has stopped
             // reading it; the second publishes the replacement. Global loads and raw
@@ -170,7 +186,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L("add.u32 %r12, %r12, 1;");
         L("setp.lt.u32 %p0, %r12, %r36;");
         L("@%p0 bra OUTER_WINO_PIPELINE;");
-        EmitOuterProducts("%rd10");
+        EmitOuterProducts("%rd10", "OUTER_FINAL_DONE");
         L("bar.sync 0;");
         EmitOutput(plan);
         L("ret;");
@@ -181,8 +197,10 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
             .Append(".address_size 64\n\n")
             .Append("// generated by PtxOuterProductWinogradConv2DEmitter -- true-fp32 SIMT\n")
-            .Append("// M32 x 32 tiles x F(2,3), component-owned 8x8 outer product\n")
-            .Append(_compactShared
+            .Append("// M32 x ").Append(I(BlockTiles))
+            .Append(" tiles x F(2,3), component-owned ")
+            .Append(I(MicroM)).Append("x8 outer product\n")
+            .Append(_schedule.CompactShared
                 ? "// compact single shared stage and two-wave output transpose\n"
                 : "// double-buffered shared stages and full output transpose\n")
             .Append(".extern .shared .align 16 .b8 stage[];\n\n")
@@ -191,7 +209,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             ptx.Append("    .param .u64 p").Append(I(i))
                 .Append(i == spec.ParameterCount - 1 ? "\n" : ",\n");
         ptx.Append(")\n");
-        if (_compactShared)
+        if (_schedule.CompactShared)
             ptx.Append(".maxnreg 128\n");
         ptx.Append("{\n")
             .Append("    .reg .pred %p<16>;\n")
@@ -332,14 +350,33 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     private void EmitVGeometry(CodegenTiledConv2DPlan plan)
     {
         L($"setp.lt.u32 %p14, %r0, {I(BlockChannels * BlockTiles)};");
-        L("shr.u32 %r26, %r0, 5;                      // V producer C");
+        EmitQuotient("%r26", "%r0", BlockTiles, "V producer C");
         L($"and.b32 %r27, %r0, {I(BlockTiles - 1)};    // V producer tile");
-        L($"mad.lo.u32 %r28, %r2, {I(BlockTiles)}, %r27;");
-        L($"shr.u32 %r29, %r28, {I(PowerOfTwoShift(MicroTiles))};");
-        L($"and.b32 %r30, %r28, {I(MicroTiles - 1)};");
-        L($"setp.lt.u32 %p4, %r29, {I(PhysicalMicroTiles)};");
-        L($"setp.lt.u32 %p13, %r30, {I(PhysicalMicroTiles)};");
-        L("and.pred %p4, %p4, %p13;                  // physical tile");
+        if (BlockTiles == 16)
+        {
+            // Interleave physical 7x7 tiles across four CTAs. A contiguous 16-slot
+            // partition would leave its final CTA with only one useful tile; this
+            // mapping balances the grid 13/12/12/12 instead.
+            L($"and.b32 %r28, %r27, {I(MicroTiles - 1)};");
+            L($"setp.lt.u32 %p13, %r28, {I(PhysicalMicroTiles)};");
+            L($"shr.u32 %r29, %r27, {I(PowerOfTwoShift(MicroTiles))};");
+            L($"mad.lo.u32 %r28, %r29, {I(PhysicalMicroTiles)}, %r28;");
+            L($"mad.lo.u32 %r28, %r28, {I(TilePartitions)}, %r2;");
+            L($"setp.lt.u32 %p4, %r28, {I(PhysicalTilesPerQuadrant)};");
+            L("and.pred %p4, %p4, %p13;              // physical tile");
+            L($"mul.lo.u32 %r29, %r28, {I(PhysicalMicroTilesReciprocal)};");
+            L($"shr.u32 %r29, %r29, {I(ReciprocalShift)};");
+            L($"mad.lo.s32 %r30, %r29, -{I(PhysicalMicroTiles)}, %r28;");
+        }
+        else
+        {
+            L($"mad.lo.u32 %r28, %r2, {I(BlockTiles)}, %r27;");
+            L($"shr.u32 %r29, %r28, {I(PowerOfTwoShift(MicroTiles))};");
+            L($"and.b32 %r30, %r28, {I(MicroTiles - 1)};");
+            L($"setp.lt.u32 %p4, %r29, {I(PhysicalMicroTiles)};");
+            L($"setp.lt.u32 %p13, %r30, {I(PhysicalMicroTiles)};");
+            L("and.pred %p4, %p4, %p13;              // physical tile");
+        }
         L("add.u32 %r29, %r10, %r29;");
         L("add.u32 %r30, %r11, %r30;");
         L("mul.lo.u32 %r29, %r29, 2;");
@@ -387,8 +424,10 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         L($"mad.lo.u32 %r35, %r17, {I(UStride)}, %r16; // invariant U shared word");
     }
 
-    private void EmitOuterProducts(string bufferBase)
+    private void EmitOuterProducts(string bufferBase, string doneLabel)
     {
+        if (ActiveComputeThreads < BlockThreads)
+            L($"@!%p15 bra {doneLabel};");
         L($"mul.lo.u32 %r13, %r8, {I(MicroM)};");
         L("shr.u32 %r14, %r6, 2;");
         L("shl.b32 %r14, %r14, 3;");
@@ -428,6 +467,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
                     issued++;
                 }
         }
+        if (ActiveComputeThreads < BlockThreads)
+            L(doneLabel + ":");
     }
 
     private void EmitOuterFragmentLoad(int c, int registerBase, int fragment)
@@ -447,12 +488,14 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     private void EmitOutput(CodegenTiledConv2DPlan plan)
     {
         int hw = plan.OutputHeight * plan.OutputWidth;
-        int outputPhases = _compactShared ? 2 : 1;
-        int phaseGroups = _compactShared ? CompactWorkspaceGroups : WorkspaceGroups;
+        int outputPhases = _schedule.CompactShared ? 2 : 1;
+        int phaseGroups = _schedule.CompactShared ? CompactWorkspaceGroups : WorkspaceGroups;
         for (int outputPhase = 0; outputPhase < outputPhases; outputPhase++)
         {
             int firstGroup = outputPhase * phaseGroups;
-            if (_compactShared)
+            if (ActiveComputeThreads < BlockThreads)
+                L($"@!%p15 bra OUTER_OUTPUT_P{I(outputPhase)}_STORE_DONE;");
+            if (_schedule.CompactShared)
             {
                 L(outputPhase == 0
                     ? $"setp.lt.u32 %p3, %r7, {I(phaseGroups)};"
@@ -471,7 +514,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             for (int element = 0; element < AccumulatorElements; element++)
                 L($"st.shared.f32 [%rd4+{I(element * WorkspaceElementStride * sizeof(float))}], " +
                   $"%f{I(element)};");
-            if (_compactShared)
+            if (_schedule.CompactShared || ActiveComputeThreads < BlockThreads)
                 L($"OUTER_OUTPUT_P{I(outputPhase)}_STORE_DONE:");
             L("bar.sync 0;");
 
@@ -524,13 +567,25 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
                   "            // M within group");
                 L($"mad.lo.s32 %r19, %r18, -{I(PhysicalMicroTiles)}, %r15;");
                 L($"mad.lo.u32 %r16, %r16, {I(MicroM)}, %r18;");
-                L($"mad.lo.u32 %r17, %r17, {I(MicroTiles)}, %r19;");
-                L($"mad.lo.u32 %r17, %r2, {I(BlockTiles)}, %r17;");
-                L($"shr.u32 %r18, %r17, {I(PowerOfTwoShift(MicroTiles))};");
-                L($"and.b32 %r19, %r17, {I(MicroTiles - 1)};");
-                L($"setp.lt.u32 %p1, %r18, {I(PhysicalMicroTiles)};");
-                L($"setp.lt.u32 %p2, %r19, {I(PhysicalMicroTiles)};");
-                L("and.pred %p1, %p1, %p2;");
+                if (BlockTiles == 16)
+                {
+                    L($"mad.lo.u32 %r17, %r17, {I(PhysicalMicroTiles)}, %r19;");
+                    L($"mad.lo.u32 %r17, %r17, {I(TilePartitions)}, %r2;");
+                    L($"setp.lt.u32 %p1, %r17, {I(PhysicalTilesPerQuadrant)};");
+                    L($"mul.lo.u32 %r18, %r17, {I(PhysicalMicroTilesReciprocal)};");
+                    L($"shr.u32 %r18, %r18, {I(ReciprocalShift)};");
+                    L($"mad.lo.s32 %r19, %r18, -{I(PhysicalMicroTiles)}, %r17;");
+                }
+                else
+                {
+                    L($"mad.lo.u32 %r17, %r17, {I(MicroTiles)}, %r19;");
+                    L($"mad.lo.u32 %r17, %r2, {I(BlockTiles)}, %r17;");
+                    L($"shr.u32 %r18, %r17, {I(PowerOfTwoShift(MicroTiles))};");
+                    L($"and.b32 %r19, %r17, {I(MicroTiles - 1)};");
+                    L($"setp.lt.u32 %p1, %r18, {I(PhysicalMicroTiles)};");
+                    L($"setp.lt.u32 %p2, %r19, {I(PhysicalMicroTiles)};");
+                    L("and.pred %p1, %p1, %p2;");
+                }
                 L("add.u32 %r18, %r10, %r18;");
                 L("add.u32 %r19, %r11, %r19;");
                 L("mul.lo.u32 %r18, %r18, 2;");

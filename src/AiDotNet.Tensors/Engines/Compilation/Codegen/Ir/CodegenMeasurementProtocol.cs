@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // A version stamp for how a number was measured.
 //
-// The measurement protocol changed eight times during this project, and each change
+// The measurement protocol changed eleven times during this project, and each change
 // silently invalidated every number recorded before it:
 //
 //   v1 -> v2  the estimator. median(A)/median(B) let clock drift during a run leak into
@@ -60,6 +60,11 @@
 //              timing, while the post boundary rejects compute-only work, unsafe temperature,
 //              and sustained whole-device utilization. A bounded quiescence window prevents the
 //              benchmark's own trailing NVIDIA utilization sample from becoming a false refusal.
+//   v11 -> v12 uncertainty-aware winner arbitration. Each autotune candidate was paired with
+//              the modelled baseline, but a challenger could replace the current winner after
+//              clearing only its own paired spread. Independent ratio windows now combine the
+//              incumbent and challenger spreads before changing a recorded schedule, so a 3%
+//              median difference between two 2-4% windows remains evidence of a tie.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -83,7 +88,7 @@ public static class CodegenMeasurementProtocol
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 11;
+    public const int Version = 12;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -93,7 +98,26 @@ public static class CodegenMeasurementProtocol
         "paired within-sample ratios; batched timed regions; clock-drift and <=5% spread gates; " +
         "true-fp32 CUDA-graph replay on both lanes; exact PTX-set autotune and dispatch-bound evidence; " +
         "exact competitor geometry; multi-strategy cuDNN plan search; " +
-        "phase-scoped counter profiles; recoverable per-operation stability windows";
+        "phase-scoped counter profiles; recoverable per-operation stability windows; " +
+        "uncertainty-aware autotune winner arbitration";
+
+    /// <summary>
+    /// Minimum ratio-of-ratios required for an independently measured challenger to
+    /// displace the current autotune winner.
+    /// </summary>
+    public static double RequiredIndependentCandidateGain(
+        double incumbentRelativeSpread, double challengerRelativeSpread)
+    {
+        if (double.IsNaN(incumbentRelativeSpread) ||
+            double.IsInfinity(incumbentRelativeSpread) || incumbentRelativeSpread < 0)
+            throw new ArgumentOutOfRangeException(nameof(incumbentRelativeSpread));
+        if (double.IsNaN(challengerRelativeSpread) ||
+            double.IsInfinity(challengerRelativeSpread) || challengerRelativeSpread < 0)
+            throw new ArgumentOutOfRangeException(nameof(challengerRelativeSpread));
+        return Math.Max(
+            AutotuneGainNoiseFloor,
+            1.0 + incumbentRelativeSpread + challengerRelativeSpread);
+    }
 
     /// <summary>
     /// Human-readable stamp to put beside a number.
