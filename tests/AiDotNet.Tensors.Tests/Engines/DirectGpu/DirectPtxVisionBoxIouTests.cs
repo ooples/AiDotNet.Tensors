@@ -331,6 +331,19 @@ public sealed class DirectPtxVisionBoxIouTests
     }
 
     [Fact]
+    public void FeatureGate_InvalidVisionOrdinalsDoNotIndexOutsideGateTable()
+    {
+        Exception? error = Record.Exception(() =>
+        {
+            _ = DirectPtxFeatureGate.IsVisionOperationEnabled(
+                (DirectPtxVisionOperation)(-1));
+            _ = DirectPtxFeatureGate.IsVisionOperationEnabled(
+                (DirectPtxVisionOperation)int.MaxValue);
+        });
+        Assert.Null(error);
+    }
+
+    [Fact]
     public void FamilyEmitter_UsesExactPointerOnlyAbi()
     {
         DirectPtxVisionSpec[] admitted = AllAdmittedDefinitions().ToArray();

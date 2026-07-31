@@ -108,10 +108,14 @@ internal static class DirectPtxFeatureGate
         VisionExperimentOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentVisionEnabled || EnvironmentVisionBoxIouEnabled);
 
-    internal static bool IsVisionOperationEnabled(DirectPtxVisionOperation operation) =>
-        VisionGateOverride ?? VisionExperimentOverride ?? TestOverride ??
-        (EnvironmentMasterEnabled || EnvironmentVisionEnabled ||
-         EnvironmentVisionOperationEnabled[(int)operation]);
+    internal static bool IsVisionOperationEnabled(DirectPtxVisionOperation operation)
+    {
+        int ordinal = (int)operation;
+        bool operationEnabled = (uint)ordinal < (uint)EnvironmentVisionOperationEnabled.Length &&
+            EnvironmentVisionOperationEnabled[ordinal];
+        return VisionGateOverride ?? VisionExperimentOverride ?? TestOverride ??
+            (EnvironmentMasterEnabled || EnvironmentVisionEnabled || operationEnabled);
+    }
     internal static bool IsConvolutionEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
 
@@ -125,11 +129,14 @@ internal static class DirectPtxFeatureGate
     private static bool[] ReadVisionOperationGates()
     {
         Array values = Enum.GetValues(typeof(DirectPtxVisionOperation));
-        var enabled = new bool[values.Length];
+        int maximum = 0;
+        foreach (DirectPtxVisionOperation operation in values)
+            maximum = Math.Max(maximum, (int)operation);
+        var enabled = new bool[maximum + 1];
         foreach (DirectPtxVisionOperation operation in values)
         {
             string suffix = VisionGateSuffix(operation);
-            enabled[(int)operation] = ReadEnabled("AIDOTNET_DIRECT_PTX_VISION_" + suffix);
+            enabled[(int)operation] = ReadEnabled(VisionEnvironmentVariable + "_" + suffix);
         }
         return enabled;
     }
