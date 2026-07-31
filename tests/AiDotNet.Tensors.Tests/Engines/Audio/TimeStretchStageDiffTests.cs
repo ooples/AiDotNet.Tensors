@@ -134,9 +134,9 @@ public class TimeStretchStageDiffTests : IDisposable
     /// <remarks>
     /// <para>
     /// Every structural difference between the CPU and GPU paths is eliminated: identical Hann window
-    /// (0.5-0.5cos(2*pi*i/(nFft-1))), identical vocoder arithmetic, identical clamped writeStart, and an
-    /// identical 1e-8 window-sum guard. The one remaining difference is that the GPU evaluates a direct
-    /// per-bin DFT in fp32 while the CPU uses FFTCore.
+    /// (0.5-0.5cos(2*pi*i/(nFft-1))), identical vocoder arithmetic, identical writeStart (both now TRIM
+    /// rather than clamp), and an identical 1e-8 window-sum guard. The one remaining difference is that
+    /// the GPU evaluates a direct per-bin DFT in fp32 while the CPU uses FFTCore.
     /// </para>
     /// <para>
     /// ISTFT divides by the accumulated window sum, so wherever that sum is small the difference is
@@ -332,19 +332,6 @@ public class TimeStretchStageDiffTests : IDisposable
     }
 
     /// <summary>
-    /// Isolates whether the ISTFT divergence lives in the CENTRED path specifically.
-    /// </summary>
-    /// <remarks>
-    /// The nFft-scaling measurement killed the fp32 explanation: the relative difference goes
-    /// 2.35e-3 -> 1.94e-2 -> 2.02e-1 -> 2.00e-1 for nFft 64/128/256/512, i.e. ~10x per doubling and
-    /// then a PLATEAU near 20%. Rounding grows like sqrt(n) or n and never saturates.
-    ///
-    /// What does saturate is the fraction of frames whose write position CLAMPS: with center,
-    /// writeStart = max(0, frame*hop - nFft/2), so at nFft=512/hop=128 all three frames clamp to 0,
-    /// whereas at nFft=64/hop=16 only the first few of seventeen do. If center:false agrees while
-    /// center:true does not, the defect is in the clamped-frame handling and nowhere else.
-    /// </remarks>
-    /// <summary>
     /// center:false on a signal shorter than one window yields ZERO frames — (257-512)/128+1 == 0
     /// under integer division — and used to surface as a bare DivideByZeroException from inside ISTFT.
     /// It must now fail at STFT with a message naming the cause.
@@ -363,6 +350,24 @@ public class TimeStretchStageDiffTests : IDisposable
         Assert.DoesNotContain("DivideByZero", ex.Message);
     }
 
+    /// <summary>
+    /// Both ISTFT centring paths must agree between CPU and GPU.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Written to isolate whether the divergence lived in the CENTRED path specifically, which it did:
+    /// the write position was clamped rather than trimmed, so the frames whose centre precedes sample 0
+    /// were displaced. That clamp is gone, and this now guards both conventions against regressing.
+    /// </para>
+    /// <para>
+    /// The earlier note here argued from a nFft-scaling PLATEAU (~20% at nFft 256 and 512) that the
+    /// cause could not be fp32 rounding, since rounding grows like sqrt(n) or n and never saturates.
+    /// That reasoning was sound and the conclusion was right, but the mechanism it proposed — the
+    /// FRACTION of clamping frames saturating — was not the whole story: the clamp also collapsed the
+    /// overlap-add window sum at the head to ~1e-8, and dividing by that amplified ordinary fp32
+    /// noise by ~1e7. Both halves had to be true to produce what was measured.
+    /// </para>
+    /// </remarks>
     [SkippableTheory]
     [InlineData(true)]
     [InlineData(false)]

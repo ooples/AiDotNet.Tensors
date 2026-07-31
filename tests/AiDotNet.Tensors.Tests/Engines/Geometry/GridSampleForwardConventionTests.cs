@@ -188,8 +188,13 @@ public class GridSampleForwardConventionTests
         tape.BindEngineIfUnset(_engine);
         var loss = _engine.ReduceSum(_engine.GridSample(input, grid, mode, padding, alignCorners), null);
 
+        // Pin the TYPE and the message content, not merely "something threw". Assert.NotNull accepts a
+        // NullReferenceException or a shape bug just as happily, which would leave the unsupported
+        // mode/padding contract itself untested.
         var ex = Record.Exception(() => tape.ComputeGradients(loss, [input, grid]));
-        Assert.NotNull(ex);
-        _out.WriteLine($"{mode}/{padding}/align={alignCorners} -> {ex!.GetType().Name}");
+        var notSupported = Assert.IsType<NotSupportedException>(ex);
+        _out.WriteLine($"{mode}/{padding}/align={alignCorners} -> {notSupported.Message}");
+        Assert.Contains(mode.ToString(), notSupported.Message, StringComparison.Ordinal);
+        Assert.Contains(padding.ToString(), notSupported.Message, StringComparison.Ordinal);
     }
 }

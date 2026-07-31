@@ -3266,9 +3266,18 @@ public partial class DirectGpuTensorEngine
             var stacked = TensorConcatenate(reshaped, gshape.Length);
             int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
             var res = stacked.Reshape(new[] { prod, m });
-            // The meshgrid/concat/reshape composition above builds its own tape entries against the
-            // intermediate grids, not against `tensors`, so the caller's inputs get no gradient
-            // without this explicit record.
+            // This record is LOAD-BEARING, not redundant, even though the GPU TensorMeshgrid above is
+            // itself built from TensorBroadcastTo(tensors[k].Reshape(rshape), ...) and so looks like it
+            // already chains back to the caller's tensors. It does not: `.Reshape` returns a VIEW that is
+            // not tape-linked to `tensors[k]` (the same GradFn-discarding behaviour the #257 notes
+            // describe for `.Contiguous`), so BroadcastToBackward accumulates into the view and the
+            // caller's input receives nothing from the composition.
+            //
+            // Verified by measurement rather than by reading, because the failure modes are adjacent and
+            // both silent: if the chain DID survive the reshape this record would double the gradient,
+            // and if it is removed the gradient disappears. CartesianProdGpuTapeParityTests pins the
+            // closed form on both engines — d(sum)/da[i] == b.Length and d(sum)/db[j] == a.Length — so
+            // either mistake fails loudly.
             DifferentiableOps.RecordIfActive("TensorCartesianProd", res, tensors,
                 BackwardFunctions<T>.CartesianProdBackward);
             return res;

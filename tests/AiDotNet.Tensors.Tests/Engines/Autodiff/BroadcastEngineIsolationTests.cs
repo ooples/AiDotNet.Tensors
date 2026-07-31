@@ -34,12 +34,61 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// scalar result, and it agrees with the same engine's own non-broadcast kernel.
 /// </para>
 /// </remarks>
-public class BroadcastEngineIsolationTests
+public class BroadcastEngineIsolationTests : IDisposable
 {
     private readonly ITestOutputHelper _out;
     private readonly CpuEngine _engine = new();
+    private readonly IEngine _originalCurrent;
+    private readonly TripwireEngine _tripwire = new();
 
-    public BroadcastEngineIsolationTests(ITestOutputHelper o) => _out = o;
+    /// <summary>
+    /// A CpuEngine that records the moment anything dispatches to it.
+    /// </summary>
+    /// <remarks>
+    /// Without this the precision assertions are HOST-DEPENDENT. On a CPU-only machine
+    /// AiDotNetEngine.Current is already a CpuEngine, so an op that wrongly consults Current still
+    /// computes in double and every assertion passes — the defect this file exists to pin would be
+    /// invisible on exactly the hosts CI runs on. Installing an observable engine as Current turns
+    /// "did it consult the global engine" into a direct observation instead of an inference from
+    /// numerical precision.
+    /// </remarks>
+    private sealed class TripwireEngine : CpuEngine
+    {
+        public int Dispatches;
+        public override Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
+        {
+            Dispatches++;
+            return base.TensorSubtract(a, b);
+        }
+        public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
+        {
+            Dispatches++;
+            return base.TensorAdd(a, b);
+        }
+    }
+
+    public BroadcastEngineIsolationTests(ITestOutputHelper o)
+    {
+        _out = o;
+        _originalCurrent = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = _tripwire;
+    }
+
+    public void Dispose()
+    {
+        AiDotNetEngine.Current = _originalCurrent;
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>Asserts the process-global engine was never consulted.</summary>
+    private void AssertGlobalEngineUntouched(string op)
+    {
+        _out.WriteLine($"global-engine dispatches during {op}: {_tripwire.Dispatches}");
+        Assert.True(_tripwire.Dispatches == 0,
+            $"{op} dispatched to AiDotNetEngine.Current {_tripwire.Dispatches} time(s). The op must " +
+            $"compute on the engine it was invoked on. This passes on a CPU-only host by accident when " +
+            $"only precision is checked, because Current is a CpuEngine there too.");
+    }
 
     private static (Tensor<double> a, Tensor<double> b) Operands(int n, int seed)
     {
@@ -73,6 +122,7 @@ public class BroadcastEngineIsolationTests
         Assert.True(worst < 1e-15,
             $"TensorBroadcastSubtract<double> worst relative error {worst:E3} — subtraction is exact in " +
             "floating point, so any error above rounding means the double path computed at float precision.");
+        AssertGlobalEngineUntouched(nameof(CpuEngine.TensorBroadcastSubtract));
     }
 
     [Fact]
@@ -94,6 +144,7 @@ public class BroadcastEngineIsolationTests
         Assert.True(worst < 1e-15,
             $"TensorBroadcastAdd<double> worst relative error {worst:E3} — addition of same-magnitude " +
             "doubles is correctly rounded, so error above 1 ULP means the double path computed at float precision.");
+        AssertGlobalEngineUntouched(nameof(CpuEngine.TensorBroadcastAdd));
     }
 
     /// <summary>
