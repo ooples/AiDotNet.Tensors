@@ -24,6 +24,9 @@ public class DirectPtxSoftmaxTests
             Assert.False(string.IsNullOrWhiteSpace(cell.PhysicalLayout));
             Assert.False(string.IsNullOrWhiteSpace(cell.DTypes));
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
+            Assert.Equal(["HIP", "Metal", "OpenCL", "Vulkan", "WebGPU"],
+                cell.PeerBackends.Select(peer => peer.Backend));
+            Assert.All(cell.PeerBackends, peer => Assert.True(peer.IsAccountedFor));
         });
         // The row-softmax kernel owns both the general Softmax and SoftmaxRows entry points.
         Assert.Equal(DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
@@ -51,6 +54,51 @@ public class DirectPtxSoftmaxTests
             c => c.Status == DirectPtxSoftmaxCoverageStatus.PlannedDirectPtx);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void SoftmaxCoverageManifest_TracksEveryMissingPeerDispatch()
+    {
+        string[] fullyNativeApis =
+        [
+            "CudaBackend.Softmax",
+            "CudaBackend.SoftmaxRows",
+            "CudaBackend.SoftmaxBackward",
+            "CudaBackend.LogSumExpBackward",
+            "CudaBackend.MaskedFillKernel",
+            "CudaBackend.MaskedFillBackward"
+        ];
+        Assert.All(fullyNativeApis, api =>
+            Assert.All(DirectPtxSoftmaxCoverageManifest.Get(api).PeerBackends,
+                peer => Assert.False(string.IsNullOrWhiteSpace(peer.NativeImplementation))));
+
+        string[] variantApis =
+        [
+            "CudaBackend.LogSoftmax",
+            "CudaBackend.LogSumExpAxis",
+            "CudaBackend.Sparsemax",
+            "CudaBackend.TaylorSoftmax"
+        ];
+        var expectedIssues = new System.Collections.Generic.Dictionary<string, int>
+        {
+            ["HIP"] = 914,
+            ["Metal"] = 915,
+            ["OpenCL"] = 916,
+            ["WebGPU"] = 917
+        };
+        Assert.All(variantApis, api =>
+        {
+            DirectPtxSoftmaxCoverageCell cell = DirectPtxSoftmaxCoverageManifest.Get(api);
+            DirectPtxPeerBackendCoverage vulkan = Assert.Single(cell.PeerBackends,
+                peer => peer.Backend == "Vulkan");
+            Assert.False(string.IsNullOrWhiteSpace(vulkan.NativeImplementation));
+            Assert.All(expectedIssues, expected =>
+            {
+                DirectPtxPeerBackendCoverage peer = Assert.Single(cell.PeerBackends,
+                    candidate => candidate.Backend == expected.Key);
+                Assert.Equal(expected.Value, peer.FollowUpIssue);
+            });
+        });
     }
 
     [Fact]

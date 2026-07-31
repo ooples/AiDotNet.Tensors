@@ -10,6 +10,15 @@ internal enum DirectPtxSoftmaxCoverageStatus
     PlannedDirectPtx
 }
 
+internal sealed record DirectPtxPeerBackendCoverage(
+    string Backend,
+    string? NativeImplementation,
+    int? FollowUpIssue)
+{
+    internal bool IsAccountedFor =>
+        !string.IsNullOrWhiteSpace(NativeImplementation) ^ FollowUpIssue.HasValue;
+}
+
 /// <summary>
 /// One auditable assignment in issue #840 (softmax, log-softmax, masking, log-sum-exp and
 /// backward fusions). The inventory is code rather than a markdown snapshot so tests reject
@@ -23,7 +32,8 @@ internal sealed record DirectPtxSoftmaxCoverageCell(
     string PhysicalLayout,
     string DTypes,
     DirectPtxSoftmaxCoverageStatus Status,
-    string DirectPtxAssignment);
+    string DirectPtxAssignment,
+    IReadOnlyList<DirectPtxPeerBackendCoverage> PeerBackends);
 
 internal static class DirectPtxSoftmaxCoverageManifest
 {
@@ -34,37 +44,79 @@ internal static class DirectPtxSoftmaxCoverageManifest
         "one-block-per-row shared-resident PTX kernel (PtxSoftmaxKernel) with in-block tree " +
         "reductions for the max and exp-sum; fails closed until GPU-validated and promoted";
 
+    // PR #884 intentionally scopes implementation to CUDA. These distinct backend follow-ups
+    // keep every missing public dispatch visible instead of silently treating embedded shader
+    // source as an implemented IDirectGpuBackend operation.
+    private const int HipSoftmaxVariantParityIssue = 914;
+    private const int MetalSoftmaxVariantParityIssue = 915;
+    private const int OpenClSoftmaxVariantParityIssue = 916;
+    private const int WebGpuSoftmaxVariantParityIssue = 917;
+
     internal static IReadOnlyList<DirectPtxSoftmaxCoverageCell> All { get; } =
     [
         new("CudaBackend.Softmax", "cuDNN/NVRTC row softmax", "row-wise stable softmax over the last axis",
-            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx, RowSoftmax),
+            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx, RowSoftmax,
+            NativePeerImplementations("Softmax")),
         new("CudaBackend.SoftmaxRows", "NVRTC row softmax", "row-wise stable softmax, explicit rows API",
-            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx, RowSoftmax),
+            RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx, RowSoftmax,
+            NativePeerImplementations("SoftmaxRows")),
         new("CudaBackend.SoftmaxBackward", "NVRTC softmax backward", "dX = softmax * (dY - sum(dY*softmax))",
             RowMajor + ", plus upstream grad", "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "one-block-per-row shared-resident PTX kernel (PtxSoftmaxBackwardKernel) with a tree-reduced dY-softmax dot; fails closed until GPU-validated and promoted"),
+            "one-block-per-row shared-resident PTX kernel (PtxSoftmaxBackwardKernel) with a tree-reduced dY-softmax dot; fails closed until GPU-validated and promoted",
+            NativePeerImplementations("SoftmaxBackward")),
         new("CudaBackend.LogSoftmax", "NVRTC log-softmax", "x - logsumexp over the last axis",
             RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "one-block-per-row shared-resident PTX kernel (PtxLogSoftmaxKernel) subtracting the tree-reduced log-partition; fails closed until GPU-validated and promoted"),
+            "one-block-per-row shared-resident PTX kernel (PtxLogSoftmaxKernel) subtracting the tree-reduced log-partition; fails closed until GPU-validated and promoted",
+            VulkanImplementationWithTrackedGaps("LogSoftmax")),
         new("CudaBackend.LogSumExpAxis", "NVRTC log-sum-exp", "log(sum(exp(x))) over an axis with max shift",
             RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "one-block-per-row shared-resident PTX reduction (PtxLogSumExpKernel) writing the [M] log-partition vector; fails closed until GPU-validated and promoted"),
+            "one-block-per-row shared-resident PTX reduction (PtxLogSumExpKernel) writing the [M] log-partition vector; fails closed until GPU-validated and promoted",
+            VulkanImplementationWithTrackedGaps("LogSumExpAxis")),
         new("CudaBackend.LogSumExpBackward", "NVRTC log-sum-exp backward", "dX = softmax(x) * dY",
             RowMajor + ", plus [M] upstream grad", "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "one-block-per-row shared-resident PTX kernel (PtxLogSumExpBackwardKernel): softmax pass times the per-row scalar gradient; fails closed until GPU-validated and promoted"),
+            "one-block-per-row shared-resident PTX kernel (PtxLogSumExpBackwardKernel): softmax pass times the per-row scalar gradient; fails closed until GPU-validated and promoted",
+            NativePeerImplementations("LogSumExpBackward")),
         new("CudaBackend.MaskedFillKernel", "NVRTC masked fill", "conditional fill by mask before softmax",
             RowMajor + ", plus mask", "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "elementwise select PTX kernel (PtxMaskedFillKernel); fails closed until GPU-validated and promoted"),
+            "elementwise select PTX kernel (PtxMaskedFillKernel); fails closed until GPU-validated and promoted",
+            NativePeerImplementations("MaskedFillKernel")),
         new("CudaBackend.MaskedFillBackward", "NVRTC masked-fill backward", "zero the gradient at masked positions",
             RowMajor + ", plus mask", "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "elementwise gradient-gating PTX kernel (PtxMaskedFillBackwardKernel); fails closed until GPU-validated and promoted"),
+            "elementwise gradient-gating PTX kernel (PtxMaskedFillBackwardKernel); fails closed until GPU-validated and promoted",
+            NativePeerImplementations("MaskedFillBackward")),
         new("CudaBackend.Sparsemax", "NVRTC sparsemax", "Euclidean projection of logits onto the simplex",
             RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "one-block-per-row shared-resident PTX kernel (PtxSparsemaxKernel) finding tau by 30-step bisection of the tree-reduced clipped sum; fails closed until GPU-validated and promoted"),
+            "one-block-per-row shared-resident PTX kernel (PtxSparsemaxKernel) finding tau by 30-step bisection of the tree-reduced clipped sum; fails closed until GPU-validated and promoted",
+            VulkanImplementationWithTrackedGaps("Sparsemax")),
         new("CudaBackend.TaylorSoftmax", "NVRTC Taylor softmax", "second-order Taylor approximation of softmax",
             RowMajor, "FP32", DirectPtxSoftmaxCoverageStatus.ExperimentalDirectPtx,
-            "one-block-per-row shared-resident PTX kernel (PtxTaylorSoftmaxKernel) normalizing the positive polynomial 1+x+x^2/2 with a single tree-reduced sum; fails closed until GPU-validated and promoted")
+            "one-block-per-row shared-resident PTX kernel (PtxTaylorSoftmaxKernel) normalizing the positive polynomial 1+x+x^2/2 with a single tree-reduced sum; fails closed until GPU-validated and promoted",
+            VulkanImplementationWithTrackedGaps("TaylorSoftmax"))
     ];
+
+    private static IReadOnlyList<DirectPtxPeerBackendCoverage> NativePeerImplementations(string method) =>
+    [
+        Native("HIP", $"HipBackend.{method}"),
+        Native("Metal", $"MetalBackend.{method}"),
+        Native("OpenCL", $"OpenClBackend.{method}"),
+        Native("Vulkan", $"VulkanBackend.{method}"),
+        Native("WebGPU", $"WebGpuBackend.{method}")
+    ];
+
+    private static IReadOnlyList<DirectPtxPeerBackendCoverage> VulkanImplementationWithTrackedGaps(string method) =>
+    [
+        Tracked("HIP", HipSoftmaxVariantParityIssue),
+        Tracked("Metal", MetalSoftmaxVariantParityIssue),
+        Tracked("OpenCL", OpenClSoftmaxVariantParityIssue),
+        Native("Vulkan", $"VulkanBackend.{method}"),
+        Tracked("WebGPU", WebGpuSoftmaxVariantParityIssue)
+    ];
+
+    private static DirectPtxPeerBackendCoverage Native(string backend, string implementation) =>
+        new(backend, implementation, null);
+
+    private static DirectPtxPeerBackendCoverage Tracked(string backend, int issue) =>
+        new(backend, null, issue);
 
     internal static DirectPtxSoftmaxCoverageCell Get(string api)
     {
