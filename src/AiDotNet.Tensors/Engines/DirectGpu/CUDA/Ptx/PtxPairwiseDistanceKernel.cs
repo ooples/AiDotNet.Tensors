@@ -83,9 +83,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
         string entry = EntryPointFor(squared);
 
         var ptx = new StringBuilder(4_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// pairwise-distance M={m} N={n} dim={dim} squared={squared}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {entry}(");

@@ -80,9 +80,7 @@ internal sealed class PtxAnnPqAdcScanKernel : IDisposable
         int tblQStride = m * ksub;   // per-query table block
 
         var ptx = new StringBuilder(3_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// ann-pq-adc-scan q={numQueries} codes={numCodes} m={m} ksub={ksub}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
@@ -111,18 +109,43 @@ internal sealed class PtxAnnPqAdcScanKernel : IDisposable
         ptx.AppendLine($"    mul.wide.u32 %rd4, %r4, {m};");             // i*m bytes
         ptx.AppendLine("    add.u64 %rd7, %rd0, %rd4;");                   // codePtr (s=0)
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // sum
-        ptx.AppendLine("    mov.u32 %r6, 0;");                            // s = 0
-        ptx.AppendLine("$ADC_S_LOOP:");
-        ptx.AppendLine("    ld.global.nc.u8 %r7, [%rd7];");             // code (zero-extended)
-        ptx.AppendLine("    mul.wide.u32 %rd8, %r7, 4;");               // code*4 bytes
-        ptx.AppendLine("    add.u64 %rd9, %rd6, %rd8;");               // &tables[q, s, code]
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");
-        ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
-        ptx.AppendLine($"    add.u64 %rd6, %rd6, {ksub * 4};");        // next subspace block (+ksub elems)
-        ptx.AppendLine("    add.u64 %rd7, %rd7, 1;");                   // next code byte
-        ptx.AppendLine("    add.u32 %r6, %r6, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r6, {m};");
-        ptx.AppendLine("    @%p0 bra $ADC_S_LOOP;");
+        if (m % 4 == 0)
+        {
+            // Strip-mine the baked subspace count four at a time. This quarters code-load and
+            // branch instructions without fully unrolling the gather stream (which measured 46
+            // registers/thread at m=16 and lost the occupancy the optimization was meant to keep).
+            ptx.AppendLine("    mov.u32 %r6, 0;");
+            ptx.AppendLine("$ADC_GROUP_LOOP:");
+            ptx.AppendLine("    ld.global.nc.u32 %r10, [%rd7];");
+            for (int lane = 0; lane < 4; lane++)
+            {
+                ptx.AppendLine($"    bfe.u32 %r7, %r10, {lane * 8}, 8;");
+                ptx.AppendLine("    mul.wide.u32 %rd8, %r7, 4;");
+                ptx.AppendLine("    add.u64 %rd9, %rd6, %rd8;");
+                ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");
+                ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+                ptx.AppendLine($"    add.u64 %rd6, %rd6, {ksub * 4};");
+            }
+            ptx.AppendLine("    add.u64 %rd7, %rd7, 4;");
+            ptx.AppendLine("    add.u32 %r6, %r6, 1;");
+            ptx.AppendLine($"    setp.lt.u32 %p0, %r6, {m / 4};");
+            ptx.AppendLine("    @%p0 bra $ADC_GROUP_LOOP;");
+        }
+        else
+        {
+            ptx.AppendLine("    mov.u32 %r6, 0;");                        // s = 0
+            ptx.AppendLine("$ADC_S_LOOP:");
+            ptx.AppendLine("    ld.global.nc.u8 %r7, [%rd7];");
+            ptx.AppendLine("    mul.wide.u32 %rd8, %r7, 4;");
+            ptx.AppendLine("    add.u64 %rd9, %rd6, %rd8;");
+            ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+            ptx.AppendLine($"    add.u64 %rd6, %rd6, {ksub * 4};");
+            ptx.AppendLine("    add.u64 %rd7, %rd7, 1;");
+            ptx.AppendLine("    add.u32 %r6, %r6, 1;");
+            ptx.AppendLine($"    setp.lt.u32 %p0, %r6, {m};");
+            ptx.AppendLine("    @%p0 bra $ADC_S_LOOP;");
+        }
         ptx.AppendLine("    mul.wide.u32 %rd10, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd11, %rd2, %rd10;");
         ptx.AppendLine("    st.global.f32 [%rd11], %f0;");

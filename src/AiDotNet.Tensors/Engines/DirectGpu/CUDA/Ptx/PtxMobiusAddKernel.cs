@@ -130,8 +130,11 @@ internal sealed class PtxMobiusAddKernel : IDisposable
         ptx.AppendLine("    @%p0 ld.global.nc.f32 %f1, [%rd14];");
         ptx.AppendLine("    add.u64 %rd15, %rd4, %rd11;");
         ptx.AppendLine("    add.u64 %rd16, %rd5, %rd11;");
-        ptx.AppendLine("    st.shared.f32 [%rd15], %f0;");
-        ptx.AppendLine("    st.shared.f32 [%rd16], %f1;");
+        // x_sh/y_sh are dimension-sized, while the block is always 128 lanes. Inactive lanes
+        // must not spill into the next shared array (dim=64 used to race x_sh[64] against
+        // y_sh[0], producing schedule-dependent wrong answers at larger batches).
+        ptx.AppendLine("    @%p0 st.shared.f32 [%rd15], %f0;");
+        ptx.AppendLine("    @%p0 st.shared.f32 [%rd16], %f1;");
         ptx.AppendLine("    mul.rn.f32 %f20, %f0, %f0;");               // x_i^2
         ptx.AppendLine("    mul.rn.f32 %f21, %f1, %f1;");               // y_i^2
         ptx.AppendLine("    mul.rn.f32 %f22, %f0, %f1;");               // x_i*y_i

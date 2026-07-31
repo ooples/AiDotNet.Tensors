@@ -127,6 +127,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--direct-ptx-scientific-head-to-head")
+        {
+            DirectPtxScientificHeadToHead.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-oracle")
         {
             KernelOracleTool.Run(args.Skip(1).ToArray());
@@ -1289,6 +1295,7 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
+        Console.WriteLine("  --direct-ptx-scientific-head-to-head [filter]: all #854 kernels vs their CUDA incumbents");
         Console.WriteLine("  --kernel-oracle: generated-family performance vs spec-derived ceilings");
         Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");

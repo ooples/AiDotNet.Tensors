@@ -12315,8 +12315,8 @@ KERNEL VARIANTS (A/B testing):
         if (numPairs > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
 
-        if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
-            throw new InvalidOperationException("OpenCL kernel not found: complex_magnitude");
+        if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: complex_magnitude_interleaved");
         int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
         kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
         kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);

@@ -14688,8 +14688,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but input buffer has {input.Size}.");
         if (numPairs > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
-        if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_magnitude");
+        if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: complex_magnitude_interleaved");
         using var _ = PushContext();
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pI = input.Handle, pO = output.Handle;

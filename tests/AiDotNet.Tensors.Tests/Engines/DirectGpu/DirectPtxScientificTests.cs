@@ -81,7 +81,14 @@ public class DirectPtxScientificTests
             PtxSphericalSoftmaxKernel.EmitPtx(8, 6, 256, 32),
             PtxPoincareProjectKernel.EmitPtx(8, 6, 64),
             PtxNormalizeProbabilitiesKernel.EmitPtx(8, 6, 64, 512),
-            PtxMeasurementForwardKernel.EmitPtx(8, 6, 32, 256)
+            PtxMeasurementForwardKernel.EmitPtx(8, 6, 32, 256),
+            PtxRbfForwardKernel.EmitPtx(8, 6, 256, 8, 12),
+            PtxPairwiseDistanceKernel.EmitPtx(8, 6, 64, 16, 10, squared: false),
+            PtxAnnComputeDistancesKernel.EmitPtx(8, 6, AnnMetric.L2, 32, 16, 12),
+            PtxAnnPqDistanceTablesKernel.EmitPtx(8, 6, AnnMetric.L2, 16, 8, 8, 6),
+            PtxAnnPqAdcScanKernel.EmitPtx(8, 6, 16, 16, 8, 8),
+            PtxCapsuleWeightedSumKernel.EmitPtx(8, 6, 8, 8, 8, 8),
+            PtxCapsuleAgreementKernel.EmitPtx(8, 6, 8, 8, 8, 8)
         ];
 
         Assert.All(modules,
@@ -847,23 +854,25 @@ public class DirectPtxScientificTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public void CapsuleContractionEmitter_IsThreadPerOutputSerialContraction(bool predictions)
+    public void CapsuleContractionEmitter_CoarsensEightContiguousOutputs(bool predictions)
     {
         DirectPtxCapsuleOp op = predictions ? DirectPtxCapsuleOp.Predictions : DirectPtxCapsuleOp.Transform;
-        // B=2, I=4, K=8, C=4, D=8 -> outputs = 2*4*4*8 = 512 (multiple of 256).
-        string ptx = PtxCapsuleContractionKernel.EmitPtx(8, 6, op, 2, 4, 8, 4, 8);
+        // B=8, I=8, K=8, C=4, D=8 -> 2048 outputs = 256 eight-wide thread groups.
+        string ptx = PtxCapsuleContractionKernel.EmitPtx(8, 6, op, 8, 8, 8, 4, 8);
         Assert.Contains(PtxCapsuleContractionKernel.EntryPointFor(op), ptx);
-        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // input[b,i,k] + weights[...] in the loop
-        Assert.Equal(1, Count(ptx, "st.global.f32"));
-        Assert.Equal(1, Count(ptx, "fma.rn.f32"));           // contraction MAC
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(8, Count(ptx, "fma.rn.f32"));
         Assert.Contains("$CAPS_K_LOOP:", ptx);
-        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // d = idx % outputDim
+        Assert.Contains("rem.u32 %r3, %r2, 1", ptx);
+        Assert.Contains("mad.lo.u32 %r10, %r3, 8, %r10", ptx);
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         // Predictions weight k-stride = D = 8 -> "add.u64 %rd7, %rd7, 32"; Transform k-stride = C*D = 32 -> "128".
         Assert.Contains(op == DirectPtxCapsuleOp.Predictions ? "add.u64 %rd7, %rd7, 32" : "add.u64 %rd7, %rd7, 128", ptx);
-        Assert.True(PtxCapsuleContractionKernel.IsSupportedShape(2, 4, 8, 4, 8));
+        Assert.True(PtxCapsuleContractionKernel.IsSupportedShape(8, 8, 8, 4, 8));
         Assert.False(PtxCapsuleContractionKernel.IsSupportedShape(2, 3, 8, 4, 8));   // 2*3*4*8=192 not mult of 256
         Assert.False(PtxCapsuleContractionKernel.IsPromotedShape(2, 4, 8, 4, 8));
     }
@@ -878,6 +887,8 @@ public class DirectPtxScientificTests
             "The checked-in capsule-contraction specialization is measured on GA10x/SM86.");
         const int b = 4, inCaps = 8, inDim = 12, outCount = 8, outDim = 8;   // outputs = 4*8*8*8 = 2048
         using var kernel = new PtxCapsuleContractionKernel(runtime, op, b, inCaps, inDim, outCount, outDim);
+        Assert.Equal(8, kernel.OutputsPerThread);
+        Assert.Equal(28, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20267700);
@@ -1146,12 +1157,14 @@ public class DirectPtxScientificTests
     {
         string ptx = PtxAnnPqAdcScanKernel.EmitPtx(8, 6, 16, 16, 8, 16);   // cells = 256
         Assert.Contains(PtxAnnPqAdcScanKernel.EntryPoint, ptx);
-        Assert.Contains("$ADC_S_LOOP:", ptx);
-        Assert.Equal(1, Count(ptx, "ld.global.nc.u8"));     // uint8 code load
-        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));    // gathered table value
+        Assert.Contains("$ADC_GROUP_LOOP:", ptx);
+        Assert.DoesNotContain("$ADC_S_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, "ld.global.nc.u32"));    // four uint8 codes per loop
+        Assert.Equal(4, Count(ptx, "bfe.u32"));             // one extraction per strip lane
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));    // four gathered table values per loop
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Contains("div.u32 %r3, %r2, 16", ptx);        // q = gid / numCodes
-        Assert.Contains("add.u64 %rd6, %rd6, 64", ptx);      // next subspace block = ksub*4 = 16*4 = 64
+        Assert.Equal(4, Count(ptx, "add.u64 %rd6, %rd6, 64")); // one pointer step per gather
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxAnnPqAdcScanKernel.IsSupportedShape(16, 16, 8, 16));
@@ -1692,22 +1705,24 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void CapsuleWeightedSumEmitter_IsThreadPerOutputSerialIReduction()
+    public void CapsuleWeightedSumEmitter_CoarsensFourContiguousOutputs()
     {
-        // B=4, I=8, C=8, D=8 -> outputs = 4*8*8 = 256.
-        string ptx = PtxCapsuleWeightedSumKernel.EmitPtx(8, 6, 4, 8, 8, 8);
+        // B=16, I=8, C=8, D=8 -> 1024 outputs = 256 four-wide thread groups.
+        string ptx = PtxCapsuleWeightedSumKernel.EmitPtx(8, 6, 16, 8, 8, 8);
         Assert.Contains(PtxCapsuleWeightedSumKernel.EntryPoint, ptx);
-        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
-        Assert.Equal(1, Count(ptx, "st.global.f32"));
-        Assert.Equal(1, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(1, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(4, Count(ptx, "fma.rn.f32"));
         Assert.Contains("$CWS_I_LOOP:", ptx);
-        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // d = idx % capsuleDim
+        Assert.Contains("rem.u32 %r3, %r2, 2", ptx);         // d-group = idx % (capsuleDim/4)
+        Assert.Contains("mad.lo.u32 %r8, %r3, 4, %r8", ptx);
         Assert.Contains("add.u64 %rd6, %rd6, 32", ptx);      // coupling i stride = C*4 = 32
         Assert.Contains("add.u64 %rd7, %rd7, 256", ptx);     // pred i stride = C*D*4 = 256
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.True(PtxCapsuleWeightedSumKernel.IsSupportedShape(4, 8, 8, 8));
+        Assert.True(PtxCapsuleWeightedSumKernel.IsSupportedShape(16, 8, 8, 8));
         Assert.False(PtxCapsuleWeightedSumKernel.IsSupportedShape(4, 8, 3, 5));   // 4*3*5=60 not mult of 256
         Assert.False(PtxCapsuleWeightedSumKernel.IsPromotedShape(4, 8, 8, 8));
     }
@@ -1737,7 +1752,7 @@ public class DirectPtxScientificTests
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in capsule-routing specialization is measured on GA10x/SM86.");
-        const int b = 8, inCaps = 8, outCaps = 8, capDim = 8;   // WS outputs = 8*8*8 = 512; AG outputs = 8*8*8 = 512
+        const int b = 32, inCaps = 8, outCaps = 8, capDim = 8;  // WS uses x8 output coarsening; AG remains divisible by 256
         var random = RandomHelper.CreateSeededRandom(20267800);
         float[] coupling = Values(random, b * inCaps * outCaps, 1.0f);
         float[] preds = Values(random, b * inCaps * outCaps * capDim, 1.0f);
@@ -1759,6 +1774,8 @@ public class DirectPtxScientificTests
         using (var outBuf = runtime.AllocateBytes((nuint)(wsExp.Length * sizeof(float))))
         using (var ws = new PtxCapsuleWeightedSumKernel(runtime, b, inCaps, outCaps, capDim))
         {
+            Assert.Equal(8, ws.OutputsPerThread);
+            Assert.Equal(28, ws.Audit.Function.RegistersPerThread);
             Assert.Equal(0, ws.Audit.Function.LocalBytesPerThread);
             couplingBuf.Upload<float>(coupling);
             predBuf.Upload<float>(preds);
@@ -1898,6 +1915,8 @@ public class DirectPtxScientificTests
         Assert.Contains("ld.param.f32 %f5, [curvature];", ptx);
         Assert.Contains(".shared .align 16 .b8 x_sh[256]", ptx);   // dim=64
         Assert.Contains(".shared .align 16 .b8 red[512]", ptx);    // 128 lanes
+        Assert.Contains("@%p0 st.shared.f32 [%rd15], %f0", ptx);  // inactive lanes cannot alias y_sh
+        Assert.Contains("@%p0 st.shared.f32 [%rd16], %f1", ptx);  // inactive lanes cannot alias red
         Assert.Contains("abs.f32 %f6, %f6", ptx);                  // |denom|
         Assert.Contains("rcp.approx.f32 %f9, %f6", ptx);           // 1/denom
         // Three reductions, each: store-barrier + 7 tree-halvings + post-load barrier.
@@ -1906,6 +1925,16 @@ public class DirectPtxScientificTests
         Assert.True(PtxMobiusAddKernel.IsSupportedShape(64, 64));
         Assert.False(PtxMobiusAddKernel.IsSupportedShape(64, 100));
         Assert.False(PtxMobiusAddKernel.IsPromotedShape(64, 64));
+    }
+
+    [Fact]
+    public void CudaComplexMagnitudeVariants_HaveDistinctCacheKeys()
+    {
+        string[] fft = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaFFTKernels.GetKernelNames();
+        string[] specialized = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaSpecializedKernels.GetKernelNames();
+        Assert.Contains("complex_magnitude", fft);
+        Assert.DoesNotContain("complex_magnitude", specialized);
+        Assert.Contains("complex_magnitude_interleaved", specialized);
     }
 
     [SkippableTheory]
@@ -1959,13 +1988,14 @@ public class DirectPtxScientificTests
     [Fact]
     public void PoincareDistanceEmitter_ReusesMobiusThenArctanh()
     {
-        string ptx = PtxPoincareDistanceKernel.EmitPtx(8, 6, 64);
+        string ptx = PtxPoincareDistanceKernel.EmitPtx(8, 6, 64, 64);
         Assert.Contains(PtxPoincareDistanceKernel.EntryPoint, ptx);
-        Assert.Contains("ld.param.f32 %f5, [curvature];", ptx);
+        Assert.Contains("ld.param.f32 %f14, [curvature];", ptx);
         Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));   // diffNorm + sqrtC
         Assert.Equal(2, Count(ptx, "lg2.approx.f32")); // arctanh via log
-        // Four reductions, each: store-barrier + 7 tree-halvings + post-load barrier.
-        Assert.Equal(36, Count(ptx, "bar.sync 0"));
+        Assert.Equal(24, Count(ptx, "shfl.sync")); // four reductions x (five down + one broadcast)
+        Assert.Equal(0, Count(ptx, "bar.sync 0"));
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxPoincareDistanceKernel.IsSupportedShape(64, 128));
         Assert.False(PtxPoincareDistanceKernel.IsPromotedShape(64, 128));
@@ -1974,12 +2004,14 @@ public class DirectPtxScientificTests
     [SkippableTheory]
     [InlineData(64, 32)]
     [InlineData(128, 64)]
+    [InlineData(64, 128)]
     public void DriverOnlyPoincareDistance_MatchesOracle(int batch, int dim)
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in poincare-distance specialization is measured on GA10x/SM86.");
         const float c = 0.5f;
         using var kernel = new PtxPoincareDistanceKernel(runtime, batch, dim, c);
+        Assert.Equal(24, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20266400 + batch + dim);

@@ -85,6 +85,8 @@ internal static class StableTimer
     /// negligible -- a 1.05x result should still not be called a win.
     /// </remarks>
     internal const double StableSpread = 0.05;
+    private const double TargetHostBatchMicroseconds = 250_000.0;
+    private const int MaxHostIterations = 50_000;
 
     /// <summary>
     /// Times <paramref name="launch"/>, repeating until the spread converges or attempts run out.
@@ -203,6 +205,7 @@ internal static class StableTimer
         int iterations = IterationsFor(workUnits);
 
         Warm(launch, synchronize, iterations);
+        iterations = CalibrateHostIterations(launch, synchronize, iterations);
 
         var samples = new List<double>(3);
         for (int attempt = 0; attempt < maxAttempts; attempt++)
@@ -246,6 +249,8 @@ internal static class StableTimer
 
         Warm(launchA, synchronizeA, iterationsA);
         Warm(launchB, synchronizeB, iterationsB);
+        iterationsA = CalibrateHostIterations(launchA, synchronizeA, iterationsA);
+        iterationsB = CalibrateHostIterations(launchB, synchronizeB, iterationsB);
 
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
@@ -310,6 +315,26 @@ internal static class StableTimer
         synchronize();
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds * 1000.0 / iterations;
+    }
+
+    /// <summary>
+    /// Corrects the work-unit estimate for kernels whose nominal arithmetic count is a poor
+    /// predictor of wall time (especially cached or memory-bound kernels under WDDM).
+    /// </summary>
+    /// <remarks>
+    /// The stability threshold is intentionally not relaxed. Instead, a throwaway calibrated
+    /// batch makes subsequent host-timed samples long enough that an ordinary scheduling event
+    /// cannot dominate the evidence. Calibration can only increase the caller's conservative
+    /// starting count and is capped to keep tiny kernels bounded.
+    /// </remarks>
+    private static int CalibrateHostIterations(
+        Action launch, Action synchronize, int startingIterations)
+    {
+        double microsecondsPerLaunch = TimeHostBatch(launch, synchronize, startingIterations);
+        if (!double.IsFinite(microsecondsPerLaunch) || microsecondsPerLaunch <= 0)
+            return startingIterations;
+        double desired = Math.Ceiling(TargetHostBatchMicroseconds / microsecondsPerLaunch);
+        return (int)Math.Clamp(desired, startingIterations, MaxHostIterations);
     }
 
     /// <summary>

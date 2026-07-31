@@ -84,9 +84,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
         string log2e = DirectPtxPtxText.Hex(1.4426950408889634f);
 
         var ptx = new StringBuilder(4_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// rbf-forward batch={batchSize} centers={numCenters} dim={inputDim}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

@@ -84,9 +84,7 @@ internal sealed class PtxAnnPqDistanceTablesKernel : IDisposable
         int cbStrideS = ksub * dsub;            // codebook [s, ksub*dsub]
 
         var ptx = new StringBuilder(3_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// ann-pq-distance-tables metric={metric} q={numQueries} m={m} ksub={ksub} dsub={dsub}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

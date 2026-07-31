@@ -105,9 +105,7 @@ internal sealed class PtxAnnComputeDistancesKernel : IDisposable
         ValidateShape(numQueries, numDatabase, dim);
 
         var ptx = new StringBuilder(3_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// ann-compute-distances metric={metric} q={numQueries} db={numDatabase} dim={dim}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

@@ -83,9 +83,7 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
         int outStrideB = outputCapsules * capsuleDim;                    // output [B,C,D]
 
         var ptx = new StringBuilder(4_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// capsule-agreement B={batchSize} I={inputCapsules} C={outputCapsules} D={capsuleDim}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
