@@ -25,6 +25,10 @@ internal static class AutoTrainingCompiler
     {
         _state = null;
         ReplayMode = false;
+        // The compile-size override is thread-static too, so leaving it set here would make this
+        // method's "all thread-static state" contract false and let a fixture's gate survive into
+        // whatever runs next on the thread.
+        _testMinForwardElementsOverride = null;
     }
 
     /// <summary>
@@ -401,9 +405,24 @@ internal static class AutoTrainingCompiler
     /// <summary>
     /// Digest of a leaf's contents, independent of where it appears in the tape.
     /// </summary>
+    /// <remarks>
+    /// Covers shape as well as values. Flattened values alone do not identify a leaf: a [2,1] and
+    /// a [1,2] constant holding the same numbers broadcast along different axes while leaving the
+    /// op name, the output shape and the value sequence identical, so the plan key would not move
+    /// and a plan compiled for one broadcast would be replayed for the other.
+    /// </remarks>
     private static long ComputeLeafValueHash<T>(Tensor<T> leaf)
     {
         long valueHash = unchecked((long)0xcbf29ce484222325L);
+
+        // Rank first, so [2,2] and [2,2,1] cannot coincide by dimension sequence alone.
+        valueHash ^= leaf._shape.Length;
+        valueHash *= unchecked((long)0x100000001b3L);
+        foreach (int dim in leaf._shape)
+        {
+            valueHash ^= dim;
+            valueHash *= unchecked((long)0x100000001b3L);
+        }
 
         // EqualityComparer<T>.Default dispatches without boxing for value types; calling
         // GetHashCode() on the element directly would allocate once per element, which on a

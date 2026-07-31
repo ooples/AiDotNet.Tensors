@@ -158,6 +158,46 @@ public class DataDerivedConstantHashTests : IDisposable
     }
 
     /// <summary>
+    /// Flattened values alone do not identify a leaf. A [2,1] and a [1,2] constant holding the
+    /// same numbers broadcast along different axes, yet leave the op name, the output shape and
+    /// the value sequence all identical - so without shape in the digest the plan key does not
+    /// move, and a plan compiled for one broadcast gets replayed for the other.
+    /// </summary>
+    [Fact]
+    public void ConstantWithSameValuesButDifferentShape_ChangesTheHash()
+    {
+        var parameter = new Tensor<float>(new[] { 2, 2 });
+        for (int i = 0; i < parameter.Length; i++) parameter[i] = 1.0f;
+
+        long HashForConstantShaped(int[] shape)
+        {
+            // Same element count, same values - only the shape differs.
+            var constant = new Tensor<float>(shape);
+            for (int i = 0; i < constant.Length; i++) constant[i] = 3.0f;
+
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+            var scaled = _engine.TensorMultiply(parameter, constant);
+            var loss = _engine.ReduceSum(scaled, null);
+
+            AutoTrainingCompiler.TryComputeStructureHash(
+                tape.Entries, tape.EntryCount, new[] { parameter }, out long hash);
+
+            GC.KeepAlive(loss);
+            return hash;
+        }
+
+        // Both broadcast against [2,2] and both produce a [2,2] output, so nothing else in the
+        // key distinguishes them.
+        long rowVector = HashForConstantShaped(new[] { 1, 2 });
+        long columnVector = HashForConstantShaped(new[] { 2, 1 });
+
+        Assert.True(
+            rowVector != columnVector,
+            "Constants with equal values but different shapes broadcast differently and must not " +
+            "share a plan key. Hashing only the flattened values makes them indistinguishable.");
+    }
+
+    /// <summary>
     /// Variadic ops (TensorAddMany, Concat, Stack) carry inputs 4+ in
     /// <c>TapeEntry.InputsOverflow</c>, and TapeEntry treats that array as the authoritative input
     /// list. A hash that reads only Input0-2 misses those slots entirely, so a data-derived
