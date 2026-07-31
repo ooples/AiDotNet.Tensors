@@ -800,19 +800,32 @@ public sealed class DirectPtxVisionBoxIouTests
             void Launch() => backend.BoxIou(aBuffer, bBuffer, output, n, m);
             IntPtr graph = backend.CaptureGraph(Launch);
             Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+            IntPtr secondGraph = backend.CaptureGraph(Launch);
+            Assert.NotEqual(IntPtr.Zero, secondGraph);
+            Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
             try
             {
                 backend.EnqueueCapturedGraph(graph);
+                backend.EnqueueCapturedGraph(secondGraph);
                 backend.Synchronize();
             }
             finally
             {
                 backend.DestroyCapturedGraph(graph);
+                try
+                {
+                    Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+                }
+                finally
+                {
+                    backend.DestroyCapturedGraph(secondGraph);
+                }
             }
             float[] actual = backend.DownloadBuffer(output);
             Assert.True(MaximumError(a, b, actual, n, m) <= 2e-6f);
             Assert.True(backend.DirectPtxVisionBoxIouDispatchCount >= 1);
-            Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+            Assert.Equal(0, backend.DirectPtxVisionBoxIouPinnedKernelCount);
             Assert.True(backend.TryGetDirectPtxVisionBoxIouAudit(n, m, out var audit));
             Assert.Equal(0, audit.Function.LocalBytesPerThread);
         }

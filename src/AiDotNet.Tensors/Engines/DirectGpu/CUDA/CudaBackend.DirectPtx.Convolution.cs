@@ -60,7 +60,8 @@ public sealed partial class CudaBackend
                 }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 PtxFusedConv2DNchwK1Kernel kernel = GetOrCreateDirectPtxConvolutionKernel();
-                if (capturing && !_directPtxConvolutionKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxConvolutionKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX convolution module for CUDA graph capture.");
                 lock (GpuDispatchLock)

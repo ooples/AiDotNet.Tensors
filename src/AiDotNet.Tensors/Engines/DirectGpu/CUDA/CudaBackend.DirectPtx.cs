@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -13,6 +14,8 @@ public sealed partial class CudaBackend
     private readonly bool _directPtxResidualRmsNormOptedIn =
         DirectPtxFeatureGate.IsResidualRmsNormEnabled;
     private readonly object _directPtxLock = new();
+    private DirectPtxCapturePinSet? _activeDirectPtxCapturePins;
+    private Dictionary<IntPtr, DirectPtxCapturePinSet>? _directPtxGraphPins;
     private readonly DirectPtxKernelCache<DirectPtxAttentionKey, PtxOnlineFusedAttention128x64Kernel>
         _directPtxAttentionKernels = new(DirectPtxFeatureGate.CacheCapacity);
     private readonly DirectPtxPlanCache<DirectPtxAttentionPlanKey, int>
@@ -32,6 +35,140 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<DirectPtxVisionBoxIouKey, PtxFusedPairwiseBoxIouF32Kernel>
         _directPtxVisionBoxIouKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
+
+    private sealed class DirectPtxCapturePinSet
+    {
+        private readonly HashSet<(object Cache, object Key)> _keys = new();
+        private readonly List<Action> _releases = new();
+
+        internal int Count => _releases.Count;
+
+        internal bool Acquire<TKey, TKernel>(
+            DirectPtxKernelCache<TKey, TKernel> cache,
+            TKey key)
+            where TKey : notnull
+            where TKernel : class, IDisposable
+        {
+            var identity = ((object)cache, (object)key);
+            if (!_keys.Add(identity)) return true;
+            if (!cache.AcquireCapturePin(key))
+            {
+                _keys.Remove(identity);
+                return false;
+            }
+            _releases.Add(() => cache.ReleaseCapturePin(key));
+            return true;
+        }
+
+        internal void Release()
+        {
+            for (int i = _releases.Count - 1; i >= 0; i--)
+                _releases[i]();
+            _releases.Clear();
+            _keys.Clear();
+        }
+    }
+
+    private bool PinDirectPtxKernelForCapture<TKey, TKernel>(
+        DirectPtxKernelCache<TKey, TKernel> cache,
+        TKey key)
+        where TKey : notnull
+        where TKernel : class, IDisposable
+    {
+        lock (_directPtxLock)
+        {
+            // Captures started outside CaptureGraph cannot report graph-handle
+            // lifetime back to us, so retain the conservative permanent pin.
+            return _activeDirectPtxCapturePins is { } pins
+                ? pins.Acquire(cache, key)
+                : cache.Pin(key);
+        }
+    }
+
+    private DirectPtxCapturePinSet BeginDirectPtxCapturePinTracking()
+    {
+        lock (_directPtxLock)
+        {
+            if (_activeDirectPtxCapturePins is not null)
+                throw new InvalidOperationException(
+                    "A direct-PTX CUDA graph capture is already active on this backend.");
+            return _activeDirectPtxCapturePins = new DirectPtxCapturePinSet();
+        }
+    }
+
+    private void CompleteDirectPtxCapturePinTracking(
+        DirectPtxCapturePinSet pins,
+        IntPtr graphExec)
+    {
+        lock (_directPtxLock)
+        {
+            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins))
+                throw new InvalidOperationException(
+                    "The direct-PTX CUDA graph capture pin owner changed unexpectedly.");
+            _activeDirectPtxCapturePins = null;
+            if (pins.Count == 0) return;
+            _directPtxGraphPins ??= new Dictionary<IntPtr, DirectPtxCapturePinSet>();
+            _directPtxGraphPins.Add(graphExec, pins);
+        }
+    }
+
+    private void AbortDirectPtxCapturePinTracking(DirectPtxCapturePinSet pins)
+    {
+        lock (_directPtxLock)
+        {
+            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins)) return;
+            _activeDirectPtxCapturePins = null;
+            pins.Release();
+        }
+    }
+
+    private void ReplaceDirectPtxGraphPins(
+        IntPtr graphExec,
+        DirectPtxCapturePinSet pins)
+    {
+        lock (_directPtxLock)
+        {
+            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins))
+                throw new InvalidOperationException(
+                    "The direct-PTX CUDA graph update pin owner changed unexpectedly.");
+            _activeDirectPtxCapturePins = null;
+            if (_directPtxGraphPins is not null &&
+                _directPtxGraphPins.TryGetValue(graphExec, out DirectPtxCapturePinSet? oldPins))
+            {
+                _directPtxGraphPins.Remove(graphExec);
+                oldPins.Release();
+            }
+            if (pins.Count == 0) return;
+            _directPtxGraphPins ??= new Dictionary<IntPtr, DirectPtxCapturePinSet>();
+            _directPtxGraphPins.Add(graphExec, pins);
+        }
+    }
+
+    private void ReleaseDirectPtxGraphPins(IntPtr graphExec)
+    {
+        lock (_directPtxLock)
+        {
+            if (_directPtxGraphPins is not null &&
+                _directPtxGraphPins.TryGetValue(graphExec, out DirectPtxCapturePinSet? pins))
+            {
+                _directPtxGraphPins.Remove(graphExec);
+                pins.Release();
+            }
+        }
+    }
+
+    private void ReleaseAllDirectPtxGraphPins()
+    {
+        lock (_directPtxLock)
+        {
+            _activeDirectPtxCapturePins?.Release();
+            _activeDirectPtxCapturePins = null;
+            if (_directPtxGraphPins is null) return;
+            foreach (DirectPtxCapturePinSet pins in _directPtxGraphPins.Values)
+                pins.Release();
+            _directPtxGraphPins.Clear();
+        }
+    }
 
     /// <summary>The last opt-in direct-PTX initialization/launch failure, if fallback was required.</summary>
     internal string? DirectPtxLastError { get; private set; }
@@ -176,7 +313,8 @@ public sealed partial class CudaBackend
                 }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 PtxFusedPairwiseBoxIouF32Kernel kernel = GetOrCreateVisionBoxIouKernel(key);
-                if (capturing && !_directPtxVisionBoxIouKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxVisionBoxIouKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX pairwise BoxIoU module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -376,7 +514,8 @@ public sealed partial class CudaBackend
                 // A graph executable retains this CUfunction after capture.
                 // cuModuleUnload invalidates function handles, so a captured
                 // specialization must never be selected as an LRU victim.
-                if (capturing && !_directPtxQkvRopeCacheKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxQkvRopeCacheKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX QKV/RoPE/cache module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -1958,6 +2097,7 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
+            ReleaseAllDirectPtxGraphPins();
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();

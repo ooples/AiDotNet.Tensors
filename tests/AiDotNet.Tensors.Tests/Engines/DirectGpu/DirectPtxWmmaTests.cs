@@ -694,6 +694,30 @@ public class DirectPtxWmmaTests
     }
 
     [Fact]
+    public void KernelCache_CapturePinsReleaseOnlyAfterTheLastGraphOwner()
+    {
+        using var cache = new DirectPtxKernelCache<int, TrackingDisposable>(2);
+        TrackingDisposable one = cache.GetOrAdd(1, () => new TrackingDisposable());
+        TrackingDisposable two = cache.GetOrAdd(2, () => new TrackingDisposable());
+        Assert.True(cache.AcquireCapturePin(1));
+        Assert.True(cache.AcquireCapturePin(1));
+
+        cache.ReleaseCapturePin(1);
+        TrackingDisposable three = cache.GetOrAdd(3, () => new TrackingDisposable());
+        Assert.False(one.IsDisposed);
+        Assert.True(two.IsDisposed);
+        Assert.Equal(1, cache.PinnedCount);
+
+        cache.ReleaseCapturePin(1);
+        TrackingDisposable four = cache.GetOrAdd(4, () => new TrackingDisposable());
+        Assert.True(one.IsDisposed);
+        Assert.False(three.IsDisposed);
+        Assert.False(four.IsDisposed);
+        Assert.Equal(0, cache.PinnedCount);
+        Assert.Throws<InvalidOperationException>(() => cache.ReleaseCapturePin(1));
+    }
+
+    [Fact]
     public void AttentionAutotuner_ExposesArchitectureIndependentShapeCandidates()
     {
         Assert.Equal(new[] { 1 }, DirectPtxAttentionAutotuner.Candidates(16));
@@ -2120,6 +2144,7 @@ public class DirectPtxWmmaTests
                 Assert.Equal(0, graphAllocated);
             }
             finally { backend.DestroyCapturedGraph(graph); }
+            Assert.Equal(0, backend.DirectPtxQkvRopeCachePinnedKernelCount);
 
             Assert.True(backend.TryGetDirectPtxQkvRopeCacheAudit(
                 heads, cacheCapacity, position, out DirectPtxKernelAudit audit));

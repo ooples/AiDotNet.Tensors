@@ -93,7 +93,8 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                     DirectPtxLastError = $"vision-{spec.Operation}-null-buffer";
                     return false;
                 }
-                if (capturing && !_directPtxVisionKernels.Pin(spec))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxVisionKernels, spec))
                     throw new InvalidOperationException(
                         $"Could not pin direct-PTX vision module {spec.Operation} for CUDA graph capture.");
                 DirectPtxTensorView av = DirectPtxTensorView.Create(a, kernel.Blueprint.Tensors[0]);
@@ -330,8 +331,8 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                 kernelA.Validate(goA, boxesAA, boxesBA, gradAV);
                 kernelB.Validate(goB, boxesAB, boxesBB, gradBV);
                 if (capturing &&
-                    (!_directPtxVisionKernels.Pin(specA) ||
-                     !_directPtxVisionKernels.Pin(specB)))
+                    (!PinDirectPtxKernelForCapture(_directPtxVisionKernels, specA) ||
+                     !PinDirectPtxKernelForCapture(_directPtxVisionKernels, specB)))
                     throw new InvalidOperationException(
                         "Could not pin both IoU-family backward modules for capture.");
                 lock (GpuDispatchLock)
@@ -458,8 +459,8 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                 kernel0.Validate(sourceView0, outputView0);
                 kernel1.Validate(sourceView1, outputView1);
                 if (capturing &&
-                    (!_directPtxVisionKernels.Pin(spec0) ||
-                     !_directPtxVisionKernels.Pin(spec1)))
+                    (!PinDirectPtxKernelForCapture(_directPtxVisionKernels, spec0) ||
+                     !PinDirectPtxKernelForCapture(_directPtxVisionKernels, spec1)))
                     throw new InvalidOperationException(
                         "Could not pin both direct-PTX meshgrid modules for capture.");
                 lock (GpuDispatchLock)
