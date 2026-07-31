@@ -18,10 +18,10 @@ internal enum DirectPtxCapsuleOp
 
 /// <summary>
 /// Capsule contraction over the input feature axis (issue #854), matching the NVRTC
-/// <c>capsule_predictions</c> and <c>capsule_transform</c> kernels. Where divisibility permits,
-/// one thread owns four or eight contiguous output dimensions so an input value is shared across
-/// multiple accumulators and weights use aligned vector loads. Other supported shapes retain the
-/// scalar path. All paths walk the contracted axis serially in registers without shared memory.
+/// <c>capsule_predictions</c> and <c>capsule_transform</c> kernels. Shapes with 16-wide input and
+/// output dimensions use 16x16x8 TF32 WMMA tiles with FP32 accumulation. Other divisible shapes
+/// assign four or eight contiguous outputs to each thread so an input value is shared across
+/// accumulators and weights use aligned vector loads; remaining shapes retain the scalar path.
 ///
 /// Logical dims are (batchSize B, inputCapsules I, inputDim K, outputCount C, outputDim D). Input is
 /// <c>[B,I,K]</c>; output is <c>[B,I,C,D]</c> row-major. Shape is baked into the PTX; the launch
@@ -44,6 +44,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
     internal int OutputCount { get; }
     internal int OutputDim { get; }
     internal int OutputsPerThread { get; }
+    internal bool UsesTensorCores { get; }
     internal string EntryPoint { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
@@ -82,7 +83,11 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         InputDim = inputDim;
         OutputCount = outputCount;
         OutputDim = outputDim;
-        OutputsPerThread = GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim);
+        UsesTensorCores = UseTensorCorePath(
+            batchSize, inputCapsules, inputDim, outputCount, outputDim);
+        OutputsPerThread = UsesTensorCores
+            ? 16
+            : GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim);
         EntryPoint = EntryPointFor(op);
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, op, batchSize, inputCapsules, inputDim, outputCount, outputDim);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, op, batchSize, inputCapsules, inputDim, outputCount, outputDim);
@@ -107,9 +112,21 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         arguments[0] = &inputPointer;
         arguments[1] = &weightsPointer;
         arguments[2] = &outputPointer;
-        uint grid = (uint)((BatchSize * InputCapsules * OutputCount * OutputDim) /
-            (BlockThreads * OutputsPerThread));
-        _module.Launch(_function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
+        if (UsesTensorCores)
+        {
+            _module.Launch(
+                _function,
+                (uint)(OutputCount / (BlockThreads / 32)),
+                (uint)InputCapsules,
+                (uint)(BatchSize / 16),
+                BlockThreads, 1, 1, 0, arguments);
+        }
+        else
+        {
+            uint grid = (uint)((BatchSize * InputCapsules * OutputCount * OutputDim) /
+                (BlockThreads * OutputsPerThread));
+            _module.Launch(_function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
+        }
     }
 
     public void Dispose() => _module.Dispose();
@@ -119,6 +136,10 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)
     {
         ValidateShape(batchSize, inputCapsules, inputDim, outputCount, outputDim);
+        if (UseTensorCorePath(batchSize, inputCapsules, inputDim, outputCount, outputDim))
+            return EmitTensorCorePtx(
+                ccMajor, ccMinor, op,
+                batchSize, inputCapsules, inputDim, outputCount, outputDim);
         string entry = EntryPointFor(op);
         (int wi, int wcj, int wk) = WeightStrides(op, inputDim, outputCount, outputDim);
         int inStrideB = inputCapsules * inputDim;   // input [B,I,K]
@@ -213,6 +234,88 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         return ptx.ToString();
     }
 
+    private static string EmitTensorCorePtx(
+        int ccMajor, int ccMinor, DirectPtxCapsuleOp op,
+        int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)
+    {
+        string entry = EntryPointFor(op);
+        int inputRowStride = inputCapsules * inputDim;
+        int weightInputCapsuleStride = inputDim * outputCount * outputDim;
+        int weightOutputStride = op == DirectPtxCapsuleOp.Predictions
+            ? inputDim * outputDim
+            : outputDim;
+        int weightKStride = op == DirectPtxCapsuleOp.Predictions
+            ? outputDim
+            : outputCount * outputDim;
+        int outputRowStride = inputCapsules * outputCount * outputDim;
+
+        var ptx = new StringBuilder(3_500);
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor);
+        ptx.AppendLine($"// {entry} tensor-core B={batchSize} I={inputCapsules} K={inputDim} C={outputCount} D={outputDim}");
+        ptx.AppendLine();
+        ptx.AppendLine($".visible .entry {entry}(");
+        ptx.AppendLine("    .param .u64 input_ptr,");
+        ptx.AppendLine("    .param .u64 weights_ptr,");
+        ptx.AppendLine("    .param .u64 out_ptr");
+        ptx.AppendLine(")");
+        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine("{");
+        ptx.AppendLine("    .reg .b32 %r<16>;");
+        ptx.AppendLine("    .reg .b64 %rd<20>;");
+        ptx.AppendLine("    .reg .b32 %a<4>;");
+        ptx.AppendLine("    .reg .b32 %b<4>;");
+        ptx.AppendLine("    .reg .f32 %d<8>;");
+        ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd1, [weights_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [out_ptr];");
+        ptx.AppendLine("    mov.u32 %r0, %tid.x;");
+        ptx.AppendLine("    shr.u32 %r1, %r0, 5;");                       // warp in block
+        ptx.AppendLine("    mov.u32 %r2, %ctaid.x;");
+        ptx.AppendLine($"    mad.lo.u32 %r4, %r2, {BlockThreads / 32}, %r1;"); // c/j
+        ptx.AppendLine("    mov.u32 %r6, %ctaid.y;");                     // i
+        ptx.AppendLine("    mov.u32 %r7, %ctaid.z;");                     // b tile
+
+        // A = input[bTile*16, i, 0], row-major 16x16 with physical B-row stride I*K.
+        ptx.AppendLine($"    mul.lo.u32 %r8, %r7, {16 * inputRowStride};");
+        ptx.AppendLine($"    mad.lo.u32 %r8, %r6, {inputDim}, %r8;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r8, 4;");
+        ptx.AppendLine("    add.u64 %rd6, %rd0, %rd3;");
+
+        // B = weights[i,c/j,0,0], with the operation-specific K row stride.
+        ptx.AppendLine($"    mul.lo.u32 %r9, %r6, {weightInputCapsuleStride};");
+        ptx.AppendLine($"    mad.lo.u32 %r9, %r4, {weightOutputStride}, %r9;");
+        ptx.AppendLine("    mul.wide.u32 %rd4, %r9, 4;");
+        ptx.AppendLine("    add.u64 %rd7, %rd1, %rd4;");
+
+        // C = output[bTile*16, i, c/j, 0], row-major with physical B-row stride I*C*D.
+        ptx.AppendLine($"    mul.lo.u32 %r10, %r7, {16 * outputRowStride};");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r6, {outputCount * outputDim}, %r10;");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r4, {outputDim}, %r10;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r10, 4;");
+        ptx.AppendLine("    add.u64 %rd8, %rd2, %rd5;");
+
+        for (int accumulator = 0; accumulator < 8; accumulator++)
+            ptx.AppendLine($"    mov.f32 %d{accumulator}, 0f00000000;");
+        for (int kTile = 0; kTile < inputDim; kTile += 8)
+        {
+            ptx.AppendLine($"    add.u64 %rd9, %rd6, {kTile * sizeof(float)};");
+            ptx.AppendLine($"    add.u64 %rd10, %rd7, {kTile * weightKStride * sizeof(float)};");
+            ptx.AppendLine($"    wmma.load.a.sync.aligned.row.m16n16k8.global.tf32 " +
+                $"{{%a0,%a1,%a2,%a3}}, [%rd9], {inputRowStride};");
+            ptx.AppendLine($"    wmma.load.b.sync.aligned.row.m16n16k8.global.tf32 " +
+                $"{{%b0,%b1,%b2,%b3}}, [%rd10], {weightKStride};");
+            ptx.AppendLine("    wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 " +
+                "{%d0,%d1,%d2,%d3,%d4,%d5,%d6,%d7}, " +
+                "{%a0,%a1,%a2,%a3}, {%b0,%b1,%b2,%b3}, " +
+                "{%d0,%d1,%d2,%d3,%d4,%d5,%d6,%d7};");
+        }
+        ptx.AppendLine($"    wmma.store.d.sync.aligned.row.m16n16k8.global.f32 " +
+            $"[%rd8], {{%d0,%d1,%d2,%d3,%d4,%d5,%d6,%d7}}, {outputRowStride};");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
+    }
+
     private static DirectPtxKernelBlueprint CreateBlueprint(
         DirectPtxArchitectureFamily architecture, DirectPtxCapsuleOp op,
         int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)
@@ -222,9 +325,11 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         var outputExtent = new DirectPtxExtent(batchSize * inputCapsules * outputCount * outputDim);
         return new DirectPtxKernelBlueprint(
             Operation: op == DirectPtxCapsuleOp.Predictions ? "capsule-predictions" : "capsule-transform",
-            Version: 2,
+            Version: 3,
             Architecture: architecture,
-            Variant: $"fp32-x{GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim)}-b{batchSize}-i{inputCapsules}-k{inputDim}-c{outputCount}-d{outputDim}",
+            Variant: UseTensorCorePath(batchSize, inputCapsules, inputDim, outputCount, outputDim)
+                ? $"tf32-wmma-b{batchSize}-i{inputCapsules}-k{inputDim}-c{outputCount}-d{outputDim}"
+                : $"fp32-x{GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim)}-b{batchSize}-i{inputCapsules}-k{inputDim}-c{outputCount}-d{outputDim}",
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -234,16 +339,22 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     outputExtent, outputExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim) switch
-                {
-                    8 => 28,
-                    4 => 18,
-                    _ => 26
-                },
-                maxStaticSharedBytes: 0,
-                maxLocalBytesPerThread: 0,
-                minBlocksPerMultiprocessor: 1),
+            ResourceBudget: UseTensorCorePath(batchSize, inputCapsules, inputDim, outputCount, outputDim)
+                ? DirectPtxResourceBudget.FromDriverMeasurement(
+                    measuredRegistersPerThread: 38,
+                    maxStaticSharedBytes: 0,
+                    maxLocalBytesPerThread: 0,
+                    minBlocksPerMultiprocessor: 1)
+                : DirectPtxResourceBudget.FromDriverMeasurement(
+                    measuredRegistersPerThread: GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim) switch
+                    {
+                        8 => 28,
+                        4 => 18,
+                        _ => 26
+                    },
+                    maxStaticSharedBytes: 0,
+                    maxLocalBytesPerThread: 0,
+                    minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = op == DirectPtxCapsuleOp.Predictions
@@ -252,8 +363,13 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none",
-                ["outputs-per-thread"] = GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim)
-                    .ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ["outputs-per-thread"] = UseTensorCorePath(batchSize, inputCapsules, inputDim, outputCount, outputDim)
+                    ? "wmma-16x16"
+                    : GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim)
+                        .ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["numeric-mode"] = UseTensorCorePath(batchSize, inputCapsules, inputDim, outputCount, outputDim)
+                    ? "TF32 multiply with FP32 accumulation"
+                    : "FP32 multiply with FP32 accumulation"
             });
     }
 
@@ -263,6 +379,14 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         long outputs = (long)batchSize * inputCapsules * outputCount * outputDim;
         if (outputDim % 8 == 0 && outputs % (BlockThreads * 8L) == 0) return 8;
         return outputDim % 4 == 0 && outputs % (BlockThreads * 4L) == 0 ? 4 : 1;
+    }
+
+    private static bool UseTensorCorePath(
+        int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)
+    {
+        long tiles = (long)(batchSize / 16) * inputCapsules * outputCount;
+        return batchSize % 16 == 0 && outputCount % (BlockThreads / 32) == 0 &&
+            inputDim == 16 && outputDim == 16 && tiles > 0;
     }
 
     internal static bool IsSupportedShape(int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)

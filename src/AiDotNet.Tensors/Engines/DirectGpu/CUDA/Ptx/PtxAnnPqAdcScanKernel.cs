@@ -111,24 +111,30 @@ internal sealed class PtxAnnPqAdcScanKernel : IDisposable
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // sum
         if (m % 4 == 0)
         {
-            // Strip-mine the baked subspace count four at a time. This quarters code-load and
-            // branch instructions without fully unrolling the gather stream (which measured 46
-            // registers/thread at m=16 and lost the occupancy the optimization was meant to keep).
+            int subspacesPerGroup = m % 8 == 0 ? 8 : 4;
+            int codeWordsPerGroup = subspacesPerGroup / 4;
+            // Strip-mine the baked subspace count four or eight at a time. Packed u32 code loads
+            // remove three byte-load instructions per word; the x8 path also halves loop-control
+            // overhead at the common m=16 shape without fully unrolling the gather stream (which
+            // measured 46 registers/thread and lost the occupancy it was meant to improve).
             ptx.AppendLine("    mov.u32 %r6, 0;");
             ptx.AppendLine("$ADC_GROUP_LOOP:");
-            ptx.AppendLine("    ld.global.nc.u32 %r10, [%rd7];");
-            for (int lane = 0; lane < 4; lane++)
+            for (int word = 0; word < codeWordsPerGroup; word++)
             {
-                ptx.AppendLine($"    bfe.u32 %r7, %r10, {lane * 8}, 8;");
-                ptx.AppendLine("    mul.wide.u32 %rd8, %r7, 4;");
-                ptx.AppendLine("    add.u64 %rd9, %rd6, %rd8;");
-                ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");
-                ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
-                ptx.AppendLine($"    add.u64 %rd6, %rd6, {ksub * 4};");
+                ptx.AppendLine($"    ld.global.nc.u32 %r10, [%rd7+{word * 4}];");
+                for (int lane = 0; lane < 4; lane++)
+                {
+                    ptx.AppendLine($"    bfe.u32 %r7, %r10, {lane * 8}, 8;");
+                    ptx.AppendLine("    mul.wide.u32 %rd8, %r7, 4;");
+                    ptx.AppendLine("    add.u64 %rd9, %rd6, %rd8;");
+                    ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");
+                    ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+                    ptx.AppendLine($"    add.u64 %rd6, %rd6, {ksub * 4};");
+                }
             }
-            ptx.AppendLine("    add.u64 %rd7, %rd7, 4;");
+            ptx.AppendLine($"    add.u64 %rd7, %rd7, {subspacesPerGroup};");
             ptx.AppendLine("    add.u32 %r6, %r6, 1;");
-            ptx.AppendLine($"    setp.lt.u32 %p0, %r6, {m / 4};");
+            ptx.AppendLine($"    setp.lt.u32 %p0, %r6, {m / subspacesPerGroup};");
             ptx.AppendLine("    @%p0 bra $ADC_GROUP_LOOP;");
         }
         else

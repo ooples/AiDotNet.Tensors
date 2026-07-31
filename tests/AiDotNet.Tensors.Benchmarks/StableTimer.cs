@@ -85,6 +85,8 @@ internal static class StableTimer
     /// negligible -- a 1.05x result should still not be called a win.
     /// </remarks>
     internal const double StableSpread = 0.05;
+    private const double TargetDeviceBatchMicroseconds = 250_000.0;
+    private const int MaxDeviceIterations = 50_000;
     private const double TargetHostBatchMicroseconds = 250_000.0;
     private const int MaxHostIterations = 50_000;
 
@@ -180,6 +182,98 @@ internal static class StableTimer
         }
 
         return Pair(samplesA, samplesB, ratios);
+    }
+
+    /// <summary>
+    /// Device-times two launches as adjacent A/B batches when both use the caller's stream.
+    /// </summary>
+    /// <remarks>
+    /// Public-backend head-to-heads cannot reach the backend's private
+    /// <see cref="DirectPtxRuntime"/>, but they can still use one timing contract when both
+    /// routes share a context and stream. The supplied timer must return microseconds per
+    /// launch for an event-bracketed batch. Keeping convergence here preserves the same
+    /// consecutive-window and five-percent gates used by <see cref="MeasurePair"/>.
+    /// </remarks>
+    internal static PairResult MeasureDevicePair(
+        Action launchA, Action launchB,
+        long workUnitsA, long workUnitsB,
+        Action synchronize,
+        Func<Action, int, double> measureMicroseconds,
+        int maxAttempts = 15)
+    {
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (synchronize is null) throw new ArgumentNullException(nameof(synchronize));
+        if (measureMicroseconds is null)
+            throw new ArgumentNullException(nameof(measureMicroseconds));
+
+        int iterationsA = IterationsFor(workUnitsA);
+        int iterationsB = IterationsFor(workUnitsB);
+        Warm(launchA, synchronize, iterationsA);
+        Warm(launchB, synchronize, iterationsB);
+        iterationsA = CalibrateDeviceIterations(
+            launchA, iterationsA, measureMicroseconds);
+        iterationsB = CalibrateDeviceIterations(
+            launchB, iterationsB, measureMicroseconds);
+
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            // A symmetric ABBA window cancels first-order clock and thermal drift. A plain AB
+            // pair consistently attributed the direction of a 10-20% WDDM swing to whichever
+            // kernel happened to run second, even with event-bracketed 250 ms batches.
+            double aFirst = measureMicroseconds(launchA, iterationsA);
+            double bFirst = measureMicroseconds(launchB, iterationsB);
+            double bSecond = measureMicroseconds(launchB, iterationsB);
+            double aSecond = measureMicroseconds(launchA, iterationsA);
+            double a = (aFirst + aSecond) * 0.5;
+            double b = (bFirst + bSecond) * 0.5;
+            AddToConsecutiveWindow(samplesA, a);
+            AddToConsecutiveWindow(samplesB, b);
+            AddToConsecutiveWindow(ratios, a / b);
+
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios);
+    }
+
+    /// <summary>
+    /// Corrects a work-unit estimate with bounded event-timed probes of the actual kernel.
+    /// </summary>
+    /// <remarks>
+    /// Scientific kernels can have the same nominal arithmetic count and radically different
+    /// occupancy or cache behavior. A proxy-derived count as low as five launches made a
+    /// 14-microsecond kernel a 70-microsecond sample, which is too short for the stability gate
+    /// to distinguish kernel behavior from ordinary device scheduling. Calibration only grows
+    /// the conservative starting count and remains capped. A second probe corrects a cold first
+    /// estimate that would otherwise leave the calibrated batch well short of its target.
+    /// </remarks>
+    private static int CalibrateDeviceIterations(
+        Action launch, int startingIterations,
+        Func<Action, int, double> measureMicroseconds)
+    {
+        int iterations = startingIterations;
+        for (int probe = 0; probe < 2; probe++)
+        {
+            double microsecondsPerLaunch = measureMicroseconds(launch, iterations);
+            if (!double.IsFinite(microsecondsPerLaunch) || microsecondsPerLaunch <= 0)
+                break;
+            int desired = (int)Math.Clamp(
+                Math.Ceiling(TargetDeviceBatchMicroseconds / microsecondsPerLaunch),
+                iterations, MaxDeviceIterations);
+            if (desired == iterations) break;
+            iterations = desired;
+        }
+        return iterations;
     }
 
     /// <summary>

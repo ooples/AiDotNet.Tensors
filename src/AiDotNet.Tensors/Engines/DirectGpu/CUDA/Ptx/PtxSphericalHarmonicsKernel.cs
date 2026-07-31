@@ -9,7 +9,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <c>output = clamp01(sum_b shCoefficients[i,b,ch] * basis_b(dir_i))</c>, matching the NVRTC
 /// <c>spherical_harmonics</c> kernel. One thread owns one (point, channel) output — the normalized
 /// view direction and the real SH basis (degree 0..3, up to 16 functions) are computed in registers
-/// and the coefficient dot-product is unrolled over <c>basisCount</c>; no shared memory, no reduction.
+/// and the coefficient dot-product is unrolled over <c>basisCount</c>. Four-channel shapes assign
+/// one point to each thread so all RGBA channels reuse that basis and use vector coefficient loads;
+/// other shapes retain the scalar channel path. There is no shared memory or reduction.
 ///
 /// Shape (numPoints, basisCount, numChannels, degree, broadcastDir) is baked into the PTX, so the
 /// launch takes buffer pointers only. 256 threads/block, grid = (numPoints*numChannels)/256, required
@@ -28,6 +30,7 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
     internal int NumPoints { get; }
     internal int BasisCount { get; }
     internal int NumChannels { get; }
+    internal int ChannelsPerThread { get; }
     internal int Degree { get; }
     internal bool BroadcastDir { get; }
     internal string Ptx { get; }
@@ -46,6 +49,7 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         NumPoints = numPoints;
         BasisCount = basisCount;
         NumChannels = numChannels;
+        ChannelsPerThread = GetChannelsPerThread(numPoints, numChannels);
         Degree = degree;
         BroadcastDir = broadcastDir;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, numPoints, basisCount, numChannels, degree, broadcastDir);
@@ -73,7 +77,7 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         arguments[0] = &coeffPointer;
         arguments[1] = &dirPointer;
         arguments[2] = &outputPointer;
-        uint grid = (uint)((NumPoints * NumChannels) / BlockThreads);
+        uint grid = (uint)((NumPoints * NumChannels) / (ChannelsPerThread * BlockThreads));
         _module.Launch(_function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -86,6 +90,7 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         int ccMajor, int ccMinor, int numPoints, int basisCount, int numChannels, int degree, bool broadcastDir)
     {
         ValidateShape(numPoints, basisCount, numChannels, degree);
+        int channelsPerThread = GetChannelsPerThread(numPoints, numChannels);
 
         // Real SH constants (Condon-Shortley folded), matching the NVRTC table.
         string c0 = DirectPtxPtxText.Hex(0.282095f), c1 = DirectPtxPtxText.Hex(0.488603f), c2 = DirectPtxPtxText.Hex(1.092548f), c3 = DirectPtxPtxText.Hex(0.315392f),
@@ -97,7 +102,7 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
-        ptx.AppendLine($"// spherical-harmonics points={numPoints} basis={basisCount} channels={numChannels} degree={degree} broadcast={broadcastDir}");
+        ptx.AppendLine($"// spherical-harmonics points={numPoints} basis={basisCount} channels={numChannels} x{channelsPerThread} degree={degree} broadcast={broadcastDir}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 coeff_ptr,");
@@ -115,9 +120,27 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         ptx.AppendLine("    ld.param.u64 %rd2, [out_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");   // idx = i*numChannels + ch
-        ptx.AppendLine($"    div.u32 %r3, %r2, {numChannels};");           // i (point)
-        ptx.AppendLine($"    rem.u32 %r4, %r2, {numChannels};");           // ch
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");   // scalar output or channel group
+        int channelGroups = numChannels / channelsPerThread;
+        if (channelsPerThread == 1)
+        {
+            ptx.AppendLine($"    div.u32 %r3, %r2, {numChannels};");       // i (point)
+            ptx.AppendLine($"    rem.u32 %r4, %r2, {numChannels};");       // ch
+        }
+        else
+        {
+            if (channelGroups == 1)
+            {
+                ptx.AppendLine("    mov.u32 %r3, %r2;");                  // one RGBA group per point
+                ptx.AppendLine("    mov.u32 %r4, 0;");
+            }
+            else
+            {
+                ptx.AppendLine($"    div.u32 %r3, %r2, {channelGroups};");
+                ptx.AppendLine($"    rem.u32 %r4, %r2, {channelGroups};");
+                ptx.AppendLine($"    mul.lo.u32 %r4, %r4, {channelsPerThread};");
+            }
+        }
 
         // dir base element = (broadcast ? 0 : i) * 3
         if (broadcastDir)
@@ -178,19 +201,35 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         ptx.AppendLine("    add.u32 %r6, %r6, %r4;");
         ptx.AppendLine("    mul.wide.u32 %rd5, %r6, 4;");
         ptx.AppendLine("    add.u64 %rd6, %rd0, %rd5;");                  // &coeff[i,0,ch]
-        ptx.AppendLine($"    mov.f32 %f7, {zero};");                     // color
+        for (int channel = 0; channel < channelsPerThread; channel++)
+            ptx.AppendLine($"    mov.f32 %f{7 + channel}, {zero};");      // color[channel]
         int strideBytes = numChannels * 4;
         for (int b = 0; b < basisCount; b++)
         {
-            ptx.AppendLine($"    ld.global.nc.f32 %f8, [%rd6+{b * strideBytes}];");
-            ptx.AppendLine($"    fma.rn.f32 %f7, %f8, %f{16 + b}, %f7;");
+            if (channelsPerThread == 4)
+            {
+                ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f32, %f33, %f34, %f35}}, [%rd6+{b * strideBytes}];");
+                for (int channel = 0; channel < channelsPerThread; channel++)
+                    ptx.AppendLine($"    fma.rn.f32 %f{7 + channel}, %f{32 + channel}, %f{16 + b}, %f{7 + channel};");
+            }
+            else
+            {
+                ptx.AppendLine($"    ld.global.nc.f32 %f8, [%rd6+{b * strideBytes}];");
+                ptx.AppendLine($"    fma.rn.f32 %f7, %f8, %f{16 + b}, %f7;");
+            }
         }
         // clamp01
-        ptx.AppendLine($"    max.f32 %f7, %f7, {zero};");
-        ptx.AppendLine($"    min.f32 %f7, %f7, {f1};");
-        ptx.AppendLine("    mul.wide.u32 %rd7, %r2, 4;");
+        for (int channel = 0; channel < channelsPerThread; channel++)
+        {
+            ptx.AppendLine($"    max.f32 %f{7 + channel}, %f{7 + channel}, {zero};");
+            ptx.AppendLine($"    min.f32 %f{7 + channel}, %f{7 + channel}, {f1};");
+        }
+        ptx.AppendLine($"    mul.wide.u32 %rd7, %r2, {channelsPerThread * sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
-        ptx.AppendLine("    st.global.f32 [%rd8], %f7;");
+        if (channelsPerThread == 4)
+            ptx.AppendLine("    st.global.v4.f32 [%rd8], {%f7, %f8, %f9, %f10};");
+        else
+            ptx.AppendLine("    st.global.f32 [%rd8], %f7;");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -204,9 +243,9 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         var outExtent = new DirectPtxExtent(numPoints * numChannels);
         return new DirectPtxKernelBlueprint(
             Operation: "spherical-harmonics",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"fp32-p{numPoints}-b{basisCount}-c{numChannels}-deg{degree}-bc{(broadcastDir ? 1 : 0)}",
+            Variant: $"fp32-x{GetChannelsPerThread(numPoints, numChannels)}-p{numPoints}-b{basisCount}-c{numChannels}-deg{degree}-bc{(broadcastDir ? 1 : 0)}",
             Tensors:
             [
                 new("shCoefficients", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -216,15 +255,26 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     outExtent, outExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 64,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: GetChannelsPerThread(numPoints, numChannels) == 4 &&
+                (basisCount == 16 || basisCount == 9)
+                ? DirectPtxResourceBudget.FromDriverMeasurement(
+                    measuredRegistersPerThread: basisCount == 16 ? 80 : 48,
+                    maxStaticSharedBytes: 0,
+                    maxLocalBytesPerThread: 0,
+                    minBlocksPerMultiprocessor: 1)
+                : new DirectPtxResourceBudget(
+                    MaxRegistersPerThread: GetChannelsPerThread(numPoints, numChannels) == 4
+                        ? 96
+                        : 64,
+                    MaxStaticSharedBytes: 0,
+                    MaxLocalBytesPerThread: 0,
+                    MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output[i,ch] = clamp01(sum_b shCoefficients[i,b,ch] * basis_b(normalize(dir_i)))",
                 ["basis"] = "real spherical harmonics, degree 0..3 (up to 16 functions)",
+                ["channels-per-thread"] = GetChannelsPerThread(numPoints, numChannels)
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"
@@ -241,6 +291,11 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
     }
 
     internal static bool IsPromotedShape(int numPoints, int basisCount, int numChannels, int degree) => false;
+
+    private static int GetChannelsPerThread(int numPoints, int numChannels) =>
+        numChannels % 4 == 0 && (long)numPoints * (numChannels / 4) % BlockThreads == 0
+            ? 4
+            : 1;
 
     private static void ValidateShape(int numPoints, int basisCount, int numChannels, int degree)
     {

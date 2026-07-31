@@ -50,7 +50,7 @@ internal static class DirectPtxScientificHeadToHead
             Console.WriteLine();
             Console.WriteLine("DIRECT PTX SCIENTIFIC - public API incumbent vs experimental route");
             Console.WriteLine("device: {0}", backend.DeviceName);
-            Console.WriteLine("gate: same backend/context/stream; adjacent host-timed batches; 5% stability ceiling");
+            Console.WriteLine("gate: same backend/context/stream; adjacent CUDA-event batches; 5% stability ceiling");
             Console.WriteLine();
             Console.WriteLine("{0,-43} {1,14} {2,14} {3,8}  {4}",
                 "operator", "incumbent", "direct PTX", "ratio", "verdict");
@@ -105,9 +105,22 @@ internal static class DirectPtxScientificHeadToHead
             return CaseResult.Rejected(string.Format(CultureInfo.InvariantCulture,
                 "not equivalent (abs {0:E2}, rel {1:E2})", absolute, relative));
 
-        StableTimer.PairResult timing = StableTimer.MeasureHostPair(
-            () => item.Launch(existing: true), backend.Synchronize, item.WorkUnits,
-            () => item.Launch(existing: false), backend.Synchronize, item.WorkUnits);
+        using var start = backend.CreateEvent(enableTiming: true);
+        using var stop = backend.CreateEvent(enableTiming: true);
+        double MeasureMicroseconds(Action launch, int iterations)
+        {
+            backend.RecordEvent(start, backend.DefaultStream);
+            for (int i = 0; i < iterations; i++) launch();
+            backend.RecordEvent(stop, backend.DefaultStream);
+            stop.Synchronize();
+            return backend.GetEventElapsedTime(start, stop) * 1_000.0 / iterations;
+        }
+
+        StableTimer.PairResult timing = StableTimer.MeasureDevicePair(
+            () => item.Launch(existing: true),
+            () => item.Launch(existing: false),
+            item.WorkUnits, item.WorkUnits,
+            backend.Synchronize, MeasureMicroseconds);
         if (!timing.Stable) return new(timing, Verdict.Rejected, "not measurable");
         Verdict verdict = timing.Ratio >= WinThreshold
             ? Verdict.Win

@@ -737,6 +737,20 @@ public class DirectPtxScientificTests
         Assert.False(PtxSphericalHarmonicsKernel.IsPromotedShape(256, 16, 3, 3));
     }
 
+    [Fact]
+    public void SphericalHarmonicsEmitter_CoarsensFourChannelsPerPoint()
+    {
+        string ptx = PtxSphericalHarmonicsKernel.EmitPtx(
+            8, 6, 256, 16, 4, 3, broadcastDir: false);
+
+        Assert.Contains("spherical-harmonics points=256 basis=16 channels=4 x4", ptx);
+        Assert.Equal(16, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(66, Count(ptx, "fma.rn.f32 %f"));   // 64 coefficient FMAs + 2 norm FMAs
+        Assert.DoesNotContain("div.u32 %r3", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rem.u32 %r4", ptx, StringComparison.Ordinal);
+    }
+
     [SkippableTheory]
     [InlineData(3, 16, false)]
     [InlineData(2, 9, true)]
@@ -746,6 +760,8 @@ public class DirectPtxScientificTests
             "The checked-in spherical-harmonics specialization is measured on GA10x/SM86.");
         const int numPoints = 256, numChannels = 4;   // count = 1024 (multiple of 256)
         using var kernel = new PtxSphericalHarmonicsKernel(runtime, numPoints, basisCount, numChannels, degree, broadcast);
+        Assert.Equal(4, kernel.ChannelsPerThread);
+        Assert.Equal(basisCount == 16 ? 80 : 48, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20267500);
@@ -877,6 +893,28 @@ public class DirectPtxScientificTests
         Assert.False(PtxCapsuleContractionKernel.IsPromotedShape(2, 4, 8, 4, 8));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void CapsuleContractionEmitter_UsesThreeDimensionalWmmaTiles(bool predictions)
+    {
+        DirectPtxCapsuleOp op = predictions
+            ? DirectPtxCapsuleOp.Predictions
+            : DirectPtxCapsuleOp.Transform;
+        string ptx = PtxCapsuleContractionKernel.EmitPtx(
+            8, 6, op, 64, 16, 16, 16, 16);
+
+        Assert.Contains("wmma.load.a.sync.aligned.row.m16n16k8.global.tf32", ptx);
+        Assert.Contains("wmma.load.b.sync.aligned.row.m16n16k8.global.tf32", ptx);
+        Assert.Equal(2, Count(ptx, "wmma.mma.sync.aligned.row.row.m16n16k8"));
+        Assert.Equal(1, Count(ptx, "wmma.store.d.sync.aligned.row.m16n16k8"));
+        Assert.Contains("mov.u32 %r6, %ctaid.y", ptx);
+        Assert.Contains("mov.u32 %r7, %ctaid.z", ptx);
+        Assert.DoesNotContain("div.u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rem.u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
+    }
+
     [SkippableTheory]
     [InlineData(true)]
     [InlineData(false)]
@@ -925,6 +963,60 @@ public class DirectPtxScientificTests
         var actual = new float[expected.Length];
         outBuf.Download<float>(actual);
         AssertVectorClose(actual, expected, 3e-3f, $"capsule {op}");
+    }
+
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void DriverOnlyCapsuleTensorCoreContraction_MatchesOracle(bool predictions)
+    {
+        DirectPtxCapsuleOp op = predictions
+            ? DirectPtxCapsuleOp.Predictions
+            : DirectPtxCapsuleOp.Transform;
+        using var runtime = CreateValidatedRuntime(
+            "The checked-in capsule WMMA specialization is measured on GA10x/SM86.");
+        const int b = 16, inCaps = 8, inDim = 16, outCount = 8, outDim = 16;
+        using var kernel = new PtxCapsuleContractionKernel(
+            runtime, op, b, inCaps, inDim, outCount, outDim);
+        Assert.True(kernel.UsesTensorCores);
+        Assert.Equal(38, kernel.Audit.Function.RegistersPerThread);
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+
+        var random = RandomHelper.CreateSeededRandom(20267701);
+        float[] input = Values(random, b * inCaps * inDim, 1.0f);
+        float[] weights = Values(random, inCaps * outCount * inDim * outDim, 1.0f);
+        var expected = new float[b * inCaps * outCount * outDim];
+        for (int bi = 0; bi < b; bi++)
+            for (int i = 0; i < inCaps; i++)
+                for (int cj = 0; cj < outCount; cj++)
+                    for (int d = 0; d < outDim; d++)
+                    {
+                        double sum = 0;
+                        for (int k = 0; k < inDim; k++)
+                        {
+                            int inputIdx = bi * inCaps * inDim + i * inDim + k;
+                            int weightIdx = op == DirectPtxCapsuleOp.Predictions
+                                ? i * outCount * inDim * outDim + cj * inDim * outDim + k * outDim + d
+                                : i * inDim * outCount * outDim + k * outCount * outDim + cj * outDim + d;
+                            sum += input[inputIdx] * weights[weightIdx];
+                        }
+                        expected[bi * inCaps * outCount * outDim + i * outCount * outDim + cj * outDim + d] = (float)sum;
+                    }
+
+        using var inBuf = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
+        using var wBuf = runtime.AllocateBytes((nuint)(weights.Length * sizeof(float)));
+        using var outBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        inBuf.Upload<float>(input);
+        wBuf.Upload<float>(weights);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(inBuf, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(wBuf, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outBuf, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        outBuf.Download<float>(actual);
+        AssertVectorClose(actual, expected, 6e-3f, $"capsule tensor-core {op}");
     }
 
     [Fact]
@@ -1159,12 +1251,12 @@ public class DirectPtxScientificTests
         Assert.Contains(PtxAnnPqAdcScanKernel.EntryPoint, ptx);
         Assert.Contains("$ADC_GROUP_LOOP:", ptx);
         Assert.DoesNotContain("$ADC_S_LOOP:", ptx);
-        Assert.Equal(1, Count(ptx, "ld.global.nc.u32"));    // four uint8 codes per loop
-        Assert.Equal(4, Count(ptx, "bfe.u32"));             // one extraction per strip lane
-        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));    // four gathered table values per loop
+        Assert.Equal(2, Count(ptx, "ld.global.nc.u32"));    // eight uint8 codes per loop
+        Assert.Equal(8, Count(ptx, "bfe.u32"));             // one extraction per strip lane
+        Assert.Equal(8, Count(ptx, "ld.global.nc.f32"));    // eight gathered table values per loop
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Contains("div.u32 %r3, %r2, 16", ptx);        // q = gid / numCodes
-        Assert.Equal(4, Count(ptx, "add.u64 %rd6, %rd6, 64")); // one pointer step per gather
+        Assert.Equal(8, Count(ptx, "add.u64 %rd6, %rd6, 64")); // one pointer step per gather
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxAnnPqAdcScanKernel.IsSupportedShape(16, 16, 8, 16));
