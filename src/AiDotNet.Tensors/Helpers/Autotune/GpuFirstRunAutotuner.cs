@@ -117,7 +117,7 @@ public static class GpuFirstRunAutotuner
     ///   the safe default and nothing is measured or stored.</item>
     /// <item>Otherwise every candidate is benchmarked on-device; the fastest is stored
     ///   (keyed by GPU fingerprint) and returned. A candidate whose benchmark throws or
-    ///   returns a non-positive score is skipped, so a launch-failing or slow config can
+    ///   returns a non-finite or non-positive score is skipped, so a launch-failing or slow config can
     ///   never be selected. If all candidates fail, the first candidate is used as the
     ///   default and nothing is stored.</item>
     /// </list>
@@ -152,7 +152,7 @@ public static class GpuFirstRunAutotuner
             return new AutotuneResolution(
                 fallback.Variant, fallback.Parameters, 0.0, fromCache: false, measured: false);
 
-        // 3. On-device sweep. A candidate that throws or scores <= 0 is skipped.
+        // 3. On-device sweep. A candidate that throws or returns a non-finite/non-positive score is skipped.
         AutotuneCandidate best = default;
         double bestGflops = double.NegativeInfinity;
         bool anyMeasured = false;
@@ -167,7 +167,7 @@ public static class GpuFirstRunAutotuner
             {
                 continue; // unlaunchable config (e.g. shared-mem over budget) — cannot win
             }
-            if (double.IsNaN(gflops) || gflops <= 0.0) continue;
+            if (double.IsNaN(gflops) || double.IsInfinity(gflops) || gflops <= 0.0) continue;
             if (gflops > bestGflops)
             {
                 bestGflops = gflops;

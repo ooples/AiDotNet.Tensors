@@ -105,18 +105,22 @@ public sealed class GpuFirstRunAutotunerTests : IDisposable
     }
 
     [Fact]
-    public void Resolve_SkipsUnlaunchableAndNonPositiveCandidates()
+    public void Resolve_SkipsUnlaunchableNonFiniteAndNonPositiveCandidates()
     {
         KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "poison", "gpu-poison-sm86");
         var shape = new ShapeProfile(16, 128, 128, 784);
 
         // tile-32 "launch-fails" (throws, e.g. shared memory over budget);
-        // tile-8 reports a non-positive score; only tile-16 is a valid winner.
+        // Other invalid candidates report non-positive or non-finite scores;
+        // only tile-16 is a valid winner.
         AutotuneResolution r = GpuFirstRunAutotuner.Resolve(
-            id, shape, Tiles(8, 16, 32),
+            id, shape, Tiles(2, 4, 8, 16, 32, 64),
             c => c.Variant switch
             {
                 "tile-32" => throw new InvalidOperationException("too much shared memory"),
+                "tile-64" => double.NaN,
+                "tile-4" => double.PositiveInfinity,
+                "tile-2" => double.NegativeInfinity,
                 "tile-8" => 0.0,
                 _ => 750.0
             },
