@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu.Telemetry;
@@ -73,9 +72,8 @@ public sealed class SupabaseGpuTuningExchangeTests
             MeasuredGflops = 900.0
         };
 
-        var options = new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
         string json = JsonSerializer.Serialize(
-            SupabaseGpuTuningExchange.Row.FromProfile(profile, "hash1", "1.2.3"), options);
+            SupabaseGpuTuningExchange.Row.FromProfile(profile, "hash1", "1.2.3"));
 
         Assert.Contains("\"model_key\":\"nvidia|RTX 3080|sm86|drv12030\"", json);
         Assert.Contains("\"measured_gflops\":900", json);

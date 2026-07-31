@@ -174,7 +174,9 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
     /// <summary>PostgREST row shape for <c>gpu_tuning_profiles</c> (snake_case columns).</summary>
     internal sealed class Row
     {
-        [JsonPropertyName("id")] public long? Id { get; set; }
+        [JsonPropertyName("id")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public long? Id { get; set; }
         [JsonPropertyName("model_key")] public string ModelKey { get; set; } = "";
         [JsonPropertyName("vendor")] public string Vendor { get; set; } = "";
         [JsonPropertyName("model")] public string Model { get; set; } = "";
@@ -188,7 +190,9 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
         [JsonPropertyName("measured_gflops")] public double MeasuredGflops { get; set; }
         [JsonPropertyName("client_hash")] public string? ClientHash { get; set; }
         [JsonPropertyName("aidotnet_version")] public string? AiDotNetVersion { get; set; }
-        [JsonPropertyName("recorded_at")] public string? RecordedAt { get; set; }
+        [JsonPropertyName("recorded_at")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? RecordedAt { get; set; }
 
         internal GpuTuningProfile ToProfile() => new()
         {
