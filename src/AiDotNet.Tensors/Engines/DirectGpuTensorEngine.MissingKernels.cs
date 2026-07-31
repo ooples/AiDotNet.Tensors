@@ -998,27 +998,6 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
-    /// GPU-executed ADJOINT of RFFT: maps a gradient shaped like the interleaved one-sided spectrum
-    /// back onto the real input signal. Returns null when the GPU path is unavailable, so the caller
-    /// can fall back to the managed adjoint.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Mirrors <c>BackwardFunctions.RFFTAdjointBackward</c>: scatter the one-sided bins into a full
-    /// nFft complex spectrum with the bins above Nyquist left at ZERO (no Hermitian mirroring — that
-    /// is what makes this the transpose rather than the inverse), apply the UNNORMALISED inverse
-    /// transform, then take the real part's first <paramref name="signalLength"/> samples.
-    /// </para>
-    /// <para>
-    /// No new kernel is needed on any backend. <c>BatchedFFT(inverse: true)</c> already applies the
-    /// 1/nFft that the true inverse carries (CudaBackend dispatches <c>scale_inverse</c> for it), so
-    /// the adjoint is exactly <c>nFft x</c> that result — recovered with the existing <c>Scale</c>.
-    /// Every primitive used here (<c>DeinterleaveComplex</c>, <c>Fill</c>, <c>CopyRows</c>,
-    /// <c>BatchedFFT</c>, <c>Scale</c>) is on IDirectGpuBackend, so this works on all six backends
-    /// from one implementation.
-    /// </para>
-    /// </remarks>
-    /// <summary>
     /// GPU-executed adjoint of IRFFT, or null when the GPU path is unavailable.
     /// </summary>
     /// <remarks>
@@ -1099,6 +1078,27 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// GPU-executed ADJOINT of RFFT: maps a gradient shaped like the interleaved one-sided spectrum
+    /// back onto the real input signal. Returns null when the GPU path is unavailable, so the caller
+    /// can fall back to the managed adjoint.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors <c>BackwardFunctions.RFFTAdjointBackward</c>: scatter the one-sided bins into a full
+    /// nFft complex spectrum with the bins above Nyquist left at ZERO (no Hermitian mirroring — that
+    /// is what makes this the transpose rather than the inverse), apply the UNNORMALISED inverse
+    /// transform, then take the real part's first <paramref name="signalLength"/> samples.
+    /// </para>
+    /// <para>
+    /// No new kernel is needed on any backend. <c>BatchedFFT(inverse: true)</c> already applies the
+    /// 1/nFft that the true inverse carries (CudaBackend dispatches <c>scale_inverse</c> for it), so
+    /// the adjoint is exactly <c>nFft x</c> that result — recovered with the existing <c>Scale</c>.
+    /// Every primitive used here (<c>DeinterleaveComplex</c>, <c>Fill</c>, <c>CopyRows</c>,
+    /// <c>BatchedFFT</c>, <c>Scale</c>) is on IDirectGpuBackend, so this works on all six backends
+    /// from one implementation.
+    /// </para>
+    /// </remarks>
     internal Tensor<T>? RfftAdjointGpu<T>(Tensor<T> gradOutput, int signalLength, int nFft, int[] inputShape)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;

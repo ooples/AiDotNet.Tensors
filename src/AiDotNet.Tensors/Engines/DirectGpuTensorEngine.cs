@@ -19999,7 +19999,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGrid = GetOrAllocateBuffer(backend, grid);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
-            // Match CpuEngine.GridSample (2-arg): align_corners=True + border/clamp padding.
             // torchvision defaults, matching the corrected CpuEngine narrow forward:
             // paddingMode 0 == zeros (the kernels treat 1 as border and anything else as zeros),
             // alignCorners false. This previously passed border + alignCorners:true, which matched

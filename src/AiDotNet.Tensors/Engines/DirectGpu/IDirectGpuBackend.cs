@@ -2051,7 +2051,6 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>STFT magnitude+phase: per (b,k,frame) DFT bin of the windowed frame. out [b][k*numFrames+frame].</summary>
     void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs);
 
-    /// <summary>Phase vocoder time-axis remap + phase accumulation (one thread per (b,f)).</summary>
     /// <summary>
     /// Phase vocoder over a <c>[leading, numFreqs, numFrames]</c> magnitude/phase pair — the STFT's
     /// layout, with TIME as the contiguous inner axis. Interpolates along time and accumulates phase
