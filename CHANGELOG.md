@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.120.6](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.5...v0.120.6) (2026-07-31)
+
+
+### Bug Fixes
+
+* **autodiff:** Spectrogram backward was not the adjoint; make MelSpectrogram differentiable; close the OpRegistry out-param hole ([#911](https://github.com/ooples/AiDotNet.Tensors/issues/911)) ([4207a19](https://github.com/ooples/AiDotNet.Tensors/commit/4207a199169eff4c6921d6cffd2c1558303d39b3))
+* **compilation:** key compiled plans on data-derived constants, not just structure ([#913](https://github.com/ooples/AiDotNet.Tensors/issues/913)) ([09e44fb](https://github.com/ooples/AiDotNet.Tensors/commit/09e44fb50eff18e2f0ec2c6b6a3288c3604eb616))
+* **tests:** double.IsFinite does not exist on net471 (completes [#898](https://github.com/ooples/AiDotNet.Tensors/issues/898)) ([#910](https://github.com/ooples/AiDotNet.Tensors/issues/910)) ([a31a350](https://github.com/ooples/AiDotNet.Tensors/commit/a31a3508834c7b07ef496a4f7391b5214f753f14))
+
+
+### Performance
+
+* **codegen:** strengthen oracle-driven kernel foundation ([#897](https://github.com/ooples/AiDotNet.Tensors/issues/897)) ([998ac91](https://github.com/ooples/AiDotNet.Tensors/commit/998ac918334c2400d1bfe39947b901da4d585493))
+
 ## [0.120.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.4...v0.120.5) (2026-07-30)
 
 
