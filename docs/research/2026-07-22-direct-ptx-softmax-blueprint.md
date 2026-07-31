@@ -15,13 +15,13 @@ softmax-over-rows, log-softmax, log-sum-exp (axis reduction) and its backward,
 softmax backward, masked-fill and its backward, sparsemax, and Taylor softmax.
 
 The family divides into two dispatch shapes. The normalizing operators (softmax,
-softmax-rows, log-softmax, log-sum-exp, softmax-backward, sparsemax) are
-**one-block-per-row reductions**: a block owns one row, its lanes stride the row
-for a coalesced partial, and a shared-memory tree-reduce with `bar.sync`
-produces the row maximum and row sum (and, for sparsemax, the bisection
-threshold). The pointwise operators (masked-fill, masked-fill-backward, Taylor
-softmax, log-sum-exp-backward broadcast) are **thread-per-element**: one thread
-owns one output cell with no cross-thread reduction.
+softmax-rows, log-softmax, log-sum-exp, softmax-backward, sparsemax, and Taylor
+softmax) are **one-block-per-row reductions**: a block owns one row, its lanes
+stride the row for a coalesced partial, and a two-level warp-shuffle reduction
+uses only eight shared warp-leader slots. The pointwise operators (masked-fill,
+masked-fill-backward, and log-sum-exp-backward broadcast) require no cross-thread
+reduction. The masking kernels coarsen each thread across two aligned float4
+transactions; log-sum-exp-backward owns one output cell per thread.
 
 **No softmax cell is promoted by this pull request.** Every specialization fails
 closed: it requires exact-SM86 architecture (`HasValidatedSoftmax`), the opt-in
@@ -29,7 +29,40 @@ softmax experiment override, and exact contiguous physical extents, and
 `IsPromoted*` is hard-coded `false`. Correctness is checked against fp64 CPU
 oracles under GPU-gated driver tests; PTX-structure and manifest-completeness
 gates pass on no-GPU CI. The production admission table remains fail-closed and
-production behavior is unchanged.
+production behavior is unchanged. The checked-in head-to-head now measures all
+ten cells against the shipped CUDA incumbent on the same backend stream. On the
+validated RTX 3080/SM86 shape `[2048,1024]`, eight cells are clear wins and the
+two standalone masking passes are exact bandwidth-floor ties. No tie is reported
+as a win and no benchmark result opens the production gate automatically.
+
+## SM86 head-to-head evidence (2026-07-31)
+
+Command: `--direct-ptx-softmax`. Both sides run on the same backend stream and
+are timed with CUDA events. Each side is independently calibrated to a roughly
+10 ms batch. One sample is the median of five internally-consistent A/B/B/A
+brackets; interrupted brackets are rejected, and three consecutive samples plus
+the paired ratio must converge within 5%. Correctness is checked after timing and
+the harness asserts that the experimental direct-PTX dispatch counter advanced.
+
+| Operator | Shipped CUDA | Direct PTX | Paired ratio | Max error | Verdict |
+|---|---:|---:|---:|---:|---|
+| Softmax | 25.9 us | 24.7 us | 1.05x | 0 | direct wins |
+| SoftmaxRows | 31.8 us | 24.5 us | 1.27x | 2.33e-10 | direct wins |
+| SoftmaxBackward | 1742.7 us | 38.2 us | 45.69x | 5.82e-11 | direct wins |
+| LogSoftmax | 717.2 us | 28.3 us | 25.62x | 2.38e-6 | direct wins |
+| LogSumExpAxis | 306.1 us | 20.3 us | 14.94x | 2.38e-6 | direct wins |
+| LogSumExpBackward | 26.9 us | 25.5 us | 1.09x | 0 | direct wins |
+| MaskedFill | 35.5 us | 35.0 us | 1.00x | 0 | tie within noise |
+| MaskedFillBackward | 35.7 us | 35.0 us | 1.01x | 0 | tie within noise |
+| Sparsemax | 111405.6 us | 157.0 us | 709.90x | 5.96e-8 | direct wins |
+| TaylorSoftmax | 835.1 us | 24.9 us | 33.53x | 0 | direct wins |
+
+The two ties have the same irreducible standalone traffic as their incumbents:
+two FP32 input reads and one FP32 output write. The vectorized PTX forms already
+use read-only loads, L2/write-through stores, zero shared/local memory, and exact
+selection semantics. A material end-to-end win therefore requires fusing the
+mask predicate into its softmax consumer so the intermediate write and reread
+disappear; changing the standalone contract cannot remove those bytes.
 
 This branch emits and validates **raw PTX**. The compiled-cubin pipeline
 (stages 2–9 below) — driver-linked cubin preservation, SASS audit, embedded
@@ -62,15 +95,15 @@ artifact-identity checks activate once stage 3 artifacts exist.
 | # | Production requirement | Current implementation and verdict |
 |---:|---|---|
 | 1 | Exact contiguous layout | Admission requires contiguous physical views whose logical/physical extents equal the baked row length (`DirectPtxExtentMode.Exact`); axis, epsilon, mask/fill, and bisection depth are removed before the hot launch. Unsupported views fall back to the established NVRTC path. **Pass.** |
-| 2 | Coalesced vector memory access | Row reductions stride the row by `blockDim` for coalesced partials and write each normalized value once; pointwise kernels use adjacent per-lane `.f32` loads. **Pass (mechanically); vectorized `v2/v4` widening is a follow-up.** |
-| 3 | Shared memory only for reuse | Only the block-per-row reductions stage a 256/128-lane tree-reduce scratch (max, sum, and the sparsemax bisection accumulator). Pointwise masked-fill and Taylor kernels use **zero** shared memory. **Pass.** |
+| 2 | Coalesced vector memory access | Row reductions stride the row by `blockDim` for coalesced partials and write each normalized value once. Masked-fill and its backward use two aligned float4 transactions per thread with read-only loads and L2-only/write-through output policy. **Pass.** |
+| 3 | Shared memory only for reuse | Block-per-row reductions use eight float warp-leader slots for the hierarchical reduction; the old 256-element staging tree is gone. Pointwise masked-fill, masked-fill-backward, and log-sum-exp-backward use **zero** shared memory. **Pass.** |
 | 4 | Register-resident math | Loaded row values, the running max, exp-sum, backward dot-product, and sparsemax threshold remain in registers until the final store. Every kernel reports **zero local bytes** (asserted in the driver tests) and passes the PTX-discipline `.local` guard. **Pass.** |
-| 5 | Combined/fused kernels | Softmax fuses max-reduction, stable exponentiation, sum-reduction, and normalization in one block pass; softmax-backward fuses the `Σ(dY·S)` reduction with the `S·(dY − Σ)` epilogue. **Mechanically pass; performance HOLD.** |
-| 6 | Bounded global reductions | Row reductions use a fixed 256/128-lane shared tree-reduce with no output-sized scratch and no atomics; sparsemax runs a fixed 30-step τ-bisection entirely in registers/shared. **Correctness pass; performance HOLD.** |
+| 5 | Combined/fused kernels | Softmax fuses max-reduction, stable exponentiation, sum-reduction, and normalization in one block pass; softmax-backward fuses the `Σ(dY·S)` reduction with the `S·(dY − Σ)` epilogue. **Pass for the eight measured winning cells; standalone mask/softmax fusion is the remaining performance follow-up.** |
+| 6 | Bounded global reductions | Row reductions use warp shuffles plus eight shared leaders, two barriers per logical reduction, no output-sized scratch, and no atomics; sparsemax runs a fixed 30-step τ-bisection with the same reducer. **Correctness and SM86 performance pass.** |
 | 7 | Asynchronous stream ordering | Launches use the backend stream with no host synchronization; the dispatch layer rejects launches during CUDA-graph capture unless prewarmed. `cp.async` is inapplicable to these single-use row loads. **Pass.** |
 | 8 | CUDA Graph/lifetime safety | Modules are pinned for capture lifetime and the dispatch shell rejects compilation/cache-miss during capture. **Pass.** |
 | 9 | Ahead-of-load binary control | PTX is emitted and blueprint-audited today; linking to cubin, SASS disasm, embedding, and content-addressed caching are staged for the SM86 pipeline. Raw PTX load is experiment-only and unpromoted. **Source-side pass; binary stages pending SM86.** |
-| 10 | Promotion evidence | Three independent corrected PyTorch comparisons plus correctness/determinism, zero hot allocation, resource, and tail gates must all pass. **HOLD:** no softmax cell is promoted; the fp64 CPU-oracle correctness harness is wired, but the uncontended three-run performance comparison is the maintainer's SM86 task. |
+| 10 | Promotion evidence | Three independent corrected competitor comparisons plus correctness/determinism, zero hot allocation, resource, and tail gates must all pass. **HOLD:** the shipped-CUDA head-to-head is now wired and reports eight wins/two ties, but the two masking cells still need fusion evidence and no cell is promoted by this PR. |
 
 Tensor Core MMA is not a requirement for this family: softmax normalization is a
 row reduction, not a matrix multiply, so cargo-cult MMA instructions that add
@@ -89,15 +122,16 @@ output-sized temporary device allocations; the only device-side scratch is the
 fixed shared reduction buffer inside the block-per-row kernels.
 
 The normalizing kernels assign one block to one row. Lanes stride the row for a
-coalesced partial, tree-reduce the row maximum through shared memory with
-`bar.sync`, recompute the stable exponentials, tree-reduce the row sum, and
-write each normalized (or log-normalized) value once. Softmax-backward reduces
+coalesced partial, reduce within each warp using `shfl.sync.down`, exchange only
+the eight warp-leader values through shared memory, recompute or stage the stable
+exponentials, reduce the row sum, and write each normalized (or log-normalized)
+value once. Softmax-backward reduces
 `Σ(dY·S)` the same way and applies `S·(dY − Σ)` in one epilogue pass. Sparsemax
 sorts nothing on device: it runs a fixed 30-step threshold bisection over the
 row in registers/shared, matching the reference tolerance. The pointwise
-kernels (masked-fill, masked-fill-backward, Taylor softmax `1 + x + x²/2`, and
-the log-sum-exp-backward broadcast) own one output cell per thread with no
-cross-thread communication.
+kernels (masked-fill, masked-fill-backward, and the log-sum-exp-backward
+broadcast) have no cross-thread communication; the masking pair own eight
+elements per thread through two aligned float4 transactions.
 
 Exponentiation uses the hardware approximate `ex2.approx.f32` on `x·log2(e)`
 (the same path the attention softmax uses); `rcp.approx`/`div.rn` produce the

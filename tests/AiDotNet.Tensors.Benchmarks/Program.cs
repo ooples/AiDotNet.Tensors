@@ -31,6 +31,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
+        {
+            DirectPtxSoftmaxExperiment.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-gpu-matrix")
         {
             DirectPtxGpuMatrixExperiment.Run();
@@ -1268,6 +1274,7 @@ class Program
         Console.WriteLine("  --direct-ptx-attention: Driver-only emitted-PTX Q*K^T vs cuBLAS/current CUDA path");
         Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
+        Console.WriteLine("  --direct-ptx-softmax [operations]: issue #840 family vs shipped CUDA incumbents");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");

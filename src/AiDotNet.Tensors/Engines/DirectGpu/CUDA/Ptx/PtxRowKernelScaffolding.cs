@@ -3,24 +3,57 @@ using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
-/// <summary>Shared 256-thread tree reduction used by row-normalization PTX kernels.</summary>
+/// <summary>
+/// Shared hierarchical warp reduction used by row-normalization PTX kernels.
+/// </summary>
 internal static class PtxRowReduce
 {
-    internal static void Emit(StringBuilder ptx, string operation)
+    internal const int WarpCount = 8;
+    internal const int SharedBytes = WarpCount * sizeof(float);
+
+    internal static void Emit(StringBuilder ptx, string operation, string accumulator)
     {
         PtxCompat.ThrowIfNull(ptx, nameof(ptx));
         if (operation != "max.f32" && operation != "add.rn.f32")
             throw new ArgumentOutOfRangeException(nameof(operation), operation,
                 "Only the audited max and add row reductions are supported.");
+        if (accumulator != "%f0")
+            throw new ArgumentOutOfRangeException(nameof(accumulator), accumulator,
+                "The audited row kernels reduce their per-lane accumulator in %f0.");
 
-        for (int stride = PtxRowShape.BlockThreads / 2; stride > 0; stride >>= 1)
+        // Reduce the caller's register accumulator within each warp, publish only the eight
+        // warp leaders, then let the first warp finish. The previous shared-memory ABI first
+        // staged and reloaded all 256 lane partials; shuffles make that round trip redundant.
+        ptx.AppendLine($"    mov.f32 %f10, {accumulator};");
+        EmitWarpShuffle(ptx, operation, predicate: "");
+        ptx.AppendLine("    and.b32 %r10, %r0, 31;");
+        ptx.AppendLine("    setp.eq.u32 %p3, %r10, 0;");
+        ptx.AppendLine("    shr.u32 %r11, %r0, 5;");
+        ptx.AppendLine("    mul.wide.u32 %rd19, %r11, 4;");
+        ptx.AppendLine("    add.u64 %rd19, %rd5, %rd19;");
+        ptx.AppendLine("    @%p3 st.shared.f32 [%rd19], %f10;");
+        ptx.AppendLine("    bar.sync 0;");
+
+        ptx.AppendLine(operation == "max.f32"
+            ? "    mov.f32 %f10, 0fFF800000;"
+            : "    mov.f32 %f10, 0f00000000;");
+        ptx.AppendLine("    setp.lt.u32 %p3, %r0, 8;");
+        ptx.AppendLine("    @%p3 ld.shared.f32 %f10, [%rd10];");
+        ptx.AppendLine("    setp.lt.u32 %p3, %r0, 32;");
+        EmitWarpShuffle(ptx, operation, predicate: "@%p3 ");
+        ptx.AppendLine("    setp.eq.u32 %p3, %r0, 0;");
+        ptx.AppendLine("    @%p3 st.shared.f32 [%rd5], %f10;");
+        ptx.AppendLine("    bar.sync 0;");
+    }
+
+    private static void EmitWarpShuffle(StringBuilder ptx, string operation, string predicate)
+    {
+        for (int offset = 16; offset > 0; offset >>= 1)
         {
-            ptx.AppendLine($"    setp.lt.u32 %p3, %r0, {stride};");
-            ptx.AppendLine("    @%p3 ld.shared.f32 %f10, [%rd10];");
-            ptx.AppendLine($"    @%p3 ld.shared.f32 %f11, [%rd10+{stride * sizeof(float)}];");
-            ptx.AppendLine($"    @%p3 {operation} %f10, %f10, %f11;");
-            ptx.AppendLine("    @%p3 st.shared.f32 [%rd10], %f10;");
-            ptx.AppendLine("    bar.sync 0;");
+            ptx.AppendLine($"    {predicate}mov.b32 %r10, %f10;");
+            ptx.AppendLine($"    {predicate}shfl.sync.down.b32 %r11, %r10, {offset}, 31, 0xffffffff;");
+            ptx.AppendLine($"    {predicate}mov.b32 %f11, %r11;");
+            ptx.AppendLine($"    {predicate}{operation} %f10, %f10, %f11;");
         }
     }
 }
@@ -52,12 +85,22 @@ internal static class PtxRowShape
 internal static class PtxElementwiseShape
 {
     internal const int BlockThreads = PtxRowShape.BlockThreads;
+    internal const int VectorWidth = 8;
     internal const int MaxCount = 2048 * 4096;
 
     internal static bool IsSupported(int count) =>
         count > 0 && count % BlockThreads == 0 && count <= MaxCount;
 
     internal static bool IsPromoted(int count) => false;
+
+    internal static int VectorGridBlocks(int count, int blockThreads = BlockThreads)
+    {
+        Validate(count, "Vectorized elementwise launch");
+        if (blockThreads <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockThreads));
+        int elementsPerBlock = checked(blockThreads * VectorWidth);
+        return checked((count + elementsPerBlock - 1) / elementsPerBlock);
+    }
 
     internal static void Validate(int count, string operation)
     {

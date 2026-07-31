@@ -8,9 +8,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// Elementwise masked-fill backward <c>gradInput[i] = mask[i] != 0 ? 0 : gradOutput[i]</c>
 /// (issue #840): the gradient does not flow through positions overwritten by the fill
 /// constant. Purely elementwise over a flat element count, matching the backend's flat-
-/// <c>size</c> ABI — one thread owns one element, no shared memory, no reduction, exact.
+/// <c>size</c> ABI — one thread owns two aligned float4 transactions, with no shared memory,
+/// reduction, or global intermediate. The result is exact.
 ///
-/// 256 threads/block, grid = count/256; supported counts are positive multiples of 256.
+/// 256 threads/block, eight elements/thread; supported counts are positive multiples of 256.
 /// </summary>
 internal sealed class PtxMaskedFillBackwardKernel : IDisposable
 {
@@ -59,7 +60,8 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         arguments[0] = &gradPointer;
         arguments[1] = &maskPointer;
         arguments[2] = &outputPointer;
-        _module.Launch(_function, (uint)(Count / BlockThreads), 1, 1, BlockThreads, 1, 1, 0, arguments);
+        _module.Launch(_function, (uint)PtxElementwiseShape.VectorGridBlocks(Count),
+            1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -83,25 +85,44 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         ptx.AppendLine("    .reg .pred %p<4>;");
         ptx.AppendLine("    .reg .b32 %r<8>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
-        ptx.AppendLine("    .reg .f32 %f<8>;");
+        ptx.AppendLine("    .reg .f32 %f<16>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [grad_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [mask_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");    // element index
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 4;");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");    // eight-element pack
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {count / PtxElementwiseShape.VectorWidth};");
+        ptx.AppendLine("    @%p0 bra.uni MASKED_FILL_BACKWARD_DONE;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 32;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");                 // gradOutput
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd5];");                 // mask
-        ptx.AppendLine("    setp.neu.f32 %p0, %f1, 0f00000000;");           // mask != 0
-        ptx.AppendLine("    selp.f32 %f3, 0f00000000, %f0, %p0;");           // 0 : gradOutput
-        ptx.AppendLine("    st.global.f32 [%rd6], %f3;");
+        EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6");
+        ptx.AppendLine("    add.u64 %rd4, %rd4, 16;");
+        ptx.AppendLine("    add.u64 %rd5, %rd5, 16;");
+        ptx.AppendLine("    add.u64 %rd6, %rd6, 16;");
+        EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6");
+        ptx.AppendLine("MASKED_FILL_BACKWARD_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
+    }
+
+    private static void EmitFloat4Slice(
+        StringBuilder ptx, string gradAddress, string maskAddress, string outputAddress)
+    {
+        ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f0,%f1,%f2,%f3}}, [{gradAddress}];");
+        ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f4,%f5,%f6,%f7}}, [{maskAddress}];");
+        ptx.AppendLine("    setp.neu.f32 %p0, %f4, 0f00000000;");
+        ptx.AppendLine("    setp.neu.f32 %p1, %f5, 0f00000000;");
+        ptx.AppendLine("    setp.neu.f32 %p2, %f6, 0f00000000;");
+        ptx.AppendLine("    setp.neu.f32 %p3, %f7, 0f00000000;");
+        ptx.AppendLine("    selp.f32 %f9, 0f00000000, %f0, %p0;");
+        ptx.AppendLine("    selp.f32 %f10, 0f00000000, %f1, %p1;");
+        ptx.AppendLine("    selp.f32 %f11, 0f00000000, %f2, %p2;");
+        ptx.AppendLine("    selp.f32 %f12, 0f00000000, %f3, %p3;");
+        ptx.AppendLine($"    st.global.wt.v4.f32 [{outputAddress}], {{%f9,%f10,%f11,%f12}};");
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, int count)
@@ -109,7 +130,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         var extent = new DirectPtxExtent(count);
         return new DirectPtxKernelBlueprint(
             Operation: "masked-fill-backward",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-count{count}",
             Tensors:
@@ -122,7 +143,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                MaxRegistersPerThread: 28,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
@@ -130,6 +151,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
             {
                 ["formula"] = "gradInput[i] = mask[i] != 0 ? 0 : gradOutput[i]",
                 ["role"] = "masked-fill-gradient-gating",
+                ["vector-width"] = "8 (two aligned float4 transactions)",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"

@@ -124,18 +124,32 @@ public class DirectPtxSoftmaxTests
             PtxRowShape.Validate(63, 256, "Test row operation"));
 
         var ptx = new StringBuilder();
-        PtxRowReduce.Emit(ptx, "add.rn.f32");
+        PtxRowReduce.Emit(ptx, "add.rn.f32", "%f0");
         string emitted = ptx.ToString();
-        Assert.Equal(8, Count(emitted, "bar.sync 0"));
-        foreach (int stride in new[] { 128, 64, 32, 16, 8, 4, 2, 1 })
+        Assert.Equal(2, Count(emitted, "bar.sync 0"));
+        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
         {
-            Assert.Contains($"setp.lt.u32 %p3, %r0, {stride};", emitted);
-            Assert.Contains($"[%rd10+{stride * sizeof(float)}]", emitted);
+            Assert.Equal(2, Count(emitted,
+                $"shfl.sync.down.b32 %r11, %r10, {offset}, 31, 0xffffffff"));
         }
+        Assert.Contains("setp.lt.u32 %p3, %r0, 8", emitted);
+        Assert.Contains("@%p3 shfl.sync.down.b32", emitted);
+        Assert.Contains("@%p3 st.shared.f32 [%rd19], %f10", emitted);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            PtxRowReduce.Emit(new StringBuilder(), "mul.rn.f32"));
+            PtxRowReduce.Emit(new StringBuilder(), "mul.rn.f32", "%f0"));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxRowReduce.Emit(new StringBuilder(), "add.rn.f32", "%f1"));
 
         Assert.Equal(PtxRowShape.BlockThreads, PtxElementwiseShape.BlockThreads);
+        Assert.Equal(PtxRowShape.BlockThreads / 32, PtxRowReduce.WarpCount);
+        Assert.Equal(32, PtxRowReduce.SharedBytes);
+        Assert.Equal(8, PtxElementwiseShape.VectorWidth);
+        Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(256));
+        Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(1280));
+        Assert.Equal(2, PtxElementwiseShape.VectorGridBlocks(2304));
+        Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(2304, 512));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxElementwiseShape.VectorGridBlocks(256, 0));
         Assert.True(PtxElementwiseShape.IsSupported(PtxElementwiseShape.BlockThreads));
         Assert.True(PtxElementwiseShape.IsSupported(PtxElementwiseShape.MaxCount));
         Assert.False(PtxElementwiseShape.IsSupported(PtxElementwiseShape.BlockThreads + 1));
@@ -157,7 +171,7 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("setp.gt.f32 %p1, %f3, 0f3F800000", ptx);       // S(mid) > 1
         Assert.Contains("@!%p1 mov.f32 %f6, %f7", ptx);                 // negated-predicate bracket update
         Assert.DoesNotContain("ex2.approx.f32", ptx);                   // no transcendental
-        Assert.Equal(20, Count(ptx, "bar.sync 0"));                     // max reduction + bisection-body reduction
+        Assert.Equal(6, Count(ptx, "bar.sync 0"));                      // register max + bisection reduction
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxSparsemaxKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxSparsemaxKernel.IsPromotedShape(128, 2048));
@@ -203,7 +217,7 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("rcp.approx.f32", ptx);
         Assert.DoesNotContain("ex2.approx.f32", ptx);                   // polynomial, no exp
         Assert.DoesNotContain("max.f32", ptx);                          // strictly positive -> no max shift
-        Assert.Equal(10, Count(ptx, "bar.sync 0"));                     // single sum reduction
+        Assert.Equal(3, Count(ptx, "bar.sync 0"));                      // one register/warp sum reduction
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxTaylorSoftmaxKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxTaylorSoftmaxKernel.IsPromotedShape(128, 2048));
@@ -257,9 +271,11 @@ public class DirectPtxSoftmaxTests
     {
         string ptx = PtxMaskedFillKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxMaskedFillKernel.EntryPoint, ptx);
-        Assert.Contains("ld.param.f32 %f2, [fill];", ptx);
-        Assert.Contains("setp.neu.f32 %p0, %f1, 0f00000000", ptx);      // mask != 0
-        Assert.Contains("selp.f32 %f3, %f2, %f0, %p0", ptx);            // fill : input
+        Assert.Contains("ld.param.f32 %f8, [fill];", ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Contains("setp.neu.f32 %p0, %f4, 0f00000000", ptx);      // mask.x != 0
+        Assert.Contains("selp.f32 %f12, %f8, %f3, %p3", ptx);           // fill : input.w
+        Assert.Equal(2, Count(ptx, "st.global.cg.v4.f32"));
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -273,8 +289,10 @@ public class DirectPtxSoftmaxTests
     {
         string ptx = PtxMaskedFillBackwardKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxMaskedFillBackwardKernel.EntryPoint, ptx);
-        Assert.Contains("setp.neu.f32 %p0, %f1, 0f00000000", ptx);
-        Assert.Contains("selp.f32 %f3, 0f00000000, %f0, %p0", ptx);     // 0 : gradOutput
+        Assert.Equal(4, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Contains("setp.neu.f32 %p0, %f4, 0f00000000", ptx);
+        Assert.Contains("selp.f32 %f12, 0f00000000, %f3, %p3", ptx);    // 0 : gradOutput.w
+        Assert.Equal(2, Count(ptx, "st.global.wt.v4.f32"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxMaskedFillBackwardKernel.IsSupportedCount(16384));
@@ -340,7 +358,7 @@ public class DirectPtxSoftmaxTests
         string ptx = PtxLogSumExpBackwardKernel.EmitPtx(8, 6, 64, 512);
         Assert.Contains(PtxLogSumExpBackwardKernel.EntryPoint, ptx);
         Assert.Contains("OUT_LOOP:", ptx);
-        Assert.Contains("ex2.approx.f32", ptx);
+        Assert.Equal(1, Count(ptx, "ex2.approx.f32"));                 // one elementwise broadcast pass
         Assert.Contains("ld.param.u64 %rd1, [lse_ptr]", ptx);
         Assert.Contains("ld.global.nc.f32 %f0, [%rd8]", ptx);           // supplied lse[m]
         Assert.Contains("ld.global.nc.f32 %f1, [%rd9]", ptx);           // per-row dY[m]
@@ -415,7 +433,7 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("fma.rn.f32 %f0, %f2, %f1, %f0", ptx);         // dot += dY*S
         Assert.DoesNotContain("ex2.approx.f32", ptx);                  // exact identity, no transcendental
         Assert.DoesNotContain("lg2.approx.f32", ptx);
-        Assert.Equal(10, Count(ptx, "bar.sync 0"));                    // one reduction
+        Assert.Equal(3, Count(ptx, "bar.sync 0"));                     // one register/warp reduction
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxSoftmaxBackwardKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxSoftmaxBackwardKernel.IsPromotedShape(128, 2048));
@@ -483,8 +501,8 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("lg2.approx.f32", ptx);
         Assert.Contains("setp.ne.u32 %p2, %r0, 0", ptx);               // thread-0 guard
         Assert.Equal(1, Count(ptx, "st.global.f32"));                  // one value per row
-        // Two reductions minus the final post-load barrier (no pass reads shared after sumExp).
-        Assert.Equal(19, Count(ptx, "bar.sync 0"));
+        // Two hierarchical reductions minus the final post-load barrier.
+        Assert.Equal(5, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxLogSumExpKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxLogSumExpKernel.IsPromotedShape(128, 2048));
@@ -539,7 +557,7 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("lg2.approx.f32", ptx);                        // log-partition
         Assert.Contains("sub.rn.f32 %f1, %f1, %f4", ptx);              // x - logZ
         Assert.DoesNotContain("rcp.approx.f32", ptx);                  // no division
-        Assert.Equal(20, Count(ptx, "bar.sync 0"));
+        Assert.Equal(6, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxLogSoftmaxKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxLogSoftmaxKernel.IsPromotedShape(128, 2048));
@@ -589,16 +607,16 @@ public class DirectPtxSoftmaxTests
     {
         string ptx = PtxSoftmaxKernel.EmitPtx(8, 6, 64, 512);
         Assert.Contains(PtxSoftmaxKernel.EntryPoint, ptx);
-        Assert.Contains(".shared .align 16 .b8 row_sh[2048]", ptx);   // N=512 row cache
-        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);
-        Assert.Contains("LOAD_LOOP:", ptx);
-        Assert.Contains("SUM_LOOP:", ptx);
-        Assert.Contains("OUT_LOOP:", ptx);
-        Assert.Contains("max.f32 %f10", ptx);                          // tree-reduced max
-        Assert.Contains("ex2.approx.f32", ptx);
+        Assert.DoesNotContain("row_sh", ptx);                          // L1 + final-output staging
+        Assert.Contains(".shared .align 16 .b8 red[32]", ptx);
+        Assert.DoesNotContain("_LOOP:", ptx);                          // baked N is fully unrolled
+        Assert.Contains("max.f32 %f10", ptx);                          // warp-hierarchical max
+        Assert.Equal(2, Count(ptx, "ex2.approx.f32"));                 // once per 256-column slice
+        Assert.Contains("ld.global.ca.f32", ptx);                      // repeated row pass stays cacheable
+        Assert.Equal(4, Count(ptx, "st.global.f32"));                  // stage + normalize each slice
         Assert.Contains("rcp.approx.f32", ptx);                        // 1/sumExp
-        // Two reductions, each: store-barrier + 8 tree-halving barriers + post-load barrier.
-        Assert.Equal(20, Count(ptx, "bar.sync 0"));
+        // Two reductions, each: two-level warp reduction + post-load barrier.
+        Assert.Equal(6, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxSoftmaxKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxSoftmaxKernel.IsSupportedShape(63, 2048));

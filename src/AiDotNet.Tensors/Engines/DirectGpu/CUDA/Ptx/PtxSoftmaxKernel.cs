@@ -6,14 +6,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Row-wise numerically-stable softmax <c>output[m,n] = exp(x[m,n] - rowMax) / rowSumExp</c>
-/// over the last axis (issue #840). One block owns one row and, in a single shared-resident
-/// pass, computes the row max and exp-sum with in-block tree reductions, then writes the
-/// normalized row — no global max/sum/probability intermediate. The row is cached in shared
-/// memory so each element is read from global exactly once. Uses <c>ex2.approx.f32</c>, so a
+/// over the last axis (issue #840). One block owns one row, computes its row max and exp-sum
+/// with hierarchical warp reductions, stages exponentials in the final output, then writes the
+/// normalized values in place. There is no separate global max/sum/probability allocation;
+/// repeated row reads stay cacheable in L1. Uses <c>ex2.approx.f32</c>, so a
 /// promoted specialization carries ~1e-3 approximation error (disclosed on the release gate).
 ///
-/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 256 floats
-/// (reduction). Supported N are multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads. Shared: 256 reduction floats. Supported N are
+/// multiples of 256 so each thread strides the row exactly.
 /// </summary>
 internal sealed class PtxSoftmaxKernel : IDisposable
 {
@@ -87,11 +87,9 @@ internal sealed class PtxSoftmaxKernel : IDisposable
         ptx.AppendLine("    .reg .b32 %r<12>;");
         ptx.AppendLine("    .reg .b64 %rd<20>;");
         ptx.AppendLine("    .reg .f32 %f<20>;");
-        ptx.AppendLine($"    .shared .align 16 .b8 row_sh[{n * sizeof(float)}];");
-        ptx.AppendLine($"    .shared .align 16 .b8 red[{BlockThreads * sizeof(float)}];");
+        ptx.AppendLine($"    .shared .align 16 .b8 red[{PtxRowReduce.SharedBytes}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [output_ptr];");
-        ptx.AppendLine("    mov.u64 %rd4, row_sh;");
         ptx.AppendLine("    mov.u64 %rd5, red;");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
@@ -101,67 +99,47 @@ internal sealed class PtxSoftmaxKernel : IDisposable
         ptx.AppendLine("    mul.wide.u32 %rd9, %r0, 4;");
         ptx.AppendLine("    add.u64 %rd10, %rd5, %rd9;");               // &red[tid]
 
-        // ---- Pass 1: cache row + partial max ----
+        // ---- Pass 1: partial max; the row remains hot in L1 for pass 2 ----
         ptx.AppendLine($"    mov.f32 %f0, {NegInf};");
-        ptx.AppendLine("    mov.u32 %r3, %r0;");
-        ptx.AppendLine("LOAD_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {n};");
-        ptx.AppendLine("    @%p0 bra.uni LOAD_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd12, %rd7, %rd11;");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd12];");
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd11;");
-        ptx.AppendLine("    st.shared.f32 [%rd13], %f1;");
-        ptx.AppendLine("    max.f32 %f0, %f0, %f1;");
-        ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
-        ptx.AppendLine("    bra.uni LOAD_LOOP;");
-        ptx.AppendLine("LOAD_DONE:");
-        ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
-        ptx.AppendLine("    bar.sync 0;");
-        PtxRowReduce.Emit(ptx, "max.f32");
+        for (int column = 0; column < n; column += BlockThreads)
+        {
+            ptx.AppendLine($"    add.u64 %rd11, %rd9, {column * sizeof(float)};");
+            ptx.AppendLine("    add.u64 %rd12, %rd7, %rd11;");
+            ptx.AppendLine("    ld.global.ca.f32 %f1, [%rd12];");
+            ptx.AppendLine("    max.f32 %f0, %f0, %f1;");
+        }
+        PtxRowReduce.Emit(ptx, "max.f32", "%f0");
         ptx.AppendLine("    ld.shared.f32 %f2, [%rd5];");                // rowMax
         ptx.AppendLine("    bar.sync 0;");
 
         // ---- Pass 2: partial sum of exp(x - rowMax) ----
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r3, %r0;");
-        ptx.AppendLine("SUM_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {n};");
-        ptx.AppendLine("    @%p0 bra.uni SUM_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd11;");
-        ptx.AppendLine("    ld.shared.f32 %f1, [%rd13];");
-        ptx.AppendLine("    sub.rn.f32 %f1, %f1, %f2;");
-        ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {Log2e};");
-        ptx.AppendLine("    ex2.approx.f32 %f1, %f1;");
-        ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
-        ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
-        ptx.AppendLine("    bra.uni SUM_LOOP;");
-        ptx.AppendLine("SUM_DONE:");
-        ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
-        ptx.AppendLine("    bar.sync 0;");
-        PtxRowReduce.Emit(ptx, "add.rn.f32");
+        for (int column = 0; column < n; column += BlockThreads)
+        {
+            ptx.AppendLine($"    add.u64 %rd11, %rd9, {column * sizeof(float)};");
+            ptx.AppendLine("    add.u64 %rd12, %rd7, %rd11;");
+            ptx.AppendLine("    ld.global.ca.f32 %f1, [%rd12];");
+            ptx.AppendLine("    sub.rn.f32 %f1, %f1, %f2;");
+            ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {Log2e};");
+            ptx.AppendLine("    ex2.approx.f32 %f1, %f1;");
+            ptx.AppendLine("    add.u64 %rd14, %rd8, %rd11;");
+            ptx.AppendLine("    st.global.f32 [%rd14], %f1;");
+            ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
+        }
+        PtxRowReduce.Emit(ptx, "add.rn.f32", "%f0");
         ptx.AppendLine("    ld.shared.f32 %f3, [%rd5];");                // sumExp
         ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine("    rcp.approx.f32 %f4, %f3;");                  // 1/sumExp
 
-        // ---- Pass 3: output = exp(x - rowMax) * inv ----
-        ptx.AppendLine("    mov.u32 %r3, %r0;");
-        ptx.AppendLine("OUT_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {n};");
-        ptx.AppendLine("    @%p0 bra.uni OUT_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd11;");
-        ptx.AppendLine("    ld.shared.f32 %f1, [%rd13];");
-        ptx.AppendLine("    sub.rn.f32 %f1, %f1, %f2;");
-        ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {Log2e};");
-        ptx.AppendLine("    ex2.approx.f32 %f1, %f1;");
-        ptx.AppendLine("    mul.rn.f32 %f1, %f1, %f4;");
-        ptx.AppendLine("    add.u64 %rd14, %rd8, %rd11;");
-        ptx.AppendLine("    st.global.f32 [%rd14], %f1;");
-        ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
-        ptx.AppendLine("    bra.uni OUT_LOOP;");
-        ptx.AppendLine("OUT_DONE:");
+        // ---- Pass 3: normalize the staged output in place ----
+        for (int column = 0; column < n; column += BlockThreads)
+        {
+            ptx.AppendLine($"    add.u64 %rd11, %rd9, {column * sizeof(float)};");
+            ptx.AppendLine("    add.u64 %rd14, %rd8, %rd11;");
+            ptx.AppendLine("    ld.global.ca.f32 %f1, [%rd14];");
+            ptx.AppendLine("    mul.rn.f32 %f1, %f1, %f4;");
+            ptx.AppendLine("    st.global.f32 [%rd14], %f1;");
+        }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -173,7 +151,7 @@ internal sealed class PtxSoftmaxKernel : IDisposable
         var extent = new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: "softmax-row",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-m{m}-n{n}",
             Tensors:
@@ -185,7 +163,7 @@ internal sealed class PtxSoftmaxKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: (n + BlockThreads) * sizeof(float),
+                MaxStaticSharedBytes: PtxRowReduce.SharedBytes,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -193,8 +171,9 @@ internal sealed class PtxSoftmaxKernel : IDisposable
                 ["formula"] = "output[m,n] = exp(x[m,n] - rowMax[m]) / sum_n exp(x[m,n] - rowMax[m])",
                 ["axis"] = "last",
                 ["stability"] = "row-max-subtracted",
-                ["reduction"] = "in-block-tree-reduction-shared",
+                ["reduction"] = "warp-shuffle-plus-warp-leader-shared",
                 ["global-intermediates"] = "none",
+                ["output-staging"] = "exponentials-normalized-in-place",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"
             });

@@ -89,7 +89,7 @@ internal sealed class PtxTaylorSoftmaxKernel : IDisposable
         ptx.AppendLine("    .reg .b64 %rd<20>;");
         ptx.AppendLine("    .reg .f32 %f<20>;");
         ptx.AppendLine($"    .shared .align 16 .b8 row_sh[{n * sizeof(float)}];");
-        ptx.AppendLine($"    .shared .align 16 .b8 red[{BlockThreads * sizeof(float)}];");
+        ptx.AppendLine($"    .shared .align 16 .b8 red[{PtxRowReduce.SharedBytes}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [output_ptr];");
         ptx.AppendLine("    mov.u64 %rd4, row_sh;");
@@ -120,9 +120,7 @@ internal sealed class PtxTaylorSoftmaxKernel : IDisposable
         ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
         ptx.AppendLine("    bra.uni LOAD_LOOP;");
         ptx.AppendLine("LOAD_DONE:");
-        ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
-        ptx.AppendLine("    bar.sync 0;");
-        PtxRowReduce.Emit(ptx, "add.rn.f32");
+        PtxRowReduce.Emit(ptx, "add.rn.f32", "%f0");
         ptx.AppendLine("    ld.shared.f32 %f3, [%rd5];");                // sum f
         ptx.AppendLine("    bar.sync 0;");
         ptx.AppendLine("    rcp.approx.f32 %f4, %f3;");                  // 1/sum
@@ -152,7 +150,7 @@ internal sealed class PtxTaylorSoftmaxKernel : IDisposable
         var extent = new DirectPtxExtent(m, n);
         return new DirectPtxKernelBlueprint(
             Operation: "taylor-softmax-row",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-m{m}-n{n}",
             Tensors:
@@ -164,7 +162,7 @@ internal sealed class PtxTaylorSoftmaxKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: (n + BlockThreads) * sizeof(float),
+                MaxStaticSharedBytes: n * sizeof(float) + PtxRowReduce.SharedBytes,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
