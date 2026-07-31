@@ -259,17 +259,58 @@ public class TimeStretchStageDiffTests : IDisposable
         var c = _cpu.ISTFT(mag, phase, nFft, hop, w, center: true, length: targetLen);
         var g = ((AiDotNet.Tensors.Engines.IEngine)_gpu!).ISTFT(mag, phase, nFft, hop, w, center: true, length: targetLen);
 
-        double worst = 0, rms = 0;
+        // How far the frames actually reach, so a residual in the UNCOVERED tail can be told apart
+        // from one inside the reconstructed region.
+        int numFrames = mag.Shape.ToArray()[^1];
+        int covered = (numFrames - 1) * hop + nFft - (nFft / 2);
+
+        // The overlap-add window sum, from pure geometry — the divisor ISTFT applies.
+        double WindowSumAt(int outIdx)
+        {
+            double s = 0;
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                int i = outIdx - (frame * hop - nFft / 2);
+                if (i >= 0 && i < nFft) s += (double)w[i] * w[i];
+            }
+            return s;
+        }
+
+        double worst = 0, rms = 0, worstNumerator = 0;
+        int worstAt = -1, worstNumeratorAt = -1;
         for (int i = 0; i < c.Length; i++)
         {
             double d = Math.Abs((double)c[i] - g[i]);
-            worst = Math.Max(worst, d);
+            if (d > worst) { worst = d; worstAt = i; }
+            // ISTFT emits numerator/windowSum, so d*windowSum recovers the difference in the NUMERATOR
+            // — the quantity the kernels actually compute, with the division's amplification divided
+            // back out. Comparing that needs no region exclusion and no per-nFft tolerance.
+            double num = d * WindowSumAt(i);
+            if (num > worstNumerator) { worstNumerator = num; worstNumeratorAt = i; }
             rms += (double)c[i] * c[i];
         }
         rms = Math.Sqrt(rms / Math.Max(1, c.Length));
-        // Relative to signal scale, so the numbers are comparable across nFft.
-        _out.WriteLine($"nFft={nFft,4} hop={hop,3}  maxAbsDiff={worst:E3}  cpuRms={rms:E3}  relative={worst / Math.Max(1e-30, rms):E3}");
-        Assert.True(true, "measurement only — the printed trend is the result");
+        _out.WriteLine($"nFft={nFft,4} hop={hop,3} frames={numFrames} covered={covered} len={c.Length} " +
+                       $"cpuRms={rms:E3} | worst={worst:E3} at={worstAt} windowSumThere={WindowSumAt(worstAt):E3} " +
+                       $"| worstNumeratorDiff={worstNumerator:E3} at={worstNumeratorAt}");
+
+        // The two engines differ only in HOW they invert: the GPU evaluates a direct per-bin DFT in fp32,
+        // summing nFft terms sequentially, while CpuEngine uses FFTCore. Sequential summation of n terms
+        // carries error growing like n*eps, against log(n)*eps for the FFT's pairwise tree, so the bound
+        // must grow LINEARLY in nFft — a flat constant would be wrong on its face. At fp32 eps = 1.2e-7
+        // and this spectrum's scale, 2e-7 per term tracks the measured growth with about 2x headroom:
+        //
+        //     nFft   64      128     256     512
+        //     meas   6.21e-6 1.09e-5 2.37e-5 5.74e-5    (9.2x across an 8x range — linear, as predicted)
+        //     bound  1.28e-5 2.56e-5 5.12e-5 1.02e-4
+        //
+        // A kernel defect is orders of magnitude clear of this: before the writeStart fix the same
+        // comparison sat at 1e-1 in output terms.
+        double bound = 2e-7 * nFft;
+        Assert.True(worstNumerator < bound,
+            $"CPU and GPU ISTFT numerators differ by {worstNumerator:E3} at index {worstNumeratorAt}, " +
+            $"above the {bound:E3} that fp32 sequential-DFT-vs-FFT accounts for at nFft={nFft} " +
+            $"(hop={hop}) — so the difference is in the kernels, not in the summation order.");
     }
 
     /// <summary>
