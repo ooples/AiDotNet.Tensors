@@ -60,6 +60,11 @@ public sealed class GradientTape<T> : IDisposable
     private IEngine _engine;
     private bool _engineExplicitlyBound;
 
+    // ResolveEngineFromData can redirect a tape created while the process default is a GPU
+    // engine back to CPU. CpuEngine is safe to share (AiDotNetEngine.Current does the same),
+    // so retain one fallback per closed GradientTape<T> instead of allocating per tape/backward.
+    private static readonly CpuEngine CpuFallbackEngine = new();
+
     /// <summary>
     /// Set when any tensor recorded onto this tape had its data on a GPU at record time.
     /// </summary>
@@ -204,7 +209,7 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_engineExplicitlyBound) return;
         if (_sawGpuResidentData) return;   // Current is the GPU engine that produced the data.
-        if (_engine is DirectGpuTensorEngine) _engine = new CpuEngine();
+        if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
     }
 
     public void BindEngineIfUnset(IEngine engine)
@@ -2374,10 +2379,10 @@ public sealed class GradientTape<T> : IDisposable
         // which is a strict superset of the old per-Output walk and bounds memory
         // to ~one step. Entries created before the tape are preserved, so the
         // cross-tape inference-reuse scenarios the old walk protected still hold.
-        // Guard on the SAME engine instance the snapshot came from (CPU<->GPU
-        // rebind, #350); the byte/managed caps remain as a backstop either way.
-        if (_parent is null && _snapshotEngine is not null
-            && ReferenceEquals(_snapshotEngine, _engine))
+        // Pair against the constructor-captured engine, independently of the dispatch engine.
+        // ResolveEngineFromData may intentionally redirect a CPU-resident tape's backward to
+        // CpuFallbackEngine, but that must not strand the suspend taken from _snapshotEngine.
+        if (_parent is null && _snapshotEngine is not null)
         {
             // Pair the SuspendActivationEviction taken in the ctor BEFORE the
             // deterministic eviction below. ResumeActivationEviction first so

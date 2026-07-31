@@ -71,6 +71,55 @@ public class TapeEngineFollowsDataDeviceTests
         }
     }
 
+    /// <summary>
+    /// Redirecting CPU-resident work away from the constructor-captured GPU engine must still
+    /// release that engine's activation-eviction suspension, and repeated redirects must reuse
+    /// the same CPU fallback rather than allocating one engine per tape.
+    /// </summary>
+    [Fact]
+    public void CpuFallback_PreservesGpuSnapshotPairing_AndIsReused()
+    {
+        IEngine previous = AiDotNetEngine.Current;
+        using var snapshotEngine = new DirectGpuTensorEngine(null!);
+        AiDotNetEngine.Current = snapshotEngine;
+
+        try
+        {
+            var cpu = new CpuEngine();
+            IEngine firstFallback;
+
+            using (var firstTape = new GradientTape<double>())
+            {
+                Assert.True(snapshotEngine.EvictionSuspended);
+                var x = Rand(4, 13);
+                var loss = cpu.ReduceSum(cpu.TensorMultiply(x, x), null);
+                firstTape.ComputeGradients(loss, [x]);
+                firstFallback = firstTape.Engine;
+
+                Assert.IsType<CpuEngine>(firstFallback);
+                Assert.NotSame(snapshotEngine, firstFallback);
+            }
+
+            Assert.False(snapshotEngine.EvictionSuspended);
+
+            using (var secondTape = new GradientTape<double>())
+            {
+                Assert.True(snapshotEngine.EvictionSuspended);
+                var x = Rand(4, 17);
+                var loss = cpu.ReduceSum(cpu.TensorMultiply(x, x), null);
+                secondTape.ComputeGradients(loss, [x]);
+
+                Assert.Same(firstFallback, secondTape.Engine);
+            }
+
+            Assert.False(snapshotEngine.EvictionSuspended);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
     /// <summary>An engine that binds itself explicitly still wins over the data-derived choice.</summary>
     [Fact]
     public void ExplicitBindingWinsOverDataInference()
