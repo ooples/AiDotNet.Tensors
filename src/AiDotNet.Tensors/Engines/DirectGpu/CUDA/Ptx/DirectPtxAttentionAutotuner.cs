@@ -11,14 +11,22 @@ internal static class DirectPtxAttentionAutotuner
     internal const string ShareableKernelName = "online-attention-v3";
     private const string VariantPrefix = "query-warps-";
 
-    internal static int[] Candidates(int sequenceLength) => sequenceLength switch
+    private static bool TrySupportedWarps(int sequenceLength, out int[] warps)
     {
-        16 => [1],
-        32 => [2, 1],
-        64 => [4, 2],
-        128 => [8, 4],
-        _ => throw new ArgumentOutOfRangeException(nameof(sequenceLength))
-    };
+        switch (sequenceLength)
+        {
+            case 16: warps = [1]; return true;
+            case 32: warps = [2, 1]; return true;
+            case 64: warps = [4, 2]; return true;
+            case 128: warps = [8, 4]; return true;
+            default: warps = []; return false;
+        }
+    }
+
+    internal static int[] Candidates(int sequenceLength) =>
+        TrySupportedWarps(sequenceLength, out int[] warps)
+            ? warps
+            : throw new ArgumentOutOfRangeException(nameof(sequenceLength));
 
     internal static IReadOnlyList<AutotuneCandidate> CandidateConfigurations(int sequenceLength)
     {
@@ -33,12 +41,11 @@ internal static class DirectPtxAttentionAutotuner
     {
         warps = 0;
         if (string.IsNullOrEmpty(candidate.Variant) ||
-            (sequenceLength != 16 && sequenceLength != 32 &&
-             sequenceLength != 64 && sequenceLength != 128) ||
+            !TrySupportedWarps(sequenceLength, out int[] supportedWarps) ||
             !candidate.Variant.StartsWith(VariantPrefix, StringComparison.Ordinal) ||
             !int.TryParse(candidate.Variant.Substring(VariantPrefix.Length), NumberStyles.None,
                 CultureInfo.InvariantCulture, out int parsed) ||
-            Array.IndexOf(Candidates(sequenceLength), parsed) < 0)
+            Array.IndexOf(supportedWarps, parsed) < 0)
             return false;
         warps = parsed;
         return true;
