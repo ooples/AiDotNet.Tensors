@@ -207,6 +207,59 @@ public class GpuCpuConsistencyTests
         }
     }
 
+    [SkippableFact]
+    public void ImplicitBroadcast_AllCompatibleShapesStayOnGpu()
+    {
+        SkipIfNoDirectGpu();
+        var cpu = new CpuEngine();
+        using var gpu = new DirectGpuTensorEngine();
+        using var scope = gpu.BeginGpuScope();
+        var operations = new (string Name, Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> Run)[]
+        {
+            ("add", static (engine, left, right) => engine.TensorAdd(left, right)),
+            ("subtract", static (engine, left, right) => engine.TensorSubtract(left, right)),
+            ("multiply", static (engine, left, right) => engine.TensorMultiply(left, right)),
+            ("divide", static (engine, left, right) => engine.TensorDivide(left, right))
+        };
+        var operands = new (Tensor<float> Left, Tensor<float> Right)[]
+        {
+            // Both operands stretch different axes. None of the historical last-axis/column fast
+            // paths can represent this shape, so it exercises the rank-generic TileAxis composition.
+            (
+                new Tensor<float>(new[] { 0.5f, 1f, 1.5f, 2f, 2.5f, 3f }, new[] { 2, 1, 3 }),
+                new Tensor<float>(new[] { 1.25f, 1.5f, 1.75f, 2f }, new[] { 1, 4, 1 })),
+            // Rank padding plus a reversed operand order: [3] stretches to [2,1,3].
+            (
+                new Tensor<float>(new[] { 0.75f, 1.25f, 2.25f }, new[] { 3 }),
+                new Tensor<float>(new[] { 1f, 1.5f, 2f, 2.5f, 3f, 3.5f }, new[] { 2, 1, 3 }))
+        };
+
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            foreach (var operation in operations)
+            foreach (var (left, right) in operands)
+            {
+                Tensor<float> expected = operation.Run(cpu, left, right);
+                GpuLaunchProbe.Reset();
+                Tensor<float> actual = operation.Run(gpu, left, right);
+
+                Assert.True(GpuLaunchProbe.Count > 0,
+                    $"Implicit broadcast {operation.Name} launched no GPU work.");
+                Assert.Empty(GpuLaunchProbe.Fallbacks);
+                Assert.Equal(0, GpuLaunchProbe.Readbacks);
+                AssertTensorClose(expected, actual,
+                    $"implicit broadcast {operation.Name} [{string.Join("x", left.Shape._dims)}] " +
+                    $"with [{string.Join("x", right.Shape._dims)}]");
+            }
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+    }
+
     #region Addition Consistency Tests
 
     [SkippableFact]
