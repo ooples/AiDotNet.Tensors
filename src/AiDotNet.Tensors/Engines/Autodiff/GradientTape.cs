@@ -2382,6 +2382,16 @@ public sealed class GradientTape<T> : IDisposable
         // Pair against the constructor-captured engine, independently of the dispatch engine.
         // ResolveEngineFromData may intentionally redirect a CPU-resident tape's backward to
         // CpuFallbackEngine, but that must not strand the suspend taken from _snapshotEngine.
+        //
+        // This used to require ReferenceEquals(_snapshotEngine, _engine), which was ALREADY latently
+        // wrong before ResolveEngineFromData existed: the ctor suspends UNCONDITIONALLY, so any tape
+        // whose dispatch engine later differed — a BindEngineIfUnset rebind just as much as a CPU
+        // redirect — skipped the resume and left the suspend depth permanently raised, disabling
+        // byte-cap eviction on that GPU engine for the rest of the process. One leak per tape, silent.
+        //
+        // Evicting is still right when the backward dispatched to CPU: the activations created after
+        // the snapshot are this step's GPU intermediates either way, so they are garbage once the tape
+        // ends.
         if (_parent is null && _snapshotEngine is not null)
         {
             // Pair the SuspendActivationEviction taken in the ctor BEFORE the

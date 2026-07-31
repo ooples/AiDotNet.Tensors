@@ -34,6 +34,11 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// scalar result, and it agrees with the same engine's own non-broadcast kernel.
 /// </para>
 /// </remarks>
+// Serialised with the other GPU/engine tests: this class mutates the PROCESS-GLOBAL
+// AiDotNetEngine.Current, and it also asserts on a GPU engine's eviction-suspend state.
+// Running in parallel let another test's engine activity break the precondition, and worse,
+// let this class's Current swap leak into whatever ran alongside it.
+[Collection("DirectGpuSerial")]
 public class BroadcastEngineIsolationTests : IDisposable
 {
     private readonly ITestOutputHelper _out;
