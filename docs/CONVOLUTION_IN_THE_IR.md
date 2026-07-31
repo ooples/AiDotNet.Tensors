@@ -18,14 +18,14 @@ from it. What did not exist was a way to *ask*.
 |---|---|
 | `CodegenOpKind.Conv2D` | dense NCHW cross-correlation |
 | `CodegenOpKind.DepthwiseConv2D` | one filter per channel, no channel reduction |
-| `CodegenOpKind.ConvTranspose2D` | the adjoint window, `(ih + pad - kh) / stride` |
+| `CodegenOpKind.ConvTranspose2D` | output extent `(ih - 1) * stride - 2 * pad + kh` |
 | `CodegenOpCategory.Convolution` | a sliding-window contraction — a reduction with windowed maps |
 | `CodegenConvAttributes` | stride and padding, as a typed record |
 | `CodegenLowering.LowerConv2D<T>` | builds the graph, optionally with bias and ReLU |
 
 `CodegenGraphToSpec` translates all three into the same spec form everything else uses:
 
-```
+```text
 dense:      out[n,k,oh,ow] = Σ_{c,kh,kw} in[n,c,W(oh,kh),W(ow,kw)] · w[k,c,kh,kw]
 depthwise:  out[n,c,oh,ow] = Σ_{kh,kw}   in[n,c,W(oh,kh),W(ow,kw)] · w[c,kh,kw]
 transposed: the same, with TransposedWindow
@@ -70,7 +70,7 @@ perfectly. Covers depthwise 3×3 with and without epilogue, dense 1×1, and dens
 **On the device.** `--frontend-check` now runs all four convolution forms end to end,
 graph → PTX → GPU:
 
-```
+```text
 graph                                  elements       rel dev   ref   result
 depthwise 3x3 + bias + relu             100,352    0.000E+000  fp64    PASS   17.1 us   98blk x256
 dense 1x1 + bias + relu                 100,352    0.000E+000  fp64    PASS   13.1 us   32blk x196

@@ -363,16 +363,41 @@ public abstract class VectorBase<T>
     /// </summary>
     internal T[]? GetBackingArrayUnsafe()
     {
-        if (_cachedArray is not null)
-            return _cachedArray;
+        return TryGetBackingArraySegment(out var array, out int offset) && offset == 0
+            ? array
+            : null;
+    }
 
-        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
-            && segment.Array is not null && segment.Offset == 0)
+    /// <summary>
+    /// Gets the actual managed backing array and the offset at which this
+    /// vector's logical memory begins, without materializing or copying.
+    /// </summary>
+    /// <remarks>
+    /// A <see cref="Memory{T}"/> may be a slice whose underlying
+    /// <see cref="ArraySegment{T}.Offset"/> is nonzero. Returning only the
+    /// array in that case loses essential addressing information and has
+    /// historically caused compiled kernels to bind a copied snapshot.
+    /// </remarks>
+    internal bool TryGetBackingArraySegment(out T[]? array, out int offset)
+    {
+        if (_cachedArray is not null)
         {
-            return segment.Array;
+            array = _cachedArray;
+            offset = 0;
+            return true;
         }
 
-        return null;
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
+            && segment.Array is not null)
+        {
+            array = segment.Array;
+            offset = segment.Offset;
+            return true;
+        }
+
+        array = null;
+        offset = 0;
+        return false;
     }
 
     /// <summary>

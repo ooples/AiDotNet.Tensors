@@ -1436,14 +1436,17 @@ public static class OpParityRegistry
         var seqShape = new[] { B, S, D };
         var gShape = new[] { B, S, H };
 
+        // RWKV-7 delta rule: (r, kappa, kTilde, v, decayLogit, iclRate). iclRate is the paper's
+        // in-context learning rate a_t and must be in (0,1) — the caller applies the sigmoid.
         var r7 = OpInput.Rand(3700, seqShape);
-        var k7 = OpInput.Rand(3701, seqShape);
-        var v7 = OpInput.Rand(3702, seqShape);
-        var a7 = OpInput.Rand(3703, seqShape);
-        var b7 = OpInput.Rand(3704, seqShape);
+        var kap7 = OpInput.Rand(3701, seqShape);
+        var kt7 = OpInput.Rand(3702, seqShape);
+        var v7 = OpInput.Rand(3703, seqShape);
+        var d7 = OpInput.Rand(3704, seqShape);
+        var a7 = OpInput.Rand(3705, seqShape, 0.05, 0.95);
         yield return new OpCase("Rwkv7SequenceForward[2,4,6;h2]", "scan",
-            e => e.Rwkv7SequenceForward(r7.F(), k7.F(), v7.F(), a7.F(), b7.F(), H),
-            e => e.Rwkv7SequenceForward(r7.D(), k7.D(), v7.D(), a7.D(), b7.D(), H),
+            e => e.Rwkv7SequenceForward(r7.F(), kap7.F(), kt7.F(), v7.F(), d7.F(), a7.F(), H),
+            e => e.Rwkv7SequenceForward(r7.D(), kap7.D(), kt7.D(), v7.D(), d7.D(), a7.D(), H),
             ParityTol.Accum(1e-3), opMethod: "Rwkv7SequenceForward");
 
         var xq = OpInput.Rand(3710, seqShape);

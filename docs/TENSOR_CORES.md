@@ -263,6 +263,43 @@ The emitter now picks the largest warp tile whose block tile divides the output.
 there. Closing that needs a per-shape autotune pass, not a cleverer rule — a static model
 picked lowerings four times on this branch and lost to the hardware every time it was checked.
 
+## cp.async — the limiter after the warp tile
+
+Re-profiling 4096³ at 4×4 showed the previous limiter was gone and a new one had appeared:
+
+| metric | value |
+|---|---|
+| **sm warps active** | **16.41%** of peak |
+| **occupancy limit (registers)** | **2 blocks/SM** at 240 reg/thread |
+| `mio_throttle` | 4.95 |
+| `wait` | 3.63 |
+| `short_scoreboard` | 1.81 |
+| `long_scoreboard` | 1.66 |
+| `barrier` | 1.11 |
+
+Total stall fell from ~44 to ~14 — the resident warps barely wait. There simply are not enough
+of them, because the register-staged copy holds its words live across the whole mma section.
+
+`cp.async` copies global to shared directly: the words never occupy a register, and one
+instruction moves 16 bytes instead of four. That addresses the register pressure and the
+largest remaining stall at once.
+
+Swept against register staging, paired in one process, every candidate verified at
+`0.000E+000`:
+
+| shape | tile | cp.async | registers |
+|---|---|---|---|
+| 512³ | **2×2** | **13.8 TF** | 8.9 |
+| 1024³ | **4×2** | **34.0 TF** | 29.9 |
+| 2048³ | **4×4** | **42.9 TF** | 39.3 |
+| 4096³ | **4×2** | **47.0 TF** | 38.4 |
+| 4096³ | 4×4 | 41.6 | **45.0** |
+
+**The last row is why the catalog records the tile and the staging form together.** At 4096³
+the 4×4 tile is *faster* with register staging than with `cp.async`, while 4×2 is much faster
+with it. Choosing the two independently picks 4×4 + `cp.async` — the worst of those four. No
+model produced that; the sweep did.
+
 ## Standing## Standing## Standing
 
 Expressiveness: **closed.** The generator can emit tensor-core kernels, with fused
@@ -270,15 +307,19 @@ element-wise epilogues cuBLAS cannot fuse through its own call boundary.
 
 Performance: **improved and still a loss.** Against cuBLAS, across the campaign:
 
-| shape | naive | staged | + double buffer | **+ warp tile** | cuBLAS |
-|---|---|---|---|---|---|
-| 1024³ | 0.35× | 0.80× | 0.84× | **0.93×** | 32.2 TF |
-| 2048³ | 0.23× | 0.60× | 0.63× | **0.78×** | 51.5 TF |
-| 4096³ | 0.05× | 0.57× | 0.57× | **0.76×** | 57.6 TF |
+| shape | naive | staged | +dbl buf | +warp tile | **+cp.async** | cuBLAS |
+|---|---|---|---|---|---|---|
+| 1024³ | 0.35× | 0.80× | 0.84× | 0.93× | **1.05×** | 66.6 µs |
+| 2048³ | 0.23× | 0.60× | 0.63× | 0.78× | **0.83×** | 333.8 µs |
+| 4096³ | 0.05× | 0.57× | 0.57× | 0.76× | **0.82×** | 2384.1 µs |
 
-Roughly 76% of cuBLAS at the largest shape, from 5%. Still a loss, and still reported as one.
-L1TEX is now 61.38% rather than a roofline, so the next limiter is no longer the one this
-work addressed and must be re-measured before anything else is built.
+**At 1024³ the generated kernel is now faster than cuBLAS** — 63.2 µs against 66.6 µs. At the
+larger shapes it remains a loss at 0.82–0.83×, and that is still reported as a loss.
+
+Promotion: **withheld at 2048³ and above**, where routing a caller who could reach cuBLAS to
+us is still a regression. 1024³ is the first shape where a promotion case exists on the
+evidence, and it should be made on a per-shape basis with the same per-family discipline
+§6 applies to convolution — not by flipping a global flag.
 
 Promotion: still **withheld everywhere**. At 0.57–0.80×, routing a caller who could reach
 cuBLAS to us is still a regression — smaller, but a regression. The capability ships; the

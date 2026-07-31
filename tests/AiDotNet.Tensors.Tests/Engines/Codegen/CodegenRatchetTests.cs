@@ -29,6 +29,7 @@ public class CodegenRatchetTests
 {
     private const int Major = 8, Minor = 6;
 
+#if NET6_0_OR_GREATER
     private sealed record Metrics(int PtxLines, int Loads, int VectorLoads, int ElidedGuards, int LoopedAxes)
     {
         internal string ToRow(string kernel) => string.Join("\t",
@@ -39,6 +40,54 @@ public class CodegenRatchetTests
             ElidedGuards.ToString(CultureInfo.InvariantCulture),
             LoopedAxes.ToString(CultureInfo.InvariantCulture));
     }
+#else
+    private sealed class Metrics : IEquatable<Metrics>
+    {
+        internal Metrics(int ptxLines, int loads, int vectorLoads, int elidedGuards, int loopedAxes)
+        {
+            PtxLines = ptxLines;
+            Loads = loads;
+            VectorLoads = vectorLoads;
+            ElidedGuards = elidedGuards;
+            LoopedAxes = loopedAxes;
+        }
+
+        internal int PtxLines { get; }
+        internal int Loads { get; }
+        internal int VectorLoads { get; }
+        internal int ElidedGuards { get; }
+        internal int LoopedAxes { get; }
+
+        internal string ToRow(string kernel) => string.Join("\t",
+            kernel,
+            PtxLines.ToString(CultureInfo.InvariantCulture),
+            Loads.ToString(CultureInfo.InvariantCulture),
+            VectorLoads.ToString(CultureInfo.InvariantCulture),
+            ElidedGuards.ToString(CultureInfo.InvariantCulture),
+            LoopedAxes.ToString(CultureInfo.InvariantCulture));
+
+        public bool Equals(Metrics? other) => other is not null &&
+            PtxLines == other.PtxLines && Loads == other.Loads &&
+            VectorLoads == other.VectorLoads && ElidedGuards == other.ElidedGuards &&
+            LoopedAxes == other.LoopedAxes;
+
+        public override bool Equals(object? obj) => Equals(obj as Metrics);
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = PtxLines;
+                hash = hash * 397 ^ Loads;
+                hash = hash * 397 ^ VectorLoads;
+                hash = hash * 397 ^ ElidedGuards;
+                return hash * 397 ^ LoopedAxes;
+            }
+        }
+
+        public override string ToString() => ToRow(string.Empty).TrimStart('\t');
+    }
+#endif
 
     private static Metrics Measure(CodegenKernelSpec spec)
     {
@@ -112,7 +161,7 @@ public class CodegenRatchetTests
                 problems.Add(pair.Key + " is new; add it to the baseline: " + pair.Value.ToRow(pair.Key));
                 continue;
             }
-            if (want != pair.Value)
+            if (!want.Equals(pair.Value))
                 problems.Add(pair.Key + Environment.NewLine +
                              "    baseline " + want + Environment.NewLine +
                              "    actual   " + pair.Value);
@@ -160,6 +209,8 @@ public class CodegenRatchetTests
     [InlineData(8, 7, "7.4")]
     [InlineData(8, 9, "7.8")]
     [InlineData(9, 0, "7.8")]
+    [InlineData(10, 0, "8.6")]
+    [InlineData(12, 0, "8.7")]
     public void PtxVersion_CanNameTheTarget(int major, int minor, string expectedVersion)
     {
         var entry = CodegenKernelCatalog.Find("depthwise_conv2d_3x3");

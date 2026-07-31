@@ -139,7 +139,7 @@ internal static class BenchmarkCalibrationExperiment
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("bench-calibration-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("bench-calibration-end", afterSuite: true);
     }
 
     /// <summary>One generated depthwise kernel plus its device buffers.</summary>

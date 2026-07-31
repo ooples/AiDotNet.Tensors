@@ -139,14 +139,10 @@ public class CodegenGraphConvolutionTests
 
         var graph = CodegenLowering.LowerConv2D<float>(
             CodegenOpKind.ConvTranspose2D,
-            new[] { N, C, H, W }, new[] { C, C, 3, 3 },
+            new[] { N, C, H, W }, new[] { C, 3, 3 },
             new CodegenConvAttributes(2, 2, 1, 1));
 
-        // Only compare when the catalog's transposed geometry is the one this lowering
-        // produces; a silent shape mismatch would make the comparison vacuous.
-        var reference = entry!.Verify;
-        Assert.True(CodegenGraphToSpec.TryTranslate(graph, "convT", out var spec, out string reason), reason);
-        Assert.Equal(reference.Output.Shape.Count, spec!.Output.Shape.Count);
+        AssertMatchesCatalog(graph, entry!.Verify);
     }
 
     /// <summary>
@@ -168,6 +164,39 @@ public class CodegenGraphConvolutionTests
 
         Assert.False(CodegenGraphToSpec.TryTranslate(g, "noattr", out _, out string reason));
         Assert.Contains("CodegenConvAttributes", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>A TryTranslate path reports malformed geometry instead of throwing.</summary>
+    [Fact]
+    public void ConvolutionWithInvalidAttributes_Declines()
+    {
+        var g = new CodegenGraph();
+        int input = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, new[] { 1, 4, 8, 8 }));
+        int weights = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, new[] { 4, 3, 3 }));
+        int conv = g.AddNode(new CodegenNode(CodegenOpKind.DepthwiseConv2D,
+            new[] { input, weights }, CodegenElementType.Float32, new[] { 1, 4, 8, 8 },
+            new CodegenConvAttributes(0, 1, 1, 1)));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { conv },
+            CodegenElementType.Float32, new[] { 1, 4, 8, 8 }));
+
+        Assert.False(CodegenGraphToSpec.TryTranslate(g, "badattrs", out _, out string reason));
+        Assert.Contains("invalid convolution geometry", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>A malformed activation node declines instead of indexing a missing operand.</summary>
+    [Fact]
+    public void ActivationWithoutAnInput_Declines()
+    {
+        var g = new CodegenGraph();
+        int relu = g.AddNode(new CodegenNode(CodegenOpKind.ReLU, Array.Empty<int>(),
+            CodegenElementType.Float32, new[] { 8 }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { relu },
+            CodegenElementType.Float32, new[] { 8 }));
+
+        Assert.False(CodegenGraphToSpec.TryTranslate(g, "badrelu", out _, out string reason));
+        Assert.Contains("exactly one input", reason, StringComparison.Ordinal);
     }
 
     /// <summary>

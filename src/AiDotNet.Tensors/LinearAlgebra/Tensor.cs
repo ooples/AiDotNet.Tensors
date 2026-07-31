@@ -156,7 +156,13 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> CreateStorageView(int[] shape, int[] strides, int storageOffset)
     {
-        var view = new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
+        // vector/storage snapshot and family registration under the detach lock; otherwise a
+        // concurrent writer could swap storage between evaluation of the two constructor args.
+        var view = HasCowAliasFamily
+            ? CreateViewInCowAliasFamily(
+                () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
+            : new Tensor<T>(_data, shape, strides, storageOffset, _storage);
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
 
@@ -176,6 +182,132 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         return view;
     }
 
+    /// <summary>
+    /// Completes a reshape-like view by attaching the same inverse reshape
+    /// edge to eager GradientTape and compiled GraphMode. Keeping both paths
+    /// here prevents metadata-only APIs from silently becoming gradient stops.
+    /// </summary>
+    private Tensor<T> FinalizeReshapeLikeView(Tensor<T> view, string opName)
+    {
+        if (!IsDifferentiableRecordingActive)
+            return view;
+
+        var originalShape = (int[])_shape.Clone();
+        return FinalizeDifferentiableView(
+            view,
+            Engines.Compilation.LazyNodeType.Reshape,
+            opName,
+            Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward,
+            new object[] { originalShape });
+    }
+
+    /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
+    private Tensor<T> FinalizePermuteView(Tensor<T> view, int[] permutation)
+    {
+        if (!IsDifferentiableRecordingActive)
+            return view;
+
+        var savedPermutation = (int[])permutation.Clone();
+        return FinalizeDifferentiableView(
+            view,
+            Engines.Compilation.LazyNodeType.Transpose,
+            "Transpose",
+            Engines.Autodiff.BackwardFunctions<T>.PermuteBackward,
+            new object[] { savedPermutation });
+    }
+
+    /// <summary>
+    /// True only while eager or compiled autodiff is recording. Keeping this check ahead of
+    /// saved-state construction makes ordinary metadata views allocation-free beyond their
+    /// required shape/stride descriptors.
+    /// </summary>
+    private static bool IsDifferentiableRecordingActive =>
+        Engines.Autodiff.GradientTape<T>.Current is not null ||
+        Engines.Compilation.GraphMode.Current is not null;
+
+    /// <summary>
+    /// Records a storage-materializing contiguous copy as a real unary edge. Unlike a metadata
+    /// view, replay must copy the input's current logical values into the independent output.
+    /// </summary>
+    private Tensor<T> FinalizeContiguousCopy(Tensor<T> result)
+    {
+        if (!IsDifferentiableRecordingActive)
+            return result;
+
+        var savedState = new object[] { (int[])_shape.Clone() };
+        Engines.Autodiff.BackwardFunction<T> backward =
+            Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward;
+        if (Engines.Autodiff.GradientTape<T>.Current is { } tape)
+        {
+            var node = Engines.Autodiff.GradNodePool<T>.Rent();
+            node.OwningTape = tape;
+            node.Backward = backward;
+            node.Output = result;
+            node.Input0 = this;
+            node.InputCount = 1;
+            node.SavedState = savedState;
+            result.GradFn = node;
+        }
+
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordMaterializedUnary(
+                Engines.Compilation.LazyNodeType.Custom,
+                "Contiguous",
+                this,
+                result,
+                (_, output) =>
+                {
+                    CopyTo(output.AsWritableSpan());
+                    output.IncrementVersion();
+                },
+                backward,
+                savedState);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Applies the common eager/compiled autodiff contract to a metadata-only
+    /// storage view. All public storage-sharing paths must pass through this
+    /// method so view APIs cannot silently become gradient stops.
+    /// </summary>
+    private Tensor<T> FinalizeDifferentiableView(
+        Tensor<T> view,
+        Engines.Compilation.LazyNodeType nodeType,
+        string opName,
+        Engines.Autodiff.BackwardFunction<T> backward,
+        object[] savedState)
+    {
+        if (Engines.Autodiff.GradientTape<T>.Current is { } tape)
+        {
+            var node = Engines.Autodiff.GradNodePool<T>.Rent();
+            node.OwningTape = tape;
+            node.Backward = backward;
+            node.Output = view;
+            node.Input0 = this;
+            node.InputCount = 1;
+            node.SavedState = savedState;
+            view.GradFn = node;
+        }
+
+        var graphScope = Engines.Compilation.GraphMode.Current;
+        if (graphScope is not null)
+        {
+            return graphScope.RecordView(
+                nodeType,
+                opName,
+                this,
+                view,
+                backward,
+                savedState);
+        }
+
+        return view;
+    }
+
     /// <inheritdoc/>
     public override TensorBase<T> CloneShared()
     {
@@ -192,7 +324,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // EnsureMaterialized can realize a lazy node or rehydrate a paged-out weight and swap storage
         // or device — re-validate the layout before sharing.
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length
-            || _storage.IsReadOnlyMapped || _device != TensorDevice.CPU)
+            || _storage.IsReadOnlyMapped || _device != TensorDevice.CPU
+            || _storage.RefCount != 1)
         {
             return CloneDeepCopy();
         }
@@ -251,14 +384,19 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             catch { }
         }
 
-        var result = new Tensor<T>(_shape);
+        // Arena-aware output: every element is written below (bulk copy or odometer
+        // walk), so an uninitialized pooled/arena buffer is safe — and this makes the
+        // materialization reuse across fused-training steps instead of GC-allocating a
+        // fresh backing each step (the transpose/permute → Contiguous path is a large
+        // slice of the per-step allocation on foundation-scale training).
+        var result = Helpers.TensorAllocator.RentUninitialized<T>(_shape);
         var dstSpan = result._data.AsWritableSpan();
 
         if (IsContiguous)
         {
             // Contiguous with offset — simple bulk copy
             _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstSpan);
-            return result;
+            return FinalizeContiguousCopy(result);
         }
 
         // Non-contiguous materialization — "odometer" stride walk.
@@ -273,7 +411,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var srcSpan = _data.AsSpan();
         int rank = Rank;
         int length = Length;
-        if (rank == 0 || length == 0) return result;
+        if (rank == 0 || length == 0) return FinalizeContiguousCopy(result);
 
         Span<int> counter = stackalloc int[rank];
         int srcIdx = _storageOffset;
@@ -294,7 +432,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return result;
+        return FinalizeContiguousCopy(result);
     }
 
     /// <summary>
@@ -419,7 +557,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return CreateStorageView(newShape, newStrides, _storageOffset);
+        return FinalizeReshapeLikeView(
+            CreateStorageView(newShape, newStrides, _storageOffset),
+            "ExpandDims");
     }
 
     /// <summary>
@@ -452,18 +592,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        var result = CreateStorageView(newShape, newStrides, _storageOffset);
-
-        // Record the view under GraphMode so the compiler sees the caller's
-        // final tensor when a forward ends in Squeeze (issue #228).
-        var graphScope = Engines.Compilation.GraphMode.Current;
-        if (graphScope is not null)
-        {
-            return graphScope.RecordView(
-                Engines.Compilation.LazyNodeType.Reshape, "Squeeze", this, result);
-        }
-
-        return result;
+        return FinalizeReshapeLikeView(
+            CreateStorageView(newShape, newStrides, _storageOffset),
+            "Squeeze");
     }
 
     /// <summary>
@@ -495,17 +626,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        var result = CreateStorageView(newShape, newStrides, _storageOffset);
-
-        // Record the view under GraphMode — see Squeeze(int) for rationale.
-        var graphScope = Engines.Compilation.GraphMode.Current;
-        if (graphScope is not null)
-        {
-            return graphScope.RecordView(
-                Engines.Compilation.LazyNodeType.Reshape, "Squeeze", this, result);
-        }
-
-        return result;
+        return FinalizeReshapeLikeView(
+            CreateStorageView(newShape, newStrides, _storageOffset),
+            "Squeeze");
     }
 
     /// <summary>
@@ -831,23 +954,26 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (indices.Length > Rank)
             throw new ArgumentException("Number of indices exceeds tensor dimensions.");
 
-        // O(1) view: fix leading dimensions by advancing offset, drop those dimensions.
-        int newRank = Rank - indices.Length;
-        var newShape = new int[newRank];
-        var newStrides = new int[newRank];
-        Array.Copy(_shape, indices.Length, newShape, 0, newRank);
-        Array.Copy(_strides, indices.Length, newStrides, 0, newRank);
-
-        int newOffset = _storageOffset;
+        // Validate against the original leading dimensions before constructing any view. This
+        // keeps failures atomic: a later invalid index cannot leave a partially-built view chain
+        // (and its storage refcounts / graph nodes) behind.
         for (int i = 0; i < indices.Length; i++)
         {
             if (indices[i] < 0 || indices[i] >= _shape[i])
                 throw new ArgumentOutOfRangeException(nameof(indices),
                     $"Index {indices[i]} is out of range for dimension {i} with size {_shape[i]}.");
-            newOffset += indices[i] * _strides[i];
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+        // Express a leading-dimension sub-tensor as a chain of axis-zero views.
+        // Besides sharing storage, this gives each removed dimension the exact
+        // slice-scatter backward in eager and compiled training.
+        Tensor<T> result = this;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            result = result.GetSliceAlongDimension(indices[i], 0);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -1446,7 +1572,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             newStrides[i] = _strides[permutation[i]];
         }
 
-        return CreateStorageView(newShape, newStrides, _storageOffset);
+        return FinalizePermuteView(
+            CreateStorageView(newShape, newStrides, _storageOffset),
+            permutation);
     }
 
     /// <summary>
@@ -1719,52 +1847,20 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentException(
                 $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
 
-        Tensor<T> result;
         if (IsContiguous)
         {
             // O(1) view: same storage, new shape, row-major strides, same offset.
             // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
             var newStrides = ComputeRowMajorStrides(newShape);
-            result = CreateStorageView(newShape, newStrides, _storageOffset);
-        }
-        else
-        {
-            // Non-contiguous view: must materialize first, then reshape the contiguous result
-            result = Contiguous().Reshape(newShape);
+            return FinalizeReshapeLikeView(
+                CreateStorageView(newShape, newStrides, _storageOffset),
+                "Reshape");
         }
 
-        // Propagate gradient chain: if a GradientTape is active, set GradFn on the
-        // result so gradients flow through Reshape during backward pass.
-        // Without this, any layer using tensor.Reshape() silently breaks the gradient tape.
-        if (Engines.Autodiff.GradientTape<T>.Current != null)
-        {
-            var originalShape = _shape.ToArray();
-            // Issue #319 Phase 3: pooled GradNode rental, stamped with
-            // the current tape so cleanup only Returns nodes it owns.
-            var reshapeNode = Engines.Autodiff.GradNodePool<T>.Rent();
-            reshapeNode.OwningTape = Engines.Autodiff.GradientTape<T>.Current;
-            reshapeNode.Backward = Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward;
-            reshapeNode.Output = result;
-            reshapeNode.Input0 = this;
-            reshapeNode.InputCount = 1;
-            reshapeNode.SavedState = new object[] { originalShape };
-            result.GradFn = reshapeNode;
-        }
-
-        // Record the view in the active lazy graph so a forward lambda ending
-        // in Reshape (or routing through Reshape in a host-side branch) hands
-        // CompiledInferencePlan.Compile a tensor with a LazySource — issue #228.
-        // The view shares storage with `this`, so the recorded node's execute
-        // step is a no-op: writes to the producer buffer are live-visible
-        // through the view at replay time.
-        var graphScope = Engines.Compilation.GraphMode.Current;
-        if (graphScope is not null)
-        {
-            return graphScope.RecordView(
-                Engines.Compilation.LazyNodeType.Reshape, "Reshape", this, result);
-        }
-
-        return result;
+        // Non-contiguous input: Contiguous() records the storage-materialization edge and the
+        // recursive call records exactly one metadata reshape. Do not finalize again here—the
+        // former double-finalization replaced the inner GradFn and duplicated the lazy graph.
+        return Contiguous().Reshape(newShape);
     }
 
     /// <summary>
@@ -3240,29 +3336,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int newOffset = _storageOffset + index * _strides[dimension];
-        var result = new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
-
-        // Propagate the gradient chain: if a GradientTape is active, set GradFn on
-        // the result so gradients flow through the slice during backward. Without
-        // this, GetSliceAlongDimension was a raw storage-sharing view with no
-        // recorded backward — any layer that slices a tape tensor per-timestep
-        // (recurrent / sequence layers) leaked wrong input gradients via aliasing.
-        // The view is preserved (zero-copy) for the inference path where no tape
-        // is active; only training pays the node record. Mirrors Reshape above.
-        if (Engines.Autodiff.GradientTape<T>.Current != null)
-        {
-            var sliceNode = Engines.Autodiff.GradNodePool<T>.Rent();
-            sliceNode.OwningTape = Engines.Autodiff.GradientTape<T>.Current;
-            sliceNode.Backward = Engines.Autodiff.BackwardFunctions<T>.SliceAxisBackward;
-            sliceNode.Output = result;
-            sliceNode.Input0 = this;
-            sliceNode.InputCount = 1;
-            // SliceAxisBackward reads SavedState as { axis, index }.
-            sliceNode.SavedState = new object[] { dimension, index };
-            result.GradFn = sliceNode;
-        }
-
-        return result;
+        return FinalizeDifferentiableView(
+            CreateStorageView(newShape, newStrides, newOffset),
+            Engines.Compilation.LazyNodeType.Slice,
+            "SliceAxis",
+            Engines.Autodiff.BackwardFunctions<T>.SliceAxisBackward,
+            new object[] { dimension, index });
     }
 
     /// <summary>
@@ -3800,7 +3879,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_shape.Length <= 1)
         {
             // 0D/1D tensor: transpose is identity. Return view with same data.
-            return new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset, _storage);
+            var identity = new int[Rank];
+            for (int i = 0; i < identity.Length; i++)
+                identity[i] = i;
+            return Transpose(identity);
         }
         else if (_shape.Length == 2)
         {
@@ -4120,6 +4202,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int axis, int start, int? end = null)
     {
+        return CreateNarrowView(axis, start, end, recordAutodiff: true);
+    }
+
+    /// <summary>
+    /// Creates the range view used by both the public tensor API and
+    /// <c>IEngine.TensorNarrow</c>. The engine path records its own named tape
+    /// entry, so it requests only the storage-safe raw view to avoid duplicate
+    /// pooled gradient nodes.
+    /// </summary>
+    internal Tensor<T> CreateNarrowView(int axis, int start, int? end, bool recordAutodiff)
+    {
         ThrowIfSparse();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentException($"Invalid axis. Must be between 0 and {Rank - 1}.");
@@ -4140,7 +4233,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         newShape[axis] = sliceSize;
         int newOffset = _storageOffset + start * _strides[axis];
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+        var view = CreateStorageView(newShape, newStrides, newOffset);
+        return recordAutodiff
+            ? FinalizeDifferentiableView(
+                view,
+                Engines.Compilation.LazyNodeType.Slice,
+                "Narrow",
+                Engines.Autodiff.BackwardFunctions<T>.NarrowBackward,
+                new object[] { axis, start, sliceSize })
+            : view;
     }
 
     /// <summary>

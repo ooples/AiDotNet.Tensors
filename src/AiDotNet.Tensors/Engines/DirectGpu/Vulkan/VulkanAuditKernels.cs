@@ -1091,15 +1091,19 @@ void main() {
 
 }";
 
+    // RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17). Sbuf holds, per (b,h), the
+    // [d_v, d_k] state followed by the kappaHat / w / a gate vectors (GLSL has no pointers, so the
+    // sub-regions are addressed by base index).
     public static string Rwkv7Forward => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float R[]; };
-layout(set=0, binding=1) buffer B1 { float K[]; };
-layout(set=0, binding=2) buffer B2 { float V[]; };
-layout(set=0, binding=3) buffer B3 { float A[]; };
-layout(set=0, binding=4) buffer B4 { float B[]; };
-layout(set=0, binding=5) buffer B5 { float outp[]; };
-layout(set=0, binding=6) buffer B6 { float Sbuf[]; };
+layout(set=0, binding=1) buffer B1 { float KAP[]; };
+layout(set=0, binding=2) buffer B2 { float KT[]; };
+layout(set=0, binding=3) buffer B3 { float V[]; };
+layout(set=0, binding=4) buffer B4 { float D[]; };
+layout(set=0, binding=5) buffer B5 { float AR[]; };
+layout(set=0, binding=6) buffer B6 { float outp[]; };
+layout(set=0, binding=7) buffer B7 { float Sbuf[]; };
 layout(push_constant) uniform PC {
     int batch;
     int seqLen;
@@ -1108,23 +1112,25 @@ layout(push_constant) uniform PC {
     int headDim;
 };
 
-#define M_PI 3.14159265358979323846
-#define P210_INF (uintBitsToFloat(0x7F800000u))
-float p210_lgamma(float x) {
-    float[9] c = float[9](0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7);
-    float xx = x - 1.0; float a = c[0]; float t = xx + 7.5;
-    for (int i = 1; i < 9; i++) a += c[i] / (xx + float(i));
-    return 0.5*log(2.0*M_PI) + (xx+0.5)*log(t) - t + log(a);
-}
-
 void main() {
 
-    int bh = int(gl_GlobalInvocationID.x); if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim; float* S=Sbuf+bh*hh;
-    for (int i=0;i<hh;i++) S[i]=0.0;
+    int bh = int(gl_GlobalInvocationID.x); if (bh>=batch*numHeads) return;
+    int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim;
+    int sB=bh*(hh+3*headDim); int khB=sB+hh; int wB=sB+hh+headDim; int aB=sB+hh+2*headDim;
+    for (int i=0;i<hh;i++) Sbuf[sB+i]=0.0;
     for (int t=0;t<seqLen;t++) {
         int baseOff=(b*seqLen+t)*modelDim+hOff;
-        for (int di=0;di<headDim;di++) { float ga=1.0/(1.0+exp(-A[baseOff+di])); float gbk=(1.0/(1.0+exp(-B[baseOff+di])))*K[baseOff+di]; int srow=di*headDim; for (int vi=0;vi<headDim;vi++) S[srow+vi]=ga*S[srow+vi]+gbk*V[baseOff+vi]; }
-        for (int di=0;di<headDim;di++) { int srow=di*headDim; float sk=0.0; for (int vi=0;vi<headDim;vi++) sk+=S[srow+vi]*K[baseOff+vi]; outp[baseOff+di]=(1.0/(1.0+exp(-R[baseOff+di])))*sk; }
+        float ss=1e-12;
+        for (int ki=0;ki<headDim;ki++) { float kp=KAP[baseOff+ki]; ss+=kp*kp; }
+        float invN=1.0/sqrt(ss);
+        for (int ki=0;ki<headDim;ki++) { Sbuf[khB+ki]=KAP[baseOff+ki]*invN; Sbuf[wB+ki]=exp(-0.60653065971263342/(1.0+exp(-D[baseOff+ki]))); Sbuf[aB+ki]=AR[baseOff+ki]; }
+        for (int vi=0;vi<headDim;vi++) {
+            int srow=sB+vi*headDim; float p=0.0;
+            for (int ki=0;ki<headDim;ki++) p+=Sbuf[srow+ki]*Sbuf[khB+ki];
+            float vv=V[baseOff+vi]; float o=0.0;
+            for (int ki=0;ki<headDim;ki++) { float sv=Sbuf[srow+ki]*Sbuf[wB+ki]-p*Sbuf[aB+ki]*Sbuf[khB+ki]+vv*KT[baseOff+ki]; Sbuf[srow+ki]=sv; o+=sv*R[baseOff+ki]; }
+            outp[baseOff+vi]=o;
+        }
     }
 
 }";

@@ -5,7 +5,7 @@ gates, driven by a loop over `CodegenKernelCatalog` rather than by per-kernel co
 Adding a kernel means adding one catalog entry; the stages then apply to it with no
 new code. That is the property that makes ~800 kernels tractable.
 
-```
+```text
 --kernel-verify [name|all]    emit -> run on device -> compare vs fp64 interpretation
 --kernel-release [name|all]   emit -> driver-linked cubin -> nvdisasm machine-code audit
 --kernel-bench [name|all]     time with the Phase 0.5 calibrated protocol
@@ -19,7 +19,13 @@ implementation disagreeing. That is not hypothetical: a hand-written grouped
 deformable backward kernel passed three structural gates while computing zeros,
 because its thread count and its reference were maintained separately.
 
-## Measured, 2026-07-24, idle RTX 3080 (sm_86, driver 610.47)
+## Historical commissioning snapshot, 2026-07-24
+
+The six-row tables below record the first conveyor commissioning run; they are not
+current release evidence. The catalog now contains 13 operations and a tuned release
+can contain 16 cubins because split reductions emit partial and combine kernels. Current
+claims come from the protocol-stamped files under `artifacts/`. For post-drift absolute
+timings, see `BENCH_CLOCK_DRIFT.md`.
 
 ### Stage 1 — verify (tolerance 2e-3, vs fp64 interpretation of the same spec)
 
@@ -59,10 +65,9 @@ one row per kernel with the content-addressed cubin SHA-256 and source key.
 | maxpool2d_2x2 | 25,088 | 160.2 | 1.28 | 2.4% |
 | conv_transpose2d_3x3_stride2 | 12,544 | 122.4 | 1.35 | 4.6% |
 
-These are absolute timings, not claims against a competitor. The harness noise floor
-is 1.05% and `depthwise_conv2d_3x3` shows a 7.2% run spread, so per-kernel differences
-under roughly 3% are not claimable and that row in particular needs re-measurement
-before it carries any comparison.
+These historical absolute timings are not claims against a competitor. The 7.2% row
+was re-measured after clock observation/retry was added; `BENCH_CLOCK_DRIFT.md` is the
+authoritative account of that correction.
 
 ## What building the conveyor found
 

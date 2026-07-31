@@ -118,7 +118,8 @@ public class PtxGraphEmitterTests
         graph.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { mul },
             CodegenElementType.Float32, new[] { 256 }));
 
-        Assert.True(CodegenGraphToSpec.TryTranslate(graph, "mul256", out var spec, out _));
+        Assert.True(CodegenGraphToSpec.TryTranslate(
+            graph, "mul256", out var spec, out string reason), reason);
 
         var lhs = new double[256];
         var rhs = new double[256];

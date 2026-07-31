@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// </summary>
 internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
 {
-    internal const int BlockThreads = 128;
+    internal const int BlockThreads = 32;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -108,12 +108,17 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
             throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
     }
 
-    internal static string EmitPtx(int major, int minor, int k, int c, bool positionMajor = false)
+    internal static string EmitPtx(
+        int major, int minor, int k, int c, bool positionMajor = false,
+        bool reductionMajor = false, bool invertFilter = false)
     {
         if (!DirectPtxArchitecture.HasExperimentalConvolution(major, minor))
             throw new NotSupportedException("Only the experimental SM86 filter transform emitter exists.");
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
-        string entry = FormattableString.Invariant($"aidotnet_winograd_f23_filter_transform_k{k}_c{c}{(positionMajor ? "_pm" : "")}");
+        string entry = "aidotnet_winograd_f23_filter_transform_k" + I(k) +
+            "_c" + I(c) + (positionMajor ? "_pm" : "") +
+            (reductionMajor ? "_reduction_major" : "") +
+            (invertFilter ? "_flip" : "");
         int total = k * c;
 
         var p = new StringBuilder(8192);
@@ -137,15 +142,44 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
         p.AppendLine($"    mad.lo.u32 %r2, %r1, {I(BlockThreads)}, %r0;");   // id = k*C + c
         p.AppendLine($"    setp.ge.u32 %p0, %r2, {I(total)};");
         p.AppendLine("    @%p0 bra DONE;");
-        p.AppendLine("    mul.wide.u32 %rd2, %r2, 36;");                     // g base = weights + id*9*4
+        if (reductionMajor)
+        {
+            if ((c & (c - 1)) == 0)
+            {
+                int shift = 0;
+                while ((1 << shift) != c) shift++;
+                p.AppendLine($"    shr.u32 %r3, %r2, {I(shift)};");          // logical k
+                p.AppendLine($"    and.b32 %r4, %r2, {I(c - 1)};");          // logical c
+            }
+            else
+            {
+                p.AppendLine($"    div.u32 %r3, %r2, {I(c)};");             // logical k
+                p.AppendLine($"    rem.u32 %r4, %r2, {I(c)};");             // logical c
+            }
+            p.AppendLine($"    mad.lo.u32 %r5, %r4, {I(k)}, %r3;");
+            p.AppendLine("    mul.wide.u32 %rd2, %r5, 36;");
+        }
+        else
+        {
+            p.AppendLine("    mul.wide.u32 %rd2, %r2, 36;");                 // g base = weights + id*9*4
+        }
         p.AppendLine("    add.u64 %rd2, %rd0, %rd2;");
         // U base. kc-major: U + id*16*4 (16 contiguous per (k,c)).
         // position-major: U + id*4 (the (k,c) slot in xi=0; xi stride = K*C*4).
         p.AppendLine($"    mul.wide.u32 %rd3, %r2, {I(positionMajor ? 4 : 64)};");
         p.AppendLine("    add.u64 %rd3, %rd1, %rd3;");
-        // load g[0..8] -> %f0..%f8
-        for (int i = 0; i < 9; i++)
-            p.AppendLine($"    ld.global.nc.f32 %f{I(i)}, [%rd2+{I(i * 4)}];");
+        // load g[0..8] -> %f0..%f8. Consecutive filters are nine words
+        // apart, so their bases are not generally vector-aligned.
+        for (int gi = 0; gi < 3; gi++)
+            for (int gj = 0; gj < 3; gj++)
+            {
+                int register = gi * 3 + gj;
+                int sourceGi = invertFilter ? 2 - gi : gi;
+                int sourceGj = invertFilter ? 2 - gj : gj;
+                int source = sourceGi * 3 + sourceGj;
+                p.AppendLine($"    ld.global.nc.f32 %f{I(register)}, " +
+                    $"[%rd2+{I(source * 4)}];");
+            }
         // u = G g (4x3) -> %f9..%f20 ; g[gi][gj] = %f(gi*3+gj)
         int G(int i, int j) => i * 3 + j;          // g at %f0..8
         int U3(int i, int j) => 9 + i * 3 + j;     // u at %f9..20
@@ -174,8 +208,17 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
             p.AppendLine($"    mov.f32 %f{I(U(i, 3))}, %f{I(U3(i, 2))};");
         }
         int uStride = positionMajor ? total * 4 : 4;   // xi stride: K*C*4 (pm) or 4 (kc)
-        for (int i = 0; i < 16; i++)
-            p.AppendLine($"    st.global.f32 [%rd3+{I(i * uStride)}], %f{I(21 + i)};");
+        if (uStride == sizeof(float))
+        {
+            for (int i = 0; i < 16; i += 4)
+                p.AppendLine($"    st.global.v4.f32 [%rd3+{I(i * sizeof(float))}], " +
+                    $"{{%f{I(21 + i)}, %f{I(22 + i)}, %f{I(23 + i)}, %f{I(24 + i)}}};");
+        }
+        else
+        {
+            for (int i = 0; i < 16; i++)
+                p.AppendLine($"    st.global.f32 [%rd3+{I(i * uStride)}], %f{I(21 + i)};");
+        }
         p.AppendLine("DONE:");
         p.AppendLine("    ret;");
         p.AppendLine("}");

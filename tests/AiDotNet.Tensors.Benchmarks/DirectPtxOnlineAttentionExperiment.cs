@@ -128,7 +128,8 @@ internal static class DirectPtxOnlineAttentionExperiment
         GpuBenchmarkEnvironment.RequireIdleGpu("online-attention-framework-baselines");
         RunAiDotNetNvrtc();
         RunTorchSharp();
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("online-attention-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "online-attention-end", afterSuite: true);
         GpuBenchmarkEnvironment.PrintSnapshot("end");
     }
 

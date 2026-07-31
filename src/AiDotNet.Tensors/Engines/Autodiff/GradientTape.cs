@@ -121,7 +121,28 @@ public sealed class GradientTape<T> : IDisposable
     internal void RemoveLastEntry()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (_entries.Count > 0)
+        {
+            ref var removed = ref _entries[_entries.Count - 1];
+            DifferentiableOps.UnpinSavedStateTensors<T>(ref removed);
+        }
         _entries.RemoveLast();
+    }
+
+    /// <summary>
+    /// Releases saved-state pins owned by the first <paramref name="entryCount"/> entries.
+    /// The per-entry ownership bit makes this safe when cleanup routes overlap or a persistent
+    /// tape is replayed. Entries appended by createGraph backward remain pinned for their own
+    /// later backward pass.
+    /// </summary>
+    private void ReleaseSavedStatePins(int entryCount)
+    {
+        int limit = Math.Min(entryCount, _entries.Count);
+        for (int i = 0; i < limit; i++)
+        {
+            ref var entry = ref _entries[i];
+            DifferentiableOps.UnpinSavedStateTensors<T>(ref entry);
+        }
     }
 
     /// <summary>
@@ -303,6 +324,7 @@ public sealed class GradientTape<T> : IDisposable
             return; // Drop new entries when at capacity
         }
 
+        DifferentiableOps.PinSavedStateTensors<T>(ref entry);
         _entries.Add(entry);
 
         // Graph-path visibility for MANUAL backward nodes. This public Record(entry) API is the
@@ -342,7 +364,7 @@ public sealed class GradientTape<T> : IDisposable
     private TapeEntry<T> _discardSlot;
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    internal ref TapeEntry<T> RecordSlot()
+    internal ref TapeEntry<T> RecordSlot(out bool accepted)
     {
         // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording
         // entry point, so a streaming-released persistent tape must reject it too — otherwise a caller
@@ -352,9 +374,11 @@ public sealed class GradientTape<T> : IDisposable
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            accepted = false;
             _discardSlot = default;
             return ref _discardSlot;
         }
+        accepted = true;
         return ref _entries.AllocateSlot();
     }
 
@@ -453,6 +477,8 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.GradFn is null)
             throw new InvalidOperationException(
                 "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+
+        int recordedEntryCount = _entries.Count;
 
         var engine = _engine;
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
@@ -654,7 +680,11 @@ public sealed class GradientTape<T> : IDisposable
                             // is what otherwise pins the whole activation set for the backward's duration.
                             if (entrySlotOfOutput is not null
                                 && entrySlotOfOutput.TryGetValue(nodeOutput, out int slot))
+                            {
+                                ref var releasedEntry = ref _entries[slot];
+                                DifferentiableOps.UnpinSavedStateTensors<T>(ref releasedEntry);
                                 _entries[slot] = default;
+                            }
                         }
                         // This node's backward has already run, so it no longer needs its INPUTS.
                         // Drop the node's references to them: an activation is the output of one node and
@@ -692,6 +722,10 @@ public sealed class GradientTape<T> : IDisposable
         finally
         {
             SetCurrentTape(savedCurrent);
+            // Release every entry recorded before streaming began, including dead
+            // entries that were absent from the GradFn traversal. Entries already
+            // released while dropping activations are guarded by their ownership bit.
+            ReleaseSavedStatePins(recordedEntryCount);
             if (!_options.Persistent)
             {
                 // Non-persistent tapes drop the whole arena here, so they're safe to
@@ -740,6 +774,7 @@ public sealed class GradientTape<T> : IDisposable
         {
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         }
+        int recordedEntryCount = _entries.Count;
 
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
@@ -1127,6 +1162,11 @@ public sealed class GradientTape<T> : IDisposable
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
             }
+            // The slow tape walk may skip pruned or gradient-dead entries, but all
+            // entries acquired saved-state pins at record time. Release the original
+            // forward range exactly once; createGraph entries appended by backward
+            // belong to the next higher-order pass and remain pinned.
+            ReleaseSavedStatePins(recordedEntryCount);
         }
 
         // Tape-walk parity for the .Grad / .GradFn cleanup that ComputeGradientsViaGraph does.
@@ -1299,6 +1339,7 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
+        int recordedEntryCount = _entries.Count;
         // Suspend recording while backward runs so engine ops invoked from
         // backward funcs don't append to *this* tape (would shift bounded
         // tapes / corrupt persistent ones), and so backward fast paths that
@@ -1325,6 +1366,10 @@ public sealed class GradientTape<T> : IDisposable
         }
         finally
         {
+            // Graph traversal reaches only loss-connected nodes. Pin acquisition is
+            // per tape entry, so release the complete pre-backward entry range here;
+            // this also covers dead entries and cached-replay early returns.
+            ReleaseSavedStatePins(recordedEntryCount);
             if (suspendTape)
             {
                 SetCurrentTape(savedCurrent);
@@ -1683,7 +1728,6 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
-
                     // Input0 CAN be a leaf (no GradFn) or a foreign-tape intermediate
                     // (GradFn.OwningTape != this), or null when the streaming backward
                     // already released this node's inputs.
@@ -1812,7 +1856,6 @@ public sealed class GradientTape<T> : IDisposable
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
-
                     // Issue #283 fix: destructive cleanup on Output AND on
                     // intermediate Inputs. Output is always an intermediate
                     // (leaves never appear as Output of an entry). Inputs
@@ -2002,6 +2045,7 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
 
+        ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
     }
 
@@ -2295,6 +2339,11 @@ public sealed class GradientTape<T> : IDisposable
             _snapshotEngine.ResumeActivationEviction();
             _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
         }
+
+        // A tape may be disposed before backward, or after a cleanup path that
+        // visited only reachable nodes. Release any entry-owned saved-state pins
+        // before the arena drops those references; already-cleaned entries no-op.
+        ReleaseSavedStatePins(_entries.Count);
 
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();

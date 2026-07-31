@@ -353,13 +353,162 @@ public class CodegenSplitReductionTests
         Assert.True(plan!.TempElements > entry.Bench.Output.ElementCount);
     }
 
-    /// <summary>A max reduction has no summed-partial combine and must be refused.</summary>
+    /// <summary>
+    /// The split requires ASSOCIATIVITY, and both reduce kinds that exist have it.
+    /// </summary>
+    /// <remarks>
+    /// This test used to assert that MAX was refused, which encoded the bug rather than the
+    /// requirement: max(max(a,b),c) = max(a,max(b,c)) associates exactly as addition does.
+    ///
+    /// The throwing branch is currently UNREACHABLE and is asserted through the predicate
+    /// instead of by constructing a spec. CodegenReduceKind has only Sum, Max and None; None
+    /// cannot coexist with a reduction axis -- the spec constructor refuses it -- so no
+    /// non-associative reduction can be built today. The guard is there for the next reduce
+    /// kind added, and saying so is more honest than a test that fabricates an impossible
+    /// spec to reach it.
+    /// </remarks>
     [Fact]
-    public void NonSumReduction_IsRefused()
+    public void SplitRequiresAnAssociativeReduction()
     {
-        var entry = CodegenKernelCatalog.Find("maxpool2d_2x2");
-        Assert.NotNull(entry);
-        Assert.Throws<NotSupportedException>(
-            () => CodegenSplitReduction.Split(entry!.Bench, entry.Bench.Space.ReductionAxes[0]));
+        Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Sum));
+        Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Max));
+        Assert.False(CodegenSplitReduction.IsSplittable(CodegenReduceKind.None));
+    }
+
+    // ---- splitting a MAXIMUM ---------------------------------------------------------------
+    //
+    // The splitter refused Max, on the stated grounds that "the combine pass has to be the same
+    // associative operation, and Max is not summed partials". The first half is right; the
+    // second does not follow. max(max(a,b),c) = max(a,max(b,c)) exactly as addition associates,
+    // so the combine over Max partials is a Max.
+    //
+    // The cost of that mistaken premise was concrete: a row-wise maximum ran one thread per
+    // row, which profiles at 32 sectors per global request against an ideal of 4 -- an
+    // eightfold traffic waste -- and 0.04 waves per multiprocessor. It was the only reduction
+    // shape with no available fix, for a reason that was not a property of Max.
+
+    private static CodegenKernelSpec RowReduce(int rows, int inner, CodegenReduceKind reduce)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("k", inner));
+
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, inner },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var y = new CodegenTensorBinding(1, "y", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+
+        return new CodegenKernelSpec("rowreduce", space, new[] { x }, y, new[] { 0 }, reduce);
+    }
+
+    private static CodegenKernelSpec RowMaxWithIndices(int rows, int inner)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("k", inner));
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, inner },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var values = new CodegenTensorBinding(1, "values", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var indices = new CodegenTensorBinding(2, "indices", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+
+        return new CodegenKernelSpec(
+            "rowmax_indices", space, new[] { x }, values, new[] { 0 }, CodegenReduceKind.Max,
+            secondaryOutput: indices, secondaryIndexExpr: CodegenAffineExpr.Axis(1));
+    }
+
+    private static double[] MaxSplitValues(int count)
+    {
+        var data = new double[count];
+        for (int i = 0; i < count; i++) data[i] = (((i * 37) % 101) - 50) / 8.0;
+        return data;
+    }
+
+    /// <summary>Max is associative, so it splits.</summary>
+    [Fact]
+    public void MaxIsSplittable()
+    {
+        Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Max));
+        Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Sum));
+        Assert.False(CodegenSplitReduction.IsSplittable(CodegenReduceKind.None));
+    }
+
+    /// <summary>Argmax metadata stays single-pass until split temporaries carry positions.</summary>
+    [Fact]
+    public void MaxWithArgmaxOutput_IsRefusedByEverySplitEntryPoint()
+    {
+        var spec = RowMaxWithIndices(64, 128);
+
+        Assert.True(CodegenSplitReduction.IsSplittable(CodegenReduceKind.Max));
+        Assert.False(CodegenSplitReduction.IsSplittable(spec));
+        Assert.Empty(CodegenSplitReduction.ChooseAxes(spec));
+        Assert.Null(CodegenSplitReduction.TryPlan(spec));
+
+        var whole = Assert.Throws<NotSupportedException>(
+            () => CodegenSplitReduction.Split(spec, 1));
+        var chunked = Assert.Throws<NotSupportedException>(
+            () => CodegenSplitReduction.SplitChunked(spec, 1, 8));
+        Assert.Contains("argmax secondary output", whole.Message, StringComparison.Ordinal);
+        Assert.Contains("argmax secondary output", chunked.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The split maximum must equal the unsplit one, checked against a hand-written scan
+    /// rather than against the single-pass spec: a shared interpreter can share a mistake.
+    /// </summary>
+    [Theory]
+    [InlineData(64, 128, 8)]
+    [InlineData(32, 256, 16)]
+    [InlineData(16, 64, 4)]
+    public void SplitMax_MatchesAHandWrittenScan(int rows, int inner, int factor)
+    {
+        var spec = RowReduce(rows, inner, CodegenReduceKind.Max);
+        var (partial, combine) = CodegenSplitReduction.SplitChunked(spec, 1, factor);
+
+        double[] x = MaxSplitValues(rows * inner);
+        double[] got = combine.Interpret(new[] { partial.Interpret(new[] { x }) });
+
+        for (int i = 0; i < rows; i++)
+        {
+            double best = double.NegativeInfinity;
+            for (int k = 0; k < inner; k++) best = Math.Max(best, x[i * inner + k]);
+            Assert.Equal(best, got[i], 9);
+        }
+    }
+
+    /// <summary>The combine must reduce with the SAME operation, not with a sum.</summary>
+    [Fact]
+    public void CombineUsesTheSameOperation()
+    {
+        var (_, combine) = CodegenSplitReduction.SplitChunked(
+            RowReduce(64, 128, CodegenReduceKind.Max), 1, 8);
+
+        Assert.Equal(CodegenReduceKind.Max, combine.Reduce);
+    }
+
+    /// <summary>A sum still splits into a sum -- the fix must not have swapped the operation.</summary>
+    [Fact]
+    public void SumStillSplitsIntoASum()
+    {
+        var spec = RowReduce(64, 128, CodegenReduceKind.Sum);
+        var (partial, combine) = CodegenSplitReduction.SplitChunked(spec, 1, 8);
+
+        Assert.Equal(CodegenReduceKind.Sum, combine.Reduce);
+
+        double[] x = MaxSplitValues(64 * 128);
+        double[] got = combine.Interpret(new[] { partial.Interpret(new[] { x }) });
+
+        for (int i = 0; i < 64; i++)
+        {
+            double sum = 0;
+            for (int k = 0; k < 128; k++) sum += x[i * 128 + k];
+            Assert.Equal(sum, got[i], 6);
+        }
+    }
+
+    /// <summary>The planner now offers a plan for a maximum, where it previously offered none.</summary>
+    [Fact]
+    public void PlannerHandlesMax()
+    {
+        Assert.NotNull(CodegenSplitReduction.TryPlan(RowReduce(4096, 1024, CodegenReduceKind.Max)));
     }
 }

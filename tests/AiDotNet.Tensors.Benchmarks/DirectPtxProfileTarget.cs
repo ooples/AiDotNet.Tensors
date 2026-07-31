@@ -40,7 +40,7 @@ internal static class DirectPtxProfileTarget
             Console.WriteLine(kernel.Audit.ToJson());
         }
         runtime.Synchronize();
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-end", afterSuite: true);
     }
 
     internal static void RunResidualRmsNorm()
@@ -67,7 +67,8 @@ internal static class DirectPtxProfileTarget
             runtime.Synchronize();
             Console.WriteLine(kernel.Audit.ToJson());
         }
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-residual-rmsnorm-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-residual-rmsnorm-end", afterSuite: true);
     }
 
     internal static void RunDecode()
@@ -109,7 +110,7 @@ internal static class DirectPtxProfileTarget
         runtime.Synchronize();
         Console.WriteLine(dense.Audit.ToJson());
         Console.WriteLine(paged.Audit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-decode-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-decode-end", afterSuite: true);
     }
 
     internal static void RunPagedPrefill()
@@ -139,7 +140,8 @@ internal static class DirectPtxProfileTarget
         launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-paged-prefill-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-paged-prefill-end", afterSuite: true);
     }
 
     internal static void RunAttentionBackward()
@@ -177,7 +179,8 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.RowDeltaAudit.ToJson());
         Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
         Console.WriteLine(kernel.GradQueryAudit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-attention-backward-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-attention-backward-end", afterSuite: true);
     }
 
     internal static void RunFlashAttentionBackward()
@@ -218,7 +221,8 @@ internal static class DirectPtxProfileTarget
         runtime.Synchronize();
         Console.WriteLine(kernel.GradQueryAudit.ToJson());
         Console.WriteLine(kernel.GradKeyValueAudit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-flash-attention-backward-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-flash-attention-backward-end", afterSuite: true);
     }
 
     internal static void RunQkvRopeCache()
@@ -261,7 +265,8 @@ internal static class DirectPtxProfileTarget
             runtime.Synchronize();
             Console.WriteLine(kernel.Audit.ToJson());
         }
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-qkv-rope-cache-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-qkv-rope-cache-end", afterSuite: true);
     }
 
     internal static void RunConvolution()
@@ -283,7 +288,8 @@ internal static class DirectPtxProfileTarget
             DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-convolution-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-convolution-end", afterSuite: true);
     }
 
     internal static void VerifyNcuCsv(string path)

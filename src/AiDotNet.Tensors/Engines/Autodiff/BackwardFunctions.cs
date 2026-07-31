@@ -1,4 +1,4 @@
-﻿using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -110,6 +110,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // See AlignGradRank: a rank-0 operand paired with a rank-1 [1] seed would otherwise throw.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+
         var gradA = engine.TensorMultiply(gradOutput, inputs[1]);
         var gradB = engine.TensorMultiply(gradOutput, inputs[0]);
         if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], gradA, engine))
@@ -119,10 +122,37 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>d(a/b)/da = grad/b, d(a/b)/db = -grad*a/(b*b)</summary>
+    /// <summary>
+    /// Reshapes an upstream gradient to an operand's shape when the two describe the SAME number of
+    /// elements but different ranks, e.g. a rank-1 <c>[1]</c> seed against a rank-0 <c>[]</c> operand.
+    /// </summary>
+    /// <remarks>
+    /// Elementwise backward functions divide/multiply the upstream gradient by an operand directly,
+    /// which requires matching shapes. A rank-0 result (any full reduction with
+    /// <c>keepDims: false</c>) receives a rank-1 <c>[1]</c> seed gradient from the tape, so those ops
+    /// threw "Tensor shapes must match. Got [1] and []" from inside ComputeGradients -- turning a
+    /// perfectly valid loss into an exception mid-training-step. Because the element count is
+    /// identical, a reshape is exact and loses nothing; anything that is NOT a pure rank mismatch is
+    /// left untouched so genuine shape errors still surface.
+    /// </remarks>
+    private static Tensor<T> AlignGradRank(IEngine engine, Tensor<T> grad, Tensor<T> operand)
+    {
+        if (grad.Shape.Length == operand.Shape.Length || grad.Length != operand.Length)
+        {
+            return grad;
+        }
+
+        return engine.Reshape(grad, (int[])operand._shape.Clone());
+    }
+
     internal static void DivideBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // The forward divide requires a and b to share a shape, so aligning against inputs[0] is
+        // enough to make every product/quotient below shape-consistent.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+
         var gradA = engine.TensorDivide(gradOutput, inputs[1]);
         var bSquared = engine.TensorMultiply(inputs[1], inputs[1]);
         var posGradA = engine.TensorMultiply(gradOutput, inputs[0]);
@@ -145,6 +175,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        gradOutput = AlignGradRank(engine, gradOutput, output);
         var grad = engine.TensorMultiply(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -154,6 +185,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
         var grad = engine.TensorDivide(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -1832,7 +1864,7 @@ internal static class BackwardFunctions<T>
 
             if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
             {
-                var dense = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+                var dense = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
             }
             return;
@@ -1842,7 +1874,20 @@ internal static class BackwardFunctions<T>
         // Generalizing SparseEmbeddingGradient to N-D / arbitrary-axis gathers is a
         // forward-ledger surface change for a future PR. For now, the perf win we
         // care about (embedding-table lookups) is covered.
-        var grad = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+        //
+        // Uses ScatterAdd (output[indices[i]] += source[i]) and NOT ScatterAddBackward.
+        // Despite the name, ScatterAddBackward is the backward of a SCATTER-ADD forward with
+        // respect to that op's `src` input, which is a GATHER:
+        // gradSource[s] = gradOutput[indices[s]], with `indices` indexed by SOURCE position.
+        // Gather's backward is the opposite - it must ACCUMULATE gradOutput[i] into source slice
+        // indices[i], because gather indices routinely REPEAT (duplicate tokens in an embedding
+        // lookup; relative-position-bias tables where many (i, j) window positions share a
+        // bucket), so a slice selected k times must receive k contributions. Borrowing the
+        // gather-shaped helper here also read `indices` OUT OF RANGE whenever the source extent
+        // exceeded the index count, because it wrapped via `indices[d % indices.Length]`: a 4-row
+        // source gathered by 3 indices produced uniform garbage instead of per-occurrence sums,
+        // and never-selected slices came back nonzero when they must be exactly 0.
+        var grad = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -4467,6 +4512,9 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var two = numOps.FromDouble(2.0);
+        // See AlignGradRank: same rank-0-operand / rank-1-seed hazard as the other elementwise
+        // backwards. Found by sweeping all 245 backward functions for this pattern.
+        gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
         var gradReal = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[0]), two);
         var gradImag = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[1]), two);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradReal, engine);
@@ -4803,8 +4851,14 @@ internal static class BackwardFunctions<T>
             // gradient tensors).
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradInputArr = (float[])(object)inputGrad.GetDataArray();
-            var gradWeightArr = (float[])(object)weightGrad.GetDataArray();
+            var gradInputArr = (float[])(object)(
+                inputGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear float input-gradient buffer must be a contiguous CPU tensor."));
+            var gradWeightArr = (float[])(object)(
+                weightGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear float weight-gradient buffer must be a contiguous CPU tensor."));
 
             bool used = false;
 
@@ -4841,7 +4895,10 @@ internal static class BackwardFunctions<T>
             if (inputs.Length > 2)
             {
                 var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var biasArr = (float[])(object)biasGrad.GetDataArray();
+                var biasArr = (float[])(object)(
+                    biasGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "FusedLinear float bias-gradient buffer must be a contiguous CPU tensor."));
                 Array.Clear(biasArr, 0, N);
                 fixed (float* pG = gArr, pB = biasArr)
                 {
@@ -4881,8 +4938,14 @@ internal static class BackwardFunctions<T>
 
             var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradInputArr = (double[])(object)inputGrad.GetDataArray();
-            var gradWeightArr = (double[])(object)weightGrad.GetDataArray();
+            var gradInputArr = (double[])(object)(
+                inputGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear double input-gradient buffer must be a contiguous CPU tensor."));
+            var gradWeightArr = (double[])(object)(
+                weightGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? throw new InvalidOperationException(
+                    "FusedLinear double weight-gradient buffer must be a contiguous CPU tensor."));
 
             // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W stored [K,N] (ldb=N), transB=true.
             bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
@@ -4903,7 +4966,10 @@ internal static class BackwardFunctions<T>
             if (inputs.Length > 2)
             {
                 var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var biasArr = (double[])(object)biasGrad.GetDataArray();
+                var biasArr = (double[])(object)(
+                    biasGrad.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "FusedLinear double bias-gradient buffer must be a contiguous CPU tensor."));
                 Array.Clear(biasArr, 0, N);
                 for (int row = 0; row < M; row++)
                 {

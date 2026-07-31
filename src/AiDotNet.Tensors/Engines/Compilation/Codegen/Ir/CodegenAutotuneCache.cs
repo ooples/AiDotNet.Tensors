@@ -22,12 +22,34 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// <summary>Lowering choices that were measured rather than modelled.</summary>
 public static class CodegenAutotuneCache
 {
+    private const double HarnessGainNoiseFloor =
+        CodegenMeasurementProtocol.AutotuneGainNoiseFloor;
     private static readonly object Sync = new();
-    private static Dictionary<string, string>? _winners;
+    private static Dictionary<CacheKey, string>? _winners;
+    private static string _cachePath = Path.Combine("artifacts", "autotune.tsv");
+
+    private readonly record struct CacheKey(
+        string Kernel,
+        string Device,
+        string Target,
+        string Spec,
+        string Emitter);
 
     /// <summary>File the autotuner writes and this reads.</summary>
-    public static string CachePath { get; set; } =
-        Path.Combine("artifacts", "autotune.tsv");
+    public static string CachePath
+    {
+        get { lock (Sync) return _cachePath; }
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException("Autotune cache path cannot be empty.", nameof(value));
+            lock (Sync)
+            {
+                _cachePath = value;
+                _winners = null;
+            }
+        }
+    }
 
     /// <summary>Forgets the loaded cache, so a fresh autotune run is picked up.</summary>
     public static void Invalidate()
@@ -36,35 +58,61 @@ public static class CodegenAutotuneCache
     }
 
     /// <summary>
-    /// The winning candidate name for a kernel, or null when it has not been tuned.
+    /// The winning candidate name for a kernel and exact build identity, or null when it has
+    /// not been tuned under that identity.
     /// </summary>
     /// <remarks>
     /// Rows stamped with a superseded measurement protocol are ignored, exactly as the
     /// release gates ignore them: a lowering chosen under a protocol that let clock
     /// drift into the ratio is not a measured choice, it is a remembered guess.
     /// </remarks>
-    public static string? WinnerFor(string kernelName)
+    public static string? WinnerFor(string kernelName, CodegenAutotuneIdentity identity)
     {
         if (string.IsNullOrEmpty(kernelName)) return null;
+        if (identity is null) throw new ArgumentNullException(nameof(identity));
 
         lock (Sync)
         {
             _winners ??= Load();
-            return _winners.TryGetValue(kernelName, out string? winner) ? winner : null;
+            var key = new CacheKey(
+                kernelName,
+                identity.DeviceFingerprint,
+                identity.Target,
+                identity.SpecFingerprint,
+                identity.EmitterFingerprint);
+            return _winners.TryGetValue(key, out string? winner) ? winner : null;
         }
     }
 
-    private static Dictionary<string, string> Load()
+    private static Dictionary<CacheKey, string> Load()
     {
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var map = new Dictionary<CacheKey, string>();
         string path = CachePath;
-        if (!File.Exists(path)) return map;
+        string[] lines;
+        try
+        {
+            lines = File.ReadAllLines(path);
+        }
+        catch (IOException)
+        {
+            return map;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return map;
+        }
 
-        foreach (string line in File.ReadAllLines(path))
+        foreach (string line in lines)
         {
             if (line.Length == 0 || line[0] == '#') continue;
             string[] cells = line.Split('\t');
-            if (cells.Length < 6) continue;
+            // A promotable row must carry exact build identity and prove that every
+            // candidate in that identity's finite search was considered. Candidate-filtered
+            // probes are useful experiments, but accepting one as dispatch would let a
+            // hand-picked subset masquerade as autotuning.
+            if (cells.Length != 11 ||
+                !string.Equals(cells[10], "full", StringComparison.Ordinal))
+                continue;
             if (!string.Equals(cells[5], CodegenMeasurementProtocol.Tag, StringComparison.Ordinal))
                 continue;
 
@@ -73,9 +121,10 @@ public static class CodegenAutotuneCache
             // switching lowerings on noise is how a tuner becomes a random walk.
             if (!double.TryParse(cells[4], NumberStyles.Any, CultureInfo.InvariantCulture, out double gain))
                 continue;
-            if (gain <= 1.0105) continue;
+            if (gain <= HarnessGainNoiseFloor) continue;
 
-            map[cells[0]] = cells[1];
+            var key = new CacheKey(cells[0], cells[6], cells[7], cells[8], cells[9]);
+            map[key] = cells[1];
         }
         return map;
     }

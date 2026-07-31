@@ -29,13 +29,24 @@ public class CodegenTensorCoreStagingTests
     /// An emitter pinned to the 2x2 warp tile.
     /// </summary>
     /// <remarks>
-    /// The emitter now SELECTS the largest warp tile the shape allows, so a test about the
-    /// structure a particular tile produces -- how many mma instructions, how much shared
-    /// memory, how many stores -- has to pin one. See WarpTileSelection_PicksTheLargestThatFits
-    /// for the selector itself.
+    /// The emitter selects a measured tile or the smallest-first fallback, so a test about
+    /// the structure a particular tile produces -- how many mma instructions, how much shared
+    /// memory, how many stores -- has to pin one. See WarpTileSelection_FollowsTheLadder for
+    /// the selector itself.
     /// </remarks>
     private static PtxTensorCoreEmitter Tile2x2() =>
         new() { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
+
+    /// <summary>
+    /// An emitter pinned to 2x2 with REGISTER staging.
+    /// </summary>
+    /// <remarks>
+    /// cp.async is the default where the architecture supports it, so a test about the
+    /// register-staged form -- its ld.global/st.shared pair, its prefetch registers -- has to
+    /// ask for it. That form is still what runs below sm_80.
+    /// </remarks>
+    private static PtxTensorCoreEmitter RegisterStaged() =>
+        new() { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true, EnableAsyncCopy = false };
 
     private static CodegenKernelSpec MatMul(
         int m, int k, int n,
@@ -123,6 +134,43 @@ public class CodegenTensorCoreStagingTests
         Assert.DoesNotContain("wmma.load.a.sync.aligned.row.m16n16k16.global.f16", ptx, StringComparison.Ordinal);
     }
 
+    /// <summary>A wrong-answer ceiling probe cannot masquerade as the real kernel.</summary>
+    [Fact]
+    public void MmaCeilingProbe_UsesMarkedDistinctEntry()
+    {
+        var spec = MatMul(512, 512, 512);
+        var emitter = Tile2x2();
+        emitter.MmaCeilingProbe = true;
+
+        string ptx = emitter.Emit(spec, Sm86Major, Sm86Minor);
+
+        Assert.Equal(spec.Name + "_ceiling_probe", emitter.EmittedEntryName);
+        Assert.False(emitter.DoubleBuffered);
+        Assert.Equal(emitter.StageBufferBytes, emitter.SharedMemoryBytes);
+        Assert.Contains($".shared .align 16 .b8 stage[{emitter.StageBufferBytes}];", ptx,
+            StringComparison.Ordinal);
+        Assert.Contains("// MMA CEILING PROBE: BENCHMARK ONLY; OUTPUT IS INTENTIONALLY INCORRECT", ptx,
+            StringComparison.Ordinal);
+        Assert.Contains(".visible .entry " + emitter.EmittedEntryName + "(", ptx,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(".visible .entry " + spec.Name + "(", ptx,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>Normal staged emission retains the source spec's kernel name.</summary>
+    [Fact]
+    public void NormalEmission_KeepsSpecEntryName()
+    {
+        var spec = MatMul(512, 512, 512);
+        var emitter = Tile2x2();
+
+        string ptx = emitter.Emit(spec, Sm86Major, Sm86Minor);
+
+        Assert.Equal(spec.Name, emitter.EmittedEntryName);
+        Assert.Contains(".visible .entry " + spec.Name + "(", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("MMA CEILING PROBE", ptx, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// FOUR mma instructions per K step from FOUR fragment loads. That two-to-one ratio is
     /// half the win: the naive lowering issues two fragment loads per single mma.
@@ -190,7 +238,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void DoubleBuffered_IssuesThePrefetchBeforeTheArithmetic()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+        string ptx = RegisterStaged().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
         Assert.True(loopStart >= 0);
@@ -217,12 +265,15 @@ public class CodegenTensorCoreStagingTests
         var emitter = Tile2x2();
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
+        // Asserted through the emitter's own arithmetic rather than literals: 8192/4096/6144
+        // were correct until shared rows gained padding, and hand-recomputed constants would
+        // simply go stale again the next time the layout moves.
         Assert.Equal(emitter.StageBufferBytes * 2, emitter.SharedMemoryBytes);
-        Assert.Contains(".shared .align 16 .b8 stage[8192];", ptx, StringComparison.Ordinal);
+        Assert.Contains($".shared .align 16 .b8 stage[{emitter.StageBufferBytes * 2}];", ptx,
+            StringComparison.Ordinal);
 
         // Buffer 1's slabs sit one whole buffer further along.
-        Assert.Contains("+4096]", ptx, StringComparison.Ordinal);
-        Assert.Contains("+6144]", ptx, StringComparison.Ordinal);
+        Assert.Contains($"+{emitter.StageBufferBytes}]", ptx, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -232,7 +283,7 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void DoubleBuffered_PredicatesThePrefetchPastTheEnd()
     {
-        string ptx = new PtxTensorCoreEmitter().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+        string ptx = RegisterStaged().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
         string body = ptx.Substring(loopStart);
@@ -275,14 +326,17 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void StagedKernel_ReservesBothSlabs()
     {
-        var emitter = Tile2x2();
+        var emitter = RegisterStaged();
         emitter.EnableDoubleBuffering = false;
         string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
-        // 64x16 halves of A plus 16x64 of B, two bytes each.
-        Assert.Equal((64 * 16 + 16 * 64) * 2, emitter.SharedMemoryBytes);
-        Assert.Contains(".shared .align 16 .b8 stage[4096];", ptx, StringComparison.Ordinal);
+        // A's rows and B's, each PADDED to break bank conflicts. Asserted through the
+        // emitter's own arithmetic: the unpadded 4096 was right until the layout changed.
+        Assert.Equal(emitter.StageBufferBytes, emitter.SharedMemoryBytes);
+        Assert.Contains($".shared .align 16 .b8 stage[{emitter.StageBufferBytes}];", ptx,
+            StringComparison.Ordinal);
         Assert.Contains("st.shared.u32", ptx, StringComparison.Ordinal);
+        Assert.True(emitter.StageBufferBytes > 4096, "rows are not padded");
     }
 
     /// <summary>
@@ -302,6 +356,26 @@ public class CodegenTensorCoreStagingTests
 
         Assert.Equal(expectedBlocks, emitter.BlockCount(plan));
         Assert.Equal(128, emitter.BlockThreads);
+    }
+
+    /// <summary>
+    /// The staged emitter has a fixed 2x2 warp layout. A tuning value for the naive lowering
+    /// must not leak into its launch geometry and create out-of-bounds shared-memory offsets.
+    /// </summary>
+    [Fact]
+    public void BlockThreads_TracksTheLoweringThatWasEmitted()
+    {
+        var staged = new PtxTensorCoreEmitter { WarpsPerBlock = 8 };
+        staged.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.True(staged.Staged);
+        Assert.Equal(128, staged.BlockThreads);
+
+        var naive = new PtxTensorCoreEmitter { EnableStaging = false, WarpsPerBlock = 8 };
+        naive.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.False(naive.Staged);
+        Assert.Equal(256, naive.BlockThreads);
     }
 
     /// <summary>Turning staging off must restore the naive grid, or the A/B measurement lies.</summary>
@@ -343,29 +417,62 @@ public class CodegenTensorCoreStagingTests
         Assert.Equal(4, CountOccurrences(ptx, "wmma.store.d.sync"));
     }
 
-    /// <summary>
-    /// The emitter picks the LARGEST warp tile whose block tile divides the output.
-    /// </summary>
+    /// <summary>The unmeasured fallback prefers the smallest tile that fits.</summary>
     /// <remarks>
-    /// Derived from `--warp-tile-sweep`, which verified and timed every candidate at four
-    /// shapes: the bigger tile won wherever it fits, by 1.28x at 2048^3 and 1.32x at 4096^3.
-    /// The mechanism is the one the profile named -- L1TEX falls from 92.34% to 61.38% and
-    /// the tensor pipe rises from 26.79% to 35.74%.
+    /// Derived from the post-padding `--warp-tile-sweep`: 2x2 won two of four measured shapes,
+    /// including 2048^3, while 2x4 and 4x2 won one each. Exact measured shapes bypass this
+    /// ladder through <see cref="TensorCoreWarpTileCatalog"/>.
     /// </remarks>
     [Theory]
-    [InlineData(128, 128, 4, 4)]      // both divide by 128
-    [InlineData(128, 64, 4, 2)]       // N only reaches 64
-    [InlineData(64, 128, 2, 4)]
+    [InlineData(128, 128, 2, 2)]
+    [InlineData(128, 64, 2, 2)]
+    [InlineData(64, 128, 2, 2)]
     [InlineData(64, 64, 2, 2)]
-    [InlineData(1024, 1024, 4, 4)]
-    public void WarpTileSelection_PicksTheLargestThatFits(int m, int n, int tileM, int tileN)
+    public void WarpTileSelection_FollowsTheLadder(int m, int n, int tileM, int tileN)
     {
+        // K = 64 here, so none of these hit a measured catalog entry: this covers the LADDER.
         var emitter = new PtxTensorCoreEmitter();
         emitter.Emit(MatMul(m, 64, n), Sm86Major, Sm86Minor);
 
         Assert.True(emitter.Staged);
+        Assert.False(emitter.WarpTileWasMeasured);
         Assert.Equal(tileM, emitter.WarpTilesM);
         Assert.Equal(tileN, emitter.WarpTilesN);
+    }
+
+    /// <summary>
+    /// A measured shape takes its MEASURED tile, which at 1024^3 is not the largest that
+    /// fits: 4x2 timed 71.9us against 4x4's 75.0us. This is the case the ladder gets wrong
+    /// and the catalog exists for.
+    /// </summary>
+    [Fact]
+    public void MeasuredShape_OverridesTheLadder()
+    {
+        var emitter = new PtxTensorCoreEmitter();
+        emitter.Emit(MatMul(1024, 1024, 1024), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.WarpTileWasMeasured);
+        Assert.Equal(2, emitter.WarpTilesM);
+        Assert.Equal(4, emitter.WarpTilesN);
+
+        // The measured winner at 1024^3 also staged with REGISTERS, not cp.async. The tile
+        // and the staging form are recorded together precisely because one does not follow
+        // from the other.
+        Assert.False(emitter.AsyncCopy);
+    }
+
+    /// <summary>Every catalog entry must be reachable, or it is a silently dead measurement.</summary>
+    [Fact]
+    public void EveryMeasuredShape_IsReachable()
+    {
+        foreach (var (m, n, k) in TensorCoreWarpTileCatalog.MeasuredShapes)
+        {
+            var emitter = new PtxTensorCoreEmitter();
+            emitter.Emit(MatMul(m, k, n), Sm86Major, Sm86Minor);
+
+            Assert.True(emitter.Staged, $"{m}x{k}x{n} does not stage");
+            Assert.True(emitter.WarpTileWasMeasured, $"{m}x{k}x{n} did not hit its catalog entry");
+        }
     }
 
     /// <summary>A pinned tile is not overridden -- that is what the sweep depends on.</summary>
@@ -377,6 +484,23 @@ public class CodegenTensorCoreStagingTests
 
         Assert.Equal(2, emitter.WarpTilesM);
         Assert.Equal(2, emitter.WarpTilesN);
+    }
+
+    /// <summary>
+    /// Pinned extents feed block-tile divisors and fixed fragment addressing, so reject every
+    /// value outside the measured 2/4 ladder at assignment time.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(8)]
+    public void WarpTileExtents_RejectUnsupportedValues(int extent)
+    {
+        var emitter = new PtxTensorCoreEmitter();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => emitter.WarpTilesM = extent);
+        Assert.Throws<ArgumentOutOfRangeException>(() => emitter.WarpTilesN = extent);
     }
 
     /// <summary>
@@ -395,6 +519,102 @@ public class CodegenTensorCoreStagingTests
         Assert.True(large.SharedMemoryBytes > small.SharedMemoryBytes);
         Assert.Equal(16, large.MmaInstructions / 2);       // 16 per body, two bodies
         Assert.Equal(4, small.MmaInstructions / 2);
+    }
+
+    // ---- cp.async staging ----------------------------------------------------------------
+
+    /// <summary>
+    /// cp.async copies global to shared directly, so the staged words never occupy a register
+    /// and one instruction moves 16 bytes instead of four.
+    /// </summary>
+    /// <remarks>
+    /// This is what took the kernel off its register occupancy limit: at the 4x4 tile the
+    /// register-staged form used 240 registers per thread, allowing 2 blocks per SM and
+    /// 16.41% of peak warps active, with `mio_throttle` the largest remaining stall.
+    /// </remarks>
+    [Fact]
+    public void AsyncCopy_ReplacesTheLoadStorePair()
+    {
+        var emitter = Tile2x2();
+        string ptx = emitter.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.AsyncCopy);
+        Assert.Contains("cp.async.ca.shared.global", ptx, StringComparison.Ordinal);
+        Assert.Contains("cp.async.commit_group;", ptx, StringComparison.Ordinal);
+        Assert.Contains("cp.async.wait_group 0;", ptx, StringComparison.Ordinal);
+
+        // The register round-trip is gone entirely.
+        Assert.DoesNotContain("st.shared.u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.global.nc.u32", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The copy must be COMMITTED before the arithmetic and WAITED on after it. Waiting before
+    /// the mma work would serialise exactly what the async form exists to overlap.
+    /// </summary>
+    [Fact]
+    public void AsyncCopy_WaitsAfterTheArithmeticNotBefore()
+    {
+        string ptx = Tile2x2().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
+        string body = ptx.Substring(loopStart);
+
+        int commit = body.IndexOf("cp.async.commit_group;", StringComparison.Ordinal);
+        int mma = body.IndexOf("wmma.mma.sync", StringComparison.Ordinal);
+        int wait = body.IndexOf("cp.async.wait_group 0;", StringComparison.Ordinal);
+
+        Assert.True(commit >= 0 && mma >= 0 && wait >= 0);
+        Assert.True(commit < mma, "the copy must be committed before the arithmetic");
+        Assert.True(mma < wait, "the wait must come after the arithmetic it overlaps with");
+    }
+
+    /// <summary>A copy past the end of K must still be predicated off.</summary>
+    [Fact]
+    public void AsyncCopy_PredicatesThePrefetchPastTheEnd()
+    {
+        string ptx = Tile2x2().Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        int loopStart = ptx.IndexOf("KLOOP:", StringComparison.Ordinal);
+        string body = ptx.Substring(loopStart);
+
+        int copies = CountOccurrences(body, "cp.async.ca.shared.global");
+        int guarded = CountOccurrences(body, "@%p") - CountOccurrences(body, "@%p1 bra");
+        Assert.True(copies > 0);
+        Assert.True(guarded >= copies, $"{copies} async copies but only {guarded} guards");
+    }
+
+    /// <summary>
+    /// cp.async is sm_80+. A pre-Ampere target must fall back to register staging rather than
+    /// emitting an instruction the assembler will reject.
+    /// </summary>
+    [Fact]
+    public void AsyncCopy_FallsBackBeforeAmpere()
+    {
+        var emitter = Tile2x2();
+        string ptx = emitter.Emit(MatMul(512, 512, 512), computeMajor: 7, computeMinor: 5);
+
+        Assert.False(emitter.AsyncCopy);
+        Assert.DoesNotContain("cp.async", ptx, StringComparison.Ordinal);
+        Assert.Contains("st.shared.u32", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The catalog records the tile and the staging form TOGETHER, because they interact: at
+    /// 4096^3 the 4x4 tile is faster with registers (45.0 TF) than with cp.async (41.6), while
+    /// 4x2 is much faster with cp.async (47.0) than without (38.4). Picking them independently
+    /// selects 4x4 + cp.async, the worst of those four.
+    /// </summary>
+    [Fact]
+    public void CatalogChoosesTileAndStagingTogether()
+    {
+        var emitter = new PtxTensorCoreEmitter();
+        emitter.Emit(MatMul(4096, 4096, 4096), Sm86Major, Sm86Minor);
+
+        Assert.True(emitter.WarpTileWasMeasured);
+        Assert.Equal(4, emitter.WarpTilesM);
+        Assert.Equal(2, emitter.WarpTilesN);
+        Assert.True(emitter.AsyncCopy);
     }
 
     private static int CountOccurrences(string haystack, string needle)

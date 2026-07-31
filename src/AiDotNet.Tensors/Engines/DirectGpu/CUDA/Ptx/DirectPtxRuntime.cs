@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Globalization;
 using System.Text;
@@ -16,6 +17,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     private IntPtr _context;
     private readonly IntPtr _stream;
     private readonly bool _ownsContext;
+    private readonly bool _ownsStream;
     private bool _disposed;
 
     internal int DeviceOrdinal { get; }
@@ -50,6 +52,8 @@ internal sealed class DirectPtxRuntime : IDisposable
             "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
 
         Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
+        Check(CudaNativeBindings.cuStreamCreate(out _stream, 1), "cuStreamCreate(non-blocking)");
+        _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation
         // below has an explicit, balanced push/pop boundary.
         Check(CuBlasNative.cuCtxPopCurrent(out IntPtr popped), "cuCtxPopCurrent");
@@ -60,7 +64,6 @@ internal sealed class DirectPtxRuntime : IDisposable
             throw new InvalidOperationException("CUDA returned a different context from cuCtxPopCurrent.");
         }
 
-        _stream = IntPtr.Zero;
         _ownsContext = true;
         DeviceOrdinal = deviceOrdinal;
         DeviceName = name.ToString();
@@ -86,6 +89,7 @@ internal sealed class DirectPtxRuntime : IDisposable
         _context = borrowedContext;
         _stream = borrowedStream;
         _ownsContext = false;
+        _ownsStream = false;
 
         using var _ = Enter();
         Check(CudaNativeBindings.cuCtxGetDevice(out int device), "cuCtxGetDevice");
@@ -215,6 +219,59 @@ internal sealed class DirectPtxRuntime : IDisposable
             Check(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
     }
 
+    internal DirectPtxGraph CaptureGraph(Action launch)
+    {
+        PtxCompat.ThrowIfNull(launch, nameof(launch));
+        if (_stream == IntPtr.Zero)
+            throw new NotSupportedException(
+                "CUDA graph capture requires an explicit non-default stream.");
+
+        using var _ = Enter();
+        Check(CudaNativeBindings.cuStreamBeginCapture(
+            _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+            "cuStreamBeginCapture");
+        IntPtr graph = IntPtr.Zero;
+        bool endCaptureCalled = false;
+        try
+        {
+            launch();
+            // EndCapture terminates the capture even when it reports an error. Mark
+            // the attempt first so no failure below can issue a second EndCapture.
+            endCaptureCalled = true;
+            Check(CudaNativeBindings.cuStreamEndCapture(_stream, out graph),
+                "cuStreamEndCapture");
+            Check(CudaNativeBindings.cuGraphInstantiate(
+                out IntPtr graphExec, graph, 0), "cuGraphInstantiate");
+            return new DirectPtxGraph(this, graphExec);
+        }
+        catch
+        {
+            if (!endCaptureCalled &&
+                CudaNativeBindings.cuStreamEndCapture(_stream, out IntPtr aborted) ==
+                    CudaResult.Success &&
+                aborted != IntPtr.Zero)
+                CudaNativeBindings.cuGraphDestroy(aborted);
+            throw;
+        }
+        finally
+        {
+            if (graph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(graph);
+        }
+    }
+
+    internal void LaunchGraph(IntPtr graphExec)
+    {
+        using var _ = Enter();
+        Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+    }
+
+    internal void DestroyGraph(IntPtr graphExec)
+    {
+        if (graphExec == IntPtr.Zero || _context == IntPtr.Zero) return;
+        using var _ = Enter();
+        CudaNativeBindings.cuGraphExecDestroy(graphExec);
+    }
+
     internal float MeasureKernelMilliseconds(Action launch, int warmup, int iterations)
     {
         PtxCompat.ThrowIfNull(launch, nameof(launch));
@@ -309,12 +366,17 @@ internal sealed class DirectPtxRuntime : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
+        if (_ownsStream && _stream != IntPtr.Zero && _context != IntPtr.Zero)
+        {
+            using var _ = Enter();
+            CudaNativeBindings.cuStreamDestroy(_stream);
+        }
         if (_ownsContext && _context != IntPtr.Zero)
         {
             CuBlasNative.cuCtxDestroy(_context);
         }
         _context = IntPtr.Zero;
+        _disposed = true;
     }
 
     internal readonly struct ContextScope : IDisposable
@@ -367,6 +429,32 @@ internal sealed class DirectPtxRuntime : IDisposable
     }
 }
 
+internal sealed class DirectPtxGraph : IDisposable
+{
+    private readonly DirectPtxRuntime _runtime;
+    private IntPtr _graphExec;
+
+    internal DirectPtxGraph(DirectPtxRuntime runtime, IntPtr graphExec)
+    {
+        _runtime = runtime;
+        _graphExec = graphExec;
+    }
+
+    internal void Launch()
+    {
+        if (_graphExec == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(DirectPtxGraph));
+        _runtime.LaunchGraph(_graphExec);
+    }
+
+    public void Dispose()
+    {
+        if (_graphExec == IntPtr.Zero) return;
+        _runtime.DestroyGraph(_graphExec);
+        _graphExec = IntPtr.Zero;
+    }
+}
+
 internal sealed class DirectPtxBuffer : IDisposable
 {
     private readonly DirectPtxRuntime _runtime;
@@ -415,7 +503,10 @@ internal sealed class DirectPtxBuffer : IDisposable
 
 internal sealed class DirectPtxModule : IDisposable
 {
+    private const uint DefaultDynamicSharedMemoryLimitBytes = 48 * 1024;
     private readonly DirectPtxRuntime _runtime;
+    private readonly object _dynamicSharedMemoryLock = new();
+    private readonly Dictionary<IntPtr, int> _dynamicSharedMemoryLimits = new();
     private IntPtr _module;
     internal string JitInfoLog { get; }
     internal DirectPtxModuleImageKind ImageKind { get; }
@@ -472,6 +563,12 @@ internal sealed class DirectPtxModule : IDisposable
         uint sharedMemoryBytes,
         void** arguments)
     {
+        // CUDA requires a per-function opt-in above the portable 48 KiB default.
+        // Keep this at the common launch boundary so an emitter cannot expose a
+        // correct byte count while a caller accidentally omits the matching attribute.
+        if (sharedMemoryBytes > DefaultDynamicSharedMemoryLimitBytes)
+            SetMaxDynamicSharedMemory(function, checked((int)sharedMemoryBytes));
+
         using var _ = _runtime.Enter();
         DirectPtxRuntime.Check(
             CudaNativeBindings.cuLaunchKernel(
@@ -483,6 +580,24 @@ internal sealed class DirectPtxModule : IDisposable
                 (IntPtr)arguments,
                 IntPtr.Zero),
             "cuLaunchKernel(PTX)");
+    }
+
+    internal void SetMaxDynamicSharedMemory(IntPtr function, int bytes)
+    {
+        if (bytes < 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+        lock (_dynamicSharedMemoryLock)
+        {
+            if (_dynamicSharedMemoryLimits.TryGetValue(function, out int configured) &&
+                configured >= bytes)
+                return;
+
+            using var _ = _runtime.Enter();
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuFuncSetAttribute(
+                    function, CudaFunctionAttribute.MaxDynamicSharedSizeBytes, bytes),
+                "cuFuncSetAttribute(MaxDynamicSharedSizeBytes)");
+            _dynamicSharedMemoryLimits[function] = bytes;
+        }
     }
 
     internal int GetActiveBlocksPerMultiprocessor(
