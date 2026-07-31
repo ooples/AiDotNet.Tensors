@@ -663,13 +663,13 @@ public class DirectPtxSoftmaxTests
     }
 
     [SkippableFact]
-    public void Backend_DirectPtxSoftmax_PrewarmsDispatchesAndAudits()
+    public void Backend_Softmax_ThreeWayParityAndAudit()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previous = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
         DirectPtxFeatureGate.TestOverride = true;
-        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
         try
         {
             using var backend = new CudaBackend();
@@ -696,11 +696,21 @@ public class DirectPtxSoftmaxTests
 
             using var inBuf = backend.AllocateBuffer(xHost);
             using var outBuf = backend.AllocateBuffer(m * n);
+
             long before = backend.DirectPtxSoftmaxDispatchCount;
+            backend.Softmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.Equal(before, backend.DirectPtxSoftmaxDispatchCount);
+            float[] incumbent = backend.DownloadBuffer(outBuf);
+            AssertVectorClose(incumbent, expected, 2e-3f, "incumbent CUDA softmax");
+
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
             backend.Softmax(inBuf, outBuf, m, n);   // public route flows through the fail-closed guard
             backend.Synchronize();
             Assert.True(backend.DirectPtxSoftmaxDispatchCount > before, backend.DirectPtxLastError);
-            AssertVectorClose(backend.DownloadBuffer(outBuf), expected, 2e-3f, "backend softmax via direct-ptx");
+            float[] directPtx = backend.DownloadBuffer(outBuf);
+            AssertVectorClose(directPtx, expected, 2e-3f, "direct-PTX softmax");
+            AssertVectorClose(directPtx, incumbent, 2e-3f, "direct-PTX vs incumbent softmax");
         }
         finally
         {
@@ -710,13 +720,13 @@ public class DirectPtxSoftmaxTests
     }
 
     [SkippableFact]
-    public void Backend_DirectPtxSoftmaxFamily_RoutesDispatchThroughPublicMethods()
+    public void Backend_SoftmaxVariants_ThreeWayParity()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previous = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
         DirectPtxFeatureGate.TestOverride = true;
-        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
         try
         {
             using var backend = new CudaBackend();
@@ -728,12 +738,6 @@ public class DirectPtxSoftmaxTests
             using var outBuf = backend.AllocateBuffer(m * n);
 
             // Log-softmax: x - logsumexp.
-            long beforeLog = backend.DirectPtxLogSoftmaxDispatchCount;
-            backend.LogSoftmax(inBuf, outBuf, m, n);
-            backend.Synchronize();
-            Assert.True(backend.DirectPtxLogSoftmaxDispatchCount > beforeLog, backend.DirectPtxLastError);
-            Assert.True(backend.TryGetDirectPtxLogSoftmaxAudit(m, n, out DirectPtxKernelAudit logAudit));
-            Assert.Equal(0, logAudit.Function.LocalBytesPerThread);
             var logExpected = new float[m * n];
             for (int row = 0; row < m; row++)
             {
@@ -744,13 +748,24 @@ public class DirectPtxSoftmaxTests
                 double logZ = max + Math.Log(sum);
                 for (int col = 0; col < n; col++) logExpected[row * n + col] = (float)(xHost[row * n + col] - logZ);
             }
-            AssertVectorClose(backend.DownloadBuffer(outBuf), logExpected, 3e-3f, "backend log-softmax route");
+            long beforeLog = backend.DirectPtxLogSoftmaxDispatchCount;
+            backend.LogSoftmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.Equal(beforeLog, backend.DirectPtxLogSoftmaxDispatchCount);
+            float[] incumbentLog = backend.DownloadBuffer(outBuf);
+            AssertVectorClose(incumbentLog, logExpected, 3e-3f, "incumbent CUDA log-softmax");
+
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+            backend.LogSoftmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxLogSoftmaxDispatchCount > beforeLog, backend.DirectPtxLastError);
+            Assert.True(backend.TryGetDirectPtxLogSoftmaxAudit(m, n, out DirectPtxKernelAudit logAudit));
+            Assert.Equal(0, logAudit.Function.LocalBytesPerThread);
+            float[] directPtxLog = backend.DownloadBuffer(outBuf);
+            AssertVectorClose(directPtxLog, logExpected, 3e-3f, "direct-PTX log-softmax");
+            AssertVectorClose(directPtxLog, incumbentLog, 3e-3f, "direct-PTX vs incumbent log-softmax");
 
             // Taylor softmax: (1+x+x^2/2) normalized.
-            long beforeTaylor = backend.DirectPtxTaylorSoftmaxDispatchCount;
-            backend.TaylorSoftmax(inBuf, outBuf, m, n);
-            backend.Synchronize();
-            Assert.True(backend.DirectPtxTaylorSoftmaxDispatchCount > beforeTaylor, backend.DirectPtxLastError);
             var taylorExpected = new float[m * n];
             for (int row = 0; row < m; row++)
             {
@@ -758,17 +773,40 @@ public class DirectPtxSoftmaxTests
                 for (int col = 0; col < n; col++) { double v = xHost[row * n + col]; sum += 1.0 + v + 0.5 * v * v; }
                 for (int col = 0; col < n; col++) { double v = xHost[row * n + col]; taylorExpected[row * n + col] = (float)((1.0 + v + 0.5 * v * v) / sum); }
             }
-            AssertVectorClose(backend.DownloadBuffer(outBuf), taylorExpected, 2e-3f, "backend taylor-softmax route");
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
+            long beforeTaylor = backend.DirectPtxTaylorSoftmaxDispatchCount;
+            backend.TaylorSoftmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.Equal(beforeTaylor, backend.DirectPtxTaylorSoftmaxDispatchCount);
+            float[] incumbentTaylor = backend.DownloadBuffer(outBuf);
+            AssertVectorClose(incumbentTaylor, taylorExpected, 2e-3f, "incumbent CUDA Taylor softmax");
+
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+            backend.TaylorSoftmax(inBuf, outBuf, m, n);
+            backend.Synchronize();
+            Assert.True(backend.DirectPtxTaylorSoftmaxDispatchCount > beforeTaylor, backend.DirectPtxLastError);
+            float[] directPtxTaylor = backend.DownloadBuffer(outBuf);
+            AssertVectorClose(directPtxTaylor, taylorExpected, 2e-3f, "direct-PTX Taylor softmax");
+            AssertVectorClose(directPtxTaylor, incumbentTaylor, 2e-3f, "direct-PTX vs incumbent Taylor softmax");
 
             // Sparsemax dispatches and projects onto the simplex (rows sum to 1).
-            long beforeSparse = backend.DirectPtxSparsemaxDispatchCount;
             using var sparseBuf = backend.AllocateBuffer(m * n);
+            float[] sparseExpected = SparsemaxReference(xHost, m, n);
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
+            long beforeSparse = backend.DirectPtxSparsemaxDispatchCount;
+            backend.Sparsemax(inBuf, sparseBuf, m, n);
+            backend.Synchronize();
+            Assert.Equal(beforeSparse, backend.DirectPtxSparsemaxDispatchCount);
+            float[] incumbentSparse = backend.DownloadBuffer(sparseBuf);
+            AssertVectorClose(incumbentSparse, sparseExpected, 2e-3f, "incumbent CUDA sparsemax");
+
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
             backend.Sparsemax(inBuf, sparseBuf, m, n);
             backend.Synchronize();
             Assert.True(backend.DirectPtxSparsemaxDispatchCount > beforeSparse, backend.DirectPtxLastError);
             var sparse = backend.DownloadBuffer(sparseBuf);
-            float[] sparseExpected = SparsemaxReference(xHost, m, n);
-            AssertVectorClose(sparse, sparseExpected, 2e-3f, "backend sparsemax route");
+            AssertVectorClose(sparse, sparseExpected, 2e-3f, "direct-PTX sparsemax");
+            AssertVectorClose(sparse, incumbentSparse, 2e-3f, "direct-PTX vs incumbent sparsemax");
             for (int row = 0; row < m; row++)
             {
                 double rowSum = 0;
@@ -796,13 +834,13 @@ public class DirectPtxSoftmaxTests
     }
 
     [SkippableFact]
-    public void Backend_DirectPtxSoftmaxFamily_BackwardAndMaskingRoutesDispatch()
+    public void Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previous = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
         DirectPtxFeatureGate.TestOverride = true;
-        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
         try
         {
             using var backend = new CudaBackend();
@@ -836,8 +874,17 @@ public class DirectPtxSoftmaxTests
                 long before = backend.DirectPtxSoftmaxBackwardDispatchCount;
                 backend.SoftmaxBackward(dyBuf, sBuf, dxBuf, m, n);
                 backend.Synchronize();
+                Assert.Equal(before, backend.DirectPtxSoftmaxBackwardDispatchCount);
+                float[] incumbent = backend.DownloadBuffer(dxBuf);
+                AssertVectorClose(incumbent, sbExpected, 2e-3f, "incumbent CUDA softmax backward");
+
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+                backend.SoftmaxBackward(dyBuf, sBuf, dxBuf, m, n);
+                backend.Synchronize();
                 Assert.True(backend.DirectPtxSoftmaxBackwardDispatchCount > before, backend.DirectPtxLastError);
-                AssertVectorClose(backend.DownloadBuffer(dxBuf), sbExpected, 2e-3f, "backend softmax-backward route");
+                float[] directPtx = backend.DownloadBuffer(dxBuf);
+                AssertVectorClose(directPtx, sbExpected, 2e-3f, "direct-PTX softmax backward");
+                AssertVectorClose(directPtx, incumbent, 2e-3f, "direct-PTX vs incumbent softmax backward");
             }
 
             // ---- LogSumExpAxis: [M,N] -> [M] ----
@@ -854,12 +901,21 @@ public class DirectPtxSoftmaxTests
             using (var xBuf = backend.AllocateBuffer(xHost))
             using (var lseBuf = backend.AllocateBuffer(m))
             {
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
                 long before = backend.DirectPtxLogSumExpDispatchCount;
                 backend.LogSumExpAxis(xBuf, lseBuf, m, n);
                 backend.Synchronize();
+                Assert.Equal(before, backend.DirectPtxLogSumExpDispatchCount);
+                float[] incumbentLse = backend.DownloadBuffer(lseBuf);
+                AssertVectorClose(incumbentLse, lseExpected, 3e-3f, "incumbent CUDA logsumexp");
+
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+                backend.LogSumExpAxis(xBuf, lseBuf, m, n);
+                backend.Synchronize();
                 Assert.True(backend.DirectPtxLogSumExpDispatchCount > before, backend.DirectPtxLastError);
-                float[] actualLse = backend.DownloadBuffer(lseBuf);
-                AssertVectorClose(actualLse, lseExpected, 3e-3f, "backend logsumexp route");
+                float[] directPtxLse = backend.DownloadBuffer(lseBuf);
+                AssertVectorClose(directPtxLse, lseExpected, 3e-3f, "direct-PTX logsumexp");
+                AssertVectorClose(directPtxLse, incumbentLse, 3e-3f, "direct-PTX vs incumbent logsumexp");
 
                 // ---- LogSumExpBackward: dX = softmax(x) * dY[m] ----
                 float[] dLseHost = Values(random, m, 1.0f);
@@ -868,15 +924,26 @@ public class DirectPtxSoftmaxTests
                 {
                     for (int c = 0; c < n; c++)
                         lseBwdExpected[row * n + c] =
-                            (float)(Math.Exp(xHost[row * n + c] - actualLse[row]) * dLseHost[row]);
+                            (float)(Math.Exp(xHost[row * n + c] - lseExpected[row]) * dLseHost[row]);
                 }
                 using var dLseBuf = backend.AllocateBuffer(dLseHost);
+                using var oracleLseBuf = backend.AllocateBuffer(lseExpected);
                 using var dxBuf = backend.AllocateBuffer(size);
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
                 long beforeB = backend.DirectPtxLogSumExpBackwardDispatchCount;
-                backend.LogSumExpBackward(dLseBuf, xBuf, lseBuf, dxBuf, m, n);
+                backend.LogSumExpBackward(dLseBuf, xBuf, oracleLseBuf, dxBuf, m, n);
+                backend.Synchronize();
+                Assert.Equal(beforeB, backend.DirectPtxLogSumExpBackwardDispatchCount);
+                float[] incumbentBwd = backend.DownloadBuffer(dxBuf);
+                AssertVectorClose(incumbentBwd, lseBwdExpected, 2e-3f, "incumbent CUDA logsumexp backward");
+
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+                backend.LogSumExpBackward(dLseBuf, xBuf, oracleLseBuf, dxBuf, m, n);
                 backend.Synchronize();
                 Assert.True(backend.DirectPtxLogSumExpBackwardDispatchCount > beforeB, backend.DirectPtxLastError);
-                AssertVectorClose(backend.DownloadBuffer(dxBuf), lseBwdExpected, 2e-3f, "backend logsumexp-backward route");
+                float[] directPtxBwd = backend.DownloadBuffer(dxBuf);
+                AssertVectorClose(directPtxBwd, lseBwdExpected, 2e-3f, "direct-PTX logsumexp backward");
+                AssertVectorClose(directPtxBwd, incumbentBwd, 2e-3f, "direct-PTX vs incumbent logsumexp backward");
 
                 // The API contract consumes the supplied lse; prove the PTX route does too.
                 var corruptedLseHost = new float[m];
@@ -899,7 +966,7 @@ public class DirectPtxSoftmaxTests
                     backend.DirectPtxLastError);
                 AssertVectorClose(
                     backend.DownloadBuffer(corruptedDxBuf), corruptedExpected, 2e-3f,
-                    "backend logsumexp-backward supplied-lse contract");
+                    "direct-PTX logsumexp-backward supplied-lse contract");
             }
 
             // ---- MaskedFill / MaskedFillBackward (flat size) ----
@@ -912,27 +979,57 @@ public class DirectPtxSoftmaxTests
             using (var outFill = backend.AllocateBuffer(size))
             using (var outBwd = backend.AllocateBuffer(size))
             {
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
                 long beforeF = backend.DirectPtxMaskedFillDispatchCount;
-                backend.MaskedFillKernel(inBuf, maskBuf, outFill, fill, size);
                 long beforeBwd = backend.DirectPtxMaskedFillBackwardDispatchCount;
+                backend.MaskedFillKernel(inBuf, maskBuf, outFill, fill, size);
+                backend.MaskedFillBackward(inBuf, maskBuf, outBwd, size);
+                backend.Synchronize();
+                Assert.Equal(beforeF, backend.DirectPtxMaskedFillDispatchCount);
+                Assert.Equal(beforeBwd, backend.DirectPtxMaskedFillBackwardDispatchCount);
+                float[] incumbentFill = backend.DownloadBuffer(outFill);
+                float[] incumbentBwd = backend.DownloadBuffer(outBwd);
+                AssertMaskedFillResults(inFlat, maskFlat, incumbentFill, incumbentBwd, fill,
+                    "incumbent CUDA");
+
+                DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+                backend.MaskedFillKernel(inBuf, maskBuf, outFill, fill, size);
                 backend.MaskedFillBackward(inBuf, maskBuf, outBwd, size);
                 backend.Synchronize();
                 Assert.True(backend.DirectPtxMaskedFillDispatchCount > beforeF, backend.DirectPtxLastError);
                 Assert.True(backend.DirectPtxMaskedFillBackwardDispatchCount > beforeBwd, backend.DirectPtxLastError);
-                var gotFill = backend.DownloadBuffer(outFill);
-                var gotBwd = backend.DownloadBuffer(outBwd);
-                for (int i = 0; i < size; i++)
-                {
-                    bool masked = maskFlat[i] != 0f;
-                    Assert.Equal(masked ? fill : inFlat[i], gotFill[i]);
-                    Assert.Equal(masked ? 0f : inFlat[i], gotBwd[i]);
-                }
+                float[] directPtxFill = backend.DownloadBuffer(outFill);
+                float[] directPtxBwd = backend.DownloadBuffer(outBwd);
+                AssertMaskedFillResults(inFlat, maskFlat, directPtxFill, directPtxBwd, fill,
+                    "direct-PTX");
+                AssertVectorClose(directPtxFill, incumbentFill, 0f,
+                    "direct-PTX vs incumbent masked fill");
+                AssertVectorClose(directPtxBwd, incumbentBwd, 0f,
+                    "direct-PTX vs incumbent masked-fill backward");
             }
         }
         finally
         {
             DirectPtxFeatureGate.TestOverride = previous;
             DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
+    private static void AssertMaskedFillResults(
+        float[] input, float[] mask, float[] fillOutput, float[] backwardOutput,
+        float fill, string implementation)
+    {
+        Assert.Equal(input.Length, fillOutput.Length);
+        Assert.Equal(input.Length, backwardOutput.Length);
+        for (int i = 0; i < input.Length; i++)
+        {
+            bool masked = mask[i] != 0f;
+            float expectedFill = masked ? fill : input[i];
+            float expectedBackward = masked ? 0f : input[i];
+            Assert.True(fillOutput[i] == expectedFill,
+                $"{implementation} masked-fill index {i}: expected {expectedFill}, got {fillOutput[i]}");
+            Assert.True(backwardOutput[i] == expectedBackward,
+                $"{implementation} masked-fill backward index {i}: expected {expectedBackward}, got {backwardOutput[i]}");
         }
     }
 
