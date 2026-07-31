@@ -16,6 +16,58 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>Tests for the issue #854 specialized-scientific direct-PTX kernels.</summary>
 public class DirectPtxScientificTests
 {
+    private sealed class TrackedResource : IDisposable
+    {
+        internal bool ThrowOnDispose { get; set; }
+        internal bool IsDisposed { get; private set; }
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
+    }
+
+    [Fact]
+    public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
+    {
+        var resource = new TrackedResource();
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackedResource, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_CleanupFailureDoesNotMaskPrimaryFailure()
+    {
+        var resource = new TrackedResource { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackedResource, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_TransfersSuccessfulResourceOwnership()
+    {
+        var resource = new TrackedResource();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
+    }
+
     [Fact]
     public void ScientificCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
