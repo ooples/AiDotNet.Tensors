@@ -12,6 +12,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using BM = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
@@ -1070,6 +1071,55 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Assert.Equal(cpu.Length, gpu.Length);
         for (int k = 0; k < cpu.Length; k++)
             AssertMatch(gpu[k], cpu[k], $"Meshgrid[{indexing}][{k}]");
+    }
+
+    [SkippableFact]
+    public void TensorMeshgrid_ActiveTapeSkipsDirectPtxRoute()
+    {
+        if (!EnsureGpuReady()) return;
+        var backend = ((IEngine)_gpu).DirectGpu?.Backend as CudaBackend;
+        Skip.If(backend is null, "Requires the CUDA backend.");
+
+        bool? oldGate = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
+        try
+        {
+            const int size = 256;
+            var output0 = new DirectPtxVisionSpec(
+                DirectPtxVisionOperation.Meshgrid2D, size, size, Flags: 0);
+            var output1 = new DirectPtxVisionSpec(
+                DirectPtxVisionOperation.Meshgrid2D, size, size, Flags: 1);
+            Skip.IfNot(
+                backend.PrewarmDirectPtxVisionKernel(output0) &&
+                backend.PrewarmDirectPtxVisionKernel(output1),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+
+            var a = Rand(209, size);
+            var b = Rand(210, size);
+            Tensor<float>[] direct = _gpu.TensorMeshgrid([a, b], "ij");
+            long afterDirect = backend.DirectPtxVisionDispatchCount(
+                DirectPtxVisionOperation.Meshgrid2D);
+            Assert.True(afterDirect >= 2, "The control call did not exercise paired Direct PTX dispatch.");
+
+            using var tape = new GradientTape<float>();
+            tape.BindEngineIfUnset(_gpu);
+            Tensor<float>[] recorded = _gpu.TensorMeshgrid([a, b], "ij");
+            Assert.Equal(afterDirect, backend.DirectPtxVisionDispatchCount(
+                DirectPtxVisionOperation.Meshgrid2D));
+
+            Tensor<float>[] expected = _cpu.TensorMeshgrid([a, b], "ij");
+            for (int i = 0; i < recorded.Length; i++)
+            {
+                AssertMatch(recorded[i], expected[i], $"Meshgrid[tape][{i}]");
+                direct[i].Dispose();
+                recorded[i].Dispose();
+                expected[i].Dispose();
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionExperimentOverride = oldGate;
+        }
     }
 
     [SkippableTheory]

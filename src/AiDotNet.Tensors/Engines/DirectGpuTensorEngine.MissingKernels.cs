@@ -3758,7 +3758,8 @@ public partial class DirectGpuTensorEngine
             bool xy = indexing == "xy" && d >= 2;
             if (xy) { int tmp = outShape[0]; outShape[0] = outShape[1]; outShape[1] = tmp; }
 
-            if (d == 2 && backend is IDirectPtxVisionBackend directPtx &&
+            if (d == 2 && !IsTapeActive<T>() &&
+                backend is IDirectPtxVisionBackend directPtx &&
                 directPtx.CanDirectPtxMeshgrid2D(
                     tensors[0]._shape[0], tensors[1]._shape[0], xy))
             {
