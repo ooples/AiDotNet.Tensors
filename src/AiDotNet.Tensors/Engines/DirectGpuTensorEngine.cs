@@ -11671,8 +11671,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
-            int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
-            if (center) outputLength -= nFft;
+            // An explicitly requested length is honoured VERBATIM; the centre-padding trim applies only
+            // to the length this method INFERS. Previously the `-= nFft` ran unconditionally, so
+            // ISTFT(..., center: true, length: 514) with nFft=512 returned TWO samples — the same
+            // defect fixed in CpuEngine.ISTFT earlier in this branch, still live here. Measured by
+            // TimeStretchStageDiffTests.Stage3_Istft_CpuMatchesGpu: cpu=514, gpu=2.
+            int outputLength;
+            if (length.HasValue)
+            {
+                outputLength = length.Value;
+            }
+            else
+            {
+                outputLength = (numFrames - 1) * hopLength + nFft;
+                if (center) outputLength -= nFft;
+            }
             int totalOutput = batch * outputLength;
 
             using var magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
