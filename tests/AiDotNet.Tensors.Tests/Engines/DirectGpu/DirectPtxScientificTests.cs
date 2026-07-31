@@ -352,6 +352,40 @@ public class DirectPtxScientificTests
         }
     }
 
+    [Fact]
+    public void ScientificRoutes_HaveNativeEntryPointsOnAllSixBackends()
+    {
+        Type[] backends =
+        [
+            typeof(CudaBackend), typeof(HipBackend), typeof(MetalBackend),
+            typeof(OpenClBackend), typeof(VulkanBackend), typeof(WebGpuBackend)
+        ];
+        Type buffer = typeof(IGpuBuffer);
+        Type integer = typeof(int);
+        (string Name, Type[] Parameters)[] operations =
+        [
+            ("CapsulePredictions", [buffer, buffer, buffer, integer, integer, integer, integer, integer]),
+            ("CapsuleTransform", [buffer, buffer, buffer, integer, integer, integer, integer, integer]),
+            ("CapsuleWeightedSum", [buffer, buffer, buffer, integer, integer, integer, integer]),
+            ("CapsuleAgreement", [buffer, buffer, buffer, integer, integer, integer, integer]),
+            ("RbfForward", [buffer, buffer, buffer, buffer, integer, integer, integer]),
+            ("QuantumMeasurement", [buffer, buffer, buffer, integer, integer]),
+            ("ComplexMatVec", [buffer, buffer, buffer, buffer, buffer, buffer, integer, integer]),
+            ("CosineSimilarity", [buffer, buffer, buffer, integer, integer]),
+            ("PairwiseDistance", [buffer, buffer, buffer, integer, integer, integer]),
+            ("PairwiseDistanceSquared", [buffer, buffer, buffer, integer, integer, integer])
+        ];
+
+        foreach (Type backend in backends)
+        foreach ((string operation, Type[] parameterTypes) in operations)
+        {
+            var method = backend.GetMethod(operation, parameterTypes);
+            Assert.True(method is not null,
+                $"{backend.Name} must provide a native {operation} route.");
+            Assert.Equal(backend, method!.DeclaringType);
+        }
+    }
+
     [SkippableFact]
     public void DriverOnlyOctonionAdd_MatchesOracle()
     {

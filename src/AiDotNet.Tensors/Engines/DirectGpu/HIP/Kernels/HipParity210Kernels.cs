@@ -28,6 +28,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
             "parity210_i0","parity210_i1","parity210_i0e","parity210_i1e",
             "parity210_is_finite","parity210_is_nan","parity210_is_inf","parity210_nan_to_num",
             "parity210_cosine_similarity_last","parity210_cdist_l2",
+            "cosine_similarity","pairwise_distance_squared",
             "parity210_clamp_min_max",
             // Missing-kernels audit (audio/FFT/logical/detection/geometry/movement/indexing/special)
             "parity210_reflect_pad_1d","parity210_stft_mag_phase","parity210_phase_vocoder",
@@ -754,6 +755,37 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_cdist_l2(
         acc += v * v;
     }
     out[idx] = sqrtf(acc);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void cosine_similarity(
+    const float* a, const float* b, float* out, int batch_size, int dim)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= batch_size) return;
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    int base_ = row * dim;
+    for (int k = 0; k < dim; ++k) {
+        float av = a[base_ + k], bv = b[base_ + k];
+        dot += av * bv;
+        na += av * av;
+        nb += bv * bv;
+    }
+    out[row] = dot / (sqrtf(na) * sqrtf(nb) + 1.0e-8f);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void pairwise_distance_squared(
+    const float* a, const float* b, float* out, int m, int n, int dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * n) return;
+    int row = idx / n;
+    int col = idx % n;
+    float acc = 0.0f;
+    for (int k = 0; k < dim; ++k) {
+        float diff = a[row * dim + k] - b[col * dim + k];
+        acc += diff * diff;
+    }
+    out[idx] = acc;
 }
 
 // ==========================================================================
