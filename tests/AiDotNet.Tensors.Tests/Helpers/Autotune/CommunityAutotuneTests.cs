@@ -223,4 +223,51 @@ public sealed class CommunityAutotuneTests : IDisposable
         Assert.Equal(fetchesAfterFirst, exchange.FetchCount);      // no extra fetch
         Assert.Equal(publishedAfterFirst, exchange.Published.Count); // no extra publish
     }
+
+    [Fact]
+    public void ProfileConstructionFailure_DoesNotEscapeMeasuredResolution()
+    {
+        var exchange = new InMemoryGpuTuningExchange();
+        var parameters = new ThrowOnSecondEnumerationDictionary("Tile", "16");
+        var candidates = new[]
+        {
+            new AutotuneCandidate("local-fast", parameters),
+            new AutotuneCandidate("local-slow")
+        };
+
+        AutotuneResolution resolution = CommunityAutotune.Resolve(
+            exchange, "profile-fault", "profile-fault-kernel", Card,
+            new ShapeProfile(17, 19), candidates,
+            candidate => candidate.Variant == "local-fast" ? 900.0 : 100.0,
+            autotuneEnabled: true);
+
+        Assert.True(resolution.Measured);
+        Assert.Equal("local-fast", resolution.Variant);
+        Assert.Empty(exchange.Published);
+    }
+
+    private sealed class ThrowOnSecondEnumerationDictionary : IReadOnlyDictionary<string, string>
+    {
+        private readonly Dictionary<string, string> _inner;
+        private int _enumerations;
+
+        internal ThrowOnSecondEnumerationDictionary(string key, string value) =>
+            _inner = new Dictionary<string, string>(StringComparer.Ordinal) { [key] = value };
+
+        public int Count => _inner.Count;
+        public IEnumerable<string> Keys => _inner.Keys;
+        public IEnumerable<string> Values => _inner.Values;
+        public string this[string key] => _inner[key];
+        public bool ContainsKey(string key) => _inner.ContainsKey(key);
+        public bool TryGetValue(string key, out string value) => _inner.TryGetValue(key, out value!);
+
+        public IEnumerator<KeyValuePair<string, string>> GetEnumerator()
+        {
+            if (++_enumerations > 1)
+                throw new InvalidOperationException("profile parameter enumeration failed");
+            return _inner.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
 }

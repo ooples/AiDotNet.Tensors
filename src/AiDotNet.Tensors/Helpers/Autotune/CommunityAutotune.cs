@@ -68,9 +68,13 @@ public static class CommunityAutotune
         // corroborates a community config that just won, or contributes a new one.
         if (exchange.IsEnabled && resolution.Measured)
         {
-            GpuTuningProfile profile = GpuTuningProfile.FromWinner(
-                fingerprint, category, shareableKernelName, shape, resolution, clientHash, aidotnetVersion);
-            try { exchange.Publish(profile); }
+            try
+            {
+                GpuTuningProfile profile = GpuTuningProfile.FromWinner(
+                    fingerprint, category, shareableKernelName, shape, resolution,
+                    clientHash, aidotnetVersion);
+                exchange.Publish(profile);
+            }
             catch { /* telemetry is advisory — never break dispatch */ }
         }
 
