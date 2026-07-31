@@ -1,7 +1,12 @@
 #if NET5_0_OR_GREATER
+using System;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu.Telemetry;
 using AiDotNet.Tensors.Helpers.Autotune;
 using Xunit;
@@ -96,6 +101,47 @@ public sealed class SupabaseGpuTuningExchangeTests
     }
 
     [Fact]
+    public async Task InjectedHttpClient_IsNotMutatedOrDisposed_AndCredentialsAreRequestScoped()
+    {
+        string? previous = Environment.GetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar);
+        Environment.SetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar, "true");
+        var handler = new RecordingHandler();
+        using var client = new HttpClient(handler);
+        try
+        {
+            using (var exchange = new SupabaseGpuTuningExchange(
+                       enabled: true,
+                       url: "https://example.supabase.co",
+                       key: "sb_publishable_x",
+                       httpClient: client))
+            {
+                Assert.False(client.DefaultRequestHeaders.Contains("apikey"));
+                Assert.Null(client.DefaultRequestHeaders.Authorization);
+
+                Assert.Empty(exchange.Fetch("m", "c", "k", "s"));
+                exchange.Publish(new GpuTuningProfile { Variant = "tile-16" });
+            }
+
+            Assert.False(handler.IsDisposed);
+            Assert.Equal(2, handler.Requests.Count);
+            foreach (RecordedRequest request in handler.Requests)
+            {
+                Assert.Equal("sb_publishable_x", request.ApiKey);
+                Assert.Equal("Bearer sb_publishable_x", request.Authorization);
+            }
+
+            using HttpResponseMessage _ = await client.GetAsync("https://unrelated.example/test");
+            RecordedRequest unrelated = handler.Requests[2];
+            Assert.Null(unrelated.ApiKey);
+            Assert.Null(unrelated.Authorization);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar, previous);
+        }
+    }
+
+    [Fact]
     public void Disabled_Fetch_ReturnsEmpty_AndPublish_DoesNotThrow()
     {
         // No AIDOTNET_TELEMETRY opt-in in the test env -> IsEnabled must be false.
@@ -105,5 +151,34 @@ public sealed class SupabaseGpuTuningExchangeTests
         Assert.Empty(exchange.Fetch("m", "c", "k", "s"));
         exchange.Publish(new GpuTuningProfile { Variant = "tile-16" }); // must not throw / must not hit network
     }
+
+    private sealed class RecordingHandler : HttpMessageHandler
+    {
+        internal List<RecordedRequest> Requests { get; } = new();
+        internal bool IsDisposed { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            string? apiKey = request.Headers.TryGetValues("apikey", out var values)
+                ? string.Join(",", values)
+                : null;
+            Requests.Add(new RecordedRequest(
+                apiKey,
+                request.Headers.Authorization?.ToString()));
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("[]")
+            });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) IsDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed record RecordedRequest(string? ApiKey, string? Authorization);
 }
 #endif

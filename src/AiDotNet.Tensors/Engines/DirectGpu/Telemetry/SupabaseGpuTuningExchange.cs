@@ -45,6 +45,7 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
     private readonly string _key;
     private readonly string? _clientHash;
     private readonly string? _version;
+    private readonly bool _ownsHttp;
     private bool _disposed;
 
     public bool IsEnabled { get; }
@@ -71,12 +72,8 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
 
         _clientHash = clientHash;
         _version = typeof(SupabaseGpuTuningExchange).Assembly.GetName().Version?.ToString();
+        _ownsHttp = httpClient is null;
         _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
-        if (IsEnabled)
-        {
-            _http.DefaultRequestHeaders.TryAddWithoutValidation("apikey", _key);
-            _http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer " + _key);
-        }
     }
 
     public IReadOnlyList<GpuTuningProfile> Fetch(
@@ -86,7 +83,9 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
         try
         {
             string requestUri = BuildFetchUri(modelKey, category, kernelName, shapeKey, limit: 5);
-            using HttpResponseMessage response = _http.GetAsync(requestUri).GetAwaiter().GetResult();
+            using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+            AddCredentials(request);
+            using HttpResponseMessage response = _http.SendAsync(request).GetAwaiter().GetResult();
             if (!response.IsSuccessStatusCode) return Array.Empty<GpuTuningProfile>();
             string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
             Row[]? rows = JsonSerializer.Deserialize<Row[]>(body, JsonOptions);
@@ -114,6 +113,7 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
             using var request = new HttpRequestMessage(
                 HttpMethod.Post, _url + "/rest/v1/" + Table) { Content = content };
             request.Headers.TryAddWithoutValidation("Prefer", "return=minimal");
+            AddCredentials(request);
             using HttpResponseMessage _ = _http.SendAsync(request).GetAwaiter().GetResult();
         }
         catch
@@ -151,11 +151,17 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
     private static string TrimTrailingSlash(string url) =>
         string.IsNullOrEmpty(url) ? url : url.TrimEnd('/');
 
+    private void AddCredentials(HttpRequestMessage request)
+    {
+        request.Headers.TryAddWithoutValidation("apikey", _key);
+        request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _key);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        _http.Dispose();
+        if (_ownsHttp) _http.Dispose();
     }
 
     /// <summary>PostgREST row shape for <c>gpu_tuning_profiles</c> (snake_case columns).</summary>
