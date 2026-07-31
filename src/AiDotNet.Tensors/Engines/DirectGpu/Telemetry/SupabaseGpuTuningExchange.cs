@@ -32,6 +32,7 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
     public const string UrlEnvVar = "AIDOTNET_TELEMETRY_URL";
     public const string KeyEnvVar = "AIDOTNET_TELEMETRY_KEY";
     public const string OptInEnvVar = "AIDOTNET_TELEMETRY";
+    internal const long MaxResponseBytes = 256 * 1024;
     private const string Table = "gpu_tuning_profiles";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -73,8 +74,14 @@ public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
         _clientHash = clientHash;
         _version = typeof(SupabaseGpuTuningExchange).Assembly.GetName().Version?.ToString();
         _ownsHttp = httpClient is null;
-        _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        _http = httpClient ?? new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(8),
+            MaxResponseContentBufferSize = MaxResponseBytes
+        };
     }
+
+    internal long ResponseContentBufferLimit => _http.MaxResponseContentBufferSize;
 
     public IReadOnlyList<GpuTuningProfile> Fetch(
         string modelKey, string category, string kernelName, string shapeKey)

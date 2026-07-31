@@ -101,6 +101,16 @@ public sealed class SupabaseGpuTuningExchangeTests
     }
 
     [Fact]
+    public void OwnedHttpClient_BoundsBufferedCommunityResponse()
+    {
+        using var exchange = new SupabaseGpuTuningExchange(enabled: false);
+
+        Assert.Equal(
+            SupabaseGpuTuningExchange.MaxResponseBytes,
+            exchange.ResponseContentBufferLimit);
+    }
+
+    [Fact]
     public async Task InjectedHttpClient_IsNotMutatedOrDisposed_AndCredentialsAreRequestScoped()
     {
         string? previous = Environment.GetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar);
