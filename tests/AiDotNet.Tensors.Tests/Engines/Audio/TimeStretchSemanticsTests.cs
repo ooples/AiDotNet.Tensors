@@ -49,13 +49,21 @@ public class TimeStretchSemanticsTests
     }
 
     /// <summary>Dominant frequency (Hz) via a plain magnitude-DFT peak over the positive bins.</summary>
-    private static double DominantHz(Tensor<double> signal, int sampleRate)
+    /// <param name="maxHz">
+    /// Upper edge of the searched band. The tests only need the PEAK LOCATION of a known tone, and a
+    /// naive DFT over every positive bin is O(n^2): at n = 4096 that is ~8.4M inner iterations with a
+    /// Cos and a Sin each, run four times across this file. Bounding the band keeps the same answer for
+    /// any tone below it at a fraction of the cost.
+    /// </param>
+    private static double DominantHz(Tensor<double> signal, int sampleRate, double maxHz = 2000.0)
     {
         int n = signal.Length;
         double best = 0;
         int bestK = 0;
+        // Highest bin whose centre frequency is still within the band, clamped to Nyquist.
+        int kMax = Math.Min(n / 2, (int)Math.Ceiling(maxHz * n / sampleRate) + 1);
         // Skip DC and the immediate neighbours so a residual offset cannot win.
-        for (int k = 2; k < n / 2; k++)
+        for (int k = 2; k < kMax; k++)
         {
             double re = 0, im = 0;
             for (int i = 0; i < n; i++)

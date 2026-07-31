@@ -606,11 +606,18 @@ public partial class CpuEngine
         // produced no gradient for either operand while the narrow overload produced both.
         //
         // The sampling parameters are forwarded so the backward can use the mode-aware
-        // GridSampleBackwardInput/Grid entry points, which implement Bilinear + Zeros +
-        // alignCorners=false and raise NotSupportedException for anything else. They are deliberately
-        // NOT used unconditionally: Nearest is piecewise-constant, so its grid gradient is 0 rather
-        // than bilinear weights, and Border/Reflection padding changes which source pixels a boundary
-        // sample reads. A loud failure beats a plausible wrong number.
+        // GridSampleBackwardInput/Grid entry points, which implement Bilinear + Zeros for BOTH
+        // align_corners conventions and raise NotSupportedException for any other mode or padding.
+        // They are deliberately NOT used unconditionally: Nearest is piecewise-constant, so its grid
+        // gradient is 0 rather than bilinear weights, and Border/Reflection padding changes which
+        // source pixels a boundary sample reads. A loud failure beats a plausible wrong number.
+        //
+        // The throw is deliberately DEFERRED to the backward rather than raised here when a tape is
+        // active. Recording is unconditional because a tape being open does not mean this particular
+        // output will be differentiated — a caller may sample with Nearest for a non-differentiated
+        // branch inside a taped region, and failing at the forward would break that valid use. The
+        // exception instead names the op, the mode, the padding and the fact that the FORWARD
+        // configuration is the cause, so it is self-locating without costing the working case.
         DifferentiableOps.RecordBinary("GridSample", output, input, grid,
             BackwardFunctions<T>.GridSampleModeBackward,
             savedState: new object[] { (int)mode, (int)padding, alignCorners });
@@ -669,8 +676,11 @@ public partial class CpuEngine
         // GPU kernels — which hardcode the align-TRUE mapping — with no CPU counterpart to check against.
         if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
             throw new NotSupportedException(
-                $"GridSample backward is currently supported only for " +
-                $"Bilinear + Zeros. Requested {mode}/{padding}.");
+                $"GridSample backward is currently supported only for Bilinear + Zeros, but a GridSample " +
+                $"FORWARD in this tape was configured with {mode}/{padding}. The gradient is refused " +
+                $"rather than approximated: Nearest is piecewise-constant (grid gradient 0, not bilinear " +
+                $"weights) and Border/Reflection change which source pixels a boundary sample reads. " +
+                $"Change that forward call's mode/padding, or wrap it so it is not differentiated.");
         if (!alignCorners) return GridSampleBackwardInput(gradOutput, grid, inputShape);
         // No second implementation needed: the conventions differ by a pure per-axis rescale of the grid.
         //     align=false: src = (g+1)*S/2 - 0.5        align=true: src = (g+1)*(S-1)/2
@@ -710,8 +720,9 @@ public partial class CpuEngine
     {
         if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
             throw new NotSupportedException(
-                $"GridSample backward is currently supported only for " +
-                $"Bilinear + Zeros. Requested {mode}/{padding}.");
+                $"GridSample backward is currently supported only for Bilinear + Zeros, but a GridSample " +
+                $"FORWARD in this tape was configured with {mode}/{padding}. See " +
+                $"GridSampleBackwardInput for why the gradient is refused rather than approximated.");
         if (!alignCorners) return GridSampleBackwardGrid(gradOutput, input, grid);
         // Same rescale as GridSampleBackwardInput, plus the chain rule: the inner call differentiates
         // with respect to g_false, and dg_false/dg_true is that same (S-1)/S factor.
