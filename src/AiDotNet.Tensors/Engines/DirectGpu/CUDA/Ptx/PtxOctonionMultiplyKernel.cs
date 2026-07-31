@@ -13,6 +13,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 ///
 /// 256 threads/block, grid = count/256 (positive multiple of 256). Buffers are contiguous of
 /// length <c>8·count</c> floats.
+///
+/// This is a CUDA specialization of an existing cross-backend operation, not a CUDA-only API.
+/// Native peer kernels are implemented by <c>HipBackend.OctonionMultiply</c>,
+/// <c>MetalBackend.OctonionMultiply</c>, <c>OpenClBackend.OctonionMultiply</c>,
+/// <c>VulkanBackend.OctonionMultiply</c>, and <c>WebGpuBackend.OctonionMultiply</c>.
 /// </summary>
 internal sealed class PtxOctonionMultiplyKernel : IDisposable
 {

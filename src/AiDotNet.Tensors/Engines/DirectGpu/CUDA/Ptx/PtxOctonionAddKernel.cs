@@ -9,6 +9,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// octonions (issue #854). One thread owns one octonion and adds its eight lanes — no shared
 /// memory, no reduction, exact. 256 threads/block, grid = count/256 (positive multiple of 256).
 /// Buffers are contiguous of length <c>8·count</c> floats.
+///
+/// This is a CUDA specialization of an existing cross-backend operation, not a CUDA-only API.
+/// Native peer routes are implemented by <c>HipBackend.OctonionAdd</c>,
+/// <c>MetalBackend.OctonionAdd</c>, <c>OpenClBackend.OctonionAdd</c>,
+/// <c>VulkanBackend.OctonionAdd</c>, and <c>WebGpuBackend.OctonionAdd</c>.
 /// </summary>
 internal sealed class PtxOctonionAddKernel : IDisposable
 {

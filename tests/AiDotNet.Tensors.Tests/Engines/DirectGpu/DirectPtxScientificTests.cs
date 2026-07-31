@@ -3,6 +3,11 @@ using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 
@@ -263,6 +268,28 @@ public class DirectPtxScientificTests
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxOctonionAddKernel.IsSupportedCount(16384));
         Assert.False(PtxOctonionAddKernel.IsPromotedCount(16384));
+    }
+
+    [Fact]
+    public void OctonionKernels_HaveNativeEntryPointsOnAllSixBackends()
+    {
+        Type[] backends =
+        [
+            typeof(CudaBackend), typeof(HipBackend), typeof(MetalBackend),
+            typeof(OpenClBackend), typeof(VulkanBackend), typeof(WebGpuBackend)
+        ];
+        Type[] parameterTypes =
+        [
+            typeof(IGpuBuffer), typeof(IGpuBuffer), typeof(IGpuBuffer), typeof(int)
+        ];
+
+        foreach (Type backend in backends)
+        foreach (string operation in new[] { "OctonionAdd", "OctonionMultiply" })
+        {
+            var method = backend.GetMethod(operation, parameterTypes);
+            Assert.NotNull(method);
+            Assert.Equal(backend, method!.DeclaringType);
+        }
     }
 
     [SkippableFact]
