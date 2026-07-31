@@ -140,11 +140,11 @@ internal sealed class PtxOctonionAddKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 12,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 26,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "out[i][k] = a[i][k] + b[i][k] for k in 0..7",

@@ -180,11 +180,11 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 20,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 40,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "out = softmax_stable(normalize_L2(x)); norm eps 1e-12, sum eps 1e-10",

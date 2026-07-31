@@ -154,11 +154,11 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
                 new("probabilities", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.ReadWrite, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 20,
-                MaxStaticSharedBytes: BlockThreads * sizeof(float),
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 22,
+                maxStaticSharedBytes: BlockThreads * sizeof(float),
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "probabilities[b,i] /= max(sum_i probabilities[b,i], 1e-10)",

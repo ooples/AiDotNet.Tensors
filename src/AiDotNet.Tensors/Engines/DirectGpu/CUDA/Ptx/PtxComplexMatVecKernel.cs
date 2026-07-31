@@ -181,11 +181,11 @@ internal sealed class PtxComplexMatVecKernel : IDisposable
                 new("outImag", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     vecExtent, vecExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 28,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 40,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "outReal[b,row]+j outImag[b,row] = sum_col (mat[row,col] * vec[b,col]) over complex",

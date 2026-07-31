@@ -172,11 +172,11 @@ internal sealed class PtxMeasurementForwardKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     outExtent, outExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 20,
-                MaxStaticSharedBytes: BlockThreads * sizeof(float),
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 22,
+                maxStaticSharedBytes: BlockThreads * sizeof(float),
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output[b,i] = |input[b,i]|^2 / max(sum_i |input[b,i]|^2, 1e-10)",

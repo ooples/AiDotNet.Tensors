@@ -119,11 +119,11 @@ internal sealed class PtxComplexMagnitudeKernel : IDisposable
                 new("magnitude", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 12,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 14,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "magnitude[i] = sqrt(real[i]^2 + imag[i]^2)",

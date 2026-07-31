@@ -159,11 +159,11 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
                 new("agreement", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     agreeExtent, agreeExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 26,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "agreement[b,i,c] = sum_d predictions[b,i,c,d] * output[b,c,d]",

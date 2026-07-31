@@ -151,11 +151,11 @@ internal sealed class PtxAnnPqAdcScanKernel : IDisposable
                 new("distances", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     distExtent, distExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 20,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 28,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "distances[q,i] = sum_s tables[q, s, codes[i,s]]",
