@@ -152,12 +152,20 @@ public sealed class SupabaseGpuTuningExchangeTests
     [Fact]
     public void Disabled_Fetch_ReturnsEmpty_AndPublish_DoesNotThrow()
     {
-        // No AIDOTNET_TELEMETRY opt-in in the test env -> IsEnabled must be false.
-        using var exchange = new SupabaseGpuTuningExchange(
-            enabled: true, url: "https://example.supabase.co", key: "sb_publishable_x");
-        Assert.False(exchange.IsEnabled);
-        Assert.Empty(exchange.Fetch("m", "c", "k", "s"));
-        exchange.Publish(new GpuTuningProfile { Variant = "tile-16" }); // must not throw / must not hit network
+        string? previous = Environment.GetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar);
+        Environment.SetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar, "false");
+        try
+        {
+            using var exchange = new SupabaseGpuTuningExchange(
+                enabled: true, url: "https://example.supabase.co", key: "sb_publishable_x");
+            Assert.False(exchange.IsEnabled);
+            Assert.Empty(exchange.Fetch("m", "c", "k", "s"));
+            exchange.Publish(new GpuTuningProfile { Variant = "tile-16" });
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SupabaseGpuTuningExchange.OptInEnvVar, previous);
+        }
     }
 
     private sealed class RecordingHandler : HttpMessageHandler
