@@ -49,9 +49,9 @@ public sealed class ConvTileAutotuneTests : IDisposable
     [Fact]
     public void ResNet_c64_AdmitsAllDefaultTiles_WithSixteenFirst()
     {
-        // N32/K64/C64/HW3136 (56x56): 64 and 3136 are divisible by 8, 16, 32.
+        // N32/K64/C64/HW3136 (56x56): 64 and 3136 are divisible by 4, 8, 16, 32.
         IReadOnlyList<AutotuneCandidate> c = ConvTileAutotune.Candidates(64, 64, 3136);
-        Assert.Equal(new[] { 16, 32, 8 }, Variants(c)); // preference order; tile-16 is the default fallback
+        Assert.Equal(new[] { 16, 32, 8, 4 }, Variants(c)); // preference order; tile-16 is the default fallback
     }
 
     [Fact]
@@ -59,21 +59,17 @@ public sealed class ConvTileAutotuneTests : IDisposable
     {
         // K128/C128/HW784 (28x28): 784 % 32 == 16, so tile-32 cannot launch.
         IReadOnlyList<AutotuneCandidate> c = ConvTileAutotune.Candidates(128, 128, 784);
-        Assert.Equal(new[] { 16, 8 }, Variants(c));
+        Assert.Equal(new[] { 16, 8, 4 }, Variants(c));
     }
 
     [Fact]
-    public void ResNet_c256_DefaultTiles_AdmitsNone_ButIsNotImpossible()
+    public void ResNet_c256_DefaultTiles_UsesFour_WhenLargerTilesCannotLaunch()
     {
-        // K256/C256/HW196 (14x14): 196 = 14^2 is divisible by none of {8,16,32}.
-        Assert.Empty(ConvTileAutotune.Candidates(256, 256, 196));
-        Assert.False(ConvTileAutotune.HasLaunchableTile(256, 256, 196));
-
-        // But gcd(256,256,196) = 4, so a tile-4 block IS launchable — c256 needs a
-        // small/non-default tile chosen by on-device measurement, not a code change.
-        IReadOnlyList<AutotuneCandidate> withFour = ConvTileAutotune.Candidates(
-            256, 256, 196, tileEdges: new[] { 4 });
-        Assert.Equal(new[] { 4 }, Variants(withFour));
+        // K256/C256/HW196 (14x14): only the default tile-4 divides every axis.
+        IReadOnlyList<AutotuneCandidate> candidates =
+            ConvTileAutotune.Candidates(256, 256, 196);
+        Assert.Equal(new[] { 4 }, Variants(candidates));
+        Assert.True(ConvTileAutotune.HasLaunchableTile(256, 256, 196));
     }
 
     [Fact]
@@ -82,7 +78,7 @@ public sealed class ConvTileAutotuneTests : IDisposable
         // With a 256-thread cap, tile-32 (1024 threads) is excluded even though it divides.
         IReadOnlyList<AutotuneCandidate> c = ConvTileAutotune.Candidates(
             64, 64, 3136, maxThreadsPerBlock: 256);
-        Assert.Equal(new[] { 16, 8 }, Variants(c)); // 16->256 threads ok, 8->64 ok, 32->1024 excluded
+        Assert.Equal(new[] { 16, 8, 4 }, Variants(c)); // 16->256 threads ok; 32->1024 excluded
     }
 
     [Fact]

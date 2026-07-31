@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers.Autotune;
 using Xunit;
 
@@ -45,5 +46,37 @@ public sealed class GpuAutotuneMeasurementTests
             new[] { 2.0f, 2.1f, 1.9f, 2.0f, 2.0f }, operations: 2_000_000);
 
         Assert.Equal(1.0, gflops, 3);
+    }
+
+    [Fact]
+    public void AdaptiveStableGflops_IncreasesLaunchGroupingUntilStable()
+    {
+        var launchGroups = new List<int>();
+        double gflops = GpuAutotuneMeasurement.AdaptiveStableGflops(
+            launches =>
+            {
+                launchGroups.Add(launches);
+                return launches == 8
+                    ? new[] { 1.0f, 1.0f, 1.0f, 1.5f }
+                    : new[] { 2.0f, 2.0f, 2.01f, 1.99f };
+            },
+            operations: 2_000_000);
+
+        Assert.Equal(new[] { 8, 32 }, launchGroups);
+        Assert.Equal(1.0, gflops, 2);
+    }
+
+    [Fact]
+    public void AdaptiveStableMedian_DoesNotRetryLaunchFailure()
+    {
+        int calls = 0;
+        Assert.Throws<NotSupportedException>(() =>
+            GpuAutotuneMeasurement.AdaptiveStableMedianMilliseconds(
+                _ =>
+                {
+                    calls++;
+                    throw new NotSupportedException("candidate cannot launch");
+                }));
+        Assert.Equal(1, calls);
     }
 }

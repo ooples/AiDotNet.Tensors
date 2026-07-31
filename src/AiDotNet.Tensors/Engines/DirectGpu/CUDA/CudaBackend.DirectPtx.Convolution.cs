@@ -1,15 +1,20 @@
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
+    private const int DirectPtxConvolutionKernelKey = 1;
     private readonly bool _directPtxConvolutionOptedIn =
         DirectPtxFeatureGate.IsConvolutionEnabled;
     private readonly DirectPtxKernelCache<int, PtxFusedConv2DNchwK1Kernel>
         _directPtxConvolutionKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<int, PtxConv2DNchwK1TiledKernel>
+        _directPtxTiledConvolutionKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private DirectPtxConvolutionVariant? _directPtxConvolutionPlan;
     private long _directPtxConvolutionDispatchCount;
 
     internal bool IsDirectPtxConvolutionEnabled =>
@@ -21,7 +26,12 @@ public sealed partial class CudaBackend
 
     internal int DirectPtxConvolutionPinnedKernelCount
     {
-        get { lock (_directPtxLock) return _directPtxConvolutionKernels.PinnedCount; }
+        get
+        {
+            lock (_directPtxLock)
+                return _directPtxConvolutionKernels.PinnedCount +
+                    _directPtxTiledConvolutionKernels.PinnedCount;
+        }
     }
 
     /// <summary>
@@ -49,26 +59,26 @@ public sealed partial class CudaBackend
         {
             bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
-            const int key = 1;
             lock (_directPtxLock)
             {
-                if (capturing && !_directPtxConvolutionKernels.TryGetValue(key, out _))
+                if (capturing &&
+                    (!_directPtxConvolutionPlan.HasValue ||
+                     !IsDirectPtxConvolutionKernelLoaded(_directPtxConvolutionPlan.Value)))
                 {
                     DirectPtxLastError =
                         "Direct PTX convolution must be prewarmed before CUDA graph capture.";
                     return false;
                 }
+
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                PtxFusedConv2DNchwK1Kernel kernel = GetOrCreateDirectPtxConvolutionKernel();
-                if (capturing && !_directPtxConvolutionKernels.Pin(key))
+                DirectPtxConvolutionVariant selected = _directPtxConvolutionPlan ??=
+                    ResolveDirectPtxConvolutionPlanSlow(input, weights, bias, output, shape);
+                EnsureDirectPtxConvolutionKernelLoaded(selected);
+                if (capturing && !PinDirectPtxConvolutionKernel(selected))
                     throw new InvalidOperationException(
-                        "Could not pin the direct-PTX convolution module for CUDA graph capture.");
+                        "Could not pin the selected direct-PTX convolution module for CUDA graph capture.");
                 lock (GpuDispatchLock)
-                    kernel.Launch(
-                        DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
-                        DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[2]),
-                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+                    LaunchDirectPtxConvolution(selected, input, weights, bias, output);
             }
             System.Threading.Interlocked.Increment(ref _directPtxConvolutionDispatchCount);
             DirectPtxLastError = null;
@@ -109,7 +119,16 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                _ = GetOrCreateDirectPtxConvolutionKernel();
+                _directPtxConvolutionPlan ??= DirectPtxConvolutionAutotuner.Resolve(
+                    _directPtxRuntime,
+                    PtxFusedConv2DNchwK1Kernel.Batch,
+                    PtxFusedConv2DNchwK1Kernel.OutputChannels,
+                    PtxFusedConv2DNchwK1Kernel.InputChannels,
+                    PtxFusedConv2DNchwK1Kernel.SpatialElements,
+                    _ => throw new InvalidOperationException(
+                        "Prewarm cannot benchmark convolution without operand buffers."),
+                    autotuneEnabled: false);
+                EnsureDirectPtxConvolutionKernelLoaded(_directPtxConvolutionPlan.Value);
             }
             DirectPtxLastError = null;
             return true;
@@ -125,27 +144,147 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            if (_directPtxConvolutionKernels.TryGetValue(1, out var kernel))
+            if (_directPtxConvolutionPlan is { } selected)
             {
-                audit = kernel.Audit;
-                return true;
+                if (selected.IsTiled &&
+                    _directPtxTiledConvolutionKernels.TryGetValue(
+                        selected.Tile, out PtxConv2DNchwK1TiledKernel? tiled))
+                {
+                    audit = tiled.Audit;
+                    return true;
+                }
+                if (!selected.IsTiled &&
+                    _directPtxConvolutionKernels.TryGetValue(
+                        DirectPtxConvolutionKernelKey,
+                        out PtxFusedConv2DNchwK1Kernel? direct))
+                {
+                    audit = direct.Audit;
+                    return true;
+                }
             }
         }
         audit = null!;
         return false;
     }
 
+    // Keep closure-bearing measurement code off the resident dispatch path.
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private DirectPtxConvolutionVariant ResolveDirectPtxConvolutionPlanSlow(
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer bias,
+        IGpuBuffer output,
+        DirectPtxConvolutionShape shape)
+    {
+        long operations = checked(
+            2L * shape.Batch * shape.OutputChannels * shape.InputChannels *
+            shape.OutputHeight * shape.OutputWidth);
+        return DirectPtxConvolutionAutotuner.Resolve(
+            _directPtxRuntime!,
+            shape.Batch,
+            shape.OutputChannels,
+            shape.InputChannels,
+            checked(shape.OutputHeight * shape.OutputWidth),
+            candidate =>
+            {
+                EnsureDirectPtxConvolutionKernelLoaded(candidate);
+                return GpuAutotuneMeasurement.AdaptiveStableGflops(
+                    launchesPerSample =>
+                    {
+                        lock (GpuDispatchLock)
+                            return _directPtxRuntime!.MeasureKernelSamples(
+                                () => LaunchDirectPtxConvolution(
+                                    candidate, input, weights, bias, output),
+                                warmup: 3, samples: 20, launchesPerSample);
+                    },
+                    operations);
+            },
+            DirectPtxFeatureGate.IsAutotuneEnabled);
+    }
+
+    private bool IsDirectPtxConvolutionKernelLoaded(DirectPtxConvolutionVariant selected) =>
+        selected.IsTiled
+            ? _directPtxTiledConvolutionKernels.TryGetValue(selected.Tile, out _)
+            : _directPtxConvolutionKernels.TryGetValue(DirectPtxConvolutionKernelKey, out _);
+
+    private void EnsureDirectPtxConvolutionKernelLoaded(DirectPtxConvolutionVariant selected)
+    {
+        if (selected.IsTiled)
+            _ = GetOrCreateDirectPtxTiledConvolutionKernel(selected.Tile);
+        else
+            _ = GetOrCreateDirectPtxConvolutionKernel();
+    }
+
+    private bool PinDirectPtxConvolutionKernel(DirectPtxConvolutionVariant selected) =>
+        selected.IsTiled
+            ? _directPtxTiledConvolutionKernels.Pin(selected.Tile)
+            : _directPtxConvolutionKernels.Pin(DirectPtxConvolutionKernelKey);
+
+    private void LaunchDirectPtxConvolution(
+        DirectPtxConvolutionVariant selected,
+        IGpuBuffer input,
+        IGpuBuffer weights,
+        IGpuBuffer bias,
+        IGpuBuffer output)
+    {
+        if (selected.IsTiled)
+        {
+            PtxConv2DNchwK1TiledKernel kernel =
+                GetOrCreateDirectPtxTiledConvolutionKernel(selected.Tile);
+            kernel.Launch(
+                DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.Create(weights, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.Create(bias, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
+            return;
+        }
+
+        PtxFusedConv2DNchwK1Kernel direct = GetOrCreateDirectPtxConvolutionKernel();
+        direct.Launch(
+            DirectPtxTensorView.Create(input, direct.Blueprint.Tensors[0]),
+            DirectPtxTensorView.Create(weights, direct.Blueprint.Tensors[1]),
+            DirectPtxTensorView.Create(bias, direct.Blueprint.Tensors[2]),
+            DirectPtxTensorView.Create(output, direct.Blueprint.Tensors[3]));
+    }
+
     private PtxFusedConv2DNchwK1Kernel GetOrCreateDirectPtxConvolutionKernel()
     {
         if (_directPtxConvolutionKernels.TryGetValue(
-                1, out PtxFusedConv2DNchwK1Kernel? existing))
+                DirectPtxConvolutionKernelKey,
+                out PtxFusedConv2DNchwK1Kernel? existing))
             return existing;
         return CreateAndCacheDirectPtxConvolutionKernelSlow();
     }
 
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private PtxFusedConv2DNchwK1Kernel CreateAndCacheDirectPtxConvolutionKernelSlow() =>
-        _directPtxConvolutionKernels.GetOrAdd(
-            1, () => new PtxFusedConv2DNchwK1Kernel(_directPtxRuntime!));
+    private PtxFusedConv2DNchwK1Kernel CreateAndCacheDirectPtxConvolutionKernelSlow()
+    {
+        var created = new PtxFusedConv2DNchwK1Kernel(_directPtxRuntime!);
+        return _directPtxConvolutionKernels.AddOrGetExisting(
+            DirectPtxConvolutionKernelKey, created);
+    }
+
+    private PtxConv2DNchwK1TiledKernel GetOrCreateDirectPtxTiledConvolutionKernel(int tile)
+    {
+        if (_directPtxTiledConvolutionKernels.TryGetValue(
+                tile, out PtxConv2DNchwK1TiledKernel? existing))
+            return existing;
+        return CreateAndCacheDirectPtxTiledConvolutionKernelSlow(tile);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxConv2DNchwK1TiledKernel CreateAndCacheDirectPtxTiledConvolutionKernelSlow(int tile)
+    {
+        var shape = new Conv2DTiledShape(
+            PtxFusedConv2DNchwK1Kernel.Batch,
+            PtxFusedConv2DNchwK1Kernel.OutputChannels,
+            PtxFusedConv2DNchwK1Kernel.InputChannels,
+            PtxFusedConv2DNchwK1Kernel.SpatialElements,
+            tile);
+        var created = new PtxConv2DNchwK1TiledKernel(_directPtxRuntime!, shape);
+        return _directPtxTiledConvolutionKernels.AddOrGetExisting(tile, created);
+    }
 }

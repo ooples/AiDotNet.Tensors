@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -701,6 +702,31 @@ public class DirectPtxWmmaTests
         Assert.Equal(new[] { 4, 2 }, DirectPtxAttentionAutotuner.Candidates(64));
         Assert.Equal(new[] { 8, 4 }, DirectPtxAttentionAutotuner.Candidates(128));
         Assert.Throws<ArgumentOutOfRangeException>(() => DirectPtxAttentionAutotuner.Candidates(96));
+    }
+
+    [Fact]
+    public void AttentionAutotuner_CandidatesRoundTripOnlySupportedWarpCounts()
+    {
+        IReadOnlyList<AutotuneCandidate> candidates =
+            DirectPtxAttentionAutotuner.CandidateConfigurations(64);
+
+        Assert.Collection(candidates,
+            candidate =>
+            {
+                Assert.True(DirectPtxAttentionAutotuner.TryGetWarps(candidate, 64, out int warps));
+                Assert.Equal(4, warps);
+                Assert.Equal("4", candidate.Parameters["WarpsPerBlock"]);
+            },
+            candidate =>
+            {
+                Assert.True(DirectPtxAttentionAutotuner.TryGetWarps(candidate, 64, out int warps));
+                Assert.Equal(2, warps);
+            });
+
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(
+            new AutotuneCandidate("query-warps-999"), 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(default, 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(candidates[0], 17, out _));
     }
 
     [Fact]

@@ -113,15 +113,16 @@ internal static class DirectPtxCubinArtifactCache
     private static DirectPtxCubinArtifact? TryReadEmbedded(
         DirectPtxRuntime runtime, string sourceKey)
     {
-        string suffix = ".Artifacts.sm" +
+        string architecturePrefix = ".Artifacts.sm" +
             runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + "." +
-            sourceKey + ".cubin";
+            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + ".";
+        string suffix = "." + sourceKey + ".cubin";
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
         string? resourceName = null;
         foreach (string candidate in assembly.GetManifestResourceNames())
         {
-            if (candidate.EndsWith(suffix, StringComparison.Ordinal))
+            if (candidate.IndexOf(architecturePrefix, StringComparison.Ordinal) >= 0 &&
+                candidate.EndsWith(suffix, StringComparison.Ordinal))
             {
                 resourceName = candidate;
                 break;
@@ -157,16 +158,26 @@ internal static class DirectPtxCubinArtifactCache
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
         foreach (string resourceName in assembly.GetManifestResourceNames())
         {
-            const string suffix = ".normalization-cubins.tsv";
-            if (!resourceName.EndsWith(suffix, StringComparison.Ordinal))
+            if (!resourceName.EndsWith("-cubins.tsv", StringComparison.Ordinal))
                 continue;
-            string marker = ".Artifacts.sm";
+            const string marker = ".Artifacts.";
             int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
-            int suffixIndex = resourceName.Length - suffix.Length;
-            if (markerIndex < 0 || suffixIndex <= markerIndex + marker.Length)
+            int architectureStart = markerIndex + marker.Length;
+            int architectureEnd = markerIndex < 0
+                ? -1
+                : resourceName.IndexOf('.', architectureStart);
+            if (markerIndex < 0 || architectureEnd <= architectureStart)
                 continue;
-            string architecture = "sm" + resourceName.Substring(
-                markerIndex + marker.Length, suffixIndex - markerIndex - marker.Length);
+            string architecture = resourceName.Substring(
+                architectureStart, architectureEnd - architectureStart);
+            if (!architecture.StartsWith("sm", StringComparison.Ordinal) ||
+                architecture.Length <= 2)
+                continue;
+            bool numericArchitecture = true;
+            for (int i = 2; i < architecture.Length; i++)
+                numericArchitecture &= architecture[i] >= '0' && architecture[i] <= '9';
+            if (!numericArchitecture)
+                continue;
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
             if (stream == null)
                 continue;
@@ -178,7 +189,14 @@ internal static class DirectPtxCubinArtifactCache
                     continue;
                 string[] columns = line.Split('\t');
                 if (columns.Length >= 4)
-                    result[architecture + "|" + columns[2]] = columns[3];
+                {
+                    string key = architecture + "|" + columns[2];
+                    if (result.TryGetValue(key, out string? priorHash) &&
+                        !string.Equals(priorHash, columns[3], StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException(
+                            "Embedded direct-PTX manifests disagree for source key: " + key);
+                    result[key] = columns[3];
+                }
             }
         }
         return result;

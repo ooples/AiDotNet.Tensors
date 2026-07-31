@@ -62,4 +62,59 @@ public static class GpuAutotuneMeasurement
         double medianMilliseconds = StableMedianMilliseconds(milliseconds, maxP95ToMedian);
         return operations / (medianMilliseconds * 1_000_000.0);
     }
+
+    /// <summary>
+    /// Measures with progressively larger launch groups until the averaged
+    /// CUDA-event samples satisfy the stability gate. Very short kernels can
+    /// otherwise appear noisy because event quantization and record overhead
+    /// are large relative to one launch. The measurement callback itself is
+    /// outside the retry catch, so launch failures are never mistaken for
+    /// timing noise.
+    /// </summary>
+    public static double AdaptiveStableMedianMilliseconds(
+        Func<int, IReadOnlyList<float>> measureSamples,
+        int initialLaunchesPerSample = 8,
+        int maxLaunchesPerSample = 512,
+        double maxP95ToMedian = DefaultMaxP95ToMedian)
+    {
+        if (measureSamples is null) throw new ArgumentNullException(nameof(measureSamples));
+        if (initialLaunchesPerSample <= 0)
+            throw new ArgumentOutOfRangeException(nameof(initialLaunchesPerSample));
+        if (maxLaunchesPerSample < initialLaunchesPerSample)
+            throw new ArgumentOutOfRangeException(nameof(maxLaunchesPerSample));
+
+        int launches = initialLaunchesPerSample;
+        while (true)
+        {
+            // Keep launch/module failures outside the stability retry. Only a
+            // completed timing distribution is eligible for a larger group.
+            IReadOnlyList<float> samples = measureSamples(launches);
+            try
+            {
+                return StableMedianMilliseconds(samples, maxP95ToMedian);
+            }
+            catch (InvalidOperationException) when (launches < maxLaunchesPerSample)
+            {
+                launches = launches > maxLaunchesPerSample / 4
+                    ? maxLaunchesPerSample
+                    : launches * 4;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Adaptive launch-group measurement converted to GFLOP/s.
+    /// </summary>
+    public static double AdaptiveStableGflops(
+        Func<int, IReadOnlyList<float>> measureSamples,
+        long operations,
+        int initialLaunchesPerSample = 8,
+        int maxLaunchesPerSample = 512,
+        double maxP95ToMedian = DefaultMaxP95ToMedian)
+    {
+        if (operations <= 0) throw new ArgumentOutOfRangeException(nameof(operations));
+        double medianMilliseconds = AdaptiveStableMedianMilliseconds(
+            measureSamples, initialLaunchesPerSample, maxLaunchesPerSample, maxP95ToMedian);
+        return operations / (medianMilliseconds * 1_000_000.0);
+    }
 }

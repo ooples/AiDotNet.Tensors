@@ -50,6 +50,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Direct-PTX release cubins are packaged only from operator-isolated
+         architecture/family directories. Legacy files directly under smXX are
+         intentionally excluded unless they are moved beside a current manifest. -->
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.cubin" />
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*-cubins.tsv" />
     <InternalsVisibleTo Include="AiDotNet" />
     <InternalsVisibleTo Include="AiDotNetTests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />

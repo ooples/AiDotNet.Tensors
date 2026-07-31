@@ -36,9 +36,10 @@ public static class ConvTileAutotune
     /// Default tile edges to sweep, ordered so the first <b>valid</b> tile is a
     /// sound unmeasured fallback: 16 (256 threads — the drafted emitter's tile,
     /// a balanced reuse/occupancy point), then 32 (max reuse, 1024 threads),
-    /// then 8 (low occupancy, last resort).
+    /// then 8 and 4 (progressively lower reuse, but useful for otherwise
+    /// untileable exact shapes).
     /// </summary>
-    public static readonly IReadOnlyList<int> DefaultTileEdges = new[] { 16, 32, 8 };
+    public static readonly IReadOnlyList<int> DefaultTileEdges = new[] { 16, 32, 8, 4 };
 
     /// <summary>The kernel identity for the tiled 1x1 conv on a given device (keyed per physical card).</summary>
     public static KernelId KernelId(GpuDeviceFingerprint fingerprint) =>
@@ -60,7 +61,7 @@ public static class ConvTileAutotune
     /// and a column tile never straddles a batch), and when <c>t*t</c> fits
     /// <paramref name="maxThreadsPerBlock"/>. An empty result means no offered
     /// tile is launchable for this contract (e.g. HW=196=14^2 admits none of
-    /// {8,16,32}); the caller must fall back rather than call the tiled path.
+    /// {4,8,16,32}); the caller must fall back rather than call the tiled path.
     /// </summary>
     public static IReadOnlyList<AutotuneCandidate> Candidates(
         int outputChannels,
