@@ -13,6 +13,18 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 public sealed class DirectPtxVisionBoxIouTests
 {
+    private sealed class TrackedResource : IDisposable
+    {
+        internal bool IsDisposed { get; private set; }
+        internal bool ThrowOnDispose { get; init; }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
+    }
+
     public static IEnumerable<object[]> VisionDefinitions()
     {
         yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256)];
@@ -519,6 +531,34 @@ public sealed class DirectPtxVisionBoxIouTests
             Assert.DoesNotContain("mul.rn.f32 %f8, %f6",
                 definition.Ptx, StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public void VisionPostLoadInitialization_DisposesAndPreservesPrimaryFailure()
+    {
+        var resource = new TrackedResource { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("resource validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackedResource, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void VisionPostLoadInitialization_TransfersSuccessfulOwnership()
+    {
+        var resource = new TrackedResource();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
+        Assert.True(resource.IsDisposed);
     }
 
     private static void AssertPtxRegisterAndLabelClosure(string ptx)

@@ -81,15 +81,27 @@ internal sealed class PtxVisionKernel : IDisposable
         Definition = PtxVisionEmitter.Emit(
             spec, runtime.ArchitectureFamily,
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        _module = runtime.LoadModule(Definition.Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        FunctionInfo = info;
-        int blockThreads = checked((int)(Definition.BlockX * Definition.BlockY * Definition.BlockZ));
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Definition.Ptx, info,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Definition.Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    EntryPoint, out DirectPtxFunctionInfo info);
+                int blockThreads = checked((int)(
+                    Definition.BlockX * Definition.BlockY * Definition.BlockZ));
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    EntryPoint, info, blockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Definition.Ptx, info,
+                    blockThreads, activeBlocks, module.JitInfoLog);
+                return (Function: function, FunctionInfo: info, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
