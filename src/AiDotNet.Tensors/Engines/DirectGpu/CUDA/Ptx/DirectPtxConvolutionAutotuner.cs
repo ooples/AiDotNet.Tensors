@@ -19,7 +19,6 @@ internal readonly record struct DirectPtxConvolutionVariant(bool IsTiled, int Ti
 /// </summary>
 internal static class DirectPtxConvolutionAutotuner
 {
-    internal const string Category = "conv2d";
     internal const string ShareableKernelName = "fused-1x1-bias-relu-nchw-fp32-v1";
     internal const string DirectVariant = "unrolled-direct";
     private const string AlgorithmParameter = "Algorithm";
@@ -123,7 +122,7 @@ internal static class DirectPtxConvolutionAutotuner
             outputChannels, inputChannels, spatial);
         AutotuneResolution resolution = CommunityAutotune.Resolve(
             exchange ?? GpuTuningExchangeProvider.Current,
-            Category,
+            ConvTileAutotune.Category,
             ShareableKernelName,
             runtime.Fingerprint,
             ConvTileAutotune.Shape(batch, outputChannels, inputChannels, spatial),
