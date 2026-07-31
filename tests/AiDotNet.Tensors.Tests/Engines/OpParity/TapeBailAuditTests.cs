@@ -140,6 +140,31 @@ public class TapeBailAuditTests
         "TensorMin",
     };
 
+    /// <summary>
+    /// Ops whose <c>IsTapeActive</c> check guards WORK, not a fallback: it skips something needed only
+    /// when taping, so the GPU kernel still runs during training.
+    /// </summary>
+    /// <remarks>
+    /// This is an allowlist rather than a syntactic rule because every cheap rule misclassifies a real
+    /// bail — see the comment in <see cref="ScanGpuOverrides"/>. Entries must state what the guard skips,
+    /// and <c>Cost_guard_ops_actually_record</c> checks each one records a node, so the list cannot be
+    /// used to hide a bail.
+    /// </remarks>
+    private static readonly string[] TapeCostGuardOnly =
+    {
+        // Snapshots the PRE-dB linear mel, which MelSpectrogramBackward needs element-aligned with the
+        // output. Pointless work when nothing will consume it.
+        "MelSpectrogram",
+        // Recomputes the resolved flat destination positions host-side. The kernel derives them on the
+        // DEVICE, and the backward wants them as an int[], so they are rebuilt only when taping.
+        "TensorIndexPut",
+        // Both save the flattened indices for their backward, and GetFlattenedData FORCES A DOWNLOAD of
+        // device-resident indices. Reading them unconditionally cost a device-to-host round trip on every
+        // call and broke ResidentIndices_WriteOperationsStayOnDeviceAndPreserveOrdering.
+        "TensorPut",
+        "TensorScatterReduce",
+    };
+
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>
     private static readonly string[] MustNotBail =
     {
@@ -152,6 +177,13 @@ public class TapeBailAuditTests
         "AffineGrid",
         "RBFKernel",
         "MaxPool3DWithIndices",
+        // The scatter-write family. Each now runs its kernel under an active tape and records the same
+        // node CpuEngine records — see the matching gradient tests in ScatterWriteGradTests,
+        // ScatterReduceGradTests and IndexPutAndBitMaskGradTests. The three that must read their indices
+        // back for the backward (TensorPut, TensorScatterReduce, TensorIndexPut) keep a tape check as a
+        // cost guard, so they live in TapeCostGuardOnly instead.
+        "TensorSelectScatter",
+        "TensorSliceScatter",
     };
 
     private static string[] GpuEngineSources(string root)
@@ -166,11 +198,11 @@ public class TapeBailAuditTests
             "CpuEngine*.cs",
             SearchOption.TopDirectoryOnly);
 
-    private static Dictionary<string, (bool HasKernel, bool Bails)> ScanGpuOverrides(
+    private static Dictionary<string, (bool HasKernel, bool Bails, bool Records)> ScanGpuOverrides(
         IEnumerable<string> gpuSources)
     {
         var methodRe = new Regex(@"(?:Tensor<T> IEngine\.|public override Tensor<T> |void IEngine\.)([A-Za-z0-9_]+)<T>\s*\(");
-        var result = new Dictionary<string, (bool, bool)>();
+        var result = new Dictionary<string, (bool, bool, bool)>();
 
         foreach (string gpuSrc in gpuSources)
         {
@@ -212,13 +244,31 @@ public class TapeBailAuditTests
                     }));
 
                 bool hasKernel = Regex.IsMatch(text, @"\bbackend\.[A-Za-z0-9_]+\(");
-                // The generic call form, so a mention in a string or identifier cannot trip it.
+
+                // Any mention of the tape check in code counts as gating the GPU path. This stays
+                // deliberately CONSERVATIVE rather than trying to classify the bail syntactically, because
+                // the real forms defeat every cheap rule:
+                //   - `if (IsTapeActive<T>()) return base.Op(..);`               early return
+                //   - `if (IsTapeActive<T>()) throw new NotSupportedException(..)` FusedLinearCrossEntropy
+                //   - `if (!IsTapeActive<T>() && ..) { <gpu path> }`             inverted gate, falls
+                //     through to a base call at the end — TensorDiagonal, ConvTranspose2D
+                // A "leads to return base." rule excuses the last two silently, and "records somewhere in
+                // the method" excuses TensorGather, which bails at the top and records further down under
+                // the label "Gather" in a branch only reachable when no tape is active.
+                //
+                // The legitimate use — guarding work needed ONLY when taping, so inference pays nothing —
+                // is handled by the explicit TapeCostGuardOnly allowlist instead, which
+                // Cost_guard_ops_actually_record verifies really does record.
                 bool bails = Regex.IsMatch(text, @"\bIsTapeActive\s*<");
                 // An op can appear more than once (overloads); kernel/bail status ORs across them.
+                // Whether THIS method records, so the allowlist check can be scoped to the body that
+                // carries the tape check rather than to the whole file set.
+                bool records = Regex.IsMatch(text, @"DifferentiableOps\.Record[A-Za-z]*\(");
+
                 if (result.TryGetValue(name, out var prev))
-                    result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails);
+                    result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails, prev.Item3 || records);
                 else
-                    result[name] = (hasKernel, bails);
+                    result[name] = (hasKernel, bails, records);
             }
         }
         return result;
@@ -260,6 +310,7 @@ public class TapeBailAuditTests
             if (name.EndsWith("Backward", StringComparison.Ordinal)) continue;
             if (!info.Bails || !info.HasKernel) continue;
             if (!withBackward.Contains(name)) continue;          // no backward to record — bail is correct
+            if (TapeCostGuardOnly.Contains(name)) continue;      // guards work, not a fallback
             if (KnownUnfixed.Contains(name)) continue;           // tracked, pending verification
             violations.Add(name);
         }
@@ -309,6 +360,45 @@ public class TapeBailAuditTests
         Assert.True(stale.Count == 0,
             "KnownUnfixed lists ops that no longer bail (or no longer exist). Remove them so the list keeps "
             + "reflecting real debt: " + string.Join(", ", stale));
+    }
+
+    /// <summary>
+    /// Every TapeCostGuardOnly entry must actually record a tape node, so the allowlist cannot be used to
+    /// wave through an op that really does bail.
+    /// </summary>
+    /// <remarks>
+    /// This is the check that makes the allowlist safe. Being on the list only means "the tape check here
+    /// guards work rather than a fallback"; it does not exempt the op from having to record.
+    /// </remarks>
+    [Fact]
+    public void Cost_guard_ops_actually_record()
+    {
+        string root = RepoRoot();
+        var overrides = ScanGpuOverrides(GpuEngineSources(root));
+
+        // An entry must still EXIST and still gate on the tape, or the exemption it grants is dead
+        // weight that keeps applying silently after a rename or a deletion. KnownUnfixed already has
+        // this protection; the allowlist had none.
+        var stale = TapeCostGuardOnly
+            .Where(op => !overrides.TryGetValue(op, out var i) || !i.Bails)
+            .ToList();
+        Assert.True(stale.Count == 0,
+            "TapeCostGuardOnly lists ops that no longer exist or no longer check IsTapeActive, so their "
+            + "exemption now applies to nothing. Remove them: " + string.Join(", ", stale));
+
+        // Scoped to the METHOD that carries the tape check, not the whole file set. A file-wide search
+        // proves only that the name appears in some Record* call somewhere, which is exactly the hole
+        // documented for TensorGather: it bails at the top and records further down, in a branch only
+        // reachable when no tape is active.
+        var notRecording = TapeCostGuardOnly
+            .Where(op => overrides.TryGetValue(op, out var i) && !i.Records)
+            .ToList();
+
+        _out.WriteLine($"checked: {string.Join(", ", TapeCostGuardOnly)}");
+        Assert.True(notRecording.Count == 0,
+            "These ops are allowlisted as using the tape check only to guard work, but their own override "
+            + "never records a tape node — so the check IS a bail and the entry is wrong: "
+            + string.Join(", ", notRecording));
     }
 }
 #endif

@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -86,6 +88,69 @@ public class FusedLinearGradientTests : IDisposable
                 Assert.True(Math.Abs(u[i] - f[i]) < 1e-9,
                     $"double FusedLinear grad mismatch at [{i}]: unfused={u[i]:R} fused={f[i]:R}");
         }
+    }
+
+    [Fact]
+    public void FusedLinear_Float_BackwardOverwritesPaddedPooledGradientBuffers()
+    {
+        const int batch = 65;
+        const int inFeatures = 257;
+        const int outFeatures = 257;
+
+        bool cacheWasEnabled = AutoTensorCache.Enabled;
+        AutoTensorCache.Clear();
+        AutoTensorCache.Enabled = true;
+        try
+        {
+            var input = CreateRandom([batch, inFeatures], 101);
+            var weight = CreateRandom([inFeatures, outFeatures], 102);
+            var bias = CreateRandom([outFeatures], 103);
+
+            using var tape = new GradientTape<float>();
+            var output = _engine.FusedLinear(input, weight, bias, FusedActivationType.None);
+            var loss = _engine.ReduceSum(output, [0, 1], keepDims: false);
+
+            // Construct the cached tensors from ArrayPool explicitly. TensorAllocator can
+            // legitimately return exact-length storage when ForceFreshAllocations is set
+            // by another test, which made this regression's setup host/order dependent.
+            // Poison only after recording the forward/loss so a forward output cannot
+            // consume the input-gradient-shaped cache entry before backward starts.
+            var poisonedInputGrad = CreatePaddedPooledTensor([batch, inFeatures]);
+            var poisonedWeightGrad = CreatePaddedPooledTensor([inFeatures, outFeatures]);
+            var poisonedBiasGrad = CreatePaddedPooledTensor([outFeatures]);
+            poisonedInputGrad.Fill(float.NaN);
+            poisonedWeightGrad.Fill(float.NaN);
+            poisonedBiasGrad.Fill(float.NaN);
+
+            AutoTensorCache.Return(poisonedInputGrad);
+            AutoTensorCache.Return(poisonedWeightGrad);
+            AutoTensorCache.Return(poisonedBiasGrad);
+
+            var grads = tape.ComputeGradients(loss, [input, weight, bias]);
+
+            Assert.Same(poisonedInputGrad, grads[input]);
+            Assert.Same(poisonedWeightGrad, grads[weight]);
+            Assert.Same(poisonedBiasGrad, grads[bias]);
+            Assert.All(grads[input].ToArray(), value => Assert.False(float.IsNaN(value) || float.IsInfinity(value)));
+            Assert.All(grads[weight].ToArray(), value => Assert.False(float.IsNaN(value) || float.IsInfinity(value)));
+            Assert.All(grads[bias].ToArray(), value => Assert.False(float.IsNaN(value) || float.IsInfinity(value)));
+        }
+        finally
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.Enabled = cacheWasEnabled;
+        }
+    }
+
+    private static Tensor<float> CreatePaddedPooledTensor(int[] shape)
+    {
+        int length = 1;
+        foreach (int dimension in shape)
+            length = checked(length * dimension);
+
+        float[] pooled = ArrayPool<float>.Shared.Rent(length);
+        Assert.True(pooled.Length > length, "The chosen shape must map to a padded ArrayPool bucket.");
+        return Tensor<float>.FromPooledMemory(new Memory<float>(pooled, 0, length), shape, pooled);
     }
 
     private void VerifyFusedMatchesUnfused(

@@ -95,13 +95,13 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
             GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
         GradQueryAudit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
-            blockThreads, gradQueryBlocks, _module.JitInfoLog);
+            blockThreads, gradQueryBlocks, _module);
         GradKeyValueAudit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
-            blockThreads, gradKeyValueBlocks, _module.JitInfoLog);
+            blockThreads, gradKeyValueBlocks, _module);
         RowDeltaAudit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, rowDeltaInfo,
-            blockThreads, rowDeltaBlocks, _module.JitInfoLog);
+            blockThreads, rowDeltaBlocks, _module);
     }
 
     internal unsafe void Launch(

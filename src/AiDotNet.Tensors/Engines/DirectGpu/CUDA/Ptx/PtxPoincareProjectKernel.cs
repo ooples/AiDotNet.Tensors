@@ -50,7 +50,7 @@ internal sealed class PtxPoincareProjectKernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
@@ -80,9 +80,7 @@ internal sealed class PtxPoincareProjectKernel : IDisposable
         const string One = "0f3F800000";
 
         var ptx = new StringBuilder(6_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// poincare-project dim={dim}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
@@ -167,11 +165,11 @@ internal sealed class PtxPoincareProjectKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 26,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "y = ||x||^2 >= (1/sqrt(c)-eps)^2 ? x*(1/sqrt(c)-eps)/||x|| : x",

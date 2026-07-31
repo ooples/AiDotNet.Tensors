@@ -48,7 +48,7 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(DirectPtxTensorView probabilities)
@@ -70,9 +70,7 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
         string minSum = DirectPtxPtxText.Hex(1e-10f);
 
         var ptx = new StringBuilder(4_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// normalize-probabilities batch={batchSize} state={stateSize}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
@@ -155,7 +153,7 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.ReadWrite, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 22,
+                measuredRegistersPerThread: 26,
                 maxStaticSharedBytes: BlockThreads * sizeof(float),
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),

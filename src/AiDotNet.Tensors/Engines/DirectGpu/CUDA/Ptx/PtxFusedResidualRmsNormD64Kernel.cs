@@ -61,7 +61,7 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, blockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+            blockThreads, activeBlocks, _module);
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(

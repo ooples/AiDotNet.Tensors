@@ -40,7 +40,7 @@ internal sealed class PtxComplexMagnitudeKernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(
@@ -120,7 +120,7 @@ internal sealed class PtxComplexMagnitudeKernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 14,
+                measuredRegistersPerThread: 24,
                 maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),

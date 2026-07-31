@@ -86,7 +86,7 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
             functionInfo, blockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+            blockThreads, activeBlocks, _module);
     }
 
     internal unsafe void LaunchDense(

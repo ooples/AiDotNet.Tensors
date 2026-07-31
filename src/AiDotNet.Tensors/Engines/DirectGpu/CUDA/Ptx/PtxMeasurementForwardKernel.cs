@@ -50,7 +50,7 @@ internal sealed class PtxMeasurementForwardKernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
@@ -75,9 +75,7 @@ internal sealed class PtxMeasurementForwardKernel : IDisposable
         string minSum = DirectPtxPtxText.Hex(1e-10f);
 
         var ptx = new StringBuilder(5_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// measurement-forward batch={batchSize} state={stateSize}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
@@ -173,7 +171,7 @@ internal sealed class PtxMeasurementForwardKernel : IDisposable
                     outExtent, outExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 22,
+                measuredRegistersPerThread: 26,
                 maxStaticSharedBytes: BlockThreads * sizeof(float),
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),

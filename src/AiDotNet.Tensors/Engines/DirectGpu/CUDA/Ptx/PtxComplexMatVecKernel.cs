@@ -49,7 +49,7 @@ internal sealed class PtxComplexMatVecKernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(
@@ -88,9 +88,7 @@ internal sealed class PtxComplexMatVecKernel : IDisposable
         ValidateShape(batchSize, dim);
 
         var ptx = new StringBuilder(4_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// complex-matvec batch={batchSize} dim={dim}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
@@ -182,7 +180,7 @@ internal sealed class PtxComplexMatVecKernel : IDisposable
                     vecExtent, vecExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 40,
+                measuredRegistersPerThread: 22,
                 maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),

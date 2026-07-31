@@ -47,7 +47,7 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(DirectPtxTensorView a, DirectPtxTensorView b, DirectPtxTensorView output)
@@ -75,9 +75,7 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
         string eps = DirectPtxPtxText.Hex(1e-8f);
 
         var ptx = new StringBuilder(3_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
-        ptx.AppendLine(".address_size 64");
+        DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
         ptx.AppendLine($"// cosine-similarity batch={batchSize} dim={dim}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
@@ -148,7 +146,7 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
                     outExtent, outExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 40,
+                measuredRegistersPerThread: 24,
                 maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),

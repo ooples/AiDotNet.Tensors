@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Text;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -50,6 +51,42 @@ public class DirectPtxScientificTests
     [InlineData(float.PositiveInfinity, "0f7F800000")]
     public void SharedPtxText_FormatsExactFloatBits(float value, string expected)
         => Assert.Equal(expected, DirectPtxPtxText.Hex(value));
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void SharedPtxText_EmitsCanonicalModuleHeader(
+        bool disableLoopUnrolling, bool expectsNoUnroll)
+    {
+        var text = new StringBuilder();
+
+        DirectPtxPtxText.AppendModuleHeader(text, 8, 6, disableLoopUnrolling);
+
+        string newline = Environment.NewLine;
+        Assert.StartsWith(
+            $".version 7.1{newline}.target sm_86{newline}.address_size 64{newline}",
+            text.ToString());
+        Assert.Equal(expectsNoUnroll,
+            text.ToString().Contains(".pragma \"nounroll\";", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void SerialReductionEmitters_DisableBackendLoopUnrolling()
+    {
+        string[] modules =
+        [
+            PtxAnnIvfAssignKernel.EmitPtx(8, 6, AnnMetric.L2, 256, 8, 12),
+            PtxComplexMatVecKernel.EmitPtx(8, 6, 4, 64),
+            PtxCosineSimilarityKernel.EmitPtx(8, 6, 256, 64),
+            PtxSphericalSoftmaxKernel.EmitPtx(8, 6, 256, 32),
+            PtxPoincareProjectKernel.EmitPtx(8, 6, 64),
+            PtxNormalizeProbabilitiesKernel.EmitPtx(8, 6, 64, 512),
+            PtxMeasurementForwardKernel.EmitPtx(8, 6, 32, 256)
+        ];
+
+        Assert.All(modules,
+            module => Assert.Contains(".pragma \"nounroll\";", module, StringComparison.Ordinal));
+    }
 
     [Fact]
     public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
@@ -623,6 +660,9 @@ public class DirectPtxScientificTests
             "The checked-in complex-matvec specialization is measured on GA10x/SM86.");
         const int batchSize = 16, dim = 64;   // rows = 1024 (multiple of 256)
         using var kernel = new PtxComplexMatVecKernel(runtime, batchSize, dim);
+        Assert.NotEqual(DirectPtxModuleImageKind.DriverJitPtx, kernel.Audit.ImageKind);
+        Assert.NotEmpty(kernel.Audit.CubinSha256);
+        Assert.NotEmpty(kernel.Audit.CubinSourceKey);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20267400);

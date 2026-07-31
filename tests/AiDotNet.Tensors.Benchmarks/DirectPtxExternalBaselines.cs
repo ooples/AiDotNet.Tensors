@@ -33,7 +33,8 @@ internal static class DirectPtxExternalBaselines
         if (process.ExitCode != 0)
             throw new InvalidOperationException(
                 $"Python GPU baselines failed with exit code {process.ExitCode}.");
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("external-gpu-baselines-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "external-gpu-baselines-end", afterSuite: true);
         GpuBenchmarkEnvironment.PrintSnapshot("external-gpu-baselines-end");
     }
 }

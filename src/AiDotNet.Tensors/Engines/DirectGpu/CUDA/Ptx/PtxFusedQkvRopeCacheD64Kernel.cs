@@ -54,7 +54,7 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
         Blueprint.ResourceBudget.Validate(EntryPoint, info, blockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+            blockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(
