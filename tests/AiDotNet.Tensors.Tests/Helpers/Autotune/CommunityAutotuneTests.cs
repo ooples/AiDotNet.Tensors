@@ -130,6 +130,29 @@ public sealed class CommunityAutotuneTests : IDisposable
     }
 
     [Fact]
+    public void SlowerCommunityConfig_Loses_LocalWinnerSelectedAndPublished()
+    {
+        var exchange = new InMemoryGpuTuningExchange();
+        exchange.Seed(Community("tile-11", 11, 1500.0));
+
+        AutotuneResolution resolution = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(), Local(),
+            candidate => candidate.Variant switch
+            {
+                "tile-16" => 1200.0,
+                "tile-11" => 600.0,
+                _ => 400.0
+            },
+            autotuneEnabled: true);
+
+        Assert.True(resolution.Measured);
+        Assert.True(ConvTileAutotune.TryGetTile(resolution, out int tile));
+        Assert.Equal(16, tile);
+        GpuTuningProfile published = Assert.Single(exchange.Published);
+        Assert.Equal("tile-16", published.Variant);
+    }
+
+    [Fact]
     public void Disabled_ExchangeNeverConsulted_AndDefaultIsLocal()
     {
         var exchange = new InMemoryGpuTuningExchange();
