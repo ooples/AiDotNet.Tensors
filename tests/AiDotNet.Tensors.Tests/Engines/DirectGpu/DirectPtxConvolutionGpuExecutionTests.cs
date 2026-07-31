@@ -59,14 +59,14 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4)]
     [InlineData(8)]
     [InlineData(16)]
     [InlineData(32)]
     public void Tiled_AutotuneCandidateForExactProductionShape_MatchesCpuReference(int tile)
     {
-        if (!DirectPtxRuntime.IsAvailable) return;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
 
         const int n = PtxFusedConv2DNchwK1Kernel.Batch;
         const int k = PtxFusedConv2DNchwK1Kernel.OutputChannels;
@@ -82,9 +82,9 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         float[] expected = ReferenceConv1x1(input, weights, bias, n, k, c, hw);
 
         using var runtime = new DirectPtxRuntime();
-        if (!DirectPtxArchitecture.HasExperimentalConvolution(
-                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
-            return;
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the validated SM86 convolution specialization.");
 
         const string cacheVariable = "AIDOTNET_DIRECT_PTX_CACHE_PATH";
         string? priorCache = Environment.GetEnvironmentVariable(cacheVariable);
@@ -107,10 +107,10 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void CudaBackend_FirstDispatchAutotunesAndLaunchesSelectedExactKernel()
     {
-        if (!DirectPtxRuntime.IsAvailable) return;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
 
         const int n = PtxFusedConv2DNchwK1Kernel.Batch;
         const int k = PtxFusedConv2DNchwK1Kernel.OutputChannels;
@@ -141,7 +141,8 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         try
         {
             using var backend = new CudaBackend();
-            if (!backend.IsDirectPtxConvolutionEnabled) return;
+            Skip.IfNot(backend.IsDirectPtxConvolutionEnabled,
+                "Requires a validated Ampere CUDA backend with convolution enabled.");
             using var dInput = backend.AllocateBuffer(input);
             using var dWeights = backend.AllocateBuffer(weights);
             using var dBias = backend.AllocateBuffer(bias);
