@@ -43,7 +43,7 @@ internal static partial class PtxVisionEmitter
         int ccMinor)
     {
         if (architecture != DirectPtxArchitectureFamily.Ampere ||
-            !DirectPtxArchitecture.HasValidatedVisionBoxIou(ccMajor, ccMinor))
+            !DirectPtxArchitecture.HasValidatedVision(ccMajor, ccMinor))
             throw new NotSupportedException(
                 $"Vision direct PTX has no {architecture} SM {ccMajor}.{ccMinor} emitter.");
         if (!DirectPtxVisionSpecializations.IsAdmitted(spec))

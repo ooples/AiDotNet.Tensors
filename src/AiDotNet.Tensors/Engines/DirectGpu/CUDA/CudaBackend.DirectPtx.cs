@@ -107,7 +107,7 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxVisionBoxIouEnabled =>
         DirectPtxFeatureGate.IsVisionBoxIouEnabled && IsAvailable &&
-        DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor);
+        DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor);
     internal long DirectPtxVisionBoxIouDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxVisionBoxIouDispatchCount);
     internal int DirectPtxVisionBoxIouKernelCapacity => _directPtxVisionBoxIouKernels.Capacity;
@@ -249,7 +249,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "vision-box-iou-backend-unavailable";
             return false;
         }
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        if (!DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = "vision-box-iou-architecture-not-implemented";
             return false;

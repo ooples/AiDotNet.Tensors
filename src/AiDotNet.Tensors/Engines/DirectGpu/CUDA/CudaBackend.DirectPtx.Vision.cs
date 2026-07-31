@@ -60,7 +60,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             DirectPtxLastError = DirectPtxVisionUnavailableReasons[(int)spec.Operation];
             return false;
         }
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        if (!DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = DirectPtxVisionArchitectureReasons[(int)spec.Operation];
             return false;
@@ -292,7 +292,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             return false;
         }
         if (!IsAvailable ||
-            !DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+            !DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = !IsAvailable
                 ? DirectPtxVisionUnavailableReasons[(int)specA.Operation]
@@ -367,7 +367,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             DirectPtxLastError = DirectPtxVisionUnavailableReasons[(int)operation];
             return false;
         }
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        if (!DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = DirectPtxVisionArchitectureReasons[(int)operation];
             return false;
@@ -424,7 +424,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             DirectPtxLastError = DirectPtxVisionUnavailableReasons[(int)spec0.Operation];
             return false;
         }
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        if (!DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = DirectPtxVisionArchitectureReasons[(int)spec0.Operation];
             return false;
@@ -498,7 +498,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             DirectPtxLastError = DirectPtxVisionUnavailableReasons[(int)spec.Operation];
             return false;
         }
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(_ccMajor, _ccMinor))
+        if (!DirectPtxArchitecture.HasValidatedVision(_ccMajor, _ccMinor))
         {
             DirectPtxLastError = DirectPtxVisionArchitectureReasons[(int)spec.Operation];
             return false;

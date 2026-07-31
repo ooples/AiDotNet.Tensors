@@ -20,6 +20,9 @@ internal enum DirectPtxArchitectureFamily
 
 internal static class DirectPtxArchitecture
 {
+    private static bool IsGa102Sm86(int major, int minor) =>
+        (major, minor) == (8, 6);
+
     internal static DirectPtxArchitectureFamily Classify(int major, int minor) => (major, minor) switch
     {
         (8, 9) => DirectPtxArchitectureFamily.Ada,
@@ -35,18 +38,18 @@ internal static class DirectPtxArchitecture
     /// implementation instead of silently inheriting Ampere's tuning.
     /// </summary>
     internal static bool HasValidatedOnlineAttention(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The first QKV/RoPE/cache specialization is measured and promoted only
     /// on GA102/SM86. Other Ampere variants remain independent tuning domains.
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
-    /// <summary>The first vision specialization is emitted only for GA102/SM86.</summary>
-    internal static bool HasValidatedVisionBoxIou(int major, int minor) =>
-        (major, minor) == (8, 6);
+    /// <summary>The first vision-family specializations are emitted only for GA102/SM86.</summary>
+    internal static bool HasValidatedVision(int major, int minor) =>
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The fused-linear + GELU decode specializations are measured and promoted
@@ -55,7 +58,7 @@ internal static class DirectPtxArchitecture
     /// rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedFusedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The mixed-precision (FP16 / W8A8) fused-linear decode specializations are
@@ -64,7 +67,7 @@ internal static class DirectPtxArchitecture
     /// own specialization rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedMixedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The fused residual + bias + LayerNorm + GELU decode specialization is
@@ -73,7 +76,7 @@ internal static class DirectPtxArchitecture
     /// own specialization rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The quantized (W8A8) decode-linear specialization is measured only on
@@ -81,7 +84,7 @@ internal static class DirectPtxArchitecture
     /// whole Ampere family would run PTX that was never validated on SM80/SM87.
     /// </summary>
     internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// Issue #841's first convolution emitter deliberately targets one exact
@@ -89,7 +92,7 @@ internal static class DirectPtxArchitecture
     /// attached; other SMs must use the established backend.
     /// </summary>
     internal static bool HasExperimentalConvolution(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 }
 
 internal enum DirectPtxExtentMode

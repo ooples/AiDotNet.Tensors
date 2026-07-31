@@ -73,7 +73,7 @@ internal sealed class PtxVisionKernel : IDisposable
     internal PtxVisionKernel(DirectPtxRuntime runtime, DirectPtxVisionSpec spec)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(
+        if (!DirectPtxArchitecture.HasValidatedVision(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new NotSupportedException(
                 $"Vision operation {spec.Operation} has no SM {runtime.ComputeCapabilityMajor}.{runtime.ComputeCapabilityMinor} specialization.");

@@ -35,7 +35,7 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!IsSupportedShape(n, m))
             throw new NotSupportedException($"Pairwise BoxIoU shape [{n},{m}] is not emitted.");
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(
+        if (!DirectPtxArchitecture.HasValidatedVision(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new NotSupportedException(
                 $"Pairwise BoxIoU has no SM {runtime.ComputeCapabilityMajor}.{runtime.ComputeCapabilityMinor} specialization.");
@@ -145,7 +145,7 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int n, int m)
     {
-        if (!DirectPtxArchitecture.HasValidatedVisionBoxIou(ccMajor, ccMinor))
+        if (!DirectPtxArchitecture.HasValidatedVision(ccMajor, ccMinor))
             throw new NotSupportedException(
                 $"Pairwise BoxIoU has no SM {ccMajor}.{ccMinor} emitter.");
         if (!IsSupportedShape(n, m))

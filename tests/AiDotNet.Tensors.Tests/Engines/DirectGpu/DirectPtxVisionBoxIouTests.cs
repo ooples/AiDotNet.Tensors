@@ -144,10 +144,10 @@ public sealed class DirectPtxVisionBoxIouTests
     [Fact]
     public void SpecializationMatrix_IsExactSm86AndUnpromoted()
     {
-        Assert.True(DirectPtxArchitecture.HasValidatedVisionBoxIou(8, 6));
-        Assert.False(DirectPtxArchitecture.HasValidatedVisionBoxIou(8, 0));
-        Assert.False(DirectPtxArchitecture.HasValidatedVisionBoxIou(8, 9));
-        Assert.False(DirectPtxArchitecture.HasValidatedVisionBoxIou(9, 0));
+        Assert.True(DirectPtxArchitecture.HasValidatedVision(8, 6));
+        Assert.False(DirectPtxArchitecture.HasValidatedVision(8, 0));
+        Assert.False(DirectPtxArchitecture.HasValidatedVision(8, 9));
+        Assert.False(DirectPtxArchitecture.HasValidatedVision(9, 0));
         Assert.True(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(256, 256));
         Assert.True(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(1024, 1024));
         Assert.False(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(257, 256));
