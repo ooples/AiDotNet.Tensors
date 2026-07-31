@@ -1018,6 +1018,87 @@ public partial class DirectGpuTensorEngine
     /// from one implementation.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// GPU-executed adjoint of IRFFT, or null when the GPU path is unavailable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors <see cref="BackwardFunctions{T}.IRFFTAdjointBackward"/>: zero-pad the real gradient to
+    /// nFft, take the UNNORMALIZED FORWARD transform, then keep the one-sided bins scaled by c_k/nFft
+    /// where c_k is 1 at DC and Nyquist and 2 elsewhere — the transpose of the Hermitian doubling the
+    /// forward applies. The Nyquist bin's imaginary part does not influence the forward output, so its
+    /// gradient is zero.
+    /// </para>
+    /// <para>
+    /// The per-bin coefficient is not uniform, so a single Scale cannot express it; the weights are
+    /// built once on the host and applied with an elementwise Multiply. Composed entirely from
+    /// primitives every backend implements, so no new kernels are needed on any of the six.
+    /// </para>
+    /// </remarks>
+    internal Tensor<T>? IrfftAdjointGpu<T>(Tensor<T> gradOutput, int numFreqs, int nFft, int outputLength, int[] inputShape)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
+        if (outputLength <= 0 || nFft <= 0 || numFreqs <= 0) return null;
+        if (gradOutput.Length % outputLength != 0) return null;
+        int batch = gradOutput.Length / outputLength;
+        if (batch <= 0) return null;
+
+        try
+        {
+            var gc = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufGrad = GetOrAllocateBuffer(backend, gc);
+            using var padRe = AllocateOutputBuffer(backend, batch * nFft);
+            using var padIm = AllocateOutputBuffer(backend, batch * nFft);
+            using var fftRe = AllocateOutputBuffer(backend, batch * nFft);
+            using var fftIm = AllocateOutputBuffer(backend, batch * nFft);
+            using var oneRe = AllocateOutputBuffer(backend, batch * numFreqs);
+            using var oneIm = AllocateOutputBuffer(backend, batch * numFreqs);
+            using var interleaved = AllocateOutputBuffer(backend, batch * numFreqs * 2);
+            using var scaled = AllocateOutputBuffer(backend, batch * numFreqs * 2);
+
+            // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
+            backend.Fill(padRe.Buffer, 0f, batch * nFft);
+            backend.Fill(padIm.Buffer, 0f, batch * nFft);
+            backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
+                System.Math.Min(outputLength, nFft));
+
+            // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
+            // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
+            backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
+
+            // Keep the one-sided bins.
+            backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
+            backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
+            backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
+
+            // c_k/nFft per bin, with the Nyquist imaginary slot zeroed.
+            var w = new float[batch * numFreqs * 2];
+            float invN = 1f / nFft;
+            for (int b = 0; b < batch; b++)
+            {
+                int rowBase = b * numFreqs * 2;
+                for (int k = 0; k < numFreqs; k++)
+                {
+                    float ck = (k == 0 || k == numFreqs - 1) ? 1f : 2f;
+                    w[rowBase + k * 2] = ck * invN;
+                    w[rowBase + k * 2 + 1] = (k == numFreqs - 1) ? 0f : ck * invN;
+                }
+            }
+            using var weights = GetOrAllocateBuffer(backend, (T[])(object)w);
+            backend.Multiply(interleaved.Buffer, weights.Buffer, scaled.Buffer, w.Length);
+            backend.Synchronize();
+
+            var result = DeferTensorResult<T>(backend, scaled.Buffer, w.Length, (int[])inputShape.Clone());
+            scaled.RelinquishOwnership();
+            return result;
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
     internal Tensor<T>? RfftAdjointGpu<T>(Tensor<T> gradOutput, int signalLength, int nFft, int[] inputShape)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
@@ -1202,8 +1283,30 @@ public partial class DirectGpuTensorEngine
         // gradient through engine.RFFT treated the inverse transform's transpose as a forward
         // transform, dropping the 1/N scaling and the Hermitian-doubling structure — the same
         // adjoint-vs-inverse defect fixed on the CPU side earlier in this branch.
+        //
+        // Prefers a GPU-EXECUTED adjoint, as RFFT above does, so the backward stays on the device the
+        // forward ran on. Recording BackwardFunctions.IRFFTAdjointBackward unconditionally meant every
+        // IRFFT training step materialised host arrays and ran the transform on the CPU even under the
+        // GPU engine. IrfftAdjointGpu returns null when the GPU path is unavailable and the managed
+        // adjoint takes over, so the gradient is identical either way — only the device differs.
         Autodiff.DifferentiableOps.RecordUnary("IRFFT", gpuResult, input,
-            Autodiff.BackwardFunctions<T>.IRFFTAdjointBackward,
+            static (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                int nf = (int)savedState[0];
+                int n = (int)savedState[1];
+                int outLen = (int)savedState[2];
+                if (engine is DirectGpuTensorEngine gpu)
+                {
+                    var gpuGrad = gpu.IrfftAdjointGpu(gradOutput, nf, n, outLen, inputs[0]._shape);
+                    if (gpuGrad is not null)
+                    {
+                        Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], gpuGrad, engine);
+                        return;
+                    }
+                }
+                Autodiff.BackwardFunctions<T>.IRFFTAdjointBackward(
+                    gradOutput, inputs, output, savedState, engine, grads);
+            },
             new object[] { numFreqs, nFft, outputLength });
         return gpuResult;
     }
