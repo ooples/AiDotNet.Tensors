@@ -3002,10 +3002,24 @@ public partial class CpuEngine : ITensorLevelEngine
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorAdd");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                return TensorBroadcastAdd(a, b);
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
@@ -5310,10 +5324,24 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                return TensorBroadcastSubtract(a, b);
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         // Pin the active gradient tape (if any) to THIS engine — same
         // reasoning as the scope.BindEngineIfUnset call below, but for the
@@ -5460,10 +5488,24 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
-            // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
-            return TensorBroadcastMultiply(a, b);
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                return TensorBroadcastMultiply(a, b);
+
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
@@ -6173,10 +6215,24 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                return TensorBroadcastDivide(a, b);
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
 
         // Lazy graph mode: record and return placeholder
@@ -12690,6 +12746,26 @@ public partial class CpuEngine : ITensorLevelEngine
 
         throw new ArgumentException(
             $"TensorMatMulFloatInto: unsupported rank combination {a.Rank} and {b.Rank}");
+    }
+
+    /// <summary>
+    /// Whether two shapes can be broadcast against each other under NumPy rules.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="ComputeBroadcastShape"/>'s compatibility test without allocating a result
+    /// shape or throwing, so the element-wise operators can ask the question cheaply before deciding
+    /// whether to stretch or to reject.
+    /// </remarks>
+    internal static bool CanBroadcast(int[] shape1, int[] shape2)
+    {
+        int maxRank = Math.Max(shape1.Length, shape2.Length);
+        for (int i = 0; i < maxRank; i++)
+        {
+            int dim1 = i < shape1.Length ? shape1[shape1.Length - 1 - i] : 1;
+            int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
+            if (dim1 != dim2 && dim1 != 1 && dim2 != 1) return false;
+        }
+        return true;
     }
 
     private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
