@@ -24,7 +24,19 @@ create table if not exists public.gpu_tuning_profiles (
     client_hash      text,                    -- pseudonymous reporter id (no PII)
     aidotnet_version text,
     recorded_at      timestamptz not null default now(),
-    constraint gpu_tuning_profiles_gflops_nonneg check (measured_gflops >= 0)
+    constraint gpu_tuning_profiles_gflops_nonneg check (measured_gflops >= 0),
+    constraint gpu_tuning_profiles_model_key_size check (octet_length(model_key) <= 512),
+    constraint gpu_tuning_profiles_vendor_size check (octet_length(vendor) <= 128),
+    constraint gpu_tuning_profiles_model_size check (octet_length(model) <= 256),
+    constraint gpu_tuning_profiles_architecture_size check (octet_length(architecture) <= 64),
+    constraint gpu_tuning_profiles_category_size check (octet_length(category) <= 128),
+    constraint gpu_tuning_profiles_kernel_name_size check (octet_length(kernel_name) <= 256),
+    constraint gpu_tuning_profiles_shape_key_size check (octet_length(shape_key) <= 1024),
+    constraint gpu_tuning_profiles_variant_size check (octet_length(variant) <= 256),
+    constraint gpu_tuning_profiles_client_hash_size check (octet_length(client_hash) <= 256),
+    constraint gpu_tuning_profiles_aidotnet_version_size check (octet_length(aidotnet_version) <= 128),
+    -- Five maximum-sized rows remain well below the client's 256 KiB response cap.
+    constraint gpu_tuning_profiles_parameters_size check (pg_column_size(parameters) <= 16384)
 );
 
 -- The exact lookup clients issue: (model_key, category, kernel_name, shape_key),
