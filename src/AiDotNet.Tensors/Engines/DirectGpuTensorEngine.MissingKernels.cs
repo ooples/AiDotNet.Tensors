@@ -3752,7 +3752,9 @@ public partial class DirectGpuTensorEngine
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (indices.Length != source.Length)
             throw new ArgumentException("indices and source must have the same element count");
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        // NOTE: deliberately does NOT bail on IsTapeActive — the tape node is recorded below with the
+        // same backward and saved state CpuEngine uses, so the kernel stays live during training.
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || !TryGetBackend(out var backend))
             return base.TensorPut(tensor, indices, source);
         try
@@ -3772,12 +3774,27 @@ public partial class DirectGpuTensorEngine
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var putResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
                 backend.IndexWrite(output, bufIdx.Buffer, bufSrc.Buffer, 0f, mode: 0,
                     outerSize: 1, idxAxis: count, innerSize: 1, dstAxis: n);
             });
+            // Same node CpuEngine.TensorPut records. Read the flattened indices off the CONTIGUOUS copy:
+            // the backward needs the same flat positions the kernel wrote to, and a non-contiguous
+            // `indices` would flatten in a different order.
+            //
+            // Guarded on IsTapeActive because GetFlattenedData FORCES A DOWNLOAD of device-resident
+            // indices. Doing it unconditionally cost a device-to-host round trip on every call and broke
+            // GpuCpuConsistencyTests.ResidentIndices_WriteOperationsStayOnDeviceAndPreserveOrdering.
+            if (IsTapeActive<T>())
+            {
+                DifferentiableOps.RecordBinary(
+                    "TensorPut", putResult, tensor, source,
+                    BackwardFunctions<T>.PutBackward,
+                    savedState: new object[] { ci.GetFlattenedData() });
+            }
+            return putResult;
         }
         catch (Exception)
         {
@@ -3859,7 +3876,9 @@ public partial class DirectGpuTensorEngine
             ScatterReduceMode.AMin => 3,
             _ => -1,
         };
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        // NOTE: deliberately does NOT bail on IsTapeActive — the tape node is recorded below with the
+        // same backward and saved state CpuEngine uses, so the kernel stays live during training.
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || !includeSelf || kmode < 0 || d < 0 || d >= rank
             || indices.Rank != rank || !ShapesEqual(indices._shape, source._shape) || !TryGetBackend(out var backend))
             return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf);
@@ -3877,11 +3896,22 @@ public partial class DirectGpuTensorEngine
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var scatterResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
                 backend.ScatterReduce(output, bufSrc.Buffer, bufIdx.Buffer, outerSize, srcDim, dstDim, innerSize, kmode);
             });
+            // Same node CpuEngine.TensorScatterReduce records, with the normalised dim and the flattened
+            // indices taken off the contiguous copy so they match what the kernel consumed. Guarded on
+            // IsTapeActive because GetFlattenedData forces a download of device-resident indices.
+            if (IsTapeActive<T>())
+            {
+                DifferentiableOps.RecordBinary(
+                    "TensorScatterReduce", scatterResult, tensor, source,
+                    BackwardFunctions<T>.ScatterReduceBackward,
+                    savedState: new object[] { d, ci.GetFlattenedData(), (int)mode, includeSelf });
+            }
+            return scatterResult;
         }
         catch (Exception) { return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf); }
     }
@@ -3894,7 +3924,9 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (source is null) throw new ArgumentNullException(nameof(source));
         int rank = tensor.Rank;
-        if (typeof(T) != typeof(float) || accumulate || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        // NOTE: deliberately does NOT bail on IsTapeActive — the tape node is recorded below with the
+        // same backward and saved state CpuEngine uses, so the kernel stays live during training.
+        if (typeof(T) != typeof(float) || accumulate || Compilation.GraphMode.IsActive
             || indices.Length != rank || tensor.Length > 16_777_216 || !TryGetBackend(out var backend))
             return base.TensorIndexPut(tensor, indices, source, accumulate);
 
@@ -3929,10 +3961,37 @@ public partial class DirectGpuTensorEngine
             var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
             var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
             using var inputBuffer = GetOrAllocateBuffer(backend, ct);
+
+            // CpuEngine saves the RESOLVED flat destination positions so the backward need not redo the
+            // index arithmetic. The kernel below computes those positions on the DEVICE, so recompute
+            // them host-side for the tape — guarded on IsTapeActive so inference pays nothing, and using
+            // the same row-major strides over tensor.Shape that CpuEngine.TensorIndexPut uses.
+            int[] ResolvePositions()
+            {
+                var strides = new int[rank];
+                int acc = 1;
+                for (int axis = rank - 1; axis >= 0; axis--) { strides[axis] = acc; acc *= tensor._shape[axis]; }
+                var positions = new int[count];
+                for (int axis = 0; axis < rank; axis++)
+                {
+                    var axisData = contiguousIndices[axis].GetDataArray();
+                    for (int i = 0; i < count; i++) positions[i] += axisData[i] * strides[axis];
+                }
+                return positions;
+            }
+
             if (count == 0)
-                return DispatchDeferredGpuOp<T>(backend, tensor.Length,
+            {
+                var emptyResult = DispatchDeferredGpuOp<T>(backend, tensor.Length,
                     (int[])tensor._shape.Clone(), output =>
                         backend.Copy(inputBuffer.Buffer, output, tensor.Length));
+                // No positions written, so the gradient is identity wrt tensor and empty wrt source.
+                DifferentiableOps.RecordBinary(
+                    "TensorIndexPut", emptyResult, tensor, source,
+                    BackwardFunctions<T>.IndexPutBackward,
+                    savedState: new object[] { System.Array.Empty<int>(), accumulate });
+                return emptyResult;
+            }
 
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             var indexBuffers = new OwnedBuffer[rank];
@@ -3958,7 +4017,7 @@ public partial class DirectGpuTensorEngine
 
                 using var nativePositions = ConvertNumericIndicesToInt32(
                     backend, flatPositions.Buffer, count);
-                return DispatchDeferredGpuOp<T>(backend, tensor.Length,
+                var indexPutResult = DispatchDeferredGpuOp<T>(backend, tensor.Length,
                     (int[])tensor._shape.Clone(), output =>
                     {
                         backend.Copy(inputBuffer.Buffer, output, tensor.Length);
@@ -3966,6 +4025,15 @@ public partial class DirectGpuTensorEngine
                             0f, mode: 0, outerSize: 1, idxAxis: count, innerSize: 1,
                             dstAxis: tensor.Length);
                     });
+                // Same node CpuEngine.TensorIndexPut records.
+                if (IsTapeActive<T>())
+                {
+                    DifferentiableOps.RecordBinary(
+                        "TensorIndexPut", indexPutResult, tensor, source,
+                        BackwardFunctions<T>.IndexPutBackward,
+                        savedState: new object[] { ResolvePositions(), accumulate });
+                }
+                return indexPutResult;
             }
             finally
             {
@@ -3986,7 +4054,9 @@ public partial class DirectGpuTensorEngine
         if (source is null) throw new ArgumentNullException(nameof(source));
         int rank = tensor.Rank;
         int d = dim < 0 ? dim + rank : dim;
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        // NOTE: deliberately does NOT bail on IsTapeActive — the tape node is recorded below with the
+        // same backward and saved state CpuEngine uses, so the kernel stays live during training.
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || d < 0 || d >= rank || source.Rank != rank
             || source._shape[d] != length || start < 0 || start + length > tensor._shape[d]
             || !TryGetBackend(out var backend))
@@ -4003,7 +4073,7 @@ public partial class DirectGpuTensorEngine
             int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= tensor._shape[k];
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var sliceResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
                 for (int outer = 0; outer < outerSize; outer++)
@@ -4013,6 +4083,12 @@ public partial class DirectGpuTensorEngine
                             output, (outer * dstAxis + start + i) * innerSize,
                             innerSize);
             });
+            // Same node CpuEngine.TensorSliceScatter records, with the normalised dim.
+            DifferentiableOps.RecordBinary(
+                "TensorSliceScatter", sliceResult, tensor, source,
+                BackwardFunctions<T>.SliceScatterBackward,
+                savedState: new object[] { d, start, length });
+            return sliceResult;
         }
         catch (Exception) { return base.TensorSliceScatter(tensor, source, dim, start, length); }
     }
@@ -4025,7 +4101,9 @@ public partial class DirectGpuTensorEngine
         int rank = tensor.Rank;
         int d = dim < 0 ? dim + rank : dim;
         int ix = index < 0 ? index + (d >= 0 && d < rank ? tensor._shape[d] : 0) : index;
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        // NOTE: deliberately does NOT bail on IsTapeActive — the tape node is recorded below with the
+        // same backward and saved state CpuEngine uses, so the kernel stays live during training.
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || d < 0 || d >= rank || source.Rank != rank - 1
             || ix < 0 || ix >= tensor._shape[d] || !TryGetBackend(out var backend))
             return base.TensorSelectScatter(tensor, source, dim, index);
@@ -4044,13 +4122,20 @@ public partial class DirectGpuTensorEngine
             int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= tensor._shape[k];
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var selResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
                 for (int outer = 0; outer < outerSize; outer++)
                     backend.Copy(bufSrc.Buffer, outer * innerSize,
                         output, (outer * dstAxis + ix) * innerSize, innerSize);
             });
+            // Same node CpuEngine.TensorSelectScatter records: normalised dim and index, and the
+            // CALLER's tensors (not the contiguous copies) so the tape links to what it was handed.
+            DifferentiableOps.RecordBinary(
+                "TensorSelectScatter", selResult, tensor, source,
+                BackwardFunctions<T>.SelectScatterBackward,
+                savedState: new object[] { d, ix });
+            return selResult;
         }
         catch (Exception) { return base.TensorSelectScatter(tensor, source, dim, index); }
     }
