@@ -47,7 +47,9 @@ public static class CommunityAutotune
             throw new ArgumentException("At least one local candidate is required.", nameof(localCandidates));
 
         KernelId kernelId = GpuFirstRunAutotuner.GpuKernelId(category, shareableKernelName, fingerprint);
-        bool useCommunity = exchange.IsEnabled && autotuneEnabled && localCandidates.Count >= 1;
+        // A single local candidate has no tuning decision to make. Keep that
+        // default path network-free exactly as the class contract promises.
+        bool useCommunity = exchange.IsEnabled && autotuneEnabled && localCandidates.Count > 1;
 
         IReadOnlyList<AutotuneCandidate> candidates = localCandidates;
         if (useCommunity && AutotuneCache.Lookup(kernelId, shape) is null)

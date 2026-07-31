@@ -159,6 +159,24 @@ public sealed class CommunityAutotuneTests : IDisposable
     }
 
     [Fact]
+    public void SingleLocalCandidate_DoesNotFetchOrMeasure()
+    {
+        var exchange = new InMemoryGpuTuningExchange();
+        exchange.Seed(Community("tile-32", 32, 9999.0));
+
+        AutotuneResolution r = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(),
+            new[] { ConvTileAutotune.CandidateFor(16) },
+            _ => throw new InvalidOperationException("single-candidate path must not benchmark"),
+            autotuneEnabled: true);
+
+        Assert.Equal("tile-16", r.Variant);
+        Assert.False(r.Measured);
+        Assert.Equal(0, exchange.FetchCount);
+        Assert.Empty(exchange.Published);
+    }
+
+    [Fact]
     public void MergeCommunityCandidates_PutsLocalFirst_Dedups_AndCaps()
     {
         IReadOnlyList<AutotuneCandidate> local = Local(); // tile-16, tile-32, tile-8
