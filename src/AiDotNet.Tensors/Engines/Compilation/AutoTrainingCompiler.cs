@@ -256,6 +256,12 @@ internal static class AutoTrainingCompiler
     /// (this returns <c>false</c>) rather than assuming they are step-invariant,
     /// since hashing them on every step would cost more than compiling saves.
     /// </para>
+    /// <para>
+    /// All inputs are covered, including the <see cref="TapeEntry{T}.InputsOverflow"/> array that
+    /// variadic ops use for inputs 4 and beyond; a constant hiding in an extra slot would otherwise
+    /// bypass the check completely. Each distinct leaf is walked at most once per call, since this
+    /// runs on every <c>ComputeGradients</c> and one constant often feeds many entries.
+    /// </para>
     /// </remarks>
     /// <param name="hash">The computed hash. Only meaningful when this returns <c>true</c>.</param>
     /// <returns>
@@ -273,10 +279,12 @@ internal static class AutoTrainingCompiler
 
         HashSet<Tensor<T>>? produced = null;
         HashSet<Tensor<T>>? parameters = null;
+        Dictionary<Tensor<T>, long>? leafValueHashes = null;
         if (sources is not null)
         {
             produced = new HashSet<Tensor<T>>(TensorIdentityComparer<T>.Instance);
             parameters = new HashSet<Tensor<T>>(TensorIdentityComparer<T>.Instance);
+            leafValueHashes = new Dictionary<Tensor<T>, long>(TensorIdentityComparer<T>.Instance);
             foreach (var source in sources)
             {
                 if (source is not null) parameters.Add(source);
@@ -299,14 +307,31 @@ internal static class AutoTrainingCompiler
                 }
             }
 
-            if (produced is not null && parameters is not null)
+            if (produced is not null && parameters is not null && leafValueHashes is not null)
             {
-                if (!TryHashLeafValue(entry.Input0, produced, parameters, ref hash)
-                    || !TryHashLeafValue(entry.Input1, produced, parameters, ref hash)
-                    || !TryHashLeafValue(entry.Input2, produced, parameters, ref hash))
+                if (!TryHashLeafValue(entry.Input0, produced, parameters, leafValueHashes, ref hash)
+                    || !TryHashLeafValue(entry.Input1, produced, parameters, leafValueHashes, ref hash)
+                    || !TryHashLeafValue(entry.Input2, produced, parameters, leafValueHashes, ref hash))
                 {
                     return false;
                 }
+
+                // Variadic ops (Concat, Stack, TensorAddMany) keep inputs 4+ ONLY here, and
+                // TapeEntry treats this array as the authoritative input list when it is set.
+                // Reading Input0-2 alone would let a data-derived constant in an extra slot
+                // escape the hash entirely - precisely the staleness this method exists to catch.
+                var overflow = entry.InputsOverflow;
+                if (overflow is not null)
+                {
+                    for (int j = 0; j < overflow.Length; j++)
+                    {
+                        if (!TryHashLeafValue(overflow[j], produced, parameters, leafValueHashes, ref hash))
+                        {
+                            return false;
+                        }
+                    }
+                }
+
                 if (entry.Output is not null) produced.Add(entry.Output);
             }
         }
@@ -338,10 +363,17 @@ internal static class AutoTrainingCompiler
     /// Folds a leaf constant's values into the hash. Returns false when the leaf is too large to
     /// hash, meaning the tape must not be compiled.
     /// </summary>
+    /// <param name="leafValueHashes">
+    /// Per-lookup memo of leaf digests. This runs on every <c>ComputeGradients</c>, and a single
+    /// constant is commonly an input to many entries; without the memo each occurrence re-walks
+    /// every element. The digest depends only on the leaf's contents, so one walk per distinct
+    /// leaf per lookup is sufficient.
+    /// </param>
     private static bool TryHashLeafValue<T>(
         Tensor<T>? candidate,
         HashSet<Tensor<T>> produced,
         HashSet<Tensor<T>> parameters,
+        Dictionary<Tensor<T>, long> leafValueHashes,
         ref long hash)
     {
         // Only LEAVES matter: anything an earlier entry produced is recomputed on replay.
@@ -350,20 +382,41 @@ internal static class AutoTrainingCompiler
         // Parameters legitimately change every step; the plan binds them by identity.
         if (parameters.Contains(candidate)) return true;
 
-        if (candidate.Length > MaxHashedConstantElements) return false;
+        if (!leafValueHashes.TryGetValue(candidate, out long valueHash))
+        {
+            if (candidate.Length > MaxHashedConstantElements) return false;
+
+            valueHash = ComputeLeafValueHash(candidate);
+            leafValueHashes[candidate] = valueHash;
+        }
+
+        // Folded at EVERY occurrence, not just the first: the digest is memoised, the position
+        // is not, so a constant moving between inputs still changes the overall hash.
+        hash ^= valueHash;
+        hash *= unchecked((long)0x100000001b3L);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Digest of a leaf's contents, independent of where it appears in the tape.
+    /// </summary>
+    private static long ComputeLeafValueHash<T>(Tensor<T> leaf)
+    {
+        long valueHash = unchecked((long)0xcbf29ce484222325L);
 
         // EqualityComparer<T>.Default dispatches without boxing for value types; calling
         // GetHashCode() on the element directly would allocate once per element, which on a
         // per-step hash of up to MaxHashedConstantElements values is a hot-path regression.
         var comparer = EqualityComparer<T>.Default;
-        for (int i = 0; i < candidate.Length; i++)
+        for (int i = 0; i < leaf.Length; i++)
         {
-            var value = candidate[i];
-            hash ^= value is null ? 0 : comparer.GetHashCode(value);
-            hash *= unchecked((long)0x100000001b3L);
+            var value = leaf[i];
+            valueHash ^= value is null ? 0 : comparer.GetHashCode(value);
+            valueHash *= unchecked((long)0x100000001b3L);
         }
 
-        return true;
+        return valueHash;
     }
 
     /// <summary>
@@ -386,7 +439,22 @@ internal static class AutoTrainingCompiler
     /// Null = use the env-or-1M default. Mirrors the established test-hook pattern
     /// (e.g. MixedPrecisionEmit.TestOverrideEnabled).
     /// </summary>
-    internal static long? TestMinForwardElementsOverride { get; set; }
+    /// <remarks>
+    /// Thread-scoped, matching the <see cref="_state"/> and <see cref="ReplayMode"/> it gates.
+    /// As a process-wide static it leaked across xunit collections, which run in parallel: while
+    /// any fixture held the gate at a tiny value, unrelated tests on other threads had their small
+    /// tapes become compile-eligible, so they intermittently exercised the replay path they were
+    /// never written for and failed depending on timing.
+    /// </remarks>
+    [ThreadStatic]
+    private static long? _testMinForwardElementsOverride;
+
+    /// <inheritdoc cref="_testMinForwardElementsOverride"/>
+    internal static long? TestMinForwardElementsOverride
+    {
+        get => _testMinForwardElementsOverride;
+        set => _testMinForwardElementsOverride = value;
+    }
 
     /// <summary>Effective size-gate threshold: the test override when set, else the env-or-1M default.</summary>
     private static long CompiledTrainingMinForwardElements

@@ -142,7 +142,65 @@ public class DataDerivedConstantHashTests : IDisposable
         // its cheap structure-only behaviour.
         long structureOnly = AutoTrainingCompiler.ComputeStructureHash(tape.Entries, tape.EntryCount);
 
-        Assert.NotEqual(0L, structureOnly);
+        // The real claim is INSENSITIVITY to constant values, which a non-zero check cannot make:
+        // an FNV hash is essentially never exactly zero whether or not value-sensitivity leaked in.
+        // Same structure, different constant, must hash the same.
+        var otherConstant = new Tensor<float>(new[] { 2, 2 });
+        for (int i = 0; i < otherConstant.Length; i++) otherConstant[i] = 99.0f;
+
+        using var otherTape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+        var otherLoss = _engine.ReduceSum(_engine.TensorMultiply(parameter, otherConstant), null);
+        long otherStructureOnly = AutoTrainingCompiler.ComputeStructureHash(otherTape.Entries, otherTape.EntryCount);
+
+        Assert.Equal(structureOnly, otherStructureOnly);
         GC.KeepAlive(loss);
+        GC.KeepAlive(otherLoss);
+    }
+
+    /// <summary>
+    /// Variadic ops (TensorAddMany, Concat, Stack) carry inputs 4+ in
+    /// <c>TapeEntry.InputsOverflow</c>, and TapeEntry treats that array as the authoritative input
+    /// list. A hash that reads only Input0-2 misses those slots entirely, so a data-derived
+    /// constant can hide in one and still reuse a stale plan - the exact bug this class guards,
+    /// just through a different door.
+    /// </summary>
+    [Fact]
+    public void ConstantInAVariadicOverflowSlot_ChangesTheHash()
+    {
+        var parameter = new Tensor<float>(new[] { 2, 2 });
+        for (int i = 0; i < parameter.Length; i++) parameter[i] = 1.0f;
+
+        long HashWithTrailingConstant(float trailingValue)
+        {
+            // Five inputs: past the three inline slots, so the tail lands in InputsOverflow.
+            var operands = new Tensor<float>[5];
+            for (int t = 0; t < operands.Length; t++)
+            {
+                operands[t] = new Tensor<float>(new[] { 2, 2 });
+                for (int i = 0; i < operands[t].Length; i++) operands[t][i] = 1.0f;
+            }
+
+            operands[0] = parameter;
+            // Last slot only reachable through the overflow array.
+            for (int i = 0; i < operands[4].Length; i++) operands[4][i] = trailingValue;
+
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+            var summed = _engine.TensorAddMany(operands);
+            var loss = _engine.ReduceSum(summed, null);
+
+            AutoTrainingCompiler.TryComputeStructureHash(
+                tape.Entries, tape.EntryCount, new[] { parameter }, out long hash);
+
+            GC.KeepAlive(loss);
+            return hash;
+        }
+
+        long hashA = HashWithTrailingConstant(2.0f);
+        long hashB = HashWithTrailingConstant(8.0f);
+
+        Assert.True(
+            hashA != hashB,
+            "A data-derived constant in a variadic op's overflow slot must change the plan key. " +
+            "Hashing only the three inline input slots lets it through unnoticed.");
     }
 }
