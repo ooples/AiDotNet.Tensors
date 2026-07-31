@@ -10,6 +10,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>Tests for the issue #840 softmax-family direct-PTX kernels.</summary>
+[Collection("DirectGpuSerial")]
 public class DirectPtxSoftmaxTests
 {
     [Fact]

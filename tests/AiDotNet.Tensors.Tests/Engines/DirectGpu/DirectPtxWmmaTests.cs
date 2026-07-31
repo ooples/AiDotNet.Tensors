@@ -10,6 +10,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("DirectGpuSerial")]
 public class DirectPtxWmmaTests
 {
     [SkippableTheory]
