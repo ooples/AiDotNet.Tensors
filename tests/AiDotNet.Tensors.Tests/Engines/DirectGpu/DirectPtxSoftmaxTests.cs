@@ -170,24 +170,7 @@ public class DirectPtxSoftmaxTests
 
         var random = RandomHelper.CreateSeededRandom(20265400 + m + n);
         float[] zHost = Values(random, m * n, 3.0f);
-        var expected = new float[m * n];
-        for (int row = 0; row < m; row++)
-        {
-            // Reference sorted closed form: tau = (sum_{i<=k} z_(i) - 1) / k.
-            var sorted = new double[n];
-            for (int col = 0; col < n; col++) sorted[col] = zHost[row * n + col];
-            Array.Sort(sorted);
-            Array.Reverse(sorted);
-            double cum = 0, tau = 0;
-            int k = 0;
-            for (int j = 0; j < n; j++)
-            {
-                cum += sorted[j];
-                if (1.0 + (j + 1) * sorted[j] > cum) { k = j + 1; tau = (cum - 1.0) / (j + 1); }
-            }
-            for (int col = 0; col < n; col++)
-                expected[row * n + col] = (float)Math.Max(zHost[row * n + col] - tau, 0.0);
-        }
+        float[] expected = SparsemaxReference(zHost, m, n);
 
         using var z = runtime.AllocateBytes((nuint)(zHost.Length * sizeof(float)));
         using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
@@ -743,19 +726,30 @@ public class DirectPtxSoftmaxTests
 
             // Sparsemax dispatches and projects onto the simplex (rows sum to 1).
             long beforeSparse = backend.DirectPtxSparsemaxDispatchCount;
-            backend.Sparsemax(inBuf, outBuf, m, n);
+            using var sparseBuf = backend.AllocateBuffer(m * n);
+            backend.Sparsemax(inBuf, sparseBuf, m, n);
             backend.Synchronize();
             Assert.True(backend.DirectPtxSparsemaxDispatchCount > beforeSparse, backend.DirectPtxLastError);
-            var sparse = backend.DownloadBuffer(outBuf);
+            var sparse = backend.DownloadBuffer(sparseBuf);
+            float[] sparseExpected = SparsemaxReference(xHost, m, n);
+            AssertVectorClose(sparse, sparseExpected, 2e-3f, "backend sparsemax route");
             for (int row = 0; row < m; row++)
             {
                 double rowSum = 0;
+                int exactZeros = 0;
                 for (int col = 0; col < n; col++)
                 {
-                    Assert.True(sparse[row * n + col] >= -1e-4f, "sparsemax output must be non-negative");
-                    rowSum += sparse[row * n + col];
+                    int index = row * n + col;
+                    Assert.True(sparse[index] >= 0f, "sparsemax output must be non-negative");
+                    if (sparseExpected[index] == 0f)
+                    {
+                        Assert.Equal(0f, sparse[index]);
+                        exactZeros++;
+                    }
+                    rowSum += sparse[index];
                 }
                 Assert.True(Math.Abs(rowSum - 1.0) < 3e-3, $"sparsemax row {row} sums to {rowSum}, expected 1");
+                Assert.True(exactZeros > 0, $"sparsemax row {row} produced no exact zeros");
             }
         }
         finally
@@ -891,6 +885,31 @@ public class DirectPtxSoftmaxTests
         for (int i = 0; i < count; i++)
             data[i] = (float)((random.NextDouble() * 2.0 - 1.0) * magnitude);
         return data;
+    }
+
+    private static float[] SparsemaxReference(float[] input, int rows, int cols)
+    {
+        var expected = new float[input.Length];
+        for (int row = 0; row < rows; row++)
+        {
+            // Sorted closed form: tau = (sum_{i<=k} z_(i) - 1) / k.
+            var sorted = new double[cols];
+            for (int col = 0; col < cols; col++) sorted[col] = input[row * cols + col];
+            Array.Sort(sorted);
+            Array.Reverse(sorted);
+            double cumulative = 0;
+            double tau = 0;
+            for (int index = 0; index < cols; index++)
+            {
+                cumulative += sorted[index];
+                if (1.0 + (index + 1) * sorted[index] > cumulative)
+                    tau = (cumulative - 1.0) / (index + 1);
+            }
+            for (int col = 0; col < cols; col++)
+                expected[row * cols + col] =
+                    (float)Math.Max(input[row * cols + col] - tau, 0.0);
+        }
+        return expected;
     }
 
     private static void AssertVectorClose(float[] actual, float[] expected, float tolerance, string what)
