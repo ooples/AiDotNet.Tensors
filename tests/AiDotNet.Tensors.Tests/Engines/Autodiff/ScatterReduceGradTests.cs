@@ -87,6 +87,12 @@ public class ScatterReduceGradTests
     [InlineData(ScatterReduceMode.Prod, false)]
     [InlineData(ScatterReduceMode.AMax, true)]
     [InlineData(ScatterReduceMode.AMin, true)]
+    // includeSelf: false resets each touched slot to a MODE-SPECIFIC identity before reducing —
+    // MinValue for AMax and MaxValue for AMin (CpuEngine.Parity210). That reset changes which
+    // contributor wins the slot, and therefore which input the gradient routes to, so it is the one
+    // forward branch with mode-specific behaviour that no gradient test covered.
+    [InlineData(ScatterReduceMode.AMax, false)]
+    [InlineData(ScatterReduceMode.AMin, false)]
     public void AllModes_GradientMatchesFiniteDifferences(ScatterReduceMode mode, bool includeSelf)
         => CheckFiniteDifferences(mode, includeSelf, $"{mode}/self={includeSelf}");
 
@@ -153,7 +159,11 @@ public class ScatterReduceGradTests
         tape.BindEngineIfUnset(_engine);
         var w = Vals([3, 1], 1.0);
         var outT = _engine.TensorScatterReduce(tensor, 0, AllToRowZero(), source, ScatterReduceMode.AMax, true);
-        Assert.Equal(1.4, outT[0]);              // max(0.6, 0.4, 0.9, 1.4)
+        // Tolerance overload, as the sibling assertion below already uses: outT[0] is ACCUMULATED as
+        // 0.4 + 2*0.5 inside Vals rather than written as the literal 1.4, so exact equality depends on
+        // round-to-even landing on the same double. True today, but brittle to any change in how Vals
+        // accumulates.
+        Assert.Equal(1.4, outT[0], 12);           // max(0.6, 0.4, 0.9, 1.4)
         var loss = _engine.ReduceSum(_engine.TensorMultiply(outT, w), null);
         var grads = tape.ComputeGradients(loss, [tensor, source]);
 

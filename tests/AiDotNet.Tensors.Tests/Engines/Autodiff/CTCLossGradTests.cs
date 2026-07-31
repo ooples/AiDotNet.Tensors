@@ -129,6 +129,43 @@ public class CTCLossGradTests
     }
 
     /// <summary>
+    /// The same closed form with N &gt; 1, which is what actually exercises the batch stride.
+    /// </summary>
+    /// <remarks>
+    /// Every other test here uses N = 1, where the flat index <c>t * C + c</c> happens to equal the
+    /// correct <c>(t * N + n) * C + c</c>. A backward that indexes the batch axis wrongly therefore
+    /// passes all of them. With N = 2 the two disagree from t = 1 onward, so this is the assertion that
+    /// can actually catch it. The two sequences are given DIFFERENT target lengths (3 and 2) so a
+    /// backward that reused one sequence's alpha/beta lattice for both cannot satisfy it either.
+    /// </remarks>
+    [Fact]
+    public void PerTimestepGradientSum_IsExactlyMinusOne_Batched()
+    {
+        const int T = 5, N = 2, C = 4;
+        var logProbs = LogProbs(T, N, C, seed: 21);
+        // Concatenated: sequence 0 is [1,3,2] (length 3), sequence 1 is [2,1] (length 2).
+        var targets = Targets(1, 3, 2, 2, 1);
+
+        using var tape = new GradientTape<double>();
+        tape.BindEngineIfUnset(_engine);
+        var loss = _engine.ReduceSum(
+            _engine.TensorCTCLoss(logProbs, targets, [T, T], [3, 2], 0), null);
+        var grads = tape.ComputeGradients(loss, [logProbs]);
+        var g = grads[logProbs];
+
+        for (int t = 0; t < T; t++)
+        {
+            for (int n = 0; n < N; n++)
+            {
+                double sum = 0;
+                for (int c = 0; c < C; c++) sum += g![(t * N + n) * C + c];
+                _out.WriteLine($"t={t} n={n} sum over classes = {sum:G12}");
+                Assert.Equal(-1.0, sum, 10);
+            }
+        }
+    }
+
+    /// <summary>
     /// A class that appears neither in the target sequence nor as the blank has posterior 0 at every
     /// timestep, so its gradient must be exactly 0. The old formula gave it prob[t,k] &gt; 0 —
     /// gradient pushing on a class the loss does not depend on.
