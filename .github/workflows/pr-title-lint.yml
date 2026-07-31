@@ -13,30 +13,75 @@ concurrency:
   group: pr-title-lint-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# contents: read is used for exactly one thing — reading release-please-config.json from the base
+# branch. The job makes no API calls and reports through core.info / core.setFailed, so no other
+# scope (notably pull-requests) is granted.
 permissions:
-  pull-requests: read
   contents: read
 
 jobs:
   lint-title:
     name: Validate PR title
     runs-on: ubuntu-latest
-    # release-please maintains its own PRs; don't lint those.
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # Deliberately no release-please exemption. Its default PR title is "chore(main): release
+    # 1.2.3", already a valid conventional commit that passes this lint, so an exemption buys
+    # nothing — and one keyed on the branch name would be a bypass, since any contributor can
+    # open a PR from a branch named release-please--anything to skip a required check.
     steps:
+      - name: Read accepted types from release-please config
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        with:
+          # Base branch, NOT the PR head: the config is the authority on what this check accepts,
+          # so a PR must not be able to widen the rules it is being judged by.
+          ref: ${{ github.base_ref }}
+          sparse-checkout: release-please-config.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Check conventional-commit format
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
+            const fs = require('fs');
+
+            // Derived from release-please-config.json rather than duplicated here. A second
+            // hand-maintained list drifts silently, and both directions are damaging: a type
+            // release-please handles gets rejected, or a type it ignores is accepted and quietly
+            // produces no release.
+            let sections;
+            try {
+              const config = JSON.parse(fs.readFileSync('release-please-config.json', 'utf8'));
+              sections = config['changelog-sections'];
+            } catch (error) {
+              core.setFailed(`Could not read release-please-config.json: ${error.message}`);
+              return;
+            }
+
+            if (!Array.isArray(sections) || sections.length === 0) {
+              core.setFailed(
+                'release-please-config.json has no changelog-sections, so the set of valid commit ' +
+                'types is unknown. Refusing to pass the title rather than accept anything.'
+              );
+              return;
+            }
+
+            const types = sections.map(s => s && s.type).filter(Boolean);
+            if (types.length === 0) {
+              core.setFailed('release-please-config.json changelog-sections contain no types.');
+              return;
+            }
+
             const title = context.payload.pull_request.title || '';
-            // Types kept in sync with release-please-config.json changelog-sections.
-            const types = ['feat','fix','perf','revert','refactor','build','ci','docs','chore','style','test'];
-            const pattern = new RegExp('^(' + types.join('|') + ')(\\([^)]+\\))?!?: .+');
+            const escaped = types.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+            const pattern = new RegExp('^(' + escaped.join('|') + ')(\\([^)]+\\))?!?: .+');
             if (pattern.test(title)) {
               core.info(`PR title OK: ${title}`);
               return;
             }
-            const releasing = ['feat','fix','perf','revert','refactor','build','docs'];
+
+            // "hidden" sections are the ones release-please keeps out of the changelog and that
+            // therefore do not cut a release.
+            const releasing = sections.filter(s => s && s.type && !s.hidden).map(s => s.type);
             core.setFailed(
               `PR title is not a Conventional Commit: "${title}"\n\n` +
               `Squash-merge uses the PR title as the commit subject, and release-please only cuts a\n` +
@@ -44,6 +89,6 @@ jobs:
               `release PRs from being created.\n\n` +
               `Use: <type>(optional-scope): <description>\n` +
               `  Allowed types: ${types.join(', ')}\n` +
-              `  Trigger a release: ${releasing.join(', ')}  (chore/ci/style/test do not)\n` +
+              `  Trigger a release: ${releasing.join(', ')}  (others do not)\n` +
               `  Examples: "feat(gpu): add paged attention", "fix(ci): repair release workflow"`
             );
