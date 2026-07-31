@@ -56,9 +56,9 @@ internal static class OpReplay
             OpType.TensorMatMul   => engine.TensorMatMul(inputs[0], inputs[1]),
 
             // ── Broadcast binary ────────────────────────────────────
-            OpType.TensorBroadcastAdd      => engine.TensorBroadcastAdd(inputs[0], inputs[1]),
-            OpType.TensorBroadcastSubtract => engine.TensorBroadcastSubtract(inputs[0], inputs[1]),
-            OpType.TensorBroadcastMultiply => engine.TensorBroadcastMultiply(inputs[0], inputs[1]),
+            OpType.TensorBroadcastAdd      => engine.TensorAdd(inputs[0], inputs[1]),
+            OpType.TensorBroadcastSubtract => engine.TensorSubtract(inputs[0], inputs[1]),
+            OpType.TensorBroadcastMultiply => engine.TensorMultiply(inputs[0], inputs[1]),
 
             // ── Batch MatMul ────────────────────────────────────────
             OpType.BatchMatMul => engine.TensorBatchMatMul(inputs[0], inputs[1]),
@@ -155,6 +155,6 @@ internal static class OpReplay
     {
         // Decomposes to MatMul + optional BroadcastAdd. Mirror of RebuildFusedLinear.
         var r = engine.TensorMatMul(inputs[0], inputs[1]);
-        return inputs.Length > 2 ? engine.TensorBroadcastAdd(r, inputs[2]) : r;
+        return inputs.Length > 2 ? engine.TensorAdd(r, inputs[2]) : r;
     }
 }

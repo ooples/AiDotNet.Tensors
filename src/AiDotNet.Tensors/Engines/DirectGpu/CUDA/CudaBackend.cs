@@ -11952,7 +11952,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         // The registered kernel is "broadcast_mul_last". This looked up "broadcast_multiply_last_axis",
         // which is never defined or registered anywhere, so EVERY call threw kernel-not-found and
-        // DirectGpuTensorEngine.TensorBroadcastMultiply swallowed it in its bare catch -> silent CPU
+        // DirectGpuTensorEngine.TensorMultiply swallowed it in its bare catch -> silent CPU
         // result. The hollow-override check missed it because that only counts the THROWING kernel-cache
         // indexer; this used TryGetValue, so no miss was ever recorded. Note the asymmetry that hid it:
         // broadcast_multiply_FIRST_axis does exist, so only the last-axis lookup was dangling.

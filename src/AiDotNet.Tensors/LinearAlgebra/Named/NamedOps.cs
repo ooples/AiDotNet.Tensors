@@ -20,12 +20,12 @@ public static class NamedOps
     /// <summary>Element-wise add — broadcasts by name. <paramref name="b"/>'s
     /// names must be a subset of <paramref name="a"/>'s; missing names
     /// are inserted as size-1 broadcast axes. Routes through
-    /// <c>TensorBroadcastAdd</c> so size-1 broadcast dims expand
+    /// <c>TensorAdd</c> so size-1 broadcast dims expand
     /// without an explicit tile copy.</summary>
     public static NamedTensor<T> Add<T>(NamedTensor<T> a, NamedTensor<T> b)
     {
         var (aligned, namesOut) = AlignForBroadcast(a, b);
-        var result = Engine.TensorBroadcastAdd(a.Tensor, aligned);
+        var result = Engine.TensorAdd(a.Tensor, aligned);
         return new NamedTensor<T>(result, namesOut);
     }
 
@@ -54,7 +54,7 @@ public static class NamedOps
         }
         // Copy source into a target-shape tensor, broadcasting any size-1
         // axes. Cheap fallback for the multiply path; ops that already
-        // broadcast natively (Add via TensorBroadcastAdd) skip this.
+        // broadcast natively (Add via TensorAdd) skip this.
         var result = new Tensor<T>(targetShape);
         var srcStrides = ComputeStrides(source._shape);
         var dstSpan = result.AsWritableSpan();

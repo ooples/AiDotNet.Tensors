@@ -6095,7 +6095,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // TensorBroadcastAdd forward: route compiled-plan replay through
+        // TensorAdd forward: route compiled-plan replay through
         // a copy-into-output + TensorBroadcastAddInPlace pair instead of the
         // generic "allocate fresh result + memcpy into plan output" closure.
         // Used in every SD UNet ResBlock for the time-embedding conditioning
@@ -6137,7 +6137,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 a.AsSpan().CopyTo(o.AsWritableSpan());
                 if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, b);
-                else { var r = eng.TensorBroadcastAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
+                else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
             };
         }
 

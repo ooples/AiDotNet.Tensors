@@ -53,9 +53,9 @@ internal static class OpSerializationRegistry<T>
             OpType.TensorMatMul   => Binary(inputs, (e, a, b) => e.TensorMatMul(a, b)),
 
             // ── Broadcast binary ────────────────────────────────────────
-            OpType.TensorBroadcastAdd      => Binary(inputs, (e, a, b) => e.TensorBroadcastAdd(a, b)),
-            OpType.TensorBroadcastSubtract => Binary(inputs, (e, a, b) => e.TensorBroadcastSubtract(a, b)),
-            OpType.TensorBroadcastMultiply => Binary(inputs, (e, a, b) => e.TensorBroadcastMultiply(a, b)),
+            OpType.TensorBroadcastAdd      => Binary(inputs, (e, a, b) => e.TensorAdd(a, b)),
+            OpType.TensorBroadcastSubtract => Binary(inputs, (e, a, b) => e.TensorSubtract(a, b)),
+            OpType.TensorBroadcastMultiply => Binary(inputs, (e, a, b) => e.TensorMultiply(a, b)),
 
             // ── Batch MatMul ────────────────────────────────────────────
             OpType.BatchMatMul => Binary(inputs, (e, a, b) => e.TensorBatchMatMul(a, b)),
@@ -389,7 +389,7 @@ internal static class OpSerializationRegistry<T>
             var r = eng.TensorMatMul(input, weight);
             if (bias is not null)
             {
-                var added = eng.TensorBroadcastAdd(r, bias);
+                var added = eng.TensorAdd(r, bias);
                 added.AsSpan().CopyTo(output.AsWritableSpan());
             }
             else

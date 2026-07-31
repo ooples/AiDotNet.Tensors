@@ -2492,7 +2492,22 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </para>
     /// </summary>
     /// <summary>Element-wise binary operation kind for the broadcast fast path.</summary>
-    private enum BroadcastOp { Add, Subtract, Multiply }
+    private enum BroadcastOp { Add, Subtract, Multiply, Divide }
+
+    /// <summary>
+    /// Writes <c>a op b</c> into <paramref name="result"/> using the coalescing SIMD kernel,
+    /// consuming non-contiguous operands where they lie.
+    /// </summary>
+    /// <remarks>
+    /// The engine's element-wise ops call this for their strided path. Walking operands element by
+    /// element through <c>LogicalToStorageIndex</c> instead costs roughly 7x on a Conv+BN shape,
+    /// which implicit broadcasting turned from a rare case into the common one.
+    /// </remarks>
+    internal static void ElementwiseInto(Tensor<T> a, Tensor<T> b, Tensor<T> result, int op)
+        => BroadcastElementwise(a, b, result, result._shape, (BroadcastOp)op);
+
+    /// <summary>Op selectors for <see cref="ElementwiseInto"/>, mirroring <c>BroadcastOp</c>.</summary>
+    internal const int OpAdd = 0, OpSubtract = 1, OpMultiply = 2, OpDivide = 3;
 
     private static void BroadcastElementwise(
         Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)
@@ -2601,6 +2616,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             BroadcastOp.Add => _numOps.Add(x, y),
             BroadcastOp.Subtract => _numOps.Subtract(x, y),
             BroadcastOp.Multiply => _numOps.Multiply(x, y),
+            BroadcastOp.Divide => _numOps.Divide(x, y),
             _ => _numOps.Multiply(x, y),
         };
 
@@ -2772,6 +2788,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             BroadcastOp.Add => x + y,
             BroadcastOp.Subtract => x - y,
             BroadcastOp.Multiply => x * y,
+            BroadcastOp.Divide => x / y,
             _ => x * y,
         };
 
@@ -2782,14 +2799,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             BroadcastOp.Add => x + y,
             BroadcastOp.Subtract => x - y,
             BroadcastOp.Multiply => x * y,
+            BroadcastOp.Divide => x / y,
             _ => x * y,
         };
 
     private static float ScalarFloat(BroadcastOp op, float x, float y)
-        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, _ => x * y };
+        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, BroadcastOp.Divide => x / y, _ => x * y };
 
     private static double ScalarDouble(BroadcastOp op, double x, double y)
-        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, _ => x * y };
+        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, BroadcastOp.Divide => x / y, _ => x * y };
 #endif
 
     /// <summary>
@@ -3772,7 +3790,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // engine — regardless of which engine the caller actually invoked. On a
         // GPU-auto-detect host AiDotNetEngine.Current is DirectGpuTensorEngine,
         // which computes elementwise arithmetic in single precision on consumer
-        // GPUs. So CpuEngine.TensorBroadcastAdd — whose generic fallback calls
+        // GPUs. So CpuEngine.TensorAdd — whose generic fallback calls
         // this method — silently returned ~8 significant digits in a
         // Tensor<double> even though the caller held an explicit CpuEngine.
         // Delegating also recorded a spurious second "TensorAdd" tape entry for
@@ -3864,7 +3882,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // delegating to Subtract(other), which would dispatch to the process-GLOBAL
         // AiDotNetEngine.Current and compute in single precision on a GPU host.
         // See BroadcastAdd for the full rationale — this was the defect behind
-        // TensorBroadcastSubtract<double> returning float-precision differences.
+        // TensorSubtract<double> returning float-precision differences.
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = TensorAllocator.Rent<T>(broadcastShape);
         BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Subtract);

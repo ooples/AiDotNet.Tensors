@@ -3066,15 +3066,16 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
-        // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
-        // IMPORTANT: use _storage.GetDataArray() (raw backing array) not tensor.GetDataArray() (which copies for views)
+        // Stride-aware: a non-contiguous operand is consumed where it lies, never materialized.
+        //
+        // Routed to the coalescing SIMD kernel rather than walked element-by-element through
+        // LogicalToStorageIndex. The per-element walk was affordable while only the occasional
+        // transposed operand reached here; implicit broadcasting sends every stretched operand down
+        // this branch as a stride-0 view. Measured on [1,64,112,112] + [1,64,1,1] — the Conv+BN
+        // shape the broadcast fast paths exist for — the walk cost 78.2 ms/call against 10.8 ms.
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aRaw = a._storage.GetDataArray(); var bRaw = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[aOff + i], bRaw[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[b.LogicalToStorageIndex(i)]); }
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpAdd);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -5404,9 +5405,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpSubtract);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -5561,9 +5562,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpMultiply);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -6282,9 +6283,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpDivide);
         }
         else if (typeof(T) == typeof(float))
         {

@@ -240,7 +240,7 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 {
                     result = eng.DepthwiseConv2D(capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings);
-                    result = eng.TensorBroadcastAdd(result, capturedFusedBias);
+                    result = eng.TensorAdd(result, capturedFusedBias);
                 }
                 else if (capturedActivation != FusedActivationType.None)
                     result = eng.FusedConv2D(capturedInput, capturedFusedWeights, capturedFusedBias,
@@ -251,7 +251,7 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 {
                     result = eng.Conv2D(capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings, capturedDilations);
-                    result = eng.TensorBroadcastAdd(result, capturedFusedBias);
+                    result = eng.TensorAdd(result, capturedFusedBias);
                 }
 
                 result.AsSpan().CopyTo(output.AsWritableSpan());
