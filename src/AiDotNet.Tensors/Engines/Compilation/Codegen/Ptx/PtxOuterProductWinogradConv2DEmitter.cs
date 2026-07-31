@@ -30,7 +30,6 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     private const int UStride = 36;
     private const int BlockThreads = 256;
     private const int UElements = BlockChannels * TransformElements * UStride;
-    private const int WorkspaceElementStride = 17;
 
     private readonly StringBuilder _body = new(131072);
     private readonly CodegenOuterProductWinogradSchedule _schedule;
@@ -58,13 +57,17 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     private int MicroGroups => MGroups * TileGroups;
     private int ActiveComputeThreads => TransformElements * MicroGroups;
     private int VStride => BlockTiles + 4;
-    private int VElements => BlockChannels * TransformElements * VStride;
+    private int VChannelStride => TransformElements * VStride +
+        (_schedule.DenseVProducers ? 28 : 0);
+    private int VElements => BlockChannels * VChannelStride;
     private int VByteOffset => UElements * sizeof(float);
     private int BufferBytes => (UElements + VElements) * sizeof(float);
     private int DoubleBufferBytes => BufferBytes * 2;
     private int WorkspaceGroups => MicroGroups;
     private int CompactWorkspaceGroups => WorkspaceGroups / 2;
-    private int WorkspaceGroupStride => AccumulatorElements * WorkspaceElementStride + 10;
+    private int WorkspaceElementStride => _schedule.TileGroupWarps ? 19 : 17;
+    private int WorkspaceGroupStride => AccumulatorElements * WorkspaceElementStride +
+        (_schedule.TileGroupWarps ? 0 : 10);
     private int WorkspaceBytes => WorkspaceGroups * WorkspaceGroupStride * sizeof(float);
     private int CompactWorkspaceBytes =>
         CompactWorkspaceGroups * WorkspaceGroupStride * sizeof(float);
@@ -137,10 +140,25 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         EmitQuotient("%r3", "%r1", TilePartitions, null);
         EmitRemainder("%r4", "%r3", quadrants, "quadrant");
         EmitQuotient("%r5", "%r3", quadrants, "batch");
-        EmitQuotient("%r6", "%r0", MicroGroups, "transform component");
-        EmitRemainder("%r7", "%r0", MicroGroups, "8x8 microtile group");
-        EmitRemainder("%r8", "%r7", MGroups, "M group");
-        EmitQuotient("%r9", "%r7", MGroups, "tile group");
+        if (_schedule.TileGroupWarps)
+        {
+            L("shr.u32 %r9, %r0, 6;                 // tile group: two complete warps");
+            L("and.b32 %r7, %r0, 63;");
+            L("shr.u32 %r6, %r7, 2;                 // transform component");
+            L($"and.b32 %r8, %r7, {I(MGroups - 1)}; // M group");
+            L($"mad.lo.u32 %r7, %r9, {I(MGroups)}, %r8; // canonical microtile group");
+            L("setp.eq.u32 %p13, %r2, 1;");
+            L($"setp.eq.u32 %p15, %r9, {I(TileGroups - 1)};");
+            L("and.pred %p13, %p13, %p15;");
+            L("not.pred %p15, %p13;                 // retire padded tile-group warps");
+        }
+        else
+        {
+            EmitQuotient("%r6", "%r0", MicroGroups, "transform component");
+            EmitRemainder("%r7", "%r0", MicroGroups, "8x8 microtile group");
+            EmitRemainder("%r8", "%r7", MGroups, "M group");
+            EmitQuotient("%r9", "%r7", MGroups, "tile group");
+        }
         EmitQuotient("%r10", "%r4", quadrantColumns, null);
         L($"mul.lo.u32 %r10, %r10, {I(PhysicalMicroTiles)};" +
           "                 // quadrant tile row");
@@ -291,8 +309,17 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             L($"add.rn.f32 %f130, %f{I(x1)}, %f{I(x2)};");
             L($"sub.rn.f32 %f131, %f{I(x2)}, %f{I(x1)};");
             L($"sub.rn.f32 %f132, %f{I(x1)}, %f{I(x3)};");
-            L($"mad.lo.u32 %r19, %r26, 16, {I(row * 4)};");
-            L($"mad.lo.u32 %r19, %r19, {I(VStride)}, %r27;");
+            if (_schedule.DenseVProducers)
+            {
+                L($"mad.lo.u32 %r19, %r26, {I(VChannelStride)}, " +
+                  $"{I(row * 4 * VStride)};");
+                L("add.u32 %r19, %r19, %r27;");
+            }
+            else
+            {
+                L($"mad.lo.u32 %r19, %r26, 16, {I(row * 4)};");
+                L($"mad.lo.u32 %r19, %r19, {I(VStride)}, %r27;");
+            }
             L("mul.wide.u32 %rd5, %r19, 4;");
             L("add.u64 %rd5, %rd6, %rd5;");
             for (int component = 0; component < 4; component++)
@@ -332,50 +359,81 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             L($"add.rn.f32 %f133, %f133, %f{I(a + 2)};");
             L("mul.rn.f32 %f98, %f133, 0f3F000000;");
             L($"mov.f32 %f99, %f{I(a + 2)};");
+
+            int firstComponent = row * 4;
+            int skew = ((firstComponent >> 2) & (MGroups - 1)) * MicroM;
+            L($"mov.u32 %r16, {I(skew)};");
+            L("xor.b32 %r16, %r13, %r16;");
+            L($"mad.lo.u32 %r19, %r14, {I(TransformElements)}, {I(firstComponent)};");
+            L($"mad.lo.u32 %r19, %r19, {I(UStride)}, %r16;");
+            L("mul.wide.u32 %rd5, %r19, 4;");
+            L($"mov.u64 %rd6, {bufferBase};");
+            L("add.u64 %rd5, %rd6, %rd5;");
             for (int column = 0; column < 4; column++)
-            {
-                int component = row * 4 + column;
-                L($"shl.b32 %r16, {I(component >> 2)}, 3;");
-                L("xor.b32 %r16, %r13, %r16;");
-                L($"mad.lo.u32 %r19, %r14, {I(TransformElements)}, {I(component)};");
-                L($"mad.lo.u32 %r19, %r19, {I(UStride)}, %r16;");
-                L("mul.wide.u32 %rd5, %r19, 4;");
-                L($"mov.u64 %rd6, {bufferBase};");
-                L("add.u64 %rd5, %rd6, %rd5;");
-                L($"st.shared.f32 [%rd5], %f{I(96 + column)};");
-            }
+                L($"st.shared.f32 [%rd5+{I(column * UStride * sizeof(float))}], " +
+                  $"%f{I(96 + column)};");
         }
     }
 
     private void EmitVGeometry(CodegenTiledConv2DPlan plan)
     {
-        L($"setp.lt.u32 %p14, %r0, {I(BlockChannels * BlockTiles)};");
-        EmitQuotient("%r26", "%r0", BlockTiles, "V producer C");
-        L($"and.b32 %r27, %r0, {I(BlockTiles - 1)};    // V producer tile");
-        if (BlockTiles == 16)
+        if (_schedule.DenseVProducers)
         {
-            // Interleave physical 7x7 tiles across four CTAs. A contiguous 16-slot
-            // partition would leave its final CTA with only one useful tile; this
-            // mapping balances the grid 13/12/12/12 instead.
-            L($"and.b32 %r28, %r27, {I(MicroTiles - 1)};");
-            L($"setp.lt.u32 %p13, %r28, {I(PhysicalMicroTiles)};");
-            L($"shr.u32 %r29, %r27, {I(PowerOfTwoShift(MicroTiles))};");
-            L($"mad.lo.u32 %r28, %r29, {I(PhysicalMicroTiles)}, %r28;");
-            L($"mad.lo.u32 %r28, %r28, {I(TilePartitions)}, %r2;");
-            L($"setp.lt.u32 %p4, %r28, {I(PhysicalTilesPerQuadrant)};");
-            L("and.pred %p4, %p4, %p13;              // physical tile");
+            L("setp.eq.u32 %p13, %r2, 0;");
+            L("@!%p13 bra DENSE_V_PARTITION_1;");
+            L($"setp.lt.u32 %p14, %r0, {I(BlockChannels * 28)};");
+            L("mul.lo.u32 %r26, %r0, 2341;");
+            L("shr.u32 %r26, %r26, 16;               // dense V producer C /28");
+            L("mad.lo.s32 %r28, %r26, -28, %r0;");
             L($"mul.lo.u32 %r29, %r28, {I(PhysicalMicroTilesReciprocal)};");
             L($"shr.u32 %r29, %r29, {I(ReciprocalShift)};");
             L($"mad.lo.s32 %r30, %r29, -{I(PhysicalMicroTiles)}, %r28;");
+            L($"mad.lo.u32 %r27, %r29, {I(MicroTiles)}, %r30; // shared V tile");
+            L("and.pred %p4, %p14, %p14;");
+            L("bra DENSE_V_GEOMETRY_DONE;");
+            L("DENSE_V_PARTITION_1:");
+            L($"setp.lt.u32 %p14, %r0, {I(BlockChannels * 21)};");
+            L("mul.lo.u32 %r26, %r0, 3121;");
+            L("shr.u32 %r26, %r26, 16;               // dense V producer C /21");
+            L("mad.lo.s32 %r28, %r26, -21, %r0;");
+            L($"mul.lo.u32 %r29, %r28, {I(PhysicalMicroTilesReciprocal)};");
+            L($"shr.u32 %r29, %r29, {I(ReciprocalShift)};");
+            L($"mad.lo.s32 %r30, %r29, -{I(PhysicalMicroTiles)}, %r28;");
+            L($"mad.lo.u32 %r27, %r29, {I(MicroTiles)}, %r30; // shared V tile");
+            L("add.u32 %r29, %r29, 4;");
+            L("and.pred %p4, %p14, %p14;");
+            L("DENSE_V_GEOMETRY_DONE:");
         }
         else
         {
-            L($"mad.lo.u32 %r28, %r2, {I(BlockTiles)}, %r27;");
-            L($"shr.u32 %r29, %r28, {I(PowerOfTwoShift(MicroTiles))};");
-            L($"and.b32 %r30, %r28, {I(MicroTiles - 1)};");
-            L($"setp.lt.u32 %p4, %r29, {I(PhysicalMicroTiles)};");
-            L($"setp.lt.u32 %p13, %r30, {I(PhysicalMicroTiles)};");
-            L("and.pred %p4, %p4, %p13;              // physical tile");
+            L($"setp.lt.u32 %p14, %r0, {I(BlockChannels * BlockTiles)};");
+            EmitQuotient("%r26", "%r0", BlockTiles, "V producer C");
+            L($"and.b32 %r27, %r0, {I(BlockTiles - 1)};    // V producer tile");
+            if (BlockTiles == 16)
+            {
+                // Interleave physical 7x7 tiles across four CTAs. A contiguous 16-slot
+                // partition would leave its final CTA with only one useful tile; this
+                // mapping balances the grid 13/12/12/12 instead.
+                L($"and.b32 %r28, %r27, {I(MicroTiles - 1)};");
+                L($"setp.lt.u32 %p13, %r28, {I(PhysicalMicroTiles)};");
+                L($"shr.u32 %r29, %r27, {I(PowerOfTwoShift(MicroTiles))};");
+                L($"mad.lo.u32 %r28, %r29, {I(PhysicalMicroTiles)}, %r28;");
+                L($"mad.lo.u32 %r28, %r28, {I(TilePartitions)}, %r2;");
+                L($"setp.lt.u32 %p4, %r28, {I(PhysicalTilesPerQuadrant)};");
+                L("and.pred %p4, %p4, %p13;              // physical tile");
+                L($"mul.lo.u32 %r29, %r28, {I(PhysicalMicroTilesReciprocal)};");
+                L($"shr.u32 %r29, %r29, {I(ReciprocalShift)};");
+                L($"mad.lo.s32 %r30, %r29, -{I(PhysicalMicroTiles)}, %r28;");
+            }
+            else
+            {
+                L($"mad.lo.u32 %r28, %r2, {I(BlockTiles)}, %r27;");
+                L($"shr.u32 %r29, %r28, {I(PowerOfTwoShift(MicroTiles))};");
+                L($"and.b32 %r30, %r28, {I(MicroTiles - 1)};");
+                L($"setp.lt.u32 %p4, %r29, {I(PhysicalMicroTiles)};");
+                L($"setp.lt.u32 %p13, %r30, {I(PhysicalMicroTiles)};");
+                L("and.pred %p4, %p4, %p13;              // physical tile");
+            }
         }
         L("add.u32 %r29, %r10, %r29;");
         L("add.u32 %r30, %r11, %r30;");
@@ -426,7 +484,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
 
     private void EmitOuterProducts(string bufferBase, string doneLabel)
     {
-        if (ActiveComputeThreads < BlockThreads)
+        if (ActiveComputeThreads < BlockThreads || _schedule.DenseVProducers ||
+            _schedule.TileGroupWarps)
             L($"@!%p15 bra {doneLabel};");
         L($"mul.lo.u32 %r13, %r8, {I(MicroM)};");
         L("shr.u32 %r14, %r6, 2;");
@@ -467,7 +526,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
                     issued++;
                 }
         }
-        if (ActiveComputeThreads < BlockThreads)
+        if (ActiveComputeThreads < BlockThreads || _schedule.DenseVProducers ||
+            _schedule.TileGroupWarps)
             L(doneLabel + ":");
     }
 
@@ -475,7 +535,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
     {
         int uFragments = MicroM / 4;
         bool u = fragment < uFragments;
-        int stageOffset = c * TransformElements * (u ? UStride : VStride) * sizeof(float);
+        int stageOffset = c * (u ? TransformElements * UStride : VChannelStride) *
+            sizeof(float);
         int operandFragment = u ? fragment : fragment - uFragments;
         int vectorOffset = stageOffset + operandFragment * 16;
         string address = u ? "%rd4" : "%rd6";
@@ -493,7 +554,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
         for (int outputPhase = 0; outputPhase < outputPhases; outputPhase++)
         {
             int firstGroup = outputPhase * phaseGroups;
-            if (ActiveComputeThreads < BlockThreads)
+            if (ActiveComputeThreads < BlockThreads || _schedule.TileGroupWarps)
                 L($"@!%p15 bra OUTER_OUTPUT_P{I(outputPhase)}_STORE_DONE;");
             if (_schedule.CompactShared)
             {
@@ -514,7 +575,8 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             for (int element = 0; element < AccumulatorElements; element++)
                 L($"st.shared.f32 [%rd4+{I(element * WorkspaceElementStride * sizeof(float))}], " +
                   $"%f{I(element)};");
-            if (_schedule.CompactShared || ActiveComputeThreads < BlockThreads)
+            if (_schedule.CompactShared || ActiveComputeThreads < BlockThreads ||
+                _schedule.TileGroupWarps)
                 L($"OUTER_OUTPUT_P{I(outputPhase)}_STORE_DONE:");
             L("bar.sync 0;");
 
@@ -524,9 +586,20 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
             {
                 L($"add.u32 %r13, %r0, {I(pairWave * BlockThreads)};");
                 bool partialWave = (pairWave + 1) * BlockThreads > outputPairs;
-                if (partialWave)
+                int validPartitionOneGroups = (TileGroups - 1) * MGroups - firstGroup;
+                bool specializedTail = _schedule.TileGroupWarps &&
+                    validPartitionOneGroups < phaseGroups;
+                if (partialWave || specializedTail)
                 {
                     L($"setp.lt.u32 %p3, %r13, {I(outputPairs)};");
+                    if (specializedTail)
+                    {
+                        L("setp.eq.u32 %p2, %r2, 0;");
+                        L($"setp.lt.u32 %p4, %r13, " +
+                          $"{I(validPartitionOneGroups * AccumulatorElements)};");
+                        L("or.pred %p4, %p2, %p4;");
+                        L("and.pred %p3, %p3, %p4;   // omit padded partition-1 groups");
+                    }
                     L($"@!%p3 bra OUTER_OUTPUT_P{I(outputPhase)}_PAIR_{I(pairWave)}_DONE;");
                 }
                 L($"shr.u32 %r14, %r13, {I(PowerOfTwoShift(MicroM))};");
@@ -599,7 +672,7 @@ public sealed class PtxOuterProductWinogradConv2DEmitter
                 L("@%p1 st.global.v2.f32 [%rd4], {%f64, %f65};");
                 L($"@%p1 st.global.v2.f32 [%rd4+{I(plan.OutputWidth * sizeof(float))}], " +
                   "{%f66, %f67};");
-                if (partialWave)
+                if (partialWave || specializedTail)
                     L($"OUTER_OUTPUT_P{I(outputPhase)}_PAIR_{I(pairWave)}_DONE:");
             }
             if (outputPhase + 1 < outputPhases)

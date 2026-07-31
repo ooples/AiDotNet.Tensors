@@ -105,6 +105,58 @@ public sealed class CodegenOuterProductWinogradConv2DTests
     }
 
     [Fact]
+    public void ExactPhysicalTileSchedule_RetiresWholeWarpsAndPaddedOutputs()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var schedule = new CodegenOuterProductWinogradSchedule(
+            blockTiles: 32, compactShared: true, tileGroupWarps: true);
+        var emitter = new PtxOuterProductWinogradConv2DEmitter(schedule);
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Equal("inline-outer-winograd-conv2d-compact-tile-warps",
+            schedule.WinnerName);
+        Assert.Equal(64U, emitter.LaunchBlocks);
+        Assert.Equal(256, emitter.LaunchBlockThreads);
+        Assert.Equal(36864, emitter.SharedMemoryBytes);
+        Assert.Contains("tile group: two complete warps", ptx);
+        Assert.Contains("retire padded tile-group warps", ptx);
+        Assert.Contains("omit padded partition-1 groups", ptx);
+        Assert.Contains("mad.lo.u32 %r13, %r13, 1064, %r6", ptx);
+    }
+
+    [Fact]
+    public void DensePhysicalTileSchedule_PacksOnlyRealInputTransforms()
+    {
+        var spec = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Bench;
+        var schedule = new CodegenOuterProductWinogradSchedule(
+            blockTiles: 32, compactShared: true,
+            denseVProducers: true, tileGroupWarps: true);
+        var emitter = new PtxOuterProductWinogradConv2DEmitter(schedule);
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Equal(
+            "inline-outer-winograd-conv2d-compact-dense-v-tile-warps",
+            schedule.WinnerName);
+        Assert.Equal(37760, emitter.SharedMemoryBytes);
+        Assert.Contains("dense V producer C /28", ptx);
+        Assert.Contains("dense V producer C /21", ptx);
+        Assert.Contains("mad.lo.u32 %r19, %r26, 604, 0", ptx);
+        Assert.Equal(10, CodegenOuterProductWinogradSchedule.SearchSpace.Count);
+        Assert.Equal(schedule.WinnerName,
+            CodegenOuterProductWinogradSchedule.Find(schedule.WinnerName)!.WinnerName);
+    }
+
+    [Fact]
+    public void DensePhysicalTileSchedule_RequiresWholeWarpOwnership()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            new CodegenOuterProductWinogradSchedule(
+                blockTiles: 32, compactShared: true, denseVProducers: true));
+    }
+
+    [Fact]
     public void UnsupportedShapeAndArchitecture_AreRejectedBeforeEmission()
     {
         var verify = CodegenKernelCatalog.Find("conv2d_3x3_bwd_data")!.Verify;

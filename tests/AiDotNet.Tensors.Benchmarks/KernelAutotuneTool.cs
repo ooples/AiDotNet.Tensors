@@ -520,9 +520,11 @@ internal static class KernelAutotuneTool
         foreach (CodegenOuterProductWinogradSchedule schedule in
                  CodegenOuterProductWinogradSchedule.SearchSpace)
         {
+            if (!CandidateEnabled(candidateSelector, schedule.WinnerName))
+                continue;
             using CandidateProgram? winograd = TryCreateInlineOuterWinograd(
                 runtime, spec, schedule);
-            if (winograd is null || !CandidateEnabled(candidateSelector, winograd.Name))
+            if (winograd is null)
                 continue;
             winograd.Launch();
             runtime.Synchronize();
