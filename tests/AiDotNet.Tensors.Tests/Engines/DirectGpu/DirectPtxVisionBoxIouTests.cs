@@ -281,10 +281,8 @@ public sealed class DirectPtxVisionBoxIouTests
             DirectPtxExtentMode.Exact, byteOffset: 16);
         var offsetBuffer = new FakeGpuBuffer(
             new IntPtr(0x1000), checked((long)offsetContract.RequiredBytes + 16));
-        Assert.Throws<ArgumentException>(() =>
-            DirectPtxTensorView.Create(offsetBuffer, offsetContract));
         DirectPtxTensorView offsetView = DirectPtxTensorView.Create(
-            offsetBuffer, offsetContract, byteOffset: 16);
+            offsetBuffer, offsetContract);
         Assert.Equal(new IntPtr(0x1010), offsetView.Pointer);
 
         DirectPtxTensorView a = DirectPtxTensorView.Create(

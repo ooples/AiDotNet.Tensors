@@ -263,14 +263,10 @@ internal readonly struct DirectPtxTensorView
 
     internal static DirectPtxTensorView Create(
         IGpuBuffer buffer,
-        DirectPtxTensorContract contract,
-        nuint byteOffset = 0)
+        DirectPtxTensorContract contract)
     {
         PtxCompat.ThrowIfNull(buffer, nameof(buffer));
-        if (byteOffset != contract.ByteOffset)
-            throw new ArgumentException(
-                $"Tensor '{contract.Name}' requires byte offset {contract.ByteOffset}; received {byteOffset}.",
-                nameof(byteOffset));
+        nuint byteOffset = contract.ByteOffset;
         if (buffer.Handle == IntPtr.Zero)
             throw new ArgumentException("The GPU buffer has no device pointer.", nameof(buffer));
         nuint allocationBytes = checked((nuint)buffer.SizeInBytes);
@@ -349,14 +345,10 @@ internal readonly struct DirectPtxTensorView
 
     internal static DirectPtxTensorView CreateOwned(
         DirectPtxBuffer buffer,
-        DirectPtxTensorContract contract,
-        nuint byteOffset = 0)
+        DirectPtxTensorContract contract)
     {
         PtxCompat.ThrowIfNull(buffer, nameof(buffer));
-        if (byteOffset != contract.ByteOffset)
-            throw new ArgumentException(
-                $"Tensor '{contract.Name}' requires byte offset {contract.ByteOffset}; received {byteOffset}.",
-                nameof(byteOffset));
+        nuint byteOffset = contract.ByteOffset;
         nuint end = checked(byteOffset + contract.RequiredBytes);
         if (buffer.Pointer == IntPtr.Zero || end > buffer.ByteLength ||
             (contract.ExtentMode == DirectPtxExtentMode.Exact && end != buffer.ByteLength))
@@ -366,6 +358,10 @@ internal readonly struct DirectPtxTensorView
         if ((pointer & (nuint)(contract.AlignmentBytes - 1)) != 0)
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
+        if (byteOffset % (nuint)contract.ElementBytes != 0 ||
+            buffer.ByteLength % (nuint)contract.ElementBytes != 0)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' extent/offset is incompatible with {contract.PhysicalType}.", nameof(buffer));
         return new DirectPtxTensorView(
             PtxCompat.ToIntPtr(pointer), contract.RequiredBytes, buffer.ByteLength,
             contract.PhysicalType, contract.Layout, contract.LogicalExtent,
