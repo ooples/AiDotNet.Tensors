@@ -417,6 +417,28 @@ public sealed class DirectPtxVisionBoxIouTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void BoxConvertBlueprint_RecordsSourceAndDestinationCoordinateLayouts()
+    {
+        DirectPtxPhysicalLayout[] layouts =
+        [
+            DirectPtxPhysicalLayout.BoxXyxy,
+            DirectPtxPhysicalLayout.BoxXywh,
+            DirectPtxPhysicalLayout.BoxCxcywh
+        ];
+
+        for (int from = 0; from < layouts.Length; from++)
+        for (int to = 0; to < layouts.Length; to++)
+        {
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                new(DirectPtxVisionOperation.BoxConvert, 256, from, to),
+                DirectPtxArchitectureFamily.Ampere, 8, 6);
+
+            Assert.Equal(layouts[from], definition.Blueprint.Tensors[0].Layout);
+            Assert.Equal(layouts[to], definition.Blueprint.Tensors[1].Layout);
+        }
+    }
+
     private static void AssertPtxRegisterAndLabelClosure(string ptx)
     {
         var limits = new Dictionary<string, int>(StringComparer.Ordinal);

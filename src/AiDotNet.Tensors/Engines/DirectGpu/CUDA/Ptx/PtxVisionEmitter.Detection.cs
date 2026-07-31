@@ -123,11 +123,19 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    st.global.v4.f32 [%rd4], {%f10,%f11,%f12,%f13};");
         return Definition(spec, architecture, $"n{n}-f{from}-t{to}",
             [
-                Tensor("boxes", DirectPtxPhysicalLayout.BoxXyxy, new(n, 4), DirectPtxTensorAccess.Read),
-                Tensor("output", DirectPtxPhysicalLayout.BoxXyxy, new(n, 4), DirectPtxTensorAccess.Write)
+                Tensor("boxes", BoxLayout(from), new(n, 4), DirectPtxTensorAccess.Read),
+                Tensor("output", BoxLayout(to), new(n, 4), DirectPtxTensorAccess.Write)
             ], Semantics(("from-format", from.ToString()), ("to-format", to.ToString())),
             Finish(ptx), n, maxRegisters: 24, minBlocksPerSm: 4);
     }
+
+    private static DirectPtxPhysicalLayout BoxLayout(int format) => format switch
+    {
+        0 => DirectPtxPhysicalLayout.BoxXyxy,
+        1 => DirectPtxPhysicalLayout.BoxXywh,
+        2 => DirectPtxPhysicalLayout.BoxCxcywh,
+        _ => throw new NotSupportedException($"Box format {format} has no physical layout.")
+    };
 
     private static DirectPtxVisionDefinition EmitAlignedLoss(
         DirectPtxVisionSpec spec, DirectPtxArchitectureFamily architecture,

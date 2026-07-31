@@ -211,6 +211,10 @@ internal enum DirectPtxPhysicalLayout
     Vector,
     /// <summary>Dense row-major bounding boxes in canonical XYXY order.</summary>
     BoxXyxy,
+    /// <summary>Dense row-major bounding boxes in XYWH order.</summary>
+    BoxXywh,
+    /// <summary>Dense row-major bounding boxes in center-X/center-Y/width/height order.</summary>
+    BoxCxcywh,
     /// <summary>Dense images with batch/channel/height/width order.</summary>
     Nchw,
     /// <summary>Dense images with batch/height/width/channel order.</summary>
