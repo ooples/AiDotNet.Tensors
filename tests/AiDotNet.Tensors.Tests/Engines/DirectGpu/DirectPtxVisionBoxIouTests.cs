@@ -540,6 +540,49 @@ public sealed class DirectPtxVisionBoxIouTests
         }
     }
 
+    [SkippableFact]
+    public void DriverOnly_PublicNmsRouteInitializesScratchAndUnusedOutput()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? old = DirectPtxFeatureGate.VisionBoxIouExperimentOverride;
+        DirectPtxFeatureGate.VisionBoxIouExperimentOverride = true;
+        try
+        {
+            const int length = 256;
+            var spec = new DirectPtxVisionSpec(
+                DirectPtxVisionOperation.Nms, length,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.PrewarmDirectPtxVisionKernel(spec),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+            var boxData = new float[length * 4];
+            for (int i = 0; i < length; i++)
+            {
+                boxData[i * 4 + 2] = 1f;
+                boxData[i * 4 + 3] = 1f;
+            }
+            using var boxes = backend.AllocateBuffer(boxData);
+            using var scores = backend.AllocateBuffer(Enumerable.Repeat(1f, length).ToArray());
+            using var classes = backend.AllocateBuffer(new float[1]);
+            using var suppressed = backend.AllocateBuffer(Enumerable.Repeat(1f, length).ToArray());
+            using var output = backend.AllocateBuffer(Enumerable.Repeat(-7f, length).ToArray());
+            using var count = backend.AllocateBuffer(new[] { -3f });
+
+            backend.Nms(boxes, scores, classes, suppressed, output, count,
+                length, 0.5f, batched: 0);
+            backend.Synchronize();
+
+            Assert.Equal(1f, backend.DownloadBuffer(count)[0]);
+            Assert.All(backend.DownloadBuffer(output), value => Assert.Equal(0f, value));
+            Assert.True(backend.DirectPtxVisionDispatchCount(
+                DirectPtxVisionOperation.Nms) >= 1);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionBoxIouExperimentOverride = old;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(256, 256)]
     [InlineData(1024, 256)]

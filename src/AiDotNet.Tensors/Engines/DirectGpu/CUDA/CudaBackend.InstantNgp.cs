@@ -282,6 +282,9 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
         int batched)
     {
         if (length <= 0) return;
+        long stateBytes = checked((long)length * sizeof(float));
+        MemsetBuffer(suppressed, 0, stateBytes);
+        MemsetBuffer(outputCapacity, 0, stateBytes);
         if (TryDirectPtxVisionNms(
                 boxes, scores, classIds, suppressed, outputCapacity, outputCount,
                 length, iouThreshold, batched != 0)) return;
