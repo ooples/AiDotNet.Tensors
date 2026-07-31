@@ -209,7 +209,11 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                     stats, stats, 16, DirectPtxTensorAccess.Write)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 96,
+                // CUDA driver 13.3 uses up to 138 registers for the causal,
+                // fused rectangular variants while preserving zero local
+                // memory and the required one-block/SM residency. Keep a
+                // small explicit envelope above that measured maximum.
+                MaxRegistersPerThread: 144,
                 MaxStaticSharedBytes: 32 * 1024,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
