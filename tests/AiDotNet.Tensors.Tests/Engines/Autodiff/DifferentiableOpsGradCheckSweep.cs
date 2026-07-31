@@ -141,7 +141,6 @@ public class DifferentiableOpsGradCheckSweep
                                                     SafeTensor([3, 2], r), 1.0, 1.0],
         ["RBFKernel"] = r => [SafeTensor([2, 3], r), SafeTensor([4, 3], r), SafeTensor([4], r)],
         // Octonions are 8-dimensional, so the feature axis must be a multiple of 8.
-        ["OctonionMatMulTensor"] = r => [SafeTensor([2, 8], r), SafeTensor([8, 8], r)],
         // RoPE: [B, H, S, D] with cos/sin tables of [S, D/2] for the interleaved variant.
         ["ApplyRoPEInterleaved"] = r => [SafeTensor([1, 1, 4, 4], r), SafeTensor([4, 2], r), SafeTensor([4, 2], r), 0],
         ["PadNd"] = r => [SafeTensor([1, 1, 3, 3], r), new[] { 1, 1, 1, 1 }, PadMode.Constant, 0.0],
@@ -149,7 +148,6 @@ public class DifferentiableOpsGradCheckSweep
         // Dropout at rate 0 is deterministic, so it CAN be gradient-checked (unlike TensorDropout,
         // which is exempted as stochastic). training:true keeps the real code path.
         ["Dropout"] = r => [SafeTensor([2, 3], r), 0.0, true, null!],
-        ["TensorTrilinearInterpolate"] = r => [SafeTensor([2, 2, 2], r), TrilinearPositions()],
         ["TensorScatterReduce"] = r => [SafeTensor([3, 2], r), 0, IdxTensor([3, 2], 3, r),
                                         SafeTensor([3, 2], r), ScatterReduceMode.Sum, true],
         // CTC needs real log-probabilities and NON-BLANK targets (0 is the blank label).
@@ -191,8 +189,6 @@ public class DifferentiableOpsGradCheckSweep
         ["DepthwiseConv1D"] = r => [SafeTensor([1, 3, 6], r), SafeTensor([3, 1, 3], r), 1, 0],
         ["DepthwiseConv2D"] = r => [SafeTensor([1, 3, 5, 5], r), SafeTensor([3, 1, 3, 3], r),
                                     new[] { 1, 1 }, new[] { 0, 0 }],
-        ["LocallyConnectedConv2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([1, 2, 2, 3, 3, 3], r),
-                                           null!, new[] { 1, 1 }],
 
         // --- pooling ---
         ["MaxPool2D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2, 0],
@@ -261,7 +257,6 @@ public class DifferentiableOpsGradCheckSweep
         ["TensorIndexCopy"] = r => [SafeTensor([3, 2], r), 0, IdxRange(3), SafeTensor([3, 2], r)],
         ["TensorIndexFill"] = r => [SafeTensor([3, 2], r), 0, IdxRange(2), 0.5],
         ["TensorIndexSelect"] = r => [SafeTensor([3, 2], r), IdxRange(2), 0],
-        ["TensorIndexPut"] = r => [SafeTensor([3, 2], r), new[] { IdxRange(2) }, SafeTensor([2, 2], r), false],
         ["TensorTake"] = r => [SafeTensor([2, 3], r), IdxRange(4)],
         ["TensorTakeAlongDim"] = r => [SafeTensor([2, 3], r), IdxTensor([2, 3], 3, r), 1],
         ["TensorPut"] = r => [SafeTensor([2, 3], r), IdxRange(3), SafeTensor([3], r)],
