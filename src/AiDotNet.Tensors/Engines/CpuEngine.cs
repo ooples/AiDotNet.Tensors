@@ -39570,12 +39570,29 @@ public partial class CpuEngine : ITensorLevelEngine
             var work = FftScratch<T>(nFft);
             int inputOffset = batchIdx * numFreqs * 2;
 
+            // FftScratch hands back a REUSED thread-static buffer and does not clear it. When the
+            // spectrum is narrower than the transform (nFft > 2*(numFreqs-1), reachable once
+            // outputLength drives nFft past the spectrum's natural length) the slots between the
+            // positive frequencies and their mirrors are never written here, so they would carry
+            // whatever the previous call left there — a different result for identical inputs
+            // depending on what ran before. Zero-padding those bins is also the correct spectral
+            // interpretation of a spectrum shorter than the transform.
+            for (int t = 0; t < nFft; t++)
+                work[t] = new Complex<T>(numOps.Zero, numOps.Zero);
+
             // Positive frequencies as given.
             for (int k = 0; k < numFreqs; k++)
                 work[k] = new Complex<T>(inputData[inputOffset + k * 2], inputData[inputOffset + k * 2 + 1]);
 
-            // Negative frequencies by conjugate symmetry: X[n-k] = conj(X[k]).
-            for (int k = 1; k < numFreqs - 1; k++)
+            // Negative frequencies by conjugate symmetry: X[nFft-k] = conj(X[k]).
+            //
+            // Mirror every bin whose partner slot is a DIFFERENT slot, rather than stopping at
+            // numFreqs-1. Those coincide only when nFft is even and numFreqs is exactly its
+            // half-spectrum width, where numFreqs-1 IS the self-conjugate Nyquist bin. For an odd
+            // nFft (reachable when outputLength exceeds the spectrum's natural length) there is no
+            // Nyquist bin, so the old bound silently dropped the last bin's conjugate and left a
+            // zero in its place — a spectrum that is not Hermitian, whose inverse is not real.
+            for (int k = 1; k < numFreqs && nFft - k > k; k++)
                 work[nFft - k] = new Complex<T>(work[k].Real, numOps.Negate(work[k].Imaginary));
 
             NativeFFTInPlace(work, inverse: true, numOps);
@@ -40412,9 +40429,37 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>BackwardFunctions{T}.SpectrogramBackward</c> needs. Deliberately NOT ISTFT: ISTFT is a
     /// synthesis operator that divides by the window-sum, which is not the adjoint.
     /// </remarks>
+    /// <remarks>
+    /// Must be a TRUE n-point transform. <see cref="FFTCore{T}(Vector{T}, Vector{T}, bool)"/>
+    /// zero-pads a non-power-of-two length up to the next power of two, which is a different
+    /// transform entirely — its bins sit at k/nPadded rather than k/n — so an adjoint built on it
+    /// does not transpose the forward it is paired with. That is fine for the power-of-two lengths
+    /// this used to see and wrong for every other one, so those route to Bluestein instead.
+    /// </remarks>
     internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransformForAdjoint<T>(
         Vector<T> realInput, Vector<T> imagInput, bool inverse)
-        => FFTCore<T>(realInput, imagInput, inverse);
+    {
+        int n = realInput.Length;
+        if (n <= 1 || AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+            return FFTCore<T>(realInput, imagInput, inverse);
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var work = new Complex<T>[n];
+        for (int i = 0; i < n; i++)
+            work[i] = new Complex<T>(realInput[i], imagInput[i]);
+
+        NativeFFTBluestein(work, n, inverse, ops);
+
+        var real = new Vector<T>(n);
+        var imag = new Vector<T>(n);
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = work[i].Real;
+            imag[i] = work[i].Imaginary;
+        }
+
+        return (real, imag);
+    }
 
     /// <summary>
     /// Core FFT computation using Cooley-Tukey algorithm with complex input.
@@ -48459,6 +48504,32 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Unnormalized transform for a non-power-of-two length, routed to Bluestein.
+    /// </summary>
+    /// <remarks>
+    /// The butterfly below is radix-2 only: its stage loop doubles <c>size</c> up to <c>n</c> and
+    /// indexes <c>data[start + k + halfSize]</c>, which runs past the end as soon as <c>n</c> is
+    /// not a power of two (n=10 reads index 12). That surfaced as an IndexOutOfRangeException from
+    /// inside IRFFT for any outputLength above the spectrum's natural length, since the clamp
+    /// there can hand this method a length like 9, 10 or 12.
+    /// </remarks>
+    private static void NativeFFTBluestein<T>(Complex<T>[] data, int n, bool inverse,
+        INumericOperations<T> ops)
+    {
+        var buf = new double[2 * n];
+        for (int i = 0; i < n; i++)
+        {
+            buf[2 * i] = ops.ToDouble(data[i].Real);
+            buf[2 * i + 1] = ops.ToDouble(data[i].Imaginary);
+        }
+
+        AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.BluesteinNoScale(buf, n, inverse);
+
+        for (int i = 0; i < n; i++)
+            data[i] = new Complex<T>(ops.FromDouble(buf[2 * i]), ops.FromDouble(buf[2 * i + 1]));
+    }
+
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops)
     {
@@ -48479,6 +48550,14 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         int n = data.Length;
+
+        // Radix-2 butterfly below cannot express any other length; route those to Bluestein.
+        if (n >= 2 && !AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            NativeFFTBluestein(data, n, inverse, ops);
+            return;
+        }
+
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
@@ -48572,6 +48651,15 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 #endif
+        if (n >= 2 && !AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            // Radix-2 only below — see NativeFFTBluestein.
+            var arbitrary = data.ToArray();
+            NativeFFTBluestein<double>(arbitrary, n, inverse, MathHelper.GetNumericOperations<double>());
+            arbitrary.AsSpan().CopyTo(data);
+            return;
+        }
+
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
@@ -48652,6 +48740,15 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 #endif
+        if (n >= 2 && !AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            // Radix-2 only below — see NativeFFTBluestein.
+            var arbitrary = data.ToArray();
+            NativeFFTBluestein<float>(arbitrary, n, inverse, MathHelper.GetNumericOperations<float>());
+            arbitrary.AsSpan().CopyTo(data);
+            return;
+        }
+
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 

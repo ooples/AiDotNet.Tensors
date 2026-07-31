@@ -7563,11 +7563,19 @@ internal static class BackwardFunctions<T>
             int outOffset = b * numFreqs * 2;
             for (int k = 0; k < numFreqs; k++)
             {
-                double ck = (k == 0 || k == numFreqs - 1) ? 1.0 : 2.0;
-                double scale = ck * invN;
+                // A bin is self-conjugate when it is its own mirror, i.e. 2k = 0 (mod nFft): DC
+                // always, and Nyquist only when nFft is even. Those contribute to the forward once
+                // and their imaginary part not at all. Every other bin is mirrored, so it
+                // contributes twice.
+                //
+                // Keying this on numFreqs - 1 instead was right only while nFft was necessarily
+                // even. With an odd nFft there is no Nyquist bin, and the last reported bin is an
+                // ordinary mirrored one -- it was being given half its weight and having a real
+                // gradient discarded.
+                bool selfConjugate = k == 0 || (nFft % 2 == 0 && k == nFft / 2);
+                double scale = (selfConjugate ? 1.0 : 2.0) * invN;
                 resultData[outOffset + k * 2] = numOps.FromDouble(numOps.ToDouble(re[k]) * scale);
-                // The Nyquist bin's imaginary part does not influence the forward output.
-                resultData[outOffset + k * 2 + 1] = (k == numFreqs - 1)
+                resultData[outOffset + k * 2 + 1] = selfConjugate
                     ? numOps.Zero
                     : numOps.FromDouble(numOps.ToDouble(im[k]) * scale);
             }

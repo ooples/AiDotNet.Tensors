@@ -294,7 +294,20 @@ public class DifferentiableOpsGradCheckSweep
                 // ops whose leading tensor is not a differentiable input — TensorWhere's leading
                 // argument is the condition mask, which correctly receives no gradient. Only flag
                 // an op when NO tensor input receives one.
-                var tensorInputs = args.OfType<Tensor<double>>().ToArray();
+                // Flatten array-typed tensor arguments too. The variadic ops (TensorAddMany,
+                // TensorConcatenate, TensorStack, TensorBlockDiag and friends) pass their tensors
+                // wrapped in a single Tensor<double>[], which OfType<Tensor<double>>() does not
+                // match -- leaving tensorInputs empty, so `got` is always null and the sweep
+                // reports "no gradient" for them the moment any is classified differentiable.
+                // That is a false accusation against a working op, not a caught regression.
+                var tensorInputs = args
+                    .SelectMany(arg => arg switch
+                    {
+                        Tensor<double> t => new[] { t },
+                        Tensor<double>[] arr => arr,
+                        _ => Array.Empty<Tensor<double>>()
+                    })
+                    .ToArray();
                 Tensor<double> input;
                 Tensor<double> analytical;
                 try
