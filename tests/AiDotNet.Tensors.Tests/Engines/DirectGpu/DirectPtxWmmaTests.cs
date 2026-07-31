@@ -725,8 +725,19 @@ public class DirectPtxWmmaTests
 
         Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(
             new AutotuneCandidate("query-warps-999"), 64, out _));
-        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(default, 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(default(AutotuneCandidate), 64, out _));
         Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(candidates[0], 17, out _));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void AttentionAutotuner_MalformedCacheVariantIsCacheMiss(string variant)
+    {
+        var cached = new KernelChoice { Variant = variant };
+
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(cached, 64, out int warps));
+        Assert.Equal(0, warps);
     }
 
     [Fact]

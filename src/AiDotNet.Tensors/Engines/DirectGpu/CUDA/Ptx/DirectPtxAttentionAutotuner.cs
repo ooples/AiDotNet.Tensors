@@ -139,11 +139,11 @@ internal static class DirectPtxAttentionAutotuner
             AutotuneCache.TryStore(KernelId(runtime), shape, legacy!);
     }
 
-    private static bool TryGetWarps(
+    internal static bool TryGetWarps(
         KernelChoice? choice, int querySequence, out int warps)
     {
         warps = 0;
-        if (choice is null) return false;
+        if (choice is null || string.IsNullOrWhiteSpace(choice.Variant)) return false;
         return TryGetWarps(
             new AutotuneCandidate(choice.Variant, choice.Parameters), querySequence, out warps);
     }
