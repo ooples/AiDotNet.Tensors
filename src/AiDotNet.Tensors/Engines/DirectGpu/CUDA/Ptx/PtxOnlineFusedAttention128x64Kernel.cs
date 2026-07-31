@@ -209,7 +209,10 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                     stats, stats, 16, DirectPtxTensorAccess.Write)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 96,
+                // Driver-linked causal variants retain mask/epilogue state across the
+                // online tile and reach 144 registers on SM86. Unmasked variants keep
+                // the tighter historical ceiling. Both lanes remain zero-spill.
+                MaxRegistersPerThread: isCausal ? 144 : 96,
                 MaxStaticSharedBytes: 32 * 1024,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),

@@ -30,6 +30,16 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal int DriverVersion { get; }
     internal string DeviceFingerprint { get; }
     internal IntPtr Stream => _stream;
+    internal uint StreamFlags
+    {
+        get
+        {
+            using var _ = Enter();
+            Check(CudaNativeBindings.cuStreamGetFlags(_stream, out uint flags),
+                "cuStreamGetFlags");
+            return flags;
+        }
+    }
 
     internal static bool IsAvailable => CudaNativeBindings.IsAvailable;
 
@@ -52,7 +62,11 @@ internal sealed class DirectPtxRuntime : IDisposable
             "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
 
         Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
-        Check(CudaNativeBindings.cuStreamCreate(out _stream, 1), "cuStreamCreate(non-blocking)");
+        // Standalone buffers use the synchronous Driver-API copy calls, which execute
+        // in the legacy default-stream ordering domain. A blocking stream preserves
+        // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
+        // and can let a freshly launched block observe pre-upload allocation contents.
+        Check(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate(blocking)");
         _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation
         // below has an explicit, balanced push/pop boundary.

@@ -194,6 +194,9 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamCreate")]
     public static extern CudaResult cuStreamCreate(out IntPtr stream, uint flags);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuStreamGetFlags")]
+    public static extern CudaResult cuStreamGetFlags(IntPtr stream, out uint flags);
+
     [DllImport(CudaLibrary, EntryPoint = "cuStreamDestroy_v2")]
     public static extern CudaResult cuStreamDestroy(IntPtr stream);
 

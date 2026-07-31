@@ -368,7 +368,9 @@ public class DirectPtxWmmaTests
             runtime, 1, isCausal, fuseLayerNormGelu, 0.125f, 1e-5f, sequence,
             emitSoftmaxStats: true, warpsPerBlock);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
-        Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, 255);
+        int registerCeiling = isCausal ? 144 : 96;
+        Assert.Equal(registerCeiling, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
+        Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, registerCeiling);
 
         using var qDevice = runtime.AllocateBytes(kernel.QBytes);
         using var kDevice = runtime.AllocateBytes(kernel.KBytes);
@@ -428,6 +430,9 @@ public class DirectPtxWmmaTests
             isCausal, false, 0.125f, 1e-5f, emitSoftmaxStats: true,
             causalQueryOffset: causalQueryOffset);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
+        int registerCeiling = isCausal ? 144 : 96;
+        Assert.Equal(registerCeiling, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
+        Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, registerCeiling);
         Assert.Equal((long)batch * queryHeads * querySequence * dimension * sizeof(float),
             (long)kernel.OutputBytes);
         Assert.Equal((long)batch * keyValueHeads * keyValueSequence * dimension * sizeof(ushort),

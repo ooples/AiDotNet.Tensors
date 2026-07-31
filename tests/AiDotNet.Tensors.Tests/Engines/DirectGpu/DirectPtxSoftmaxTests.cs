@@ -13,6 +13,14 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class DirectPtxSoftmaxTests
 {
+    [SkippableFact]
+    public void StandaloneRuntime_OrdersSynchronousUploadsBeforeLaunches()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Assert.Equal(0u, runtime.StreamFlags);
+    }
+
     [Fact]
     public void SoftmaxCoverageManifest_AssignsEveryScopedApiExactlyOnce()
     {
