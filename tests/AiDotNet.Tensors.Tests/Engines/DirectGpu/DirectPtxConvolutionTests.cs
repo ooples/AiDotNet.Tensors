@@ -19,7 +19,7 @@ public sealed class DirectPtxConvolutionTests
         Assert.Contains(resources, name =>
             name.EndsWith(".Artifacts.sm86.convolution.convolution-cubins.tsv", StringComparison.Ordinal));
         Assert.True(resources.Count(name =>
-            name.Contains(".Artifacts.sm86.convolution.", StringComparison.Ordinal) &&
+            name.IndexOf(".Artifacts.sm86.convolution.", StringComparison.Ordinal) >= 0 &&
             name.EndsWith(".cubin", StringComparison.Ordinal)) >= 47);
     }
 
