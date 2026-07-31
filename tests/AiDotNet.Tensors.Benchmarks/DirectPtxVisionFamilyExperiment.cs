@@ -184,15 +184,19 @@ internal static class DirectPtxVisionFamilyExperiment
             PrintComparison(run, spec, pairedSpec is not null,
                 "cuda-graph", graphComparison);
 
-            MeasureAndPrint(backend, run, spec, "Direct PTX", cell.LaunchDirect,
+            MeasureAndPrint(backend, run, spec, pairedSpec is not null,
+                "Direct PTX", cell.LaunchDirect,
                 error, establishedRouteError, directOracleError,
                 model, audit, pairedAudit);
-            MeasureAndPrint(backend, run, spec, "Direct PTX CUDA graph",
+            MeasureAndPrint(backend, run, spec, pairedSpec is not null,
+                "Direct PTX CUDA graph",
                 () => backend.EnqueueCapturedGraph(directGraph), error,
                 establishedRouteError, directOracleError, model, audit, pairedAudit);
-            MeasureAndPrint(backend, run, spec, "AiDotNet NVRTC", cell.LaunchCurrent,
+            MeasureAndPrint(backend, run, spec, pairedSpec is not null,
+                "AiDotNet NVRTC", cell.LaunchCurrent,
                 currentOracleError ?? 0, 0, currentOracleError, model, null);
-            MeasureAndPrint(backend, run, spec, "AiDotNet NVRTC CUDA graph",
+            MeasureAndPrint(backend, run, spec, pairedSpec is not null,
+                "AiDotNet NVRTC CUDA graph",
                 () => backend.EnqueueCapturedGraph(currentGraph), currentOracleError ?? 0,
                 0, currentOracleError, model, null);
         }
@@ -243,6 +247,7 @@ internal static class DirectPtxVisionFamilyExperiment
         CudaBackend backend,
         int run,
         DirectPtxVisionSpec spec,
+        bool paired,
         string method,
         Action launch,
         double error,
@@ -263,7 +268,7 @@ internal static class DirectPtxVisionFamilyExperiment
         {
             status = "ok",
             run,
-            operation = OperationLabel(spec, pairedAudit is not null),
+            operation = OperationLabel(spec, paired),
             specialization = audit is null ? "established" : pairedAudit is null
                 ? audit.BlueprintId
                 : $"{audit.BlueprintId}+{pairedAudit.BlueprintId}",
