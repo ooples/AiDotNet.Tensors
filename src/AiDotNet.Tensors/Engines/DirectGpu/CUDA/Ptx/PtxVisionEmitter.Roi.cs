@@ -64,7 +64,7 @@ internal static partial class PtxVisionEmitter
             ptx.AppendLine($"    max.f32 %f5, %f5, {F(0.1f)}; max.f32 %f6, %f6, {F(0.1f)};");
         else if (!aligned)
             ptx.AppendLine("    max.f32 %f5, %f5, 0f3F800000; max.f32 %f6, %f6, 0f3F800000;");
-        ptx.AppendLine($"    mul.rn.f32 %f7, %f5, {F(1f / outW)}; mul.rn.f32 %f8, %f6, {F(1f / outH)};");
+        ptx.AppendLine($"    div.rn.f32 %f7, %f5, {F((float)outW)}; div.rn.f32 %f8, %f6, {F((float)outH)};");
         if (positionSensitive)
             ptx.AppendLine($"    mad.lo.u32 %r10, %r7, {outH}, %r5; mad.lo.u32 %r10, %r10, {outW}, %r3;");
         else

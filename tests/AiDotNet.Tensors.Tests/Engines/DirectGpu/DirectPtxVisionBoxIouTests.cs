@@ -487,6 +487,40 @@ public sealed class DirectPtxVisionBoxIouTests
         }
     }
 
+    [Fact]
+    public void RoiEmitter_DividesBinSizesLikeEstablishedCudaKernels()
+    {
+        DirectPtxVisionSpec[] specs =
+        [
+            new(DirectPtxVisionOperation.RoiAlign,
+                1, 256, 56, 56, 256, 7, 7, 256, 2,
+                BitConverter.SingleToInt32Bits(0.25f)),
+            new(DirectPtxVisionOperation.RoiPool,
+                1, 256, 56, 56, 256, 7, 7, 256,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.25f)),
+            new(DirectPtxVisionOperation.PsRoiAlign,
+                1, 196, 56, 56, 256, 7, 7, 4, 2,
+                BitConverter.SingleToInt32Bits(0.25f)),
+            new(DirectPtxVisionOperation.PsRoiPool,
+                1, 196, 56, 56, 256, 7, 7, 4,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.25f))
+        ];
+
+        foreach (DirectPtxVisionSpec spec in specs)
+        {
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                spec, DirectPtxArchitectureFamily.Ampere, 8, 6);
+            Assert.Contains("div.rn.f32 %f7, %f5, 0f40E00000",
+                definition.Ptx, StringComparison.Ordinal);
+            Assert.Contains("div.rn.f32 %f8, %f6, 0f40E00000",
+                definition.Ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("mul.rn.f32 %f7, %f5",
+                definition.Ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("mul.rn.f32 %f8, %f6",
+                definition.Ptx, StringComparison.Ordinal);
+        }
+    }
+
     private static void AssertPtxRegisterAndLabelClosure(string ptx)
     {
         var limits = new Dictionary<string, int>(StringComparer.Ordinal);
