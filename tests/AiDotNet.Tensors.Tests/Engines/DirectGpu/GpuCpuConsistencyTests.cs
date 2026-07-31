@@ -108,6 +108,23 @@ public class GpuCpuConsistencyTests
         }
     }
 
+    private static int[] ExpectedBroadcastShape(int[] left, int[] right)
+    {
+        int rank = Math.Max(left.Length, right.Length);
+        var result = new int[rank];
+        for (int axis = 0; axis < rank; axis++)
+        {
+            int leftAxis = axis - (rank - left.Length);
+            int rightAxis = axis - (rank - right.Length);
+            int leftDim = leftAxis < 0 ? 1 : left[leftAxis];
+            int rightDim = rightAxis < 0 ? 1 : right[rightAxis];
+            Assert.True(leftDim == rightDim || leftDim == 1 || rightDim == 1,
+                $"Test operands are not broadcast-compatible at axis {axis}: {leftDim} vs {rightDim}.");
+            result[axis] = leftDim == 1 ? rightDim : leftDim;
+        }
+        return result;
+    }
+
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
@@ -241,7 +258,9 @@ public class GpuCpuConsistencyTests
             foreach (var operation in operations)
             foreach (var (left, right) in operands)
             {
+                int[] expectedShape = ExpectedBroadcastShape(left.Shape._dims, right.Shape._dims);
                 Tensor<float> expected = operation.Run(cpu, left, right);
+                Assert.Equal(expectedShape, expected.Shape.ToArray());
                 GpuLaunchProbe.Reset();
                 Tensor<float> actual = operation.Run(gpu, left, right);
 
@@ -249,6 +268,7 @@ public class GpuCpuConsistencyTests
                     $"Implicit broadcast {operation.Name} launched no GPU work.");
                 Assert.Empty(GpuLaunchProbe.Fallbacks);
                 Assert.Equal(0, GpuLaunchProbe.Readbacks);
+                Assert.Equal(expectedShape, actual.Shape.ToArray());
                 AssertTensorClose(expected, actual,
                     $"implicit broadcast {operation.Name} [{string.Join("x", left.Shape._dims)}] " +
                     $"with [{string.Join("x", right.Shape._dims)}]");
