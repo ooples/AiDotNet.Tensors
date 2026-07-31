@@ -60,12 +60,14 @@ public sealed partial class CudaBackend
     }
     private long _directPtxLogSumExpDispatchCount;
 
-    // ---- Log-sum-exp backward: input[M,N], grad[M] -> output[M,N] ----
-    internal bool TryDirectPtxLogSumExpBackward(IGpuBuffer input, IGpuBuffer grad, IGpuBuffer output, int m, int n)
+    // ---- Log-sum-exp backward: input[M,N], lse[M], grad[M] -> output[M,N] ----
+    internal bool TryDirectPtxLogSumExpBackward(
+        IGpuBuffer input, IGpuBuffer lse, IGpuBuffer grad, IGpuBuffer output, int m, int n)
     {
         if (!SoftmaxFamilyGateOpen || !PtxLogSumExpBackwardKernel.IsSupportedShape(m, n))
         { DirectPtxLastError = "logsumexp-backward-not-eligible"; return false; }
         if (input.SizeInBytes != checked((long)m * n * sizeof(float)) ||
+            lse.SizeInBytes != checked((long)m * sizeof(float)) ||
             grad.SizeInBytes != checked((long)m * sizeof(float)) ||
             output.SizeInBytes != checked((long)m * n * sizeof(float)))
         { DirectPtxLastError = "logsumexp-backward-physical-extent-mismatch"; return false; }
@@ -76,8 +78,9 @@ public sealed partial class CudaBackend
             lock (GpuDispatchLock)
                 kernel.Launch(
                     DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
-                    DirectPtxTensorView.Create(grad, kernel.Blueprint.Tensors[1]),
-                    DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+                    DirectPtxTensorView.Create(lse, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.Create(grad, kernel.Blueprint.Tensors[2]),
+                    DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[3]));
         }, ref _directPtxLogSumExpBackwardDispatchCount);
     }
     private long _directPtxLogSumExpBackwardDispatchCount;

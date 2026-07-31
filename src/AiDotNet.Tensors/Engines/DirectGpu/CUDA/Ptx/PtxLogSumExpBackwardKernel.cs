@@ -5,16 +5,15 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// Row-wise log-sum-exp backward <c>dX[m,n] = softmax(x[m,:])[n] * dY[m]</c> over the last
-/// axis (issue #840), where <c>dY</c> is the [M] upstream gradient of the [M] log-partition
-/// output. One block owns one row: a single shared-resident pass reduces the stable row max
-/// and exp-sum with in-block tree reductions, then the broadcast pass multiplies each
-/// softmax probability by the row's scalar upstream gradient — no global intermediate. Uses
-/// <c>ex2.approx.f32</c>, so a promoted specialization carries ~1e-3 approximation error
-/// (disclosed on the release gate).
+/// Row-wise log-sum-exp backward <c>dX[m,n] = exp(x[m,n] - lse[m]) * dY[m]</c> over the last
+/// axis (issue #840), where <c>lse</c> is the caller-provided [M] forward log-partition and
+/// <c>dY</c> is its [M] upstream gradient. One block owns one row and reuses those forward
+/// statistics directly, matching the incumbent CUDA contract while avoiding a redundant max
+/// and exp-sum reduction. Uses <c>ex2.approx.f32</c>, so a promoted specialization carries
+/// ~1e-3 approximation error (disclosed on the release gate).
 ///
-/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 256 floats
-/// (reduction). Supported N are multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads, no shared memory. Supported N are multiples of
+/// 256 so each thread strides the row exactly.
 /// </summary>
 internal sealed class PtxLogSumExpBackwardKernel : IDisposable
 {
@@ -51,19 +50,25 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
     }
 
     internal unsafe void Launch(
-        DirectPtxTensorView input, DirectPtxTensorView grad, DirectPtxTensorView output)
+        DirectPtxTensorView input,
+        DirectPtxTensorView logSumExp,
+        DirectPtxTensorView grad,
+        DirectPtxTensorView output)
     {
         PtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
-        PtxAbiGuard.Require(grad, Blueprint.Tensors[1], nameof(grad));
-        PtxAbiGuard.Require(output, Blueprint.Tensors[2], nameof(output));
+        PtxAbiGuard.Require(logSumExp, Blueprint.Tensors[1], nameof(logSumExp));
+        PtxAbiGuard.Require(grad, Blueprint.Tensors[2], nameof(grad));
+        PtxAbiGuard.Require(output, Blueprint.Tensors[3], nameof(output));
 
         IntPtr inputPointer = input.Pointer;
+        IntPtr logSumExpPointer = logSumExp.Pointer;
         IntPtr gradPointer = grad.Pointer;
         IntPtr outputPointer = output.Pointer;
-        void** arguments = stackalloc void*[3];
+        void** arguments = stackalloc void*[4];
         arguments[0] = &inputPointer;
-        arguments[1] = &gradPointer;
-        arguments[2] = &outputPointer;
+        arguments[1] = &logSumExpPointer;
+        arguments[2] = &gradPointer;
+        arguments[3] = &outputPointer;
         _module.Launch(_function, (uint)M, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -74,9 +79,8 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         PtxRowShape.Validate(m, n, "Log-sum-exp backward");
         int rowBytes = checked(n * sizeof(float));
         const string Log2e = "0f3FB8AA3B";
-        const string NegInf = "0fFF800000";
 
-        var ptx = new StringBuilder(10_000);
+        var ptx = new StringBuilder(5_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
@@ -84,94 +88,44 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
+        ptx.AppendLine("    .param .u64 lse_ptr,");
         ptx.AppendLine("    .param .u64 grad_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<4>;");
-        ptx.AppendLine("    .reg .b32 %r<12>;");
-        ptx.AppendLine("    .reg .b64 %rd<24>;");
-        ptx.AppendLine("    .reg .f32 %f<20>;");
-        ptx.AppendLine($"    .shared .align 16 .b8 row_sh[{n * sizeof(float)}];");
-        ptx.AppendLine($"    .shared .align 16 .b8 red[{BlockThreads * sizeof(float)}];");
+        ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .f32 %f<8>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
-        ptx.AppendLine("    ld.param.u64 %rd1, [grad_ptr];");
-        ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
-        ptx.AppendLine("    mov.u64 %rd4, row_sh;");
-        ptx.AppendLine("    mov.u64 %rd5, red;");
+        ptx.AppendLine("    ld.param.u64 %rd1, [lse_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd2, [grad_ptr];");
+        ptx.AppendLine("    ld.param.u64 %rd3, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mul.wide.u32 %rd6, %r1, {rowBytes};");
-        ptx.AppendLine("    add.u64 %rd7, %rd0, %rd6;");                 // &input[m,0]
-        ptx.AppendLine("    add.u64 %rd8, %rd2, %rd6;");                 // &output[m,0]
-        ptx.AppendLine("    mul.wide.u32 %rd9, %r0, 4;");
-        ptx.AppendLine("    add.u64 %rd10, %rd5, %rd9;");               // &red[tid]
-
-        // ---- Pass 1: cache row + partial max ----
-        ptx.AppendLine($"    mov.f32 %f0, {NegInf};");
-        ptx.AppendLine("    mov.u32 %r3, %r0;");
-        ptx.AppendLine("LOAD_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {n};");
-        ptx.AppendLine("    @%p0 bra.uni LOAD_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd12, %rd7, %rd11;");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd12];");
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd11;");
-        ptx.AppendLine("    st.shared.f32 [%rd13], %f1;");
-        ptx.AppendLine("    max.f32 %f0, %f0, %f1;");
-        ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
-        ptx.AppendLine("    bra.uni LOAD_LOOP;");
-        ptx.AppendLine("LOAD_DONE:");
-        ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
-        ptx.AppendLine("    bar.sync 0;");
-        PtxRowReduce.Emit(ptx, "max.f32");
-        ptx.AppendLine("    ld.shared.f32 %f2, [%rd5];");                // rowMax
-        ptx.AppendLine("    bar.sync 0;");
-
-        // ---- Pass 2: partial sum of exp(x - rowMax) ----
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r3, %r0;");
-        ptx.AppendLine("SUM_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {n};");
-        ptx.AppendLine("    @%p0 bra.uni SUM_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd11;");
-        ptx.AppendLine("    ld.shared.f32 %f1, [%rd13];");
-        ptx.AppendLine("    sub.rn.f32 %f1, %f1, %f2;");
-        ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {Log2e};");
-        ptx.AppendLine("    ex2.approx.f32 %f1, %f1;");
-        ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
-        ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
-        ptx.AppendLine("    bra.uni SUM_LOOP;");
-        ptx.AppendLine("SUM_DONE:");
-        ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
-        ptx.AppendLine("    bar.sync 0;");
-        PtxRowReduce.Emit(ptx, "add.rn.f32");
-        ptx.AppendLine("    ld.shared.f32 %f3, [%rd5];");                // sumExp
-        ptx.AppendLine("    bar.sync 0;");
-        ptx.AppendLine("    rcp.approx.f32 %f4, %f3;");                  // 1/sumExp
-        // Broadcast per-row scalar upstream gradient dY[m].
-        ptx.AppendLine("    mul.wide.u32 %rd14, %r1, 4;");
-        ptx.AppendLine("    add.u64 %rd15, %rd1, %rd14;");
-        ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd15];");           // dY[m]
-        ptx.AppendLine("    mul.rn.f32 %f4, %f4, %f5;");                // inv * dY[m]
-
-        // ---- Pass 3: output = exp(x - rowMax) * (inv * dY[m]) ----
-        ptx.AppendLine("    mov.u32 %r3, %r0;");
+        ptx.AppendLine($"    mul.wide.u32 %rd4, %r1, {rowBytes};");
+        ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");               // &input[m,0]
+        ptx.AppendLine("    add.u64 %rd6, %rd3, %rd4;");               // &output[m,0]
+        ptx.AppendLine("    mul.wide.u32 %rd7, %r1, 4;");
+        ptx.AppendLine("    add.u64 %rd8, %rd1, %rd7;");               // &lse[m]
+        ptx.AppendLine("    add.u64 %rd9, %rd2, %rd7;");               // &grad[m]
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd8];");           // lse[m]
+        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");           // dY[m]
+        ptx.AppendLine("    mov.u32 %r2, %r0;");
         ptx.AppendLine("OUT_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r3, {n};");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {n};");
         ptx.AppendLine("    @%p0 bra.uni OUT_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd11, %r3, 4;");
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd11;");
-        ptx.AppendLine("    ld.shared.f32 %f1, [%rd13];");
-        ptx.AppendLine("    sub.rn.f32 %f1, %f1, %f2;");
-        ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {Log2e};");
-        ptx.AppendLine("    ex2.approx.f32 %f1, %f1;");
-        ptx.AppendLine("    mul.rn.f32 %f1, %f1, %f4;");
-        ptx.AppendLine("    add.u64 %rd16, %rd8, %rd11;");
-        ptx.AppendLine("    st.global.f32 [%rd16], %f1;");
-        ptx.AppendLine($"    add.u32 %r3, %r3, {BlockThreads};");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r2, 4;");
+        ptx.AppendLine("    add.u64 %rd11, %rd5, %rd10;");
+        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd11];");
+        ptx.AppendLine("    sub.rn.f32 %f2, %f2, %f0;");
+        ptx.AppendLine($"    mul.rn.f32 %f2, %f2, {Log2e};");
+        ptx.AppendLine("    ex2.approx.f32 %f2, %f2;");
+        ptx.AppendLine("    mul.rn.f32 %f2, %f2, %f1;");
+        ptx.AppendLine("    add.u64 %rd12, %rd6, %rd10;");
+        ptx.AppendLine("    st.global.f32 [%rd12], %f2;");
+        ptx.AppendLine($"    add.u32 %r2, %r2, {BlockThreads};");
         ptx.AppendLine("    bra.uni OUT_LOOP;");
         ptx.AppendLine("OUT_DONE:");
         ptx.AppendLine("    ret;");
@@ -186,30 +140,33 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         var vector = new DirectPtxExtent(m);
         return new DirectPtxKernelBlueprint(
             Operation: "logsumexp-backward-row",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-m{m}-n{n}",
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     matrix, matrix, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
+                new("logSumExp", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                    vector, vector, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
                 new("grad", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     vector, vector, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     matrix, matrix, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 32,
-                MaxStaticSharedBytes: (n + BlockThreads) * sizeof(float),
+                MaxRegistersPerThread: 16,
+                MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "dX[m,n] = softmax(x[m,:])[n] * dY[m]",
+                ["formula"] = "dX[m,n] = exp(x[m,n] - lse[m]) * dY[m]",
                 ["axis"] = "last",
                 ["broadcast"] = "per-row-scalar-upstream-gradient",
-                ["reduction"] = "in-block-tree-reduction-shared",
-                ["global-intermediates"] = "none",
+                ["forward-statistics"] = "caller-provided-logsumexp-vector",
+                ["reduction"] = "none-forward-logsumexp-reused",
+                ["global-intermediates"] = "caller-provided-lse-input",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"
             });

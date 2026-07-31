@@ -9520,8 +9520,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        // Fail-closed direct-PTX fast path (issue #840): dX = softmax(input) * gradOutput[m].
-        if (TryDirectPtxLogSumExpBackward(input, gradOutput, gradInput, outerSize, reduceSize)) return;
+        // Fail-closed direct-PTX fast path (issue #840): dX = exp(input-lse) * gradOutput[m].
+        if (TryDirectPtxLogSumExpBackward(input, lse, gradOutput, gradInput, outerSize, reduceSize)) return;
         if (!_kernelCache.TryGetValue("logsumexp_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: logsumexp_backward");
         using var _ = PushContext();

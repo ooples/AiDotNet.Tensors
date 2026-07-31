@@ -327,18 +327,21 @@ public class DirectPtxSoftmaxTests
     }
 
     [Fact]
-    public void LogSumExpBackwardEmitter_BroadcastsPerRowScalarGradient()
+    public void LogSumExpBackwardEmitter_ReusesSuppliedLogPartition()
     {
         string ptx = PtxLogSumExpBackwardKernel.EmitPtx(8, 6, 64, 512);
         Assert.Contains(PtxLogSumExpBackwardKernel.EntryPoint, ptx);
-        Assert.Contains("LOAD_LOOP:", ptx);
-        Assert.Contains("SUM_LOOP:", ptx);
         Assert.Contains("OUT_LOOP:", ptx);
         Assert.Contains("ex2.approx.f32", ptx);
-        Assert.Contains("rcp.approx.f32", ptx);
-        Assert.Contains("ld.global.nc.f32 %f5, [%rd15]", ptx);          // per-row scalar dY[m]
-        Assert.Contains("mul.rn.f32 %f4, %f4, %f5", ptx);               // fold into inv
-        Assert.Equal(20, Count(ptx, "bar.sync 0"));
+        Assert.Contains("ld.param.u64 %rd1, [lse_ptr]", ptx);
+        Assert.Contains("ld.global.nc.f32 %f0, [%rd8]", ptx);           // supplied lse[m]
+        Assert.Contains("ld.global.nc.f32 %f1, [%rd9]", ptx);           // per-row dY[m]
+        Assert.Contains("sub.rn.f32 %f2, %f2, %f0", ptx);               // x - supplied lse
+        Assert.DoesNotContain("LOAD_LOOP:", ptx);
+        Assert.DoesNotContain("SUM_LOOP:", ptx);
+        Assert.DoesNotContain("rcp.approx.f32", ptx);
+        Assert.DoesNotContain("bar.sync", ptx);
+        Assert.DoesNotContain(".shared", ptx);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxLogSumExpBackwardKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxLogSumExpBackwardKernel.IsPromotedShape(128, 2048));
@@ -360,6 +363,7 @@ public class DirectPtxSoftmaxTests
         var random = RandomHelper.CreateSeededRandom(20265100 + m + n);
         float[] xHost = Values(random, m * n, 3.0f);
         float[] dyHost = Values(random, m, 1.0f);
+        var lseHost = new float[m];
         var expected = new float[m * n];
         for (int row = 0; row < m; row++)
         {
@@ -367,20 +371,26 @@ public class DirectPtxSoftmaxTests
             for (int col = 0; col < n; col++) max = Math.Max(max, xHost[row * n + col]);
             double sum = 0;
             for (int col = 0; col < n; col++) sum += Math.Exp(xHost[row * n + col] - max);
+            lseHost[row] = (float)(max + Math.Log(sum));
             for (int col = 0; col < n; col++)
-                expected[row * n + col] = (float)(Math.Exp(xHost[row * n + col] - max) / sum * dyHost[row]);
+                expected[row * n + col] =
+                    (float)(Math.Exp(xHost[row * n + col] - lseHost[row]) * dyHost[row]);
         }
 
         using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));
+        using var lse = runtime.AllocateBytes((nuint)(lseHost.Length * sizeof(float)));
         using var dy = runtime.AllocateBytes((nuint)(dyHost.Length * sizeof(float)));
         using var output = runtime.AllocateBytes((nuint)(m * n * sizeof(float)));
         x.Upload<float>(xHost);
+        lse.Upload<float>(lseHost);
         dy.Upload<float>(dyHost);
         kernel.Launch(
             DirectPtxTensorView.CreateOwned(x, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(dy, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+            DirectPtxTensorView.CreateOwned(lse, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(dy, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
         runtime.Synchronize();
+        Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
         var actual = new float[m * n];
         output.Download<float>(actual);
         AssertVectorClose(actual, expected, 2e-3f, $"logsumexp-backward {m}x{n}");
@@ -822,19 +832,17 @@ public class DirectPtxSoftmaxTests
                 backend.LogSumExpAxis(xBuf, lseBuf, m, n);
                 backend.Synchronize();
                 Assert.True(backend.DirectPtxLogSumExpDispatchCount > before, backend.DirectPtxLastError);
-                AssertVectorClose(backend.DownloadBuffer(lseBuf), lseExpected, 3e-3f, "backend logsumexp route");
+                float[] actualLse = backend.DownloadBuffer(lseBuf);
+                AssertVectorClose(actualLse, lseExpected, 3e-3f, "backend logsumexp route");
 
                 // ---- LogSumExpBackward: dX = softmax(x) * dY[m] ----
                 float[] dLseHost = Values(random, m, 1.0f);
                 var lseBwdExpected = new float[size];
                 for (int row = 0; row < m; row++)
                 {
-                    double mx = double.NegativeInfinity;
-                    for (int c = 0; c < n; c++) mx = Math.Max(mx, xHost[row * n + c]);
-                    double sm = 0;
-                    for (int c = 0; c < n; c++) sm += Math.Exp(xHost[row * n + c] - mx);
                     for (int c = 0; c < n; c++)
-                        lseBwdExpected[row * n + c] = (float)(Math.Exp(xHost[row * n + c] - mx) / sm * dLseHost[row]);
+                        lseBwdExpected[row * n + c] =
+                            (float)(Math.Exp(xHost[row * n + c] - actualLse[row]) * dLseHost[row]);
                 }
                 using var dLseBuf = backend.AllocateBuffer(dLseHost);
                 using var dxBuf = backend.AllocateBuffer(size);
@@ -843,6 +851,29 @@ public class DirectPtxSoftmaxTests
                 backend.Synchronize();
                 Assert.True(backend.DirectPtxLogSumExpBackwardDispatchCount > beforeB, backend.DirectPtxLastError);
                 AssertVectorClose(backend.DownloadBuffer(dxBuf), lseBwdExpected, 2e-3f, "backend logsumexp-backward route");
+
+                // The API contract consumes the supplied lse; prove the PTX route does too.
+                var corruptedLseHost = new float[m];
+                var corruptedExpected = new float[size];
+                for (int row = 0; row < m; row++)
+                {
+                    corruptedLseHost[row] = lseExpected[row] + 0.75f;
+                    for (int col = 0; col < n; col++)
+                        corruptedExpected[row * n + col] =
+                            (float)(Math.Exp(xHost[row * n + col] - corruptedLseHost[row]) * dLseHost[row]);
+                }
+                using var corruptedLseBuf = backend.AllocateBuffer(corruptedLseHost);
+                using var corruptedDxBuf = backend.AllocateBuffer(size);
+                long beforeCorrupted = backend.DirectPtxLogSumExpBackwardDispatchCount;
+                backend.LogSumExpBackward(
+                    dLseBuf, xBuf, corruptedLseBuf, corruptedDxBuf, m, n);
+                backend.Synchronize();
+                Assert.True(
+                    backend.DirectPtxLogSumExpBackwardDispatchCount > beforeCorrupted,
+                    backend.DirectPtxLastError);
+                AssertVectorClose(
+                    backend.DownloadBuffer(corruptedDxBuf), corruptedExpected, 2e-3f,
+                    "backend logsumexp-backward supplied-lse contract");
             }
 
             // ---- MaskedFill / MaskedFillBackward (flat size) ----
