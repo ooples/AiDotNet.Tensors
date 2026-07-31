@@ -186,6 +186,13 @@ internal readonly record struct DirectPtxTensorContract
             throw new ArgumentOutOfRangeException(nameof(alignmentBytes), "Alignment must be a power of two.");
         if (physicalExtent.ElementCount < logicalExtent.ElementCount)
             throw new ArgumentException("Physical extent cannot be smaller than logical extent.", nameof(physicalExtent));
+        if (byteOffset % (nuint)alignmentBytes != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(byteOffset), "Byte offset must be a multiple of the required alignment.");
+        int elementBytes = ElementSize(physicalType);
+        if (byteOffset % (nuint)elementBytes != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(byteOffset), "Byte offset must be a multiple of the tensor element size.");
         Name = name;
         PhysicalType = physicalType;
         Layout = layout;
@@ -198,13 +205,15 @@ internal readonly record struct DirectPtxTensorContract
     }
 
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
-    internal int ElementBytes => PhysicalType switch
+    internal int ElementBytes => ElementSize(PhysicalType);
+
+    private static int ElementSize(DirectPtxPhysicalType physicalType) => physicalType switch
     {
         DirectPtxPhysicalType.Int8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
-        _ => throw new ArgumentOutOfRangeException(nameof(PhysicalType))
+        _ => throw new ArgumentOutOfRangeException(nameof(physicalType))
     };
 }
 

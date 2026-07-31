@@ -287,6 +287,19 @@ public sealed class DirectPtxVisionBoxIouTests
             new FakeGpuBuffer(new IntPtr(0x1004), checked((long)aContract.RequiredBytes)),
             aContract));
 
+        Assert.Equal("byteOffset", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DirectPtxTensorContract(
+                "misaligned-boxes", aContract.PhysicalType, aContract.Layout,
+                aContract.LogicalExtent, aContract.PhysicalExtent,
+                aContract.AlignmentBytes, aContract.Access,
+                DirectPtxExtentMode.Exact, byteOffset: 4)).ParamName);
+        Assert.Equal("byteOffset", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DirectPtxTensorContract(
+                "partial-element-boxes", aContract.PhysicalType, aContract.Layout,
+                aContract.LogicalExtent, aContract.PhysicalExtent,
+                alignmentBytes: 2, access: aContract.Access,
+                DirectPtxExtentMode.Exact, byteOffset: 2)).ParamName);
+
         var offsetContract = new DirectPtxTensorContract(
             "offset-boxes", aContract.PhysicalType, aContract.Layout,
             aContract.LogicalExtent, aContract.PhysicalExtent,
