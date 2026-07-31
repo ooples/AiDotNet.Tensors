@@ -1,6 +1,7 @@
 #if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text.RegularExpressions;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -460,6 +461,30 @@ public sealed class DirectPtxVisionBoxIouTests
         Assert.DoesNotContain("single deterministic controller thread",
             definition.Ptx, StringComparison.Ordinal);
         AssertPtxRegisterAndLabelClosure(definition.Ptx);
+    }
+
+    [Fact]
+    public void NmsBlueprint_FormatsThresholdInvariantly()
+    {
+        CultureInfo oldCulture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("fr-FR");
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                new(DirectPtxVisionOperation.Nms, 256,
+                    ScalarBits: BitConverter.SingleToInt32Bits(0.5f)),
+                DirectPtxArchitectureFamily.Ampere, 8, 6);
+
+            Assert.Contains("threshold-0.5", definition.Blueprint.Variant,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("threshold-0,5", definition.Blueprint.Variant,
+                StringComparison.Ordinal);
+            Assert.Equal("0.5", definition.Blueprint.Semantics["threshold"]);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = oldCulture;
+        }
     }
 
     private static void AssertPtxRegisterAndLabelClosure(string ptx)

@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -53,7 +54,8 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    setp.ne.u32 %p0, %r0, 0; @%p0 bra DONE;");
         ptx.AppendLine("    cvt.rn.f32.u32 %f29, %r1; st.global.f32 [%rd5], %f29;");
         string code = Finish(ptx);
-        return Definition(spec, architecture, $"n{length}-threshold-{threshold:R}-batched-{batched}",
+        string thresholdText = threshold.ToString("R", CultureInfo.InvariantCulture);
+        return Definition(spec, architecture, $"n{length}-threshold-{thresholdText}-batched-{batched}",
             [
                 Tensor("boxes", DirectPtxPhysicalLayout.BoxXyxy, new(length, 4), DirectPtxTensorAccess.Read),
                 Tensor("scores", DirectPtxPhysicalLayout.Vector, new(length), DirectPtxTensorAccess.Read),
@@ -63,7 +65,7 @@ internal static partial class PtxVisionEmitter
                 Tensor("output", DirectPtxPhysicalLayout.Vector, new(length), DirectPtxTensorAccess.Write),
                 Tensor("output-count", DirectPtxPhysicalLayout.Vector, new(1), DirectPtxTensorAccess.Write)
             ], Semantics(("stable-tie", "lower original index"), ("batched", batched.ToString()),
-                ("threshold", threshold.ToString("R", System.Globalization.CultureInfo.InvariantCulture)),
+                ("threshold", thresholdText),
                 ("execution", "deterministic cooperative block: parallel argmax and suppression")),
             code, 1, maxRegisters: 48, minBlocksPerSm: 1,
             blockThreads: BlockThreads, maxStaticSharedBytes: SharedBytes);
