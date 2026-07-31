@@ -17,7 +17,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// </summary>
 internal sealed class PtxLogSumExpKernel : IDisposable
 {
-    internal const int BlockThreads = 256;
+    internal const int BlockThreads = PtxRowShape.BlockThreads;
     internal const string EntryPoint = "aidotnet_logsumexp_row";
 
     private readonly DirectPtxModule _module;
@@ -36,7 +36,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in log-sum-exp specialization is measured only on GA10x/SM86.");
-        ValidateShape(m, n);
+        PtxRowShape.Validate(m, n, "Log-sum-exp");
         M = m;
         N = n;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, n);
@@ -51,8 +51,8 @@ internal sealed class PtxLogSumExpKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        PtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        PtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer;
         IntPtr outputPointer = output.Pointer;
@@ -66,7 +66,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int m, int n)
     {
-        ValidateShape(m, n);
+        PtxRowShape.Validate(m, n, "Log-sum-exp");
         int rowBytes = checked(n * sizeof(float));
         const string Log2e = "0f3FB8AA3B";
         const string Ln2 = "0f3F317218";
@@ -118,7 +118,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
         ptx.AppendLine("LOAD_DONE:");
         ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
         ptx.AppendLine("    bar.sync 0;");
-        EmitTreeReduce(ptx, "max.f32");
+        PtxRowReduce.Emit(ptx, "max.f32");
         ptx.AppendLine("    ld.shared.f32 %f2, [%rd5];");                // rowMax
         ptx.AppendLine("    bar.sync 0;");
 
@@ -140,7 +140,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
         ptx.AppendLine("SUM_DONE:");
         ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
         ptx.AppendLine("    bar.sync 0;");
-        EmitTreeReduce(ptx, "add.rn.f32");
+        PtxRowReduce.Emit(ptx, "add.rn.f32");
         ptx.AppendLine("    ld.shared.f32 %f3, [%rd5];");                // sumExp
 
         // ---- logZ = rowMax + ln2*lg2(sumExp); thread 0 writes output[m] ----
@@ -155,19 +155,6 @@ internal sealed class PtxLogSumExpKernel : IDisposable
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
-    }
-
-    private static void EmitTreeReduce(StringBuilder ptx, string op)
-    {
-        foreach (int stride in new[] { 128, 64, 32, 16, 8, 4, 2, 1 })
-        {
-            ptx.AppendLine($"    setp.lt.u32 %p3, %r0, {stride};");
-            ptx.AppendLine("    @%p3 ld.shared.f32 %f10, [%rd10];");
-            ptx.AppendLine($"    @%p3 ld.shared.f32 %f11, [%rd10+{stride * sizeof(float)}];");
-            ptx.AppendLine($"    @%p3 {op} %f10, %f10, %f11;");
-            ptx.AppendLine("    @%p3 st.shared.f32 [%rd10], %f10;");
-            ptx.AppendLine("    bar.sync 0;");
-        }
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -204,28 +191,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
             });
     }
 
-    internal static bool IsSupportedShape(int m, int n) =>
-        m > 0 && m % 64 == 0 &&
-        n > 0 && n % BlockThreads == 0 &&
-        m is 64 or 128 or 256 or 512 or 1024 or 2048 &&
-        n is 256 or 512 or 1024 or 2048 or 4096;
+    internal static bool IsSupportedShape(int m, int n) => PtxRowShape.IsSupported(m, n);
 
-    internal static bool IsPromotedShape(int m, int n) => false;
-
-    private static void ValidateShape(int m, int n)
-    {
-        if (!IsSupportedShape(m, n))
-            throw new ArgumentOutOfRangeException(
-                nameof(m),
-                "Log-sum-exp supports M in {64,128,256,512,1024,2048}, N in {256,512,1024,2048,4096}.");
-    }
-
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
+    internal static bool IsPromotedShape(int m, int n) => PtxRowShape.IsPromoted(m, n);
 }

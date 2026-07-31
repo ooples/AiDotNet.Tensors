@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Text;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -99,6 +100,31 @@ public class DirectPtxSoftmaxTests
                 Assert.Equal(expected.Value, peer.FollowUpIssue);
             });
         });
+    }
+
+    [Fact]
+    public void RowKernelScaffolding_CentralizesAuditedReductionAndShapePolicy()
+    {
+        Assert.Equal(256, PtxRowShape.BlockThreads);
+        Assert.True(PtxRowShape.IsSupported(64, 256));
+        Assert.True(PtxRowShape.IsSupported(2048, 4096));
+        Assert.False(PtxRowShape.IsSupported(63, 256));
+        Assert.False(PtxRowShape.IsSupported(64, 768));
+        Assert.False(PtxRowShape.IsPromoted(128, 2048));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxRowShape.Validate(63, 256, "Test row operation"));
+
+        var ptx = new StringBuilder();
+        PtxRowReduce.Emit(ptx, "add.rn.f32");
+        string emitted = ptx.ToString();
+        Assert.Equal(8, Count(emitted, "bar.sync 0"));
+        foreach (int stride in new[] { 128, 64, 32, 16, 8, 4, 2, 1 })
+        {
+            Assert.Contains($"setp.lt.u32 %p3, %r0, {stride};", emitted);
+            Assert.Contains($"[%rd10+{stride * sizeof(float)}]", emitted);
+        }
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxRowReduce.Emit(new StringBuilder(), "mul.rn.f32"));
     }
 
     [Fact]
