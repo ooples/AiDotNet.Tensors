@@ -57,9 +57,9 @@ public class CodegenEmitterLimitsTests
         }
     }
 
-    /// <summary>A grid past the launch API's X limit is refused, not silently truncated.</summary>
+    /// <summary>The largest one-dimensional shape representable by an int still emits.</summary>
     [Fact]
-    public void GridPastTheLaunchLimit_IsRefusedWithAUsefulMessage()
+    public void MaximalIntSizedGrid_Emits()
     {
         // 2^31 elements at one output per thread exceeds the 2^31-1 block limit once
         // divided by the block size only if coarsening is off; use a huge 1-D copy.
@@ -71,6 +71,25 @@ public class CodegenEmitterLimitsTests
         string ptx = emitter.Emit(huge, 8, 6);
         Assert.Contains(".visible .entry", ptx, StringComparison.Ordinal);
         Assert.True(emitter.LaunchBlocks > 0);
+    }
+
+    /// <summary>A thread count the emitted u32 gid cannot represent is refused.</summary>
+    [Fact]
+    public void ThreadCountPastU32_IsRefusedWithAUsefulMessage()
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("row", int.MaxValue),
+            CodegenAxis.Parallel("column", 3));
+        var input = new CodegenTensorBinding(0, "input", new[] { int.MaxValue, 3 },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var output = new CodegenTensorBinding(1, "output", new[] { int.MaxValue, 3 },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
+        var huge = new CodegenKernelSpec("u32_overflow", space, new[] { input }, output,
+            new[] { 0 }, CodegenReduceKind.None);
+
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            new PtxAffineEmitter { Coarsening = 1 }.Emit(huge, 8, 6));
+        Assert.Contains("u32 gid", ex.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -103,6 +122,8 @@ public class CodegenEmitterLimitsTests
     [InlineData(8, 6)]
     [InlineData(8, 9)]
     [InlineData(9, 0)]
+    [InlineData(10, 0)]
+    [InlineData(12, 0)]
     public void EveryAcceptedArchitecture_GetsAnIsaVersionThatNamesIt(int major, int minor)
     {
         string ptx = new PtxAffineEmitter().Emit(Copy("arch_copy", 1024), major, minor);
@@ -110,7 +131,9 @@ public class CodegenEmitterLimitsTests
 
         Assert.StartsWith(".version ", version, StringComparison.Ordinal);
         double declared = double.Parse(version.Substring(9), System.Globalization.CultureInfo.InvariantCulture);
-        double required = (major * 10 + minor) >= 89 ? 7.8 : (major * 10 + minor) >= 87 ? 7.4 : 7.1;
+        int capability = major * 10 + minor;
+        double required = capability >= 120 ? 8.7 : capability >= 100 ? 8.6 :
+                          capability >= 89 ? 7.8 : capability >= 87 ? 7.4 : 7.1;
         Assert.True(declared >= required,
             "sm_" + major + minor + " needs ISA " + required + " but the emitter declared " + declared);
     }

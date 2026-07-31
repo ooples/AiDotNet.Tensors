@@ -31,19 +31,18 @@ using System.Text;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using static AiDotNet.Tensors.Benchmarks.KernelToolArgs;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
 internal static class KernelConveyorTool
 {
-    private const double Tolerance = 2e-3;
+    private const double Tolerance = CodegenMeasurementProtocol.AccumulationTolerance;
     private const int Warmup = 20;
     private const int Samples = 51;
     private const int LaunchesPerSample = 50;
     private const int Runs = 3;
-
-    /// <summary>Attempts allowed to obtain a measurement taken at a steady SM clock.</summary>
-    private const int ClockRetries = 4;
+    private const int StabilityAttempts = 15;
 
     /// <summary>
     /// Forces per-dimension activation staging on, for the correctness gate and for
@@ -66,7 +65,8 @@ internal static class KernelConveyorTool
             Console.WriteLine("No catalog entry matches '" + selector + "'. Known kernels:");
             foreach (var e in CodegenKernelCatalog.All)
                 Console.WriteLine("  " + e.Name.PadRight(32) + e.Summary);
-            return;
+            KernelToolArgs.RequireNonEmptySelection(
+                selector, entries.Count, "kernel-" + stage);
         }
 
         switch (stage)
@@ -102,6 +102,7 @@ internal static class KernelConveyorTool
             string ptx = emitter.Emit(entry.Bench, 8, 6);
             string path = Path.Combine(dir, entry.Name + ".ptx");
             File.WriteAllText(path, ptx);
+            File.WriteAllText(Path.Combine(dir, entry.Name + ".spec.txt"), entry.Bench.Describe());
             Console.WriteLine(path + "  lanes=" + emitter.CoarsenedLanes +
                               " blocks=" + emitter.LaunchBlocks);
         }
@@ -186,9 +187,14 @@ internal static class KernelConveyorTool
                           " G warp-inst/s | dram " + (machine.DramBytesPerSecond / 1e9).ToString("F0", CultureInfo.InvariantCulture) +
                           " GB/s | compute " + (machine.MacsPerSecond * 2 / 1e12).ToString("F1", CultureInfo.InvariantCulture) + " TFLOP/s");
         Console.WriteLine();
-        Console.WriteLine("measured column recorded under protocol " + CodegenMeasurementProtocol.Tag);
+        Console.WriteLine("measured column loaded from competitor evidence under protocol " +
+                          CodegenMeasurementProtocol.Tag);
         Console.WriteLine();
-        Console.WriteLine("kernel                        tile            block  ld/MAC  staged");
+        Console.WriteLine("kernel                        tile            block  ld/MAC  staged" +
+                          "                 predicted  measured  pred/meas");
+
+        var measuredEvidence = ReadEvidence(
+            Path.Combine("artifacts", "competitor-ratios.tsv"), 1);
 
         foreach (var entry in entries)
         {
@@ -202,11 +208,23 @@ internal static class KernelConveyorTool
             long threads = spec.Space.TotalThreads / Math.Max(1, emitter.CoarsenedLanes);
             var p = CodegenPerformanceModel.Predict(spec, threads, emitter.DynamicLoadsPerThread, machine);
 
-            double measured = MeasuredMicroseconds(entry.Name);
-            string measuredText = measured > 0 ? measured.ToString("F1", CultureInfo.InvariantCulture) : "-";
-            string ratioText = measured > 0
-                ? (p.PredictedMicroseconds / measured).ToString("F2", CultureInfo.InvariantCulture) + "x"
+            double measured = measuredEvidence.TryGetValue(entry.Name, out string? cell) &&
+                              double.TryParse(cell, NumberStyles.Any,
+                                  CultureInfo.InvariantCulture, out double parsed)
+                ? parsed
+                : 0.0;
+            string measuredText = measured > 0
+                ? measured.ToString("F1", CultureInfo.InvariantCulture)
+                : "MISSING";
+            string predictedText = p.HasComputeCeiling
+                ? p.PredictedMicroseconds.ToString("F1", CultureInfo.InvariantCulture)
                 : "-";
+            string ratioText = measured <= 0
+                ? "MISSING"
+                : p.HasComputeCeiling
+                    ? (p.PredictedMicroseconds / measured)
+                        .ToString("F2", CultureInfo.InvariantCulture) + "x"
+                    : "-";
 
             Console.WriteLine(entry.Name.PadRight(30) +
                 emitter.TileDescription.PadRight(16) +
@@ -214,7 +232,9 @@ internal static class KernelConveyorTool
                 p.LoadsPerMac.ToString("F3", CultureInfo.InvariantCulture).PadLeft(8) +
                 "  " + (emitter.UsedTwoDimensionalBlock
                     ? "2D " + emitter.LaunchBlockX + "x" + emitter.LaunchBlockY + " "
-                    : "flat ") + emitter.StagedOperands);
+                    : "flat ") + emitter.StagedOperands.PadRight(16) +
+                predictedText.PadLeft(10) +
+                measuredText.PadLeft(10) + ratioText.PadLeft(11));
         }
 
         Console.WriteLine();
@@ -228,24 +248,6 @@ internal static class KernelConveyorTool
                                       "invariant in {" + string.Join(", ", pair.Value) + "}");
         }
     }
-
-    /// <summary>
-    /// Measured times from the locked-clock true-fp32 bake-off, so the prediction can
-    /// be checked against reality in the same table.
-    /// </summary>
-    private static double MeasuredMicroseconds(string kernel) => kernel switch
-    {
-        "depthwise_conv2d_3x3_bias_relu" => 81.0,
-        "depthwise_conv2d_3x3" => 78.8,
-        "depthwise_conv2d_3x3_bwd_data" => 78.1,
-        "conv2d_1x1_bias_relu" => 38.6,
-        "conv2d_1x1_bwd_data" => 42.9,
-        "conv2d_3x3_bias_relu" => 75.0,
-        "conv2d_3x3_bwd_data" => 87.6,
-        "maxpool2d_2x2" => 171.6,
-        "conv_transpose2d_3x3_stride2" => 109.0,
-        _ => 0.0,
-    };
 
     // ---------------------------------------------------------------- verify
 
@@ -311,6 +313,12 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine("verify: " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
+        if (failed != 0 || passed != entries.Count)
+            throw new InvalidOperationException(
+                "Kernel verification failed closed: " +
+                passed.ToString(CultureInfo.InvariantCulture) + " of " +
+                entries.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected operations passed.");
     }
 
     /// <summary>
@@ -329,9 +337,9 @@ internal static class KernelConveyorTool
     /// looking up by the spec name silently found nothing, so those kernels ran the
     /// modelled lowering while the cache said they had been tuned.
     /// </param>
-    private static void ApplyTuned(PtxAffineEmitter emitter, string kernelName)
+    internal static void ApplyTuned(
+        PtxAffineEmitter emitter, string kernelName, string? winner)
     {
-        string? winner = CodegenAutotuneCache.WinnerFor(kernelName);
         switch (winner)
         {
             case "no-tile": emitter.Coarsening = 1; break;
@@ -339,12 +347,15 @@ internal static class KernelConveyorTool
             case "lanes4": emitter.MaxTileLanes = 4; break;
             case "no-staging": emitter.EnableSharedStaging = false; break;
             case "no-vector": emitter.EnableVectorLoads = false; break;
+            case "input-staging": emitter.EnableInputStaging = true; break;
 
             // A split winner is not a knob -- it is a different PROGRAM, two kernels and a
             // temporary, which this single-kernel path cannot launch. Saying so is the
             // point: silently falling through would report a kernel as tuned while running
             // the lowering the tuner measured as 17x slower.
             case not null when winner.StartsWith("split:", StringComparison.Ordinal):
+            case not null when winner.StartsWith("tiled-split:", StringComparison.Ordinal):
+            case not null when winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal):
                 Console.WriteLine("    note: " + kernelName + " measured fastest as " + winner +
                                   ", a two-kernel split this stage cannot launch; " +
                                   "running the single-kernel lowering instead");
@@ -358,10 +369,9 @@ internal static class KernelConveyorTool
     //
     // A tuned lowering is usually a set of knobs, but it can also be a different PROGRAM:
     // the autotuner measures a two-kernel split against every single-kernel candidate and
-    // records "split:N" when it wins, which it does on all three weight gradients --
-    // 17.12x, 35.09x and 2.03x. The conveyor stages used to print a note and run the
-    // slower lowering, so the headline evidence for those kernels described a lowering the
-    // tuner had already rejected.
+    // records "split:N" or "tiled-split:N" when one wins. The conveyor stages used to
+    // print a note and run the slower lowering, so the headline evidence described a
+    // lowering the tuner had already rejected.
     //
     // This resolves the recorded winner into something all three stages can run, whether
     // it is one kernel or two.
@@ -369,7 +379,8 @@ internal static class KernelConveyorTool
     /// <summary>One kernel of a tuned program, with everything needed to launch it.</summary>
     private sealed record ProgramKernel(
         CodegenKernelSpec Spec, string Ptx, uint Blocks, uint BlockX, uint BlockY,
-        int LoopedAxes, int ElidedGuards, string StagedOperands);
+        int LoopedAxes, int ElidedGuards, string StagedOperands,
+        uint DynamicSharedMemoryBytes = 0);
 
     /// <summary>What the tuner says to run for a catalog entry.</summary>
     /// <param name="Spec">
@@ -388,37 +399,286 @@ internal static class KernelConveyorTool
 
         /// <summary>How the stages label this lowering in their tables.</summary>
         internal string Label() => IsSplit
-            ? "split x" + Kernels.Count.ToString(CultureInfo.InvariantCulture)
-            : Describe(Kernels[0].LoopedAxes);
+            ? (Winner is not null &&
+               Winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal)
+                ? "tiled chunked split x"
+                : Winner is not null && Winner.StartsWith("tiled-split:", StringComparison.Ordinal)
+                    ? "tiled split x"
+                : CodegenTiledConv2DSplitSchedule.Find(Winner) is not null
+                    ? "tiled conv2d split x"
+                    : "split x") + Kernels.Count.ToString(CultureInfo.InvariantCulture)
+            : string.Equals(Winner, "tiled-contraction", StringComparison.Ordinal) ||
+              CodegenTiledContractionSchedule.Find(Winner) is not null
+                ? "tiled contraction"
+                : string.Equals(Winner, "tiled-conv2d", StringComparison.Ordinal) ||
+                  CodegenTiledConv2DSchedule.Find(Winner) is not null
+                    ? "tiled conv2d"
+                : string.Equals(Winner, "depthwise-weight-gradient", StringComparison.Ordinal)
+                    ? "coop dW"
+                : string.Equals(Winner, "parity-transposed", StringComparison.Ordinal)
+                    ? "parity transpose"
+                : Describe(Kernels[0].LoopedAxes);
     }
 
     /// <summary>Emits the program the tuner recorded for this entry.</summary>
     private static TunedProgram ResolveTuned(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, string catalogName)
     {
-        string? winner = CodegenAutotuneCache.WinnerFor(catalogName);
+        var identity = CodegenAutotuneIdentity.Create(
+            spec, runtime.DeviceFingerprint,
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        string? winner = CodegenAutotuneCache.WinnerFor(catalogName, identity);
 
-        if (winner is not null && winner.StartsWith("split:", StringComparison.Ordinal))
+        CodegenOuterProductWinogradSchedule? winogradSchedule =
+            CodegenOuterProductWinogradSchedule.Find(winner);
+        if (winogradSchedule is not null)
+        {
+            try
+            {
+                var winograd = new PtxOuterProductWinogradConv2DEmitter(winogradSchedule);
+                string text = winograd.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, winograd.LaunchBlocks,
+                            checked((uint)winograd.LaunchBlockThreads), 1,
+                            0, 0, "weights+input tiles",
+                            checked((uint)winograd.SharedMemoryBytes)),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName +
+                                  " recorded " + winner + " but it could not " +
+                                  "be rebuilt (" + ex.Message + "); using the affine kernel");
+            }
+        }
+
+        CodegenTiledContractionSchedule? contractionSchedule =
+            CodegenTiledContractionSchedule.Find(winner);
+        if (string.Equals(winner, "tiled-contraction", StringComparison.Ordinal) ||
+            contractionSchedule is not null)
+        {
+            try
+            {
+                var tiled = contractionSchedule is null
+                    ? new PtxTiledContractionEmitter()
+                    : new PtxTiledContractionEmitter(contractionSchedule);
+                string text = tiled.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, tiled.LaunchBlocks,
+                            checked((uint)tiled.LaunchBlockThreads), 1,
+                            0, 0, "matrix+stream"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName + " recorded " + winner + " " +
+                                  "but it could not be rebuilt (" + ex.Message +
+                                  "); using the affine kernel");
+            }
+        }
+
+        CodegenTiledConv2DSplitSchedule? conv2DSplitSchedule =
+            CodegenTiledConv2DSplitSchedule.Find(winner);
+        if (conv2DSplitSchedule is not null)
+        {
+            try
+            {
+                if (!CodegenTiledConv2DSplitPlan.TryCreate(
+                        spec, conv2DSplitSchedule,
+                        out CodegenTiledConv2DSplitPlan? exact, out string reason))
+                    throw new NotSupportedException(reason);
+
+                CodegenSplitPlan split = exact!.Split;
+                var partial = new PtxTiledConv2DEmitter(conv2DSplitSchedule.Tile);
+                string partialText = partial.Emit(
+                    split.Partial, runtime.ComputeCapabilityMajor,
+                    runtime.ComputeCapabilityMinor);
+                var combine = new PtxAffineEmitter();
+                string combineText = combine.Emit(
+                    split.Combine, runtime.ComputeCapabilityMajor,
+                    runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(split.Partial, partialText,
+                            partial.LaunchBlocks,
+                            checked((uint)partial.LaunchBlockThreads), 1,
+                            split.Partial.Space.ReductionAxes.Length, 0,
+                            "weights+three input rows"),
+                        new ProgramKernel(split.Combine, combineText,
+                            combine.LaunchBlocks,
+                            checked((uint)combine.LaunchBlockX),
+                            checked((uint)combine.LaunchBlockY),
+                            combine.LoopedAxes, combine.ElidedGuards,
+                            combine.StagedOperands),
+                    },
+                    split, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName + " recorded " + winner +
+                                  " but its tiled Conv2D split could not be rebuilt (" +
+                                  ex.Message + "); using the single-kernel lowering");
+            }
+        }
+
+        CodegenTiledConv2DSchedule? conv2DSchedule =
+            CodegenTiledConv2DSchedule.Find(winner);
+        if (string.Equals(winner, "tiled-conv2d", StringComparison.Ordinal) ||
+            conv2DSchedule is not null)
+        {
+            try
+            {
+                var tiled = conv2DSchedule is null
+                    ? new PtxTiledConv2DEmitter()
+                    : new PtxTiledConv2DEmitter(conv2DSchedule);
+                string text = tiled.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, tiled.LaunchBlocks,
+                            checked((uint)tiled.LaunchBlockThreads), 1,
+                            0, 0, "weights+three input rows"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName + " recorded tiled-conv2d " +
+                                  "but it could not be rebuilt (" + ex.Message +
+                                  "); using the affine kernel");
+            }
+        }
+
+        if (string.Equals(winner, "depthwise-weight-gradient", StringComparison.Ordinal))
+        {
+            try
+            {
+                var cooperative = new PtxDepthwiseConv2DWeightGradientEmitter();
+                string text = cooperative.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, cooperative.LaunchBlocks,
+                            checked((uint)cooperative.LaunchBlockThreads), 1,
+                            spec.Space.ReductionAxes.Length, 0, "dOut/kw"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName +
+                                  " recorded depthwise-weight-gradient but it could not " +
+                                  "be rebuilt (" + ex.Message + "); using the affine kernel");
+            }
+        }
+
+        if (string.Equals(winner, "parity-transposed", StringComparison.Ordinal))
+        {
+            try
+            {
+                var parity = new PtxParityTransposedConv2DEmitter();
+                string text = parity.Emit(
+                    spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new TunedProgram(
+                    spec,
+                    new[]
+                    {
+                        new ProgramKernel(spec, text, parity.LaunchBlocks,
+                            checked((uint)parity.LaunchBlockThreads), 1,
+                            spec.Space.ReductionAxes.Length, 0, "input parity tile+weights"),
+                    },
+                    null, winner);
+            }
+            catch (NotSupportedException ex)
+            {
+                Console.WriteLine("    note: " + catalogName +
+                                  " recorded parity-transposed but it could not be " +
+                                  "rebuilt (" + ex.Message + "); using the affine kernel");
+            }
+        }
+
+        bool tiledSplit = winner is not null &&
+            winner.StartsWith("tiled-split:", StringComparison.Ordinal);
+        bool tiledChunkedSplit = winner is not null &&
+            winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal);
+        if (winner is not null &&
+            (winner.StartsWith("split:", StringComparison.Ordinal) || tiledSplit ||
+             tiledChunkedSplit))
         {
             CodegenSplitPlan? plan = null;
-            try { plan = CodegenSplitReduction.TryPlan(spec); }
+            try
+            {
+                if (tiledChunkedSplit)
+                    plan = TryParseChunkFactor(winner, out int chunkFactor)
+                        ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
+                        : null;
+                else
+                    plan = CodegenSplitReduction.TryPlan(spec);
+            }
             catch (NotSupportedException) { }
 
             if (plan is not null)
             {
                 var halves = new List<ProgramKernel>(2);
                 bool emitted = true;
-                foreach (var half in new[] { plan.Partial, plan.Combine })
+                if (tiledSplit || tiledChunkedSplit)
                 {
-                    var e = new PtxAffineEmitter();
                     try
                     {
-                        string text = e.Emit(half, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                        halves.Add(new ProgramKernel(half, text, e.LaunchBlocks,
-                            (uint)e.LaunchBlockX, (uint)e.LaunchBlockY,
-                            e.LoopedAxes, e.ElidedGuards, e.StagedOperands));
+                        PtxTiledOuterProductProgram tiled =
+                            PtxTiledOuterProductDispatcher.Emit(
+                                plan.Partial, runtime.ComputeCapabilityMajor,
+                                runtime.ComputeCapabilityMinor,
+                                CodegenTiledOuterProductSchedule.FindForWinner(winner));
+                        halves.Add(new ProgramKernel(
+                            plan.Partial, tiled.Text, tiled.LaunchBlocks,
+                            checked((uint)tiled.BlockThreads), 1,
+                            plan.Partial.Space.ReductionAxes.Length, 0,
+                            tiled.StagedLabel));
                     }
-                    catch (NotSupportedException) { emitted = false; break; }
+                    catch (NotSupportedException) { emitted = false; }
+                }
+                else
+                {
+                    var partial = new PtxAffineEmitter();
+                    try
+                    {
+                        string text = partial.Emit(plan.Partial,
+                            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        halves.Add(new ProgramKernel(plan.Partial, text, partial.LaunchBlocks,
+                            (uint)partial.LaunchBlockX, (uint)partial.LaunchBlockY,
+                            partial.LoopedAxes, partial.ElidedGuards, partial.StagedOperands));
+                    }
+                    catch (NotSupportedException) { emitted = false; }
+                }
+                if (emitted)
+                {
+                    var combine = new PtxAffineEmitter();
+                    try
+                    {
+                        string text = combine.Emit(plan.Combine,
+                            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        halves.Add(new ProgramKernel(plan.Combine, text, combine.LaunchBlocks,
+                            (uint)combine.LaunchBlockX, (uint)combine.LaunchBlockY,
+                            combine.LoopedAxes, combine.ElidedGuards, combine.StagedOperands));
+                    }
+                    catch (NotSupportedException) { emitted = false; }
                 }
                 if (emitted) return new TunedProgram(spec, halves, plan, winner);
             }
@@ -431,7 +691,7 @@ internal static class KernelConveyorTool
         }
 
         var single = new PtxAffineEmitter();
-        ApplyTuned(single, catalogName);
+        ApplyTuned(single, catalogName, winner);
         if (_forceInputStaging) single.EnableInputStaging = true;
         string ptx = single.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         return new TunedProgram(
@@ -445,12 +705,26 @@ internal static class KernelConveyorTool
             null, winner);
     }
 
+    private static bool TryParseChunkFactor(string winner, out int chunkFactor)
+    {
+        chunkFactor = 0;
+        int marker = winner.LastIndexOf('x');
+        int end = marker < 0 ? -1 : winner.IndexOf(':', marker + 1);
+        if (end < 0) end = winner.Length;
+        return marker >= 0 && marker + 1 < end &&
+            int.TryParse(winner.Substring(marker + 1, end - marker - 1), NumberStyles.None,
+                CultureInfo.InvariantCulture, out chunkFactor) &&
+            CodegenAutotuneIdentity.IsChunkedSplitFactor(chunkFactor);
+    }
+
     /// <summary>A loaded, bound tuned program: one launch call whatever its shape.</summary>
     private sealed class TunedLaunchable : IDisposable
     {
         private readonly List<DirectPtxModule> _modules = new();
         private readonly List<DirectPtxBuffer> _buffers = new();
-        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args, uint Blocks, uint X, uint Y)> _steps = new();
+        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args,
+            uint Blocks, uint X, uint Y, uint DynamicSharedMemoryBytes)> _steps = new();
+        private DirectPtxGraph? _graph;
         private DirectPtxBuffer _output = null!;
 
         /// <summary>Highest register count across the program's kernels.</summary>
@@ -523,6 +797,11 @@ internal static class KernelConveyorTool
                     it.Add(runtime, program.Kernels[0], args);
                 }
 
+                // The competitor's accepted lane is CUDA-graph replay. Capture the exact
+                // tuned program too, so every catalog kernel gets the same launch-overhead
+                // treatment and a one- versus two-kernel lowering remains comparable.
+                it._graph = runtime.CaptureGraph(it.LaunchDirect);
+
                 return it;
             }
             catch
@@ -537,32 +816,35 @@ internal static class KernelConveyorTool
             var module = runtime.LoadModule(kernel.Ptx, allowExperimentalJitFallback: true);
             _modules.Add(module);
             IntPtr fn = module.GetFunction(kernel.Spec.Name, out DirectPtxFunctionInfo info);
+            if (kernel.DynamicSharedMemoryBytes != 0)
+                module.SetMaxDynamicSharedMemory(
+                    fn, checked((int)kernel.DynamicSharedMemoryBytes));
             RegistersPerThread = Math.Max(RegistersPerThread, info.RegistersPerThread);
-            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY));
+            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY,
+                kernel.DynamicSharedMemoryBytes));
         }
 
         /// <summary>Runs the whole program in order; the combine depends on the partial.</summary>
+        private void LaunchDirect()
+        {
+            foreach (var (module, fn, args, blocks, x, y, dynamicSharedMemoryBytes) in _steps)
+                LaunchSpec(module, fn, args, blocks, x, y, dynamicSharedMemoryBytes);
+        }
+
         internal void Launch()
         {
-            foreach (var (module, fn, args, blocks, x, y) in _steps)
-                LaunchSpec(module, fn, args, blocks, x, y);
+            if (_graph is not null) _graph.Launch();
+            else LaunchDirect();
         }
 
         internal void DownloadOutput(float[] destination) => _output.Download<float>(destination);
 
         public void Dispose()
         {
+            _graph?.Dispose();
             foreach (var b in _buffers) b.Dispose();
             foreach (var m in _modules) m.Dispose();
         }
-    }
-
-    /// <summary>Number of reduction axes a spec lowers to runtime loops.</summary>
-    private static int LoweringOf(DirectPtxRuntime runtime, CodegenKernelSpec spec)
-    {
-        var emitter = new PtxAffineEmitter();
-        emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        return emitter.LoopedAxes;
     }
 
     private static string Describe(int loopedAxes) =>
@@ -701,7 +983,7 @@ internal static class KernelConveyorTool
 
         string manifest = Path.Combine(outputDirectory, "codegen-cubins.tsv");
         var text = new StringBuilder();
-        text.AppendLine("kernel\tentry\tcubin_sha256\tsource_key\tregisters\tsass_instructions\tldg\tstg\tspill_ld\tspill_st");
+        text.AppendLine("kernel\tentry\tcubin_sha256\tsource_key\tregisters\tsass_instructions\tldg\tstg\tspill_ld\tspill_st\tprotocol");
         foreach (string row in rows) text.AppendLine(row);
         File.WriteAllText(manifest, text.ToString());
 
@@ -710,7 +992,7 @@ internal static class KernelConveyorTool
         Console.WriteLine("release: " + gated.ToString(CultureInfo.InvariantCulture) + " zero-spill, " +
                           spilled.ToString(CultureInfo.InvariantCulture) + " spilling");
 
-        ReportEvidenceGates(entries, outputDirectory);
+        EnforceEvidenceGates(entries, runtime);
     }
 
     /// <summary>
@@ -721,14 +1003,17 @@ internal static class KernelConveyorTool
     ///   a competitor ratio  -- otherwise every number about it is ours-vs-ours;
     ///   a named limiter     -- otherwise nobody knows what its next lever is.
     ///
-    /// Both files are produced by other stages, so this reports rather than recomputes,
-    /// and a missing or stale file is itself the finding.
+    /// Both files are produced by other stages. A missing or stale file is a release
+    /// failure, not an informational line that still returns success.
     /// </summary>
-    private static void ReportEvidenceGates(
-        IReadOnlyList<CodegenCatalogEntry> entries, string outputDirectory)
+    private static void EnforceEvidenceGates(
+        IReadOnlyList<CodegenCatalogEntry> entries, DirectPtxRuntime runtime)
     {
-        var ratios = ReadEvidence(Path.Combine("artifacts", "competitor-ratios.tsv"), 3);
-        var limiters = ReadEvidence(Path.Combine("artifacts", "limiter.tsv"), 1);
+        string dispatch = KernelEvidenceIdentity.CurrentDispatch(runtime);
+        var ratios = ReadEvidence(
+            Path.Combine("artifacts", "competitor-ratios.tsv"), 3, dispatch);
+        var limiters = ReadEvidence(
+            Path.Combine("artifacts", "limiter.tsv"), 1, dispatch);
 
         Console.WriteLine();
         Console.WriteLine("EVIDENCE GATES (protocol " + CodegenMeasurementProtocol.Tag + ")");
@@ -751,12 +1036,20 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine(releasable.ToString(CultureInfo.InvariantCulture) + " of " +
                           entries.Count.ToString(CultureInfo.InvariantCulture) +
-                          " carry both. Run --kernel-limiter and tools/bakeoff/run_bakeoff.py");
-        Console.WriteLine("to fill gaps; a kernel without both is well-formed but unproven.");
+                          " carry both. Run --kernel-limiter and --kernel-competitor");
+        Console.WriteLine("to fill gaps; any kernel without both aborts the release as unproven.");
+
+        if (releasable != entries.Count)
+        {
+            throw new InvalidOperationException(
+                (entries.Count - releasable).ToString(CultureInfo.InvariantCulture) +
+                " kernel(s) lack current-protocol release evidence.");
+        }
     }
 
     /// <summary>Reads kernel -> column from a protocol-stamped evidence file.</summary>
-    private static Dictionary<string, string> ReadEvidence(string path, int column)
+    private static Dictionary<string, string> ReadEvidence(
+        string path, int column, string? expectedDispatch = null)
     {
         var found = new Dictionary<string, string>(StringComparer.Ordinal);
         if (!File.Exists(path)) return found;
@@ -768,6 +1061,10 @@ internal static class KernelConveyorTool
             if (cells.Length <= column) continue;
             if (!cells[cells.Length - 1].Equals(CodegenMeasurementProtocol.Tag, StringComparison.Ordinal))
                 continue;   // stale protocol is the same as absent
+            if (expectedDispatch is not null &&
+                (cells.Length < 9 || !cells[cells.Length - 2].Equals(
+                    expectedDispatch, StringComparison.Ordinal)))
+                continue;   // another tuned program is another benchmark
             found[cells[0]] = cells[column];
         }
         return found;
@@ -789,9 +1086,15 @@ internal static class KernelConveyorTool
         start.ArgumentList.Add(cubinPath);
         using Process? process = Process.Start(start);
         if (process is null) return null;
-        string output = process.StandardOutput.ReadToEnd();
-        process.StandardError.ReadToEnd();
-        process.WaitForExit();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit((int)TimeSpan.FromMinutes(5).TotalMilliseconds))
+        {
+            process.Kill(entireProcessTree: true);
+            return null;
+        }
+        string output = outputTask.GetAwaiter().GetResult();
+        errorTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0) return null;
 
         int instructions = 0, ldg = 0, stg = 0, spillLd = 0, spillSt = 0;
@@ -831,6 +1134,7 @@ internal static class KernelConveyorTool
         GpuBenchmarkEnvironment.RequireIdleGpu("kernel-bench-start");
         using var runtime = OpenRuntime();
         if (runtime is null) return;
+        var failures = new List<string>();
 
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
@@ -840,7 +1144,8 @@ internal static class KernelConveyorTool
             Console.WriteLine("CONVEYOR STAGE 3 - bench with the Phase 0.5 calibrated protocol");
             Console.WriteLine("device-filling shapes, " + LaunchesPerSample +
                               " launches per timed region, paired within-sample ratio, " +
-                              Runs + " runs");
+                              "up to " + StabilityAttempts + " attempts with a latest-" +
+                              Runs + " stability window");
             Console.WriteLine("harness noise floor measured at 1.05%; differences under ~3% are not claimable");
             Console.WriteLine("protocol " + CodegenMeasurementProtocol.Stamp(
                 "RTX 3080, clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
@@ -854,7 +1159,7 @@ internal static class KernelConveyorTool
                     var spec = entry.Bench;
 
                     // Bench the program the TUNER CHOSE, which for the weight gradients
-                    // is a two-kernel split measured at 17.12x, 35.09x and 2.03x. Timing
+                    // may be a two-kernel split. Timing
                     // the single-kernel lowering here would publish a number for a
                     // lowering the tuner had already rejected.
                     bool overridden = args.Contains("--no-coarsen", StringComparer.Ordinal)
@@ -891,75 +1196,71 @@ internal static class KernelConveyorTool
 
                     uint blocks = program.Kernels[0].Blocks;
 
-                    var buffers = new List<DirectPtxBuffer>();
-                    try
+                    using var launchable = TunedLaunchable.Create(runtime, program);
+                    void Launch() => launchable.Launch();
+                    // p11: both cross-process lanes retain the latest three runs.
+                    // A WDDM preemption ages out instead of poisoning a max/min over
+                    // all history, and both sides publish the MEDIAN of that window.
+                    var medians = new List<double>(Runs);
+                    var tails = new List<double>(Runs);
+                    int clockBefore = 0, clockAfter = 0;
+                    bool converged = false;
+                    for (int attempt = 0; attempt < StabilityAttempts; attempt++)
                     {
-                        using var launchable = TunedLaunchable.Create(runtime, program);
-                        void Launch() => launchable.Launch();
-                        int bestClockBefore = 0, bestClockAfter = 0;
-
-                        // RETRY ON CLOCK DRIFT. The SM clock was observed swinging
-                        // 2025 -> 1770 MHz (-12.6%) inside a single kernel's three runs,
-                        // and the rows whose clock held still had low spread while every
-                        // drifting row was elevated. That, not the kernel, is what
-                        // produced the intermittent 7.5% spreads. Locking clocks needs
-                        // administrator rights that are not available here, so instead
-                        // the measurement is repeated and the least-contaminated attempt
-                        // is the one reported.
-                        var medians = new double[Runs];
-                        double worstTail = 0;
-                        int clockBefore = 0, clockAfter = 0;
-                        double bestDrift = double.MaxValue;
-                        var bestMedians = new double[Runs];
-                        double bestTail = 0;
-                        for (int attempt = 0; attempt < ClockRetries; attempt++)
+                        clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                        Dist d = Measure(runtime.Synchronize, Launch);
+                        clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                        medians.Add(d.Median);
+                        tails.Add(d.Median > 0 ? d.P95 / d.Median : double.NaN);
+                        if (medians.Count > Runs)
                         {
-                            clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
-                            worstTail = 0;
-                            for (int run = 0; run < Runs; run++)
-                            {
-                                var d = Measure(runtime.Synchronize, Launch);
-                                medians[run] = d.Median;
-                                worstTail = Math.Max(worstTail, d.Median > 0 ? d.P95 / d.Median : double.NaN);
-                            }
-                            clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
-
-                            double drift = clockBefore > 0
-                                ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
-                                : double.MaxValue;
-                            if (drift < bestDrift)
-                            {
-                                bestDrift = drift;
-                                Array.Copy(medians, bestMedians, Runs);
-                                bestTail = worstTail;
-                                bestClockBefore = clockBefore;
-                                bestClockAfter = clockAfter;
-                            }
-                            if (drift <= 0.02) break;   // clean enough; stop retrying
+                            medians.RemoveAt(0);
+                            tails.RemoveAt(0);
                         }
-                        Array.Copy(bestMedians, medians, Runs);
-                        worstTail = bestTail;
-                        clockBefore = bestClockBefore;
-                        clockAfter = bestClockAfter;
-                        double lo = medians.Min(), hi = medians.Max();
-                        Console.WriteLine(entry.Name.PadRight(36) +
-                            blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
-                            (lo * 1000.0).ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
-                            worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
-                            ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
-                            GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
+
+                        double loNow = medians.Min(), hiNow = medians.Max();
+                        double spreadNow = loNow > 0 ? hiNow / loNow - 1.0 : double.MaxValue;
+                        double drift = clockBefore > 0
+                            ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
+                            : double.MaxValue;
+                        if (medians.Count == Runs &&
+                            spreadNow <= StableTimer.StableSpread && drift <= 0.02)
+                        {
+                            converged = true;
+                            break;
+                        }
                     }
-                    finally { foreach (var b in buffers) b.Dispose(); }
+                    double lo = medians.Min(), hi = medians.Max();
+                    double reported = medians.OrderBy(value => value).ElementAt(medians.Count / 2);
+                    double worstTail = tails.Max();
+                    if (!converged)
+                        failures.Add(entry.Name + ": timing did not converge within " +
+                                     StabilityAttempts.ToString(CultureInfo.InvariantCulture) +
+                                     " attempts");
+                    Console.WriteLine(entry.Name.PadRight(36) +
+                        blocks.ToString("N0", CultureInfo.InvariantCulture).PadLeft(8) +
+                        (converged
+                            ? (reported * 1000.0).ToString("F1", CultureInfo.InvariantCulture)
+                            : "UNSTABLE").PadLeft(13) +
+                        worstTail.ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
+                        ((hi / lo - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
+                        GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
                 }
                 catch (Exception ex)
                 {
+                    failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
                     Console.WriteLine(entry.Name.PadRight(36) + "  ERROR  " + ex.Message.Split('\n')[0]);
                 }
             }
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected kernel(s) produced no stable benchmark row. " +
+                string.Join("; ", failures));
     }
 
     /// <summary>
@@ -1207,21 +1508,16 @@ internal static class KernelConveyorTool
         return total;
     }
 
-    private static string? ValueOf(string[] args, string flag)
-    {
-        for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], flag, StringComparison.Ordinal))
-                return args[i + 1];
-        return null;
-    }
-
-    private static unsafe void LaunchSpec(DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint blockX, uint blockY)
+    private static unsafe void LaunchSpec(
+        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks,
+        uint blockX, uint blockY, uint dynamicSharedMemoryBytes = 0)
     {
         fixed (IntPtr* pinned = pointers)
         {
             void** argv = stackalloc void*[pointers.Length];
             for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, blockX, blockY, 1, 0, argv);
+            module.Launch(
+                fn, blocks, 1, 1, blockX, blockY, 1, dynamicSharedMemoryBytes, argv);
         }
     }
 }

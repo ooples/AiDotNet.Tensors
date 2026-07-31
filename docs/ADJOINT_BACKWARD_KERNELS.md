@@ -2,13 +2,13 @@
 
 A forward operator is
 
-```
+```text
 out[F(p)] = sum over r of  data[G(p,r)] * weight[H(p,r)]
 ```
 
 and its gradient with respect to the data is the **adjoint** of that same map:
 
-```
+```text
 dData[j] = sum over every (p,r) with G(p,r) = j  of  dOut[F(p)] * weight[H(p,r)]
 ```
 
@@ -46,7 +46,7 @@ Checking a derived backward kernel against its own interpreter proves only that 
 derivation is self-consistent. The **dot-product identity** is independent of how the
 adjoint was constructed:
 
-```
+```text
 <forward(x), y>  ==  <x, backward(y)>
 ```
 
@@ -77,7 +77,9 @@ Three derived backward kernels went through the full conveyor with no per-kernel
 | conv2d_1x1_bwd_data | 36 | unroll | 0.000E+000 | PASS |
 | conv2d_3x3_bwd_data | 40 | loop x1 | 0.000E+000 | PASS |
 
-9 of 9 catalog kernels pass (6 forward, 3 derived).
+13 of 13 catalog operations pass, including data and weight gradients. Weight-gradient
+split programs use the conveyor-wide accumulation-aware relative tolerance of `2e-3`;
+the depthwise split previously differed by `5.6e-4` solely from fp32 accumulation order.
 
 ### Release — driver-linked cubin, SASS audit, gate = zero spills
 
@@ -87,7 +89,8 @@ Three derived backward kernels went through the full conveyor with no per-kernel
 | conv2d_1x1_bwd_data | 44 | 576 | 128 | 1 | 0/0 | PASS |
 | conv2d_3x3_bwd_data | 40 | 176 | 18 | 1 | 0/0 | PASS |
 
-9 of 9 zero-spill.
+16 generated cubins are zero-spill; the count exceeds the 13 operations because each
+selected split reduction releases a partial and a combine kernel.
 
 ### Bench — Phase 0.5 calibrated protocol
 

@@ -338,6 +338,7 @@ public sealed partial class PtxTensorCoreEmitter
         AsyncCopy = false;
         SharedMemoryBytes = 0;
         LoopBarriers = 0;
+        EmittedEntryName = spec.Name;
         _reg = FixedRegisters;
         _reg64 = FixedRegisters64;
         _pred = FixedPredicates;

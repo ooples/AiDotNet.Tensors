@@ -78,6 +78,9 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Bounds guards elided because interval analysis proved them unnecessary.</summary>
     public int ElidedGuards { get; private set; }
 
+    /// <summary>Stores emitted as one vector instruction covering several lanes.</summary>
+    public int VectorisedStores { get; private set; }
+
     /// <summary>Index loads emitted for data-dependent (gather/scatter) dimensions.</summary>
     public int IndirectIndexLoads { get; private set; }
 
@@ -87,14 +90,6 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Extra-output stores emitted beyond the primary and any argmax.</summary>
     public int ExtraOutputStores { get; private set; }
 
-    /// <summary>
-    /// Emits PTX for <paramref name="spec"/>.
-    /// </summary>
-    /// <exception cref="NotSupportedException">
-    /// Thrown for specs this layer deliberately cannot express (data-dependent
-    /// indexing). Declining loudly is required -- silently mis-lowering an index
-    /// map is exactly the failure this layer exists to prevent.
-    /// </exception>
     /// <summary>Number of reduction axes lowered to runtime loops rather than unrolled.</summary>
     public int LoopedAxes { get; private set; }
 
@@ -116,7 +111,8 @@ public sealed partial class PtxAffineEmitter
     internal static string PtxIsaVersionFor(int computeMajor, int computeMinor)
     {
         int capability = computeMajor * 10 + computeMinor;
-        if (capability >= 90) return "7.8";
+        if (capability >= 120) return "8.7";
+        if (capability >= 100) return "8.6";
         if (capability >= 89) return "7.8";
         if (capability >= 87) return "7.4";
         return "7.1";   // sm_70 through sm_86
@@ -648,6 +644,12 @@ public sealed partial class PtxAffineEmitter
     /// <summary>Largest grid the CUDA launch API accepts in the X dimension.</summary>
     private const long MaxGridBlocksX = 2147483647L;
 
+    /// <summary>Largest thread count representable by the emitted u32 gid arithmetic.</summary>
+    private const long MaxU32ThreadCount = uint.MaxValue;
+
+    /// <summary>Smallest tensor rank treated as an activation by input staging.</summary>
+    private const int MinimumActivationRankForInputStaging = 3;
+
     /// <summary>Bytes of kernel parameter space PTX guarantees.</summary>
     private const int MaxParameterBytes = 4096;
 
@@ -686,6 +688,13 @@ public sealed partial class PtxAffineEmitter
             throw new NotSupportedException(
                 "Kernel '" + spec.Name + "' resolved to " + I(threadCount) + " threads. " +
                 "A tile factor larger than an axis extent would do this.");
+
+        if (threadCount > MaxU32ThreadCount)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' needs " + I(threadCount) +
+                " threads, past the " + I(MaxU32ThreadCount) +
+                " values representable by its u32 gid and bounds guard. Add a grid-stride " +
+                "loop or split the iteration space before emission.");
 
         int parameterBytes = spec.ParameterCount * sizeof(long);
         if (parameterBytes > MaxParameterBytes)
@@ -767,7 +776,7 @@ public sealed partial class PtxAffineEmitter
         foreach (int tw in factors)
         {
             if (tw > 1 && axes[contiguous].Extent % tw != 0) continue;
-            if (tw > laneCeiling) continue;
+            if (tw > laneCeiling || tw > factor) continue;
 
             // One-dimensional candidate: only the contiguous axis.
             double solo = PredictedRelativeTime(spec, axes, new[] { contiguous }, new[] { tw });
@@ -928,23 +937,67 @@ public sealed partial class PtxAffineEmitter
         CodegenTensorBinding binding, string basePointer, string[] axisReg,
         int[] reductionValues, int[] reductionAxes, int width)
     {
+        if (width != VectorWidth)
+            throw new InvalidOperationException(
+                "Only a " + I(VectorWidth) + "-wide vector load is supported; got " +
+                I(width) + ".");
+
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out string? pred);
         if (pred != null)
             throw new InvalidOperationException(
                 "A vectorised binding must be provably in range; " + binding.Name + " produced a guard.");
 
         string byteOffset = NextRd(), address = NextRd();
-        L($"mul.wide.u32 {byteOffset}, {offset}, 4;");
+        L($"mul.wide.u32 {byteOffset}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {address}, {basePointer}, {byteOffset};");
 
         var regs = new string[width];
         for (int i = 0; i < width; i++) regs[i] = NextF();
-        L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+
+        if (binding.NeedsConversion)
+        {
+            // FOUR HALVES ARE TWO WORDS, and two words is v2.u32 -- the same FOUR elements a
+            // v4.f32 carries, so the lane model above is unchanged and only the instruction,
+            // the byte scale and the unpacking differ.
+            //
+            // Without this a narrow tensor took the scalar path, and the profile said what
+            // that costs: 32 lanes at 2 bytes is a 64-byte request, half a cache line, which
+            // measured 2 sectors per request against fp32's 4 and reached only 66.6% of DRAM
+            // peak against fp32's 89.1%. The access was perfectly coalesced FOR ITS WIDTH and
+            // still wasted half the bus.
+            //
+            // This is emphatically not the v4.f32 path re-enabled for narrow bindings. That
+            // one scales by four bytes an element and would read twice the intended span,
+            // returning neighbouring data with no complaint -- which is why it was excluded.
+            string lo = NextR(), hi = NextR();
+            L($"ld.global.nc.v2.u32 {{{lo}, {hi}}}, [{address}];");
+
+            EmitWiden(binding.ElementType, lo, regs[0]);
+            string loHigh = NextR();
+            L($"shr.b32 {loHigh}, {lo}, 16;");
+            EmitWiden(binding.ElementType, loHigh, regs[1]);
+
+            EmitWiden(binding.ElementType, hi, regs[2]);
+            string hiHigh = NextR();
+            L($"shr.b32 {hiHigh}, {hi}, 16;");
+            EmitWiden(binding.ElementType, hiHigh, regs[3]);
+        }
+        else
+        {
+            L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+        }
+
         VectorisedLoads++;
         EmittedLoads++;
         return regs;
     }
 
+    /// <summary>Emits PTX for <paramref name="spec"/>.</summary>
+    /// <exception cref="NotSupportedException">
+    /// Thrown for specs this layer deliberately cannot express. Declining loudly is
+    /// required; silently mis-lowering an index map is exactly the failure this layer
+    /// exists to prevent.
+    /// </exception>
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
@@ -1005,6 +1058,19 @@ public sealed partial class PtxAffineEmitter
         var tileFactors = new List<int>();
         if (Coarsening > 1 && parallel.Length > 0)
             SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
+
+        // NOT COARSENED FOR STREAMING, AND THAT IS A MEASURED DECISION. SelectTile
+        // minimises loads-per-MAC, so a kernel with no reduction has no reuse to find and it
+        // declines to tile -- which leaves each thread with one element and blocks both
+        // vector paths. Forcing the contiguous tile at VectorWidth to unblock them was tried
+        // and made things WORSE:
+        //
+        //   elementwise copy 4M         94.3% -> 84.6% of ceiling
+        //   elementwise copy 4M, fp16   69.8% -> 40.2%
+        //
+        // So the one-element-per-thread layout is already the better one for pure streaming
+        // on this hardware, and the fp16 shortfall is NOT the coarsening decision. Reverted
+        // rather than kept, and recorded here so the next reader does not retry it.
 
         int lanes = 1;
         foreach (int f in tileFactors) lanes *= f;
@@ -1111,7 +1177,9 @@ public sealed partial class PtxAffineEmitter
         // stores coalesced; y over the reuse axis makes a staged row serve the column.
         int dataOperand = -1;
         foreach (int inputIdx in spec.ProductInputs)
-            if (inputIdx != stagedInput && spec.Inputs[inputIdx].Map.Count > 2) dataOperand = inputIdx;
+            if (inputIdx != stagedInput &&
+                spec.Inputs[inputIdx].Map.Count >= MinimumActivationRankForInputStaging)
+                dataOperand = inputIdx;
 
         bool twoDimensional = false;
         int blockX = blockThreads, blockY = 1;
@@ -1224,6 +1292,11 @@ public sealed partial class PtxAffineEmitter
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
         long threadCount = total / lanes;
+        if (stagedSlices.Count > 0 && threadCount % blockThreads != 0)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' stages shared memory with " + I(blockThreads) +
+                " threads per block, which does not divide its " + I(threadCount) +
+                " threads. The tail block would reach bar.sync with missing threads.");
         long blocks;
         if (twoDimensional)
         {
@@ -1241,7 +1314,7 @@ public sealed partial class PtxAffineEmitter
         LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
-        IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0;
+        IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0; VectorisedStores = 0;
         _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
         // calls makes the SAME spec emit different text on a second Emit, and cubins
@@ -1473,11 +1546,14 @@ public sealed partial class PtxAffineEmitter
         if (EnableVectorLoads && innermost >= 0 && axes[innermost].Extent % VectorWidth == 0)
         {
             foreach (int inputIdx in spec.ProductInputs)
-                // A narrow binding is excluded: the vector path emits ld.global.v4.f32 and
-                // scales its address by four bytes per element, so on a 16-bit tensor it
-                // would read twice the intended span and silently return neighbouring data.
-                // Widening a v4 load is a separate lowering, not a flag.
-                if (!spec.Inputs[inputIdx].NeedsConversion &&
+                // A narrow binding vectorises through v2.u32 -- four halves, the same four
+                // elements a v4.f32 carries -- rather than being excluded. It cannot use the
+                // f32 form, which scales by four bytes an element and would read twice the
+                // intended span; see EmitVectorLoad.
+                //
+                // An INDEX tensor is still excluded: it is never an arithmetic operand, so
+                // there is nothing to widen it into.
+                if (!spec.Inputs[inputIdx].IsIndexTensor &&
                     IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
                 {
                     vectorisable[inputIdx] = true;
@@ -1767,6 +1843,25 @@ public sealed partial class PtxAffineEmitter
         // wrong values while their epilogue-free siblings stayed exact.
         var epilogueCache = new Dictionary<string, string>(StringComparer.Ordinal);
 
+        // A VECTORISED STORE NEEDS THE THREAD TO OWN CONTIGUOUS OUTPUTS. The load side was
+        // fixed first and did not move the fp16 streaming number at all, because a copy
+        // kernel's store is half its traffic and every store here was scalar: at fp16 that is
+        // 32 lanes at two bytes, a 64-byte request against a 128-byte line. fp32 never showed
+        // it, since 32 lanes at four bytes fills the line exactly.
+        //
+        // The conditions are deliberately narrow. Anything predicated, atomic, or writing more
+        // than one buffer keeps the per-lane path, because a vector store commits all four
+        // elements together and cannot honour a per-element guard.
+        bool vectorStore =
+            lanes == VectorWidth &&
+            contiguousFactor == VectorWidth &&
+            !spec.Output.NeedsAtomicStore &&
+            !spec.Output.NeedsBoundsCheck &&
+            spec.ExtraOutputs.Count == 0 &&
+            IsUnitStrideIn(spec.Output, coarsenAxis, axes);
+
+        var pendingStore = vectorStore ? new string[lanes] : null;
+
         for (int l = 0; l < lanes; l++)
         {
             string acc = accs[l];
@@ -1809,6 +1904,12 @@ public sealed partial class PtxAffineEmitter
                 acc = na;
             }
             acc = EmitActivation(spec.Activation, acc);
+
+            if (pendingStore is not null)
+            {
+                pendingStore[l] = acc;
+                continue;
+            }
 
             string laneOff = EmitOffset(spec.Output, laneAxisReg[l], reductionValues, reduction,
                                        out string? lanePred);
@@ -1906,6 +2007,45 @@ public sealed partial class PtxAffineEmitter
 
                 ExtraOutputStores++;
             }
+        }
+
+        if (pendingStore is not null)
+        {
+            string vecOff = EmitOffset(spec.Output, laneAxisReg[0], reductionValues, reduction,
+                                       out string? vecPred);
+            if (vecPred is not null)
+                throw new InvalidOperationException(
+                    "A vectorised store must be provably in range; " + spec.Output.Name +
+                    " produced a guard.");
+
+            string vecByte = NextRd(), vecAddr = NextRd();
+            L($"mul.wide.u32 {vecByte}, {vecOff}, {I(spec.Output.ElementBytes)};");
+            L($"add.u64 {vecAddr}, {basePtr[spec.Output.ParameterIndex]}, {vecByte};");
+
+            if (spec.Output.NeedsConversion)
+            {
+                // Four halves are two words. Each word carries a PAIR, so the second of each
+                // pair is shifted up before being or-ed in -- the mirror of the shift-down the
+                // narrow vector LOAD does when it unpacks.
+                var words = new string[2];
+                for (int w = 0; w < 2; w++)
+                {
+                    string lo = EmitNarrow(spec.Output.ElementType, pendingStore[w * 2]);
+                    string hi = EmitNarrow(spec.Output.ElementType, pendingStore[w * 2 + 1]);
+                    string shifted = NextR();
+                    words[w] = NextR();
+                    L($"shl.b32 {shifted}, {hi}, 16;");
+                    L($"or.b32 {words[w]}, {lo}, {shifted};");
+                }
+                L($"st.global.v2.u32 [{vecAddr}], {{{words[0]}, {words[1]}}};");
+            }
+            else
+            {
+                L($"st.global.v4.f32 [{vecAddr}], " +
+                  $"{{{pendingStore[0]}, {pendingStore[1]}, {pendingStore[2]}, {pendingStore[3]}}};");
+            }
+
+            VectorisedStores++;
         }
 
         // Loads before the loop run once, loads in its body run once per trip, loads

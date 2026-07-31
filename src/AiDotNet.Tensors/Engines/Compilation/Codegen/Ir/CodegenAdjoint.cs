@@ -38,25 +38,6 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 public static class CodegenAdjoint
 {
     /// <summary>
-    /// Builds the gradient-with-respect-to-data kernel of <paramref name="forward"/>.
-    /// </summary>
-    /// <param name="forward">The forward operator. Must be a plain sum-reduction of two operands.</param>
-    /// <param name="dataInput">
-    /// Index of the operand to differentiate with respect to. Passed explicitly rather
-    /// than guessed: picking the wrong operand silently produces a kernel that computes
-    /// the wrong gradient, and no shape check would catch it.
-    /// </param>
-    /// <returns>
-    /// A spec taking (dOut, weight) and producing dData, with the same reduce kind and
-    /// no epilogue.
-    /// </returns>
-    /// <exception cref="NotSupportedException">
-    /// Thrown for forward operators whose adjoint this layer cannot express: a
-    /// non-sum reduction, an activation (whose backward needs the forward output),
-    /// a bias (which makes the operator affine rather than linear), or an index map
-    /// that is not an axis or a single strided window.
-    /// </exception>
-    /// <summary>
     /// Gradient with respect to the WEIGHTS, without which these kernels cannot train.
     /// </summary>
     /// <remarks>
@@ -76,6 +57,16 @@ public static class CodegenAdjoint
     public static CodegenKernelSpec BackwardWeights(CodegenKernelSpec forward, int weightInput)
         => BackwardData(forward, weightInput);
 
+    /// <summary>Builds the gradient-with-respect-to-data kernel of <paramref name="forward"/>.</summary>
+    /// <param name="forward">The forward operator. Must be a plain sum-reduction of two operands.</param>
+    /// <param name="dataInput">
+    /// Index of the operand to differentiate with respect to. Passed explicitly rather
+    /// than guessed, because the wrong operand can have a compatible shape.
+    /// </param>
+    /// <returns>A spec taking (dOut, weight) and producing dData with no epilogue.</returns>
+    /// <exception cref="NotSupportedException">
+    /// Thrown for forward operators whose adjoint this layer cannot express.
+    /// </exception>
     public static CodegenKernelSpec BackwardData(CodegenKernelSpec forward, int dataInput)
     {
         if (forward is null) throw new ArgumentNullException(nameof(forward));

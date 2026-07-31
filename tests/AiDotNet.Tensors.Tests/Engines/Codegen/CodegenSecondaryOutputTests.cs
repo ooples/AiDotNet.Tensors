@@ -191,6 +191,28 @@ public class CodegenSecondaryOutputTests
             secondaryOutput: second, secondaryIndexExpr: CodegenAffineExpr.Axis(1)));
     }
 
+    /// <summary>The legacy secondary pair uses the same index-axis validation as extras.</summary>
+    [Fact]
+    public void SecondaryOutputWithInvalidIndexAxis_IsRefusedAtConstruction()
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("n", 4), CodegenAxis.Reduce("k", 4));
+        var x = new CodegenTensorBinding(0, "x", new[] { 4, 4 },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var output = new CodegenTensorBinding(1, "out", new[] { 4 },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var second = new CodegenTensorBinding(2, "idx", new[] { 4 },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+
+        var ex = Assert.Throws<ArgumentException>(() => new CodegenKernelSpec(
+            "bad_secondary_axis", space, new[] { x }, output, new[] { 0 },
+            CodegenReduceKind.Max,
+            secondaryOutput: second, secondaryIndexExpr: CodegenAffineExpr.Axis(2)));
+
+        Assert.Contains("index expression references affine axis 2", ex.Message,
+            StringComparison.Ordinal);
+    }
+
     /// <summary>The parameter count must include the secondary output, or a launcher misbinds.</summary>
     [Fact]
     public void ParameterCount_IncludesTheSecondaryOutput()

@@ -43,21 +43,27 @@ public static class TensorCoreWarpTileCatalog
     private static readonly Dictionary<(int M, int N, int K), Choice> Measured =
         new()
         {
-            // 2x2 + cp.async at 19.5 us (13.8 TF). The SMALLEST tile wins here, and by a
-            // wide margin -- at this size there is not enough work to amortise a big tile's
-            // occupancy cost. Second best was 4x2 + registers at 28.1 us.
-            [(512, 512, 512)] = new Choice(2, 2, AsyncCopy: true),
+            // RE-MEASURED after shared-row padding removed the bank conflicts. Every entry
+            // here changed: the pre-padding catalog is not merely suboptimal now, it is wrong,
+            // because the conflict rate was what made a bigger tile pay. Fixing the memory
+            // layout changed which lowering wins, which is why the catalog is regenerated
+            // from a sweep rather than reasoned about.
 
-            // 4x2 + cp.async at 63.2 us (34.0 TF), against 4x4 + cp.async at 74.5 and
-            // 4x2 + registers at 71.7. The largest tile LOSES here.
-            [(1024, 1024, 1024)] = new Choice(4, 2, AsyncCopy: true),
+            // 2x2 + registers at 18.2 us (14.8 TF). At this size the kernel is launch- and
+            // tail-bound, and cp.async's extra setup does not pay back.
+            [(512, 512, 512)] = new Choice(2, 2, AsyncCopy: false),
 
-            // 4x4 + cp.async at 400.2 us (42.9 TF), against 4x2 + cp.async at 422.3.
-            [(2048, 2048, 2048)] = new Choice(4, 4, AsyncCopy: true),
+            // 2x4 + registers at 51.2 us (42.0 TF), a hair under 2x4 + cp.async at 52.0.
+            [(1024, 1024, 1024)] = new Choice(2, 4, AsyncCopy: false),
 
-            // 4x2 + cp.async at 2922.7 us (47.0 TF). Note 4x4 + cp.async is 41.6 TF while
-            // 4x4 + REGISTERS is 45.0 -- the staging form and the tile interact, and not
-            // monotonically. No model produced this; the sweep did.
+            // 2x2 + cp.async at 321.1 us (53.5 TF) -- FASTER THAN cuBLAS's 333.8 us. Note the
+            // SMALLEST tile now wins: with conflicts gone, the big tile's occupancy cost is no
+            // longer offset by a shared-traffic saving that no longer exists.
+            [(2048, 2048, 2048)] = new Choice(2, 2, AsyncCopy: true),
+
+            // 4x2 + cp.async at 2451.7 us (56.1 TF), against a 58.5 TF oracle for that tile --
+            // 96% of what this instruction mix can reach with no memory traffic at all.
+            // cuBLAS is 2384.1 us, so this is 0.97x.
             [(4096, 4096, 4096)] = new Choice(4, 2, AsyncCopy: true),
         };
 
@@ -91,11 +97,12 @@ public static class TensorCoreWarpTileCatalog
 
         measured = false;
 
-        // THE FALLBACK LADDER, for shapes nobody has measured: the largest tile whose block
-        // tile divides the output, staged with cp.async. cp.async is the right default because
-        // it won at 10 of the 12 measured (shape, tile) pairs, and its two losses were small;
-        // the tile choice is the one that varies, which is what the entries above record.
-        foreach (var (tileM, tileN) in new[] { (4, 2), (4, 4), (2, 4), (2, 2) })
+        // THE FALLBACK LADDER, for shapes nobody has measured. It now prefers the SMALLER
+        // tile, which is the opposite of what it preferred before the padding fix: with bank
+        // conflicts gone there is no shared-traffic saving to offset a big tile's occupancy
+        // cost, and 2x2 or 2x4 won at three of the four measured shapes. cp.async is kept as
+        // the default staging form because it won at the two large shapes, where it matters.
+        foreach (var (tileM, tileN) in new[] { (2, 2), (2, 4), (4, 2), (4, 4) })
             if (m % (tileM * 32) == 0 && n % (tileN * 32) == 0)
                 return new Choice(tileM, tileN, AsyncCopy: true);
 
