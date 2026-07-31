@@ -198,11 +198,11 @@ public class TapeBailAuditTests
             "CpuEngine*.cs",
             SearchOption.TopDirectoryOnly);
 
-    private static Dictionary<string, (bool HasKernel, bool Bails)> ScanGpuOverrides(
+    private static Dictionary<string, (bool HasKernel, bool Bails, bool Records)> ScanGpuOverrides(
         IEnumerable<string> gpuSources)
     {
         var methodRe = new Regex(@"(?:Tensor<T> IEngine\.|public override Tensor<T> |void IEngine\.)([A-Za-z0-9_]+)<T>\s*\(");
-        var result = new Dictionary<string, (bool, bool)>();
+        var result = new Dictionary<string, (bool, bool, bool)>();
 
         foreach (string gpuSrc in gpuSources)
         {
@@ -261,10 +261,14 @@ public class TapeBailAuditTests
                 // Cost_guard_ops_actually_record verifies really does record.
                 bool bails = Regex.IsMatch(text, @"\bIsTapeActive\s*<");
                 // An op can appear more than once (overloads); kernel/bail status ORs across them.
+                // Whether THIS method records, so the allowlist check can be scoped to the body that
+                // carries the tape check rather than to the whole file set.
+                bool records = Regex.IsMatch(text, @"DifferentiableOps\.Record[A-Za-z]*\(");
+
                 if (result.TryGetValue(name, out var prev))
-                    result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails);
+                    result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails, prev.Item3 || records);
                 else
-                    result[name] = (hasKernel, bails);
+                    result[name] = (hasKernel, bails, records);
             }
         }
         return result;
@@ -370,18 +374,30 @@ public class TapeBailAuditTests
     public void Cost_guard_ops_actually_record()
     {
         string root = RepoRoot();
-        string gpu = string.Join("\n", GpuEngineSources(root).Select(File.ReadAllText));
+        var overrides = ScanGpuOverrides(GpuEngineSources(root));
 
-        const string quote = "\"";
+        // An entry must still EXIST and still gate on the tape, or the exemption it grants is dead
+        // weight that keeps applying silently after a rename or a deletion. KnownUnfixed already has
+        // this protection; the allowlist had none.
+        var stale = TapeCostGuardOnly
+            .Where(op => !overrides.TryGetValue(op, out var i) || !i.Bails)
+            .ToList();
+        Assert.True(stale.Count == 0,
+            "TapeCostGuardOnly lists ops that no longer exist or no longer check IsTapeActive, so their "
+            + "exemption now applies to nothing. Remove them: " + string.Join(", ", stale));
+
+        // Scoped to the METHOD that carries the tape check, not the whole file set. A file-wide search
+        // proves only that the name appears in some Record* call somewhere, which is exactly the hole
+        // documented for TensorGather: it bails at the top and records further down, in a branch only
+        // reachable when no tape is active.
         var notRecording = TapeCostGuardOnly
-            .Where(op => !Regex.IsMatch(
-                gpu, @"DifferentiableOps\.Record[A-Za-z]*\(\s*" + quote + Regex.Escape(op) + quote))
+            .Where(op => overrides.TryGetValue(op, out var i) && !i.Records)
             .ToList();
 
         _out.WriteLine($"checked: {string.Join(", ", TapeCostGuardOnly)}");
         Assert.True(notRecording.Count == 0,
-            "These ops are allowlisted as using the tape check only to guard work, but they never record a "
-            + "tape node on the GPU result — so the check IS a bail and the entry is wrong: "
+            "These ops are allowlisted as using the tape check only to guard work, but their own override "
+            + "never records a tape node — so the check IS a bail and the entry is wrong: "
             + string.Join(", ", notRecording));
     }
 }
