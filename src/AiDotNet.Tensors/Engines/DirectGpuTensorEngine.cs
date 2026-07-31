@@ -8701,9 +8701,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <c>catch</c> blocks that route selected GPU kernels, including Power, conv / transpose / unfold-fold /
     /// pooling / locally-connected / deformable / attention operations, to their CPU reference RETHROW instead of
     /// silently falling back. Because the per-kernel fallback now lives partly inside the individual backends
-    /// (Metal / Vulkan implement the conv/pool family in their own classes), the flag is a process-wide
-    /// <c>static</c> so those backend <c>catch</c> blocks can honor it too
-    /// (<see cref="ThrowOnGpuKernelFallback"/> is read from <c>DirectGpuTensorEngine</c> by the backends).
+    /// (Metal / Vulkan implement the conv/pool family in their own classes), the accessor is <c>static</c> so
+    /// those backend <c>catch</c> blocks can honor it too. Its backing field remains <c>[ThreadStatic]</c>:
+    /// backends read the current test thread's value through <see cref="ThrowOnGpuKernelFallback"/>, while
+    /// parallel test threads retain their independent defaults.
     /// <para>
     /// <see cref="GpuConvKernelCoverageTests"/> (in the test project) enables it so the GPU-vs-CPU accuracy
     /// gate PROVES the GPU kernel actually ran on-device — a kernel that threw (or a backend that silently
