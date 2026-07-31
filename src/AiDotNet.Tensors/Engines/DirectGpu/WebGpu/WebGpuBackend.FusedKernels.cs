@@ -209,11 +209,11 @@ public sealed partial class WebGpuBackend
         DispatchNBufferAsync("Audit:StftMagPhase", WebGpuAuditKernels.StftMagPhase, "main",
             new IGpuBuffer[] { padded, window, mag, phase }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(lp), BitConverter.Int32BitsToSingle(nFft), BitConverter.Int32BitsToSingle(hop), BitConverter.Int32BitsToSingle(numFrames), BitConverter.Int32BitsToSingle(numFreqs), 0f, 0f }, __total).GetAwaiter().GetResult();
     }
-    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
-        int __total = leading*nFreqV; if (__total <= 0) return;
+        int __total = leading*numFreqs; if (__total <= 0) return;
         DispatchNBufferAsync("Audit:PhaseVocoder", WebGpuAuditKernels.PhaseVocoder, "main",
-            new IGpuBuffer[] { mag, phase, newMag, newPhase }, new float[] { BitConverter.Int32BitsToSingle(leading), BitConverter.Int32BitsToSingle(nFramesV), BitConverter.Int32BitsToSingle(nFreqV), BitConverter.Int32BitsToSingle(outFrames), rate, 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
+            new IGpuBuffer[] { mag, phase, newMag, newPhase }, new float[] { BitConverter.Int32BitsToSingle(leading), BitConverter.Int32BitsToSingle(numFrames), BitConverter.Int32BitsToSingle(numFreqs), BitConverter.Int32BitsToSingle(outFrames), rate, 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
     }
     public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft)
     {

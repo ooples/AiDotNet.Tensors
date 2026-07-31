@@ -11613,13 +11613,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
-    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
         var kernel = ResolveParity210Kernel("parity210_phase_vocoder");
         using var _ = PushContext();
-        int __total = leading*nFreqV; if (__total <= 0) return;
+        int __total = leading*numFreqs; if (__total <= 0) return;
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = nFramesV; int la6 = nFreqV; int la7 = outFrames; float la8 = rate;
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = numFrames; int la6 = numFreqs; int la7 = outFrames; float la8 = rate;
         void** args = stackalloc void*[9];
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);

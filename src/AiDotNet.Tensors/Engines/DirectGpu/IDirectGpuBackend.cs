@@ -2051,8 +2051,18 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>STFT magnitude+phase: per (b,k,frame) DFT bin of the windowed frame. out [b][k*numFrames+frame].</summary>
     void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs);
 
-    /// <summary>Phase vocoder time-axis remap + phase accumulation (one thread per (b,f)).</summary>
-    void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate);
+    /// <summary>
+    /// Phase vocoder over a <c>[leading, numFreqs, numFrames]</c> magnitude/phase pair — the STFT's
+    /// layout, with TIME as the contiguous inner axis. Interpolates along time and accumulates phase
+    /// per frequency bin, writing <c>[leading, numFreqs, outFrames]</c>.
+    /// </summary>
+    /// <remarks>
+    /// The <c>numFrames</c>/<c>numFreqs</c> parameters were previously named nFramesV/nFreqV and
+    /// carried the OPPOSITE meaning: callers passed numFreqs as the "frames" slot to reproduce a CPU
+    /// defect that interpolated across frequency bins. Both the kernels and the callers now use the
+    /// natural meaning.
+    /// </remarks>
+    void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate);
 
     /// <summary>Build the full conj-symmetric spectrum (two CPU passes in order) from mag/phase.</summary>
     void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft);

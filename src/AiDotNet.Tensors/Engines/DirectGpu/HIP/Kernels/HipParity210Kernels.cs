@@ -797,18 +797,25 @@ extern ""C"" __global__ void parity210_stft_mag_phase(
 }
 extern ""C"" __global__ void parity210_phase_vocoder(
     const float* __restrict__ mag, const float* __restrict__ phase,
-    float* __restrict__ newMag, float* __restrict__ newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    float* __restrict__ newMag, float* __restrict__ newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= leading*nFreqV) return;
-    int f = idx % nFreqV; int b = idx / nFreqV; int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    // Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching parity210_build_spectrum
+    // and CpuEngine's vocoder. See the CUDA kernel for why the old outer-axis interpretation was
+    // wrong (it interpolated across frequency bins).
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= leading*numFreqs) return;
+    int f = idx % numFreqs; int b = idx / numFreqs;
+    int row = b*numFreqs*numFrames + f*numFrames;
+    int outRow = b*numFreqs*outFrames + f*outFrames;
     float accPhase = 0.0f;
     for (int t = 0; t < outFrames; t++) {
-        float srcT = (float)t * rate; int t0 = (int)floorf(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
-        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
-        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        float srcT = (float)t * rate; int t0 = (int)floorf(srcT);
+        if (t0 > numFrames-1) t0 = numFrames-1;
+        int t1 = min(t0+1, numFrames-1); float frac = srcT - (float)t0;
+        float m0 = mag[row + t0]; float m1 = mag[row + t1];
+        newMag[outRow + t] = (1.0f-frac)*m0 + frac*m1;
         float dp = 0.0f;
-        if (t0+1 < nFramesV) { dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f]; dp -= 2.0f*(float)M_PI * roundf(dp/(2.0f*(float)M_PI)); }
-        accPhase += dp; newPhase[b*outStride + t*nFreqV + f] = accPhase;
+        if (t0+1 < numFrames) { dp = phase[row + t0 + 1] - phase[row + t0]; dp -= 2.0f*(float)M_PI * roundf(dp/(2.0f*(float)M_PI)); }
+        accPhase += dp; newPhase[outRow + t] = accPhase;
     }
 }
 extern ""C"" __global__ void parity210_build_spectrum(
@@ -828,7 +835,9 @@ extern ""C"" __global__ void parity210_istft_from_spectrum(
     int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*outputLength; if (idx >= total) return;
     int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0f; float windowAcc = 0.0f;
     for (int frame = 0; frame < numFrames; frame++) {
-        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+        // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8.
+        int writeStart = center ? frame*hop - nFft/2 : frame*hop; int i = outIdx - writeStart;
         if (i >= 0 && i < nFft) {
             int specOff = (b*numFrames + frame) * nFft; float acc = 0.0f;
             for (int k = 0; k < nFft; k++) { float a = 2.0f*(float)M_PI*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cosf(a) - specIm[specOff+k]*sinf(a); }

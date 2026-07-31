@@ -59,6 +59,24 @@ public sealed class GradientTape<T> : IDisposable
     private readonly GradientTapeOptions _options;
     private IEngine _engine;
     private bool _engineExplicitlyBound;
+
+    // ResolveEngineFromData can redirect a tape created while the process default is a GPU
+    // engine back to CPU. CpuEngine is safe to share (AiDotNetEngine.Current does the same),
+    // so retain one fallback per closed GradientTape<T> instead of allocating per tape/backward.
+    private static readonly CpuEngine CpuFallbackEngine = new();
+
+    /// <summary>
+    /// Set when any tensor recorded onto this tape had its data on a GPU at record time.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes the backward FOLLOW THE DATA instead of guessing. Only 36 of the ~365
+    /// differentiable CpuEngine ops call <see cref="BindEngineIfUnset"/>, so roughly nine in ten tapes
+    /// were left on the constructor default of <c>AiDotNetEngine.Current</c> — the DirectGpu engine on
+    /// any auto-detect host. A caller explicitly holding a <c>CpuEngine</c> and working in
+    /// <c>double</c> therefore got its backward run on the GPU in fp32. Adding the missing 329 binding
+    /// calls would fix it once and rot immediately, since every new op would have to remember.
+    /// </remarks>
+    private bool _sawGpuResidentData;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
     // Set true once a streaming backward (ComputeGradientsStreaming) has
@@ -163,6 +181,37 @@ public sealed class GradientTape<T> : IDisposable
     /// call this with <c>this</c> so the backward walk dispatches to the same
     /// engine instance the user invoked the forward op on. Closes #350.
     /// </summary>
+    /// <summary>
+    /// Records where a tensor's data lived when it was taped, so the backward can be dispatched to the
+    /// device that actually holds it.
+    /// </summary>
+    /// <remarks>
+    /// Called from the three <c>DifferentiableOps.Record*</c> entry points, which every differentiable
+    /// op funnels through — one place instead of a binding call per op. An engine that binds itself
+    /// explicitly always wins; this only decides the case where nothing did.
+    /// </remarks>
+    internal void NoteDataDevice(Tensor<T>? tensor)
+    {
+        if (_engineExplicitlyBound || _sawGpuResidentData || tensor is null) return;
+        if (tensor.HasPendingGpuData) _sawGpuResidentData = true;
+    }
+
+    /// <summary>
+    /// Picks the backward engine from where the taped data lives, unless an engine bound itself.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT <c>AiDotNetEngine.Current</c> as a blanket default. Current reflects what the
+    /// process auto-detected, not what this computation used, and defaulting to it silently moved
+    /// CPU-resident double workloads onto a fp32 GPU backward. When GPU-resident data WAS taped,
+    /// Current is the engine that produced it and staying there avoids a round trip.
+    /// </remarks>
+    private void ResolveEngineFromData()
+    {
+        if (_engineExplicitlyBound) return;
+        if (_sawGpuResidentData) return;   // Current is the GPU engine that produced the data.
+        if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
+    }
+
     public void BindEngineIfUnset(IEngine engine)
     {
         if (_engineExplicitlyBound) return;
@@ -470,6 +519,7 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
         ThrowIfStreamingReleased();
+        ResolveEngineFromData();
         if (sources is null) throw new ArgumentNullException(nameof(sources));
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
         if (_entries.Count == 0)
@@ -769,6 +819,7 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
         ThrowIfStreamingReleased();
+        ResolveEngineFromData();
 
         if (_entries.Count == 0)
         {
@@ -2193,6 +2244,9 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.Length != 1)
             throw new ArgumentException($"CompileBackward requires a scalar loss tensor (length 1), got length {loss.Length}.", nameof(loss));
 
+        // A caller that compiles directly never goes through ComputeGradients, so without this the
+        // compiled graph captures the constructor default instead of the data-derived engine.
+        ResolveEngineFromData();
         return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine, _retainGrad);
     }
 
@@ -2325,10 +2379,20 @@ public sealed class GradientTape<T> : IDisposable
         // which is a strict superset of the old per-Output walk and bounds memory
         // to ~one step. Entries created before the tape are preserved, so the
         // cross-tape inference-reuse scenarios the old walk protected still hold.
-        // Guard on the SAME engine instance the snapshot came from (CPU<->GPU
-        // rebind, #350); the byte/managed caps remain as a backstop either way.
-        if (_parent is null && _snapshotEngine is not null
-            && ReferenceEquals(_snapshotEngine, _engine))
+        // Pair against the constructor-captured engine, independently of the dispatch engine.
+        // ResolveEngineFromData may intentionally redirect a CPU-resident tape's backward to
+        // CpuFallbackEngine, but that must not strand the suspend taken from _snapshotEngine.
+        //
+        // This used to require ReferenceEquals(_snapshotEngine, _engine), which was ALREADY latently
+        // wrong before ResolveEngineFromData existed: the ctor suspends UNCONDITIONALLY, so any tape
+        // whose dispatch engine later differed — a BindEngineIfUnset rebind just as much as a CPU
+        // redirect — skipped the resume and left the suspend depth permanently raised, disabling
+        // byte-cap eviction on that GPU engine for the rest of the process. One leak per tape, silent.
+        //
+        // Evicting is still right when the backward dispatched to CPU: the activations created after
+        // the snapshot are this step's GPU intermediates either way, so they are garbage once the tape
+        // ends.
+        if (_parent is null && _snapshotEngine is not null)
         {
             // Pair the SuspendActivationEviction taken in the ctor BEFORE the
             // deterministic eviction below. ResumeActivationEviction first so

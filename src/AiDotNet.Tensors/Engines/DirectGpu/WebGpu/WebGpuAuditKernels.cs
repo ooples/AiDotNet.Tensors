@@ -48,19 +48,25 @@ struct P { batch: i32, Lp: i32, nFft: i32, hop: i32, numFrames: i32, numFreqs: i
 @group(0) @binding(1) var<storage, read> phase : array<f32>;
 @group(0) @binding(2) var<storage, read_write> newMag : array<f32>;
 @group(0) @binding(3) var<storage, read_write> newPhase : array<f32>;
-struct P { leading: i32, nFramesV: i32, nFreqV: i32, outFrames: i32, rate: f32 };
+struct P { leading: i32, numFrames: i32, numFreqs: i32, outFrames: i32, rate: f32 };
 @group(0) @binding(4) var<uniform> pc : P;
+// Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching BuildSpectrum below and
+// CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let idx = i32(gid.x); if (idx >= pc.leading * pc.nFreqV) { return; }
-  let f = idx % pc.nFreqV; let b = idx / pc.nFreqV; let stride = pc.nFramesV * pc.nFreqV; let outStride = pc.outFrames * pc.nFreqV;
+  let idx = i32(gid.x); if (idx >= pc.leading * pc.numFreqs) { return; }
+  let f = idx % pc.numFreqs; let b = idx / pc.numFreqs;
+  let row = b * pc.numFreqs * pc.numFrames + f * pc.numFrames;
+  let outRow = b * pc.numFreqs * pc.outFrames + f * pc.outFrames;
   var accPhase = 0.0;
   for (var t = 0; t < pc.outFrames; t = t + 1) {
-    let srcT = f32(t) * pc.rate; let t0 = i32(floor(srcT)); let t1 = min(t0 + 1, pc.nFramesV - 1); let frac = srcT - f32(t0);
-    let m0 = mag[b * stride + t0 * pc.nFreqV + f]; let m1 = mag[b * stride + t1 * pc.nFreqV + f];
-    newMag[b * outStride + t * pc.nFreqV + f] = (1.0 - frac) * m0 + frac * m1;
+    let srcT = f32(t) * pc.rate; var t0 = i32(floor(srcT));
+    if (t0 > pc.numFrames - 1) { t0 = pc.numFrames - 1; }
+    let t1 = min(t0 + 1, pc.numFrames - 1); let frac = srcT - f32(t0);
+    let m0 = mag[row + t0]; let m1 = mag[row + t1];
+    newMag[outRow + t] = (1.0 - frac) * m0 + frac * m1;
     var dp = 0.0;
-    if (t0 + 1 < pc.nFramesV) { dp = phase[b * stride + (t0 + 1) * pc.nFreqV + f] - phase[b * stride + t0 * pc.nFreqV + f]; dp = dp - 2.0 * 3.14159265358979 * round(dp / (2.0 * 3.14159265358979)); }
-    accPhase = accPhase + dp; newPhase[b * outStride + t * pc.nFreqV + f] = accPhase;
+    if (t0 + 1 < pc.numFrames) { dp = phase[row + t0 + 1] - phase[row + t0]; dp = dp - 2.0 * 3.14159265358979 * round(dp / (2.0 * 3.14159265358979)); }
+    accPhase = accPhase + dp; newPhase[outRow + t] = accPhase;
   }
 }";
 
@@ -524,7 +530,10 @@ struct P { batch: i32, numFrames: i32, nFft: i32, hop: i32, outputLength: i32, c
   let idx = i32(gid.x); let total = pc.batch * pc.outputLength; if (idx >= total) { return; }
   let outIdx = idx % pc.outputLength; let b = idx / pc.outputLength; var resultAcc = 0.0; var windowAcc = 0.0;
   for (var frame = 0; frame < pc.numFrames; frame = frame + 1) {
-    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = max(0, frame * pc.hop - pc.nFft / 2); }
+    // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+    // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8. writeStart is
+    // i32 here (idx is i32(gid.x)), so a negative start is representable and the i >= 0 test trims it.
+    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = frame * pc.hop - pc.nFft / 2; }
     let i = outIdx - writeStart;
     if (i >= 0 && i < pc.nFft) {
       let specOff = (b * pc.numFrames + frame) * pc.nFft; var acc = 0.0;
