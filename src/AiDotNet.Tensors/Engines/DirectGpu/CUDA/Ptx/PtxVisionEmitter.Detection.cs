@@ -5,6 +5,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 internal static partial class PtxVisionEmitter
 {
+    private enum BoxMetric
+    {
+        Iou,
+        GeneralizedIou,
+        DistanceIou,
+        CompleteIou
+    }
+
     private static DirectPtxVisionDefinition EmitPairwiseMetric(
         DirectPtxVisionSpec spec, DirectPtxArchitectureFamily architecture,
         int ccMajor, int ccMinor)
@@ -22,7 +30,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine($"    shr.u32 %r3, %r2, {shift};");
         ptx.AppendLine($"    and.b32 %r4, %r2, {m - 1};");
         LoadBoxPair(ptx, "%r3", "%r4");
-        EmitMetric(ptx, spec.Operation, "%f31");
+        EmitMetric(ptx, MetricForPairwise(spec.Operation), "%f31");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
         ptx.AppendLine("    st.global.f32 [%rd8], %f31;");
@@ -148,15 +156,7 @@ internal static partial class PtxVisionEmitter
         LoadParameters(ptx, "predicted", "target", "loss");
         EmitGlobalIndex(ptx, n);
         LoadBoxPair(ptx, "%r2", "%r2");
-        DirectPtxVisionOperation metric = spec.Operation switch
-        {
-            DirectPtxVisionOperation.IoULoss =>
-                (DirectPtxVisionOperation)((int)DirectPtxVisionOperation.GeneralizedBoxIou - 1),
-            DirectPtxVisionOperation.GIoULoss => DirectPtxVisionOperation.GeneralizedBoxIou,
-            DirectPtxVisionOperation.DIoULoss => DirectPtxVisionOperation.DistanceBoxIou,
-            _ => DirectPtxVisionOperation.CompleteBoxIou
-        };
-        EmitMetric(ptx, metric, "%f31");
+        EmitMetric(ptx, MetricForLoss(spec.Operation), "%f31");
         ptx.AppendLine($"    sub.rn.f32 %f32, {F(1f)}, %f31;");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
@@ -190,7 +190,7 @@ internal static partial class PtxVisionEmitter
 
     /// <summary>Emits IoU-family geometry. Result is placed in result.</summary>
     private static void EmitMetric(
-        StringBuilder ptx, DirectPtxVisionOperation operation, string result)
+        StringBuilder ptx, BoxMetric metric, string result)
     {
         ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
         ptx.AppendLine("    sub.rn.f32 %f9, %f2, %f0; max.f32 %f9, %f9, %f8;");
@@ -207,7 +207,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    add.rn.f32 %f20, %f11, %f14; sub.rn.f32 %f20, %f20, %f19;");
         ptx.AppendLine("    mov.f32 %f21, 0f00000000; setp.gt.f32 %p1, %f20, %f8;");
         ptx.AppendLine("    @%p1 div.approx.f32 %f21, %f19, %f20;");
-        if ((int)operation < (int)DirectPtxVisionOperation.GeneralizedBoxIou)
+        if (metric == BoxMetric.Iou)
         {
             ptx.AppendLine($"    mov.f32 {result}, %f21;");
             return;
@@ -215,7 +215,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    min.f32 %f22, %f0, %f4; min.f32 %f23, %f1, %f5;");
         ptx.AppendLine("    max.f32 %f24, %f2, %f6; max.f32 %f25, %f3, %f7;");
         ptx.AppendLine("    sub.rn.f32 %f26, %f24, %f22; sub.rn.f32 %f27, %f25, %f23;");
-        if (operation == DirectPtxVisionOperation.GeneralizedBoxIou)
+        if (metric == BoxMetric.GeneralizedIou)
         {
             ptx.AppendLine("    mul.rn.f32 %f28, %f26, %f27;");
             ptx.AppendLine("    mov.f32 %f29, 0f00000000; setp.gt.f32 %p2, %f28, %f8;");
@@ -234,7 +234,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    mov.f32 %f36, 0f00000000; setp.gt.f32 %p3, %f35, %f8;");
         ptx.AppendLine("    @%p3 div.approx.f32 %f36, %f34, %f35;");
         ptx.AppendLine("    sub.rn.f32 %f37, %f21, %f36;");
-        if (operation == DirectPtxVisionOperation.DistanceBoxIou)
+        if (metric == BoxMetric.DistanceIou)
         {
             ptx.AppendLine($"    mov.f32 {result}, %f37;");
             return;
@@ -292,7 +292,7 @@ internal static partial class PtxVisionEmitter
             ptx.AppendLine("    mul.wide.u32 %rd4, %r2, 16; add.u64 %rd5, %rd1, %rd4; add.u64 %rd6, %rd2, %rd4;");
             ptx.AppendLine("    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd5]; ld.global.v4.f32 {%f4,%f5,%f6,%f7}, [%rd6];");
             ptx.AppendLine("    mul.wide.u32 %rd7, %r2, 4; add.u64 %rd8, %rd0, %rd7; ld.global.f32 %f63, [%rd8];");
-            DirectPtxVisionOperation metric = MetricForBackward(spec.Operation);
+            BoxMetric metric = MetricForBackward(spec.Operation);
             EmitAnalyticMetricGradient(ptx, metric, ownerA: true, negative: true,
                 "%f64", "%f65", "%f66", "%f67");
             ptx.AppendLine("    add.u64 %rd9, %rd3, %rd4; st.global.v4.f32 [%rd9], {%f64,%f65,%f66,%f67};");
@@ -341,12 +341,13 @@ internal static partial class PtxVisionEmitter
         else
             pairPtx.AppendLine("    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd6];");
         pairPtx.AppendLine("    ld.global.f32 %f63, [%rd9];");
-        DirectPtxVisionOperation pairMetric = variant switch
+        BoxMetric pairMetric = variant switch
         {
-            0 => (DirectPtxVisionOperation)((int)DirectPtxVisionOperation.GeneralizedBoxIou - 1),
-            1 => DirectPtxVisionOperation.GeneralizedBoxIou,
-            2 => DirectPtxVisionOperation.DistanceBoxIou,
-            _ => DirectPtxVisionOperation.CompleteBoxIou
+            0 => BoxMetric.Iou,
+            1 => BoxMetric.GeneralizedIou,
+            2 => BoxMetric.DistanceIou,
+            3 => BoxMetric.CompleteIou,
+            _ => throw new NotSupportedException($"IoU-family variant {variant} is not emitted.")
         };
         EmitAnalyticMetricGradient(pairPtx, pairMetric, ownerA, negative: false,
             "%f68", "%f69", "%f70", "%f71");
@@ -370,14 +371,33 @@ internal static partial class PtxVisionEmitter
             Finish(pairPtx), owners, maxRegisters: 96, minBlocksPerSm: 1, blockThreads: PairBlockThreads);
     }
 
-    private static DirectPtxVisionOperation MetricForBackward(DirectPtxVisionOperation operation) =>
+    private static BoxMetric MetricForPairwise(DirectPtxVisionOperation operation) =>
         operation switch
         {
-            DirectPtxVisionOperation.IoULossBackward =>
-                (DirectPtxVisionOperation)((int)DirectPtxVisionOperation.GeneralizedBoxIou - 1),
-            DirectPtxVisionOperation.GIoULossBackward => DirectPtxVisionOperation.GeneralizedBoxIou,
-            DirectPtxVisionOperation.DIoULossBackward => DirectPtxVisionOperation.DistanceBoxIou,
-            _ => DirectPtxVisionOperation.CompleteBoxIou
+            DirectPtxVisionOperation.GeneralizedBoxIou => BoxMetric.GeneralizedIou,
+            DirectPtxVisionOperation.DistanceBoxIou => BoxMetric.DistanceIou,
+            DirectPtxVisionOperation.CompleteBoxIou => BoxMetric.CompleteIou,
+            _ => throw new NotSupportedException($"{operation} is not a pairwise IoU metric.")
+        };
+
+    private static BoxMetric MetricForLoss(DirectPtxVisionOperation operation) =>
+        operation switch
+        {
+            DirectPtxVisionOperation.IoULoss => BoxMetric.Iou,
+            DirectPtxVisionOperation.GIoULoss => BoxMetric.GeneralizedIou,
+            DirectPtxVisionOperation.DIoULoss => BoxMetric.DistanceIou,
+            DirectPtxVisionOperation.CIoULoss => BoxMetric.CompleteIou,
+            _ => throw new NotSupportedException($"{operation} is not an aligned IoU loss.")
+        };
+
+    private static BoxMetric MetricForBackward(DirectPtxVisionOperation operation) =>
+        operation switch
+        {
+            DirectPtxVisionOperation.IoULossBackward => BoxMetric.Iou,
+            DirectPtxVisionOperation.GIoULossBackward => BoxMetric.GeneralizedIou,
+            DirectPtxVisionOperation.DIoULossBackward => BoxMetric.DistanceIou,
+            DirectPtxVisionOperation.CIoULossBackward => BoxMetric.CompleteIou,
+            _ => throw new NotSupportedException($"{operation} is not an aligned IoU-loss backward metric.")
         };
 
     /// <summary>
@@ -388,7 +408,7 @@ internal static partial class PtxVisionEmitter
     /// </summary>
     private static void EmitAnalyticMetricGradient(
         StringBuilder ptx,
-        DirectPtxVisionOperation metric,
+        BoxMetric metric,
         bool ownerA,
         bool negative,
         string x1Gradient,
@@ -396,9 +416,14 @@ internal static partial class PtxVisionEmitter
         string x2Gradient,
         string y2Gradient)
     {
-        int variant = metric == DirectPtxVisionOperation.GeneralizedBoxIou ? 1 :
-            metric == DirectPtxVisionOperation.DistanceBoxIou ? 2 :
-            metric == DirectPtxVisionOperation.CompleteBoxIou ? 3 : 0;
+        int variant = metric switch
+        {
+            BoxMetric.Iou => 0,
+            BoxMetric.GeneralizedIou => 1,
+            BoxMetric.DistanceIou => 2,
+            BoxMetric.CompleteIou => 3,
+            _ => throw new NotSupportedException($"Box metric {metric} is not emitted.")
+        };
 
         ptx.AppendLine($"    mov.f32 {x1Gradient}, 0f00000000; mov.f32 {y1Gradient}, 0f00000000; mov.f32 {x2Gradient}, 0f00000000; mov.f32 {y2Gradient}, 0f00000000;");
         ptx.AppendLine($"    {(negative ? "neg" : "mov")}.f32 %f58, %f63;");
