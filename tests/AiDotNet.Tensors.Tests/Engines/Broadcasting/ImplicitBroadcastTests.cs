@@ -212,6 +212,31 @@ public class ImplicitBroadcastTests
         Assert.False(ShapePolicy.IsStrict);
     }
 
+    [Fact]
+    public void StrictScope_AliasesCannotDisposeTheSameScopeTwice()
+    {
+        Assert.False(ShapePolicy.IsStrict);
+        using (ShapePolicy.Strict())
+        {
+            var inner = ShapePolicy.Strict();
+            var alias = inner;
+
+            inner.Dispose();
+            alias.Dispose();
+
+            // Both variables reference one idempotent handle. Disposing the alias must not consume
+            // the still-active outer scope, which was possible when StrictScope was a copyable struct.
+            Assert.True(ShapePolicy.IsStrict);
+        }
+        Assert.False(ShapePolicy.IsStrict);
+    }
+
+    [Fact]
+    public void StrictScope_HasNoPublicConstructor()
+    {
+        Assert.Empty(typeof(ShapePolicy.StrictScope).GetConstructors());
+    }
+
     /// <summary>
     /// In-place operators must refuse a broadcast that would need to grow their destination.
     /// </summary>
