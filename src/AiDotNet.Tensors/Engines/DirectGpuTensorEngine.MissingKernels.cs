@@ -4763,6 +4763,10 @@ public partial class DirectGpuTensorEngine
             backend.Fill(output, 0f, inSize);
             backend.GridSampleBackwardInputNhwc(
                 bufGO.Buffer, gridForKernel, output, N, H, W, C, outH, outW);
+            // Same lifetime hazard as the chain-rule scratch in GridSampleBackwardGrid below: the
+            // rescaled grid is a `using` buffer that returns to the pool once this method returns,
+            // while the launch above may still be reading it.
+            if (bufGridAdj is not null) backend.Synchronize();
         });
     }
 
@@ -4839,6 +4843,13 @@ public partial class DirectGpuTensorEngine
             backend.Scale(gx.Buffer, gx.Buffer, (float)W / (W - 1), pairs);
             backend.Scale(gy.Buffer, gy.Buffer, (float)H / (H - 1), pairs);
             backend.InterleaveComplex(gx.Buffer, gy.Buffer, output, pairs);
+            // gx/gy are `using` scratch: their `using` declarations return them to the backend pool the
+            // moment this callback returns. DispatchDeferredGpuOp only DISPATCHES, and DeferTensorResult
+            // defers the download rather than the compute, so these launches can still be in flight at
+            // that point — a later allocation could reuse the memory while they are still writing it and
+            // corrupt the grid gradient non-deterministically. IEngine.RFFT guards the same hazard the
+            // same way.
+            backend.Synchronize();
         });
     }
 

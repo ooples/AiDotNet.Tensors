@@ -50,6 +50,14 @@ public class TimeStretchStageDiffTests : IDisposable
     private const int Hop = 128;
     private const double Rate = 0.5;
 
+    private static Tensor<float> LongSignal(int n)
+    {
+        var rng = new Random(9);
+        var t = new Tensor<float>([n]);
+        for (int i = 0; i < n; i++) t[i] = (float)(rng.NextDouble() * 2 - 1);
+        return t;
+    }
+
     private static Tensor<float> Signal()
     {
         var rng = new Random(7);
@@ -136,7 +144,7 @@ public class TimeStretchStageDiffTests : IDisposable
     /// factor is a fact about the ARGUMENTS, independent of either implementation.
     /// </para>
     /// </remarks>
-    [SkippableTheory]
+    [Theory]
     [InlineData(0.5)]
     [InlineData(0.75)]
     [InlineData(1.5)]
@@ -159,7 +167,7 @@ public class TimeStretchStageDiffTests : IDisposable
             double sum = 0;
             for (int frame = 0; frame < outFrames; frame++)
             {
-                int writeStart = Math.Max(0, frame * Hop - NFft / 2);
+                int writeStart = frame * Hop - NFft / 2;
                 int i = outIdx - writeStart;
                 if (i >= 0 && i < NFft) sum += win[i] * win[i];
             }
@@ -170,7 +178,16 @@ public class TimeStretchStageDiffTests : IDisposable
         _out.WriteLine($"rate={rate,4} outFrames={outFrames} len={outputLength} belowGuard={belowGuard} " +
                        $"minDivisor={minDivisor:E3} at={minDivisorAt} " +
                        $"amplification={1.0 / minDivisor:E3}");
-        Assert.True(true, "measurement only — the printed conditioning is the result");
+
+        // Regression guard on the writeStart fix. Under correct centring output 0 sits at the window's
+        // CENTRE, where win[nFft/2] is approximately 1, so every divisor is O(1) and nothing lands near
+        // the 1e-8 guard. The clamped form put win[0] = 0 there instead and bottomed out at 2.29e-8,
+        // amplifying fp32 noise by ~1e7. Reintroducing the clamp fails here rather than surfacing as
+        // mysterious CPU/GPU drift somewhere downstream.
+        Assert.Equal(0, belowGuard);
+        Assert.True(minDivisor > 0.1,
+            $"smallest overlap-add divisor is {minDivisor:E3} at index {minDivisorAt} (rate={rate}); " +
+            $"correct centring keeps it O(1), so this small a value means the frames are misaligned.");
     }
 
     /// <summary>
@@ -196,11 +213,7 @@ public class TimeStretchStageDiffTests : IDisposable
         var g = _gpu!.TimeStretch(x, rate, NFft, Hop);
 
         int outFrames = (int)Math.Floor(3 / rate);
-        if (c.Length != g.Length)
-        {
-            _out.WriteLine($"rate={rate,4} outFrames={outFrames} LENGTH cpu={c.Length} gpu={g.Length}");
-            return;
-        }
+        Assert.Equal(c.Length, g.Length);
         double worst = 0;
         int worstAt = -1;
         for (int i = 0; i < c.Length; i++)
@@ -215,7 +228,12 @@ public class TimeStretchStageDiffTests : IDisposable
         for (int i = 8; i < c.Length; i++) worstTail = Math.Max(worstTail, Math.Abs((double)c[i] - g[i]));
         _out.WriteLine($"rate={rate,4} outFrames={outFrames} len={c.Length} " +
                        $"maxAbsDiff={worst:E3} at={worstAt} maxAbsDiff[8..]={worstTail:E3}");
-        Assert.True(true, "measurement only — the printed trend is the result");
+        // Post-fix these all sit at fp32 DFT-vs-FFT noise (9.3e-5 to 3.7e-4 across rates 0.5-2.0),
+        // three orders below the 1e-1 the clamped writeStart produced. Same bound as
+        // Stage2_TimeStretch_CpuMatchesGpu, which exercises one rate of this same op.
+        Assert.True(worst < 1e-2,
+            $"CPU and GPU TimeStretch differ by {worst:E3} at index {worstAt} (rate={rate}), well above " +
+            $"fp32 noise — the tail is {worstTail:E3}.");
     }
 
     /// <summary>Stage 2 — the whole op, for reference against the harness's reported error.</summary>
@@ -347,10 +365,15 @@ public class TimeStretchStageDiffTests : IDisposable
 
     [SkippableTheory]
     [InlineData(true)]
+    [InlineData(false)]
     public void IstftDivergence_IsolatedToTheCentredPath(bool center)
     {
         Skip.If(!_available, "GPU backend not available");
-        var x = Signal();
+        // center: false does no padding, so the signal must be at least one window long — L=257 against
+        // nFft=512 yields zero frames and STFT rejects it by design. The centred case keeps the
+        // harness's exact length; the un-centred case uses the shortest length that can produce frames
+        // at all, since that is what the mode requires rather than a choice.
+        var x = center ? Signal() : LongSignal(1024);
         var w = Hann(NFft);
         _cpu.STFT(x, NFft, Hop, w, center: center, out var mag, out var phase);
 
@@ -369,8 +392,38 @@ public class TimeStretchStageDiffTests : IDisposable
             double d = Math.Abs((double)c[i] - g[i]);
             if (d > worst) { worst = d; at = i; }
         }
-        _out.WriteLine($"center={center}: maxAbsDiff={worst:E3} at [{at}] len={c.Length}");
-        Assert.True(true, "measurement only — the printed comparison is the result");
+        // ISTFT emits numerator/windowSum, so scaling the observed difference BY the window sum
+        // recovers the difference in the NUMERATOR — what the kernels actually compute — with the
+        // division's amplification divided back out. Needed because the un-centred tail is inherently
+        // ill-conditioned: the last samples are covered only by the decaying edge of the final window,
+        // so its sum approaches zero and fp32 noise there is amplified without either engine being
+        // wrong. Raw diff peaks at 3.4e-2 at index 1019 for center: false purely from that.
+        int frames = mag.Shape.ToArray()[^1];
+        double WindowSumAt(int outIdx)
+        {
+            double sum = 0;
+            for (int f = 0; f < frames; f++)
+            {
+                int i = outIdx - (center ? f * Hop - NFft / 2 : f * Hop);
+                if (i >= 0 && i < NFft) sum += (double)w[i] * w[i];
+            }
+            return sum;
+        }
+        double worstNumerator = 0;
+        int numeratorAt = -1;
+        for (int i = 0; i < c.Length; i++)
+        {
+            double n = Math.Abs((double)c[i] - g[i]) * WindowSumAt(i);
+            if (n > worstNumerator) { worstNumerator = n; numeratorAt = i; }
+        }
+        _out.WriteLine($"center={center}: maxAbsDiff={worst:E3} at [{at}] len={c.Length} " +
+                       $"worstNumerator={worstNumerator:E3} at [{numeratorAt}]");
+
+        // Same derived bound as IstftResidual_ScalesWithNFft: the GPU sums nFft terms sequentially per
+        // bin while CpuEngine uses FFTCore, and sequential summation error grows like n*eps.
+        Assert.True(worstNumerator < 2e-7 * NFft,
+            $"CPU and GPU ISTFT numerators differ by {worstNumerator:E3} at index {numeratorAt} " +
+            $"(center={center}), above what fp32 summation order accounts for.");
     }
 
     /// <summary>
