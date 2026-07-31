@@ -664,30 +664,60 @@ public partial class CpuEngine
     public virtual Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
-        // The existing 3-arg GridSampleBackwardInput is hard-coded to
-        // bilinear + zeros + alignCorners=false (torchvision defaults).
-        // For non-default settings, specialised GPU kernels are a
-        // follow-up; the managed impl here matches the forward default
-        // only. Guard so callers asking for non-default backward get a
-        // clear error rather than a silent mismatched gradient.
-        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros || alignCorners)
+        // The 3-arg GridSampleBackwardInput implements bilinear + zeros + alignCorners=false (the
+        // torchvision defaults). alignCorners=true used to throw here as a "follow-up", which left the
+        // GPU kernels — which hardcode the align-TRUE mapping — with no CPU counterpart to check against.
+        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
             throw new NotSupportedException(
                 $"GridSample backward is currently supported only for " +
-                $"Bilinear + Zeros + alignCorners=false. Requested " +
-                $"{mode}/{padding}/alignCorners={alignCorners}.");
-        return GridSampleBackwardInput(gradOutput, grid, inputShape);
+                $"Bilinear + Zeros. Requested {mode}/{padding}.");
+        if (!alignCorners) return GridSampleBackwardInput(gradOutput, grid, inputShape);
+        // No second implementation needed: the conventions differ by a pure per-axis rescale of the grid.
+        //     align=false: src = (g+1)*S/2 - 0.5        align=true: src = (g+1)*(S-1)/2
+        // Equating them gives g_false = g_true * (S-1)/S, the inverse of the factor
+        // DirectGpuTensorEngine applies to reach align=true from an align-false kernel.
+        return GridSampleBackwardInput(
+            gradOutput, ScaleGridAxes(grid, inputShape[3], inputShape[2]), inputShape);
+    }
+
+    /// <summary>
+    /// Rescales an align_corners=true grid to the equivalent align_corners=false grid:
+    /// <c>g_false = g_true * (S-1)/S</c> per axis.
+    /// </summary>
+    /// <remarks>
+    /// Component 0 of each trailing pair is x (paired with width) and component 1 is y (paired with
+    /// height), matching the sampling code's read order. A size-1 axis makes the factor 0, which is the
+    /// correct degenerate answer: with one sample there is nowhere else to land.
+    /// </remarks>
+    private static Tensor<T> ScaleGridAxes<T>(Tensor<T> grid, int width, int height)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scaled = (Tensor<T>)grid.Clone();
+        var span = scaled.AsWritableSpan();
+        T fx = ops.FromDouble(width <= 0 ? 0.0 : (width - 1) / (double)width);
+        T fy = ops.FromDouble(height <= 0 ? 0.0 : (height - 1) / (double)height);
+        for (int i = 0; i + 1 < span.Length; i += 2)
+        {
+            span[i] = ops.Multiply(span[i], fx);
+            span[i + 1] = ops.Multiply(span[i + 1], fy);
+        }
+        return scaled;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
-        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros || alignCorners)
+        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
             throw new NotSupportedException(
                 $"GridSample backward is currently supported only for " +
-                $"Bilinear + Zeros + alignCorners=false. Requested " +
-                $"{mode}/{padding}/alignCorners={alignCorners}.");
-        return GridSampleBackwardGrid(gradOutput, input, grid);
+                $"Bilinear + Zeros. Requested {mode}/{padding}.");
+        if (!alignCorners) return GridSampleBackwardGrid(gradOutput, input, grid);
+        // Same rescale as GridSampleBackwardInput, plus the chain rule: the inner call differentiates
+        // with respect to g_false, and dg_false/dg_true is that same (S-1)/S factor.
+        int w = input._shape[3], h = input._shape[2];
+        var gradGrid = GridSampleBackwardGrid(gradOutput, input, ScaleGridAxes(grid, w, h));
+        return ScaleGridAxes(gradGrid, w, h);
     }
 
     /// <inheritdoc/>

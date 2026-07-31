@@ -4626,20 +4626,78 @@ public partial class DirectGpuTensorEngine
         if (grid is null) throw new ArgumentNullException(nameof(grid));
         if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
         // NCHW (PyTorch): inputShape [N,C,H,W], gradOutput [N,C,outH,outW], grid [N,outH,outW,2].
+        //
+        // The kernel hardcodes the align_corners=TRUE mapping src = (g+1)*(S-1)/2. It used to bail
+        // whenever alignCorners was false, which is the torchvision DEFAULT and the convention this
+        // engine standardised on — so the kernel never ran and GpuResidencyProbeTests measured 0/1
+        // launches for this op.
+        //
+        // No kernel change is needed, because the two conventions differ by a pure RESCALE of the grid:
+        //     align=false: src = (g+1)*S/2 - 0.5
+        //     align=true : src = (g'+1)*(S-1)/2
+        // Equating them gives g' = g * S/(S-1), independently per axis. So pre-scaling the grid makes the
+        // align-true kernel compute the align-false mapping exactly. Composed from portable primitives
+        // (DeinterleaveComplex/Scale/InterleaveComplex), so it works on all six backends at once rather
+        // than threading a flag through six kernel sources and six wrappers.
+        //
+        // S == 1 makes S/(S-1) undefined; align_corners=false with a size-1 axis is degenerate, so defer.
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
-            || !alignCorners || inputShape.Length != 4 || gradOutput.Rank != 4 || grid.Rank != 4 || !TryGetBackend(out var backend))
+            || inputShape.Length != 4 || gradOutput.Rank != 4 || grid.Rank != 4
+            || (!alignCorners && (inputShape[2] <= 1 || inputShape[3] <= 1))
+            || !TryGetBackend(out var backend))
             return base.GridSampleBackwardInput(gradOutput, grid, inputShape, mode, padding, alignCorners);
         int N = inputShape[0], C = inputShape[1], H = inputShape[2], W = inputShape[3];
         int outH = gradOutput._shape[2], outW = gradOutput._shape[3];
         int inSize = N * H * W * C;
         using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
         using var bufGrid = GetOrAllocateBuffer(backend, grid);
+        // g' = g * S/(S-1) per axis; see the derivation above. Identity when alignCorners is already true.
+        using var bufGridAdj = AlignFalseGridToAlignTrue(
+            backend, bufGrid.Buffer, N * outH * outW, H, W, alignCorners);
+        var gridForKernel = bufGridAdj?.Buffer ?? bufGrid.Buffer;
         return DispatchDeferredGpuOp<T>(backend, inSize, (int[])inputShape.Clone(), output =>
         {
             backend.Fill(output, 0f, inSize);
             backend.GridSampleBackwardInputNhwc(
-                bufGO.Buffer, bufGrid.Buffer, output, N, H, W, C, outH, outW);
+                bufGO.Buffer, gridForKernel, output, N, H, W, C, outH, outW);
         });
+    }
+
+    /// <summary>
+    /// Rescales an <c>align_corners=false</c> grid so an <c>align_corners=true</c> kernel evaluates the
+    /// same sampling positions, or returns null when no adjustment is needed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// align=false maps src = (g+1)*S/2 - 0.5 and align=true maps src = (g'+1)*(S-1)/2. Equating them
+    /// gives g' = g * S/(S-1), one factor per axis. Component 0 of each grid pair is x (paired with W)
+    /// and component 1 is y (paired with H), matching how the kernels read gridBase and gridBase+1.
+    /// </para>
+    /// <para>
+    /// Built from DeinterleaveComplex/Scale/InterleaveComplex, which every backend already implements, so
+    /// the two conventions are supported everywhere without duplicating a kernel six times.
+    /// </para>
+    /// </remarks>
+    private OwnedBuffer? AlignFalseGridToAlignTrue(
+        IDirectGpuBackend backend, IGpuBuffer gridBuffer, int pairCount, int h, int w, bool alignCorners)
+    {
+        if (alignCorners || pairCount <= 0) return null;
+        var gx = AllocateOutputBuffer(backend, pairCount);
+        try
+        {
+            using var gy = AllocateOutputBuffer(backend, pairCount);
+            var adjusted = AllocateOutputBuffer(backend, pairCount * 2);
+            try
+            {
+                backend.DeinterleaveComplex(gridBuffer, gx.Buffer, gy.Buffer, pairCount);
+                backend.Scale(gx.Buffer, gx.Buffer, (float)w / (w - 1), pairCount);
+                backend.Scale(gy.Buffer, gy.Buffer, (float)h / (h - 1), pairCount);
+                backend.InterleaveComplex(gx.Buffer, gy.Buffer, adjusted.Buffer, pairCount);
+            }
+            catch { adjusted.Dispose(); throw; }
+            return adjusted;
+        }
+        finally { gx.Dispose(); }
     }
 
     /// <inheritdoc/>
@@ -4649,18 +4707,36 @@ public partial class DirectGpuTensorEngine
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (grid is null) throw new ArgumentNullException(nameof(grid));
+        // Same align_corners handling as GridSampleBackwardInput above — see the derivation there.
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
-            || !alignCorners || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4 || !TryGetBackend(out var backend))
+            || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4
+            || (!alignCorners && (input._shape[2] <= 1 || input._shape[3] <= 1))
+            || !TryGetBackend(out var backend))
             return base.GridSampleBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int outH = grid._shape[1], outW = grid._shape[2];
-        int gridSize = N * outH * outW * 2;
+        int pairs = N * outH * outW;
+        int gridSize = pairs * 2;
         using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
         using var bufIn = GetOrAllocateBuffer(backend, input);
         using var bufGrid = GetOrAllocateBuffer(backend, grid);
+        using var bufGridAdj = AlignFalseGridToAlignTrue(backend, bufGrid.Buffer, pairs, H, W, alignCorners);
+        var gridForKernel = bufGridAdj?.Buffer ?? bufGrid.Buffer;
         return DispatchDeferredGpuOp<T>(backend, gridSize, (int[])grid._shape.Clone(), output =>
+        {
             backend.GridSampleBackwardGridNhwc(
-                bufGO.Buffer, bufIn.Buffer, bufGrid.Buffer, output, N, H, W, C, outH, outW));
+                bufGO.Buffer, bufIn.Buffer, gridForKernel, output, N, H, W, C, outH, outW);
+            if (bufGridAdj is null) return;
+            // The kernel differentiated with respect to g', so the chain rule carries the SAME per-axis
+            // factor back: dL/dg = dL/dg' * dg'/dg = dL/dg' * S/(S-1). Skipping this would leave the
+            // position mapping right and the gradient magnitudes wrong.
+            using var gx = AllocateOutputBuffer(backend, pairs);
+            using var gy = AllocateOutputBuffer(backend, pairs);
+            backend.DeinterleaveComplex(output, gx.Buffer, gy.Buffer, pairs);
+            backend.Scale(gx.Buffer, gx.Buffer, (float)W / (W - 1), pairs);
+            backend.Scale(gy.Buffer, gy.Buffer, (float)H / (H - 1), pairs);
+            backend.InterleaveComplex(gx.Buffer, gy.Buffer, output, pairs);
+        });
     }
 
     /// <inheritdoc/>
