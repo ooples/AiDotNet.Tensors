@@ -1058,6 +1058,35 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     public bool IsGpuResident => _device != TensorDevice.CPU;
 
     /// <summary>
+    /// True when this tensor's data physically lives on a GPU right now — either because the device
+    /// says so, or because its backing array is still waiting on a deferred download.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="IsGpuResident"/> alone is NOT a reliable answer to "where is my data", because the
+    /// two GPU result paths disagree. <c>DeferTensorResult</c> builds its output with
+    /// <c>CreateGpuResident</c>, so <see cref="Device"/> is correct there. <c>FinishGpuOp</c> instead
+    /// returns a bare array with a deferred materializer registered — the GPU buffer stays resident and
+    /// the download has not happened — and the caller wraps that array in a tensor whose device
+    /// defaults to CPU. Such a tensor reports CPU while its data is on the device.
+    /// </para>
+    /// <para>
+    /// Kept SEPARATE from <see cref="IsGpuResident"/> rather than folded into it: that property gates
+    /// eviction, transfer and residency-assert paths throughout the engine, and widening it would
+    /// change their behaviour for reasons unrelated to the question being asked here.
+    /// </para>
+    /// </remarks>
+    public bool HasPendingGpuData
+    {
+        get
+        {
+            if (_device != TensorDevice.CPU) return true;
+            var live = GetLiveBackingArrayOrNull();
+            return live is not null && Helpers.DeferredArrayMaterializer.IsPending(live);
+        }
+    }
+
+    /// <summary>
     /// Gets the full device info including device index for multi-GPU scenarios.
     /// Equivalent to PyTorch's <c>tensor.device</c> which returns e.g. <c>device(type='cuda', index=0)</c>.
     /// </summary>

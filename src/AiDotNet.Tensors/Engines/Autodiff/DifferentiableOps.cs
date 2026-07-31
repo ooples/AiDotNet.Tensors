@@ -219,6 +219,9 @@ internal static class DifferentiableOps
 
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
+        // Dispatch the backward to wherever the data actually lives. This is the single funnel every
+        // differentiable op passes through, so it needs no per-op upkeep — see NoteDataDevice.
+        tape.NoteDataDevice(output);
         slot.OperationName = opName;
         slot.Output = output;
         slot.Backward = backward;
@@ -305,6 +308,9 @@ internal static class DifferentiableOps
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
+        // Dispatch the backward to wherever the data actually lives. This is the single funnel every
+        // differentiable op passes through, so it needs no per-op upkeep — see NoteDataDevice.
+        tape.NoteDataDevice(output);
         slot.OperationName = opName;
         slot.Output = output;
         slot.Backward = backward;
@@ -351,6 +357,9 @@ internal static class DifferentiableOps
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
+        // Dispatch the backward to wherever the data actually lives. This is the single funnel every
+        // differentiable op passes through, so it needs no per-op upkeep — see NoteDataDevice.
+        tape.NoteDataDevice(output);
         slot.OperationName = opName;
         slot.Output = output;
         slot.Backward = backward;
