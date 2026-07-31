@@ -55,6 +55,63 @@ public sealed record CodegenSplitPlan(
 public static class CodegenSplitReduction
 {
     /// <summary>
+    /// Whether a reduction can be split into a partial pass and a combine pass.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The requirement is ASSOCIATIVITY, and both sum and maximum have it:
+    /// <c>max(max(a, b), c) = max(a, max(b, c))</c> exactly as
+    /// <c>(a + b) + c = a + (b + c)</c>. A split computes partials over disjoint chunks and
+    /// combines them with the same operation, which is valid for any associative reduce.
+    /// </para>
+    /// <para>
+    /// This previously refused Max, on the stated grounds that "the combine pass has to be the
+    /// same associative operation, and Max is not summed partials". The first half is right
+    /// and the second does not follow -- the combine over Max partials is a Max, not a sum.
+    /// The cost of that error was concrete: a row-wise maximum ran one thread per row, which
+    /// profiles at 32 sectors per global request against an ideal of 4, an eightfold traffic
+    /// waste, and 0.04 waves per multiprocessor. It was the only reduction shape with no
+    /// available fix, and the reason was a mistaken premise rather than a property of Max.
+    /// </para>
+    /// <para>
+    /// Mean is NOT a separate case: it is a sum with <c>ReduceScale</c>, and the scale moves
+    /// to the combine pass along with the rest of the epilogue, so it applies once.
+    /// </para>
+    /// </remarks>
+    public static bool IsSplittable(CodegenReduceKind reduce) =>
+        reduce is CodegenReduceKind.Sum or CodegenReduceKind.Max;
+
+    /// <summary>
+    /// Whether a complete spec can be split without dropping output semantics.
+    /// </summary>
+    /// <remarks>
+    /// A maximum with an argmax output needs both the winning value and its position to
+    /// survive the partial and combine passes. The current split carries only values, so
+    /// such a spec must remain single-pass until the temporary also stores positions.
+    /// </remarks>
+    public static bool IsSplittable(CodegenKernelSpec spec)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        return IsSplittable(spec.Reduce) &&
+            spec.SecondaryOutput is null && spec.SecondaryIndexExpr is null;
+    }
+
+    /// <summary>Throws with the reason when a spec's reduction cannot be split.</summary>
+    private static void RequireSplittable(CodegenKernelSpec spec)
+    {
+        if (IsSplittable(spec)) return;
+
+        if (spec.SecondaryOutput is not null || spec.SecondaryIndexExpr is not null)
+            throw new NotSupportedException(
+                "A split maximum cannot preserve its argmax secondary output yet; the " +
+                "partial and combine temporaries currently carry values only.");
+
+        throw new NotSupportedException(
+            "A split needs an ASSOCIATIVE reduction, so the combine can apply the same " +
+            "operation to the partials; " + spec.Reduce + " is not one.");
+    }
+
+    /// <summary>
     /// Largest partial buffer worth materialising, in elements -- 64 Mi, so 256 MB of
     /// fp32. Above this the combine pass's own DRAM traffic dominates whatever the extra
     /// parallelism bought.
@@ -116,6 +173,33 @@ public static class CodegenSplitReduction
             chunkedPartial, chunkedCombine, chunkedPartial.Output.ElementCount, new[] { axis });
     }
 
+    /// <summary>
+    /// Builds a measured-candidate plan that chunks the highest-ranked reduction axis
+    /// even when other reduction axes remain.
+    /// </summary>
+    /// <remarks>
+    /// The default plan promotes that axis whole because it maximizes partial-pass
+    /// parallelism. Weight gradients can pay more for the enlarged temporary than they
+    /// gain from those extra blocks, so autotuning also needs deterministic chunk counts
+    /// that trade parallelism for less materialization traffic.
+    /// </remarks>
+    public static CodegenSplitPlan? TryPlanChunked(
+        CodegenKernelSpec spec, int splitFactor,
+        int multiprocessors = 68, int blockThreads = 256)
+    {
+        var ranked = ChooseAxes(spec, multiprocessors, blockThreads);
+        if (ranked.Count == 0) return null;
+
+        int axis = ranked[0];
+        int extent = spec.Space.Axes[axis].Extent;
+        if (splitFactor <= 1 || splitFactor >= extent || extent % splitFactor != 0)
+            return null;
+
+        var (partial, combine) = SplitChunked(spec, axis, splitFactor);
+        return new CodegenSplitPlan(
+            partial, combine, partial.Output.ElementCount, new[] { axis });
+    }
+
     /// <summary>Largest divisor of <paramref name="extent"/> not above <paramref name="cap"/>.</summary>
     private static int LargestDivisorAtMost(int extent, int cap)
     {
@@ -161,7 +245,7 @@ public static class CodegenSplitReduction
         if (spec is null) throw new ArgumentNullException(nameof(spec));
 
         var chosen = new List<int>();
-        if (spec.Reduce != CodegenReduceKind.Sum) return chosen;
+        if (!IsSplittable(spec)) return chosen;
 
         // Four blocks per SM is the point past which latency is hidden; a kernel already
         // there does not need the extra launch or the temporary.
@@ -253,10 +337,7 @@ public static class CodegenSplitReduction
         CodegenKernelSpec spec, int reductionAxis, int splitFactor)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
-        if (spec.Reduce != CodegenReduceKind.Sum)
-            throw new NotSupportedException(
-                "Only a sum reduction splits: the combine pass has to be the same " +
-                "associative operation, and " + spec.Reduce + " is not summed partials.");
+        RequireSplittable(spec);
 
         var axes = spec.Space.Axes;
         bool isReduction = false;
@@ -317,7 +398,7 @@ public static class CodegenSplitReduction
             spec.Name + "_partial", partialSpace, partialInputs,
             new CodegenTensorBinding(partialInputs.Length, "partial", partialShape, partialMap, isOutput: true),
             partialProduct,
-            AnyReductionLeft(partialSpace) ? CodegenReduceKind.Sum : CodegenReduceKind.None);
+            AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None);
 
         return (partial, BuildCombine(spec, partialShape, new[] { splitFactor }));
     }
@@ -361,10 +442,7 @@ public static class CodegenSplitReduction
         if (reductionAxes.Count == 0)
             throw new ArgumentException("At least one axis has to be promoted.", nameof(reductionAxes));
 
-        if (spec.Reduce != CodegenReduceKind.Sum)
-            throw new NotSupportedException(
-                "Only a sum reduction splits: the combine pass has to be the same " +
-                "associative operation, and " + spec.Reduce + " is not summed partials.");
+        RequireSplittable(spec);
 
         var axes = spec.Space.Axes;
         var promote = new List<int>();
@@ -430,7 +508,7 @@ public static class CodegenSplitReduction
         // has nothing left to reduce and must not claim it does.
         var partial = new CodegenKernelSpec(
             spec.Name + "_partial", partialSpace, partialInputs, partialOutput, partialProduct,
-            AnyReductionLeft(partialSpace) ? CodegenReduceKind.Sum : CodegenReduceKind.None);
+            AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None);
 
         var promotedExtents = new int[promote.Count];
         for (int p = 0; p < promote.Count; p++) promotedExtents[p] = axes[promote[p]].Extent;
@@ -498,8 +576,15 @@ public static class CodegenSplitReduction
 
         return new CodegenKernelSpec(
             spec.Name + "_combine", combineSpace, combineInputs.ToArray(), combineOutput,
-            new[] { 0 }, CodegenReduceKind.Sum,
-            biasInput: combineBias, scaleInput: combineScale, activation: spec.Activation);
+            // THE COMBINE APPLIES THE SAME OPERATION AS THE PARTIAL. Summing the partials of a
+            // maximum would return their total instead of the largest -- a number of roughly
+            // the right magnitude, which is exactly the kind of wrong that survives review.
+            new[] { 0 }, spec.Reduce,
+            biasInput: combineBias, scaleInput: combineScale, activation: spec.Activation,
+            // The constant scale is part of the epilogue and moves with it. Leaving it on
+            // the partial pass would divide once per partial and then again nowhere -- a
+            // mean split four ways would come out four times too small.
+            reduceScale: spec.ReduceScale);
     }
 
     /// <summary>

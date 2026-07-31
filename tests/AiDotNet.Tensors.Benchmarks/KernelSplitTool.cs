@@ -116,9 +116,9 @@ internal static class KernelSplitTool
         var buffers = new List<DirectPtxBuffer>();
         try
         {
-            using var directModule = runtime.LoadModule(directPtx);
-            using var partialModule = runtime.LoadModule(partialPtx);
-            using var combineModule = runtime.LoadModule(combinePtx);
+            using var directModule = runtime.LoadModule(directPtx, allowExperimentalJitFallback: true);
+            using var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
+            using var combineModule = runtime.LoadModule(combinePtx, allowExperimentalJitFallback: true);
 
             IntPtr directFn = directModule.GetFunction(spec.Name, out _);
             IntPtr partialFn = partialModule.GetFunction(partial.Name, out _);

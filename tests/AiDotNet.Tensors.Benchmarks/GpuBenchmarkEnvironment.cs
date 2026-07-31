@@ -6,6 +6,11 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class GpuBenchmarkEnvironment
 {
     private const int MixedComputeConflictThresholdPercent = 5;
+    private const int DeviceUtilizationCeilingPercent = 20;
+    private const int PostSuiteUtilizationAttempts = 6;
+    private const int PostSuiteUtilizationDelayMilliseconds = 250;
+    private const int DeviceMemoryCeilingMegabytes = 2048;
+    private const int DeviceTemperatureCeilingCelsius = 75;
 
     internal static void RequireIdleGpu(string label)
     {
@@ -18,7 +23,9 @@ internal static class GpuBenchmarkEnvironment
         if (cells.Length >= 3 && int.TryParse(cells[0], out int utilization)
             && int.TryParse(cells[1], out int usedMegabytes)
             && int.TryParse(cells[2], out int temperatureCelsius)
-            && (utilization > 20 || usedMegabytes > 2048 || temperatureCelsius > 75))
+            && (utilization > DeviceUtilizationCeilingPercent ||
+                usedMegabytes > DeviceMemoryCeilingMegabytes ||
+                temperatureCelsius > DeviceTemperatureCeilingCelsius))
         {
             throw new InvalidOperationException(
                 $"[{label}] GPU is not benchmark-ready (utilization={utilization}%, " +
@@ -26,22 +33,61 @@ internal static class GpuBenchmarkEnvironment
         }
     }
 
-    internal static void RequireNoForeignCompute(string label)
+    internal static void RequireNoForeignCompute(string label, bool afterSuite = false)
     {
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
-        string[] conflicts = FindComputeWorkloadConflicts(processMonitor, Environment.ProcessId);
+        int? trustedOrchestrator = int.TryParse(
+            Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
+            out int orchestratorId) && orchestratorId > 0
+                ? orchestratorId
+                : null;
+        string[] conflicts = FindComputeWorkloadConflicts(
+            processMonitor, Environment.ProcessId, trustedOrchestrator, afterSuite);
         if (conflicts.Length != 0)
             throw new InvalidOperationException(
                 $"[{label}] Foreign GPU workload detected; clean benchmark refused: {string.Join("; ", conflicts)}");
 
         string temperature = RunNvidiaSmi(
             "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits");
-        if (int.TryParse(temperature, out int temperatureCelsius) && temperatureCelsius > 75)
+        if (int.TryParse(temperature, out int temperatureCelsius) &&
+            temperatureCelsius > DeviceTemperatureCeilingCelsius)
             throw new InvalidOperationException(
-                $"[{label}] GPU temperature {temperatureCelsius} C exceeds the 75 C evidence ceiling.");
+                $"[{label}] GPU temperature {temperatureCelsius} C exceeds the " +
+                $"{DeviceTemperatureCeilingCelsius} C evidence ceiling.");
+
+        if (afterSuite)
+            RequirePostSuiteDeviceQuiescence(label);
     }
 
-    internal static string[] FindComputeWorkloadConflicts(string processMonitor, int currentProcessId)
+    private static void RequirePostSuiteDeviceQuiescence(string label)
+    {
+        int utilizationPercent = 0;
+        for (int attempt = 0; attempt < PostSuiteUtilizationAttempts; attempt++)
+        {
+            string utilization = RunNvidiaSmi(
+                "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits");
+            if (!int.TryParse(utilization, out utilizationPercent) ||
+                utilizationPercent <= DeviceUtilizationCeilingPercent)
+                return;
+
+            // NVIDIA reports utilization over a trailing sample window. Immediately
+            // after our own synchronized launches, the first snapshot can therefore
+            // describe work that has already finished. Give that sample a bounded
+            // opportunity to age out; sustained foreign work remains above the ceiling
+            // and still fails closed after the final sample.
+            if (attempt + 1 < PostSuiteUtilizationAttempts)
+                System.Threading.Thread.Sleep(PostSuiteUtilizationDelayMilliseconds);
+        }
+
+        throw new InvalidOperationException(
+            $"[{label}] GPU utilization remains {utilizationPercent}% after " +
+            $"{PostSuiteUtilizationAttempts} post-suite quiescence samples, above the " +
+            $"{DeviceUtilizationCeilingPercent}% evidence ceiling.");
+    }
+
+    internal static string[] FindComputeWorkloadConflicts(
+        string processMonitor, int currentProcessId, int? trustedOrchestratorId = null,
+        bool afterSuite = false)
     {
         var conflicts = new List<string>();
         foreach (string line in processMonitor.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -57,12 +103,30 @@ internal static class GpuBenchmarkEnvironment
 
             string processType = cells[2];
             string smUtilization = cells[3];
+            // --kernel-competitor is a parent .NET process orchestrating two child lanes.
+            // Merely loading CUDA-capable benchmark dependencies can make that parent appear
+            // in pmon as type C at 0% SM. Trust only the explicitly supplied parent PID and
+            // only while it reports no SM sample ('-') or remains below the same
+            // material-compute threshold used for C+G; if it starts doing work, it becomes
+            // a conflict like anything else.
+            if (trustedOrchestratorId is > 0 && processId == trustedOrchestratorId &&
+                (smUtilization == "-" ||
+                 (int.TryParse(smUtilization, out int orchestratorSm) &&
+                  orchestratorSm <= MixedComputeConflictThresholdPercent)))
+            {
+                continue;
+            }
             bool isComputeOnly = string.Equals(processType, "C", StringComparison.OrdinalIgnoreCase);
             // Under WDDM, ordinary desktop applications can be reported as C+G
             // with a 0-1% sample. Treat a mixed process as competing compute only
             // when its measured SM use is material; the separate whole-device
             // guard still rejects >20% utilization at every suite boundary.
-            bool isActiveMixedCompute = processType.Contains('C') &&
+            // A single WDDM pmon sample can retain a C+G percentage after the timed
+            // work has ended, including values inconsistent with a quiet whole-device
+            // snapshot. Enforce mixed-process admission before every suite; afterward,
+            // the row-level spread/clock gates have already judged the timed region and
+            // every compute-only process remains an unconditional conflict.
+            bool isActiveMixedCompute = !afterSuite && processType.Contains('C') &&
                 int.TryParse(smUtilization, out int smPercent) &&
                 smPercent > MixedComputeConflictThresholdPercent;
             if (isComputeOnly || isActiveMixedCompute)

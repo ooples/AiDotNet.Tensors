@@ -119,19 +119,19 @@ public class PtxAffineEmitterTests
     /// The generated PTX, executed on the device, against the same fp64 oracle the
     /// hand-written kernel is tested against.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void GeneratedPtx_MatchesFp64Oracle_OnDevice()
     {
-        if (!DirectPtxRuntime.IsAvailable) return;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
 
         var (input, weights, bias) = MakeData();
         var expected = Oracle(input, weights, bias);
         var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(N, C, H, W);
 
         using var runtime = new DirectPtxRuntime();
-        if (!DirectPtxArchitecture.HasExperimentalConvolution(
-                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
-            return;
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Experimental generated convolution is unavailable on this GPU architecture.");
 
         string ptx = new PtxAffineEmitter().Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 
@@ -139,7 +139,7 @@ public class PtxAffineEmitterTests
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
         try
         {
-            using var module = runtime.LoadModule(ptx);
+            using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
             var fn = module.GetFunction(spec.Name, out _);
 
             using var dIn = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
@@ -168,22 +168,63 @@ public class PtxAffineEmitterTests
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
     }
 
-    /// <summary>
-    /// Writes the generated PTX so ptxas/nvdisasm can measure it against the
-    /// hand-written baseline. Static metrics need no GPU, which is what lets the
-    /// bake-off run while the device is busy.
-    /// </summary>
-    [Fact]
-    public void DumpGeneratedPtxForBakeOff()
+    [SkippableFact]
+    public void GeneratedPtx_CudaGraphReplaysCapturedLaunchAndLiveBuffers()
     {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
+
+        var (input, weights, bias) = MakeData();
         var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(N, C, H, W);
-        string ptx = new PtxAffineEmitter().Emit(spec, 8, 6);
-        string dir = System.IO.Path.Combine(
-            System.IO.Path.GetTempPath(), "aidotnet-bakeoff");
-        System.IO.Directory.CreateDirectory(dir);
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "generated_dwconv2d3x3.ptx"), ptx);
-        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "spec.txt"), spec.Describe());
-        Assert.Contains(".visible .entry", ptx);
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Experimental generated convolution is unavailable on this GPU architecture.");
+        Assert.NotEqual(IntPtr.Zero, runtime.Stream);
+
+        string ptx = new PtxAffineEmitter().Emit(
+            spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        using var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+        IntPtr fn = module.GetFunction(spec.Name, out _);
+        using var dIn = runtime.AllocateBytes((nuint)(input.Length * sizeof(float)));
+        using var dW = runtime.AllocateBytes((nuint)(weights.Length * sizeof(float)));
+        using var dB = runtime.AllocateBytes((nuint)(bias.Length * sizeof(float)));
+        using var dOut = runtime.AllocateBytes(
+            (nuint)(spec.Output.ElementCount * sizeof(float)));
+        dIn.Upload<float>(input);
+        dW.Upload<float>(weights);
+        dB.Upload<float>(bias);
+
+        Assert.Throws<InvalidOperationException>(() => runtime.CaptureGraph(() =>
+        {
+            LaunchFour(module, fn, dIn.Pointer, dW.Pointer, dB.Pointer, dOut.Pointer,
+                PtxAffineEmitter.GridBlocks(spec));
+            throw new InvalidOperationException("deliberate capture-body failure");
+        }));
+
+        // A failed capture must leave the stream reusable by the next capture.
+        using DirectPtxGraph graph = runtime.CaptureGraph(() =>
+            LaunchFour(module, fn, dIn.Pointer, dW.Pointer, dB.Pointer, dOut.Pointer,
+                PtxAffineEmitter.GridBlocks(spec)));
+
+        graph.Launch();
+        runtime.Synchronize();
+        var actual = new float[spec.Output.ElementCount];
+        dOut.Download<float>(actual);
+        TiledPtxTestHelper.AssertClose(
+            Oracle(input, weights, bias), actual,
+            CodegenMeasurementProtocol.AccumulationTolerance, "first graph replay");
+
+        Array.Clear(input, 0, input.Length);
+        dIn.Upload<float>(input);
+        graph.Launch();
+        runtime.Synchronize();
+        dOut.Download<float>(actual);
+        TiledPtxTestHelper.AssertClose(
+            Oracle(input, weights, bias), actual,
+            CodegenMeasurementProtocol.AccumulationTolerance, "replay after input update");
+
+        graph.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => graph.Launch());
     }
 
     private static unsafe void LaunchFour(
@@ -259,7 +300,6 @@ public class PtxAffineEmitterTests
         }
 
         double[] result = spec.Interpret(inputs);
-
         // Spelled out rather than double.IsFinite: that method does not exist on net471,
         // and this project builds every target framework.
         Assert.All(result, v => Assert.True(!double.IsNaN(v) && !double.IsInfinity(v)));

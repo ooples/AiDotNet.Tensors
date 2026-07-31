@@ -4317,29 +4317,42 @@ public interface IEngine
         bool returnSequences = false);
 
     /// <summary>
-    /// Fused RWKV-7 time-mixing WKV recurrence over a whole sequence in a single op
-    /// (forward + custom autodiff backward). Replaces the ~10 per-timestep tape micro-ops the
-    /// decomposed <c>RWKV7Block</c> loop records, which is the dominant training cost on long
-    /// sequences (issue ooples/AiDotNet#1464). Inputs are the per-position projected gate/value
-    /// streams <c>[batch, seqLen, modelDim]</c>; the per-position sigmoids are applied internally.
-    /// Unlike <see cref="LstmSequenceForward{T}"/>, this op IS differentiable — it records a single
-    /// tape node whose backward runs the BPTT adjoint of the recurrence, so it is safe under an
-    /// active <c>GradientTape</c>.
+    /// Fused RWKV-7 "Goose" time-mixing WKV recurrence over a whole sequence in a single op
+    /// (forward + custom autodiff backward). Replaces the per-timestep tape micro-ops a decomposed
+    /// <c>RWKV7Block</c> loop records, which is the dominant training cost on long sequences
+    /// (issue ooples/AiDotNet#1464). Unlike <see cref="LstmSequenceForward{T}"/>, this op IS
+    /// differentiable — it records a single tape node whose backward runs the BPTT adjoint of the
+    /// recurrence, so it is safe under an active <c>GradientTape</c>.
+    /// <para>Implements the paper's generalised delta rule (arXiv:2503.14456, Eq. 17) — a diagonal
+    /// decay MINUS a rank-1 removal term, per head:</para>
+    /// <code>
+    ///   wkv_t = wkv_{t-1} (diag(w_t) - kappaHat_t^T (a_t (*) kappaHat_t)) + v_t^T kTilde_t
+    ///   o_t   = wkv_t . r_t
+    /// </code>
+    /// <para>where <c>w_t = exp(-e^(-1/2) * sigmoid(decayLogit_t))</c> in <c>(0.5453, 1)</c> and
+    /// <c>kappaHat_t = kappa_t / ||kappa_t||_2</c> (L2-normalised per head) are both computed
+    /// internally, so the recurrence and its adjoint never touch the tape per step.</para>
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="rProj">Receptance projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
-    /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
-    /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
-    /// <param name="aProj">State-evolution decay (a) projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
-    /// <param name="bProj">State-evolution injection (b) projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
+    /// <param name="rProj">Receptance r_t [batch, seqLen, modelDim], used raw — the paper contracts
+    /// the state with r; output gating/normalisation belongs to the caller.</param>
+    /// <param name="kappa">kappa_t [batch, seqLen, modelDim] PRE-normalisation (L2-normalised per head
+    /// inside the kernel); in the reference implementation kappa_t = k_t (*) k_k.</param>
+    /// <param name="kTilde">kTilde_t [batch, seqLen, modelDim], the value-injection key
+    /// k_t (*) (1 + (a_t - 1) (*) k_a).</param>
+    /// <param name="vProj">Value projection v_t [batch, seqLen, modelDim].</param>
+    /// <param name="decayLogit">Decay pre-activation d_t [batch, seqLen, modelDim].</param>
+    /// <param name="iclRate">In-context learning rate a_t [batch, seqLen, modelDim], already in (0,1)
+    /// (passed post-activation because the caller also needs it to form <paramref name="kTilde"/>).</param>
     /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
-    /// <returns>The gated WKV output [batch, seqLen, modelDim].</returns>
+    /// <returns>The WKV readout o_t [batch, seqLen, modelDim].</returns>
     Tensor<T> Rwkv7SequenceForward<T>(
         Tensor<T> rProj,
-        Tensor<T> kProj,
+        Tensor<T> kappa,
+        Tensor<T> kTilde,
         Tensor<T> vProj,
-        Tensor<T> aProj,
-        Tensor<T> bProj,
+        Tensor<T> decayLogit,
+        Tensor<T> iclRate,
         int numHeads);
 
     /// <summary>

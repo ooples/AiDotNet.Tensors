@@ -58,10 +58,13 @@ public readonly struct CodegenAffineTerm
 /// <c>(out + pad - k) / stride</c> and which is only valid when that numerator
 /// divides exactly -- expressed by <see cref="RequiresExactDivision"/>.
 /// </para>
-/// <para><b>Deliberately not expressible:</b> data-dependent indices, where the
-/// index is read from another tensor (deformable convolution's learned offsets).
-/// Those need a gather escape hatch and are out of scope for this layer; the
-/// emitter must reject them rather than silently mis-lower them.</para>
+/// <para><b>Deliberately not expressible here:</b> data-dependent indices, where
+/// the index is read from another tensor. That is not a gap -- it is a boundary.
+/// An affine expression is a closed-form function of the axes, and the bounds
+/// predicate, the index folding and the tensor-core recogniser all rely on that.
+/// An index fetched from memory has none of those properties and must not be able
+/// to masquerade as one, so it lives on the BINDING instead: see
+/// <see cref="CodegenIndirectIndex"/>.</para>
 /// </remarks>
 public sealed class CodegenAffineExpr
 {
@@ -348,6 +351,7 @@ public sealed class CodegenTensorBinding
 {
     private readonly CodegenAffineExpr[] _map;
     private readonly int[] _shape;
+    private readonly CodegenIndirectIndex?[] _indirect;
 
     /// <summary>Kernel parameter index this tensor is bound to.</summary>
     public int ParameterIndex { get; }
@@ -365,6 +369,73 @@ public sealed class CodegenTensorBinding
     public bool IsOutput { get; }
 
     /// <summary>
+    /// Per dimension, the data-dependent index for that dimension, or null when the
+    /// dimension is addressed by its affine map.
+    /// </summary>
+    /// <remarks>
+    /// A dimension has one or the other, never both. Where an entry is non-null the
+    /// corresponding <see cref="Map"/> entry is unused, and is required to be
+    /// <see cref="CodegenAffineExpr.Const"/> zero so that anything reading the map without
+    /// consulting this list produces an obviously wrong address rather than a plausible one.
+    /// </remarks>
+    public IReadOnlyList<CodegenIndirectIndex?> Indirect => _indirect;
+
+    /// <summary>True when any dimension is addressed by a run-time index.</summary>
+    public bool HasIndirection
+    {
+        get
+        {
+            for (int d = 0; d < _indirect.Length; d++) if (_indirect[d] is not null) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when this binding is written by more than one iteration, so its stores must
+    /// accumulate atomically.
+    /// </summary>
+    /// <remarks>
+    /// This is the scatter case and it is decided by the STRUCTURE, not by the caller: an
+    /// output dimension addressed by a run-time index cannot be proven injective, so two
+    /// iterations may target the same element. A plain store would then keep whichever warp
+    /// happened to finish last -- a race that produces a different wrong answer per run and
+    /// looks like flakiness rather than a bug.
+    /// </remarks>
+    public bool NeedsAtomicStore => IsOutput && HasIndirection;
+
+    /// <summary>
+    /// How this tensor is stored in memory. Arithmetic is always fp32.
+    /// </summary>
+    /// <remarks>
+    /// Storage and compute are deliberately separate. A binding may be fp16 or bf16 while
+    /// the accumulator stays fp32, which is what mixed precision means and what every
+    /// tensor-core path requires: the operands are narrow, the accumulator is not. Making
+    /// this a property of the BINDING rather than of the kernel is what lets one kernel
+    /// read fp16 activations against fp32 weights, which is the common decode shape.
+    ///
+    /// Before this existed the emitter hardcoded fp32 in 69 places, so no mixed-precision
+    /// kernel could be expressed at all and every such PR had to hand-write one.
+    /// </remarks>
+    public CodegenElementType ElementType { get; }
+
+    /// <summary>Bytes one element occupies in memory.</summary>
+    public int ElementBytes => ElementType switch
+    {
+        CodegenElementType.Float16 or CodegenElementType.BFloat16 => 2,
+        _ => 4,
+    };
+
+    /// <summary>
+    /// True when this tensor holds indices rather than values, so it may be read only as an
+    /// index source and never as an arithmetic operand.
+    /// </summary>
+    public bool IsIndexTensor => ElementType == CodegenElementType.Int32;
+
+    /// <summary>True when a load has to widen, or a store narrow, to reach fp32.</summary>
+    public bool NeedsConversion =>
+        ElementType is CodegenElementType.Float16 or CodegenElementType.BFloat16;
+
+    /// <summary>
     /// True when at least one dimension can address outside the tensor, so the
     /// emitter must guard the access. Computed from the maps, never supplied.
     /// </summary>
@@ -374,6 +445,9 @@ public sealed class CodegenTensorBinding
         {
             for (int d = 0; d < _map.Length; d++)
             {
+                // A run-time index can be anything, so it always needs a guard.
+                if (_indirect[d] is not null) return true;
+
                 var e = _map[d];
                 if (e.RequiresExactDivision) return true;
                 // A bare axis or constant that cannot leave [0, dim) needs no guard;
@@ -394,8 +468,22 @@ public sealed class CodegenTensorBinding
         string name,
         int[] shape,
         CodegenAffineExpr[] map,
-        bool isOutput = false)
+        bool isOutput = false,
+        CodegenElementType elementType = CodegenElementType.Float32,
+        CodegenIndirectIndex?[]? indirect = null)
     {
+        ElementType = elementType;
+        // Int32 is admitted for INDEX tensors only. Making it a real element type rather
+        // than letting an index tensor masquerade as fp32 is what lets the emitter refuse to
+        // multiply by one: a gather's index buffer read as a float operand would produce
+        // arithmetic out of a bit pattern, silently.
+        if (elementType is not (CodegenElementType.Float32 or CodegenElementType.Float16
+                or CodegenElementType.BFloat16 or CodegenElementType.Int32))
+            throw new ArgumentException(
+                "The PTX emitter stores fp32, fp16, bf16, or int32 indices; got " + elementType +
+                ". Anything else must be refused here rather than silently emitted as fp32.",
+                nameof(elementType));
+
         if (parameterIndex < 0) throw new ArgumentOutOfRangeException(nameof(parameterIndex));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Binding needs a name.", nameof(name));
         _shape = shape ?? throw new ArgumentNullException(nameof(shape));
@@ -405,6 +493,34 @@ public sealed class CodegenTensorBinding
                 $"'{name}' has {_shape.Length} dimensions but {_map.Length} index expressions.", nameof(map));
         for (int i = 0; i < _shape.Length; i++)
             if (_shape[i] <= 0) throw new ArgumentException($"'{name}' dimension {i} must be positive.", nameof(shape));
+
+        _indirect = indirect ?? new CodegenIndirectIndex?[_map.Length];
+        if (_indirect.Length != _map.Length)
+            throw new ArgumentException(
+                $"'{name}' has {_map.Length} dimensions but {_indirect.Length} indirection slots.",
+                nameof(indirect));
+
+        for (int d = 0; d < _indirect.Length; d++)
+        {
+            if (_indirect[d] is null) continue;
+
+            // The indirection's bound must be the dimension it addresses. Allowing them to
+            // disagree would mean the guard admits indices the allocation does not contain,
+            // which is the exact failure this whole mechanism exists to prevent.
+            if (_indirect[d]!.Bound != _shape[d])
+                throw new ArgumentException(
+                    $"'{name}' dimension {d} has extent {_shape[d]} but its run-time index is " +
+                    $"bounded at {_indirect[d]!.Bound}.", nameof(indirect));
+
+            // The affine map for an indirect dimension is dead. Requiring it to be zero
+            // means any consumer that reads the map without consulting the indirection
+            // computes an obviously wrong address rather than a plausible one.
+            if (_map[d].Terms.Count != 0 || _map[d].Constant != 0 || _map[d].Divisor != 1)
+                throw new ArgumentException(
+                    $"'{name}' dimension {d} is addressed by a run-time index, so its affine " +
+                    "map is unused and must be Const(0).", nameof(map));
+        }
+
         ParameterIndex = parameterIndex;
         Name = name;
         IsOutput = isOutput;
@@ -434,14 +550,45 @@ public sealed class CodegenTensorBinding
     /// exact-division requirement. Callers must treat an out-of-bounds read as
     /// the additive identity and must not perform the store.
     /// </param>
-    public long ResolveOffset(IReadOnlyList<int> axisValues, out bool inBounds)
+    public long ResolveOffset(IReadOnlyList<int> axisValues, out bool inBounds) =>
+        ResolveOffset(axisValues, null, out inBounds);
+
+    /// <summary>
+    /// Resolves the flat offset, consulting <paramref name="inputData"/> for any dimension
+    /// addressed by a run-time index.
+    /// </summary>
+    /// <param name="axisValues">Value of every axis in the iteration space.</param>
+    /// <param name="inputData">
+    /// Operand buffers, needed only when the binding has indirection. Passing null where
+    /// indirection exists throws rather than silently resolving to element zero.
+    /// </param>
+    /// <param name="inBounds">False when the access must not happen.</param>
+    public long ResolveOffset(
+        IReadOnlyList<int> axisValues, IReadOnlyList<double[]>? inputData, out bool inBounds)
     {
         long offset = 0;
         inBounds = true;
         for (int d = 0; d < _map.Length; d++)
         {
-            int idx = _map[d].Evaluate(axisValues, out bool exact);
-            if (!exact || idx < 0 || idx >= _shape[d]) { inBounds = false; return 0; }
+            int idx;
+            var indirect = _indirect[d];
+            if (indirect is not null)
+            {
+                if (inputData is null)
+                    throw new InvalidOperationException(
+                        $"'{Name}' dimension {d} is addressed by a run-time index, so the " +
+                        "operand buffers are required to resolve it.");
+
+                idx = indirect.Resolve(inputData[indirect.IndexInput], axisValues, out bool active);
+                if (!active) { inBounds = false; return 0; }
+            }
+            else
+            {
+                idx = _map[d].Evaluate(axisValues, out bool exact);
+                if (!exact) { inBounds = false; return 0; }
+            }
+
+            if (idx < 0 || idx >= _shape[d]) { inBounds = false; return 0; }
             offset += idx * Stride(d);
         }
         return offset;

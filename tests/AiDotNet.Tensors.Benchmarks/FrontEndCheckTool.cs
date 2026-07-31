@@ -20,6 +20,13 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class FrontEndCheckTool
 {
     /// <summary>
+    /// Upper limit for fp32 contraction tolerance. This matches the conveyor and
+    /// autotuner, while the front-end check still scales its bound with reduction length.
+    /// </summary>
+    private const double AccumulationTolerance =
+        CodegenMeasurementProtocol.AccumulationTolerance;
+
+    /// <summary>
     /// Whether timings may be reported. Correctness does not care what else is on the
     /// GPU; a ratio does. Gating the whole check on an idle device would mean a busy box
     /// could not verify anything, and reporting microseconds taken against a foreign
@@ -99,6 +106,21 @@ internal static class FrontEndCheckTool
             }
         }
 
+        foreach (var (label, program) in Programs())
+        {
+            try
+            {
+                bool ok = CheckProgram(runtime, label, program);
+                if (ok) passed++; else failed++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Console.WriteLine(label.PadRight(38) + "        -             -     ERROR");
+                Console.WriteLine("    " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+            }
+        }
+
         Console.WriteLine();
         Console.WriteLine("front end: " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
@@ -159,6 +181,288 @@ internal static class FrontEndCheckTool
             CodegenLowering.LowerConv2D<float>(CodegenOpKind.ConvTranspose2D,
                 new[] { 2, 16, 16, 16 }, new[] { 16, 16, 3, 3 },
                 new CodegenConvAttributes(2, 2, 1, 1)));
+
+        // Global average pooling: a mean over the spatial axes, which is a SUM with a
+        // constant 1/(H*W) epilogue rather than its own reduce kind.
+        yield return ("global average pool [8,64,28,28] -> [8,64]", GlobalAveragePool(8, 64, 28, 28));
+
+        // Activations. These carry APPROXIMATE PTX instructions (ex2, rcp, tanh), so they
+        // are the first kernels that cannot reach exact agreement with the fp64 oracle.
+        // The deviation is the point of the row.
+        foreach (var op in new[]
+                 {
+                     CodegenOpKind.Sigmoid, CodegenOpKind.Tanh,
+                     CodegenOpKind.Swish, CodegenOpKind.GELU,
+                 })
+        {
+            yield return ("conv 1x1 + bias + " + op.ToString().ToLowerInvariant(),
+                ConvWithActivation(op));
+        }
+    }
+
+    /// <summary>Longest reduction any pass performs, which bounds the accumulated error.</summary>
+    private static long LongestReduction(CodegenProgram program)
+    {
+        long longest = 1;
+        foreach (var pass in program.Passes)
+            longest = Math.Max(longest, ReductionTrips(pass.Space));
+        return longest;
+    }
+
+    /// <summary>Number of values accumulated into each output element.</summary>
+    private static long ReductionTrips(CodegenIterationSpace space)
+    {
+        long trips = 1;
+        foreach (int axis in space.ReductionAxes) trips *= space.Axes[axis].Extent;
+        return trips;
+    }
+
+    /// <summary>Fp32 accumulation error bound scaled by reduction length.</summary>
+    private static double AccumulationBound(long trips) => trips > 1
+        ? Math.Min(AccumulationTolerance, Math.Max(1e-6, trips * 1.2e-7))
+        : 0.0;
+
+    private static IEnumerable<(string Label, CodegenProgram Program)> Programs()
+    {
+        yield return ("softmax rows 512x256 (3 passes)", CodegenFusedStatistics.Softmax(512, 256));
+        // Two lengths of the SAME operator. If the deviation tracks the reduction length
+        // it is fp32 accumulation; if it does not, something is wrong with the maths.
+        yield return ("fp16 operands -> fp32 matmul 128x96x64",
+            new CodegenProgram(new[] { Fp16MatMul(128, 96, 64) },
+                new long[] { 128L * 64 }, "fp16 matmul"));
+        yield return ("rmsnorm scale 512x256 (1 kernel, rsqrt)",
+            new CodegenProgram(new[] { RmsNormScale(512, 256) }, new long[] { 512 }, "rmsnorm"));
+        yield return ("mse per-sample 512x256 (1 kernel)",
+            new CodegenProgram(new[] { CodegenFusedStatistics.MeanSquaredError(512, 256) },
+                new long[] { 512 }, "mse"));
+        yield return ("layernorm stats 512x64 (2 passes)",
+            CodegenFusedStatistics.LayerNormStatistics(512, 64));
+        yield return ("layernorm stats 512x256 (2 passes)",
+            CodegenFusedStatistics.LayerNormStatistics(512, 256));
+    }
+
+    /// <summary>
+    /// Runs a multi-pass program on the device and compares the final output against the
+    /// fp64 interpretation of the same passes.
+    /// </summary>
+    /// <remarks>
+    /// Parameter 0 of every pass is the source tensor; later parameters are the statistics
+    /// earlier passes produced, in order. That convention is what lets the passes be
+    /// chained without a scheduler.
+    /// </remarks>
+    private static bool CheckProgram(DirectPtxRuntime runtime, string label, CodegenProgram program)
+    {
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        var buffers = new List<DirectPtxBuffer>();
+        var modules = new List<DirectPtxModule>();
+        try
+        {
+            var firstBinding = program.Passes[0].Inputs[0];
+            long sourceCount = firstBinding.ElementCount;
+            var host = new float[sourceCount];
+            var wide = new double[sourceCount];
+            for (long e = 0; e < sourceCount; e++)
+            {
+                double v = ((((e * 37) % 97) - 48) / 16.0);
+                host[e] = (float)v;
+                wide[e] = v;
+            }
+
+            // A NARROW BINDING IS QUANTISED FIRST, and the oracle is given the SAME
+            // quantised values. Otherwise the comparison would measure fp16's rounding of
+            // the inputs -- about 1e-3 -- rather than anything about the kernel, and the
+            // row would report a large deviation that says nothing.
+            var source = UploadOperand(runtime, firstBinding, host, wide);
+            buffers.Add(source);
+
+            var producedGpu = new List<DirectPtxBuffer>();
+            var producedCpu = new List<double[]>();
+
+            foreach (var pass in program.Passes)
+            {
+                var emitter = new PtxAffineEmitter();
+                string ptx = emitter.Emit(pass, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                var module = runtime.LoadModule(ptx);
+                modules.Add(module);
+                IntPtr fn = module.GetFunction(pass.Name, out _);
+
+                var args = new IntPtr[pass.ParameterCount];
+                var cpuOperands = new double[pass.Inputs.Count][];
+                for (int i = 0; i < pass.Inputs.Count; i++)
+                {
+                    // Parameter 0 is the source. A later parameter is an earlier pass's
+                    // output when one exists, and otherwise a SECOND source -- which is
+                    // what a two-operand kernel like MSE needs, since it consumes two
+                    // tensors and produces no intermediate at all.
+                    if (i == 0)
+                    {
+                        args[i] = source.Pointer;
+                        cpuOperands[i] = wide;
+                    }
+                    else if (i - 1 < producedGpu.Count)
+                    {
+                        args[i] = producedGpu[i - 1].Pointer;
+                        cpuOperands[i] = producedCpu[i - 1];
+                    }
+                    else
+                    {
+                        long extra = pass.Inputs[i].ElementCount;
+                        var extraHost = new float[extra];
+                        var extraWide = new double[extra];
+                        for (long e = 0; e < extra; e++)
+                        {
+                            double v = ((((e * 53 + 17) % 89) - 44) / 16.0);
+                            extraHost[e] = (float)v;
+                            extraWide[e] = v;
+                        }
+                        var extraBuffer = UploadOperand(runtime, pass.Inputs[i], extraHost, extraWide);
+                        buffers.Add(extraBuffer);
+                        args[i] = extraBuffer.Pointer;
+                        cpuOperands[i] = extraWide;
+                    }
+                }
+
+                long outCount = pass.Output.ElementCount;
+                var outBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
+                buffers.Add(outBuffer);
+                args[pass.Inputs.Count] = outBuffer.Pointer;
+
+                Launch(module, fn, args, emitter.LaunchBlocks,
+                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
+
+                producedGpu.Add(outBuffer);
+                producedCpu.Add(pass.Interpret(cpuOperands));
+            }
+            runtime.Synchronize();
+
+            var final = program.Passes[program.Passes.Count - 1];
+            long count = final.Output.ElementCount;
+            var got = new float[count];
+            producedGpu[producedGpu.Count - 1].Download<float>(got);
+            double[] want = producedCpu[producedCpu.Count - 1];
+
+            double worst = 0, scale = 0;
+            for (long e = 0; e < count; e++)
+            {
+                worst = Math.Max(worst, Math.Abs(got[e] - want[e]));
+                scale = Math.Max(scale, Math.Abs(want[e]));
+            }
+            double deviation = scale > 0 ? worst / scale : worst;
+
+            long trips = LongestReduction(program);
+            double bound = AccumulationBound(trips);
+            bool ok = deviation <= bound;
+
+            Console.WriteLine(label.PadRight(38) +
+                count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
+                deviation.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
+                "  fp64 " + (ok ? "PASS" : "FAIL").PadLeft(7) +
+                ("  <= " + bound.ToString("E1", CultureInfo.InvariantCulture)).PadLeft(14));
+            return ok;
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+            foreach (var m in modules) m.Dispose();
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
+    /// <summary>
+    /// Uploads an operand in its binding's storage format, quantising <paramref name="wide"/>
+    /// in place so the oracle sees exactly what the device will read.
+    /// </summary>
+    private static DirectPtxBuffer UploadOperand(
+        DirectPtxRuntime runtime, CodegenTensorBinding binding, float[] host, double[] wide)
+    {
+        if (binding.ElementType != CodegenElementType.Float16)
+        {
+            var wideBuffer = runtime.AllocateBytes((nuint)(host.Length * sizeof(float)));
+            wideBuffer.Upload<float>(host);
+            return wideBuffer;
+        }
+
+        var bits = new ushort[host.Length];
+        for (int e = 0; e < host.Length; e++)
+        {
+            var half = (Half)host[e];
+            bits[e] = BitConverter.HalfToUInt16Bits(half);
+            wide[e] = (float)half;      // the oracle sees the QUANTISED value
+        }
+
+        var narrow = runtime.AllocateBytes((nuint)(host.Length * sizeof(ushort)));
+        narrow.Upload<ushort>(bits);
+        return narrow;
+    }
+
+    /// <summary>A matmul whose operands are stored fp16 and whose accumulator is fp32.</summary>
+    private static CodegenKernelSpec Fp16MatMul(int m, int k, int n)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("m", m), CodegenAxis.Parallel("n", n),
+            CodegenAxis.Reduce("k", k));
+
+        var a = new CodegenTensorBinding(0, "a", new[] { m, k },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) },
+            elementType: CodegenElementType.Float16);
+        var b = new CodegenTensorBinding(1, "b", new[] { k, n },
+            new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) },
+            elementType: CodegenElementType.Float16);
+        var output = new CodegenTensorBinding(2, "out", new[] { m, n },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
+
+        return new CodegenKernelSpec("fp16_matmul", space, new[] { a, b }, output,
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+    }
+
+    /// <summary>1 / sqrt(mean(x^2)) per row -- the RMSNorm normalising factor.</summary>
+    private static CodegenKernelSpec RmsNormScale(int rows, int columns)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("j", columns));
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, columns },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var output = new CodegenTensorBinding(1, "scale", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+
+        return new CodegenKernelSpec("rmsnorm_scale", space, new[] { x }, output,
+            new[] { 0 }, CodegenReduceKind.Sum,
+            activation: CodegenActivationKind.Rsqrt,
+            reduceScale: 1.0 / columns,
+            preReduce: CodegenPreReduceOp.Square);
+    }
+
+    /// <summary>Mean over the two spatial axes of an NCHW tensor.</summary>
+    private static CodegenGraph GlobalAveragePool(int n, int c, int h, int w)
+    {
+        var g = new CodegenGraph();
+        int x = Load(g, new[] { n, c, h, w });
+        int mean = g.AddNode(new CodegenNode(CodegenOpKind.ReduceMean, new[] { x },
+            CodegenElementType.Float32, new[] { n, c }, new[] { 2, 3 }));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { mean },
+            CodegenElementType.Float32, new[] { n, c }));
+        return g;
+    }
+
+    /// <summary>A 1x1 convolution with a bias and one activation, to isolate the epilogue.</summary>
+    private static CodegenGraph ConvWithActivation(CodegenOpKind activation)
+    {
+        int[] outShape = { 4, 32, 28, 28 };
+        var g = new CodegenGraph();
+        int input = Load(g, new[] { 4, 32, 28, 28 });
+        int weights = Load(g, new[] { 32, 32, 1, 1 });
+        int bias = Load(g, new[] { 1, 32, 1, 1 });
+
+        int conv = g.AddNode(new CodegenNode(CodegenOpKind.Conv2D, new[] { input, weights },
+            CodegenElementType.Float32, outShape, CodegenConvAttributes.Valid));
+        int add = g.AddNode(new CodegenNode(CodegenOpKind.Add, new[] { conv, bias },
+            CodegenElementType.Float32, outShape));
+        int act = g.AddNode(new CodegenNode(activation, new[] { add },
+            CodegenElementType.Float32, outShape));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { act },
+            CodegenElementType.Float32, outShape));
+        return g;
     }
 
     private static int Load(CodegenGraph g, int[] shape) =>
@@ -290,7 +594,7 @@ internal static class FrontEndCheckTool
         var buffers = new List<DirectPtxBuffer>();
         try
         {
-            using var module = runtime.LoadModule(emitted.Source);
+            using var module = runtime.LoadModule(emitted.Source, allowExperimentalJitFallback: true);
             IntPtr fn = module.GetFunction(spec.Name, out _);
 
             var pointers = new IntPtr[spec.ParameterCount];
@@ -321,11 +625,9 @@ internal static class FrontEndCheckTool
                 scale = Math.Max(scale, Math.Abs(want[e]));
             }
 
-            // A reduction accumulates, so the tolerance has to be relative to the result's
-            // own magnitude; an absolute 1e-6 would be a fp32 epsilon test, not a
-            // correctness test. Pointwise graphs still land on exact zero.
             double deviation = scale > 0 ? worst / scale : worst;
-            bool ok = deviation <= 1e-6;
+            double bound = AccumulationBound(ReductionTrips(spec.Space));
+            bool ok = deviation <= bound;
             double singleUs = Measure(runtime.Synchronize, LaunchSingle);
             Console.WriteLine(label.PadRight(38) +
                 count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
@@ -346,7 +648,7 @@ internal static class FrontEndCheckTool
             // reference rather than trusted. A two-kernel path through a temporary is
             // exactly the shape that produces a fast wrong answer.
             if (gpu.LastSplitProgram is { } split)
-                ok &= CheckSplit(runtime, label, split, spec, host, want);
+                ok &= CheckSplit(runtime, label, split, spec, host, want, bound);
 
             return ok;
         }
@@ -363,13 +665,13 @@ internal static class FrontEndCheckTool
     /// </summary>
     private static bool CheckSplit(
         DirectPtxRuntime runtime, string label, PtxSplitProgram split,
-        CodegenKernelSpec spec, float[][] host, double[] want)
+        CodegenKernelSpec spec, float[][] host, double[] want, double bound)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
         {
-            using var partialModule = runtime.LoadModule(split.PartialSource);
-            using var combineModule = runtime.LoadModule(split.CombineSource);
+            using var partialModule = runtime.LoadModule(split.PartialSource, allowExperimentalJitFallback: true);
+            using var combineModule = runtime.LoadModule(split.CombineSource, allowExperimentalJitFallback: true);
             IntPtr partialFn = partialModule.GetFunction(split.PartialName, out _);
             IntPtr combineFn = combineModule.GetFunction(split.CombineName, out _);
 
@@ -436,7 +738,7 @@ internal static class FrontEndCheckTool
                 scale2 = Math.Max(scale2, Math.Abs(want[e]));
             }
             double deviation = scale2 > 0 ? worst / scale2 : worst;
-            bool ok = deviation <= 1e-6;
+            bool ok = deviation <= bound;
 
             // The emitter ADVERTISES this as the faster route, so the claim is measured
             // rather than asserted. A split offered on a shape it does not help is a bug

@@ -44,8 +44,10 @@ public sealed class CodegenMachineModel
     /// <summary>Creates a machine model.</summary>
     public CodegenMachineModel(
         string name, int multiprocessors, double clockHz,
-        double loadInstructionsPerSmPerCycle, double fmaLanesPerSm, double dramBytesPerSecond)
+        double loadInstructionsPerSmPerCycle, double fmaLanesPerSm, double dramBytesPerSecond,
+        double tensorCoreMacsPerSmPerCycle = 0)
     {
+        TensorCoreMacsPerSmPerCycle = tensorCoreMacsPerSmPerCycle;
         Name = name;
         Multiprocessors = multiprocessors;
         ClockHz = clockHz;
@@ -88,6 +90,37 @@ public sealed class CodegenMachineModel
     public double MacsPerSecond => FmaLanesPerSm * Multiprocessors * ClockHz;
 
     /// <summary>
+    /// Tensor-core multiply-accumulates per SM per cycle, or zero when the model has none.
+    /// </summary>
+    /// <remarks>
+    /// WITHOUT THIS THE MODEL CANNOT SCORE A TENSOR-CORE KERNEL AT ALL. FmaLanesPerSm counts
+    /// the fp32 pipe: 128 lanes at 68 SMs and 1.77 GHz is 30.8 TFLOP/s, and a measured
+    /// tensor-core matmul on the same device reaches 61.3. Scored against the fp32 rate such a
+    /// kernel reads as 180%+ of "peak", which is not a headroom figure -- it is a category
+    /// error, and it silently reports finished work on kernels with half their performance
+    /// still on the table.
+    /// </remarks>
+    public double TensorCoreMacsPerSmPerCycle { get; }
+
+    /// <summary>Tensor-core multiply-accumulates per second.</summary>
+    public double TensorCoreMacsPerSecond =>
+        TensorCoreMacsPerSmPerCycle * Multiprocessors * ClockHz;
+
+    /// <summary>True when this model can bound a tensor-core kernel.</summary>
+    public bool HasTensorCores =>
+        !double.IsNaN(TensorCoreMacsPerSmPerCycle) &&
+        !double.IsInfinity(TensorCoreMacsPerSmPerCycle) &&
+        TensorCoreMacsPerSmPerCycle > 0;
+
+    /// <summary>
+    /// The arithmetic rate for a kernel, picking the tensor-core pipe when the kernel uses it.
+    /// </summary>
+    public double MacsPerSecondFor(bool usesTensorCores) =>
+        usesTensorCores
+            ? HasTensorCores ? TensorCoreMacsPerSecond : double.NaN
+            : MacsPerSecond;
+
+    /// <summary>
     /// Coefficient of the occupancy penalty <c>1 + c / blocksPerSm</c>.
     /// </summary>
     /// <remarks>
@@ -116,7 +149,13 @@ public sealed class CodegenMachineModel
         clockHz: 1.77e9,
         loadInstructionsPerSmPerCycle: 0.293,
         fmaLanesPerSm: 128,
-        dramBytesPerSecond: 760e9);
+        dramBytesPerSecond: 760e9,
+
+        // 256 fp16 MACs per SM per cycle with an fp32 accumulator: 256 * 68 * 1.77e9 = 30.8
+        // TMAC/s = 61.6 TFLOP/s. CONFIRMED by measurement rather than taken from the
+        // datasheet -- the mma ceiling probe, which runs the same instruction mix with the
+        // fragment loads hoisted out of the K loop, reaches 61.3 TFLOP/s, or 99.5% of it.
+        tensorCoreMacsPerSmPerCycle: 256);
 }
 
 /// <summary>What the model predicts for one kernel.</summary>
@@ -165,8 +204,12 @@ public sealed class CodegenPerformancePrediction
     /// <summary>Microseconds if device-memory bandwidth is the only constraint.</summary>
     public double DramMicroseconds { get; }
 
-    /// <summary>Microseconds if FMA throughput is the only constraint.</summary>
+    /// <summary>Microseconds if compute throughput is the only constraint.</summary>
     public double ComputeMicroseconds { get; }
+
+    /// <summary>Whether the compute rate needed by this kernel was available.</summary>
+    public bool HasComputeCeiling =>
+        !double.IsNaN(ComputeMicroseconds) && !double.IsInfinity(ComputeMicroseconds);
 
     /// <summary>The resource predicted to bind first.</summary>
     public CodegenLimiter Limiter =>
@@ -206,6 +249,27 @@ public static class CodegenPerformanceModel
     private const int BytesPerElement = 4;
 
     /// <summary>
+    /// Whether a spec is the shape a tensor-core lowering will take: an fp16 contraction of
+    /// two operands over a sum.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately structural rather than a caller-supplied flag. A prediction whose pipe is
+    /// asserted by its caller is a prediction that silently disagrees with the emitter as soon
+    /// as the recogniser's rules move.
+    /// </remarks>
+    private static bool UsesTensorCores(CodegenKernelSpec spec)
+    {
+        if (spec.Reduce != CodegenReduceKind.Sum) return false;
+        if (spec.ProductInputs.Count != 2) return false;
+        if (spec.Space.ParallelAxes.Length != 2 || spec.Space.ReductionAxes.Length != 1) return false;
+
+        foreach (int index in spec.ProductInputs)
+            if (spec.Inputs[index].ElementType != CodegenElementType.Float16) return false;
+
+        return true;
+    }
+
+    /// <summary>
     /// Predicts the bottleneck for <paramref name="spec"/> under a lowering that
     /// executes <paramref name="dynamicLoadsPerThread"/> global loads per thread across
     /// <paramref name="threads"/> threads.
@@ -229,9 +293,20 @@ public static class CodegenPerformanceModel
         long outputs = spec.Output.ElementCount;
         long macs = outputs * Math.Max(1, spec.Space.ReductionTripCount);
 
-        long uniqueBytes = spec.Output.ElementCount * BytesPerElement;
+        // BYTES COME FROM EACH BINDING'S OWN STORAGE. This was a fixed 4, which silently
+        // doubled the predicted traffic of every fp16 kernel and halved its apparent
+        // arithmetic intensity -- moving it to the wrong side of the roofline and pointing
+        // any lever chosen from the prediction at the wrong thing.
+        int components = spec.Algebra.Components();
+        long uniqueBytes = spec.Output.ElementCount * spec.Output.ElementBytes * components;
         for (int i = 0; i < spec.Inputs.Count; i++)
-            uniqueBytes += spec.Inputs[i].ElementCount * BytesPerElement;
+        {
+            var input = spec.Inputs[i];
+            uniqueBytes += input.ElementCount * input.ElementBytes
+                         * (input.IsIndexTensor ? 1 : components);
+        }
+        foreach (var extra in spec.ExtraOutputs)
+            uniqueBytes += extra.Binding.ElementCount * extra.Binding.ElementBytes;
 
         // A warp issues one instruction for its 32 threads, so instruction count is
         // thread-load-count scaled by threads and divided by the warp width.
@@ -242,7 +317,13 @@ public static class CodegenPerformanceModel
 
         double loadIssueUs = warpLoads / machine.LoadInstructionsPerSecond * 1e6;
         double dramUs = uniqueBytes / machine.DramBytesPerSecond * 1e6;
-        double computeUs = macs / machine.MacsPerSecond * 1e6;
+        // THE ARITHMETIC RATE DEPENDS ON WHICH PIPE THE KERNEL USES. Scoring a tensor-core
+        // contraction against the fp32 pipe -- 30.8 TFLOP/s on this device against 61.6 --
+        // makes a finished kernel read as 180%+ of peak, which is a category error rather
+        // than a headroom figure.
+        bool tensorCore = UsesTensorCores(spec);
+        double computeRate = machine.MacsPerSecondFor(tensorCore);
+        double computeUs = computeRate > 0 ? macs / computeRate * 1e6 : double.NaN;
 
         var prediction = new CodegenPerformancePrediction(
             spec.Name, outputs, macs, uniqueBytes, warpLoads, loadsPerMac,
@@ -317,7 +398,7 @@ public static class CodegenPerformanceModel
     }
 
     /// <summary>Human-readable one-kernel report.</summary>
-    public static string Describe(CodegenPerformancePrediction p, CodegenKernelSpec spec)
+    public static string Describe(CodegenPerformancePrediction p, CodegenKernelSpec? spec)
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
 
@@ -331,11 +412,16 @@ public static class CodegenPerformanceModel
           .Append("   loads/MAC ").Append(p.LoadsPerMac.ToString("F3", ic)).Append('\n');
         sb.Append("  load-issue ").Append(p.LoadIssueMicroseconds.ToString("F1", ic))
           .Append(" us | dram ").Append(p.DramMicroseconds.ToString("F1", ic))
-          .Append(" us | compute ").Append(p.ComputeMicroseconds.ToString("F1", ic)).Append(" us\n");
-        sb.Append("  PREDICTED ").Append(p.Limiter.ToString().ToUpperInvariant())
-          .Append(" at ").Append(p.PredictedMicroseconds.ToString("F1", ic))
+          .Append(" us | compute ")
+          .Append(p.HasComputeCeiling ? p.ComputeMicroseconds.ToString("F1", ic) : "-")
+          .Append(" us\n");
+        sb.Append("  PREDICTED ")
+          .Append(p.HasComputeCeiling ? p.Limiter.ToString().ToUpperInvariant() : "-")
+          .Append(" at ")
+          .Append(p.HasComputeCeiling ? p.PredictedMicroseconds.ToString("F1", ic) : "-")
           .Append(" us; headroom if loads were free ")
-          .Append(p.HeadroomIfLoadsWereFree.ToString("F2", ic)).Append("x\n");
+          .Append(p.HasComputeCeiling ? p.HeadroomIfLoadsWereFree.ToString("F2", ic) : "-")
+          .Append("x\n");
 
         if (spec != null)
         {

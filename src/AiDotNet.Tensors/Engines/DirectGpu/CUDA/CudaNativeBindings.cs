@@ -34,7 +34,8 @@ internal enum CudaFunctionAttribute
     LocalSizeBytes = 3,
     NumRegisters = 4,
     PtxVersion = 5,
-    BinaryVersion = 6
+    BinaryVersion = 6,
+    MaxDynamicSharedSizeBytes = 8
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -158,6 +159,10 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuFuncGetAttribute")]
     public static extern CudaResult cuFuncGetAttribute(
         out int value, CudaFunctionAttribute attribute, IntPtr function);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuFuncSetAttribute")]
+    public static extern CudaResult cuFuncSetAttribute(
+        IntPtr function, CudaFunctionAttribute attribute, int value);
 
     [DllImport(CudaLibrary, EntryPoint = "cuLaunchKernel")]
     public static extern CudaResult cuLaunchKernel(

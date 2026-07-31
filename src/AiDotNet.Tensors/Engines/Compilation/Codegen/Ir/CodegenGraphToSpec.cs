@@ -16,7 +16,7 @@
 // for fusion chains. This version translates the reduction forms the spec can express
 // exactly. The spec's body is
 //
-//     out = activation( reduce(product of operands) + bias ) * scale
+//     out = activation( reduce(product of operands) + bias )
 //
 // and a matmul is exactly that: the product is A*B, the reduction is over k. What differs
 // from a pointwise chain is only the INDEX MAPS, which is what the spec was built to
@@ -98,9 +98,15 @@ public static class CodegenGraphToSpec
         for (int guard = 0; guard <= graph.Count; guard++)
         {
             var node = graph[cursor];
-            if (node.Op == CodegenOpKind.ReLU && activation == CodegenActivationKind.None)
+            if (activation == CodegenActivationKind.None && TryMapActivation(node.Op) is { } mapped)
             {
-                activation = CodegenActivationKind.ReLU;
+                if (node.Inputs.Length != 1)
+                {
+                    declineReason = "activation " + node.Op + " needs exactly one input, got " +
+                                    node.Inputs.Length;
+                    return false;
+                }
+                activation = mapped;
                 cursor = node.Inputs[0];
                 continue;
             }
@@ -124,6 +130,7 @@ public static class CodegenGraphToSpec
         CodegenAffineExpr[][] operandMaps;
         CodegenAffineExpr[] outputMap;
         CodegenReduceKind reduce;
+        double reduceScale = 1.0;
 
         switch (core.Op)
         {
@@ -148,9 +155,26 @@ public static class CodegenGraphToSpec
 
             case CodegenOpKind.ReduceSum:
             case CodegenOpKind.ReduceMax:
+            case CodegenOpKind.ReduceMean:
                 if (!TryBuildReduce(graph, core, outShape, operands,
                         out axes!, out operandMaps!, out outputMap!, out reduce, out declineReason))
                     return false;
+
+                // A mean is a sum times 1/count. The count is the product of the reduced
+                // extents, which is known here and constant, so it becomes the spec's
+                // scalar epilogue rather than a separate reduce kind.
+                if (core.Op == CodegenOpKind.ReduceMean)
+                {
+                    long reduced = 1;
+                    foreach (var axis in axes!)
+                        if (axis.IsReduction) reduced *= axis.Extent;
+                    if (reduced <= 0)
+                    {
+                        declineReason = "a mean over " + reduced + " elements has no value";
+                        return false;
+                    }
+                    reduceScale = 1.0 / reduced;
+                }
                 break;
 
             case CodegenOpKind.Mul:
@@ -163,7 +187,7 @@ public static class CodegenGraphToSpec
 
             default:
                 declineReason = "op " + core.Op + " is outside the spec's body form " +
-                                "(activation(reduce(product) + bias) * scale)";
+                                "(activation(reduce(product) + bias))";
                 return false;
         }
 
@@ -201,10 +225,30 @@ public static class CodegenGraphToSpec
         spec = new CodegenKernelSpec(
             name, new CodegenIterationSpace(axes), bindings, output, productIndices, reduce,
             biasInput: biasNode.HasValue ? ordered.Count - 1 : null,
-            activation: activation);
+            activation: activation,
+            reduceScale: reduceScale);
         graphNodeOrder = ordered;
         return true;
     }
+
+    /// <summary>
+    /// The epilogue activation an op maps to, or null when it is not one.
+    /// </summary>
+    /// <remarks>
+    /// Only the activations the emitter has a PTX form for. <c>Swish</c> is the IR's name
+    /// for SiLU. <c>LeakyReLU</c> and <c>ELU</c> are deliberately absent: both carry a
+    /// parameter the spec has nowhere to put, and mapping them to their default slope
+    /// would silently compile a different operator.
+    /// </remarks>
+    private static CodegenActivationKind? TryMapActivation(CodegenOpKind op) => op switch
+    {
+        CodegenOpKind.ReLU => CodegenActivationKind.ReLU,
+        CodegenOpKind.Sigmoid => CodegenActivationKind.Sigmoid,
+        CodegenOpKind.Tanh => CodegenActivationKind.Tanh,
+        CodegenOpKind.Swish => CodegenActivationKind.Swish,
+        CodegenOpKind.GELU => CodegenActivationKind.Gelu,
+        _ => null,
+    };
 
     /// <summary>Order the launcher must bind buffers in, matching the translated spec.</summary>
     public static bool TryGetParameterOrder(
@@ -324,13 +368,22 @@ public static class CodegenGraphToSpec
                      "padding are unknown; guessing them would silently change the operator";
             return false;
         }
-        conv.Validate();
+        try
+        {
+            conv.Validate();
+        }
+        catch (ArgumentException ex)
+        {
+            reason = core.Op + " has invalid convolution geometry: " + ex.Message;
+            return false;
+        }
 
-        bool depthwise = core.Op == CodegenOpKind.DepthwiseConv2D;
         bool transposed = core.Op == CodegenOpKind.ConvTranspose2D;
 
         int[] inShape = graph[core.Inputs[0]].Shape;
         int[] wShape = graph[core.Inputs[1]].Shape;
+        bool depthwise = core.Op == CodegenOpKind.DepthwiseConv2D ||
+                         (transposed && wShape.Length == 3);
         if (inShape.Length != 4 || outShape.Length != 4)
         {
             reason = core.Op + " expects NCHW operands; got input rank " + inShape.Length +
@@ -446,6 +499,7 @@ public static class CodegenGraphToSpec
         out CodegenAffineExpr[]? outputMap, out CodegenReduceKind reduce, out string reason)
     {
         axes = null; operandMaps = null; outputMap = null; reason = string.Empty;
+        // A mean reduces by SUMMING; the division is the scalar epilogue the caller sets.
         reduce = core.Op == CodegenOpKind.ReduceMax ? CodegenReduceKind.Max : CodegenReduceKind.Sum;
 
         if (core.Inputs.Length != 1)
@@ -565,7 +619,7 @@ public static class CodegenGraphToSpec
             if (node.Op != CodegenOpKind.Mul || node.Inputs.Length != 2)
             {
                 reason = "op " + node.Op + " is outside the spec's body form " +
-                         "(activation(reduce(product) + bias) * scale)";
+                         "(activation(reduce(product) + bias))";
                 return false;
             }
 

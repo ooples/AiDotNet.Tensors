@@ -164,10 +164,10 @@ public sealed partial class VulkanBackend
             new IGpuBuffer[] { idx },
             new uint[] { (uint)l, (uint)p, (uint)numRows });
     }
-    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         GlslDispatchN(VulkanAuditKernels.Rwkv7Forward, batch*numHeads,
-            new IGpuBuffer[] { r, k, v, a, b, output, sbuf },
+            new IGpuBuffer[] { r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf },
             new uint[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
     }
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
@@ -218,11 +218,11 @@ public sealed partial class VulkanBackend
             new IGpuBuffer[] { padded, window, mag, phase },
             new uint[] { (uint)batch, (uint)lp, (uint)nFft, (uint)hop, (uint)numFrames, (uint)numFreqs });
     }
-    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
-        GlslDispatchN(VulkanAuditKernels.PhaseVocoder, leading*nFreqV,
+        GlslDispatchN(VulkanAuditKernels.PhaseVocoder, leading*numFreqs,
             new IGpuBuffer[] { mag, phase, newMag, newPhase },
-            new uint[] { (uint)leading, (uint)nFramesV, (uint)nFreqV, (uint)outFrames, FloatBits(rate) });
+            new uint[] { (uint)leading, (uint)numFrames, (uint)numFreqs, (uint)outFrames, FloatBits(rate) });
     }
     public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft)
     {

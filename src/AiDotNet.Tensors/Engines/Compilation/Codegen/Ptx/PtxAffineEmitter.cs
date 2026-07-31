@@ -23,7 +23,7 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>
 /// Emits SM86 PTX for a <see cref="CodegenKernelSpec"/>.
 /// </summary>
-public sealed class PtxAffineEmitter
+public sealed partial class PtxAffineEmitter
 {
     /// <summary>Threads per block. Matches the hand-written kernels so metrics compare like-for-like.</summary>
     public const int BlockThreads = 256;
@@ -47,6 +47,12 @@ public sealed class PtxAffineEmitter
     private readonly StringBuilder _body = new(16384);
     private int _r, _f, _p, _rd;
     private IReadOnlyList<CodegenAxis> axesMeta = Array.Empty<CodegenAxis>();
+
+    /// <summary>Base-pointer register per kernel parameter, for the current emission.</summary>
+    private string[]? _basePointers;
+
+    /// <summary>Input bindings of the spec being emitted, for the current emission.</summary>
+    private IReadOnlyList<CodegenTensorBinding>? _inputBindings;
 
     private string NextR() => "%r" + (_r++).ToString(CultureInfo.InvariantCulture);
     private string NextF() => "%f" + (_f++).ToString(CultureInfo.InvariantCulture);
@@ -72,14 +78,18 @@ public sealed class PtxAffineEmitter
     /// <summary>Bounds guards elided because interval analysis proved them unnecessary.</summary>
     public int ElidedGuards { get; private set; }
 
-    /// <summary>
-    /// Emits PTX for <paramref name="spec"/>.
-    /// </summary>
-    /// <exception cref="NotSupportedException">
-    /// Thrown for specs this layer deliberately cannot express (data-dependent
-    /// indexing). Declining loudly is required -- silently mis-lowering an index
-    /// map is exactly the failure this layer exists to prevent.
-    /// </exception>
+    /// <summary>Stores emitted as one vector instruction covering several lanes.</summary>
+    public int VectorisedStores { get; private set; }
+
+    /// <summary>Index loads emitted for data-dependent (gather/scatter) dimensions.</summary>
+    public int IndirectIndexLoads { get; private set; }
+
+    /// <summary>Stores emitted as atomic accumulations because the destination may collide.</summary>
+    public int AtomicStores { get; private set; }
+
+    /// <summary>Extra-output stores emitted beyond the primary and any argmax.</summary>
+    public int ExtraOutputStores { get; private set; }
+
     /// <summary>Number of reduction axes lowered to runtime loops rather than unrolled.</summary>
     public int LoopedAxes { get; private set; }
 
@@ -101,7 +111,8 @@ public sealed class PtxAffineEmitter
     internal static string PtxIsaVersionFor(int computeMajor, int computeMinor)
     {
         int capability = computeMajor * 10 + computeMinor;
-        if (capability >= 90) return "7.8";
+        if (capability >= 120) return "8.7";
+        if (capability >= 100) return "8.6";
         if (capability >= 89) return "7.8";
         if (capability >= 87) return "7.4";
         return "7.1";   // sm_70 through sm_86
@@ -254,25 +265,83 @@ public sealed class PtxAffineEmitter
     /// COMPILE-TIME index, so every consumer becomes a constant-offset
     /// <c>ld.shared.f32</c> -- no address arithmetic at the point of use.
     /// </remarks>
+    /// <summary>One operand resident in shared memory for the current strip-mine step.</summary>
+    /// <param name="Input">Index into the spec's inputs.</param>
+    /// <param name="TileSlot">Tile axis the operand varies on, or -1 when block-invariant.</param>
+    /// <param name="Dimension">
+    /// Block dimension that indexes the slice: 0 for x, 1 for y, or -1 when the slice is
+    /// block-invariant and every consumer reads a compile-time constant offset.
+    /// </param>
+    /// <param name="Count">Elements in the slice.</param>
+    /// <param name="ByteOffset">Where the slice starts inside the shared buffer.</param>
+    private sealed record StagedSlice(int Input, int TileSlot, int Dimension, int Count, int ByteOffset);
+
+    /// <summary>The slice holding an operand, or null when it is not staged.</summary>
+    private static StagedSlice? SliceFor(List<StagedSlice> slices, int input)
+    {
+        foreach (var slice in slices) if (slice.Input == input) return slice;
+        return null;
+    }
+
     private void EmitStageLoad(
         CodegenTensorBinding binding, string basePointer, string sharedBase,
         string tid, int tiledSlot, string tileBaseReg, int tileFactor,
         int[] innerReduction, IReadOnlyList<CodegenAxis> axes, string[] axisRegTemplate,
-        int count, int trips)
+        int count, int trips, bool coversAxisFromZero = false, int blockThreads = 0)
+    {
+        // A SLICE CAN BE LARGER THAN THE BLOCK. Requiring one pass per fetch rejected
+        // exactly the staging that matters: on dense 3x3 the activation slice is
+        // 28 positions x 9 trips = 252 elements against 112 threads, so the one-pass rule
+        // refused it and the 2D lowering ran with nothing staged -- which is worse than
+        // flat, because it also gives up the block-invariant weight staging (loads/MAC rose
+        // from 0.258 to 0.501).
+        //
+        // The passes are compile-time, so they unroll. Only the last needs a bounds guard.
+        if (blockThreads <= 0) blockThreads = count;
+        int passes = (count + blockThreads - 1) / blockThreads;
+        for (int pass = 0; pass < passes; pass++)
+            EmitStagePass(binding, basePointer, sharedBase, tid, tiledSlot, tileBaseReg,
+                tileFactor, innerReduction, axes, axisRegTemplate, count, trips,
+                coversAxisFromZero, pass * blockThreads);
+
+        L("bar.sync 0;");
+    }
+
+    private void EmitStagePass(
+        CodegenTensorBinding binding, string basePointer, string sharedBase,
+        string tid, int tiledSlot, string tileBaseReg, int tileFactor,
+        int[] innerReduction, IReadOnlyList<CodegenAxis> axes, string[] axisRegTemplate,
+        int count, int trips, bool coversAxisFromZero, int indexBase)
     {
         string skip = "STAGE_SKIP_" + I(_stageLabel++);
 
+        // The flat index into the slice for this pass.
+        string index = tid;
+        if (indexBase != 0)
+        {
+            index = NextR();
+            L($"add.u32 {index}, {tid}, {I(indexBase)};");
+        }
+
         string active = NextP();
-        L($"setp.ge.u32 {active}, {tid}, {I(count)};");
+        L($"setp.ge.u32 {active}, {index}, {I(count)};");
         L($"@{active} bra {skip};");
 
         // Split the flat stage index into (lane offset on the tiled axis, trip).
         var runtime = (string[])axisRegTemplate.Clone();
         string laneOff = NextR(), trip = NextR();
-        L($"div.u32 {laneOff}, {tid}, {I(trips)};");
-        L($"rem.u32 {trip}, {tid}, {I(trips)};");
+        L($"div.u32 {laneOff}, {index}, {I(trips)};");
+        L($"rem.u32 {trip}, {index}, {I(trips)};");
 
-        if (tiledSlot >= 0 && tileBaseReg != null)
+        if (tiledSlot >= 0 && coversAxisFromZero)
+        {
+            // PER-DIMENSION SLICE. The block covers this axis completely, so the slice
+            // spans the whole extent and the flat index IS the axis coordinate -- no block
+            // base to add. That full cover is exactly what CanStageInput requires, and it
+            // is what keeps this addressed from zero.
+            runtime[tiledSlot] = laneOff;
+        }
+        else if (tiledSlot >= 0 && tileBaseReg != null)
         {
             string tiledValue = NextR();
             L($"mad.lo.u32 {tiledValue}, {tileBaseReg}, {I(tileFactor)}, {laneOff};");
@@ -314,12 +383,166 @@ public sealed class PtxAffineEmitter
         EmittedLoads++;
 
         string sharedByte = NextRd(), sharedAddr = NextRd();
-        L($"mul.wide.u32 {sharedByte}, {tid}, 4;");
+        L($"mul.wide.u32 {sharedByte}, {index}, 4;");
         L($"add.u64 {sharedAddr}, {sharedBase}, {sharedByte};");
         L($"st.shared.f32 [{sharedAddr}], {value2};");
 
         _body.Append(skip).Append(":\n");
-        L("bar.sync 0;");
+    }
+
+    /// <summary>
+    /// Emits the epilogue activation, returning the register holding the result.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// PTX has no <c>exp</c>: it has <c>ex2.approx.f32</c>, so every exponential is
+    /// <c>ex2(x * log2 e)</c> with <c>log2 e = 1.4426950408889634</c>. Reciprocals use
+    /// <c>rcp.approx.f32</c> and <c>tanh.approx.f32</c> is native from sm_75, which this
+    /// emitter already requires.
+    /// </para>
+    /// <para>
+    /// These are APPROXIMATE instructions — roughly 2 ulp for <c>ex2</c>, 1 ulp for
+    /// <c>rcp</c> — so a kernel carrying one of them cannot reach the exact
+    /// <c>0.000E+000</c> the affine kernels hit against the fp64 oracle. The deviation is
+    /// measured and reported per activation rather than assumed; see
+    /// <c>docs/ACTIVATION_ACCURACY.md</c>. ReLU stays exact because <c>max</c> is exact.
+    /// </para>
+    /// </remarks>
+    private string EmitActivation(CodegenActivationKind kind, string x)
+    {
+        const string Log2E = "0f3FB8AA3B";          // 1.4426950408889634
+        const string One = "0f3F800000";
+        const string Half = "0f3F000000";
+        const string GeluOuter = "0f3F4C422A";      // sqrt(2/pi) = 0.7978845608028654
+        const string GeluInner = "0f3D372713";      // 0.044715
+
+        switch (kind)
+        {
+            case CodegenActivationKind.None:
+                return x;
+
+            case CodegenActivationKind.ReLU:
+                L($"max.f32 {x}, {x}, 0f00000000;");
+                return x;
+
+            case CodegenActivationKind.Tanh:
+                return EmitTanh(x, Log2E, One);
+
+            case CodegenActivationKind.Reciprocal:
+            {
+                string r = NextF();
+                L($"rcp.approx.f32 {r}, {x};");
+                return r;
+            }
+
+            case CodegenActivationKind.Rsqrt:
+            {
+                string r = NextF();
+                L($"rsqrt.approx.f32 {r}, {x};");
+                return r;
+            }
+
+            case CodegenActivationKind.Sigmoid:
+                return EmitSigmoid(x, Log2E, One);
+
+            case CodegenActivationKind.Swish:
+            {
+                string s = EmitSigmoid(x, Log2E, One);
+                string r = NextF();
+                L($"mul.rn.f32 {r}, {x}, {s};");
+                return r;
+            }
+
+            case CodegenActivationKind.Gelu:
+            {
+                // 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))
+                string x2 = NextF(), x3 = NextF(), inner = NextF(), scaled = NextF();
+                L($"mul.rn.f32 {x2}, {x}, {x};");
+                L($"mul.rn.f32 {x3}, {x2}, {x};");
+                L($"fma.rn.f32 {inner}, {x3}, {GeluInner}, {x};");
+                L($"mul.rn.f32 {scaled}, {inner}, {GeluOuter};");
+
+                string t = EmitTanh(scaled, Log2E, One);
+                string sum = NextF(), half = NextF(), r = NextF();
+                L($"add.rn.f32 {sum}, {t}, {One};");
+                L($"mul.rn.f32 {half}, {x}, {Half};");
+                L($"mul.rn.f32 {r}, {half}, {sum};");
+                return r;
+            }
+
+            default:
+                throw new NotSupportedException(
+                    "The PTX emitter has no form for activation " + kind + ".");
+        }
+    }
+
+    /// <summary>
+    /// tanh, built from <c>ex2</c> rather than from <c>tanh.approx.f32</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Measured on device against the fp64 oracle, the native instruction is the weakest
+    /// link in the whole activation set:
+    /// </para>
+    /// <code>
+    ///   sigmoid  ex2 + rcp            9.574E-008
+    ///   swish    ex2 + rcp            8.450E-008
+    ///   tanh     tanh.approx.f32      7.268E-006     <- 76x worse
+    ///   gelu     tanh.approx.f32      2.437E-006
+    /// </code>
+    /// <para>
+    /// So tanh is derived from the same primitives the accurate two are:
+    /// <c>tanh(x) = sign(x) * (1 - 2 / (exp(2|x|) + 1))</c>. Taking the absolute value
+    /// first is what makes it stable — for large |x| the exponential saturates to
+    /// infinity, the reciprocal underflows to zero, and the result lands on exactly
+    /// ±1 with no special case. Evaluating the raw ratio instead would produce inf/inf.
+    /// </para>
+    /// </remarks>
+    private string EmitTanh(string x, string log2E, string one)
+    {
+        const string Two = "0f40000000";
+
+        string ax = NextF(), scaled = NextF(), e = NextF();
+        L($"abs.f32 {ax}, {x};");
+        L($"mul.rn.f32 {scaled}, {ax}, {log2E};");
+        L($"add.rn.f32 {scaled}, {scaled}, {scaled};");     // 2|x| log2 e
+        L($"ex2.approx.f32 {e}, {scaled};");
+
+        string denom = NextF(), inv = NextF(), twice = NextF(), magnitude = NextF(), r = NextF();
+        L($"add.rn.f32 {denom}, {e}, {one};");
+        L($"rcp.approx.f32 {inv}, {denom};");
+        L($"mul.rn.f32 {twice}, {inv}, {Two};");
+        L($"sub.rn.f32 {magnitude}, {one}, {twice};");
+        L($"copysign.f32 {r}, {x}, {magnitude};");
+        return r;
+    }
+
+    /// <summary>
+    /// A double as a PTX fp32 hex literal, which is how PTX spells a float constant.
+    /// </summary>
+    /// <remarks>
+    /// Emitting the decimal form would let ptxas re-parse and re-round the value; the hex
+    /// form names the exact bit pattern, so the constant in the kernel is the constant the
+    /// oracle used.
+    /// </remarks>
+    private static string F32(double value)
+    {
+        // GetBytes/ToUInt32 rather than SingleToUInt32Bits, which does not exist on
+        // net471 -- and this project builds every target framework.
+        uint bits = BitConverter.ToUInt32(BitConverter.GetBytes((float)value), 0);
+        return "0f" + bits.ToString("X8", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>1 / (1 + exp(-x)), via ex2 and rcp.</summary>
+    private string EmitSigmoid(string x, string log2E, string one)
+    {
+        string negScaled = NextF(), e = NextF(), denom = NextF(), r = NextF();
+        L($"mul.rn.f32 {negScaled}, {x}, {log2E};");
+        L($"neg.f32 {negScaled}, {negScaled};");
+        L($"ex2.approx.f32 {e}, {negScaled};");
+        L($"add.rn.f32 {denom}, {e}, {one};");
+        L($"rcp.approx.f32 {r}, {denom};");
+        return r;
     }
 
     private int _stageLabel;
@@ -329,8 +552,9 @@ public sealed class PtxAffineEmitter
     /// </summary>
     /// <remarks>
     /// <c>0f00000000</c> for a sum, <c>0fFF800000</c> (negative infinity) for a maximum.
-    /// Set per emission from the spec, because it is a property of the operator and not of
-    /// the emitter.
+    /// Zero is the ADDITIVE identity; under a maximum it is a real candidate, so a padded
+    /// max-pool over all-negative inputs returned 0 instead of the true maximum -- in the
+    /// oracle and the emitter alike, which is why the agreement gate passed it.
     /// </remarks>
     private string _outOfRangeFill = "0f00000000";
 
@@ -420,6 +644,12 @@ public sealed class PtxAffineEmitter
     /// <summary>Largest grid the CUDA launch API accepts in the X dimension.</summary>
     private const long MaxGridBlocksX = 2147483647L;
 
+    /// <summary>Largest thread count representable by the emitted u32 gid arithmetic.</summary>
+    private const long MaxU32ThreadCount = uint.MaxValue;
+
+    /// <summary>Smallest tensor rank treated as an activation by input staging.</summary>
+    private const int MinimumActivationRankForInputStaging = 3;
+
     /// <summary>Bytes of kernel parameter space PTX guarantees.</summary>
     private const int MaxParameterBytes = 4096;
 
@@ -458,6 +688,13 @@ public sealed class PtxAffineEmitter
             throw new NotSupportedException(
                 "Kernel '" + spec.Name + "' resolved to " + I(threadCount) + " threads. " +
                 "A tile factor larger than an axis extent would do this.");
+
+        if (threadCount > MaxU32ThreadCount)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' needs " + I(threadCount) +
+                " threads, past the " + I(MaxU32ThreadCount) +
+                " values representable by its u32 gid and bounds guard. Add a grid-stride " +
+                "loop or split the iteration space before emission.");
 
         int parameterBytes = spec.ParameterCount * sizeof(long);
         if (parameterBytes > MaxParameterBytes)
@@ -539,7 +776,7 @@ public sealed class PtxAffineEmitter
         foreach (int tw in factors)
         {
             if (tw > 1 && axes[contiguous].Extent % tw != 0) continue;
-            if (tw > laneCeiling) continue;
+            if (tw > laneCeiling || tw > factor) continue;
 
             // One-dimensional candidate: only the contiguous axis.
             double solo = PredictedRelativeTime(spec, axes, new[] { contiguous }, new[] { tw });
@@ -700,26 +937,75 @@ public sealed class PtxAffineEmitter
         CodegenTensorBinding binding, string basePointer, string[] axisReg,
         int[] reductionValues, int[] reductionAxes, int width)
     {
+        if (width != VectorWidth)
+            throw new InvalidOperationException(
+                "Only a " + I(VectorWidth) + "-wide vector load is supported; got " +
+                I(width) + ".");
+
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out string? pred);
         if (pred != null)
             throw new InvalidOperationException(
                 "A vectorised binding must be provably in range; " + binding.Name + " produced a guard.");
 
         string byteOffset = NextRd(), address = NextRd();
-        L($"mul.wide.u32 {byteOffset}, {offset}, 4;");
+        L($"mul.wide.u32 {byteOffset}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {address}, {basePointer}, {byteOffset};");
 
         var regs = new string[width];
         for (int i = 0; i < width; i++) regs[i] = NextF();
-        L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+
+        if (binding.NeedsConversion)
+        {
+            // FOUR HALVES ARE TWO WORDS, and two words is v2.u32 -- the same FOUR elements a
+            // v4.f32 carries, so the lane model above is unchanged and only the instruction,
+            // the byte scale and the unpacking differ.
+            //
+            // Without this a narrow tensor took the scalar path, and the profile said what
+            // that costs: 32 lanes at 2 bytes is a 64-byte request, half a cache line, which
+            // measured 2 sectors per request against fp32's 4 and reached only 66.6% of DRAM
+            // peak against fp32's 89.1%. The access was perfectly coalesced FOR ITS WIDTH and
+            // still wasted half the bus.
+            //
+            // This is emphatically not the v4.f32 path re-enabled for narrow bindings. That
+            // one scales by four bytes an element and would read twice the intended span,
+            // returning neighbouring data with no complaint -- which is why it was excluded.
+            string lo = NextR(), hi = NextR();
+            L($"ld.global.nc.v2.u32 {{{lo}, {hi}}}, [{address}];");
+
+            EmitWiden(binding.ElementType, lo, regs[0]);
+            string loHigh = NextR();
+            L($"shr.b32 {loHigh}, {lo}, 16;");
+            EmitWiden(binding.ElementType, loHigh, regs[1]);
+
+            EmitWiden(binding.ElementType, hi, regs[2]);
+            string hiHigh = NextR();
+            L($"shr.b32 {hiHigh}, {hi}, 16;");
+            EmitWiden(binding.ElementType, hiHigh, regs[3]);
+        }
+        else
+        {
+            L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+        }
+
         VectorisedLoads++;
         EmittedLoads++;
         return regs;
     }
 
+    /// <summary>Emits PTX for <paramref name="spec"/>.</summary>
+    /// <exception cref="NotSupportedException">
+    /// Thrown for specs this layer deliberately cannot express. Declining loudly is
+    /// required; silently mis-lowering an index map is exactly the failure this layer
+    /// exists to prevent.
+    /// </exception>
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
+
+        // A non-real algebra takes its own path, leaving everything below untouched. See
+        // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
+        if (spec.Algebra != CodegenAlgebra.Real)
+            return EmitAlgebraic(spec, computeMajor, computeMinor);
 
         var space = spec.Space;
         var axes = space.Axes;
@@ -773,6 +1059,19 @@ public sealed class PtxAffineEmitter
         if (Coarsening > 1 && parallel.Length > 0)
             SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
 
+        // NOT COARSENED FOR STREAMING, AND THAT IS A MEASURED DECISION. SelectTile
+        // minimises loads-per-MAC, so a kernel with no reduction has no reuse to find and it
+        // declines to tile -- which leaves each thread with one element and blocks both
+        // vector paths. Forcing the contiguous tile at VectorWidth to unblock them was tried
+        // and made things WORSE:
+        //
+        //   elementwise copy 4M         94.3% -> 84.6% of ceiling
+        //   elementwise copy 4M, fp16   69.8% -> 40.2%
+        //
+        // So the one-element-per-thread layout is already the better one for pure streaming
+        // on this hardware, and the fp16 shortfall is NOT the coarsening decision. Reverted
+        // rather than kept, and recorded here so the next reader does not retry it.
+
         int lanes = 1;
         foreach (int f in tileFactors) lanes *= f;
         CoarsenedLanes = lanes;
@@ -812,6 +1111,11 @@ public sealed class PtxAffineEmitter
         {
             foreach (int inputIdx in spec.ProductInputs)
             {
+                // The staged slice is addressed in 4-byte units and re-read as f32, so a
+                // narrow binding would be staged at the wrong stride. Excluded until the
+                // staging path carries an element size of its own.
+                if (spec.Inputs[inputIdx].NeedsConversion) continue;
+
                 bool varies = false;
                 foreach (int ax in varyingAxes)
                     if (ReferencesAxis(spec.Inputs[inputIdx], ax)) varies = true;
@@ -873,7 +1177,9 @@ public sealed class PtxAffineEmitter
         // stores coalesced; y over the reuse axis makes a staged row serve the column.
         int dataOperand = -1;
         foreach (int inputIdx in spec.ProductInputs)
-            if (inputIdx != stagedInput && spec.Inputs[inputIdx].Map.Count > 2) dataOperand = inputIdx;
+            if (inputIdx != stagedInput &&
+                spec.Inputs[inputIdx].Map.Count >= MinimumActivationRankForInputStaging)
+                dataOperand = inputIdx;
 
         bool twoDimensional = false;
         int blockX = blockThreads, blockY = 1;
@@ -887,23 +1193,79 @@ public sealed class PtxAffineEmitter
         }
         UsedTwoDimensionalBlock = twoDimensional;
 
-        // A two-dimensional block INVALIDATES the flat staging analysis. That analysis
-        // asks which operands are constant across the whole block; under a flat block
-        // the weights are, because every thread shares one reuse-axis group. Under a 2D
-        // block y varies over the reuse axis, so each row wants a different weight slice
-        // and the single staged copy is wrong for all but one row -- measured directly:
-        // the two dense kernels returned 5.277 and 1.112e1 instead of zero.
+        // PER-DIMENSION STAGING.
         //
-        // Under 2D each operand is invariant in exactly ONE dimension, not the block, so
-        // staging has to be indexed by the dimension the operand varies in. Until that is
-        // implemented, the 2D lowering runs without staging.
+        // A two-dimensional block invalidates the flat staging analysis. That analysis asks
+        // which operands are constant across the whole BLOCK; under a flat block the
+        // weights are, because every thread shares one reuse-axis group. Under 2D, y varies
+        // over that axis, so each row wants a different weight slice and one staged copy is
+        // wrong for every row but one -- measured directly, the two dense kernels returned
+        // 5.277 and 1.112e1 instead of zero.
+        //
+        // The fix is not to disable staging but to index it correctly: under 2D each operand
+        // is invariant in exactly one DIMENSION, so its slice is keyed by the dimension it
+        // varies in and shared along the other. The activation varies in x and is invariant
+        // in y, so one row serves the whole column; the weights are the mirror image. Both
+        // get staged, which is the point -- the activation half is where the traffic is, and
+        // staging weights alone only moved dense 3x3 from 68.1 us to 61.9 us against
+        // cuDNN's 41.3.
+        //
+        // The slice spans the whole axis because CanStageInput requires the block to cover
+        // both tiled axes completely, so it is addressed from zero.
+        var stagedSlices = new List<StagedSlice>();
         if (twoDimensional)
         {
             stagedInput = -1;
-            stageCount = 0;
             stagedTileSlot = -1;
-            SharedMemoryBytes = 0;
-            StagedOperands = "none";
+            stageCount = 0;
+
+            long tripsPerStep = 1;
+            foreach (int ax in reduction) tripsPerStep *= axes[ax].Extent;
+
+            int byteOffset = 0;
+            for (int slot = 0; slot < 2 && slot < tileAxes.Count; slot++)
+            {
+                int tileAxis = tileAxes[slot];
+                int other = tileAxes[slot == 0 ? 1 : 0];
+
+                foreach (int inputIdx in spec.ProductInputs)
+                {
+                    var binding = spec.Inputs[inputIdx];
+                    if (binding.NeedsConversion) continue;   // see the flat staging note
+
+                    // Keyed by this dimension only if it varies here and is invariant in
+                    // the other -- that invariance is the reuse being exploited.
+                    if (!ReferencesAxis(binding, tileAxis)) continue;
+                    if (ReferencesAxis(binding, other)) continue;
+
+                    // Every OTHER axis this operand reads is either a reduction axis, which
+                    // the fetch unpacks from the trip, or an axis the grid covers, which is
+                    // constant across the block and so already correct in the thread's own
+                    // register. The two tiled axes are the only ones that vary within a 2D
+                    // block, and both have been accounted for above.
+                    //
+                    // Using the FLAT lowering's varying-axis set here rejected every
+                    // candidate: it counts n and oh as varying, when under 2D those are
+                    // grid axes and constant within the block.
+                    long count = axes[tileAxis].Extent * tripsPerStep;
+                    if ((byteOffset + count * 4) > MaxSharedBytes) continue;
+
+                    stagedSlices.Add(new StagedSlice(inputIdx, slot, slot, (int)count, byteOffset));
+                    byteOffset += (int)count * 4;
+                    break;   // one operand per dimension
+                }
+            }
+
+            SharedMemoryBytes = byteOffset;
+            StagedOperands = stagedSlices.Count == 0
+                ? "none"
+                : string.Join("+", stagedSlices.ConvertAll(s => spec.Inputs[s.Input].Name));
+        }
+        else if (stagedInput >= 0)
+        {
+            // Flat block: the operand is invariant across the WHOLE block, so every
+            // consumer reads a compile-time constant offset. Dimension -1 records that.
+            stagedSlices.Add(new StagedSlice(stagedInput, stagedTileSlot, -1, stageCount, 0));
         }
 
         // The derived block size exists ONLY to make staging possible: it is chosen so a
@@ -920,13 +1282,21 @@ public sealed class PtxAffineEmitter
         LaunchBlockX = blockX;
         LaunchBlockY = blockY;
 
-        SharedMemoryBytes = stageCount * 4;
+        if (!twoDimensional)
+        {
+            SharedMemoryBytes = stageCount * 4;
+            StagedOperands = stagedInput < 0 ? "none" : spec.Inputs[stagedInput].Name;
+        }
         LaunchBlockThreads = blockThreads;
-        StagedOperands = stagedInput < 0 ? "none" : spec.Inputs[stagedInput].Name;
 
         // Threads, grid and in-kernel guard all come from this one number, which is
         // the invariant the whole IR exists to protect.
         long threadCount = total / lanes;
+        if (stagedSlices.Count > 0 && threadCount % blockThreads != 0)
+            throw new NotSupportedException(
+                "Kernel '" + spec.Name + "' stages shared memory with " + I(blockThreads) +
+                " threads per block, which does not divide its " + I(threadCount) +
+                " threads. The tail block would reach bar.sync with missing threads.");
         long blocks;
         if (twoDimensional)
         {
@@ -944,18 +1314,18 @@ public sealed class PtxAffineEmitter
         LaunchBlocks = (uint)blocks;
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
+        IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0; VectorisedStores = 0;
+        _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
         // calls makes the SAME spec emit different text on a second Emit, and cubins
         // are content-addressed on that text.
         _stageLabel = 0;
 
-        // The out-of-range fill is the reduction's identity, not always zero. A maximum
-        // over zero-filled padding treats the padding as a candidate.
+        // The out-of-range fill is the reduction's identity, not always zero.
         _outOfRangeFill = spec.Reduce == CodegenReduceKind.Max ? "0fFF800000" : "0f00000000";
 
-        // Under a maximum the product of several operands has no single sensible identity:
-        // -inf times a positive operand is -inf, but -inf times zero is NaN. No spec needs
-        // it, so refuse rather than emit something whose padding behaviour is undefined.
+        // Under a maximum, a product of operands has no single sensible identity: -inf times
+        // a positive operand is -inf, but -inf times zero is NaN.
         if (spec.Reduce == CodegenReduceKind.Max && spec.ProductInputs.Count > 1)
             throw new NotSupportedException(
                 "A Max reduction over a product of " + spec.ProductInputs.Count +
@@ -989,6 +1359,7 @@ public sealed class PtxAffineEmitter
             basePtr[i] = NextRd();
             L($"ld.param.u64 {basePtr[i]}, [p{I(i)}];");
         }
+        _basePointers = basePtr;
 
         string ctaid = NextR(), tid = NextR(), gid = NextR();
         L($"mov.u32 {ctaid}, %ctaid.x;");
@@ -1098,6 +1469,18 @@ public sealed class PtxAffineEmitter
                 : $"mov.f32 {accs[l]}, 0f00000000;");
         }
 
+        // One index register per lane, tracking which reduction term is currently winning.
+        string[]? argIndex = null;
+        if (spec.SecondaryOutput is not null && spec.SecondaryIndexExpr is not null)
+        {
+            argIndex = new string[lanes];
+            for (int l = 0; l < lanes; l++)
+            {
+                argIndex[l] = NextR();
+                L($"mov.u32 {argIndex[l]}, 0;");
+            }
+        }
+
         // Open one runtime loop per peeled axis. Each level emits its counter reset
         // BEFORE its own label, so the reset for level i+1 lands inside level i's
         // body and re-runs on every outer trip.
@@ -1125,18 +1508,30 @@ public sealed class PtxAffineEmitter
         // Stage the block-invariant operand for THIS strip-mine step. Inside a loop this
         // re-runs per iteration, which is required: the staged slice depends on the loop
         // counter.
-        if (stagedInput >= 0 && sharedBase != null)
+        if (stagedSlices.Count > 0 && sharedBase != null)
         {
-            var b = spec.Inputs[stagedInput];
             long innerTripsNow = 1;
             foreach (int ax in reduction) innerTripsNow *= axes[ax].Extent;
 
-            EmitStageLoad(
-                b, basePtr[b.ParameterIndex], sharedBase, tid,
-                stagedTileSlot >= 0 ? tileAxes[stagedTileSlot] : -1,
-                stagedTileSlot >= 0 ? axisReg[tileAxes[stagedTileSlot]] : null!,
-                stagedTileSlot >= 0 ? tileFactors[stagedTileSlot] : 1,
-                reduction, axes, axisReg, stageCount, (int)innerTripsNow);
+            foreach (var slice in stagedSlices)
+            {
+                var b = spec.Inputs[slice.Input];
+                string sliceBase = sharedBase;
+                if (slice.ByteOffset != 0)
+                {
+                    sliceBase = NextRd();
+                    L($"add.u64 {sliceBase}, {sharedBase}, {I(slice.ByteOffset)};");
+                }
+
+                EmitStageLoad(
+                    b, basePtr[b.ParameterIndex], sliceBase, tid,
+                    slice.TileSlot >= 0 ? tileAxes[slice.TileSlot] : -1,
+                    slice.TileSlot >= 0 ? axisReg[tileAxes[slice.TileSlot]] : null!,
+                    slice.TileSlot >= 0 ? tileFactors[slice.TileSlot] : 1,
+                    reduction, axes, axisReg, slice.Count, (int)innerTripsNow,
+                    coversAxisFromZero: slice.Dimension >= 0,
+                    blockThreads: LaunchBlockThreads);
+            }
         }
 
         // Decide, before emitting anything, which product operands can be read with a
@@ -1151,7 +1546,15 @@ public sealed class PtxAffineEmitter
         if (EnableVectorLoads && innermost >= 0 && axes[innermost].Extent % VectorWidth == 0)
         {
             foreach (int inputIdx in spec.ProductInputs)
-                if (IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
+                // A narrow binding vectorises through v2.u32 -- four halves, the same four
+                // elements a v4.f32 carries -- rather than being excluded. It cannot use the
+                // f32 form, which scales by four bytes an element and would read twice the
+                // intended span; see EmitVectorLoad.
+                //
+                // An INDEX tensor is still excluded: it is never an arithmetic operand, so
+                // there is nothing to widen it into.
+                if (!spec.Inputs[inputIdx].IsIndexTensor &&
+                    IsUnitStrideIn(spec.Inputs[inputIdx], innermost, axes))
                 {
                     vectorisable[inputIdx] = true;
                     vectorGroup = VectorWidth;
@@ -1170,6 +1573,29 @@ public sealed class PtxAffineEmitter
         // sharing one cache let trip 1 reuse trip 0's vector and silently corrupted
         // both 1x1 kernels while their neighbours stayed exact.
         var reductionVectorCache = new Dictionary<string, string[]>(StringComparer.Ordinal);
+
+        // Per-thread base for each dimension-keyed slice, hoisted once. The block
+        // coordinate is the only runtime term in a staged read, so lifting it here keeps
+        // every consumer at a constant offset.
+        var sliceBaseCache = new Dictionary<int, string>();
+        string SliceBase(StagedSlice slice, long tileTripsForBase)
+        {
+            if (sliceBaseCache.TryGetValue(slice.Input, out string? cached)) return cached;
+
+            int stride = (int)(tileFactors[slice.TileSlot] * tileTripsForBase * 4);
+            string scaled = NextRd();
+            L($"mul.wide.u32 {scaled}, {axisReg[tileAxes[slice.TileSlot]]}, {I(stride)};");
+            string result = NextRd();
+            L($"add.u64 {result}, {sharedBase}, {scaled};");
+            if (slice.ByteOffset != 0)
+            {
+                string shifted = NextRd();
+                L($"add.u64 {shifted}, {result}, {I(slice.ByteOffset)};");
+                result = shifted;
+            }
+            sliceBaseCache[slice.Input] = result;
+            return result;
+        }
 
         for (long t = 0; t < trips; t++)
         {
@@ -1255,16 +1681,33 @@ public sealed class PtxAffineEmitter
                         }
                         value = rvec[reductionValues[innermost] % vectorGroup];
                     }
-                    else if (inputIdx == stagedInput && sharedBase != null)
+                    else if (sharedBase != null && SliceFor(stagedSlices, inputIdx) is { } slice)
                     {
-                        // Resident in shared memory. Both coordinates are compile-time
-                        // constants here, so this is a constant-offset ld.shared with no
-                        // address arithmetic at the point of use.
-                        int laneOffset = stagedTileSlot >= 0 ? laneOffsets[l][stagedTileSlot] : 0;
-                        long slotIndex = laneOffset * trips + t;
-                        string sharedAddr = NextRd();
+                        // Resident in shared memory.
+                        int laneOffset = slice.TileSlot >= 0 ? laneOffsets[l][slice.TileSlot] : 0;
                         string loaded = NextF();
-                        L($"add.u64 {sharedAddr}, {sharedBase}, {I(slotIndex * 4)};");
+                        string sharedAddr = NextRd();
+
+                        if (slice.Dimension < 0)
+                        {
+                            // Block-invariant: both coordinates are compile-time constants,
+                            // so this is a constant-offset ld.shared with no address
+                            // arithmetic at the point of use.
+                            long slotIndex = laneOffset * trips + t;
+                            L($"add.u64 {sharedAddr}, {sharedBase}, {I(slice.ByteOffset + slotIndex * 4)};");
+                        }
+                        else
+                        {
+                            // Keyed by a block dimension. The slice spans the whole axis, so
+                            // the element is at (blockCoord * tileFactor + lane) * trips + t.
+                            // Only the blockCoord term is a runtime value, and it is hoisted
+                            // once per thread, so this stays a constant offset from a
+                            // per-thread base.
+                            string sliceBase = SliceBase(slice, tileTripsForBase: trips);
+                            long constant = (laneOffset * (long)trips + t) * 4;
+                            L($"add.u64 {sharedAddr}, {sliceBase}, {I(constant)};");
+                        }
+
                         L($"ld.shared.f32 {loaded}, [{sharedAddr}];");
                         value = loaded;
                     }
@@ -1302,10 +1745,62 @@ public sealed class PtxAffineEmitter
                     }
                 }
 
+                // The pre-reduction slot: shift, then transform, per TERM. An epilogue
+                // activation cannot do this -- it runs once on the finished accumulator,
+                // while softmax needs exp applied to every term before summing.
+                if (spec.PreBiasInput.HasValue)
+                {
+                    var pb = spec.Inputs[spec.PreBiasInput.Value];
+                    string pv = EmitLoad(pb, basePtr[pb.ParameterIndex], laneAxisReg[l],
+                                         reductionValues, reduction, out _);
+                    string shifted = NextF();
+                    if (spec.PreBiasScale == 1.0)
+                    {
+                        L($"add.rn.f32 {shifted}, {product!}, {pv};");
+                    }
+                    else
+                    {
+                        // fma so the scaled add stays one instruction and one rounding.
+                        L($"fma.rn.f32 {shifted}, {pv}, {F32(spec.PreBiasScale)}, {product!};");
+                    }
+                    product = shifted;
+                }
+                if (spec.PreReduce != CodegenPreReduceOp.None)
+                {
+                    string transformed = NextF();
+                    if (spec.PreReduce == CodegenPreReduceOp.Square)
+                    {
+                        L($"mul.rn.f32 {transformed}, {product!}, {product!};");
+                    }
+                    else
+                    {
+                        // exp(t) = ex2(t * log2 e); PTX has no exp.
+                        string scaledT = NextF();
+                        L($"mul.rn.f32 {scaledT}, {product!}, 0f3FB8AA3B;");
+                        L($"ex2.approx.f32 {transformed}, {scaledT};");
+                    }
+                    product = transformed;
+                }
+
                 // An out-of-range tap contributes the additive identity; the guarded
                 // load already produced 0, so no extra select is needed for Sum.
                 if (spec.Reduce == CodegenReduceKind.Max)
                 {
+                    if (argIndex is not null)
+                    {
+                        // Track WHICH term won, not just the value. Strictly greater keeps
+                        // the FIRST maximum on a tie, matching the established kernel --
+                        // the backward pass routes a gradient by this index, so a different
+                        // tie-break silently sends it to the wrong element.
+                        string beats = NextP();
+                        L($"setp.gt.f32 {beats}, {product!}, {accs[l]};");
+
+                        string candidate = EmitAffine(
+                            spec.SecondaryIndexExpr!, laneAxisReg[l], reductionValues, reduction);
+                        string chosen = NextR();
+                        L($"selp.b32 {chosen}, {candidate}, {argIndex[l]}, {beats};");
+                        argIndex[l] = chosen;
+                    }
                     L($"max.f32 {accs[l]}, {accs[l]}, {product!};");
                 }
                 else
@@ -1328,7 +1823,7 @@ public sealed class PtxAffineEmitter
             for (int l = 0; l < lanes; l++)
                 if (!string.Equals(accs[l], accsFixed[l], StringComparison.Ordinal))
                     L($"mov.f32 {accsFixed[l]}, {accs[l]};");
-            if (stagedInput >= 0) L("bar.sync 0;");
+            if (stagedSlices.Count > 0) L("bar.sync 0;");
             for (int i = loopAxes.Length - 1; i >= 0; i--)
             {
                 string cont = NextP();
@@ -1348,9 +1843,38 @@ public sealed class PtxAffineEmitter
         // wrong values while their epilogue-free siblings stayed exact.
         var epilogueCache = new Dictionary<string, string>(StringComparer.Ordinal);
 
+        // A VECTORISED STORE NEEDS THE THREAD TO OWN CONTIGUOUS OUTPUTS. The load side was
+        // fixed first and did not move the fp16 streaming number at all, because a copy
+        // kernel's store is half its traffic and every store here was scalar: at fp16 that is
+        // 32 lanes at two bytes, a 64-byte request against a 128-byte line. fp32 never showed
+        // it, since 32 lanes at four bytes fills the line exactly.
+        //
+        // The conditions are deliberately narrow. Anything predicated, atomic, or writing more
+        // than one buffer keeps the per-lane path, because a vector store commits all four
+        // elements together and cannot honour a per-element guard.
+        bool vectorStore =
+            lanes == VectorWidth &&
+            contiguousFactor == VectorWidth &&
+            !spec.Output.NeedsAtomicStore &&
+            !spec.Output.NeedsBoundsCheck &&
+            spec.ExtraOutputs.Count == 0 &&
+            IsUnitStrideIn(spec.Output, coarsenAxis, axes);
+
+        var pendingStore = vectorStore ? new string[lanes] : null;
+
         for (int l = 0; l < lanes; l++)
         {
             string acc = accs[l];
+
+            // The constant scale lands BEFORE the bias: a mean-then-add-bias is the
+            // operator, and scaling afterwards would scale the bias too.
+            if (spec.ReduceScale != 1.0)
+            {
+                string scaled = NextF();
+                L($"mul.rn.f32 {scaled}, {acc}, {F32(spec.ReduceScale)};");
+                acc = scaled;
+            }
+
             if (spec.BiasInput.HasValue)
             {
                 var b = spec.Inputs[spec.BiasInput.Value];
@@ -1379,16 +1903,149 @@ public sealed class PtxAffineEmitter
                 L($"mul.rn.f32 {na}, {acc}, {v};");
                 acc = na;
             }
-            if (spec.Activation == CodegenActivationKind.ReLU)
-                L($"max.f32 {acc}, {acc}, 0f00000000;");
+            acc = EmitActivation(spec.Activation, acc);
+
+            if (pendingStore is not null)
+            {
+                pendingStore[l] = acc;
+                continue;
+            }
 
             string laneOff = EmitOffset(spec.Output, laneAxisReg[l], reductionValues, reduction,
                                        out string? lanePred);
             string laneAddr = NextRd(), laneByte = NextRd();
-            L($"mul.wide.u32 {laneByte}, {laneOff}, 4;");
+            L($"mul.wide.u32 {laneByte}, {laneOff}, {I(spec.Output.ElementBytes)};");
             L($"add.u64 {laneAddr}, {basePtr[spec.Output.ParameterIndex]}, {laneByte};");
-            if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
+            if (spec.Output.NeedsAtomicStore)
+            {
+                // SCATTER. A destination reached through a run-time index cannot be proven
+                // unique, so two iterations may target the same element. A plain store would
+                // keep whichever warp finished last -- a race that yields a different wrong
+                // answer per run and reads as flakiness rather than as a bug. The atomic
+                // makes it an accumulation, which is what every scatter operator wants
+                // anyway: an embedding backward sums the gradients of repeated tokens.
+                //
+                // The destination must be zeroed by the caller before launch, since this
+                // adds to whatever is already there.
+                if (spec.Output.NeedsConversion)
+                    throw new NotSupportedException(
+                        "A scatter destination must be fp32: there is no atomic add for a " +
+                        "16-bit float here, and emulating one with a compare-and-swap loop " +
+                        "would silently change the operator's cost.");
+
+                if (lanePred is null) L($"red.global.add.f32 [{laneAddr}], {acc};");
+                else L($"@{lanePred} red.global.add.f32 [{laneAddr}], {acc};");
+                AtomicStores++;
+            }
+            else if (spec.Output.NeedsConversion)
+            {
+                string narrowed = EmitNarrow(spec.Output.ElementType, acc);
+                if (lanePred is null) L($"st.global.u16 [{laneAddr}], {narrowed};");
+                else L($"@{lanePred} st.global.u16 [{laneAddr}], {narrowed};");
+            }
+            else if (lanePred is null) L($"st.global.f32 [{laneAddr}], {acc};");
             else L($"@{lanePred} st.global.f32 [{laneAddr}], {acc};");
+
+            // The secondary output holds the argmax position, stored as a 32-bit INTEGER --
+            // the consumer is an indices buffer that the backward pass indexes with, not a
+            // float. Writing it as f32 would round above 2^24 and silently misroute
+            // gradients on a large enough tensor.
+            if (argIndex is not null && spec.SecondaryOutput is not null)
+            {
+                string secondOff = EmitOffset(spec.SecondaryOutput, laneAxisReg[l],
+                                              reductionValues, reduction, out string? secondPred);
+                string secondAddr = NextRd(), secondByte = NextRd();
+                L($"mul.wide.u32 {secondByte}, {secondOff}, 4;");
+                L($"add.u64 {secondAddr}, {basePtr[spec.SecondaryOutput.ParameterIndex]}, {secondByte};");
+                if (secondPred is null) L($"st.global.u32 [{secondAddr}], {argIndex[l]};");
+                else L($"@{secondPred} st.global.u32 [{secondAddr}], {argIndex[l]};");
+            }
+
+            // EVERY REMAINING EXTRA OUTPUT, from the SAME accumulator. The count is not
+            // capped: an Adam step writes two moment states and the updated parameter, and
+            // splitting that across kernels re-reads every operand once per kernel -- which
+            // is the exact cost the fusion argument is about.
+            //
+            // The argmax written just above is skipped here because it has already been
+            // emitted through the legacy path; both are entries in the same list.
+            for (int e = 0; e < spec.ExtraOutputs.Count; e++)
+            {
+                var extra = spec.ExtraOutputs[e];
+                if (extra.Kind == CodegenExtraOutputKind.ArgMaxIndex) continue;
+
+                // Scale * primary, then optionally + BiasScale * bias. The primary is the
+                // FINISHED value -- after the epilogue activation -- because an optimizer's
+                // parameter update steps by the state it just computed, not by a partial.
+                string value = NextF();
+                L($"mul.rn.f32 {value}, {acc}, {F32(extra.Scale)};");
+
+                if (extra.BiasInput.HasValue)
+                {
+                    var biasBinding = spec.Inputs[extra.BiasInput.Value];
+                    string biasValue = EmitLoad(
+                        biasBinding, basePtr[biasBinding.ParameterIndex], laneAxisReg[l],
+                        reductionValues, reduction, out _);
+                    string combined = NextF();
+                    L($"fma.rn.f32 {combined}, {biasValue}, {F32(extra.BiasScale)}, {value};");
+                    value = combined;
+                }
+
+                string extraOff = EmitOffset(extra.Binding, laneAxisReg[l],
+                                             reductionValues, reduction, out string? extraPred);
+                string extraAddr = NextRd(), extraByte = NextRd();
+                L($"mul.wide.u32 {extraByte}, {extraOff}, {I(extra.Binding.ElementBytes)};");
+                L($"add.u64 {extraAddr}, {basePtr[extra.Binding.ParameterIndex]}, {extraByte};");
+
+                if (extra.Binding.NeedsConversion)
+                {
+                    string narrowedExtra = EmitNarrow(extra.Binding.ElementType, value);
+                    if (extraPred is null) L($"st.global.u16 [{extraAddr}], {narrowedExtra};");
+                    else L($"@{extraPred} st.global.u16 [{extraAddr}], {narrowedExtra};");
+                }
+                else if (extraPred is null) L($"st.global.f32 [{extraAddr}], {value};");
+                else L($"@{extraPred} st.global.f32 [{extraAddr}], {value};");
+
+                ExtraOutputStores++;
+            }
+        }
+
+        if (pendingStore is not null)
+        {
+            string vecOff = EmitOffset(spec.Output, laneAxisReg[0], reductionValues, reduction,
+                                       out string? vecPred);
+            if (vecPred is not null)
+                throw new InvalidOperationException(
+                    "A vectorised store must be provably in range; " + spec.Output.Name +
+                    " produced a guard.");
+
+            string vecByte = NextRd(), vecAddr = NextRd();
+            L($"mul.wide.u32 {vecByte}, {vecOff}, {I(spec.Output.ElementBytes)};");
+            L($"add.u64 {vecAddr}, {basePtr[spec.Output.ParameterIndex]}, {vecByte};");
+
+            if (spec.Output.NeedsConversion)
+            {
+                // Four halves are two words. Each word carries a PAIR, so the second of each
+                // pair is shifted up before being or-ed in -- the mirror of the shift-down the
+                // narrow vector LOAD does when it unpacks.
+                var words = new string[2];
+                for (int w = 0; w < 2; w++)
+                {
+                    string lo = EmitNarrow(spec.Output.ElementType, pendingStore[w * 2]);
+                    string hi = EmitNarrow(spec.Output.ElementType, pendingStore[w * 2 + 1]);
+                    string shifted = NextR();
+                    words[w] = NextR();
+                    L($"shl.b32 {shifted}, {hi}, 16;");
+                    L($"or.b32 {words[w]}, {lo}, {shifted};");
+                }
+                L($"st.global.v2.u32 [{vecAddr}], {{{words[0]}, {words[1]}}};");
+            }
+            else
+            {
+                L($"st.global.v4.f32 [{vecAddr}], " +
+                  $"{{{pendingStore[0]}, {pendingStore[1]}, {pendingStore[2]}, {pendingStore[3]}}};");
+            }
+
+            VectorisedStores++;
         }
 
         // Loads before the loop run once, loads in its body run once per trip, loads
@@ -1398,16 +2055,7 @@ public sealed class PtxAffineEmitter
 
         CheckEmittedSize(spec);
         _body.Append("END:\n    ret;\n}\n");
-
-        if (SharedMemoryBytes > 0)
-            _sb.Append("    .shared .align 4 .b8 stageBuf[")
-               .Append(I(SharedMemoryBytes)).Append("];\n");
-        _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
-           .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
-           .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")
-           .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
-           .Append(_body);
-        return _sb.ToString();
+        return Assemble();
     }
 
     /// <summary>
@@ -1465,6 +2113,87 @@ public sealed class PtxAffineEmitter
     /// Emits the flat element offset for a binding, plus the DERIVED validity
     /// predicate (null when the maps provably cannot leave the tensor).
     /// </summary>
+    /// <summary>
+    /// Evaluates a single affine expression into a register.
+    /// </summary>
+    /// <remarks>
+    /// Used for the secondary output's index, which is an expression rather than a tensor
+    /// map: it names a POSITION in the input, not an address in a binding. Reduction-axis
+    /// terms fold to constants exactly as they do in an address, because the value is
+    /// emitted once per unrolled term.
+    /// </remarks>
+    /// <summary>
+    /// Closes the module: register declarations sized from what the body actually used,
+    /// then the body.
+    /// </summary>
+    /// <remarks>
+    /// The bound is DERIVED FROM USAGE rather than fixed. It was previously a literal
+    /// %p&lt;256&gt;/%f&lt;512&gt;, which is a silent ceiling rather than a generous bound:
+    /// coarsening pushed the transposed convolution one past the declared range, and ptxas
+    /// reported it as "Arguments mismatch for instruction 'setp'" -- an undeclared register,
+    /// not a malformed instruction.
+    /// </remarks>
+    private string Assemble()
+    {
+        if (SharedMemoryBytes > 0)
+            _sb.Append("    .shared .align 4 .b8 stageBuf[")
+               .Append(I(SharedMemoryBytes)).Append("];\n");
+        _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
+           .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
+           .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")
+           .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
+           .Append(_body);
+        return _sb.ToString();
+    }
+
+    private string EmitAffine(
+        CodegenAffineExpr expr, string[] axisReg, int[] reductionValues, int[] reductionAxes)
+    {
+        var reductionSet = new HashSet<int>(reductionAxes);
+
+        int folded = expr.Constant;
+        var symbolic = new List<CodegenAffineTerm>();
+        foreach (var term in expr.Terms)
+        {
+            if (reductionSet.Contains(term.Axis)) folded += term.Coefficient * reductionValues[term.Axis];
+            else symbolic.Add(term);
+        }
+
+        string? value = null;
+        foreach (var term in symbolic)
+        {
+            string contribution;
+            if (term.Coefficient == 1) contribution = axisReg[term.Axis];
+            else
+            {
+                contribution = NextR();
+                L($"mul.lo.s32 {contribution}, {axisReg[term.Axis]}, {I(term.Coefficient)};");
+            }
+            if (value is null) value = contribution;
+            else { string sum = NextR(); L($"add.s32 {sum}, {value}, {contribution};"); value = sum; }
+        }
+
+        if (value is null)
+        {
+            value = NextR();
+            L($"mov.u32 {value}, {I(folded)};");
+        }
+        else if (folded != 0)
+        {
+            string sum = NextR();
+            L($"add.s32 {sum}, {value}, {I(folded)};");
+            value = sum;
+        }
+
+        if (expr.Divisor != 1)
+        {
+            string divided = NextR();
+            L($"div.s32 {divided}, {value}, {I(expr.Divisor)};");
+            value = divided;
+        }
+        return value;
+    }
+
     private string EmitOffset(
         CodegenTensorBinding binding,
         string[] axisReg,
@@ -1478,83 +2207,20 @@ public sealed class PtxAffineEmitter
 
         for (int d = 0; d < binding.Map.Count; d++)
         {
-            var expr = binding.Map[d];
             int dim = binding.Shape[d];
             long stride = binding.Stride(d);
+            string idx;
 
-            // Fold every reduction-axis term into the constant; keep parallel terms symbolic.
-            int folded = expr.Constant;
-            var symbolic = new List<CodegenAffineTerm>();
-            foreach (var term in expr.Terms)
+            var indirect = binding.Indirect[d];
+            if (indirect is not null)
             {
-                if (reductionSet.Contains(term.Axis)) folded += term.Coefficient * reductionValues[term.Axis];
-                else symbolic.Add(term);
-            }
-
-            // Build the numerator.
-            string? num;
-            if (symbolic.Count == 0)
-            {
-                num = NextR();
-                L($"mov.u32 {num}, {I(folded)};");
+                idx = EmitIndirectIndex(indirect, axisReg, reductionValues, reductionSet, ref predicate);
             }
             else
             {
-                num = null;
-                foreach (var term in symbolic)
-                {
-                    string contribution;
-                    if (term.Coefficient == 1) contribution = axisReg[term.Axis];
-                    else
-                    {
-                        contribution = NextR();
-                        L($"mul.lo.s32 {contribution}, {axisReg[term.Axis]}, {I(term.Coefficient)};");
-                    }
-                    if (num is null) num = contribution;
-                    else { string s = NextR(); L($"add.s32 {s}, {num}, {contribution};"); num = s; }
-                }
-                if (folded != 0) { string s = NextR(); L($"add.s32 {s}, {num}, {I(folded)};"); num = s; }
-            }
-
-            // Apply the divisor, deriving the exactness predicate when required.
-            string idx = num!;
-            if (expr.Divisor != 1)
-            {
-                if (expr.RequiresExactDivision)
-                {
-                    string rem = NextR(), pe = NextP();
-                    L($"rem.s32 {rem}, {num}, {I(expr.Divisor)};");
-                    L($"setp.eq.s32 {pe}, {rem}, 0;");
-                    predicate = AndPred(predicate, pe);
-                }
-                idx = NextR();
-                L($"div.s32 {idx}, {num}, {I(expr.Divisor)};");
-            }
-
-            // Derived bounds predicate: 0 <= idx < dim, emitted only when the folded
-            // expression can ACTUALLY leave the tensor.
-            //
-            // Interval analysis over the parallel axis ranges, not a syntactic guess.
-            // The syntactic form is both unsound and wasteful: after a reduction axis is
-            // folded away, `oh + kh - 1` becomes `oh - 1`, `oh`, or `oh + 1` depending on
-            // the tap, and only the first and last can escape [0, H). Testing the
-            // pre-folding constant guards all three; testing the folded range guards
-            // exactly the two that need it -- fewer instructions AND no missed case.
-            long rangeLo = folded, rangeHi = folded;
-            foreach (var term in symbolic)
-            {
-                long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
-                if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
-            }
-            bool canEscape = expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim;
-            if (!canEscape) ElidedGuards++;
-            if (canEscape)
-            {
-                string lo = NextP(), hi = NextP(), both = NextP();
-                L($"setp.ge.s32 {lo}, {idx}, 0;");
-                L($"setp.lt.s32 {hi}, {idx}, {I(dim)};");
-                L($"and.pred {both}, {lo}, {hi};");
-                predicate = AndPred(predicate, both);
+                var expr = binding.Map[d];
+                idx = EmitAffineIndex(
+                    expr, axisReg, reductionValues, reductionSet, dim, ref predicate);
             }
 
             // offset += idx * stride
@@ -1575,15 +2241,169 @@ public sealed class PtxAffineEmitter
     }
 
     /// <summary>
-    /// Emits a guarded load, yielding the REDUCTION'S IDENTITY for an out-of-range access.
+    /// Computes one affine dimension's index, contributing its exactness and bounds terms to
+    /// <paramref name="predicate"/>.
+    /// </summary>
+    private string EmitAffineIndex(
+        CodegenAffineExpr expr,
+        string[] axisReg,
+        int[] reductionValues,
+        HashSet<int> reductionSet,
+        int dim,
+        ref string? predicate)
+    {
+        // Fold every reduction-axis term into the constant; keep parallel terms symbolic.
+        int folded = expr.Constant;
+        var symbolic = new List<CodegenAffineTerm>();
+        foreach (var term in expr.Terms)
+        {
+            if (reductionSet.Contains(term.Axis)) folded += term.Coefficient * reductionValues[term.Axis];
+            else symbolic.Add(term);
+        }
+
+        // Build the numerator.
+        string? num;
+        if (symbolic.Count == 0)
+        {
+            num = NextR();
+            L($"mov.u32 {num}, {I(folded)};");
+        }
+        else
+        {
+            num = null;
+            foreach (var term in symbolic)
+            {
+                string contribution;
+                if (term.Coefficient == 1) contribution = axisReg[term.Axis];
+                else
+                {
+                    contribution = NextR();
+                    L($"mul.lo.s32 {contribution}, {axisReg[term.Axis]}, {I(term.Coefficient)};");
+                }
+                if (num is null) num = contribution;
+                else { string s = NextR(); L($"add.s32 {s}, {num}, {contribution};"); num = s; }
+            }
+            if (folded != 0) { string s = NextR(); L($"add.s32 {s}, {num}, {I(folded)};"); num = s; }
+        }
+
+        // Apply the divisor, deriving the exactness predicate when required.
+        string idx = num!;
+        if (expr.Divisor != 1)
+        {
+            if (expr.RequiresExactDivision)
+            {
+                string rem = NextR(), pe = NextP();
+                L($"rem.s32 {rem}, {num}, {I(expr.Divisor)};");
+                L($"setp.eq.s32 {pe}, {rem}, 0;");
+                predicate = AndPred(predicate, pe);
+            }
+            idx = NextR();
+            L($"div.s32 {idx}, {num}, {I(expr.Divisor)};");
+        }
+
+        // Derived bounds predicate: 0 <= idx < dim, emitted only when the folded
+        // expression can ACTUALLY leave the tensor.
+        //
+        // Interval analysis over the parallel axis ranges, not a syntactic guess.
+        // The syntactic form is both unsound and wasteful: after a reduction axis is
+        // folded away, `oh + kh - 1` becomes `oh - 1`, `oh`, or `oh + 1` depending on
+        // the tap, and only the first and last can escape [0, H). Testing the
+        // pre-folding constant guards all three; testing the folded range guards
+        // exactly the two that need it -- fewer instructions AND no missed case.
+        long rangeLo = folded, rangeHi = folded;
+        foreach (var term in symbolic)
+        {
+            long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
+            if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
+        }
+        bool canEscape = expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim;
+        if (!canEscape) ElidedGuards++;
+        if (canEscape)
+        {
+            string lo = NextP(), hi = NextP(), both = NextP();
+            L($"setp.ge.s32 {lo}, {idx}, 0;");
+            L($"setp.lt.s32 {hi}, {idx}, {I(dim)};");
+            L($"and.pred {both}, {lo}, {hi};");
+            predicate = AndPred(predicate, both);
+        }
+
+        return idx;
+    }
+
+    /// <summary>
+    /// Loads a dimension's index from another tensor at run time -- the gather/scatter case.
     /// </summary>
     /// <remarks>
-    /// Zero is the additive identity, not the universal one. Under a maximum, a zero-filled
-    /// out-of-range tap is a real candidate, so a padded max-pool over all-negative inputs
-    /// returns 0 instead of the true maximum. The oracle had the same bug in the same
-    /// direction, so the exact-agreement gate passed it -- the one class of defect a shared
-    /// oracle cannot catch.
+    /// <para>
+    /// Two guards are emitted and they do different jobs, which is the whole subtlety here.
+    /// </para>
+    /// <para>
+    /// The value is ALWAYS clamped into <c>[0, bound)</c> before it reaches the address
+    /// arithmetic. That is not the caller's out-of-range policy -- it is what keeps a
+    /// malformed index tensor from forming an address outside the allocation. Predicating
+    /// the load alone would not do it: the address is computed whether or not the load
+    /// fires, and on a wild index that arithmetic can overflow into somebody else's memory.
+    /// </para>
+    /// <para>
+    /// The POLICY then decides whether the access counts. Under <c>Skip</c> the range test
+    /// joins the access predicate, so an out-of-range index contributes the reduction
+    /// identity on a gather and performs no write on a scatter -- which is what a padding row
+    /// or a -1 sentinel means. Under <c>Clamp</c> no predicate is added and the clamped edge
+    /// element is genuinely read or written.
+    /// </para>
     /// </remarks>
+    private string EmitIndirectIndex(
+        CodegenIndirectIndex indirect,
+        string[] axisReg,
+        int[] reductionValues,
+        HashSet<int> reductionSet,
+        ref string? predicate)
+    {
+        var indexBinding = _inputBindings![indirect.IndexInput];
+
+        // Where to read the index from. This position is still affine, which is what keeps
+        // the whole mechanism tractable: the emitter knows exactly where the index lives, it
+        // just does not know its value until the load returns.
+        string? positionPredicate = null;
+        string position = EmitAffineIndex(
+            indirect.Position, axisReg, reductionValues, reductionSet,
+            (int)indexBinding.ElementCount, ref positionPredicate);
+
+        string posBytes = NextRd(), posAddr = NextRd(), raw = NextR();
+        L($"mul.wide.s32 {posBytes}, {position}, 4;");
+        L($"add.u64 {posAddr}, {_basePointers![indexBinding.ParameterIndex]}, {posBytes};");
+
+        if (positionPredicate is null)
+        {
+            L($"ld.global.nc.u32 {raw}, [{posAddr}];");
+        }
+        else
+        {
+            // A position outside the index tensor reads nothing and yields a sentinel that
+            // the range test below will reject.
+            L($"mov.u32 {raw}, 0xFFFFFFFF;");
+            L($"@{positionPredicate} ld.global.nc.u32 {raw}, [{posAddr}];");
+        }
+        IndirectIndexLoads++;
+
+        if (indirect.OutOfRange == CodegenIndexOutOfRange.Skip)
+        {
+            string lo = NextP(), hi = NextP(), both = NextP();
+            L($"setp.ge.s32 {lo}, {raw}, 0;");
+            L($"setp.lt.s32 {hi}, {raw}, {I(indirect.Bound)};");
+            L($"and.pred {both}, {lo}, {hi};");
+            predicate = AndPred(predicate, both);
+            if (positionPredicate is not null) predicate = AndPred(predicate, positionPredicate);
+        }
+
+        // The unconditional clamp described above. Both forms need it.
+        string clampedLow = NextR(), clamped = NextR();
+        L($"max.s32 {clampedLow}, {raw}, 0;");
+        L($"min.s32 {clamped}, {clampedLow}, {I(indirect.Bound - 1)};");
+        return clamped;
+    }
+
+    /// <summary>Emits a guarded load, yielding 0 for an out-of-range access (zero padding).</summary>
     private string EmitLoad(
         CodegenTensorBinding binding,
         string basePtr,
@@ -1592,10 +2412,48 @@ public sealed class PtxAffineEmitter
         int[] reductionAxes,
         out string? predicate)
     {
+        if (binding.IsIndexTensor)
+            throw new NotSupportedException(
+                "'" + binding.Name + "' is an int32 index tensor and cannot be read as an " +
+                "arithmetic operand. Reading it as one would compute with a bit pattern.");
+
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out predicate);
         string byteOff = NextRd(), addr = NextRd(), dst = NextF();
-        L($"mul.wide.s32 {byteOff}, {offset}, 4;");
+        L($"mul.wide.s32 {byteOff}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {addr}, {basePtr}, {byteOff};");
+
+        if (binding.NeedsConversion)
+        {
+            // NARROW STORAGE, WIDE ARITHMETIC. A 16-bit operand is widened the moment it
+            // is read and everything downstream stays fp32, which is what mixed precision
+            // means: the operands are narrow, the accumulator is not. Accumulating in fp16
+            // would lose roughly three decimal digits over a long reduction and is never
+            // what a caller wants from a narrow INPUT.
+            string raw = NextR();
+            if (predicate is null)
+            {
+                L($"ld.global.nc.u16 {raw}, [{addr}];");
+            }
+            else
+            {
+                L($"mov.u32 {raw}, 0;");
+                L($"@{predicate} ld.global.nc.u16 {raw}, [{addr}];");
+            }
+            EmitWiden(binding.ElementType, raw, dst);
+
+            // The out-of-range fill has to be applied AFTER widening: a zero bit pattern is
+            // zero in both formats, but the Max identity is negative infinity and its fp16
+            // pattern differs from its fp32 one.
+            if (predicate is not null && _outOfRangeFill != "0f00000000")
+            {
+                string fill = NextF();
+                L($"mov.f32 {fill}, {_outOfRangeFill};");
+                L($"selp.f32 {dst}, {dst}, {fill}, {predicate};");
+            }
+            EmittedLoads++;
+            return dst;
+        }
+
         if (predicate is null)
         {
             L($"ld.global.nc.f32 {dst}, [{addr}];");
@@ -1607,6 +2465,51 @@ public sealed class PtxAffineEmitter
         }
         EmittedLoads++;
         return dst;
+    }
+
+    /// <summary>Widens a 16-bit stored element in a b32 register into an f32 register.</summary>
+    /// <remarks>
+    /// fp16 has a hardware conversion. bf16 does not need one: it is the TOP 16 bits of the
+    /// fp32 pattern, so widening is a shift and narrowing is a truncation. Doing bf16
+    /// through <c>cvt</c> would be both slower and wrong, since no such instruction exists
+    /// for it on this architecture.
+    /// </remarks>
+    private void EmitWiden(CodegenElementType type, string rawB32, string destF32)
+    {
+        if (type == CodegenElementType.Float16)
+        {
+            L($"cvt.f32.f16 {destF32}, {rawB32};");
+            return;
+        }
+
+        string shifted = NextR();
+        L($"shl.b32 {shifted}, {rawB32}, 16;");
+        L($"mov.b32 {destF32}, {shifted};");
+    }
+
+    /// <summary>Narrows an f32 register into the low 16 bits of a b32 register.</summary>
+    /// <remarks>
+    /// bf16 narrowing rounds to nearest even rather than truncating. Truncation is the
+    /// obvious implementation and biases every value toward zero, which accumulates into a
+    /// systematic drift over a training run rather than showing up as noise in one kernel.
+    /// </remarks>
+    private string EmitNarrow(CodegenElementType type, string sourceF32)
+    {
+        string result = NextR();
+        if (type == CodegenElementType.Float16)
+        {
+            L($"cvt.rn.f16.f32 {result}, {sourceF32};");
+            return result;
+        }
+
+        string bits = NextR(), lsb = NextR(), bias = NextR(), rounded = NextR();
+        L($"mov.b32 {bits}, {sourceF32};");
+        L($"shr.u32 {lsb}, {bits}, 16;");
+        L($"and.b32 {lsb}, {lsb}, 1;");
+        L($"add.u32 {bias}, {lsb}, 32767;");
+        L($"add.u32 {rounded}, {bits}, {bias};");
+        L($"shr.u32 {result}, {rounded}, 16;");
+        return result;
     }
 
     private string? AndPred(string? a, string? b)

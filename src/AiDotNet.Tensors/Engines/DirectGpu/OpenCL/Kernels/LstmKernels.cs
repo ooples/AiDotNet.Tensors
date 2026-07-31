@@ -166,8 +166,11 @@ __kernel void lstm_forward_sequence(
             float sumG = biasIh[2 * hiddenSize + h] + biasHh[2 * hiddenSize + h];
             float sumO = biasIh[3 * hiddenSize + h] + biasHh[3 * hiddenSize + h];
 
-            // Input contribution at this timestep
-            int inputOffset = t * batch * inputSize + b * inputSize;
+            // Input contribution at this timestep. The engine feeds the input in its native
+            // [batch, seq, in] (batch-major) layout — element (b, t) is at (b*seqLen + t) — so the
+            // offset must be batch-major too. It was seq-major (t*batch + b), which reads the wrong
+            // element whenever batch != seq and grossly corrupted the forward output.
+            int inputOffset = (b * seqLen + t) * inputSize;
             for (int j = 0; j < inputSize; j++) {
                 float inVal = input[inputOffset + j];
                 sumI += inVal * weightsIh[h * inputSize + j];
@@ -197,8 +200,11 @@ __kernel void lstm_forward_sequence(
             // Hidden state update
             float newH = o * tanh(newC);
 
-            // Store output
-            int outIdx = t * batch * hiddenSize + gid;
+            // Store output in the engine's native [batch, seq, hidden] (batch-major) layout —
+            // element (b, t, h) at (b*seqLen + t)*hidden + h — matching how the C# side reads bufOut
+            // as [B, S, Hd] with no permute. The previous seq-major index (t*batch + b) transposed
+            // the sequence whenever batch != seq.
+            int outIdx = (b * seqLen + t) * hiddenSize + h;
             output[outIdx] = newH;
 
             // Store all states for backward pass
@@ -371,331 +377,163 @@ __kernel void lstm_backward_prevh(
 }
 
 // ===========================================================================
-// LSTM BACKWARD SEQUENCE KERNEL
+// LSTM BACKWARD SEQUENCE (correct, race-free BPTT) -- two kernels
 // ===========================================================================
-// Processes backward pass through entire sequence.
-// Iterates in reverse through timesteps for proper BPTT.
+// The forward caches (allH/allC [(S+1),B,H], cacheGates [S,B,H,4] gate order i,f,g,o) are
+// seq-major; gradOutput/input/gradInput are the engine's native batch-major [B,S,*]. The
+// recurrence over t is inherently sequential, so kernel A runs ONE work-item per batch element
+// (each independent -> no barriers, no cross-work-item writes) and emits the gate-preactivation
+// gradients dGates[S,B,4H], grad_input, and the initial-state grads (gradHInit/gradCInit double
+// as the reverse-time carry). Kernel B then sums dGates into the weight/bias gradients with one
+// work-item per output element -- each an independent reduction over (t,b), so no atomics.
 
-__kernel void lstm_backward_sequence(
-    __global const float* gradOutput,  // [seqLen, batch, hidden_size]
-    __global const float* allH,        // [seqLen + 1, batch, hidden_size]
-    __global const float* allC,        // [seqLen + 1, batch, hidden_size]
-    __global const float* cacheGates,  // [seqLen, batch, hidden_size, 4]
-    __global const float* weightsIh,   // [4 * hidden_size, input_size]
-    __global const float* weightsHh,   // [4 * hidden_size, hidden_size]
-    __global float* gradInput,         // [seqLen, batch, input_size]
-    __global float* gradHInit,         // [batch, hidden_size]
-    __global float* gradCInit,         // [batch, hidden_size]
-    __global float* gradWeightsIh,     // [4 * hidden_size, input_size] - accumulated
-    __global float* gradWeightsHh,     // [4 * hidden_size, hidden_size] - accumulated
-    __global float* gradBiasIh,        // [4 * hidden_size] - accumulated
-    __global float* gradBiasHh,        // [4 * hidden_size] - accumulated
-    __global const float* input,       // [seqLen, batch, input_size]
+// Kernel A: per-(batch) reverse-time BPTT. global size = batch.
+__kernel void lstm_backward_dgates(
+    __global const float* gradOutput,  // [batch, seqLen, hidden] (batch-major)
+    __global const float* allC,        // [seqLen + 1, batch, hidden]  (allC[0]=c0, allC[t+1]=c_t)
+    __global const float* cacheGates,  // [seqLen, batch, hidden, 4]   (slots: i,f,g,o)
+    __global const float* weightsIh,   // [4*hidden, inputSize]
+    __global const float* weightsHh,   // [4*hidden, hidden]
+    __global float* dGates,            // [seqLen, batch, 4*hidden]  (out: gate-preact grads)
+    __global float* gradInput,         // [batch, seqLen, inputSize] (batch-major, out)
+    __global float* gradHInit,         // [batch, hidden] (out; also the reverse-time dH carry)
+    __global float* gradCInit,         // [batch, hidden] (out; also the reverse-time dC carry)
     const int seqLen,
     const int batch,
     const int inputSize,
     const int hiddenSize)
 {
-    int gid = get_global_id(0);
-    int totalElements = batch * hiddenSize;
-    int b = gid / hiddenSize;
-    int h = gid % hiddenSize;
-    int isValid = (gid < totalElements) ? 1 : 0;
+    int b = get_global_id(0);
+    if (b >= batch) return;
 
-    // Initialize gradients
-    float dH = 0.0f;  // Gradient w.r.t. hidden state (accumulated from next timestep)
-    float dC = 0.0f;  // Gradient w.r.t. cell state (accumulated from next timestep)
+    int H = hiddenSize;
+    int G = 4 * H;
 
-    // Initialize gradHInit buffer for use as intermediate storage during BPTT
-    if (isValid) {
-        gradHInit[gid] = 0.0f;
+    // Carries start at zero: h_{S-1}/c_{S-1} receive no gradient from beyond the sequence end.
+    for (int h = 0; h < H; h++) {
+        gradHInit[b * H + h] = 0.0f;
+        gradCInit[b * H + h] = 0.0f;
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
 
-    // Process timesteps in reverse
     for (int t = seqLen - 1; t >= 0; t--) {
-        if (isValid) {
-            // Read accumulated recurrent gradient from previous iteration (if any)
-            if (t < seqLen - 1) {
-                dH = gradHInit[gid];
-                gradHInit[gid] = 0.0f;  // Clear for next accumulation
-            }
-        }
-        barrier(CLK_GLOBAL_MEM_FENCE);
+        int goBase   = (b * seqLen + t) * H;              // gradOutput[b, t, :]
+        int cCurr    = ((t + 1) * batch + b) * H;         // allC[t+1] = c_t
+        int cPrev    = (t * batch + b) * H;               // allC[t]   = c_{t-1}
+        int gateBase = ((t * batch + b) * H) * 4;         // cacheGates[t, b, :, :]
+        int dgBase   = (t * batch + b) * G;               // dGates[t, b, :]
 
-        if (isValid) {
-            // Add gradient from output at this timestep
-            int outIdx = t * batch * hiddenSize + gid;
-            dH += gradOutput[outIdx];
+        // Phase 1: per hidden unit -> gate-preactivation gradients; update the dC carry.
+        for (int h = 0; h < H; h++) {
+            float dh = gradOutput[goBase + h] + gradHInit[b * H + h];   // upstream + recurrent
+            int gI = gateBase + h * 4;
+            float i = cacheGates[gI + 0];
+            float f = cacheGates[gI + 1];
+            float g = cacheGates[gI + 2];
+            float o = cacheGates[gI + 3];
+            float cT    = allC[cCurr + h];
+            float cPrv  = allC[cPrev + h];
+            float tanhC = tanh(cT);
 
-            // Load cached gate values
-            int gateIdx = (t * batch * hiddenSize + gid) * 4;
-            float i = cacheGates[gateIdx + 0];
-            float f = cacheGates[gateIdx + 1];
-            float g = cacheGates[gateIdx + 2];
-            float o = cacheGates[gateIdx + 3];
+            float dO    = dh * tanhC;
+            float dPreO = dO * o * (1.0f - o);
+            float dc    = gradCInit[b * H + h] + dh * o * (1.0f - tanhC * tanhC);
+            float dI    = dc * g;
+            float dPreI = dI * i * (1.0f - i);
+            float dG    = dc * i;
+            float dPreG = dG * (1.0f - g * g);
+            float dF    = dc * cPrv;
+            float dPreF = dF * f * (1.0f - f);
 
-            // Load cell states
-            int prevStateIdx = t * batch * hiddenSize + gid;
-            int currStateIdx = (t + 1) * batch * hiddenSize + gid;
-            float cPrev = allC[prevStateIdx];
-            float cCurr = allC[currStateIdx];
+            // dc flows to the previous (earlier) timestep; at t==0 this becomes grad w.r.t. c0.
+            gradCInit[b * H + h] = dc * f;
 
-            float tanhC = tanh(cCurr);
-
-            // Gradient through output gate
-            float dO = dH * tanhC * sigmoid_derivative(o);
-
-            // Gradient to cell state (from hidden gradient + next timestep cell gradient)
-            dC += dH * o * tanh_derivative(tanhC);
-
-            // Gradients through gates
-            float dF = dC * cPrev * sigmoid_derivative(f);
-            float dI = dC * g * sigmoid_derivative(i);
-            float dG = dC * i * tanh_derivative(g);
-
-            // Gradient to previous cell state for next iteration
-            float dCPrev = dC * f;
-
-            // Gradient to previous hidden state for BPTT
-            // dH_prev[j] = sum_k (dGate[k] * Wh[k, j]) for all four gates
-            // Each thread k contributes its gate gradients to all hidden units j
-            // Note: Using simpler accumulation pattern - within work group this relies on
-            // sequential execution of contributions. For production, use proper float atomic add.
-            for (int j = 0; j < hiddenSize; j++) {
-                // Contribution from gate derivatives at position h to hidden unit j
-                // Wh layout: [4*hiddenSize, hiddenSize], so Wh[k, j] = Wh[k * hiddenSize + j]
-                float contrib = dI * weightsHh[h * hiddenSize + j];
-                contrib += dF * weightsHh[(hiddenSize + h) * hiddenSize + j];
-                contrib += dG * weightsHh[(2 * hiddenSize + h) * hiddenSize + j];
-                contrib += dO * weightsHh[(3 * hiddenSize + h) * hiddenSize + j];
-                // Simple accumulation - relies on single work group execution
-                // For multi-group, would need atomic operations or reduction kernel
-                gradHInit[b * hiddenSize + j] += contrib;
-            }
-
-            // Update dC for next iteration
-            dC = dCPrev;
+            // Store gate-preact grads; row = gate*H + h, gate order i,f,g,o (matches the weights).
+            dGates[dgBase + 0 * H + h] = dPreI;
+            dGates[dgBase + 1 * H + h] = dPreF;
+            dGates[dgBase + 2 * H + h] = dPreG;
+            dGates[dgBase + 3 * H + h] = dPreO;
         }
 
-        barrier(CLK_GLOBAL_MEM_FENCE);
-    }
+        // Phase 2a: recurrent dh for the previous step: dh_prev[hh] = sum_row dPre[row] * Whh[row, hh].
+        // Overwrites gradHInit (Phase 1 already consumed the old value for every h).
+        for (int hh = 0; hh < H; hh++) {
+            float s = 0.0f;
+            for (int row = 0; row < G; row++) {
+                s += dGates[dgBase + row] * weightsHh[row * H + hh];
+            }
+            gradHInit[b * H + hh] = s;   // at t==0 this becomes grad w.r.t. h0
+        }
 
-    // Store initial state gradients
-    // gradHInit already contains accumulated gradient for h_init
-    if (isValid) {
-        gradCInit[gid] = dC;
+        // Phase 2b: grad_input[b, t, j] = sum_row dPre[row] * Wih[row, j].
+        int giBase = (b * seqLen + t) * inputSize;
+        for (int j = 0; j < inputSize; j++) {
+            float s = 0.0f;
+            for (int row = 0; row < G; row++) {
+                s += dGates[dgBase + row] * weightsIh[row * inputSize + j];
+            }
+            gradInput[giBase + j] = s;
+        }
     }
 }
 
-// ===========================================================================
-// LSTM WEIGHT GRADIENT ACCUMULATION KERNELS
-// ===========================================================================
-
-__kernel void lstm_accumulate_weight_gradients_ih(
-    __global const float* input,        // [seqLen, batch, input_size]
-    __global const float* allH,         // [seqLen + 1, batch, hidden_size]
-    __global const float* allC,         // [seqLen + 1, batch, hidden_size]
-    __global const float* cacheGates,   // [seqLen, batch, hidden_size, 4]
-    __global const float* gradOutput,   // [seqLen, batch, hidden_size]
-    __global float* gradWeightsIh,      // [4 * hidden_size, input_size]
+// Kernel B: weight + bias gradients from the precomputed dGates. One work-item per output
+// element across the concatenated ranges [dWih | dWhh | dBias]; each is an independent sum.
+__kernel void lstm_backward_dweights(
+    __global const float* dGates,      // [seqLen, batch, 4*hidden]
+    __global const float* input,       // [batch, seqLen, inputSize] (batch-major)
+    __global const float* allH,        // [seqLen + 1, batch, hidden]  (allH[t] = h_{t-1})
+    __global float* gradWeightsIh,     // [4*hidden, inputSize]
+    __global float* gradWeightsHh,     // [4*hidden, hidden]
+    __global float* gradBiasIh,        // [4*hidden]
+    __global float* gradBiasHh,        // [4*hidden]
     const int seqLen,
     const int batch,
     const int inputSize,
     const int hiddenSize)
 {
     int gid = get_global_id(0);
-    int totalWeights = 4 * hiddenSize * inputSize;
+    int H = hiddenSize;
+    int G = 4 * H;
+    int nWih = G * inputSize;
+    int nWhh = G * H;
 
-    if (gid >= totalWeights) return;
-
-    int gateIdx = gid / (hiddenSize * inputSize);  // Which gate (0-3)
-    int remainder = gid % (hiddenSize * inputSize);
-    int h = remainder / inputSize;
-    int j = remainder % inputSize;
-
-    float gradSum = 0.0f;
-
-    // Accumulate gradients over all timesteps and batch elements
-    // Note: This requires computing gate gradients inline
-    for (int t = 0; t < seqLen; t++) {
-        for (int b = 0; b < batch; b++) {
-            int batchHiddenIdx = b * hiddenSize + h;
-
-            // Load cached values
-            int cacheIdx = (t * batch * hiddenSize + batchHiddenIdx) * 4;
-            float i = cacheGates[cacheIdx + 0];
-            float f = cacheGates[cacheIdx + 1];
-            float g = cacheGates[cacheIdx + 2];
-            float o = cacheGates[cacheIdx + 3];
-
-            // Cell states
-            int prevStateIdx = t * batch * hiddenSize + batchHiddenIdx;
-            int currStateIdx = (t + 1) * batch * hiddenSize + batchHiddenIdx;
-            float cPrev = allC[prevStateIdx];
-            float cCurr = allC[currStateIdx];
-
-            // Get output gradient (simplified - full impl needs accumulated dH, dC)
-            float dH = gradOutput[t * batch * hiddenSize + batchHiddenIdx];
-            float tanhC = tanh(cCurr);
-
-            // Compute gate gradients
-            float dO = dH * tanhC * sigmoid_derivative(o);
-            float dC = dH * o * tanh_derivative(tanhC);
-            float dF = dC * cPrev * sigmoid_derivative(f);
-            float dI = dC * g * sigmoid_derivative(i);
-            float dG = dC * i * tanh_derivative(g);
-
-            // Get input value
-            float inputVal = input[t * batch * inputSize + b * inputSize + j];
-
-            // Accumulate based on gate index
-            if (gateIdx == 0) {
-                gradSum += dI * inputVal;
-            } else if (gateIdx == 1) {
-                gradSum += dF * inputVal;
-            } else if (gateIdx == 2) {
-                gradSum += dG * inputVal;
-            } else {
-                gradSum += dO * inputVal;
+    if (gid < nWih) {
+        // dWih[row, j] = sum_{t,b} dGates[t,b,row] * input[b,t,j]
+        int row = gid / inputSize;
+        int j   = gid % inputSize;
+        float s = 0.0f;
+        for (int t = 0; t < seqLen; t++) {
+            for (int b = 0; b < batch; b++) {
+                s += dGates[(t * batch + b) * G + row] * input[(b * seqLen + t) * inputSize + j];
             }
         }
-    }
-
-    gradWeightsIh[gid] = gradSum;
-}
-
-__kernel void lstm_accumulate_weight_gradients_hh(
-    __global const float* allH,         // [seqLen + 1, batch, hidden_size]
-    __global const float* allC,         // [seqLen + 1, batch, hidden_size]
-    __global const float* cacheGates,   // [seqLen, batch, hidden_size, 4]
-    __global const float* gradOutput,   // [seqLen, batch, hidden_size]
-    __global float* gradWeightsHh,      // [4 * hidden_size, hidden_size]
-    const int seqLen,
-    const int batch,
-    const int hiddenSize)
-{
-    int gid = get_global_id(0);
-    int totalWeights = 4 * hiddenSize * hiddenSize;
-
-    if (gid >= totalWeights) return;
-
-    int gateIdx = gid / (hiddenSize * hiddenSize);  // Which gate (0-3)
-    int remainder = gid % (hiddenSize * hiddenSize);
-    int h = remainder / hiddenSize;
-    int j = remainder % hiddenSize;
-
-    float gradSum = 0.0f;
-
-    for (int t = 0; t < seqLen; t++) {
-        for (int b = 0; b < batch; b++) {
-            int batchHiddenIdx = b * hiddenSize + h;
-
-            // Load cached values
-            int cacheIdx = (t * batch * hiddenSize + batchHiddenIdx) * 4;
-            float i = cacheGates[cacheIdx + 0];
-            float f = cacheGates[cacheIdx + 1];
-            float g = cacheGates[cacheIdx + 2];
-            float o = cacheGates[cacheIdx + 3];
-
-            // Cell states
-            int prevStateIdx = t * batch * hiddenSize + batchHiddenIdx;
-            int currStateIdx = (t + 1) * batch * hiddenSize + batchHiddenIdx;
-            float cPrev = allC[prevStateIdx];
-            float cCurr = allC[currStateIdx];
-
-            // Get output gradient
-            float dH = gradOutput[t * batch * hiddenSize + batchHiddenIdx];
-            float tanhC = tanh(cCurr);
-
-            // Compute gate gradients
-            float dO = dH * tanhC * sigmoid_derivative(o);
-            float dC = dH * o * tanh_derivative(tanhC);
-            float dF = dC * cPrev * sigmoid_derivative(f);
-            float dI = dC * g * sigmoid_derivative(i);
-            float dG = dC * i * tanh_derivative(g);
-
-            // Get previous hidden value
-            float hPrev = allH[t * batch * hiddenSize + b * hiddenSize + j];
-
-            // Accumulate based on gate index
-            if (gateIdx == 0) {
-                gradSum += dI * hPrev;
-            } else if (gateIdx == 1) {
-                gradSum += dF * hPrev;
-            } else if (gateIdx == 2) {
-                gradSum += dG * hPrev;
-            } else {
-                gradSum += dO * hPrev;
+        gradWeightsIh[row * inputSize + j] = s;
+    } else if (gid < nWih + nWhh) {
+        // dWhh[row, hh] = sum_{t,b} dGates[t,b,row] * h_{t-1}[b,hh]   (h_{t-1} = allH[t])
+        int k   = gid - nWih;
+        int row = k / H;
+        int hh  = k % H;
+        float s = 0.0f;
+        for (int t = 0; t < seqLen; t++) {
+            for (int b = 0; b < batch; b++) {
+                s += dGates[(t * batch + b) * G + row] * allH[(t * batch + b) * H + hh];
             }
         }
-    }
-
-    gradWeightsHh[gid] = gradSum;
-}
-
-__kernel void lstm_accumulate_bias_gradients(
-    __global const float* allC,         // [seqLen + 1, batch, hidden_size]
-    __global const float* cacheGates,   // [seqLen, batch, hidden_size, 4]
-    __global const float* gradOutput,   // [seqLen, batch, hidden_size]
-    __global float* gradBias,           // [4 * hidden_size]
-    const int seqLen,
-    const int batch,
-    const int hiddenSize)
-{
-    int gid = get_global_id(0);
-    int totalBiases = 4 * hiddenSize;
-
-    if (gid >= totalBiases) return;
-
-    int gateIdx = gid / hiddenSize;  // Which gate (0-3)
-    int h = gid % hiddenSize;
-
-    float gradSum = 0.0f;
-
-    for (int t = 0; t < seqLen; t++) {
-        for (int b = 0; b < batch; b++) {
-            int batchHiddenIdx = b * hiddenSize + h;
-
-            // Load cached values
-            int cacheIdx = (t * batch * hiddenSize + batchHiddenIdx) * 4;
-            float i = cacheGates[cacheIdx + 0];
-            float f = cacheGates[cacheIdx + 1];
-            float g = cacheGates[cacheIdx + 2];
-            float o = cacheGates[cacheIdx + 3];
-
-            // Cell states
-            int prevStateIdx = t * batch * hiddenSize + batchHiddenIdx;
-            int currStateIdx = (t + 1) * batch * hiddenSize + batchHiddenIdx;
-            float cPrev = allC[prevStateIdx];
-            float cCurr = allC[currStateIdx];
-
-            // Get output gradient
-            float dH = gradOutput[t * batch * hiddenSize + batchHiddenIdx];
-            float tanhC = tanh(cCurr);
-
-            // Compute gate gradients
-            float dO = dH * tanhC * sigmoid_derivative(o);
-            float dC = dH * o * tanh_derivative(tanhC);
-            float dF = dC * cPrev * sigmoid_derivative(f);
-            float dI = dC * g * sigmoid_derivative(i);
-            float dG = dC * i * tanh_derivative(g);
-
-            // Accumulate based on gate index
-            if (gateIdx == 0) {
-                gradSum += dI;
-            } else if (gateIdx == 1) {
-                gradSum += dF;
-            } else if (gateIdx == 2) {
-                gradSum += dG;
-            } else {
-                gradSum += dO;
+        gradWeightsHh[row * H + hh] = s;
+    } else if (gid < nWih + nWhh + G) {
+        // dBih[row] = dBhh[row] = sum_{t,b} dGates[t,b,row]   (both biases share the gate grad)
+        int row = gid - nWih - nWhh;
+        float s = 0.0f;
+        for (int t = 0; t < seqLen; t++) {
+            for (int b = 0; b < batch; b++) {
+                s += dGates[(t * batch + b) * G + row];
             }
         }
+        gradBiasIh[row] = s;
+        gradBiasHh[row] = s;
     }
-
-    gradBias[gid] = gradSum;
 }
+
 ";
     }
 
@@ -711,10 +549,8 @@ __kernel void lstm_accumulate_bias_gradients(
             "lstm_cell_backward",
             "lstm_backward_input",
             "lstm_backward_prevh",
-            "lstm_backward_sequence",
-            "lstm_accumulate_weight_gradients_ih",
-            "lstm_accumulate_weight_gradients_hh",
-            "lstm_accumulate_bias_gradients"
+            "lstm_backward_dgates",
+            "lstm_backward_dweights"
         };
     }
 }
