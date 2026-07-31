@@ -113,11 +113,11 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         DirectPtxTensorView output,
         DirectPtxTensorView rms)
     {
-        DirectPtxAbi.RequireAtLeast(input, Blueprint.Tensors[0], nameof(input));
-        DirectPtxAbi.RequireAtLeast(residual, Blueprint.Tensors[1], nameof(residual));
-        DirectPtxAbi.RequireAtLeast(gamma, Blueprint.Tensors[2], nameof(gamma));
-        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[3], nameof(output));
-        DirectPtxAbi.RequireAtLeast(rms, Blueprint.Tensors[4], nameof(rms));
+        DirectPtxAbi.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.Require(residual, Blueprint.Tensors[1], nameof(residual));
+        DirectPtxAbi.Require(gamma, Blueprint.Tensors[2], nameof(gamma));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.Require(rms, Blueprint.Tensors[4], nameof(rms));
         if (output.Pointer == input.Pointer || output.Pointer == residual.Pointer)
             throw new ArgumentException("The fused output must not alias either input.", nameof(output));
 

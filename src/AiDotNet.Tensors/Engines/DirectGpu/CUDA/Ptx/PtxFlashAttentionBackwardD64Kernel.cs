@@ -100,21 +100,21 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView gradValue,
         DirectPtxTensorView? attentionBias = null)
     {
-        DirectPtxAbi.RequireAtLeast(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[1], nameof(query));
-        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[2], nameof(key));
-        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[3], nameof(value));
-        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[4], nameof(output));
-        DirectPtxAbi.RequireAtLeast(softmaxStats, Blueprint.Tensors[5], nameof(softmaxStats));
-        DirectPtxAbi.RequireAtLeast(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
-        DirectPtxAbi.RequireAtLeast(gradKey, Blueprint.Tensors[7], nameof(gradKey));
-        DirectPtxAbi.RequireAtLeast(gradValue, Blueprint.Tensors[8], nameof(gradValue));
+        DirectPtxAbi.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[1], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[2], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[3], nameof(value));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.Require(softmaxStats, Blueprint.Tensors[5], nameof(softmaxStats));
+        DirectPtxAbi.Require(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
+        DirectPtxAbi.Require(gradKey, Blueprint.Tensors[7], nameof(gradKey));
+        DirectPtxAbi.Require(gradValue, Blueprint.Tensors[8], nameof(gradValue));
         if (HasAttentionBias != attentionBias.HasValue)
             throw new ArgumentException(
                 "The attention-bias view must match the baked FlashAttention-backward specialization.",
                 nameof(attentionBias));
         if (attentionBias is DirectPtxTensorView bias)
-            DirectPtxAbi.RequireAtLeast(bias, Blueprint.Tensors[9], nameof(attentionBias));
+            DirectPtxAbi.Require(bias, Blueprint.Tensors[9], nameof(attentionBias));
         RejectOutputAliasing(
             gradOutput, query, key, value, output, softmaxStats,
             gradQuery, gradKey, gradValue, attentionBias);

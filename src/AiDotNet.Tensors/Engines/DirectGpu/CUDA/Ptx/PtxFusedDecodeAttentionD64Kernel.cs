@@ -96,10 +96,10 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         DirectPtxTensorView output)
     {
         if (IsPaged) throw new InvalidOperationException("A paged decode module requires a block table.");
-        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[0], nameof(query));
-        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[1], nameof(key));
-        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[2], nameof(value));
-        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[1], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[2], nameof(value));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[3], nameof(output));
         RejectAliases(query, key, value, output);
 
         IntPtr q = query.Pointer, k = key.Pointer, v = value.Pointer, o = output.Pointer;
@@ -116,11 +116,11 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         DirectPtxTensorView output)
     {
         if (!IsPaged) throw new InvalidOperationException("A dense decode module has no block table ABI.");
-        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[0], nameof(query));
-        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[1], nameof(key));
-        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[2], nameof(value));
-        DirectPtxAbi.RequireAtLeast(blockTable, Blueprint.Tensors[3], nameof(blockTable));
-        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[1], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[2], nameof(value));
+        DirectPtxAbi.Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[4], nameof(output));
         RejectAliases(query, key, value, output);
 
         IntPtr q = query.Pointer, k = key.Pointer, v = value.Pointer;

@@ -114,14 +114,14 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView gradKey,
         DirectPtxTensorView gradValue)
     {
-        DirectPtxAbi.RequireAtLeast(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[1], nameof(query));
-        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[2], nameof(key));
-        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[3], nameof(value));
-        DirectPtxAbi.RequireAtLeast(probabilities, Blueprint.Tensors[4], nameof(probabilities));
-        DirectPtxAbi.RequireAtLeast(gradQuery, Blueprint.Tensors[5], nameof(gradQuery));
-        DirectPtxAbi.RequireAtLeast(gradKey, Blueprint.Tensors[6], nameof(gradKey));
-        DirectPtxAbi.RequireAtLeast(gradValue, Blueprint.Tensors[7], nameof(gradValue));
+        DirectPtxAbi.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[1], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[2], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[3], nameof(value));
+        DirectPtxAbi.Require(probabilities, Blueprint.Tensors[4], nameof(probabilities));
+        DirectPtxAbi.Require(gradQuery, Blueprint.Tensors[5], nameof(gradQuery));
+        DirectPtxAbi.Require(gradKey, Blueprint.Tensors[6], nameof(gradKey));
+        DirectPtxAbi.Require(gradValue, Blueprint.Tensors[7], nameof(gradValue));
         RejectOutputAliasing(
             gradOutput, query, key, value, probabilities, gradQuery, gradKey, gradValue);
 

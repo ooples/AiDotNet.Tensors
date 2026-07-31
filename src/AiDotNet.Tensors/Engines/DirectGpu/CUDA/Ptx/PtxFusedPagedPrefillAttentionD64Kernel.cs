@@ -90,11 +90,11 @@ internal sealed class PtxFusedPagedPrefillAttentionD64Kernel : IDisposable
         DirectPtxTensorView blockTable,
         DirectPtxTensorView output)
     {
-        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[0], nameof(query));
-        DirectPtxAbi.RequireAtLeast(keyPages, Blueprint.Tensors[1], nameof(keyPages));
-        DirectPtxAbi.RequireAtLeast(valuePages, Blueprint.Tensors[2], nameof(valuePages));
-        DirectPtxAbi.RequireAtLeast(blockTable, Blueprint.Tensors[3], nameof(blockTable));
-        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.Require(keyPages, Blueprint.Tensors[1], nameof(keyPages));
+        DirectPtxAbi.Require(valuePages, Blueprint.Tensors[2], nameof(valuePages));
+        DirectPtxAbi.Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[4], nameof(output));
         if (output.Pointer == query.Pointer || output.Pointer == keyPages.Pointer ||
             output.Pointer == valuePages.Pointer || output.Pointer == blockTable.Pointer)
             throw new ArgumentException("Paged-prefill output may not alias Q, K, V, or the block table.", nameof(output));
