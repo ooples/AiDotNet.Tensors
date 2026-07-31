@@ -657,6 +657,17 @@ public class DirectPtxWmmaTests
     }
 
     [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void MeasuredResourceBudget_RejectsNonPositiveMeasurement(int measuredRegisters)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegisters, maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1));
+    }
+
+    [Theory]
     [InlineData(8, 0, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 6, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 9, (int)DirectPtxArchitectureFamily.Ada)]
