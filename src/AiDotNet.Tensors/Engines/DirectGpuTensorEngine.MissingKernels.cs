@@ -997,6 +997,75 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// GPU-executed ADJOINT of RFFT: maps a gradient shaped like the interleaved one-sided spectrum
+    /// back onto the real input signal. Returns null when the GPU path is unavailable, so the caller
+    /// can fall back to the managed adjoint.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors <c>BackwardFunctions.RFFTAdjointBackward</c>: scatter the one-sided bins into a full
+    /// nFft complex spectrum with the bins above Nyquist left at ZERO (no Hermitian mirroring — that
+    /// is what makes this the transpose rather than the inverse), apply the UNNORMALISED inverse
+    /// transform, then take the real part's first <paramref name="signalLength"/> samples.
+    /// </para>
+    /// <para>
+    /// No new kernel is needed on any backend. <c>BatchedFFT(inverse: true)</c> already applies the
+    /// 1/nFft that the true inverse carries (CudaBackend dispatches <c>scale_inverse</c> for it), so
+    /// the adjoint is exactly <c>nFft x</c> that result — recovered with the existing <c>Scale</c>.
+    /// Every primitive used here (<c>DeinterleaveComplex</c>, <c>Fill</c>, <c>CopyRows</c>,
+    /// <c>BatchedFFT</c>, <c>Scale</c>) is on IDirectGpuBackend, so this works on all six backends
+    /// from one implementation.
+    /// </para>
+    /// </remarks>
+    internal Tensor<T>? RfftAdjointGpu<T>(Tensor<T> gradOutput, int signalLength, int nFft, int[] inputShape)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
+        int numFreqs = nFft / 2 + 1;
+        if (gradOutput.Length % (numFreqs * 2) != 0) return null;
+        int batch = gradOutput.Length / (numFreqs * 2);
+        if (batch <= 0) return null;
+
+        try
+        {
+            var gc = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufGrad = GetOrAllocateBuffer(backend, gc);
+            using var oneSidedRe = AllocateOutputBuffer(backend, batch * numFreqs);
+            using var oneSidedIm = AllocateOutputBuffer(backend, batch * numFreqs);
+            using var fullRe = AllocateOutputBuffer(backend, batch * nFft);
+            using var fullIm = AllocateOutputBuffer(backend, batch * nFft);
+            using var outRe = AllocateOutputBuffer(backend, batch * nFft);
+            using var outIm = AllocateOutputBuffer(backend, batch * nFft);
+
+            // Interleaved [re,im,re,im,...] -> separate planes, the GPU-native complex layout.
+            backend.DeinterleaveComplex(bufGrad.Buffer, oneSidedRe.Buffer, oneSidedIm.Buffer, batch * numFreqs);
+
+            // Zero the full spectrum, then place the one-sided bins. Bins above Nyquist stay ZERO.
+            backend.Fill(fullRe.Buffer, 0f, batch * nFft);
+            backend.Fill(fullIm.Buffer, 0f, batch * nFft);
+            backend.CopyRows(oneSidedRe.Buffer, fullRe.Buffer, numFreqs, nFft, batch, numFreqs);
+            backend.CopyRows(oneSidedIm.Buffer, fullIm.Buffer, numFreqs, nFft, batch, numFreqs);
+
+            // Unnormalised inverse transform: run the inverse (which divides by nFft) and undo it.
+            backend.BatchedFFT(fullRe.Buffer, fullIm.Buffer, outRe.Buffer, outIm.Buffer, batch, nFft, inverse: true);
+            backend.Scale(outRe.Buffer, outRe.Buffer, nFft, batch * nFft);
+
+            // Real part, first signalLength samples per batch row.
+            var resultBuf = AllocateOutputBuffer(backend, batch * signalLength);
+            backend.CopyRows(outRe.Buffer, resultBuf.Buffer, nFft, signalLength, batch, signalLength);
+            backend.Synchronize();
+
+            var res = DeferTensorResult<T>(backend, resultBuf.Buffer, batch * signalLength, inputShape);
+            resultBuf.RelinquishOwnership();
+            return res;
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
     Tensor<T> IEngine.RFFT<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -1058,8 +1127,27 @@ public partial class DirectGpuTensorEngine
         // doubling) rather than the transpose — the same adjoint-vs-inverse confusion fixed on the CPU
         // side earlier in this branch. RecordUnary is a no-op when no tape is active, so this costs
         // nothing outside training.
+        //
+        // Prefers a GPU-EXECUTED adjoint so the backward stays on the device the forward ran on;
+        // RfftAdjointGpu returns null when the GPU path is unavailable and the managed adjoint takes
+        // over, so the gradient is identical either way, only the device differs.
         Autodiff.DifferentiableOps.RecordUnary("RFFT", gpuResult, input,
-            Autodiff.BackwardFunctions<T>.RFFTAdjointBackward,
+            static (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                int n = (int)savedState[0];
+                int nf = (int)savedState[1];
+                if (engine is DirectGpuTensorEngine gpu)
+                {
+                    var gpuGrad = gpu.RfftAdjointGpu(gradOutput, n, nf, inputs[0]._shape);
+                    if (gpuGrad is not null)
+                    {
+                        Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], gpuGrad, engine);
+                        return;
+                    }
+                }
+                Autodiff.BackwardFunctions<T>.RFFTAdjointBackward(
+                    gradOutput, inputs, output, savedState, engine, grads);
+            },
             new object[] { signalLength, nFft });
         return gpuResult;
     }
