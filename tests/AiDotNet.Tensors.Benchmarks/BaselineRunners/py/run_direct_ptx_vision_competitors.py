@@ -114,6 +114,14 @@ def maximum_error(actual: object, reference: object) -> float:
     return error
 
 
+def fixed_nms_output(indices: torch.Tensor, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the PTX oracle's padded kept-index buffer plus scalar count contract."""
+    output = torch.zeros(capacity, dtype=indices.dtype, device=indices.device)
+    output[:indices.numel()] = indices
+    count = torch.full((1,), indices.numel(), dtype=indices.dtype, device=indices.device)
+    return output, count
+
+
 def loss_backward_oracle(function: Callable, predicted: torch.Tensor,
                          target: torch.Tensor, grad_output: torch.Tensor) -> Callable[[], object]:
     def evaluate() -> object:
@@ -197,13 +205,17 @@ def build_cases() -> tuple[list[Case], list[dict[str, str]]]:
     scores = torch.linspace(1.0, 0.0, 256, device="cuda")
     labels = torch.arange(256, device="cuda") % 8
     cases.append(Case("NMS", "N=256", "torchvision.ops.nms",
-                      lambda: ops.nms(a, scores, 0.5), 256.0 * 256.0, 20.0, 36.0,
-                      lambda: ops.nms(a.cpu().double(), scores.cpu().double(), 0.5)))
-    cases.append(Case("BatchedNMS", "N=256,C=8", "torchvision.ops.batched_nms",
-                      lambda: ops.batched_nms(a, scores, labels, 0.5),
+                      lambda: fixed_nms_output(ops.nms(a, scores, 0.5), 256),
                       256.0 * 256.0, 20.0, 36.0,
-                      lambda: ops.batched_nms(a.cpu().double(), scores.cpu().double(),
-                                              labels.cpu(), 0.5)))
+                      lambda: fixed_nms_output(
+                          ops.nms(a.cpu().double(), scores.cpu().double(), 0.5), 256)))
+    cases.append(Case("BatchedNMS", "N=256,C=8", "torchvision.ops.batched_nms",
+                      lambda: fixed_nms_output(
+                          ops.batched_nms(a, scores, labels, 0.5), 256),
+                      256.0 * 256.0, 20.0, 36.0,
+                      lambda: fixed_nms_output(
+                          ops.batched_nms(a.cpu().double(), scores.cpu().double(),
+                                          labels.cpu(), 0.5), 256)))
 
     masks = (torch.rand((256, 28, 28), device="cuda") > 0.9).to(torch.float32)
     cases.append(Case("MasksToBoxes", "256x28x28", "torchvision.ops.masks_to_boxes",
