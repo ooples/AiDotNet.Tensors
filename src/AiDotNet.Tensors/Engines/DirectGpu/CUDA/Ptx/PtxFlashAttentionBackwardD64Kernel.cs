@@ -100,21 +100,21 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView gradValue,
         DirectPtxTensorView? attentionBias = null)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(query, Blueprint.Tensors[1], nameof(query));
-        Require(key, Blueprint.Tensors[2], nameof(key));
-        Require(value, Blueprint.Tensors[3], nameof(value));
-        Require(output, Blueprint.Tensors[4], nameof(output));
-        Require(softmaxStats, Blueprint.Tensors[5], nameof(softmaxStats));
-        Require(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
-        Require(gradKey, Blueprint.Tensors[7], nameof(gradKey));
-        Require(gradValue, Blueprint.Tensors[8], nameof(gradValue));
+        DirectPtxAbi.RequireAtLeast(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[1], nameof(query));
+        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[2], nameof(key));
+        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[3], nameof(value));
+        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.RequireAtLeast(softmaxStats, Blueprint.Tensors[5], nameof(softmaxStats));
+        DirectPtxAbi.RequireAtLeast(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
+        DirectPtxAbi.RequireAtLeast(gradKey, Blueprint.Tensors[7], nameof(gradKey));
+        DirectPtxAbi.RequireAtLeast(gradValue, Blueprint.Tensors[8], nameof(gradValue));
         if (HasAttentionBias != attentionBias.HasValue)
             throw new ArgumentException(
                 "The attention-bias view must match the baked FlashAttention-backward specialization.",
                 nameof(attentionBias));
         if (attentionBias is DirectPtxTensorView bias)
-            Require(bias, Blueprint.Tensors[9], nameof(attentionBias));
+            DirectPtxAbi.RequireAtLeast(bias, Blueprint.Tensors[9], nameof(attentionBias));
         RejectOutputAliasing(
             gradOutput, query, key, value, output, softmaxStats,
             gradQuery, gradKey, gradValue, attentionBias);
@@ -161,17 +161,6 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             (uint)(WarpsPerBlock * 32), 1, 1, 0, gradQueryArguments);
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     private static void RejectOutputAliasing(
         DirectPtxTensorView gradOutput,

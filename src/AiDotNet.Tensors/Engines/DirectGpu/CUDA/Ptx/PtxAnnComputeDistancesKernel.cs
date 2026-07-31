@@ -58,9 +58,9 @@ internal sealed class PtxAnnComputeDistancesKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView queries, DirectPtxTensorView database, DirectPtxTensorView distances)
     {
-        Require(queries, Blueprint.Tensors[0], nameof(queries));
-        Require(database, Blueprint.Tensors[1], nameof(database));
-        Require(distances, Blueprint.Tensors[2], nameof(distances));
+        DirectPtxAbi.Require(queries, Blueprint.Tensors[0], nameof(queries));
+        DirectPtxAbi.Require(database, Blueprint.Tensors[1], nameof(database));
+        DirectPtxAbi.Require(distances, Blueprint.Tensors[2], nameof(distances));
 
         IntPtr queriesPointer = queries.Pointer;
         IntPtr databasePointer = database.Pointer;
@@ -198,12 +198,4 @@ internal sealed class PtxAnnComputeDistancesKernel : IDisposable
                 $"ANN compute distances requires positive dims with dim<={MaxDim} and (numQueries*numDatabase) a multiple of {BlockThreads} up to {MaxCells}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

@@ -113,11 +113,11 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         DirectPtxTensorView output,
         DirectPtxTensorView rms)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(residual, Blueprint.Tensors[1], nameof(residual));
-        Require(gamma, Blueprint.Tensors[2], nameof(gamma));
-        Require(output, Blueprint.Tensors[3], nameof(output));
-        Require(rms, Blueprint.Tensors[4], nameof(rms));
+        DirectPtxAbi.RequireAtLeast(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.RequireAtLeast(residual, Blueprint.Tensors[1], nameof(residual));
+        DirectPtxAbi.RequireAtLeast(gamma, Blueprint.Tensors[2], nameof(gamma));
+        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.RequireAtLeast(rms, Blueprint.Tensors[4], nameof(rms));
         if (output.Pointer == input.Pointer || output.Pointer == residual.Pointer)
             throw new ArgumentException("The fused output must not alias either input.", nameof(output));
 
@@ -137,17 +137,6 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
             (uint)(WarpsPerBlock * 32), 1, 1, 0, arguments);
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     public void Dispose() => _module.Dispose();
 

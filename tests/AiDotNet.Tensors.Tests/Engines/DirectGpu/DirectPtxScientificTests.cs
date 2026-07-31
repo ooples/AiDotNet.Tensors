@@ -44,6 +44,13 @@ public class DirectPtxScientificTests
         }
     }
 
+    [Theory]
+    [InlineData(1.0f, "0f3F800000")]
+    [InlineData(-0.0f, "0f80000000")]
+    [InlineData(float.PositiveInfinity, "0f7F800000")]
+    public void SharedPtxText_FormatsExactFloatBits(float value, string expected)
+        => Assert.Equal(expected, DirectPtxPtxText.Hex(value));
+
     [Fact]
     public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
     {

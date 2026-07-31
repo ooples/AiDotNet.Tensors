@@ -54,9 +54,9 @@ internal sealed class PtxPoincareExpMapKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView basePoint, DirectPtxTensorView tangent, DirectPtxTensorView output)
     {
-        Require(basePoint, Blueprint.Tensors[0], nameof(basePoint));
-        Require(tangent, Blueprint.Tensors[1], nameof(tangent));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        DirectPtxAbi.Require(basePoint, Blueprint.Tensors[0], nameof(basePoint));
+        DirectPtxAbi.Require(tangent, Blueprint.Tensors[1], nameof(tangent));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[2], nameof(output));
 
         IntPtr basePointer = basePoint.Pointer;
         IntPtr tangentPointer = tangent.Pointer;
@@ -250,12 +250,4 @@ internal sealed class PtxPoincareExpMapKernel : IDisposable
                 nameof(dim), $"Poincare exp map supports dim in {{32,64,128}} and batch a multiple of {BlockThreads}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

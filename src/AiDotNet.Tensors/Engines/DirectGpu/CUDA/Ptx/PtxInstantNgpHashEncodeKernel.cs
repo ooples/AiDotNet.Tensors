@@ -64,9 +64,9 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView positions, DirectPtxTensorView hashTable, DirectPtxTensorView output)
     {
-        Require(positions, Blueprint.Tensors[0], nameof(positions));
-        Require(hashTable, Blueprint.Tensors[1], nameof(hashTable));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        DirectPtxAbi.Require(positions, Blueprint.Tensors[0], nameof(positions));
+        DirectPtxAbi.Require(hashTable, Blueprint.Tensors[1], nameof(hashTable));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[2], nameof(output));
 
         IntPtr positionsPointer = positions.Pointer;
         IntPtr hashTablePointer = hashTable.Pointer;
@@ -81,7 +81,6 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     // Emits h = ((x*73856093) ^ (y*19349663) ^ (z*83492791)) % tableSize into %r14, using %r11..%r13.
     private static void AppendHash(StringBuilder ptx, string xReg, string yReg, string zReg, int tableSize)
@@ -111,7 +110,7 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         int featuresPerLevel, int levelOffset, int outputStride)
     {
         ValidateShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
-        string res = Hex(resolution), clampHi = Hex(0.999999f);
+        string res = DirectPtxPtxText.Hex(resolution), clampHi = DirectPtxPtxText.Hex(0.999999f);
         const string one = "0f3F800000", zero = "0f00000000";
 
         var ptx = new StringBuilder(6_000);
@@ -248,12 +247,4 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
                 $"Instant-NGP hash encode requires positive dims, levelOffset+featuresPerLevel<=outputStride, and (numPoints*featuresPerLevel) a multiple of {BlockThreads} up to {MaxCells}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

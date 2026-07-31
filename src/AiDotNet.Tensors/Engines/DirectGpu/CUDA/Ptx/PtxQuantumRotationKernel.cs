@@ -60,11 +60,11 @@ internal sealed class PtxQuantumRotationKernel : IDisposable
         DirectPtxTensorView stateReal, DirectPtxTensorView stateImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag, DirectPtxTensorView angles)
     {
-        Require(stateReal, Blueprint.Tensors[0], nameof(stateReal));
-        Require(stateImag, Blueprint.Tensors[1], nameof(stateImag));
-        Require(outReal, Blueprint.Tensors[2], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[3], nameof(outImag));
-        Require(angles, Blueprint.Tensors[4], nameof(angles));
+        DirectPtxAbi.Require(stateReal, Blueprint.Tensors[0], nameof(stateReal));
+        DirectPtxAbi.Require(stateImag, Blueprint.Tensors[1], nameof(stateImag));
+        DirectPtxAbi.Require(outReal, Blueprint.Tensors[2], nameof(outReal));
+        DirectPtxAbi.Require(outImag, Blueprint.Tensors[3], nameof(outImag));
+        DirectPtxAbi.Require(angles, Blueprint.Tensors[4], nameof(angles));
 
         IntPtr stateRealPointer = stateReal.Pointer;
         IntPtr stateImagPointer = stateImag.Pointer;
@@ -252,12 +252,4 @@ internal sealed class PtxQuantumRotationKernel : IDisposable
                 $"Quantum rotation requires numQubits in [1,{MaxQubits}] and batchSize*2^numQubits <= {MaxBatch}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

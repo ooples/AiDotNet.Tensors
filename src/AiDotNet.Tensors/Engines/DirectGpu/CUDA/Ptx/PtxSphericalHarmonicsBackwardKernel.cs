@@ -66,10 +66,10 @@ internal sealed class PtxSphericalHarmonicsBackwardKernel : IDisposable
         DirectPtxTensorView shCoefficients, DirectPtxTensorView viewDirections,
         DirectPtxTensorView outputGradient, DirectPtxTensorView shGrad)
     {
-        Require(shCoefficients, Blueprint.Tensors[0], nameof(shCoefficients));
-        Require(viewDirections, Blueprint.Tensors[1], nameof(viewDirections));
-        Require(outputGradient, Blueprint.Tensors[2], nameof(outputGradient));
-        Require(shGrad, Blueprint.Tensors[3], nameof(shGrad));
+        DirectPtxAbi.Require(shCoefficients, Blueprint.Tensors[0], nameof(shCoefficients));
+        DirectPtxAbi.Require(viewDirections, Blueprint.Tensors[1], nameof(viewDirections));
+        DirectPtxAbi.Require(outputGradient, Blueprint.Tensors[2], nameof(outputGradient));
+        DirectPtxAbi.Require(shGrad, Blueprint.Tensors[3], nameof(shGrad));
 
         IntPtr coeffPointer = shCoefficients.Pointer;
         IntPtr dirPointer = viewDirections.Pointer;
@@ -86,17 +86,16 @@ internal sealed class PtxSphericalHarmonicsBackwardKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(
         int ccMajor, int ccMinor, int numPoints, int basisCount, int numChannels, int degree, bool broadcastDir)
     {
         ValidateShape(numPoints, basisCount, numChannels, degree);
 
-        string c0 = Hex(0.282095f), c1 = Hex(0.488603f), c2 = Hex(1.092548f), c3 = Hex(0.315392f),
-               c4 = Hex(0.546274f), c5 = Hex(0.590044f), c6 = Hex(2.890611f), c7 = Hex(0.457046f),
-               c8 = Hex(0.373176f), c9 = Hex(1.445306f);
-        string f3 = Hex(3.0f), f5 = Hex(5.0f), f1 = Hex(1.0f), zero = "0f00000000";
+        string c0 = DirectPtxPtxText.Hex(0.282095f), c1 = DirectPtxPtxText.Hex(0.488603f), c2 = DirectPtxPtxText.Hex(1.092548f), c3 = DirectPtxPtxText.Hex(0.315392f),
+               c4 = DirectPtxPtxText.Hex(0.546274f), c5 = DirectPtxPtxText.Hex(0.590044f), c6 = DirectPtxPtxText.Hex(2.890611f), c7 = DirectPtxPtxText.Hex(0.457046f),
+               c8 = DirectPtxPtxText.Hex(0.373176f), c9 = DirectPtxPtxText.Hex(1.445306f);
+        string f3 = DirectPtxPtxText.Hex(3.0f), f5 = DirectPtxPtxText.Hex(5.0f), f1 = DirectPtxPtxText.Hex(1.0f), zero = "0f00000000";
 
         int perPoint = basisCount * numChannels;
         var ptx = new StringBuilder(9_000);
@@ -279,12 +278,4 @@ internal sealed class PtxSphericalHarmonicsBackwardKernel : IDisposable
                 $"Spherical harmonics backward requires degree in [0,{MaxDegree}], basisCount<=(degree+1)^2, and (numPoints*basisCount*numChannels) a multiple of {BlockThreads} up to {MaxCount}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

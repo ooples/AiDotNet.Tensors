@@ -620,6 +620,25 @@ public class DirectPtxWmmaTests
         Assert.Throws<ArgumentException>(() => DirectPtxTensorView.Create(misaligned, contract));
     }
 
+    [Fact]
+    public void SharedPhysicalAbiValidator_PreservesExactAndAtLeastContracts()
+    {
+        var extent = new DirectPtxExtent(2, 8);
+        var contract = new DirectPtxTensorContract(
+            "shared-abi", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.RowMajor2D,
+            extent, extent, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact);
+        using var buffer = new SyntheticGpuBuffer((IntPtr)0x2000, 32);
+        DirectPtxTensorView view = DirectPtxTensorView.Create(buffer, contract);
+
+        DirectPtxAbi.Require(view, contract, "input");
+        DirectPtxAbi.RequireAtLeast(view, contract, "input");
+
+        var error = Assert.Throws<ArgumentException>(() =>
+            DirectPtxAbi.Require(default, contract, "input"));
+        Assert.Equal("input", error.ParamName);
+        Assert.Contains("shared-abi", error.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(8, 0, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 6, (int)DirectPtxArchitectureFamily.Ampere)]

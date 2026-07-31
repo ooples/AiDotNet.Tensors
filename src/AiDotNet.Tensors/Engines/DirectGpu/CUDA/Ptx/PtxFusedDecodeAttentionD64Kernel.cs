@@ -96,10 +96,10 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         DirectPtxTensorView output)
     {
         if (IsPaged) throw new InvalidOperationException("A paged decode module requires a block table.");
-        Require(query, Blueprint.Tensors[0], nameof(query));
-        Require(key, Blueprint.Tensors[1], nameof(key));
-        Require(value, Blueprint.Tensors[2], nameof(value));
-        Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[1], nameof(key));
+        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[2], nameof(value));
+        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[3], nameof(output));
         RejectAliases(query, key, value, output);
 
         IntPtr q = query.Pointer, k = key.Pointer, v = value.Pointer, o = output.Pointer;
@@ -116,11 +116,11 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         DirectPtxTensorView output)
     {
         if (!IsPaged) throw new InvalidOperationException("A dense decode module has no block table ABI.");
-        Require(query, Blueprint.Tensors[0], nameof(query));
-        Require(key, Blueprint.Tensors[1], nameof(key));
-        Require(value, Blueprint.Tensors[2], nameof(value));
-        Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
-        Require(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[1], nameof(key));
+        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[2], nameof(value));
+        DirectPtxAbi.RequireAtLeast(blockTable, Blueprint.Tensors[3], nameof(blockTable));
+        DirectPtxAbi.RequireAtLeast(output, Blueprint.Tensors[4], nameof(output));
         RejectAliases(query, key, value, output);
 
         IntPtr q = query.Pointer, k = key.Pointer, v = value.Pointer;
@@ -146,17 +146,6 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
             throw new ArgumentException("Decode output may not alias Q, K, or V.", nameof(output));
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     public void Dispose() => _module.Dispose();
 

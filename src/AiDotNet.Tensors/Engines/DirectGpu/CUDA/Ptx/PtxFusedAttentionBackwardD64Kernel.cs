@@ -114,14 +114,14 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView gradKey,
         DirectPtxTensorView gradValue)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(query, Blueprint.Tensors[1], nameof(query));
-        Require(key, Blueprint.Tensors[2], nameof(key));
-        Require(value, Blueprint.Tensors[3], nameof(value));
-        Require(probabilities, Blueprint.Tensors[4], nameof(probabilities));
-        Require(gradQuery, Blueprint.Tensors[5], nameof(gradQuery));
-        Require(gradKey, Blueprint.Tensors[6], nameof(gradKey));
-        Require(gradValue, Blueprint.Tensors[7], nameof(gradValue));
+        DirectPtxAbi.RequireAtLeast(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbi.RequireAtLeast(query, Blueprint.Tensors[1], nameof(query));
+        DirectPtxAbi.RequireAtLeast(key, Blueprint.Tensors[2], nameof(key));
+        DirectPtxAbi.RequireAtLeast(value, Blueprint.Tensors[3], nameof(value));
+        DirectPtxAbi.RequireAtLeast(probabilities, Blueprint.Tensors[4], nameof(probabilities));
+        DirectPtxAbi.RequireAtLeast(gradQuery, Blueprint.Tensors[5], nameof(gradQuery));
+        DirectPtxAbi.RequireAtLeast(gradKey, Blueprint.Tensors[6], nameof(gradKey));
+        DirectPtxAbi.RequireAtLeast(gradValue, Blueprint.Tensors[7], nameof(gradValue));
         RejectOutputAliasing(
             gradOutput, query, key, value, probabilities, gradQuery, gradKey, gradValue);
 
@@ -168,17 +168,6 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
 
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     private static void RejectOutputAliasing(
         DirectPtxTensorView gradOutput,

@@ -52,9 +52,9 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView a, DirectPtxTensorView b, DirectPtxTensorView output)
     {
-        Require(a, Blueprint.Tensors[0], nameof(a));
-        Require(b, Blueprint.Tensors[1], nameof(b));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        DirectPtxAbi.Require(a, Blueprint.Tensors[0], nameof(a));
+        DirectPtxAbi.Require(b, Blueprint.Tensors[1], nameof(b));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[2], nameof(output));
 
         IntPtr aPointer = a.Pointer;
         IntPtr bPointer = b.Pointer;
@@ -68,12 +68,11 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int batchSize, int dim)
     {
         ValidateShape(batchSize, dim);
-        string eps = Hex(1e-8f);
+        string eps = DirectPtxPtxText.Hex(1e-8f);
 
         var ptx = new StringBuilder(3_500);
         ptx.AppendLine(".version 7.1");
@@ -178,12 +177,4 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
                 $"Cosine similarity requires positive dims with dim<={MaxDim} and batchSize a multiple of {BlockThreads} up to {MaxBatch}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

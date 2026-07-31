@@ -57,10 +57,10 @@ internal sealed class PtxRbfForwardKernel : IDisposable
         DirectPtxTensorView input, DirectPtxTensorView centers,
         DirectPtxTensorView epsilons, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(centers, Blueprint.Tensors[1], nameof(centers));
-        Require(epsilons, Blueprint.Tensors[2], nameof(epsilons));
-        Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.Require(centers, Blueprint.Tensors[1], nameof(centers));
+        DirectPtxAbi.Require(epsilons, Blueprint.Tensors[2], nameof(epsilons));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[3], nameof(output));
 
         IntPtr inputPointer = input.Pointer;
         IntPtr centersPointer = centers.Pointer;
@@ -77,12 +77,11 @@ internal sealed class PtxRbfForwardKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int batchSize, int numCenters, int inputDim)
     {
         ValidateShape(batchSize, numCenters, inputDim);
-        string log2e = Hex(1.4426950408889634f);
+        string log2e = DirectPtxPtxText.Hex(1.4426950408889634f);
 
         var ptx = new StringBuilder(4_000);
         ptx.AppendLine(".version 7.1");
@@ -199,12 +198,4 @@ internal sealed class PtxRbfForwardKernel : IDisposable
                 $"RBF forward requires positive dims with inputDim<={MaxInputDim} and (batchSize*numCenters) a multiple of {BlockThreads} up to {MaxPairs}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

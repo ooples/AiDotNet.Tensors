@@ -60,9 +60,9 @@ internal sealed class PtxAnnPqDistanceTablesKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView queries, DirectPtxTensorView codebooks, DirectPtxTensorView tables)
     {
-        Require(queries, Blueprint.Tensors[0], nameof(queries));
-        Require(codebooks, Blueprint.Tensors[1], nameof(codebooks));
-        Require(tables, Blueprint.Tensors[2], nameof(tables));
+        DirectPtxAbi.Require(queries, Blueprint.Tensors[0], nameof(queries));
+        DirectPtxAbi.Require(codebooks, Blueprint.Tensors[1], nameof(codebooks));
+        DirectPtxAbi.Require(tables, Blueprint.Tensors[2], nameof(tables));
 
         IntPtr queriesPointer = queries.Pointer;
         IntPtr codebooksPointer = codebooks.Pointer;
@@ -183,12 +183,4 @@ internal sealed class PtxAnnPqDistanceTablesKernel : IDisposable
                 $"ANN PQ distance tables requires positive dims with dsub<={MaxSubDim} and (numQueries*m*ksub) a multiple of {BlockThreads} up to {MaxCells}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

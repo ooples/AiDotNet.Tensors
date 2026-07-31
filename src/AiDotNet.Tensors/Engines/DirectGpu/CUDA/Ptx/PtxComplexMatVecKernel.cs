@@ -57,12 +57,12 @@ internal sealed class PtxComplexMatVecKernel : IDisposable
         DirectPtxTensorView vecReal, DirectPtxTensorView vecImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag)
     {
-        Require(matReal, Blueprint.Tensors[0], nameof(matReal));
-        Require(matImag, Blueprint.Tensors[1], nameof(matImag));
-        Require(vecReal, Blueprint.Tensors[2], nameof(vecReal));
-        Require(vecImag, Blueprint.Tensors[3], nameof(vecImag));
-        Require(outReal, Blueprint.Tensors[4], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[5], nameof(outImag));
+        DirectPtxAbi.Require(matReal, Blueprint.Tensors[0], nameof(matReal));
+        DirectPtxAbi.Require(matImag, Blueprint.Tensors[1], nameof(matImag));
+        DirectPtxAbi.Require(vecReal, Blueprint.Tensors[2], nameof(vecReal));
+        DirectPtxAbi.Require(vecImag, Blueprint.Tensors[3], nameof(vecImag));
+        DirectPtxAbi.Require(outReal, Blueprint.Tensors[4], nameof(outReal));
+        DirectPtxAbi.Require(outImag, Blueprint.Tensors[5], nameof(outImag));
 
         IntPtr matRealPointer = matReal.Pointer;
         IntPtr matImagPointer = matImag.Pointer;
@@ -213,12 +213,4 @@ internal sealed class PtxComplexMatVecKernel : IDisposable
                 $"Complex matvec requires positive dims with dim<={MaxDim} and (batch*dim) a multiple of {BlockThreads} up to {MaxRows}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

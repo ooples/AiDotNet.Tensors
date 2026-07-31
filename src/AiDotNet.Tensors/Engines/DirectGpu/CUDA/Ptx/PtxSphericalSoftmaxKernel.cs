@@ -54,8 +54,8 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbi.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer;
         IntPtr outputPointer = output.Pointer;
@@ -67,12 +67,11 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int outerSize, int innerSize)
     {
         ValidateShape(outerSize, innerSize);
-        string normEps = Hex(1e-12f), sumEps = Hex(1e-10f), log2e = Hex(1.4426950408889634f);
+        string normEps = DirectPtxPtxText.Hex(1e-12f), sumEps = DirectPtxPtxText.Hex(1e-10f), log2e = DirectPtxPtxText.Hex(1.4426950408889634f);
         const string one = "0f3F800000", negInf = "0fFF800000";
 
         var ptx = new StringBuilder(5_000);
@@ -212,12 +211,4 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
                 $"Spherical softmax requires positive dims with innerSize<={MaxInner} and outerSize a multiple of {BlockThreads} up to {MaxOuter}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

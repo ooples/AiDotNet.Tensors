@@ -67,14 +67,14 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
         DirectPtxTensorView keyCache,
         DirectPtxTensorView valueCache)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(packedWeights, Blueprint.Tensors[1], nameof(packedWeights));
-        Require(bias, Blueprint.Tensors[2], nameof(bias));
-        Require(cosine, Blueprint.Tensors[3], nameof(cosine));
-        Require(sine, Blueprint.Tensors[4], nameof(sine));
-        Require(query, Blueprint.Tensors[5], nameof(query));
-        Require(keyCache, Blueprint.Tensors[6], nameof(keyCache));
-        Require(valueCache, Blueprint.Tensors[7], nameof(valueCache));
+        DirectPtxAbi.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.Require(packedWeights, Blueprint.Tensors[1], nameof(packedWeights));
+        DirectPtxAbi.Require(bias, Blueprint.Tensors[2], nameof(bias));
+        DirectPtxAbi.Require(cosine, Blueprint.Tensors[3], nameof(cosine));
+        DirectPtxAbi.Require(sine, Blueprint.Tensors[4], nameof(sine));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[5], nameof(query));
+        DirectPtxAbi.Require(keyCache, Blueprint.Tensors[6], nameof(keyCache));
+        DirectPtxAbi.Require(valueCache, Blueprint.Tensors[7], nameof(valueCache));
         RejectOutputAliasing(input, packedWeights, bias, cosine, sine, query, keyCache, valueCache);
 
         IntPtr inputPointer = input.Pointer;
@@ -103,17 +103,6 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     private static void RejectOutputAliasing(
         DirectPtxTensorView input,

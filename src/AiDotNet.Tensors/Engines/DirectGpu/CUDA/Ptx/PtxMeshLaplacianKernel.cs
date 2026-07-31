@@ -53,8 +53,8 @@ internal sealed class PtxMeshLaplacianKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView faces, DirectPtxTensorView output)
     {
-        Require(faces, Blueprint.Tensors[0], nameof(faces));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbi.Require(faces, Blueprint.Tensors[0], nameof(faces));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr facesPointer = faces.Pointer;
         IntPtr outputPointer = output.Pointer;
@@ -187,12 +187,4 @@ internal sealed class PtxMeshLaplacianKernel : IDisposable
                 $"Mesh laplacian requires positive numFaces<={MaxFaces} and (numVertices*numVertices) a multiple of {BlockThreads} up to {MaxCells}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

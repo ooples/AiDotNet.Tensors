@@ -48,9 +48,9 @@ internal sealed class PtxComplexPhaseKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView real, DirectPtxTensorView imag, DirectPtxTensorView phase)
     {
-        Require(real, Blueprint.Tensors[0], nameof(real));
-        Require(imag, Blueprint.Tensors[1], nameof(imag));
-        Require(phase, Blueprint.Tensors[2], nameof(phase));
+        DirectPtxAbi.Require(real, Blueprint.Tensors[0], nameof(real));
+        DirectPtxAbi.Require(imag, Blueprint.Tensors[1], nameof(imag));
+        DirectPtxAbi.Require(phase, Blueprint.Tensors[2], nameof(phase));
 
         IntPtr realPointer = real.Pointer;
         IntPtr imagPointer = imag.Pointer;
@@ -64,15 +64,14 @@ internal sealed class PtxComplexPhaseKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int count)
     {
         ValidateShape(count);
         // Minimax atan(a) ~ a*(c0 + t(c1 + t(c2 + t(c3 + t c4)))), t = a^2, a in [0,1].
-        string c0 = Hex(0.9998660f), c1 = Hex(-0.3302995f), c2 = Hex(0.1801410f),
-               c3 = Hex(-0.0851330f), c4 = Hex(0.0208351f);
-        string pi = Hex((float)Math.PI), halfPi = Hex((float)(Math.PI / 2.0)), tiny = Hex(1e-20f);
+        string c0 = DirectPtxPtxText.Hex(0.9998660f), c1 = DirectPtxPtxText.Hex(-0.3302995f), c2 = DirectPtxPtxText.Hex(0.1801410f),
+               c3 = DirectPtxPtxText.Hex(-0.0851330f), c4 = DirectPtxPtxText.Hex(0.0208351f);
+        string pi = DirectPtxPtxText.Hex((float)Math.PI), halfPi = DirectPtxPtxText.Hex((float)(Math.PI / 2.0)), tiny = DirectPtxPtxText.Hex(1e-20f);
         const string NegOne = "0fBF800000";
 
         var ptx = new StringBuilder(5_000);
@@ -186,12 +185,4 @@ internal sealed class PtxComplexPhaseKernel : IDisposable
                 $"Complex phase supports a positive element count that is a multiple of {BlockThreads} up to {MaxCount}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

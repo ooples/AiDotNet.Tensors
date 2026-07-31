@@ -49,9 +49,9 @@ internal sealed class PtxQuantumMeasurementKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView real, DirectPtxTensorView imag, DirectPtxTensorView probabilities)
     {
-        Require(real, Blueprint.Tensors[0], nameof(real));
-        Require(imag, Blueprint.Tensors[1], nameof(imag));
-        Require(probabilities, Blueprint.Tensors[2], nameof(probabilities));
+        DirectPtxAbi.Require(real, Blueprint.Tensors[0], nameof(real));
+        DirectPtxAbi.Require(imag, Blueprint.Tensors[1], nameof(imag));
+        DirectPtxAbi.Require(probabilities, Blueprint.Tensors[2], nameof(probabilities));
 
         IntPtr realPointer = real.Pointer;
         IntPtr imagPointer = imag.Pointer;
@@ -150,12 +150,4 @@ internal sealed class PtxQuantumMeasurementKernel : IDisposable
                 $"Quantum measurement supports a positive element count that is a multiple of {BlockThreads} up to {MaxCount}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

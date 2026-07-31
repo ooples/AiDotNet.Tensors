@@ -53,7 +53,7 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView probabilities)
     {
-        Require(probabilities, Blueprint.Tensors[0], nameof(probabilities));
+        DirectPtxAbi.Require(probabilities, Blueprint.Tensors[0], nameof(probabilities));
 
         IntPtr probPointer = probabilities.Pointer;
         void** arguments = stackalloc void*[1];
@@ -63,12 +63,11 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int batchSize, int stateSize)
     {
         ValidateShape(batchSize, stateSize);
-        string minSum = Hex(1e-10f);
+        string minSum = DirectPtxPtxText.Hex(1e-10f);
 
         var ptx = new StringBuilder(4_500);
         ptx.AppendLine(".version 7.1");
@@ -186,12 +185,4 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
                 $"Normalize probabilities requires positive batchSize<={MaxBatch} and stateSize<={MaxState}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

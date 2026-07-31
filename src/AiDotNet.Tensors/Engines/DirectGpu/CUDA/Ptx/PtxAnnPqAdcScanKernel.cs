@@ -57,9 +57,9 @@ internal sealed class PtxAnnPqAdcScanKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView codes, DirectPtxTensorView tables, DirectPtxTensorView distances)
     {
-        Require(codes, Blueprint.Tensors[0], nameof(codes));
-        Require(tables, Blueprint.Tensors[1], nameof(tables));
-        Require(distances, Blueprint.Tensors[2], nameof(distances));
+        DirectPtxAbi.Require(codes, Blueprint.Tensors[0], nameof(codes));
+        DirectPtxAbi.Require(tables, Blueprint.Tensors[1], nameof(tables));
+        DirectPtxAbi.Require(distances, Blueprint.Tensors[2], nameof(distances));
 
         IntPtr codesPointer = codes.Pointer;
         IntPtr tablesPointer = tables.Pointer;
@@ -183,12 +183,4 @@ internal sealed class PtxAnnPqAdcScanKernel : IDisposable
                 $"ANN PQ ADC scan requires positive dims with m<={MaxSubspaces}, ksub<=256 (uint8 codes), and (numQueries*numCodes) a multiple of {BlockThreads} up to {MaxCells}.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }
