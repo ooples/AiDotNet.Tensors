@@ -504,15 +504,6 @@ public sealed partial class CudaBackend
         bool IsInput(IGpuBuffer output) =>
             Overlaps(output, input) || Overlaps(output, packedWeights) ||
             Overlaps(output, bias) || Overlaps(output, cosine) || Overlaps(output, sine);
-
-        static bool Overlaps(IGpuBuffer left, IGpuBuffer right)
-        {
-            nuint leftStart = PtxCompat.ToNuint(left.Handle);
-            nuint rightStart = PtxCompat.ToNuint(right.Handle);
-            nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
-            nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
-            return leftStart < rightEnd && rightStart < leftEnd;
-        }
     }
 
     internal bool TryGetDirectPtxQkvRopeCacheAudit(
