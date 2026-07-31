@@ -384,6 +384,24 @@ public sealed class DirectPtxVisionBoxIouTests
             pair.Blueprint.Semantics["method"], StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void FamilyEmitter_GlobalIndexStrideMatchesNonDefaultBlockGeometry()
+    {
+        DirectPtxVisionDefinition pair = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(128u, pair.BlockX);
+        Assert.Contains("mad.lo.u32 %r2, %r0, 128, %r1", pair.Ptx,
+            StringComparison.Ordinal);
+
+        DirectPtxVisionDefinition masks = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(64u, masks.BlockX);
+        Assert.Contains("mad.lo.u32 %r2, %r0, 64, %r1", masks.Ptx,
+            StringComparison.Ordinal);
+    }
+
     private static void AssertPtxRegisterAndLabelClosure(string ptx)
     {
         var limits = new Dictionary<string, int>(StringComparer.Ordinal);

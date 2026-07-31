@@ -49,12 +49,13 @@ internal static partial class PtxVisionEmitter
         DirectPtxVisionSpec spec, DirectPtxArchitectureFamily architecture,
         int ccMajor, int ccMinor)
     {
+        const uint BlockThreads = 64;
         int n = spec.D0, h = spec.D1, w = spec.D2;
         if ((n, h, w) is not ((256, 28, 28) or (64, 64, 64)))
             throw new NotSupportedException("MasksToBoxes shape is not emitted.");
         var ptx = Begin(spec, ccMajor, ccMinor, "masks", "boxes");
         ptx.AppendLine("    .reg .pred %p<8>; .reg .b32 %r<24>; .reg .b64 %rd<12>; .reg .f32 %f<8>;");
-        LoadParameters(ptx, "masks", "boxes"); EmitGlobalIndex(ptx, n);
+        LoadParameters(ptx, "masks", "boxes"); EmitGlobalIndex(ptx, n, BlockThreads);
         ptx.AppendLine($"    mov.u32 %r3, {w}; mov.u32 %r4, {h}; mov.s32 %r5, -1; mov.s32 %r6, -1; mov.u32 %r7, 0;");
         ptx.AppendLine($"    mul.lo.u32 %r8, %r2, {h * w};");
         ptx.AppendLine("MASK_LOOP:");
@@ -68,11 +69,11 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    setp.lt.s32 %p3, %r5, 0; selp.u32 %r3, 0, %r3, %p3; selp.u32 %r4, 0, %r4, %p3; selp.u32 %r5, 0, %r5, %p3; selp.u32 %r6, 0, %r6, %p3;");
         ptx.AppendLine("    cvt.rn.f32.u32 %f1, %r3; cvt.rn.f32.u32 %f2, %r4; cvt.rn.f32.u32 %f3, %r5; cvt.rn.f32.u32 %f4, %r6;");
         ptx.AppendLine("    mul.wide.u32 %rd4, %r2, 16; add.u64 %rd5, %rd1, %rd4; st.global.v4.f32 [%rd5], {%f1,%f2,%f3,%f4};");
-        return Definition(spec, architecture, $"n{n}-{h}x{w}",
+        return Definition(spec, architecture, $"n{n}-{h}x{w}-b{BlockThreads}",
             [
                 Tensor("masks", DirectPtxPhysicalLayout.RowMajor3D, new(n, h, w), DirectPtxTensorAccess.Read),
                 Tensor("boxes", DirectPtxPhysicalLayout.BoxXyxy, new(n, 4), DirectPtxTensorAccess.Write)
             ], Semantics(("empty-mask", "zero box"), ("predicate", "nonzero")),
-            Finish(ptx), n, maxRegisters: 40, minBlocksPerSm: 2);
+            Finish(ptx), n, maxRegisters: 40, minBlocksPerSm: 2, blockThreads: BlockThreads);
     }
 }

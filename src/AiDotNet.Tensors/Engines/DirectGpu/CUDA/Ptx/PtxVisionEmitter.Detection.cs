@@ -300,6 +300,7 @@ internal static partial class PtxVisionEmitter
                 Finish(ptx), n, maxRegisters: 96, minBlocksPerSm: 1);
         }
 
+        const uint PairBlockThreads = 128;
         int boxesA = spec.D0, boxesB = spec.D1, variant = spec.D2;
         RequireOneOf(boxesA, nameof(boxesA), 256, 1024);
         RequireOneOf(boxesB, nameof(boxesB), 256, 1024);
@@ -311,7 +312,7 @@ internal static partial class PtxVisionEmitter
             "grad_output", "boxes_a", "boxes_b", ownerA ? "grad_a" : "grad_b");
         DeclareBoxRegisters(pairPtx);
         LoadParameters(pairPtx, "grad_output", "boxes_a", "boxes_b", ownerA ? "grad_a" : "grad_b");
-        EmitGlobalIndex(pairPtx, owners);
+        EmitGlobalIndex(pairPtx, owners, PairBlockThreads);
         // The owner box is loop-invariant. Hoist it exactly as the incumbent
         // CUDA compiler does so every cell fetches only the opposing box.
         if (ownerA)
@@ -348,7 +349,7 @@ internal static partial class PtxVisionEmitter
         pairPtx.AppendLine("    add.u32 %r8, %r8, 1; bra PAIR_GRAD_LOOP;");
         pairPtx.AppendLine("PAIR_GRAD_DONE: mul.wide.u32 %rd10, %r2, 16; add.u64 %rd11, %rd3, %rd10; st.global.v4.f32 [%rd11], {%f64,%f65,%f66,%f67};");
         return Definition(spec, architecture,
-            $"n{boxesA}-m{boxesB}-v{variant}-owner-{(ownerA ? "a" : "b")}",
+            $"n{boxesA}-m{boxesB}-v{variant}-owner-{(ownerA ? "a" : "b")}-b{PairBlockThreads}",
             [
                 Tensor("grad-output", DirectPtxPhysicalLayout.RowMajor2D, new(boxesA, boxesB), DirectPtxTensorAccess.Read),
                 Tensor("boxes-a", DirectPtxPhysicalLayout.BoxXyxy, new(boxesA, 4), DirectPtxTensorAccess.Read),
@@ -358,7 +359,7 @@ internal static partial class PtxVisionEmitter
                 ("owner", ownerA ? "a" : "b"),
                 ("method", "analytical reverse mode; CIoU alpha detached"),
                 ("determinism", "one owner thread, fixed other-index order")),
-            Finish(pairPtx), owners, maxRegisters: 96, minBlocksPerSm: 1);
+            Finish(pairPtx), owners, maxRegisters: 96, minBlocksPerSm: 1, blockThreads: PairBlockThreads);
     }
 
     private static DirectPtxVisionOperation MetricForBackward(DirectPtxVisionOperation operation) =>

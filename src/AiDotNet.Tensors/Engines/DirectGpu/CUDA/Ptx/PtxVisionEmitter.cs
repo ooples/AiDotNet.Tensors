@@ -151,12 +151,13 @@ internal static partial class PtxVisionEmitter
             ptx.AppendLine($"    ld.param.u64 %rd{i}, [{parameters[i]}_ptr];");
     }
 
-    private static void EmitGlobalIndex(StringBuilder ptx, int total, string done = "DONE")
+    private static void EmitGlobalIndex(
+        StringBuilder ptx, int total, uint blockThreads = 256, string done = "DONE")
     {
         ptx.AppendLine("    mov.u32 %r0, %ctaid.x;");
         ptx.AppendLine("    mov.u32 %r1, %tid.x;");
-        ptx.AppendLine("    mad.lo.u32 %r2, %r0, 256, %r1;");
-        if ((total & 255) != 0)
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r0, {blockThreads}, %r1;");
+        if (total % blockThreads != 0)
         {
             ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {total};");
             ptx.AppendLine($"    @%p0 bra {done};");
