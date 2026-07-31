@@ -39971,6 +39971,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int numFrames = (signalLength - nFft) / hopLength + 1;
         int numFreqs = nFft / 2 + 1;
 
+        // A signal shorter than one analysis window yields ZERO frames — integer division makes
+        // (257 - 512) / 128 + 1 == 0 rather than anything negative, so nothing downstream notices.
+        // Returning an empty spectrogram then detonated in ISTFT as an opaque
+        // DivideByZeroException (magnitude.Length / (numFreqs * numFrames)), which is a terrible
+        // diagnostic for "your signal is too short". Fail here, where the cause is visible.
+        if (numFrames <= 0)
+            throw new ArgumentException(
+                $"Signal length {signalLength} is too short for nFft {nFft} with hopLength " +
+                $"{hopLength}: that yields {numFrames} frames. Use center: true (which pads by " +
+                $"nFft/2 on each side), a smaller nFft, or a longer signal.",
+                nameof(input));
+
         // Output shapes
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFrames;
@@ -40094,6 +40106,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // since the reading depended on whatever the pool last held.
         System.Array.Clear(resultData, 0, resultData.Length);
         System.Array.Clear(windowSumData, 0, windowSumData.Length);
+
+        // Defence in depth: STFT now refuses to emit a zero-frame spectrogram, but ISTFT can be
+        // handed a spectrogram from anywhere, and dividing by numFreqs * numFrames == 0 gave a bare
+        // DivideByZeroException with no indication of which argument was wrong.
+        if (numFrames <= 0 || numFreqs <= 0)
+            throw new ArgumentException(
+                $"Spectrogram has no data to invert: numFreqs={numFreqs}, numFrames={numFrames}. " +
+                $"Both must be positive.", nameof(magnitude));
 
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
