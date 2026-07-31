@@ -27,6 +27,23 @@ public class DirectPtxScientificTests
         }
     }
 
+    private static DirectPtxRuntime CreateValidatedRuntime(string skipMessage)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        var runtime = new DirectPtxRuntime();
+        try
+        {
+            Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor), skipMessage);
+            return runtime;
+        }
+        catch
+        {
+            runtime.Dispose();
+            throw;
+        }
+    }
+
     [Fact]
     public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
     {
@@ -137,10 +154,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyComplexPhase_MatchesAtan2Oracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in complex-phase specialization is measured on GA10x/SM86.");
         const int count = 16384;
         using var kernel = new PtxComplexPhaseKernel(runtime, count);
@@ -200,10 +214,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyComplexConjugateAndMagnitude_MatchOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in complex specializations are measured on GA10x/SM86.");
         const int pairs = 16384;
         var random = RandomHelper.CreateSeededRandom(20266000);
@@ -271,10 +282,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyComplexMultiply_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in complex-multiply specialization is measured on GA10x/SM86.");
         const int pairs = 16384;
         using var kernel = new PtxComplexMultiplyKernel(runtime, pairs);
@@ -347,10 +355,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyOctonionAdd_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in octonion-add specialization is measured on GA10x/SM86.");
         const int count = 16384;
         using var kernel = new PtxOctonionAddKernel(runtime, count);
@@ -399,10 +404,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyRbfForward_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in RBF-forward specialization is measured on GA10x/SM86.");
         const int batchSize = 128, numCenters = 8, inputDim = 12;   // pairs = 1024 (multiple of 256)
         using var kernel = new PtxRbfForwardKernel(runtime, batchSize, numCenters, inputDim);
@@ -470,10 +472,7 @@ public class DirectPtxScientificTests
     [InlineData(true)]
     public void DriverOnlyPairwiseDistance_MatchesOracle(bool squared)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in pairwise-distance specialization is measured on GA10x/SM86.");
         const int m = 64, n = 16, dim = 10;   // pairs = 1024 (multiple of 256)
         using var kernel = new PtxPairwiseDistanceKernel(runtime, m, n, dim, squared);
@@ -530,10 +529,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyQuantumMeasurement_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in quantum-measurement specialization is measured on GA10x/SM86.");
         const int count = 16384;   // batchSize*stateSize
         using var kernel = new PtxQuantumMeasurementKernel(runtime, count);
@@ -582,10 +578,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyComplexMatVec_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in complex-matvec specialization is measured on GA10x/SM86.");
         const int batchSize = 16, dim = 64;   // rows = 1024 (multiple of 256)
         using var kernel = new PtxComplexMatVecKernel(runtime, batchSize, dim);
@@ -661,10 +654,7 @@ public class DirectPtxScientificTests
     [InlineData(2, 9, true)]
     public void DriverOnlySphericalHarmonics_MatchesOracle(int degree, int basisCount, bool broadcast)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in spherical-harmonics specialization is measured on GA10x/SM86.");
         const int numPoints = 256, numChannels = 4;   // count = 1024 (multiple of 256)
         using var kernel = new PtxSphericalHarmonicsKernel(runtime, numPoints, basisCount, numChannels, degree, broadcast);
@@ -727,10 +717,7 @@ public class DirectPtxScientificTests
     [InlineData(2, 9, true)]
     public void DriverOnlySphericalHarmonicsBackward_MatchesOracle(int degree, int basisCount, bool broadcast)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in spherical-harmonics-backward specialization is measured on GA10x/SM86.");
         const int numPoints = 64, numChannels = 4;   // count = points*basis*channels multiple of 256
         using var kernel = new PtxSphericalHarmonicsBackwardKernel(runtime, numPoints, basisCount, numChannels, degree, broadcast);
@@ -806,10 +793,7 @@ public class DirectPtxScientificTests
     public void DriverOnlyCapsuleContraction_MatchesOracle(bool predictions)
     {
         DirectPtxCapsuleOp op = predictions ? DirectPtxCapsuleOp.Predictions : DirectPtxCapsuleOp.Transform;
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in capsule-contraction specialization is measured on GA10x/SM86.");
         const int b = 4, inCaps = 8, inDim = 12, outCount = 8, outDim = 8;   // outputs = 4*8*8*8 = 2048
         using var kernel = new PtxCapsuleContractionKernel(runtime, op, b, inCaps, inDim, outCount, outDim);
@@ -872,10 +856,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyMeshLaplacian_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in mesh-laplacian specialization is measured on GA10x/SM86.");
         const int numFaces = 40, numVertices = 16;   // cells = 256
         using var kernel = new PtxMeshLaplacianKernel(runtime, numFaces, numVertices);
@@ -947,10 +928,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyInstantNgpHashEncodeBackward_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in instant-ngp-hash-encode-backward specialization is measured on GA10x/SM86.");
         const int numPoints = 64, resolution = 16, tableSize = 256, fpl = 2, levelOffset = 0, outputStride = 4;
         using var kernel = new PtxInstantNgpHashEncodeBackwardKernel(runtime, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
@@ -1029,10 +1007,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyInstantNgpHashEncode_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in instant-ngp-hash-encode specialization is measured on GA10x/SM86.");
         const int numPoints = 256, resolution = 16, tableSize = 4096, fpl = 2, levelOffset = 0, outputStride = 4;
         using var kernel = new PtxInstantNgpHashEncodeKernel(runtime, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
@@ -1106,10 +1081,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyAnnPqAdcScan_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in ann-pq-adc-scan specialization is measured on GA10x/SM86.");
         const int numQueries = 16, numCodes = 32, m = 8, ksub = 16;   // cells = 512
         using var kernel = new PtxAnnPqAdcScanKernel(runtime, numQueries, numCodes, m, ksub);
@@ -1168,10 +1140,7 @@ public class DirectPtxScientificTests
     [InlineData(AnnMetric.InnerProduct)]
     public void DriverOnlyAnnIvfAssign_MatchesOracle(AnnMetric metric)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in ann-ivf-assign specialization is measured on GA10x/SM86.");
         const int numVectors = 256, numCentroids = 12, dim = 10;
         using var kernel = new PtxAnnIvfAssignKernel(runtime, metric, numVectors, numCentroids, dim);
@@ -1259,10 +1228,7 @@ public class DirectPtxScientificTests
     [InlineData(AnnMetric.InnerProduct)]
     public void DriverOnlyAnnComputeDistances_MatchesOracle(AnnMetric metric)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in ann-compute-distances specialization is measured on GA10x/SM86.");
         const int numQueries = 32, numDatabase = 16, dim = 12;   // cells = 512
         using var kernel = new PtxAnnComputeDistancesKernel(runtime, metric, numQueries, numDatabase, dim);
@@ -1304,10 +1270,7 @@ public class DirectPtxScientificTests
     [InlineData(AnnMetric.InnerProduct)]
     public void DriverOnlyAnnPqDistanceTables_MatchesOracle(AnnMetric metric)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in ann-pq-distance-tables specialization is measured on GA10x/SM86.");
         const int numQueries = 16, m = 8, ksub = 8, dsub = 6;   // cells = 1024
         using var kernel = new PtxAnnPqDistanceTablesKernel(runtime, metric, numQueries, m, ksub, dsub);
@@ -1370,10 +1333,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyQuantumRotation_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in quantum-rotation specialization is measured on GA10x/SM86.");
         const int numQubits = 6, batchSize = 16;
         int dim = 1 << numQubits;
@@ -1451,10 +1411,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyMeasurementForward_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in measurement-forward specialization is measured on GA10x/SM86.");
         const int batchSize = 32, stateSize = 256;   // state > blockDim exercises the strided loop
         using var kernel = new PtxMeasurementForwardKernel(runtime, batchSize, stateSize);
@@ -1509,10 +1466,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyNormalizeProbabilities_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in normalize-probabilities specialization is measured on GA10x/SM86.");
         const int batchSize = 64, stateSize = 512;   // state > blockDim exercises the strided loop
         using var kernel = new PtxNormalizeProbabilitiesKernel(runtime, batchSize, stateSize);
@@ -1563,10 +1517,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlySphericalSoftmax_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in spherical-softmax specialization is measured on GA10x/SM86.");
         const int outerSize = 256, innerSize = 40;
         using var kernel = new PtxSphericalSoftmaxKernel(runtime, outerSize, innerSize);
@@ -1623,10 +1574,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyCosineSimilarity_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in cosine-similarity specialization is measured on GA10x/SM86.");
         const int batchSize = 256, dim = 48;
         using var kernel = new PtxCosineSimilarityKernel(runtime, batchSize, dim);
@@ -1706,10 +1654,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyCapsuleRouting_MatchesOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in capsule-routing specialization is measured on GA10x/SM86.");
         const int b = 8, inCaps = 8, outCaps = 8, capDim = 8;   // WS outputs = 8*8*8 = 512; AG outputs = 8*8*8 = 512
         var random = RandomHelper.CreateSeededRandom(20267800);
@@ -1822,10 +1767,7 @@ public class DirectPtxScientificTests
     [SkippableFact]
     public void DriverOnlyOctonionMultiply_MatchesCayleyDicksonOracle()
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in octonion-multiply specialization is measured on GA10x/SM86.");
         const int count = 16384;
         using var kernel = new PtxOctonionMultiplyKernel(runtime, count);
@@ -1891,10 +1833,7 @@ public class DirectPtxScientificTests
     [InlineData(64, 128)]
     public void DriverOnlyMobiusAdd_MatchesOracle(int batch, int dim)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in mobius-add specialization is measured on GA10x/SM86.");
         const float c = 0.5f;
         using var kernel = new PtxMobiusAddKernel(runtime, batch, dim, c);
@@ -1956,10 +1895,7 @@ public class DirectPtxScientificTests
     [InlineData(128, 64)]
     public void DriverOnlyPoincareDistance_MatchesOracle(int batch, int dim)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in poincare-distance specialization is measured on GA10x/SM86.");
         const float c = 0.5f;
         using var kernel = new PtxPoincareDistanceKernel(runtime, batch, dim, c);
@@ -2039,10 +1975,7 @@ public class DirectPtxScientificTests
     [InlineData(256, 128)]
     public void DriverOnlyPoincareProject_MatchesOracle(int batch, int dim)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in poincare-project specialization is measured on GA10x/SM86.");
         const float c = 0.5f, eps = 1e-5f;
         using var kernel = new PtxPoincareProjectKernel(runtime, batch, dim, c, eps);
@@ -2102,10 +2035,7 @@ public class DirectPtxScientificTests
     [InlineData(256, 128)]
     public void DriverOnlyPoincareExpMap_MatchesOracle(int batch, int dim)
     {
-        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
-        using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(DirectPtxArchitecture.HasValidatedScientific(
-            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+        using var runtime = CreateValidatedRuntime(
             "The checked-in poincare-exp-map specialization is measured on GA10x/SM86.");
         const float c = 0.5f;
         using var kernel = new PtxPoincareExpMapKernel(runtime, batch, dim, c);
