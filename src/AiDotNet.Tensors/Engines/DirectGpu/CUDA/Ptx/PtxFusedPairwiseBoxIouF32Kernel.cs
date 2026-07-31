@@ -99,11 +99,9 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
         DirectPtxTensorView boxesB,
         DirectPtxTensorView output)
     {
-        Require(boxesA, Blueprint.Tensors[0], nameof(boxesA));
-        Require(boxesB, Blueprint.Tensors[1], nameof(boxesB));
-        Require(output, Blueprint.Tensors[2], nameof(output));
-        if (RangesOverlap(output, boxesA) || RangesOverlap(output, boxesB))
-            throw new ArgumentException("Pairwise BoxIoU output must not alias either input.", nameof(output));
+        Span<DirectPtxTensorView> views = stackalloc DirectPtxTensorView[3]
+            { boxesA, boxesB, output };
+        PtxVisionKernel.ValidateViews(Blueprint, views);
 
         IntPtr a = boxesA.Pointer;
         IntPtr b = boxesB.Pointer;
@@ -114,32 +112,6 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
         arguments[2] = &o;
         uint blocks = checked((uint)(((long)BoxCountA * BoxCountB) / BlockThreads));
         _module.Launch(_function, blocks, 1, 1, BlockThreads, 1, 1, 0, arguments);
-    }
-
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero ||
-            view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout ||
-            view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes ||
-            view.Access != contract.Access)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
-
-    private static bool RangesOverlap(DirectPtxTensorView left, DirectPtxTensorView right)
-    {
-        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
-        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
-        nuint leftEnd = checked(leftStart + left.ByteLength);
-        nuint rightEnd = checked(rightStart + right.ByteLength);
-        return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     public void Dispose() => _module.Dispose();
