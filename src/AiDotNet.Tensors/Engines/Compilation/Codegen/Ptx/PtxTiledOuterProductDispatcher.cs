@@ -57,11 +57,13 @@ internal sealed class PtxTiledOuterProductDispatchException : NotSupportedExcept
 internal static class PtxTiledOuterProductDispatcher
 {
     internal static PtxTiledOuterProductProgram Emit(
-        CodegenKernelSpec spec, int computeMajor, int computeMinor)
+        CodegenKernelSpec spec, int computeMajor, int computeMinor,
+        CodegenTiledOuterProductSchedule? schedule = null)
     {
+        schedule ??= CodegenTiledOuterProductSchedule.Default;
         try
         {
-            var emitter = new PtxTiledOuterProductEmitter();
+            var emitter = new PtxTiledOuterProductEmitter(schedule);
             string text = emitter.Emit(spec, computeMajor, computeMinor);
             CodegenTiledOuterProductPlan plan = emitter.Plan!;
             return new PtxTiledOuterProductProgram(
@@ -72,6 +74,7 @@ internal static class PtxTiledOuterProductDispatcher
         }
         catch (NotSupportedException outerProduct)
         {
+            if (!schedule.IsDefault) throw;
             try
             {
                 var emitter = new PtxTiledConv2DOuterProductEmitter();

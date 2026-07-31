@@ -71,8 +71,15 @@ public sealed class CodegenTiledOuterProductPlan
     /// <summary>Recovers the exact split outer-product form or reports why it was refused.</summary>
     public static bool TryCreate(
         CodegenKernelSpec spec, out CodegenTiledOuterProductPlan? plan, out string reason)
+        => TryCreate(spec, CodegenTiledOuterProductSchedule.Default, out plan, out reason);
+
+    /// <summary>Recovers the exact split form with a measured output/thread schedule.</summary>
+    public static bool TryCreate(
+        CodegenKernelSpec spec, CodegenTiledOuterProductSchedule schedule,
+        out CodegenTiledOuterProductPlan? plan, out string reason)
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
+        if (schedule is null) throw new ArgumentNullException(nameof(schedule));
         plan = null;
 
         if (spec.Reduce != CodegenReduceKind.Sum ||
@@ -138,15 +145,25 @@ public sealed class CodegenTiledOuterProductPlan
             return false;
         }
 
-        int tileM = LargestDivisorAtMost(m, 16, 4);
-        int tileN = LargestDivisorAtMost(n, 16, 4);
+        int tileM = LargestDivisorAtMost(m, schedule.MaximumTileM, 4);
+        int tileN = LargestDivisorAtMost(n, schedule.MaximumTileN, 4);
         if (tileM == 0 || tileN == 0)
         {
             reason = "the M or N extent has no supported whole tile";
             return false;
         }
-        int threadTileM = tileM >= 16 ? 2 : 1;
-        int threadTileN = tileN >= 16 ? 2 : 1;
+        if (schedule.RequireExactTile &&
+            (tileM != schedule.MaximumTileM || tileN != schedule.MaximumTileN))
+        {
+            reason = "the requested measured output tile does not divide M or N";
+            return false;
+        }
+        int threadTileM = schedule.IsDefault
+            ? (tileM >= 16 ? 2 : 1)
+            : schedule.ThreadTileM;
+        int threadTileN = schedule.IsDefault
+            ? (tileN >= 16 ? 2 : 1)
+            : schedule.ThreadTileN;
         int threads = (tileM / threadTileM) * (tileN / threadTileN);
         if (threads < 32 || threads > 256)
         {

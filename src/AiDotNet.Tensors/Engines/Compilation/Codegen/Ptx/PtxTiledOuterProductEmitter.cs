@@ -14,6 +14,7 @@ public sealed class PtxTiledOuterProductEmitter
     private const int FixedRd = 8;
     private const int FixedP = 4;
     private readonly StringBuilder _body = new();
+    private readonly CodegenTiledOuterProductSchedule _schedule;
     private int _r, _rd, _p, _f;
 
     public CodegenTiledOuterProductPlan? Plan { get; private set; }
@@ -21,11 +22,20 @@ public sealed class PtxTiledOuterProductEmitter
     public int LaunchBlockThreads => Plan?.BlockThreads ?? 0;
     public int SharedMemoryBytes => Plan?.SharedMemoryBytes ?? 0;
 
+    public PtxTiledOuterProductEmitter()
+        : this(CodegenTiledOuterProductSchedule.Default)
+    {
+    }
+
+    public PtxTiledOuterProductEmitter(CodegenTiledOuterProductSchedule schedule) =>
+        _schedule = schedule ?? throw new ArgumentNullException(nameof(schedule));
+
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
         if (computeMajor < 8)
             throw new NotSupportedException("The double-buffered outer product requires cp.async on sm_80+.");
-        if (!CodegenTiledOuterProductPlan.TryCreate(spec, out var possible, out string reason))
+        if (!CodegenTiledOuterProductPlan.TryCreate(
+                spec, _schedule, out var possible, out string reason))
             throw new NotSupportedException("This spec cannot use the tiled outer product: " + reason);
         var plan = possible!;
 

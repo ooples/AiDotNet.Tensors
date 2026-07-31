@@ -235,7 +235,8 @@ internal static class KernelCatalogOracleTool
                     entry.Name + " records " + winner + " but no split can be rebuilt.");
 
             PtxTiledOuterProductProgram tiled = PtxTiledOuterProductDispatcher.Emit(
-                split.Partial, major, minor);
+                split.Partial, major, minor,
+                CodegenTiledOuterProductSchedule.FindForWinner(winner));
             int tiledBlocks = tiled.Blocks;
             int tiledSteps = tiled.Steps;
             int tiledInnerReduction = tiled.InnerReduction;
@@ -538,8 +539,10 @@ internal static class KernelCatalogOracleTool
     {
         chunkFactor = 0;
         int marker = winner.LastIndexOf('x');
-        return marker >= 0 && marker + 1 < winner.Length &&
-            int.TryParse(winner.Substring(marker + 1), NumberStyles.None,
+        int end = marker < 0 ? -1 : winner.IndexOf(':', marker + 1);
+        if (end < 0) end = winner.Length;
+        return marker >= 0 && marker + 1 < end &&
+            int.TryParse(winner.Substring(marker + 1, end - marker - 1), NumberStyles.None,
                 CultureInfo.InvariantCulture, out chunkFactor) &&
             CodegenAutotuneIdentity.IsChunkedSplitFactor(chunkFactor);
     }

@@ -206,6 +206,12 @@ public sealed record CodegenAutotuneIdentity(
                     computeMajor, computeMinor, static _ => { });
                 AppendTiledOuterProductCandidate(text, split.Partial,
                     computeMajor, computeMinor);
+                foreach (CodegenTiledOuterProductSchedule schedule in
+                         CodegenTiledOuterProductSchedule.SearchSpace)
+                    if (!schedule.IsDefault)
+                        AppendTiledOuterProductCandidate(text, split.Partial,
+                            computeMajor, computeMinor,
+                            "tiled-split-partial:" + schedule.Suffix, schedule);
             }
 
             foreach (int chunkFactor in ChunkedSplitFactors)
@@ -218,6 +224,14 @@ public sealed record CodegenAutotuneIdentity(
                 AppendTiledOuterProductCandidate(text, chunked.Partial,
                     computeMajor, computeMinor,
                     "tiled-chunked-split-" + label + "-partial");
+                foreach (CodegenTiledOuterProductSchedule schedule in
+                         CodegenTiledOuterProductSchedule.SearchSpace)
+                    if (!schedule.IsDefault)
+                        AppendTiledOuterProductCandidate(text, chunked.Partial,
+                            computeMajor, computeMinor,
+                            "tiled-chunked-split-" + label + "-partial:" +
+                                schedule.Suffix,
+                            schedule);
                 AppendCandidate(text, "tiled-chunked-split-" + label + "-combine",
                     chunked.Combine, computeMajor, computeMinor, static _ => { });
             }
@@ -262,13 +276,14 @@ public sealed record CodegenAutotuneIdentity(
 
     private static void AppendTiledOuterProductCandidate(
         StringBuilder text, CodegenKernelSpec spec, int computeMajor, int computeMinor,
-        string name = "tiled-split-partial")
+        string name = "tiled-split-partial",
+        CodegenTiledOuterProductSchedule? schedule = null)
     {
         text.Append("candidate=").Append(name).Append(';');
         try
         {
             PtxTiledOuterProductProgram program = PtxTiledOuterProductDispatcher.Emit(
-                spec, computeMajor, computeMinor);
+                spec, computeMajor, computeMinor, schedule);
             if (program.OuterProductRefusal is not null)
                 text.Append("outer-unsupported=")
                     .Append(program.OuterProductRefusal).Append(';');

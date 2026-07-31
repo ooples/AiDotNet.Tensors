@@ -70,6 +70,27 @@ public sealed class CodegenTiledOuterProductTests
     }
 
     [Fact]
+    public void PointwiseWeightGradientSplit_EmitsWiderMeasuredMFragment()
+    {
+        var spec = CodegenSplitReduction.TryPlan(
+            CodegenKernelCatalog.Find("conv2d_1x1_bwd_weights")!.Bench)!.Partial;
+        CodegenTiledOuterProductSchedule wide =
+            CodegenTiledOuterProductSchedule.SearchSpace[1];
+        var emitter = new PtxTiledOuterProductEmitter(wide);
+
+        string ptx = emitter.Emit(spec, 8, 6);
+
+        Assert.Equal((32, 16, 4, 2, 64, 224),
+            (emitter.Plan!.TileM, emitter.Plan.TileN,
+             emitter.Plan.ThreadTileM, emitter.Plan.ThreadTileN,
+             emitter.LaunchBlockThreads, emitter.Plan.Blocks));
+        Assert.Contains("output tile 32x16", ptx);
+        Assert.Same(wide,
+            CodegenTiledOuterProductSchedule.FindForWinner(
+                "tiled-split:3:m32n16tm4tn2"));
+    }
+
+    [Fact]
     public void Dispatcher_ReportsGenericOuterProductMetadata()
     {
         var spec = CodegenSplitReduction.TryPlan(

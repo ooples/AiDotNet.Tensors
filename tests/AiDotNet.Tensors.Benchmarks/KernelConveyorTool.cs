@@ -644,7 +644,8 @@ internal static class KernelConveyorTool
                         PtxTiledOuterProductProgram tiled =
                             PtxTiledOuterProductDispatcher.Emit(
                                 plan.Partial, runtime.ComputeCapabilityMajor,
-                                runtime.ComputeCapabilityMinor);
+                                runtime.ComputeCapabilityMinor,
+                                CodegenTiledOuterProductSchedule.FindForWinner(winner));
                         halves.Add(new ProgramKernel(
                             plan.Partial, tiled.Text, tiled.LaunchBlocks,
                             checked((uint)tiled.BlockThreads), 1,
@@ -708,8 +709,10 @@ internal static class KernelConveyorTool
     {
         chunkFactor = 0;
         int marker = winner.LastIndexOf('x');
-        return marker >= 0 && marker + 1 < winner.Length &&
-            int.TryParse(winner.Substring(marker + 1), NumberStyles.None,
+        int end = marker < 0 ? -1 : winner.IndexOf(':', marker + 1);
+        if (end < 0) end = winner.Length;
+        return marker >= 0 && marker + 1 < end &&
+            int.TryParse(winner.Substring(marker + 1, end - marker - 1), NumberStyles.None,
                 CultureInfo.InvariantCulture, out chunkFactor) &&
             CodegenAutotuneIdentity.IsChunkedSplitFactor(chunkFactor);
     }

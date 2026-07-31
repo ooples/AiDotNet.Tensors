@@ -594,13 +594,18 @@ internal static class KernelAutotuneTool
             }
         }
 
-        // Both split forms preserve the deterministic affine combine. The second changes
-        // only the expensive partial pass to a cooperative outer-product tile. Each stays
-        // paired against the live modelled program, with both launches in the timed region.
-        for (int splitKind = 0; splitKind < 2; splitKind++)
+        // Every split form preserves the deterministic affine combine. The measured
+        // schedules change only the expensive partial pass and remain exact replay choices.
+        for (int splitKind = 0;
+             splitKind <= CodegenTiledOuterProductSchedule.SearchSpace.Count;
+             splitKind++)
         {
+            CodegenTiledOuterProductSchedule? outerSchedule = splitKind == 0
+                ? null
+                : CodegenTiledOuterProductSchedule.SearchSpace[splitKind - 1];
             using CandidateProgram? split = TryCreateSplit(
-                runtime, spec, tiledPartial: splitKind == 1);
+                runtime, spec, tiledPartial: splitKind != 0,
+                outerSchedule: outerSchedule);
             if (split is null) continue;
             if (!CandidateEnabled(candidateSelector, split.Name)) continue;
 
@@ -620,21 +625,26 @@ internal static class KernelAutotuneTool
 
         foreach (int chunkFactor in CodegenAutotuneIdentity.ChunkedSplitFactors)
         {
-            using CandidateProgram? split = TryCreateSplit(
-                runtime, spec, tiledPartial: true, chunkFactor: chunkFactor);
-            if (split is null || !CandidateEnabled(candidateSelector, split.Name)) continue;
-
-            split.Launch();
-            runtime.Synchronize();
-            if (!Agrees(split.ReadOutput(), reference, out double deviation))
+            foreach (CodegenTiledOuterProductSchedule outerSchedule in
+                     CodegenTiledOuterProductSchedule.SearchSpace)
             {
-                Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
-                                  deviation.ToString("E3", CultureInfo.InvariantCulture) +
-                                  " relative; rejected");
-                continue;
-            }
+                using CandidateProgram? split = TryCreateSplit(
+                    runtime, spec, tiledPartial: true, chunkFactor: chunkFactor,
+                    outerSchedule: outerSchedule);
+                if (split is null || !CandidateEnabled(candidateSelector, split.Name)) continue;
 
-            Consider(runtime, modelled, split, workUnits, state);
+                split.Launch();
+                runtime.Synchronize();
+                if (!Agrees(split.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                    continue;
+                }
+
+                Consider(runtime, modelled, split, workUnits, state);
+            }
         }
 
         if (!state.HasStableTiming)
@@ -983,7 +993,8 @@ internal static class KernelAutotuneTool
 
     private static CandidateProgram? TryCreateSplit(
         DirectPtxRuntime runtime, CodegenKernelSpec spec,
-        bool tiledPartial = false, int chunkFactor = 0)
+        bool tiledPartial = false, int chunkFactor = 0,
+        CodegenTiledOuterProductSchedule? outerSchedule = null)
     {
         CodegenSplitPlan? plan;
         try
@@ -1007,7 +1018,7 @@ internal static class KernelAutotuneTool
                 PtxTiledOuterProductProgram partial =
                     PtxTiledOuterProductDispatcher.Emit(
                         plan.Partial, runtime.ComputeCapabilityMajor,
-                        runtime.ComputeCapabilityMinor);
+                        runtime.ComputeCapabilityMinor, outerSchedule);
                 partialPtx = partial.Text;
                 partialBlocks = partial.LaunchBlocks;
                 partialBlockX = checked((uint)partial.BlockThreads);
@@ -1081,11 +1092,14 @@ internal static class KernelAutotuneTool
                 LaunchCombine();
             }
 
+            string scheduleSuffix = outerSchedule is { IsDefault: false }
+                ? ":" + outerSchedule.Suffix
+                : string.Empty;
             string name = chunkFactor > 0
                 ? "tiled-chunked-split:" + string.Join("+", plan.PromotedAxes) +
-                    "x" + chunkFactor.ToString(CultureInfo.InvariantCulture)
+                    "x" + chunkFactor.ToString(CultureInfo.InvariantCulture) + scheduleSuffix
                 : (tiledPartial ? "tiled-split:" : "split:") +
-                    string.Join("+", plan.PromotedAxes);
+                    string.Join("+", plan.PromotedAxes) + scheduleSuffix;
             return new CandidateProgram(
                 name, Launch, output, checked((int)spec.Output.ElementCount), resources,
                 new[]
