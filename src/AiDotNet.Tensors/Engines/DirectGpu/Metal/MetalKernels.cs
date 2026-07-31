@@ -223,7 +223,19 @@ kernel void pow_kernel(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = pow(A[gid], power);
+        float x = A[gid];
+        // Metal pow is undefined for a negative base. Integral exponents are
+        // mathematically valid, so evaluate |x|^power and restore odd parity.
+        if (x < 0.0f) {
+            if (power == trunc(power)) {
+                float magnitude = pow(-x, power);
+                B[gid] = (fmod(fabs(power), 2.0f) == 1.0f) ? -magnitude : magnitude;
+            } else {
+                B[gid] = NAN;
+            }
+        } else {
+            B[gid] = pow(x, power);
+        }
     }
 }
 
@@ -1171,7 +1183,9 @@ kernel void selu_backward(
         const float alpha = 1.6732632423543772f;
         const float scale = 1.0507009873554805f;
         float x = input[gid];
-        float grad = x > 0.0f ? scale : scale * alpha * exp(x);
+        // #775: use >= to match CpuEngine (deriv = x >= 0 ? scale : scale*alpha*exp(x)), as OpenCL and
+        // WebGpu already do. Differs only at x==0 and x==-0, where it is a factor-of-alpha error.
+        float grad = x >= 0.0f ? scale : scale * alpha * exp(x);
         gradInput[gid] = gradOutput[gid] * grad;
     }
 }

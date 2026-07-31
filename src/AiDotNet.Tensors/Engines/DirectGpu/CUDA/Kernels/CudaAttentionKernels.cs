@@ -40,7 +40,9 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     float scale,
     int isCausal,
     int maskMode,
-    int storeWeights)
+    int storeWeights,
+    float softcap,
+    int numKVHeads)  // Grouped-Query Attention: <numHeads shares each KV head; == numHeads for MHA.
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int totalRows = batch * numHeads * seqQ;
@@ -49,35 +51,47 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     int qi = row % seqQ;
     int bh = row / seqQ;
     int qOffset = row * headDim;
-    int kOffset = bh * seqK * headDim;
+    // GQA: map query head -> shared KV head. bh = b*numHeads + h; kvHead = h / (numHeads/numKVHeads);
+    // the K/V slab for this row lives at (b*numKVHeads + kvHead). numKVHeads==numHeads collapses to bh.
+    int b = bh / numHeads;
+    int h = bh - b * numHeads;
+    int kvGroup = numHeads / numKVHeads;
+    int bkvh = b * numKVHeads + (h / kvGroup);
+    int kOffset = bkvh * seqK * headDim;
     int vOffset = kOffset;
     int wOffset = row * seqK;
     int maskOffset = (maskMode == 2 ? bh * seqQ * seqK : 0) + qi * seqK;
+    // Causal with a KV-cache offset: query row qi is at absolute position qi + (seqK - seqQ) (seqQ==seqK
+    // collapses to ki > qi; a decode step seqQ=1<seqK attends to the whole cached prefix, not just key 0).
+    int qPos = qi + (seqK - seqQ);
+
+    // Attention-logit soft-cap (Gemma-2): softcap * tanh((score*scale)/softcap); softcap<=0 disables.
+    #define ATTN_LOGIT(sc) (softcap > 0.0f ? softcap * tanhf(((sc) * scale) / softcap) : (sc) * scale)
 
     float rowMax = -INFINITY;
     for (int ki = 0; ki < seqK; ki++) {
-        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) score += query[qOffset + d] * key[kOffset + ki * headDim + d];
-        rowMax = fmaxf(rowMax, score * scale);
+        rowMax = fmaxf(rowMax, ATTN_LOGIT(score));
     }
 
     float denominator = 0.0f;
     for (int ki = 0; ki < seqK; ki++) {
-        if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+        if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) score += query[qOffset + d] * key[kOffset + ki * headDim + d];
-        denominator += expf(score * scale - rowMax);
+        denominator += expf(ATTN_LOGIT(score) - rowMax);
     }
 
     float inverseDenominator = denominator > 0.0f ? 1.0f / denominator : 0.0f;
     if (storeWeights) {
         for (int ki = 0; ki < seqK; ki++) {
             float weight = 0.0f;
-            if (!((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
+            if (!((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f))) {
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) score += query[qOffset + d] * key[kOffset + ki * headDim + d];
-                weight = expf(score * scale - rowMax) * inverseDenominator;
+                weight = expf(ATTN_LOGIT(score) - rowMax) * inverseDenominator;
             }
             attentionWeights[wOffset + ki] = weight;
         }
@@ -86,14 +100,15 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
     for (int d = 0; d < headDim; d++) {
         float sum = 0.0f;
         for (int ki = 0; ki < seqK; ki++) {
-            if ((isCausal && ki > qi) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
+            if ((isCausal && ki > qPos) || (maskMode != 0 && mask[maskOffset + ki] == 0.0f)) continue;
             float score = 0.0f;
             for (int inner = 0; inner < headDim; inner++) score += query[qOffset + inner] * key[kOffset + ki * headDim + inner];
-            float weight = expf(score * scale - rowMax) * inverseDenominator;
+            float weight = expf(ATTN_LOGIT(score) - rowMax) * inverseDenominator;
             sum += weight * value[vOffset + ki * headDim + d];
         }
         output[qOffset + d] = sum;
     }
+    #undef ATTN_LOGIT
 }
 
 // ===========================================================================
@@ -1000,6 +1015,39 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_forward(
         }
     }
 }
+
+// ===========================================================================
+// FUSED ROTARY POSITION EMBEDDING (RoPE) - interleaved (GPT-NeoX / LLaMA / GGML)
+// One thread per (row, pair). cos/sin are [maxSeq, headDim/2], indexed by absolute position.
+// ===========================================================================
+extern ""C"" __global__ void rope_interleaved(
+    const float* __restrict__ input,      // [rows * headDim]
+    const float* __restrict__ cosCache,   // [maxSeq * halfDim]
+    const float* __restrict__ sinCache,   // [maxSeq * halfDim]
+    float* __restrict__ output,           // [rows * headDim]
+    int rows,
+    int headDim,
+    int seqLen,
+    int startPosition)
+{
+    int halfDim = headDim / 2;
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= rows * halfDim) return;
+
+    int i = g % halfDim;
+    int row = g / halfDim;
+    int s = row % seqLen;
+    int pos = startPosition + s;
+    int baseIdx = row * headDim;
+    int cacheIdx = pos * halfDim + i;
+
+    float c = cosCache[cacheIdx];
+    float sn = sinCache[cacheIdx];
+    float xEven = input[baseIdx + 2 * i];
+    float xOdd = input[baseIdx + 2 * i + 1];
+    output[baseIdx + 2 * i] = xEven * c - xOdd * sn;
+    output[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
+}
 ";
         }
 
@@ -1016,7 +1064,8 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_forward(
                 "grouped_query_attention_backward",
                 "grouped_query_attention_backward_gradq_deterministic",
                 "grouped_query_attention_backward_gradkv_deterministic",
-                "flash_attention_forward"
+                "flash_attention_forward",
+                "rope_interleaved"
             };
         }
     }

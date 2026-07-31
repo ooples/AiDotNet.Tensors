@@ -708,6 +708,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 _audioModule = IntPtr.Zero;
             }
 
+            // Fused ANN kernels (IAnnBackend). Supply-chain-clean replacement for FaissNet/MKL.
+            try
+            {
+                CompileKernelModule(Kernels.HipAnnKernels.GetSource(), "ann",
+                    ref _annModule, Kernels.HipAnnKernels.GetKernelNames());
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"HIP ANN kernel compilation failed: {ex.Message}");
+                _annModule = IntPtr.Zero;
+            }
+
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
         }
@@ -6087,15 +6099,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal, float softcap = 0.0f,
+        int numKVHeads = 0)
     {
         if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
         if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: scaled_dot_product_attention");
 
+        // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
+        // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
+        int kvHeads = numKVHeads > 0 ? numKVHeads : numHeads;
+        if (numHeads % kvHeads != 0)
+            throw new ArgumentException("numHeads must be an integer multiple of numKVHeads.", nameof(numKVHeads));
         int querySize = checked(batch * numHeads * seqQ * headDim);
-        int keyValueSize = checked(batch * numHeads * seqK * headDim);
+        int keyValueSize = checked(batch * kvHeads * seqK * headDim);
         int weightsSize = checked(batch * numHeads * seqQ * seqK);
         if (query.Size < querySize || key.Size < keyValueSize || value.Size < keyValueSize || output.Size < querySize)
             throw new ArgumentException("Attention tensor buffers are smaller than the requested dimensions.");
@@ -6113,7 +6131,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int causalFlag = isCausal ? 1 : 0;
         int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
         int storeWeights = attentionWeights is null ? 0 : 1;
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[17];
         args[0] = &queryPtr;
         args[1] = &keyPtr;
         args[2] = &valuePtr;
@@ -6129,9 +6147,44 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[12] = &causalFlag;
         args[13] = &maskMode;
         args[14] = &storeWeights;
+        args[15] = &softcap;
+        args[16] = &kvHeads;
 
         int rows = checked(batch * numHeads * seqQ);
         uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
+        int rows, int headDim, int seqLen, int startPosition)
+    {
+        if (rows <= 0 || headDim <= 0 || seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "RoPE dimensions must be positive.");
+        if ((headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
+        if (!_kernelCache.TryGetValue("rope_interleaved", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: rope_interleaved");
+        int total = checked(rows * headDim);
+        if (input.Size < total || output.Size < total)
+            throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
+
+        IntPtr inputPtr = input.Handle;
+        IntPtr cosPtr = cos.Handle;
+        IntPtr sinPtr = sin.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPtr;
+        args[1] = &cosPtr;
+        args[2] = &sinPtr;
+        args[3] = &outputPtr;
+        args[4] = &rows;
+        args[5] = &headDim;
+        args[6] = &seqLen;
+        args[7] = &startPosition;
+
+        int pairs = checked(rows * (headDim / 2));
+        uint grid = (uint)((pairs + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
         Synchronize();
     }
@@ -8259,14 +8312,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
-    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
         int __total = batch*numHeads; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
-        void** args = stackalloc void*[12];
-        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        IntPtr la0 = r.Handle; IntPtr la1 = kappa.Handle; IntPtr la2 = kTilde.Handle; IntPtr la3 = v.Handle; IntPtr la4 = decayLogit.Handle; IntPtr la5 = iclRate.Handle; IntPtr la6 = output.Handle; IntPtr la7 = sbuf.Handle; int la8 = batch; int la9 = seqLen; int la10 = modelDim; int la11 = numHeads; int la12 = headDim;
+        void** args = stackalloc void*[13];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11; args[12] = &la12;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
@@ -9000,17 +9053,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/N for inverse FFT
+        // Scale by 1/n for inverse FFT (n elements, factor 1/n).
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / n;
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &n;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9167,7 +9222,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/N for inverse FFT (batched)
+        // Scale batched inverse: touch batch*n elements but scale each by 1/n (NOT 1/(batch*n)).
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             int total = batch * n;
@@ -9175,10 +9230,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / n;   // per-transform length, NOT 1/(batch*n)
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &total;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -9204,17 +9261,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         HipCopyBuffer(inputReal, outputReal, total);
         HipCopyBuffer(inputImag, outputImag, total);
 
-        // Row-wise bit reversal and FFT
-        if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel) &&
+        // Row-wise bit reversal (DIT operates on bit-reversed input) then row butterflies. The previous
+        // code left an EMPTY per-row loop here (no bit reversal at all), so the DIT butterflies ran on
+        // un-permuted data and the whole 2D FFT produced garbage. Now each row is bit-reversed first.
+        if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowsBitRevKernel) &&
             _kernelCache.TryGetValue("fft_rows_butterfly", out var rowsButterflyKernel))
         {
-            // Bit reversal for each row (using batched approach)
-            for (int row = 0; row < height; row++)
-            {
-                int offset = row * width;
-                // Note: For production, we should use offset buffers or batched kernel
-                // This is a simplified version that operates row by row
-            }
+                {
+                uint gridBrX = (uint)((width + DefaultBlockSize - 1) / DefaultBlockSize);
+                uint gridBrY = (uint)height;
+                IntPtr _b0 = outputReal.Handle;
+                IntPtr _b1 = outputImag.Handle;
+#pragma warning disable CA2014
+                void** brArgs = stackalloc void*[5];
+#pragma warning restore CA2014
+                brArgs[0] = &_b0;
+                brArgs[1] = &_b1;
+                brArgs[2] = &height;
+                brArgs[3] = &width;
+                brArgs[4] = &log2Width;
+                LaunchKernel2D(rowsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+                }
 
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= width; stride *= 2)
@@ -9240,9 +9307,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Column-wise FFT
+        // Column-wise bit reversal then column butterflies (same missing-bit-reversal fix as the rows).
         if (_kernelCache.TryGetValue("fft_cols_butterfly", out var colsButterflyKernel))
         {
+            if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colsBitRevKernel))
+            {
+                uint gridBrX = (uint)((height + DefaultBlockSize - 1) / DefaultBlockSize);
+                uint gridBrY = (uint)width;
+                IntPtr _b0 = outputReal.Handle;
+                IntPtr _b1 = outputImag.Handle;
+#pragma warning disable CA2014
+                void** brArgs = stackalloc void*[5];
+#pragma warning restore CA2014
+                brArgs[0] = &_b0;
+                brArgs[1] = &_b1;
+                brArgs[2] = &height;
+                brArgs[3] = &width;
+                brArgs[4] = &log2Height;
+                LaunchKernel2D(colsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+            }
+
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= height; stride *= 2)
             {
@@ -9269,17 +9353,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
         }
 
-        // Scale by 1/(height*width) for inverse FFT
+        // Scale by 1/(height*width) for inverse 2D FFT.
         if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
         {
             uint gridSize = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[3];
+                float invScale = 1.0f / total;   // 2D transform length = height*width
+                void** args = stackalloc void*[4];
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &total;
+                args[3] = &invScale;
 
 
                 LaunchKernel(scaleKernel, gridSize, (uint)DefaultBlockSize, args);
@@ -11189,6 +11275,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 HipNativeBindings.hipModuleUnload(modRef);
         }
         _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
+
+        // Unload the fused ANN kernel module (IAnnBackend).
+        if (_annModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_annModule);
+            _annModule = IntPtr.Zero;
+        }
 
         // Unload all additional kernel modules
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })

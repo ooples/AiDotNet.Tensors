@@ -84,3 +84,14 @@ src/AiDotNet.Native.CUDA/obj/cuda-split/
 # local CLI/device state (gh)
 .local/
 scratch-opparity/
+
+# License signing PRIVATE keys / issued artifacts — NEVER commit. Generated locally by
+# tools/license-issuer/*keygen*.py (RSA entitlement signing key) and the issuers. The PUBLIC
+# key is embedded in source (SignedEntitlement.EntitlementPublicKey / Licensing/LicensePublicKey.json).
+*.pem
+private_key.pem
+tensors-entitlement.json
+
+# Python tool caches
+__pycache__/
+*.pyc

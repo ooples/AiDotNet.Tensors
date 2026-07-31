@@ -67,6 +67,8 @@ internal static class OpRegistry
 
         // Attention/Embedding
         "Embedding", "Dropout",
+        // Interleaved RoPE: orthogonal rotation, records with ApplyRoPEInterleavedBackward (inverse rotation).
+        "ApplyRoPEInterleaved",
         "GridSample", "Unfold", "Fold",
 
         // Spatial
@@ -443,6 +445,7 @@ internal static class OpRegistry
         // Attention ops (composed from recorded sub-ops)
         "TensorScaledDotProductAttention", // TensorMatMul + TensorMultiplyScalar + Softmax
         "ScaledDotProductAttention",       // composed
+        "ScaledDotProductAttentionGqa",    // delegates to ScaledDotProductAttention (records)
         "FlashAttention",                  // composed
         "GroupedQueryAttention",           // composed
         "GraphAttention",                  // composed

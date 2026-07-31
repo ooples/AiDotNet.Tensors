@@ -4184,13 +4184,41 @@ public interface IEngine
     /// <item><description>Combined: Element-wise AND of causal and padding masks</description></item>
     /// </list>
     /// </remarks>
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0, the scaled scores
+    /// are passed through <c>softcap · tanh(scores / softcap)</c> before the softmax, bounding them to
+    /// <c>(-softcap, softcap)</c>. 0 (the default) disables it.</param>
     Tensor<T> ScaledDotProductAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
         Tensor<T> value,
         Tensor<bool>? mask,
         double? scale,
-        out Tensor<T> attentionWeights);
+        out Tensor<T> attentionWeights,
+        double softcap = 0.0);
+
+    /// <summary>
+    /// Grouped-query scaled dot-product attention (inference), device-agnostically: <paramref name="key"/> and
+    /// <paramref name="value"/> may carry fewer heads than <paramref name="query"/> (<c>qHeads % kvHeads == 0</c>)
+    /// and each KV head is shared across its query-head group WITHOUT materializing an expanded copy. The GPU
+    /// engine dispatches to the fused GQA-aware attention kernel (recordable under a deferred scope); the CPU
+    /// engine broadcasts the KV heads internally and runs standard attention. Causality is expressed as a flag
+    /// (not a mask tensor) so it matches the kernel; attention weights are not returned (inference only).
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="query">Query tensor <c>[batch, qHeads, seqQ, headDim]</c>.</param>
+    /// <param name="key">Key tensor <c>[batch, kvHeads, seqK, headDim]</c> (kvHeads divides qHeads).</param>
+    /// <param name="value">Value tensor <c>[batch, kvHeads, seqK, headDim]</c>.</param>
+    /// <param name="scale">Softmax scale (typically <c>1/sqrt(headDim)</c>).</param>
+    /// <param name="isCausal">When <see langword="true"/>, position <c>q</c> attends only to keys <c>k &lt;= q</c>.</param>
+    /// <param name="softcap">Gemma-2 attention logit soft-cap; 0 disables it.</param>
+    /// <returns>Attention output <c>[batch, qHeads, seqQ, headDim]</c>.</returns>
+    Tensor<T> ScaledDotProductAttentionGqa<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        double scale,
+        bool isCausal,
+        double softcap = 0.0);
 
     /// <summary>
     /// Fused multi-head attention forward (inference only): Q/K/V projection +
@@ -4289,29 +4317,42 @@ public interface IEngine
         bool returnSequences = false);
 
     /// <summary>
-    /// Fused RWKV-7 time-mixing WKV recurrence over a whole sequence in a single op
-    /// (forward + custom autodiff backward). Replaces the ~10 per-timestep tape micro-ops the
-    /// decomposed <c>RWKV7Block</c> loop records, which is the dominant training cost on long
-    /// sequences (issue ooples/AiDotNet#1464). Inputs are the per-position projected gate/value
-    /// streams <c>[batch, seqLen, modelDim]</c>; the per-position sigmoids are applied internally.
-    /// Unlike <see cref="LstmSequenceForward{T}"/>, this op IS differentiable — it records a single
-    /// tape node whose backward runs the BPTT adjoint of the recurrence, so it is safe under an
-    /// active <c>GradientTape</c>.
+    /// Fused RWKV-7 "Goose" time-mixing WKV recurrence over a whole sequence in a single op
+    /// (forward + custom autodiff backward). Replaces the per-timestep tape micro-ops a decomposed
+    /// <c>RWKV7Block</c> loop records, which is the dominant training cost on long sequences
+    /// (issue ooples/AiDotNet#1464). Unlike <see cref="LstmSequenceForward{T}"/>, this op IS
+    /// differentiable — it records a single tape node whose backward runs the BPTT adjoint of the
+    /// recurrence, so it is safe under an active <c>GradientTape</c>.
+    /// <para>Implements the paper's generalised delta rule (arXiv:2503.14456, Eq. 17) — a diagonal
+    /// decay MINUS a rank-1 removal term, per head:</para>
+    /// <code>
+    ///   wkv_t = wkv_{t-1} (diag(w_t) - kappaHat_t^T (a_t (*) kappaHat_t)) + v_t^T kTilde_t
+    ///   o_t   = wkv_t . r_t
+    /// </code>
+    /// <para>where <c>w_t = exp(-e^(-1/2) * sigmoid(decayLogit_t))</c> in <c>(0.5453, 1)</c> and
+    /// <c>kappaHat_t = kappa_t / ||kappa_t||_2</c> (L2-normalised per head) are both computed
+    /// internally, so the recurrence and its adjoint never touch the tape per step.</para>
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="rProj">Receptance projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
-    /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
-    /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
-    /// <param name="aProj">State-evolution decay (a) projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
-    /// <param name="bProj">State-evolution injection (b) projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
+    /// <param name="rProj">Receptance r_t [batch, seqLen, modelDim], used raw — the paper contracts
+    /// the state with r; output gating/normalisation belongs to the caller.</param>
+    /// <param name="kappa">kappa_t [batch, seqLen, modelDim] PRE-normalisation (L2-normalised per head
+    /// inside the kernel); in the reference implementation kappa_t = k_t (*) k_k.</param>
+    /// <param name="kTilde">kTilde_t [batch, seqLen, modelDim], the value-injection key
+    /// k_t (*) (1 + (a_t - 1) (*) k_a).</param>
+    /// <param name="vProj">Value projection v_t [batch, seqLen, modelDim].</param>
+    /// <param name="decayLogit">Decay pre-activation d_t [batch, seqLen, modelDim].</param>
+    /// <param name="iclRate">In-context learning rate a_t [batch, seqLen, modelDim], already in (0,1)
+    /// (passed post-activation because the caller also needs it to form <paramref name="kTilde"/>).</param>
     /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
-    /// <returns>The gated WKV output [batch, seqLen, modelDim].</returns>
+    /// <returns>The WKV readout o_t [batch, seqLen, modelDim].</returns>
     Tensor<T> Rwkv7SequenceForward<T>(
         Tensor<T> rProj,
-        Tensor<T> kProj,
+        Tensor<T> kappa,
+        Tensor<T> kTilde,
         Tensor<T> vProj,
-        Tensor<T> aProj,
-        Tensor<T> bProj,
+        Tensor<T> decayLogit,
+        Tensor<T> iclRate,
         int numHeads);
 
     /// <summary>
@@ -5369,6 +5410,22 @@ public interface IEngine
     /// </list>
     /// </remarks>
     Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms);
+
+    /// <summary>
+    /// Applies interleaved rotary positional embedding (RoPE, GPT-J / GGML layout) to a
+    /// <c>[.., seqLen, headDim]</c> activation, device-agnostically: the GPU engine dispatches to the fused
+    /// <c>rope_interleaved</c> kernel (recordable under a deferred scope), while the CPU engine runs the same
+    /// interleaved rotation. Adjacent dimensions <c>(2i, 2i+1)</c> are rotated by the angle at
+    /// <c>cos/sin[position, i]</c> where <c>position = startPosition + (row % seqLen)</c>:
+    /// <c>out[2i] = x[2i]·cos − x[2i+1]·sin</c>, <c>out[2i+1] = x[2i]·sin + x[2i+1]·cos</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">Activation to rotate, shape <c>[.., seqLen, headDim]</c> with an even <c>headDim</c>.</param>
+    /// <param name="cos">Precomputed cosine cache <c>[maxSeq, headDim/2]</c>.</param>
+    /// <param name="sin">Precomputed sine cache <c>[maxSeq, headDim/2]</c>.</param>
+    /// <param name="startPosition">Absolute position of the first sequence element (KV-cache offset).</param>
+    /// <returns>The rotated tensor, same shape as <paramref name="input"/>.</returns>
+    Tensor<T> ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition = 0);
 
     /// <summary>
     /// Computes the backward pass for RMSNorm.

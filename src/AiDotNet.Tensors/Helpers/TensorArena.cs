@@ -126,6 +126,9 @@ public sealed class TensorArena : IDisposable
     /// which already had to be resident during the step.</summary>
     private const int MaxPersistPerSize = 64;
 
+    /// <summary>Bytes per MiB, used to render byte counters in the diagnostic messages.</summary>
+    private const double BytesPerMiB = 1024.0 * 1024.0;
+
     private static Array? RentPersistent(Type type, int elementCount)
     {
         if (elementCount < PersistThresholdElems) return null;
@@ -305,9 +308,22 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     internal static TensorArena? Current => _current;
 
-    private TensorArena(TensorArena? previous)
+    // When true, Dispose returns this arena's scratch/ring backing arrays to the
+    // cross-arena persistent pool EVEN when nested (_previous != null). Normally
+    // only a TOP-LEVEL arena may pool (a nested arena's op outputs can escape to the
+    // still-live outer scope — the #1221 hazard). A caller sets this ONLY when it can
+    // guarantee none of the arena's tensors escape the scope — e.g. the per-step FUSED
+    // training arena, whose forward/backward intermediates are all consumed inside
+    // CompiledTrainingPlan.Step (the loss is copied out; gradients use the persistent
+    // pool). Without this, that per-step arena — nested inside TrainWithTape's own
+    // arena — GC-drops its large (>ArrayPool-cap) buffers every step (the ~1 GB/step
+    // churn on foundation-scale training; AiDotNet #478 only fixed the top-level case).
+    private readonly bool _poolWhenNested;
+
+    private TensorArena(TensorArena? previous, bool poolWhenNested = false)
     {
         _previous = previous;
+        _poolWhenNested = poolWhenNested;
     }
 
     /// <summary>
@@ -315,12 +331,74 @@ public sealed class TensorArena : IDisposable
     /// All <see cref="TensorAllocator.Rent{T}"/> calls on this thread will allocate from the arena
     /// until it is disposed.
     /// </summary>
+    /// <param name="poolWhenNested">When true, this arena pools its backing arrays into the
+    /// cross-arena persistent pool on <see cref="Dispose"/> even if it is nested inside another
+    /// arena. Set ONLY when the caller guarantees no arena tensor escapes the scope (e.g. a
+    /// self-contained per-step fused training arena); pooling an escaped buffer corrupts the live
+    /// outer-scope tensor (#1221).</param>
     /// <returns>An arena that must be disposed to deactivate.</returns>
-    public static TensorArena Create()
+    public static TensorArena Create(bool poolWhenNested = false)
     {
-        var arena = new TensorArena(_current);
+        var arena = new TensorArena(_current, poolWhenNested);
         _current = arena;
         return arena;
+    }
+
+    /// <summary>
+    /// Creates a DETACHED, long-lived arena that is NOT activated (the thread's <see cref="Current"/>
+    /// is unchanged). The caller holds it across iterations and drives it with <see cref="Activate"/>
+    /// then <see cref="Reset"/> to reuse ALL of its backing buffers — no cross-arena persist threshold
+    /// or per-size cap, unlike the create+dispose-per-step pattern which only reuses via the capped
+    /// <c>_persistent</c> pool. This is the zero-GC per-step training arena: a foundation-scale fused
+    /// step re-allocated its entire ~1 GB working set every step because its per-step arena's small
+    /// buffers fell under the persist threshold and its large ones hit the per-size cap. The holder
+    /// owns the lifetime (call <see cref="Dispose"/> when the model is torn down).
+    /// </summary>
+    public static TensorArena CreateDetached() => new TensorArena(null);
+
+    /// <summary>
+    /// Activates this arena as the thread's <see cref="Current"/> for the lifetime of the returned
+    /// scope, restoring the previously-active arena on <see cref="ActivationScope.Dispose"/>. Does NOT
+    /// dispose or reset this arena — pair with <see cref="Reset"/> between iterations to reuse its
+    /// buffers. Only valid on a detached arena (one the caller owns across iterations).
+    /// </summary>
+    public ActivationScope Activate()
+    {
+        var saved = _current;
+        _current = this;
+        return new ActivationScope(this, saved);
+    }
+
+    /// <summary>Restores the thread's active arena to what it was before the paired
+    /// <see cref="TensorArena.Activate"/>. Does not dispose the activated arena.</summary>
+    /// <remarks>
+    /// Dispose is idempotent AND ownership-aware. An unconditional <c>_current = _saved</c> would
+    /// clobber a NEWER active arena on a repeated or out-of-order dispose, after which subsequent
+    /// rents target the wrong arena and can hand back buffers that are still live. The restore
+    /// therefore only happens while this scope's arena is still the active one.
+    /// </remarks>
+    public struct ActivationScope : IDisposable
+    {
+        private readonly TensorArena? _saved;
+        private readonly TensorArena _activated;
+        private bool _disposed;
+
+        internal ActivationScope(TensorArena activated, TensorArena? saved)
+        {
+            _activated = activated;
+            _saved = saved;
+            _disposed = false;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // Only unwind if we are still the innermost activation; a nested scope activated
+            // after us owns _current until it disposes.
+            if (ReferenceEquals(_current, _activated))
+                _current = _saved;
+        }
     }
 
     /// <summary>
@@ -597,6 +675,12 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     public void Reset()
     {
+        if (TensorAllocator.AllocDiag)
+        {
+            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={TensorAllocator.ArenaHit}({TensorAllocator.ArenaHitBytes / BytesPerMiB:F0}MB) arenaMiss={TensorAllocator.ArenaMiss}({TensorAllocator.ArenaMissBytes / BytesPerMiB:F0}MB) arenaNull={TensorAllocator.ArenaNull}({TensorAllocator.ArenaNullBytes / BytesPerMiB:F0}MB)");
+            TensorAllocator.ArenaHit = 0; TensorAllocator.ArenaMiss = 0; TensorAllocator.ArenaNull = 0;
+            TensorAllocator.ArenaHitBytes = 0; TensorAllocator.ArenaMissBytes = 0; TensorAllocator.ArenaNullBytes = 0;
+        }
         // Rewind all cursors to 0 — arrays and tensors stay pooled.
         // NOTE: must snapshot the keys before mutating. On .NET Framework
         // (net471), Dictionary<,>.this[key] = value increments the collection
@@ -670,7 +754,7 @@ public sealed class TensorArena : IDisposable
         // following eval forward, making Predict non-idempotent — first forward ≠ rest).
         // Top-level per-step training arenas (the #478 pattern: TrainWithTape's own
         // `using var arena`, no outer wrapper) keep pooling, so the GC win is preserved.
-        if (_previous is null)
+        if (_previous is null || _poolWhenNested)
         {
             foreach (var kvp in _pool)
             {
@@ -689,6 +773,8 @@ public sealed class TensorArena : IDisposable
             if (_pendingCarryReturn is { } carry)
                 ReturnCarry(carry.type, carry.size, carry.arr);
         }
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_ARENA_DIAG") == "1")
+            System.Console.Error.WriteLine($"[ARENA-DISPOSE] pooled={( _previous is null || _poolWhenNested)} poolWhenNested={_poolWhenNested} prevNull={_previous is null} ringBackings={_ringBackingArrays.Count} poolBuckets={_pool.Count} peakMB={_peakBackingBytes / BytesPerMiB:F1} reuseHitsTotal={_persistentReuseHits}");
         _pendingCarryReturn = null;
 
         _pool.Clear();

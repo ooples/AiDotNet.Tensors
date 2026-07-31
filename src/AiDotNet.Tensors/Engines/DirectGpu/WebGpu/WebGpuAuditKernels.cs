@@ -259,6 +259,35 @@ struct P { n: i32, d: i32, p: f32 };
   let outIdx = i * pc.n - (i * (i + 1)) / 2 + (j - i - 1); outp[outIdx] = dist;
 }";
 
+    /// <summary>
+    /// Packs split real/imag into one interleaved [re0, im0, ...] buffer. Not composable from CopyRows,
+    /// which can express real -> interleaved[2i] but has no destination offset for imag -> [2i+1].
+    /// </summary>
+    public static string InterleaveComplex => @"
+@group(0) @binding(0) var<storage, read> realv : array<f32>;
+@group(0) @binding(1) var<storage, read> imagv : array<f32>;
+@group(0) @binding(2) var<storage, read_write> inter : array<f32>;
+struct P { n: i32 };
+@group(0) @binding(3) var<uniform> pc : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let g = i32(gid.x); if (g >= pc.n) { return; }
+  inter[2 * g] = realv[g];
+  inter[2 * g + 1] = imagv[g];
+}";
+
+    /// <summary>Splits an interleaved complex buffer into separate real/imag buffers.</summary>
+    public static string DeinterleaveComplex => @"
+@group(0) @binding(0) var<storage, read> inter : array<f32>;
+@group(0) @binding(1) var<storage, read_write> realv : array<f32>;
+@group(0) @binding(2) var<storage, read_write> imagv : array<f32>;
+struct P { n: i32 };
+@group(0) @binding(3) var<uniform> pc : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let g = i32(gid.x); if (g >= pc.n) { return; }
+  realv[g] = inter[2 * g];
+  imagv[g] = inter[2 * g + 1];
+}";
+
     public static string CopyRows => @"
 @group(0) @binding(0) var<storage, read> src : array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<f32>;
@@ -540,29 +569,44 @@ struct P { rowLen: i32, k: i32, j: i32, numRows: i32, descending: i32 };
   if (doSwap) { values[base + i] = b; values[base + ixj] = a; let t = indices[base + i]; indices[base + i] = indices[base + ixj]; indices[base + ixj] = t; }
 }";
 
+    // RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17). Sbuf holds, per (b,h), the
+    // [d_v, d_k] state followed by the kappaHat / w / a gate vectors.
     public static string Rwkv7Forward => @"
 @group(0) @binding(0) var<storage, read> R : array<f32>;
-@group(0) @binding(1) var<storage, read> K : array<f32>;
-@group(0) @binding(2) var<storage, read> V : array<f32>;
-@group(0) @binding(3) var<storage, read> A : array<f32>;
-@group(0) @binding(4) var<storage, read> B : array<f32>;
-@group(0) @binding(5) var<storage, read_write> outp : array<f32>;
-@group(0) @binding(6) var<storage, read_write> Sbuf : array<f32>;
+@group(0) @binding(1) var<storage, read> KAP : array<f32>;
+@group(0) @binding(2) var<storage, read> KT : array<f32>;
+@group(0) @binding(3) var<storage, read> V : array<f32>;
+@group(0) @binding(4) var<storage, read> D : array<f32>;
+@group(0) @binding(5) var<storage, read> AR : array<f32>;
+@group(0) @binding(6) var<storage, read_write> outp : array<f32>;
+@group(0) @binding(7) var<storage, read_write> Sbuf : array<f32>;
 struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
-@group(0) @binding(7) var<uniform> pc : P;
+@group(0) @binding(8) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let bh = i32(gid.x); if (bh >= pc.batch * pc.numHeads) { return; } let b = bh / pc.numHeads; let h = bh % pc.numHeads; let hOff = h * pc.headDim; let hh = pc.headDim * pc.headDim; let sBase = bh * hh;
+  let bh = i32(gid.x); if (bh >= pc.batch * pc.numHeads) { return; }
+  let b = bh / pc.numHeads; let h = bh % pc.numHeads; let hOff = h * pc.headDim; let hh = pc.headDim * pc.headDim;
+  let sBase = bh * (hh + 3 * pc.headDim); let khB = sBase + hh; let wB = sBase + hh + pc.headDim; let aB = sBase + hh + 2 * pc.headDim;
   for (var i = 0; i < hh; i = i + 1) { Sbuf[sBase + i] = 0.0; }
   for (var t = 0; t < pc.seqLen; t = t + 1) {
     let baseOff = (b * pc.seqLen + t) * pc.modelDim + hOff;
-    for (var di = 0; di < pc.headDim; di = di + 1) {
-      let ga = 1.0 / (1.0 + exp(-A[baseOff + di])); let gbk = (1.0 / (1.0 + exp(-B[baseOff + di]))) * K[baseOff + di]; let srow = di * pc.headDim;
-      for (var vi = 0; vi < pc.headDim; vi = vi + 1) { Sbuf[sBase + srow + vi] = ga * Sbuf[sBase + srow + vi] + gbk * V[baseOff + vi]; }
+    var ss = 1e-12;
+    for (var ki = 0; ki < pc.headDim; ki = ki + 1) { let kp = KAP[baseOff + ki]; ss = ss + kp * kp; }
+    let invN = 1.0 / sqrt(ss);
+    for (var ki = 0; ki < pc.headDim; ki = ki + 1) {
+      Sbuf[khB + ki] = KAP[baseOff + ki] * invN;
+      Sbuf[wB + ki] = exp(-0.60653065971263342 / (1.0 + exp(-D[baseOff + ki])));
+      Sbuf[aB + ki] = AR[baseOff + ki];
     }
-    for (var di = 0; di < pc.headDim; di = di + 1) {
-      let srow = di * pc.headDim; var sk = 0.0;
-      for (var vi = 0; vi < pc.headDim; vi = vi + 1) { sk = sk + Sbuf[sBase + srow + vi] * K[baseOff + vi]; }
-      outp[baseOff + di] = (1.0 / (1.0 + exp(-R[baseOff + di]))) * sk;
+    for (var vi = 0; vi < pc.headDim; vi = vi + 1) {
+      let srow = sBase + vi * pc.headDim; var p = 0.0;
+      for (var ki = 0; ki < pc.headDim; ki = ki + 1) { p = p + Sbuf[srow + ki] * Sbuf[khB + ki]; }
+      let vv = V[baseOff + vi]; var o = 0.0;
+      for (var ki = 0; ki < pc.headDim; ki = ki + 1) {
+        let sv = Sbuf[srow + ki] * Sbuf[wB + ki] - p * Sbuf[aB + ki] * Sbuf[khB + ki] + vv * KT[baseOff + ki];
+        Sbuf[srow + ki] = sv;
+        o = o + sv * R[baseOff + ki];
+      }
+      outp[baseOff + vi] = o;
     }
   }
 }";

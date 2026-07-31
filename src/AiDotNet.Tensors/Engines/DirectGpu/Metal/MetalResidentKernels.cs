@@ -418,8 +418,8 @@ kernel void capsule_squash(
     uint capsule = gid / dimension, offset = capsule * dimension;
     float normSquared = 0.0f;
     for (uint d = 0; d < dimension; ++d) { float value = input[offset + d]; normSquared += value * value; }
-    float norm = sqrt(normSquared + epsilon);
-    float scale = normSquared / ((1.0f + normSquared) * norm);
+    float denominator = (1.0f + normSquared) * (sqrt(normSquared) + epsilon);
+    float scale = denominator != 0.0f ? normSquared / denominator : 0.0f;
     output[gid] = input[gid] * scale;
 }
 
@@ -430,11 +430,20 @@ kernel void capsule_squash_backward(
 {
     if (gid >= capsules * dimension) return;
     uint capsule = gid / dimension, offset = capsule * dimension;
-    float normSquared = 0.0f;
-    for (uint d = 0; d < dimension; ++d) { float value = input[offset + d]; normSquared += value * value; }
-    float norm = sqrt(normSquared + epsilon);
-    float scale = normSquared / ((1.0f + normSquared) * norm);
-    gradInput[gid] = gradOutput[gid] * scale;
+    float normSquared = 0.0f, dot = 0.0f;
+    for (uint d = 0; d < dimension; ++d) {
+        float value = input[offset + d];
+        normSquared += value * value;
+        dot += value * gradOutput[offset + d];
+    }
+    float norm = sqrt(normSquared);
+    float normPlusEpsilon = norm + epsilon;
+    float denominator = (1.0f + normSquared) * normPlusEpsilon;
+    float scale = denominator != 0.0f ? normSquared / denominator : 0.0f;
+    float coefficient = denominator != 0.0f
+        ? (norm + 2.0f * epsilon - normSquared * norm) / (denominator * denominator)
+        : 0.0f;
+    gradInput[gid] = gradOutput[gid] * scale + input[gid] * dot * coefficient;
 }
 
 kernel void capsule_predictions(
@@ -1113,24 +1122,54 @@ kernel void attention_forward_serial(
     device float* output [[buffer(3)]], device float* weights [[buffer(4)]], device const float* mask [[buffer(5)]],
     constant uint& batch [[buffer(6)]], constant uint& heads [[buffer(7)]], constant uint& queryLength [[buffer(8)]], constant uint& keyLength [[buffer(9)]],
     constant uint& dimension [[buffer(10)]], constant uint& scaleBits [[buffer(11)]], constant uint& causal [[buffer(12)]],
-    constant uint& hasWeights [[buffer(13)]], constant uint& maskMode [[buffer(14)]],
+    constant uint& hasWeights [[buffer(13)]], constant uint& maskMode [[buffer(14)]], constant uint& softcapBits [[buffer(15)]],
+    constant uint& numKVHeads [[buffer(16)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid != 0u) return; float scale = as_type<float>(scaleBits);
+    if (gid != 0u) return; float scale = as_type<float>(scaleBits); float softcap = as_type<float>(softcapBits);
+    // GQA: query head h shares KV head h / (heads/numKVHeads); numKVHeads==heads collapses to MHA.
+    uint kvGroup = heads / numKVHeads;
     for (uint b = 0; b < batch; ++b) for (uint h = 0; h < heads; ++h) {
         uint queryOffset = (b * heads + h) * queryLength * dimension;
-        uint keyOffset = (b * heads + h) * keyLength * dimension;
+        uint keyOffset = (b * numKVHeads + h / kvGroup) * keyLength * dimension;
         uint weightOffset = (b * heads + h) * queryLength * keyLength;
         uint maskOffset = (maskMode == 2u ? (b * heads + h) * queryLength * keyLength : 0u);
         for (uint i = 0; i < queryLength; ++i) {
+            // KV-cache causal offset: query i is at absolute position i + (keyLength - queryLength); queryLength
+            // ==keyLength collapses to j > i (prefill), decode attends to the whole cached prefix.
+            uint qPos = i + (keyLength - queryLength);
             float maximum = -INFINITY;
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; maximum = max(maximum, score); }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; maximum = max(maximum, score); }
             float sumExp = 0.0f;
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sumExp += exp(score - maximum); }
-            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; float weight = sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f; if (hasWeights != 0u) weights[weightOffset + i * keyLength + j] = weight; }
-            for (uint d = 0; d < dimension; ++d) { float sum = 0.0f; for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if ((causal != 0u && j > i) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sum += (sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f) * value[keyOffset + j * dimension + d]; } output[queryOffset + i * dimension + d] = sum; }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sumExp += exp(score - maximum); }
+            for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; float weight = sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f; if (hasWeights != 0u) weights[weightOffset + i * keyLength + j] = weight; }
+            for (uint d = 0; d < dimension; ++d) { float sum = 0.0f; for (uint j = 0; j < keyLength; ++j) { float score = resident_attention_dot(query, key, queryOffset + i * dimension, keyOffset + j * dimension, dimension) * scale; if (softcap > 0.0f) score = softcap * tanh(score / softcap); if ((causal != 0u && j > qPos) || (maskMode != 0u && mask[maskOffset + i * keyLength + j] == 0.0f)) score = -INFINITY; sum += (sumExp > 0.0f ? exp(score - maximum) / sumExp : 0.0f) * value[keyOffset + j * dimension + d]; } output[queryOffset + i * dimension + d] = sum; }
         }
     }
+}
+
+// Fused interleaved RoPE (GPT-NeoX / LLaMA / GGML). One thread per (row, pair).
+// cos/sin are [maxSeq, headDim/2] indexed by absolute position (startPosition + rowWithinSequence).
+kernel void rope_interleaved(
+    device const float* input [[buffer(0)]], device const float* cosCache [[buffer(1)]], device const float* sinCache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& rows [[buffer(4)]], constant uint& headDim [[buffer(5)]], constant uint& seqLen [[buffer(6)]], constant uint& startPosition [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint halfDim = headDim / 2u;
+    if (gid >= rows * halfDim) return;
+    uint i = gid % halfDim;
+    uint row = gid / halfDim;
+    uint s = row % seqLen;
+    uint pos = startPosition + s;
+    uint baseIdx = row * headDim;
+    uint cacheIdx = pos * halfDim + i;
+    float c = cosCache[cacheIdx];
+    float sn = sinCache[cacheIdx];
+    float xEven = input[baseIdx + 2u * i];
+    float xOdd = input[baseIdx + 2u * i + 1u];
+    output[baseIdx + 2u * i] = xEven * c - xOdd * sn;
+    output[baseIdx + 2u * i + 1u] = xEven * sn + xOdd * c;
 }
 
 kernel void attention_backward_serial(
@@ -1290,7 +1329,7 @@ kernel void lstm_forward_sequence(
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= batch) return; uint stateSize = batch * hiddenSize;
-    for (uint t = 0; t < sequence; ++t) { uint inputOffset = t * batch * inputSize + gid * inputSize, previousOffset = t * stateSize + gid * hiddenSize, currentOffset = (t + 1u) * stateSize + gid * hiddenSize, outputOffset = t * stateSize + gid * hiddenSize, gateOffset = (t * batch + gid) * hiddenSize * 4u;
+    for (uint t = 0; t < sequence; ++t) { uint inputOffset = (gid * sequence + t) * inputSize, previousOffset = t * stateSize + gid * hiddenSize, currentOffset = (t + 1u) * stateSize + gid * hiddenSize, outputOffset = (gid * sequence + t) * hiddenSize, gateOffset = (t * batch + gid) * hiddenSize * 4u;
         for (uint h = 0; h < hiddenSize; ++h) { float activated[4];
             for (uint gate = 0; gate < 4u; ++gate) { uint gateRow = gate * hiddenSize + h; float sum = biasIh[gateRow] + biasHh[gateRow]; for (uint i = 0; i < inputSize; ++i) sum += weightsIh[gateRow * inputSize + i] * input[inputOffset + i]; for (uint hp = 0; hp < hiddenSize; ++hp) sum += weightsHh[gateRow * hiddenSize + hp] * allH[previousOffset + hp]; activated[gate] = gate == 2u ? tanh(sum) : resident_stable_sigmoid(sum); }
             for (uint gate = 0; gate < 4u; ++gate) gates[gateOffset + h * 4u + gate] = activated[gate];
@@ -1313,12 +1352,12 @@ kernel void lstm_backward_sequence_serial(
     for (uint i = 0; i < sequence * batch * inputSize; ++i) gradInput[i] = 0.0f;
     for (uint i = 0; i < stateSize; ++i) { gradHInit[i] = 0.0f; gradCInit[i] = 0.0f; nextH[i] = 0.0f; nextC[i] = 0.0f; }
     for (uint i = 0; i < gateRows * inputSize; ++i) gradWeightsIh[i] = 0.0f; for (uint i = 0; i < gateRows * hiddenSize; ++i) gradWeightsHh[i] = 0.0f; for (uint i = 0; i < gateRows; ++i) gradBias[i] = 0.0f;
-    for (int time = int(sequence) - 1; time >= 0; --time) { uint t = uint(time), inputOffsetBase = t * batch * inputSize, previousBase = t * stateSize, currentBase = (t + 1u) * stateSize, outputBase = t * stateSize, gateBase = t * batch * hiddenSize * 4u;
+    for (int time = int(sequence) - 1; time >= 0; --time) { uint t = uint(time), previousBase = t * stateSize, currentBase = (t + 1u) * stateSize, gateBase = t * batch * hiddenSize * 4u;
         for (uint b = 0; b < batch; ++b) for (uint h = 0; h < hiddenSize; ++h) { uint cache = gateBase + b * hiddenSize * 4u + h * 4u, state = b * hiddenSize + h; float inputGate = gates[cache], forgetGate = gates[cache + 1u], candidate = gates[cache + 2u], outputGate = gates[cache + 3u], previousCell = allC[previousBase + state], currentCell = allC[currentBase + state];
-            float dHidden = gradOutput[outputBase + state] + nextH[state], tanhCell = tanh(currentCell), dOutput = dHidden * tanhCell, dCell = dHidden * outputGate * (1.0f - tanhCell * tanhCell) + nextC[state];
+            float dHidden = gradOutput[(b * sequence + t) * hiddenSize + h] + nextH[state], tanhCell = tanh(currentCell), dOutput = dHidden * tanhCell, dCell = dHidden * outputGate * (1.0f - tanhCell * tanhCell) + nextC[state];
             float raw[4] = { dCell * candidate * inputGate * (1.0f - inputGate), dCell * previousCell * forgetGate * (1.0f - forgetGate), dCell * inputGate * (1.0f - candidate * candidate), dOutput * outputGate * (1.0f - outputGate) };
-            for (uint gate = 0; gate < 4u; ++gate) { uint row = gate * hiddenSize + h; gradBias[row] += raw[gate]; for (uint i = 0; i < inputSize; ++i) gradWeightsIh[row * inputSize + i] += raw[gate] * input[inputOffsetBase + b * inputSize + i]; for (uint hp = 0; hp < hiddenSize; ++hp) gradWeightsHh[row * hiddenSize + hp] += raw[gate] * allH[previousBase + b * hiddenSize + hp]; }
-            for (uint i = 0; i < inputSize; ++i) { float sum = 0.0f; for (uint gate = 0; gate < 4u; ++gate) sum += raw[gate] * weightsIh[(gate * hiddenSize + h) * inputSize + i]; gradInput[inputOffsetBase + b * inputSize + i] += sum; }
+            for (uint gate = 0; gate < 4u; ++gate) { uint row = gate * hiddenSize + h; gradBias[row] += raw[gate]; for (uint i = 0; i < inputSize; ++i) gradWeightsIh[row * inputSize + i] += raw[gate] * input[(b * sequence + t) * inputSize + i]; for (uint hp = 0; hp < hiddenSize; ++hp) gradWeightsHh[row * hiddenSize + hp] += raw[gate] * allH[previousBase + b * hiddenSize + hp]; }
+            for (uint i = 0; i < inputSize; ++i) { float sum = 0.0f; for (uint gate = 0; gate < 4u; ++gate) sum += raw[gate] * weightsIh[(gate * hiddenSize + h) * inputSize + i]; gradInput[(b * sequence + t) * inputSize + i] += sum; }
             for (uint hp = 0; hp < hiddenSize; ++hp) { float sum = 0.0f; for (uint gate = 0; gate < 4u; ++gate) sum += raw[gate] * weightsHh[(gate * hiddenSize + hp) * hiddenSize + h]; if (t > 0u) nextH[b * hiddenSize + hp] = sum; else gradHInit[b * hiddenSize + hp] += sum; }
             float previousCellGradient = dCell * forgetGate; if (t > 0u) nextC[state] = previousCellGradient; else gradCInit[state] = previousCellGradient;
         }

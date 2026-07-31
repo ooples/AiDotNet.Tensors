@@ -88,7 +88,7 @@ internal static class TensorCodec
         TensorCodecOptions.SetCurrent(opts);
         try
         {
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableTraining(parameters);
             computation();
             return scope.CompileTraining(parameters);
         }

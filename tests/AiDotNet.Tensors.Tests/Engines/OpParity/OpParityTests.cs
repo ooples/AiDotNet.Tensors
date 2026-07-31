@@ -21,7 +21,7 @@ public sealed class OpParityTests
         OpParityRegistry.All().ToDictionary(o => o.Name);
 
     public static IEnumerable<object[]> ForwardCases =>
-        OpParityRegistry.All().Select(o => new object[] { o.Name });
+        OpParityRegistry.All().Where(o => ParityShard.Include(o.Name)).Select(o => new object[] { o.Name });
 
     [SkippableTheory]
     [MemberData(nameof(ForwardCases))]

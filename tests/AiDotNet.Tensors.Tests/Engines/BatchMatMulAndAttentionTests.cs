@@ -283,4 +283,36 @@ public class BatchMatMulAndAttentionTests
         bool allSame = data.All(x => Math.Abs(x - first) < 1e-8f);
         Assert.False(allSame, $"{name} is uniform - all {data.Length} elements equal {first}");
     }
+
+    [Fact]
+    public void ScaledDotProductAttention_Softcap_CapsLogitsBeforeSoftmax()
+    {
+        // One query attending to two keys with large-magnitude scores: Q·K^T = [10, -10] (scale = 1).
+        var Q = new Tensor<float>(new float[] { 10f }, new[] { 1, 1, 1, 1 });
+        var K = new Tensor<float>(new float[] { 1f, -1f }, new[] { 1, 1, 2, 1 });
+        var V = new Tensor<float>(new float[] { 3f, 7f }, new[] { 1, 1, 2, 1 });
+
+        // softcap = 2: logits become 2·tanh([5, -5]) before softmax, bounding them to (-2, 2).
+        const double cap = 2.0;
+        _engine.ScaledDotProductAttention(Q, K, V, null, scale: 1.0, out var wCapped, softcap: cap);
+
+        double t0 = cap * Math.Tanh(10.0 / cap);
+        double t1 = cap * Math.Tanh(-10.0 / cap);
+        double m = Math.Max(t0, t1);
+        double e0 = Math.Exp(t0 - m), e1 = Math.Exp(t1 - m), sum = e0 + e1;
+        Assert.Equal(e0 / sum, wCapped[0, 0, 0, 0], 4);
+        Assert.Equal(e1 / sum, wCapped[0, 0, 0, 1], 4);
+
+        // Without softcap the distribution is far more peaked (~[1, 0]); softcap moves probability mass
+        // toward the low-scoring key (capped ~0.018 vs plain ~2e-9 here).
+        _engine.ScaledDotProductAttention(Q, K, V, null, scale: 1.0, out var wPlain);
+        Assert.True(wPlain[0, 0, 0, 1] < 1e-3f, $"plain low-score weight should be tiny (was {wPlain[0, 0, 0, 1]})");
+        Assert.True(wCapped[0, 0, 0, 1] > 100f * wPlain[0, 0, 0, 1],
+            $"softcap should raise the low-score weight (capped={wCapped[0, 0, 0, 1]}, plain={wPlain[0, 0, 0, 1]})");
+
+        // Default softcap (0) must be byte-identical to the plain call (regression guard).
+        _engine.ScaledDotProductAttention(Q, K, V, null, scale: 1.0, out var wDefault, softcap: 0.0);
+        Assert.Equal(wPlain[0, 0, 0, 0], wDefault[0, 0, 0, 0], 6);
+        Assert.Equal(wPlain[0, 0, 0, 1], wDefault[0, 0, 0, 1], 6);
+    }
 }

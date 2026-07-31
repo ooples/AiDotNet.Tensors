@@ -385,6 +385,18 @@ public static class Fft
         int inStride = 2 * nIn;
         int outStride = 2 * n;
 
+        // Float-native, batch-vectorized fast path (pow2 n). End-to-end float,
+        // SIMD across the batch, cached twiddles, pooled scratch — no per-row
+        // double conversion. Falls through to the generic double path for
+        // non-float T or non-pow2 n.
+        if (typeof(T) == typeof(float) &&
+            FftBatchFloat.TryTransform(
+                (float[])(object)inD, inStride, (float[])(object)rD, outStride,
+                batch, nIn, n, inverse, norm))
+        {
+            return result;
+        }
+
         var ops = MathHelper.GetNumericOperations<T>();
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * n * (long)Math.Log(Math.Max(n, 2), 2), b =>

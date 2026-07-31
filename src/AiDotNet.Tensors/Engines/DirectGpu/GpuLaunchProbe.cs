@@ -22,18 +22,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal static class GpuLaunchProbe
 {
     private static long _count;
+    private static long _totalEver;   // DIAGNOSTIC: never reset, distinguishes "no launch" from "count zeroed"
     private static long _kernelMisses;
     private static long _readbacks;
     private static long _readbackBytes;
     private static int _captureReadbackSites;
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _missedNames = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _readbackSites = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _fallbacks = new();
 
     /// <summary>Total kernel launches observed since the last <see cref="Reset"/> (lock-free read).</summary>
     public static long Count => Interlocked.Read(ref _count);
 
     /// <summary>Called once per GPU kernel dispatch. Cheap; safe to call from any thread.</summary>
-    public static void OnLaunch() => Interlocked.Increment(ref _count);
+    public static void OnLaunch() { Interlocked.Increment(ref _count); Interlocked.Increment(ref _totalEver); }
+
+    /// <summary>DIAGNOSTIC: launches since process start; <see cref="Reset"/> does NOT clear it.</summary>
+    public static long TotalEver => Interlocked.Read(ref _totalEver);
 
     /// <summary>Device-to-host transfers observed since the last <see cref="Reset"/>.</summary>
     public static long Readbacks => Interlocked.Read(ref _readbacks);
@@ -101,6 +106,34 @@ internal static class GpuLaunchProbe
         if (name is not null) _missedNames.TryAdd(name, 0);
     }
 
+    /// <summary>Reasons GPU overrides silently routed to the CPU since the last <see cref="Reset"/>.</summary>
+    /// <remarks>
+    /// The launch counter tells you an op did zero GPU work; it cannot tell you WHY. Most overrides in
+    /// <c>DirectGpuTensorEngine</c> wrap their device path in <c>catch (Exception) { return base.Op(...); }</c>,
+    /// which turns a genuine kernel defect into a silent, correct-looking CPU result — invisible to both
+    /// parity (the CPU answer is right) and the hollow-override check (no kernel-cache miss is recorded).
+    /// This channel makes that class observable: a fallback records the op and the exception that caused it.
+    /// </remarks>
+    public static string[] Fallbacks => System.Linq.Enumerable.ToArray(
+        System.Linq.Enumerable.Select(
+            System.Linq.Enumerable.OrderBy(_fallbacks, entry => entry.Key),
+            entry => $"{entry.Value}x {entry.Key}"));
+
+    /// <summary>Records one silent GPU-to-CPU fallback. <paramref name="reason"/> is the caught exception, or
+    /// null when a guard or route declined the device path before attempting it.</summary>
+    public static void OnFallback(string op, System.Exception? reason)
+    {
+        // Diagnostic keys must have bounded cardinality. Callers may append tensor shapes or route details
+        // after a colon, and exception messages often contain input-specific values; retaining either in the
+        // process-wide dictionary would allow a long-running workload to create an unbounded number of keys.
+        int detailSeparator = op.IndexOf(':');
+        string operation = detailSeparator >= 0 ? op.Substring(0, detailSeparator) : op;
+        string key = reason is null
+            ? $"{operation}: guard or route declined"
+            : $"{operation}: {reason.GetType().Name}";
+        _fallbacks.AddOrUpdate(key, 1, static (_, count) => count + 1);
+    }
+
     /// <summary>Zeroes launches AND misses before a measured region. Returns the pre-reset launch count.</summary>
     public static long Reset()
     {
@@ -109,6 +142,7 @@ internal static class GpuLaunchProbe
         Interlocked.Exchange(ref _readbackBytes, 0);
         _missedNames.Clear();
         _readbackSites.Clear();
+        _fallbacks.Clear();
         return Interlocked.Exchange(ref _count, 0);
     }
 }

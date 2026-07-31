@@ -182,9 +182,13 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
         float prev_c = 0.0f;
 
         if (isValid) {
+            // Gate slice layout is PyTorch/CPU order i,f,g,o: slice 0 = INPUT, slice 1 = FORGET,
+            // slice 2 = cell-candidate (g), slice 3 = OUTPUT. This kernel keeps variables named by ROLE
+            // (sumF=forget, sumI=input), so forget reads slice 1 and input reads slice 0. (The original
+            // code read forget from slice 0 → it multiplied prev_c by the INPUT gate: a gross parity bug.)
             // Bias is sum of input-hidden and hidden-hidden biases
-            sumF = biasIh[h_idx] + biasHh[h_idx];
-            sumI = biasIh[hiddenSize + h_idx] + biasHh[hiddenSize + h_idx];
+            sumI = biasIh[h_idx] + biasHh[h_idx];                                       // slice 0 = input
+            sumF = biasIh[hiddenSize + h_idx] + biasHh[hiddenSize + h_idx];             // slice 1 = forget
             sumC = biasIh[2 * hiddenSize + h_idx] + biasHh[2 * hiddenSize + h_idx];
             sumO = biasIh[3 * hiddenSize + h_idx] + biasHh[3 * hiddenSize + h_idx];
 
@@ -192,8 +196,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
             int inputOffset = (b * timeSteps + t) * inputSize;
             for (int i = 0; i < inputSize; i++) {
                 float x_val = input[inputOffset + i];
-                sumF += Wi[h_idx * inputSize + i] * x_val;
-                sumI += Wi[(hiddenSize + h_idx) * inputSize + i] * x_val;
+                sumI += Wi[h_idx * inputSize + i] * x_val;                               // slice 0 = input
+                sumF += Wi[(hiddenSize + h_idx) * inputSize + i] * x_val;                // slice 1 = forget
                 sumC += Wi[(2 * hiddenSize + h_idx) * inputSize + i] * x_val;
                 sumO += Wi[(3 * hiddenSize + h_idx) * inputSize + i] * x_val;
             }
@@ -209,8 +213,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
                     // Read from cached h_states for previous timestep
                     hj = h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + j];
                 }
-                sumF += Wh[h_idx * hiddenSize + j] * hj;
-                sumI += Wh[(hiddenSize + h_idx) * hiddenSize + j] * hj;
+                sumI += Wh[h_idx * hiddenSize + j] * hj;                                 // slice 0 = input
+                sumF += Wh[(hiddenSize + h_idx) * hiddenSize + j] * hj;                  // slice 1 = forget
                 sumC += Wh[(2 * hiddenSize + h_idx) * hiddenSize + j] * hj;
                 sumO += Wh[(3 * hiddenSize + h_idx) * hiddenSize + j] * hj;
             }
@@ -644,6 +648,16 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             // Gradient to previous cell state for next iteration
             float dC_prev = dC * f;
 
+            // Map the gate-ROLE derivatives (dF=forget, dI=input, dCCandidate=g, dO=output) onto the
+            // WEIGHT-ROW order, which is PyTorch i,f,g,o: row0=input, row1=forget, row2=g, row3=o. So the
+            // input weight row (row0) receives dI and the forget weight row (row1) receives dF. (The gate
+            // CACHE is [f,i,g,o] and is read correctly above; only the weight-row mapping needs this swap —
+            // the original kernel put dF on row0/dI on row1, i.e. gradients on the wrong weight rows.)
+            float dRow0 = dI;            // input  gate -> weight row 0
+            float dRow1 = dF;            // forget gate -> weight row 1
+            float dRow2 = dCCandidate;   // cell candidate g -> weight row 2
+            float dRow3 = dO;            // output gate -> weight row 3
+
             // Get previous hidden state for weight gradients
             float h_prev_val;
             if (t == 0) {
@@ -656,10 +670,10 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             int inputOffset = (b * timeSteps + t) * inputSize;
             for (int i = 0; i < inputSize; i++) {
                 float x_val = input[inputOffset + i];
-                atomicAdd(&dWi[h_idx * inputSize + i], dF * x_val);
-                atomicAdd(&dWi[(hiddenSize + h_idx) * inputSize + i], dI * x_val);
-                atomicAdd(&dWi[(2 * hiddenSize + h_idx) * inputSize + i], dCCandidate * x_val);
-                atomicAdd(&dWi[(3 * hiddenSize + h_idx) * inputSize + i], dO * x_val);
+                atomicAdd(&dWi[h_idx * inputSize + i], dRow0 * x_val);
+                atomicAdd(&dWi[(hiddenSize + h_idx) * inputSize + i], dRow1 * x_val);
+                atomicAdd(&dWi[(2 * hiddenSize + h_idx) * inputSize + i], dRow2 * x_val);
+                atomicAdd(&dWi[(3 * hiddenSize + h_idx) * inputSize + i], dRow3 * x_val);
             }
 
             // Hidden weight gradients - need all prev hidden values
@@ -670,30 +684,30 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
                 } else {
                     hj = h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + j];
                 }
-                atomicAdd(&dWh[h_idx * hiddenSize + j], dF * hj);
-                atomicAdd(&dWh[(hiddenSize + h_idx) * hiddenSize + j], dI * hj);
-                atomicAdd(&dWh[(2 * hiddenSize + h_idx) * hiddenSize + j], dCCandidate * hj);
-                atomicAdd(&dWh[(3 * hiddenSize + h_idx) * hiddenSize + j], dO * hj);
+                atomicAdd(&dWh[h_idx * hiddenSize + j], dRow0 * hj);
+                atomicAdd(&dWh[(hiddenSize + h_idx) * hiddenSize + j], dRow1 * hj);
+                atomicAdd(&dWh[(2 * hiddenSize + h_idx) * hiddenSize + j], dRow2 * hj);
+                atomicAdd(&dWh[(3 * hiddenSize + h_idx) * hiddenSize + j], dRow3 * hj);
             }
 
             // Bias gradients - same gradient flows to both biasIh and biasHh since they're summed
-            atomicAdd(&dBiasIh[h_idx], dF);
-            atomicAdd(&dBiasIh[hiddenSize + h_idx], dI);
-            atomicAdd(&dBiasIh[2 * hiddenSize + h_idx], dCCandidate);
-            atomicAdd(&dBiasIh[3 * hiddenSize + h_idx], dO);
-            atomicAdd(&dBiasHh[h_idx], dF);
-            atomicAdd(&dBiasHh[hiddenSize + h_idx], dI);
-            atomicAdd(&dBiasHh[2 * hiddenSize + h_idx], dCCandidate);
-            atomicAdd(&dBiasHh[3 * hiddenSize + h_idx], dO);
+            atomicAdd(&dBiasIh[h_idx], dRow0);
+            atomicAdd(&dBiasIh[hiddenSize + h_idx], dRow1);
+            atomicAdd(&dBiasIh[2 * hiddenSize + h_idx], dRow2);
+            atomicAdd(&dBiasIh[3 * hiddenSize + h_idx], dRow3);
+            atomicAdd(&dBiasHh[h_idx], dRow0);
+            atomicAdd(&dBiasHh[hiddenSize + h_idx], dRow1);
+            atomicAdd(&dBiasHh[2 * hiddenSize + h_idx], dRow2);
+            atomicAdd(&dBiasHh[3 * hiddenSize + h_idx], dRow3);
 
             // Compute gradient to input at this timestep
             int gradInputOffset = (b * timeSteps + t) * inputSize;
             for (int i = 0; i < inputSize; i++) {
                 float grad_i = 0.0f;
-                grad_i += dF * Wi[h_idx * inputSize + i];
-                grad_i += dI * Wi[(hiddenSize + h_idx) * inputSize + i];
-                grad_i += dCCandidate * Wi[(2 * hiddenSize + h_idx) * inputSize + i];
-                grad_i += dO * Wi[(3 * hiddenSize + h_idx) * inputSize + i];
+                grad_i += dRow0 * Wi[h_idx * inputSize + i];
+                grad_i += dRow1 * Wi[(hiddenSize + h_idx) * inputSize + i];
+                grad_i += dRow2 * Wi[(2 * hiddenSize + h_idx) * inputSize + i];
+                grad_i += dRow3 * Wi[(3 * hiddenSize + h_idx) * inputSize + i];
                 atomicAdd(&gradInput[gradInputOffset + i], grad_i);
             }
 
@@ -705,10 +719,10 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             for (int j = 0; j < hiddenSize; j++) {
                 // Contribution from gate derivatives at position h_idx to hidden unit j
                 // Wh layout: [4*hiddenSize, hiddenSize], so Wh[k, j] = Wh[k * hiddenSize + j]
-                float contrib = dF * Wh[h_idx * hiddenSize + j];
-                contrib += dI * Wh[(hiddenSize + h_idx) * hiddenSize + j];
-                contrib += dCCandidate * Wh[(2 * hiddenSize + h_idx) * hiddenSize + j];
-                contrib += dO * Wh[(3 * hiddenSize + h_idx) * hiddenSize + j];
+                float contrib = dRow0 * Wh[h_idx * hiddenSize + j];
+                contrib += dRow1 * Wh[(hiddenSize + h_idx) * hiddenSize + j];
+                contrib += dRow2 * Wh[(2 * hiddenSize + h_idx) * hiddenSize + j];
+                contrib += dRow3 * Wh[(3 * hiddenSize + h_idx) * hiddenSize + j];
                 atomicAdd(&dH_init[b * hiddenSize + j], contrib);
             }
 
