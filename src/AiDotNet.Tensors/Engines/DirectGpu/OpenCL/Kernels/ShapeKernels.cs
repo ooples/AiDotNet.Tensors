@@ -294,23 +294,28 @@ __kernel void stft_mag_phase(__global const float* padded, __global const float*
 // phase_vocoder: one thread per (b,f) runs the sequential t-scan internally (accPhase carries over t).
 // Mirrors CpuEngine.TimeStretch index math EXACTLY (its 'nFrames'=outer axis, 'nFreq'=inner axis).
 __kernel void phase_vocoder(__global const float* mag, __global const float* phase,
-    __global float* newMag, __global float* newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) {
-    int idx = get_global_id(0); if (idx >= leading*nFreqV) return;
-    int f = idx % nFreqV; int b = idx / nFreqV;
-    int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    __global float* newMag, __global float* newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate) {
+    // Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching build_spectrum and
+    // CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
+    int idx = get_global_id(0); if (idx >= leading*numFreqs) return;
+    int f = idx % numFreqs; int b = idx / numFreqs;
+    int row = b*numFreqs*numFrames + f*numFrames;
+    int outRow = b*numFreqs*outFrames + f*outFrames;
     float accPhase = 0.0f;
     for (int t = 0; t < outFrames; t++) {
         float srcT = (float)t * rate;
-        int t0 = (int)floor(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
-        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
-        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        int t0 = (int)floor(srcT);
+        if (t0 > numFrames-1) t0 = numFrames-1;
+        int t1 = min(t0+1, numFrames-1); float frac = srcT - (float)t0;
+        float m0 = mag[row + t0]; float m1 = mag[row + t1];
+        newMag[outRow + t] = (1.0f-frac)*m0 + frac*m1;
         float dp = 0.0f;
-        if (t0+1 < nFramesV) {
-            dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f];
+        if (t0+1 < numFrames) {
+            dp = phase[row + t0 + 1] - phase[row + t0];
             dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F));
         }
         accPhase += dp;
-        newPhase[b*outStride + t*nFreqV + f] = accPhase;
+        newPhase[outRow + t] = accPhase;
     }
 }
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).

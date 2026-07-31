@@ -384,11 +384,11 @@ public sealed partial class MetalBackend
         encoder.SetBytes(numFreqs, 9);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
-    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_phase_vocoder");
-        int __total = leading*nFreqV; if (__total <= 0) return;
+        int __total = leading*numFreqs; if (__total <= 0) return;
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -397,8 +397,8 @@ public sealed partial class MetalBackend
         encoder.SetBuffer((MetalGpuBuffer)newMag, 2);
         encoder.SetBuffer((MetalGpuBuffer)newPhase, 3);
         encoder.SetBytes(leading, 4);
-        encoder.SetBytes(nFramesV, 5);
-        encoder.SetBytes(nFreqV, 6);
+        encoder.SetBytes(numFrames, 5);
+        encoder.SetBytes(numFreqs, 6);
         encoder.SetBytes(outFrames, 7);
         encoder.SetBytes(rate, 8);
         encoder.DispatchThreadgroups(tgr, tpg);

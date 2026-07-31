@@ -885,21 +885,27 @@ kernel void parity210_phase_vocoder(
     device float* newMag [[buffer(2)]],
     device float* newPhase [[buffer(3)]],
     constant int& leading [[buffer(4)]],
-    constant int& nFramesV [[buffer(5)]],
-    constant int& nFreqV [[buffer(6)]],
+    constant int& numFrames [[buffer(5)]],
+    constant int& numFreqs [[buffer(6)]],
     constant int& outFrames [[buffer(7)]],
     constant float& rate [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; if (idx >= leading*nFreqV) return;
-    int f = idx % nFreqV; int b = idx / nFreqV; int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    // Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching build_spectrum and
+    // CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
+    int idx = (int)gid; if (idx >= leading*numFreqs) return;
+    int f = idx % numFreqs; int b = idx / numFreqs;
+    int row = b*numFreqs*numFrames + f*numFrames;
+    int outRow = b*numFreqs*outFrames + f*outFrames;
     float accPhase = 0.0f;
     for (int t = 0; t < outFrames; t++) {
-        float srcT = (float)t * rate; int t0 = (int)floor(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
-        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
-        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        float srcT = (float)t * rate; int t0 = (int)floor(srcT);
+        if (t0 > numFrames-1) t0 = numFrames-1;
+        int t1 = min(t0+1, numFrames-1); float frac = srcT - (float)t0;
+        float m0 = mag[row + t0]; float m1 = mag[row + t1];
+        newMag[outRow + t] = (1.0f-frac)*m0 + frac*m1;
         float dp = 0.0f;
-        if (t0+1 < nFramesV) { dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f]; dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F)); }
-        accPhase += dp; newPhase[b*outStride + t*nFreqV + f] = accPhase;
+        if (t0+1 < numFrames) { dp = phase[row + t0 + 1] - phase[row + t0]; dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F)); }
+        accPhase += dp; newPhase[outRow + t] = accPhase;
     }
 }
 

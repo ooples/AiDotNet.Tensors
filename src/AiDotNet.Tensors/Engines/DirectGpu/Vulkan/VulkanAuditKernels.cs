@@ -76,8 +76,8 @@ layout(set=0, binding=2) buffer B2 { float newMag[]; };
 layout(set=0, binding=3) buffer B3 { float newPhase[]; };
 layout(push_constant) uniform PC {
     int leading;
-    int nFramesV;
-    int nFreqV;
+    int numFrames;
+    int numFreqs;
     int outFrames;
     float rate;
 };
@@ -93,16 +93,26 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= leading*nFreqV) return;
-    int f = idx % nFreqV; int b = idx / nFreqV; int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    // Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching BuildSpectrum and
+    // CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
+    //
+    // The thread index also used blockIdx/blockDim/threadIdx — CUDA builtins that do not exist in
+    // GLSL, so this shader could not have compiled. Uses gl_GlobalInvocationID as the other Vulkan
+    // kernels in this file do.
+    int idx = int(gl_GlobalInvocationID.x); if (idx >= leading*numFreqs) return;
+    int f = idx % numFreqs; int b = idx / numFreqs;
+    int row = b*numFreqs*numFrames + f*numFrames;
+    int outRow = b*numFreqs*outFrames + f*outFrames;
     float accPhase = 0.0;
     for (int t = 0; t < outFrames; t++) {
-        float srcT = float(t) * rate; int t0 = int(floor(srcT)); int t1 = min(t0+1, nFramesV-1); float frac = srcT - float(t0);
-        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
-        newMag[b*outStride + t*nFreqV + f] = (1.0-frac)*m0 + frac*m1;
+        float srcT = float(t) * rate; int t0 = int(floor(srcT));
+        if (t0 > numFrames-1) t0 = numFrames-1;
+        int t1 = min(t0+1, numFrames-1); float frac = srcT - float(t0);
+        float m0 = mag[row + t0]; float m1 = mag[row + t1];
+        newMag[outRow + t] = (1.0-frac)*m0 + frac*m1;
         float dp = 0.0;
-        if (t0+1 < nFramesV) { dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f]; dp -= 2.0*float(M_PI) * round(dp/(2.0*float(M_PI))); }
-        accPhase += dp; newPhase[b*outStride + t*nFreqV + f] = accPhase;
+        if (t0+1 < numFrames) { dp = phase[row + t0 + 1] - phase[row + t0]; dp -= 2.0*float(M_PI) * round(dp/(2.0*float(M_PI))); }
+        accPhase += dp; newPhase[outRow + t] = accPhase;
     }
 
 }";

@@ -4289,10 +4289,14 @@ public partial class DirectGpuTensorEngine
             int numFreqs = nFft / 2 + 1;
             if (batch == 0 || numFrames <= 0 || pad >= L)
                 return base.TimeStretch(waveform, rate, nFft, hopLength);
-            // STFT output is [.., numFreqs, numFrames]; the CPU phase vocoder reads it with its own
-            // (axis-flipped) convention: nFramesV = mag._shape[^2] = numFreqs, nFreqV = mag._shape[^1] = numFrames.
-            int nFreqV = numFrames, nFramesV = numFreqs, leading = batch;
-            int outFrames = (int)System.Math.Floor(nFramesV / rate);
+            // STFT output is [.., numFreqs, numFrames] with TIME contiguous-inner, and PhaseVocoder now
+            // uses that layout directly. This used to pass the two swapped (nFramesV = numFreqs,
+            // nFreqV = numFrames) to reproduce a CPU defect that interpolated across frequency bins;
+            // both the CPU vocoder and every backend kernel now interpolate along time, so the values
+            // are passed with their natural meaning and outFrames comes from the FRAME count.
+            int leading = batch;
+            int outFrames = (int)System.Math.Floor(numFrames / rate);
+            if (outFrames < 1) outFrames = 1;
             int targetLen = (int)System.Math.Round((double)L / rate);
             // CpuEngine.TimeStretch ends with ISTFT(..., center: true, length: targetLen), and an
             // explicitly requested length is now honoured VERBATIM. This used to read
@@ -4315,21 +4319,24 @@ public partial class DirectGpuTensorEngine
             using var bufMag = AllocateOutputBuffer(backend, stftLen);
             using var bufPhase = AllocateOutputBuffer(backend, stftLen);
             backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
-            int newLen = leading * outFrames * nFreqV;
+            // Vocoder output is [leading, numFreqs, outFrames] — same layout as the input with only
+            // the TIME axis resized.
+            int newLen = leading * numFreqs * outFrames;
             using var bufNewMag = AllocateOutputBuffer(backend, newLen);
             using var bufNewPhase = AllocateOutputBuffer(backend, newLen);
-            backend.PhaseVocoder(bufMag.Buffer, bufPhase.Buffer, bufNewMag.Buffer, bufNewPhase.Buffer, leading, nFramesV, nFreqV, outFrames, (float)rate);
+            backend.PhaseVocoder(bufMag.Buffer, bufPhase.Buffer, bufNewMag.Buffer, bufNewPhase.Buffer, leading, numFrames, numFreqs, outFrames, (float)rate);
             int outTotal = batch * outputLength;
-            // ISTFT sees numFreqs=outFrames, numFrames=nFreqV (the vocoder output axes). Build the full
+            // ISTFT sees the vocoder output as [numFreqs, outFrames]. Build the full
             // conj-symmetric spectrum first (replays the CPU two passes in order), then inverse-DFT it.
-            using var bufSpecRe = AllocateOutputBuffer(backend, batch * nFreqV * nFft);
-            using var bufSpecIm = AllocateOutputBuffer(backend, batch * nFreqV * nFft);
-            backend.BuildSpectrum(bufNewMag.Buffer, bufNewPhase.Buffer, bufSpecRe.Buffer, bufSpecIm.Buffer, batch, outFrames, nFreqV, nFft);
+            // One nFft-point spectrum per OUTPUT frame.
+            using var bufSpecRe = AllocateOutputBuffer(backend, batch * outFrames * nFft);
+            using var bufSpecIm = AllocateOutputBuffer(backend, batch * outFrames * nFft);
+            backend.BuildSpectrum(bufNewMag.Buffer, bufNewPhase.Buffer, bufSpecRe.Buffer, bufSpecIm.Buffer, batch, numFreqs, outFrames, nFft);
             using var bufWinSum = AllocateOutputBuffer(backend, outTotal);
             var bufResult = AllocateOutputBuffer(backend, outTotal);
             backend.Fill(bufResult.Buffer, 0f, outTotal);
             backend.Fill(bufWinSum.Buffer, 0f, outTotal);
-            backend.IstftFromSpectrum(bufSpecRe.Buffer, bufSpecIm.Buffer, bufWin.Buffer, bufResult.Buffer, bufWinSum.Buffer, batch, nFreqV, nFft, hopLength, outputLength, 1);
+            backend.IstftFromSpectrum(bufSpecRe.Buffer, bufSpecIm.Buffer, bufWin.Buffer, bufResult.Buffer, bufWinSum.Buffer, batch, outFrames, nFft, hopLength, outputLength, 1);
             backend.IstftNormalize(bufResult.Buffer, bufWinSum.Buffer, outTotal);
             backend.Synchronize();   // all `using` intermediates feed the deferred result — force compute first
             var outShape = new int[rank0];
