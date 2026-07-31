@@ -2239,6 +2239,9 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.Length != 1)
             throw new ArgumentException($"CompileBackward requires a scalar loss tensor (length 1), got length {loss.Length}.", nameof(loss));
 
+        // A caller that compiles directly never goes through ComputeGradients, so without this the
+        // compiled graph captures the constructor default instead of the data-derived engine.
+        ResolveEngineFromData();
         return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine, _retainGrad);
     }
 

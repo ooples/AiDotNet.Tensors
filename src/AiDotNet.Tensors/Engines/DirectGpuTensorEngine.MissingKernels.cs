@@ -1132,13 +1132,25 @@ public partial class DirectGpuTensorEngine
             backend.Scale(outRe.Buffer, outRe.Buffer, nFft, batch * nFft);
 
             // Real part, first signalLength samples per batch row.
+            // try/finally rather than a bare local: the catch below swallows the exception and returns
+            // null, so anything thrown by CopyRows/Synchronize/DeferTensorResult would leak a
+            // batch*signalLength device buffer, and every repeated fallback would leak another.
+            // RelinquishOwnership on the success path hands the buffer to the deferred result, after
+            // which Dispose is a no-op. Mirrors DispatchDeferredGpuOp.
             var resultBuf = AllocateOutputBuffer(backend, batch * signalLength);
-            backend.CopyRows(outRe.Buffer, resultBuf.Buffer, nFft, signalLength, batch, signalLength);
-            backend.Synchronize();
+            try
+            {
+                backend.CopyRows(outRe.Buffer, resultBuf.Buffer, nFft, signalLength, batch, signalLength);
+                backend.Synchronize();
 
-            var res = DeferTensorResult<T>(backend, resultBuf.Buffer, batch * signalLength, inputShape);
-            resultBuf.RelinquishOwnership();
-            return res;
+                // Clone: inputShape is the caller's LIVE shape array (inputs[0]._shape), and handing it
+                // to the result would alias it. IrfftAdjointGpu already clones.
+                var res = DeferTensorResult<T>(
+                    backend, resultBuf.Buffer, batch * signalLength, (int[])inputShape.Clone());
+                resultBuf.RelinquishOwnership();
+                return res;
+            }
+            finally { resultBuf.Dispose(); }
         }
         catch (Exception)
         {
@@ -4069,11 +4081,21 @@ public partial class DirectGpuTensorEngine
             // index arithmetic. The kernel below computes those positions on the DEVICE, so recompute
             // them host-side for the tape — guarded on IsTapeActive so inference pays nothing, and using
             // the same row-major strides over tensor.Shape that CpuEngine.TensorIndexPut uses.
+            // ONE stride vector for both the device positions computed below and the host positions the
+            // backward needs. They were two independently written loops: the kernel writes at the
+            // device-computed cells while IndexPutBackward credits the host-computed ones, so any drift
+            // between them is a silently wrong gradient rather than an error.
+            var rowMajorStrides = new int[rank];
+            int strideAcc = 1;
+            for (int axis = rank - 1; axis >= 0; axis--)
+            {
+                rowMajorStrides[axis] = strideAcc;
+                strideAcc = checked(strideAcc * tensor._shape[axis]);
+            }
+
             int[] ResolvePositions()
             {
-                var strides = new int[rank];
-                int acc = 1;
-                for (int axis = rank - 1; axis >= 0; axis--) { strides[axis] = acc; acc *= tensor._shape[axis]; }
+                var strides = rowMajorStrides;
                 var positions = new int[count];
                 for (int axis = 0; axis < rank; axis++)
                 {
@@ -4110,12 +4132,10 @@ public partial class DirectGpuTensorEngine
                 using var flatPositions = AllocateOutputBuffer(backend, count);
                 using var scaledAxis = AllocateOutputBuffer(backend, count);
                 backend.Fill(flatPositions.Buffer, 0f, count);
-                int stride = 1;
                 for (int axis = rank - 1; axis >= 0; axis--)
                 {
-                    backend.Scale(indexBuffers[axis].Buffer, scaledAxis.Buffer, stride, count);
+                    backend.Scale(indexBuffers[axis].Buffer, scaledAxis.Buffer, rowMajorStrides[axis], count);
                     backend.Add(flatPositions.Buffer, scaledAxis.Buffer, flatPositions.Buffer, count);
-                    stride = checked(stride * tensor._shape[axis]);
                 }
 
                 using var nativePositions = ConvertNumericIndicesToInt32(

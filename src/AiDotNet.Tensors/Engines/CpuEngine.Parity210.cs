@@ -1818,6 +1818,10 @@ public partial class CpuEngine
             throw new ArgumentException("At least one of min / max must be supplied");
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn. Recording the
+        // reassigned local would tape an internal copy the caller never sees, so a non-contiguous
+        // argument (a transpose or a slice) would receive no gradient at all.
+        var clampTensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Broadcast min / max against the tensor shape using NumPy / PyTorch
@@ -1871,8 +1875,8 @@ public partial class CpuEngine
         // bound below the min bound wins — matching this loop), which is why the
         // broadcast strides are saved rather than recomputed from shapes.
         var clampInputs = min is null
-            ? (max is null ? new[] { tensor } : new[] { tensor, max })
-            : (max is null ? new[] { tensor, min } : new[] { tensor, min, max });
+            ? (max is null ? new[] { clampTensorOrig } : new[] { clampTensorOrig, max })
+            : (max is null ? new[] { clampTensorOrig, min } : new[] { clampTensorOrig, min, max });
         DifferentiableOps.RecordIfActive(
             "TensorClampTensor", result, clampInputs,
             BackwardFunctions<T>.ClampTensorBackward,
@@ -2397,6 +2401,9 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
         var scatterTensorOrig = tensor;
+        // The destination already captured its pre-Contiguous ref; the SOURCE needs the same, or a
+        // non-contiguous source operand is taped as an internal copy and receives no gradient.
+        var scatterSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -2500,7 +2507,7 @@ public partial class CpuEngine
         // backward can replay the forward's per-slot decisions (which contributor won an AMin/AMax
         // slot, each slot's Mean divisor, whether the destination value survived) exactly.
         DifferentiableOps.RecordBinary(
-            "TensorScatterReduce", result, scatterTensorOrig, source,
+            "TensorScatterReduce", result, scatterTensorOrig, scatterSourceOrig,
             BackwardFunctions<T>.ScatterReduceBackward,
             savedState: new object[] { dim, indices.GetFlattenedData(), (int)mode, includeSelf });
         return result;

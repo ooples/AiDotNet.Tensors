@@ -3687,11 +3687,13 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
+        RequireSavedState(nameof(ClampTensorBackward), savedState, 5);
         bool hasMin = SavedBool(nameof(ClampTensorBackward), savedState, 0, "hasMin");
         bool hasMax = SavedBool(nameof(ClampTensorBackward), savedState, 1, "hasMax");
+        // minStrides/maxStrides stay `as` — the recorder writes null for an absent bound by design.
         var minStrides = savedState[2] as int[];
         var maxStrides = savedState[3] as int[];
-        var shape = (int[])savedState[4];
+        var shape = SavedIntArray(nameof(ClampTensorBackward), savedState, 4, "shape");
 
         var tensor = inputs[0];
         // Bounds occupy the following slots in the order (min, max), skipping absent ones.
@@ -8328,8 +8330,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
-        int n = (int)savedState[0];
-        int nFft = (int)savedState[1];
+        RequireSavedState(nameof(RFFTAdjointBackward), savedState, 2);
+        int n = SavedInt(nameof(RFFTAdjointBackward), savedState, 0, "signalLength");
+        int nFft = SavedInt(nameof(RFFTAdjointBackward), savedState, 1, "nFft");
         int numFreqs = nFft / 2 + 1;
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -8390,9 +8393,10 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
-        int numFreqs = (int)savedState[0];
-        int nFft = (int)savedState[1];
-        int outputLength = (int)savedState[2];
+        RequireSavedState(nameof(IRFFTAdjointBackward), savedState, 3);
+        int numFreqs = SavedInt(nameof(IRFFTAdjointBackward), savedState, 0, "numFreqs");
+        int nFft = SavedInt(nameof(IRFFTAdjointBackward), savedState, 1, "nFft");
+        int outputLength = SavedInt(nameof(IRFFTAdjointBackward), savedState, 2, "outputLength");
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
@@ -8471,6 +8475,14 @@ internal static class BackwardFunctions<T>
             ? v
             : throw new ArgumentException(
                 $"{op}: savedState[{slot}] ({name}) is {Describe(savedState[slot])}, expected bool.", nameof(savedState));
+
+    /// <summary>Reads an <c>int[]</c> savedState slot, naming it on mismatch.</summary>
+    private static int[] SavedIntArray(string op, object[] savedState, int slot, string name) =>
+        savedState[slot] is int[] v
+            ? v
+            : throw new ArgumentException(
+                $"{op}: savedState[{slot}] ({name}) is {Describe(savedState[slot])}, expected int[].",
+                nameof(savedState));
 
     private static Tensor<T> SavedTensor(string op, object[] savedState, int slot, string name) =>
         savedState[slot] is Tensor<T> v
