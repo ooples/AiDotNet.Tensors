@@ -476,21 +476,24 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void RbfForwardEmitter_IsThreadPerPairSerialDim()
+    public void RbfForwardEmitter_IsWarpPerPairWithCoalescedLoads()
     {
         string ptx = PtxRbfForwardKernel.EmitPtx(8, 6, 256, 4, 8);
         Assert.Contains(PtxRbfForwardKernel.EntryPoint, ptx);
         Assert.Equal(3, Count(ptx, "ld.global.nc.f32"));    // input + centers in the loop, epsilon after
         Assert.Equal(1, Count(ptx, "st.global.f32"));        // one output per (batch,center) pair
         Assert.Equal(1, Count(ptx, "ex2.approx.f32"));       // expf via exp2
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));   // warp sum
         Assert.Contains("$RBF_DIM_LOOP:", ptx);
-        Assert.Contains("div.u32 %r3, %r2, 4", ptx);         // b = idx / numCenters
-        Assert.Contains("rem.u32 %r4, %r2, 4", ptx);         // c = idx % numCenters
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);         // warp owns the pair
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);        // lane owns the feature
+        Assert.Contains("div.u32 %r5, %r4, 4", ptx);         // b = pair / numCenters
+        Assert.Contains("rem.u32 %r6, %r4, 4", ptx);         // c = pair % numCenters
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxRbfForwardKernel.IsSupportedShape(256, 4, 8));
-        Assert.False(PtxRbfForwardKernel.IsSupportedShape(255, 4, 8));   // pairs not a multiple of 256
+        Assert.False(PtxRbfForwardKernel.IsSupportedShape(255, 4, 8));   // pairs not a multiple of 8
         Assert.False(PtxRbfForwardKernel.IsPromotedShape(256, 4, 8));
     }
 
@@ -542,21 +545,25 @@ public class DirectPtxScientificTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void PairwiseDistanceEmitter_IsThreadPerPairSerialDim(bool squared)
+    public void PairwiseDistanceEmitter_IsWarpPerPairWithCoalescedLoads(bool squared)
     {
         string ptx = PtxPairwiseDistanceKernel.EmitPtx(8, 6, 32, 8, 4, squared);
         Assert.Contains(PtxPairwiseDistanceKernel.EntryPointFor(squared), ptx);
         Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // a + b in the loop
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(squared ? 0 : 1, Count(ptx, "sqrt.rn.f32"));   // L2 takes sqrt, squared does not
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));           // warp sum
         Assert.Contains("$PD_DIM_LOOP:", ptx);
-        Assert.Contains("div.u32 %r3, %r2, 8", ptx);         // i = idx / N
-        Assert.Contains("rem.u32 %r4, %r2, 8", ptx);         // j = idx % N
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);         // warp owns the pair
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);        // lane owns the feature
+        Assert.Contains("div.u32 %r5, %r4, 8", ptx);         // i = pair / N
+        Assert.Contains("rem.u32 %r6, %r4, 8", ptx);         // j = pair % N
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxPairwiseDistanceKernel.IsSupportedShape(32, 8, 4));
-        Assert.False(PtxPairwiseDistanceKernel.IsSupportedShape(33, 8, 4));  // pairs not multiple of 256
+        Assert.True(PtxPairwiseDistanceKernel.IsSupportedShape(33, 8, 4));
+        Assert.False(PtxPairwiseDistanceKernel.IsSupportedShape(33, 7, 4));  // pairs not multiple of 8
         Assert.False(PtxPairwiseDistanceKernel.IsPromotedShape(32, 8, 4));
     }
 
@@ -567,7 +574,7 @@ public class DirectPtxScientificTests
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in pairwise-distance specialization is measured on GA10x/SM86.");
-        const int m = 64, n = 16, dim = 10;   // pairs = 1024 (multiple of 256)
+        const int m = 64, n = 16, dim = 10;   // ragged feature dimension exercises zero-contributing lanes
         using var kernel = new PtxPairwiseDistanceKernel(runtime, m, n, dim, squared);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 

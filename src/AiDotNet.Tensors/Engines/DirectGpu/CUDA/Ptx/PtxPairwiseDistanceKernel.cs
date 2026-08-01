@@ -7,16 +7,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Pairwise distance between two point sets: <c>output[i,j] = ||a[i] - b[j]||</c> (L2) or
 /// <c>||a[i] - b[j]||^2</c> (squared), matching the NVRTC <c>pairwise_distance</c> /
-/// <c>pairwise_distance_squared</c> kernels (issue #854). One thread owns one (i,j) output pair
-/// and walks the <c>dim</c> feature axis serially in registers — no shared memory, no reduction.
-/// The squared variant simply skips the closing <c>sqrt.rn.f32</c>.
+/// <c>pairwise_distance_squared</c> kernels (issue #854). One warp owns one (i,j) output pair,
+/// loading the <c>dim</c> feature axis in coalesced lane-strided chunks and reducing with shuffles.
+/// The squared variant skips the closing <c>sqrt.rn.f32</c>.
 ///
 /// Shape (M, N, dim) is baked into the PTX, so the launch takes buffer pointers only.
-/// 256 threads/block, grid = (M*N)/256, required to divide evenly (no divergent bounds guard).
+/// 256 threads/block (8 pairs/block), grid = (M*N)/8, required to divide evenly.
 /// </summary>
 internal sealed class PtxPairwiseDistanceKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int WarpsPerBlock = BlockThreads / 32;
     internal const int MaxPairs = 2048 * 4096;
     internal const int MaxDim = 4096;
 
@@ -71,7 +72,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
         arguments[0] = &aPointer;
         arguments[1] = &bPointer;
         arguments[2] = &outputPointer;
-        uint grid = (uint)((M * N) / BlockThreads);
+        uint grid = (uint)((M * N) / WarpsPerBlock);
         _module.Launch(_function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -84,7 +85,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
 
         var ptx = new StringBuilder(4_000);
         DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
-        ptx.AppendLine($"// pairwise-distance M={m} N={n} dim={dim} squared={squared}");
+        ptx.AppendLine($"// pairwise-distance M={m} N={n} dim={dim} squared={squared}; one pair per warp");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {entry}(");
         ptx.AppendLine("    .param .u64 a_ptr,");
@@ -93,8 +94,8 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<2>;");
-        ptx.AppendLine("    .reg .b32 %r<10>;");
+        ptx.AppendLine("    .reg .pred %p<3>;");
+        ptx.AppendLine("    .reg .b32 %r<14>;");
         ptx.AppendLine("    .reg .b64 %rd<14>;");
         ptx.AppendLine("    .reg .f32 %f<6>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [a_ptr];");
@@ -102,28 +103,35 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
         ptx.AppendLine("    ld.param.u64 %rd2, [out_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");   // idx = i*N + j
-        ptx.AppendLine($"    div.u32 %r3, %r2, {n};");                     // i
-        ptx.AppendLine($"    rem.u32 %r4, %r2, {n};");                     // j
-        ptx.AppendLine($"    mul.lo.u32 %r5, %r3, {dim};");               // i*dim
-        ptx.AppendLine($"    mul.lo.u32 %r6, %r4, {dim};");               // j*dim
-        ptx.AppendLine("    mul.wide.u32 %rd4, %r5, 4;");
-        ptx.AppendLine("    mul.wide.u32 %rd5, %r6, 4;");
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");                        // warp in block
+        ptx.AppendLine("    and.b32 %r3, %r0, 31;");                       // lane
+        ptx.AppendLine($"    mad.lo.u32 %r4, %r1, {WarpsPerBlock}, %r2;"); // pair = i*N + j
+        ptx.AppendLine($"    div.u32 %r5, %r4, {n};");                     // i
+        ptx.AppendLine($"    rem.u32 %r6, %r4, {n};");                     // j
+        ptx.AppendLine($"    mad.lo.u32 %r7, %r5, {dim}, %r3;");           // i*dim + lane
+        ptx.AppendLine($"    mad.lo.u32 %r8, %r6, {dim}, %r3;");           // j*dim + lane
+        ptx.AppendLine("    mul.wide.u32 %rd4, %r7, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r8, 4;");
         ptx.AppendLine("    add.u64 %rd6, %rd0, %rd4;");                   // &a[i*dim]
         ptx.AppendLine("    add.u64 %rd7, %rd1, %rd5;");                   // &b[j*dim]
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // distSq
-        ptx.AppendLine("    mov.u32 %r7, 0;");                            // d = 0
+        ptx.AppendLine("    mov.u32 %r9, %r3;");                          // d = lane
         ptx.AppendLine("$PD_DIM_LOOP:");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r9, {dim};");
+        ptx.AppendLine("    @%p0 bra $PD_REDUCE;");
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd7];");
         ptx.AppendLine("    sub.rn.f32 %f3, %f1, %f2;");                  // diff
         ptx.AppendLine("    fma.rn.f32 %f0, %f3, %f3, %f0;");             // distSq += diff*diff
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 4;");
-        ptx.AppendLine("    add.u64 %rd7, %rd7, 4;");
-        ptx.AppendLine("    add.u32 %r7, %r7, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r7, {dim};");
-        ptx.AppendLine("    @%p0 bra $PD_DIM_LOOP;");
-        ptx.AppendLine("    mul.wide.u32 %rd8, %r2, 4;");
+        ptx.AppendLine("    add.u64 %rd6, %rd6, 128;");
+        ptx.AppendLine("    add.u64 %rd7, %rd7, 128;");
+        ptx.AppendLine("    add.u32 %r9, %r9, 32;");
+        ptx.AppendLine("    bra $PD_DIM_LOOP;");
+        ptx.AppendLine("$PD_REDUCE:");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f0", "%r11", "%r12", "%f5");
+        ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
+        ptx.AppendLine("    @%p1 bra $PD_END;");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r4, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd2, %rd8;");
         if (squared)
         {
@@ -134,6 +142,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
             ptx.AppendLine("    sqrt.rn.f32 %f4, %f0;");                  // output = sqrt(distSq)
             ptx.AppendLine("    st.global.f32 [%rd9], %f4;");
         }
+        ptx.AppendLine("$PD_END:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -147,7 +156,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
         var outExtent = new DirectPtxExtent(m * n);
         return new DirectPtxKernelBlueprint(
             Operation: squared ? "pairwise-distance-squared" : "pairwise-distance",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-m{m}-n{n}-d{dim}",
             Tensors:
@@ -160,7 +169,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
                     outExtent, outExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 30,
+                measuredRegistersPerThread: 24,
                 maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),
@@ -179,7 +188,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
     {
         if (m <= 0 || n <= 0 || dim <= 0 || dim > MaxDim) return false;
         long pairs = (long)m * n;
-        return pairs > 0 && pairs % BlockThreads == 0 && pairs <= MaxPairs;
+        return pairs > 0 && pairs % WarpsPerBlock == 0 && pairs <= MaxPairs;
     }
 
     internal static bool IsPromotedShape(int m, int n, int dim) => false;
@@ -189,7 +198,7 @@ internal sealed class PtxPairwiseDistanceKernel : IDisposable
         if (!IsSupportedShape(m, n, dim))
             throw new ArgumentOutOfRangeException(
                 nameof(m),
-                $"Pairwise distance requires positive dims with dim<={MaxDim} and (M*N) a multiple of {BlockThreads} up to {MaxPairs}.");
+                $"Pairwise distance requires positive dims with dim<={MaxDim} and (M*N) a multiple of {WarpsPerBlock} up to {MaxPairs}.");
     }
 
 }

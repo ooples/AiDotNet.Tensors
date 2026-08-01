@@ -119,9 +119,9 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
         ptx.AppendLine("    add.u32 %r6, %r6, 32;");
         ptx.AppendLine("    bra $COS_DIM_LOOP;");
         ptx.AppendLine("$COS_REDUCE:");
-        EmitWarpReduce(ptx, "%f0");
-        EmitWarpReduce(ptx, "%f1");
-        EmitWarpReduce(ptx, "%f2");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f0", "%r8", "%r9", "%f9");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f1", "%r8", "%r9", "%f9");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f2", "%r8", "%r9", "%f9");
         ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
         ptx.AppendLine("    @%p1 bra $COS_END;");
         ptx.AppendLine("    sqrt.rn.f32 %f5, %f1;");                     // ||a||
@@ -136,17 +136,6 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
-    }
-
-    private static void EmitWarpReduce(StringBuilder ptx, string partial)
-    {
-        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
-        {
-            ptx.AppendLine($"    mov.b32 %r8, {partial};");
-            ptx.AppendLine($"    shfl.sync.down.b32 %r9, %r8, {offset}, 31, 0xffffffff;");
-            ptx.AppendLine("    mov.b32 %f9, %r9;");
-            ptx.AppendLine($"    add.rn.f32 {partial}, {partial}, %f9;");
-        }
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, int batchSize, int dim)

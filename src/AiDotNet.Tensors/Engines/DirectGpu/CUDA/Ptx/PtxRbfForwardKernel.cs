@@ -6,18 +6,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Radial-basis-function activation <c>output[b,c] = exp(-epsilons[c] * ||input[b] - centers[c]||^2)</c>
-/// (issue #854). One thread owns one (batch, center) output pair, walking the <c>inputDim</c> feature
-/// axis serially in registers — no shared memory, no reduction — matching the NVRTC <c>rbf_forward</c>
-/// kernel exactly. <c>expf</c> is reconstructed as <c>ex2.approx.f32(x * log2(e))</c>, the same
+/// (issue #854). One warp owns one (batch, center) output pair, loading the <c>inputDim</c>
+/// feature axis in coalesced lane-strided chunks and reducing the squared distance with shuffles.
+/// <c>expf</c> is reconstructed as <c>ex2.approx.f32(x * log2(e))</c>, the same
 /// transcendental path used by the softmax family.
 ///
 /// Shape is baked into the PTX (batchSize, numCenters, inputDim are compile-time constants), so the
-/// launch takes buffer pointers only. 256 threads/block, grid = (batchSize*numCenters)/256, which is
-/// required to divide evenly so there is no divergent bounds guard.
+/// launch takes buffer pointers only. 256 threads/block (8 cells/block), grid =
+/// (batchSize*numCenters)/8, which is required to divide evenly so there is no bounds guard.
 /// </summary>
 internal sealed class PtxRbfForwardKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int WarpsPerBlock = BlockThreads / 32;
     internal const int MaxPairs = 2048 * 4096;
     internal const int MaxInputDim = 4096;
     internal const string EntryPoint = "aidotnet_rbf_forward";
@@ -71,7 +72,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
         arguments[1] = &centersPointer;
         arguments[2] = &epsilonsPointer;
         arguments[3] = &outputPointer;
-        uint grid = (uint)((BatchSize * NumCenters) / BlockThreads);
+        uint grid = (uint)((BatchSize * NumCenters) / WarpsPerBlock);
         _module.Launch(_function, grid, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -85,7 +86,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
 
         var ptx = new StringBuilder(4_000);
         DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
-        ptx.AppendLine($"// rbf-forward batch={batchSize} centers={numCenters} dim={inputDim}");
+        ptx.AppendLine($"// rbf-forward batch={batchSize} centers={numCenters} dim={inputDim}; one cell per warp");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 input_ptr,");
@@ -95,47 +96,55 @@ internal sealed class PtxRbfForwardKernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<2>;");
-        ptx.AppendLine("    .reg .b32 %r<10>;");
+        ptx.AppendLine("    .reg .pred %p<3>;");
+        ptx.AppendLine("    .reg .b32 %r<14>;");
         ptx.AppendLine("    .reg .b64 %rd<16>;");
-        ptx.AppendLine("    .reg .f32 %f<8>;");
+        ptx.AppendLine("    .reg .f32 %f<10>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [centers_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [epsilons_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd3, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");   // idx = b*NC + c
-        ptx.AppendLine($"    div.u32 %r3, %r2, {numCenters};");            // b
-        ptx.AppendLine($"    rem.u32 %r4, %r2, {numCenters};");            // c
-        ptx.AppendLine($"    mul.lo.u32 %r5, %r3, {inputDim};");           // b*ID
-        ptx.AppendLine($"    mul.lo.u32 %r6, %r4, {inputDim};");           // c*ID
-        ptx.AppendLine("    mul.wide.u32 %rd4, %r5, 4;");
-        ptx.AppendLine("    mul.wide.u32 %rd5, %r6, 4;");
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");                        // warp in block
+        ptx.AppendLine("    and.b32 %r3, %r0, 31;");                       // lane
+        ptx.AppendLine($"    mad.lo.u32 %r4, %r1, {WarpsPerBlock}, %r2;"); // pair = b*NC + c
+        ptx.AppendLine($"    div.u32 %r5, %r4, {numCenters};");            // b
+        ptx.AppendLine($"    rem.u32 %r6, %r4, {numCenters};");            // c
+        ptx.AppendLine($"    mad.lo.u32 %r7, %r5, {inputDim}, %r3;");      // b*ID + lane
+        ptx.AppendLine($"    mad.lo.u32 %r8, %r6, {inputDim}, %r3;");      // c*ID + lane
+        ptx.AppendLine("    mul.wide.u32 %rd4, %r7, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r8, 4;");
         ptx.AppendLine("    add.u64 %rd6, %rd0, %rd4;");                   // &input[b*ID]
         ptx.AppendLine("    add.u64 %rd7, %rd1, %rd5;");                   // &centers[c*ID]
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // distSq
-        ptx.AppendLine("    mov.u32 %r7, 0;");                            // d = 0
+        ptx.AppendLine("    mov.u32 %r9, %r3;");                          // d = lane
         ptx.AppendLine("$RBF_DIM_LOOP:");
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r9, {inputDim};");
+        ptx.AppendLine("    @%p0 bra $RBF_REDUCE;");
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd7];");
         ptx.AppendLine("    sub.rn.f32 %f3, %f1, %f2;");                  // diff
         ptx.AppendLine("    fma.rn.f32 %f0, %f3, %f3, %f0;");             // distSq += diff*diff
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 4;");
-        ptx.AppendLine("    add.u64 %rd7, %rd7, 4;");
-        ptx.AppendLine("    add.u32 %r7, %r7, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r7, {inputDim};");
-        ptx.AppendLine("    @%p0 bra $RBF_DIM_LOOP;");
-        ptx.AppendLine("    mul.wide.u32 %rd8, %r4, 4;");
+        ptx.AppendLine("    add.u64 %rd6, %rd6, 128;");
+        ptx.AppendLine("    add.u64 %rd7, %rd7, 128;");
+        ptx.AppendLine("    add.u32 %r9, %r9, 32;");
+        ptx.AppendLine("    bra $RBF_DIM_LOOP;");
+        ptx.AppendLine("$RBF_REDUCE:");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f0", "%r11", "%r12", "%f7");
+        ptx.AppendLine("    setp.ne.u32 %p1, %r3, 0;");
+        ptx.AppendLine("    @%p1 bra $RBF_END;");
+        ptx.AppendLine("    mul.wide.u32 %rd8, %r6, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd2, %rd8;");
         ptx.AppendLine("    ld.global.nc.f32 %f4, [%rd9];");             // eps = epsilons[c]
         ptx.AppendLine("    mul.rn.f32 %f5, %f4, %f0;");                 // eps*distSq
         ptx.AppendLine("    neg.f32 %f5, %f5;");                         // -eps*distSq
         ptx.AppendLine($"    mul.rn.f32 %f5, %f5, {log2e};");            // * log2(e)
         ptx.AppendLine("    ex2.approx.f32 %f6, %f5;");                  // exp(-eps*distSq)
-        ptx.AppendLine("    mul.wide.u32 %rd10, %r2, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r4, 4;");
         ptx.AppendLine("    add.u64 %rd11, %rd3, %rd10;");
         ptx.AppendLine("    st.global.f32 [%rd11], %f6;");
+        ptx.AppendLine("$RBF_END:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -150,7 +159,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
         var outputExtent = new DirectPtxExtent(batchSize * numCenters);
         return new DirectPtxKernelBlueprint(
             Operation: "rbf-forward",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-b{batchSize}-c{numCenters}-d{inputDim}",
             Tensors:
@@ -165,7 +174,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
                     outputExtent, outputExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 36,
+                measuredRegistersPerThread: 24,
                 maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),
@@ -183,7 +192,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
     {
         if (batchSize <= 0 || numCenters <= 0 || inputDim <= 0 || inputDim > MaxInputDim) return false;
         long pairs = (long)batchSize * numCenters;
-        return pairs > 0 && pairs % BlockThreads == 0 && pairs <= MaxPairs;
+        return pairs > 0 && pairs % WarpsPerBlock == 0 && pairs <= MaxPairs;
     }
 
     internal static bool IsPromotedShape(int batchSize, int numCenters, int inputDim) => false;
@@ -193,7 +202,7 @@ internal sealed class PtxRbfForwardKernel : IDisposable
         if (!IsSupportedShape(batchSize, numCenters, inputDim))
             throw new ArgumentOutOfRangeException(
                 nameof(batchSize),
-                $"RBF forward requires positive dims with inputDim<={MaxInputDim} and (batchSize*numCenters) a multiple of {BlockThreads} up to {MaxPairs}.");
+                $"RBF forward requires positive dims with inputDim<={MaxInputDim} and (batchSize*numCenters) a multiple of {WarpsPerBlock} up to {MaxPairs}.");
     }
 
 }
