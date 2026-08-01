@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.121.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.6...v0.121.0) (2026-08-01)
+
+
+### Features
+
+* **engine:** broadcast implicitly on the element-wise operators ([#919](https://github.com/ooples/AiDotNet.Tensors/issues/919)) ([fc390f0](https://github.com/ooples/AiDotNet.Tensors/commit/fc390f007f6897d34443a66e5f3b55204f436e49))
+
+
+### Bug Fixes
+
+* **autodiff:** reject full-span views from tensor pool ([#925](https://github.com/ooples/AiDotNet.Tensors/issues/925)) ([1b0006f](https://github.com/ooples/AiDotNet.Tensors/commit/1b0006f43af5c49df44ac9054b0f152f31b8716e))
+
 ## [0.120.6](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.5...v0.120.6) (2026-07-31)
 
 
