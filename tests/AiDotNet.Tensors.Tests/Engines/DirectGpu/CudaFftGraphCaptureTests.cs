@@ -55,11 +55,16 @@ public sealed class CudaFftGraphCaptureTests
         backend.Synchronize();
         var eager = SnapshotOutputs();
 
+        // Poison every destination so a graph that captures or replays no work cannot pass by
+        // returning the bytes left behind by the eager execution.
+        PoisonOutputs();
+
         IntPtr graph = backend.CaptureGraph(LaunchFftFamily);
         Assert.NotEqual(IntPtr.Zero, graph);
         try
         {
             backend.LaunchCapturedGraph(graph);
+            backend.Synchronize();
             var replay = SnapshotOutputs();
             Assert.Equal(eager, replay);
         }
@@ -90,6 +95,21 @@ public sealed class CudaFftGraphCaptureTests
                 slice.CopyTo(result, offset);
                 offset += length;
             }
+        }
+
+        void PoisonOutputs()
+        {
+            const float Sentinel = -12345f;
+            backend.Fill(fftOutputReal, Sentinel, n);
+            backend.Fill(fftOutputImag, Sentinel, n);
+            backend.Fill(rfftOutputReal, Sentinel, n / 2 + 1);
+            backend.Fill(rfftOutputImag, Sentinel, n / 2 + 1);
+            backend.Fill(irfftOutput, Sentinel, n);
+            backend.Fill(batchedOutputReal, Sentinel, batch * n);
+            backend.Fill(batchedOutputImag, Sentinel, batch * n);
+            backend.Fill(fft2DOutputReal, Sentinel, height * width);
+            backend.Fill(fft2DOutputImag, Sentinel, height * width);
+            backend.Synchronize();
         }
     }
 }
