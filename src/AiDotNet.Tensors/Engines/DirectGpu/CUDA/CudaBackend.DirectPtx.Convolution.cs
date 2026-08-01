@@ -119,15 +119,19 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                _directPtxConvolutionPlan ??= DirectPtxConvolutionAutotuner.Resolve(
-                    _directPtxRuntime,
-                    PtxFusedConv2DNchwK1Kernel.Batch,
-                    PtxFusedConv2DNchwK1Kernel.OutputChannels,
-                    PtxFusedConv2DNchwK1Kernel.InputChannels,
-                    PtxFusedConv2DNchwK1Kernel.SpatialElements,
-                    _ => throw new InvalidOperationException(
-                        "Prewarm cannot benchmark convolution without operand buffers."),
-                    autotuneEnabled: false);
+                if (!_directPtxConvolutionPlan.HasValue)
+                {
+                    DirectPtxConvolutionVariant selected = DirectPtxConvolutionVariant.Direct;
+                    if (DirectPtxFeatureGate.IsAutotuneEnabled)
+                        DirectPtxConvolutionAutotuner.TryLoad(
+                            _directPtxRuntime,
+                            PtxFusedConv2DNchwK1Kernel.Batch,
+                            PtxFusedConv2DNchwK1Kernel.OutputChannels,
+                            PtxFusedConv2DNchwK1Kernel.InputChannels,
+                            PtxFusedConv2DNchwK1Kernel.SpatialElements,
+                            out selected);
+                    _directPtxConvolutionPlan = selected;
+                }
                 EnsureDirectPtxConvolutionKernelLoaded(_directPtxConvolutionPlan.Value);
             }
             DirectPtxLastError = null;

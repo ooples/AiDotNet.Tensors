@@ -148,4 +148,30 @@ internal static class DirectPtxConvolutionAutotuner
                 $"Convolution autotune resolved unsupported variant '{resolution.Variant}'.");
         return selected;
     }
+
+    internal static bool TryLoad(
+        DirectPtxRuntime runtime,
+        int batch,
+        int outputChannels,
+        int inputChannels,
+        int spatial,
+        out DirectPtxConvolutionVariant variant)
+    {
+        if (runtime is null) throw new ArgumentNullException(nameof(runtime));
+
+        KernelId kernelId = GpuFirstRunAutotuner.GpuKernelId(
+            ConvTileAutotune.Category, ShareableKernelName, runtime.Fingerprint);
+        KernelChoice? cached = AutotuneCache.Lookup(
+            kernelId,
+            ConvTileAutotune.Shape(batch, outputChannels, inputChannels, spatial));
+        if (cached is null)
+        {
+            variant = default;
+            return false;
+        }
+
+        return TryGetVariant(
+            new AutotuneCandidate(cached.Variant, cached.Parameters),
+            outputChannels, inputChannels, spatial, out variant);
+    }
 }

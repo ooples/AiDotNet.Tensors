@@ -1545,7 +1545,8 @@ public sealed partial class CudaBackend
                     PtxCompat.SingleToInt32Bits(scale), PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxAttentionPlans.TryGetValue(plan, out int warps))
                 {
-                    if (!DirectPtxAttentionAutotuner.TryLoad(
+                    if (!DirectPtxFeatureGate.IsAutotuneEnabled ||
+                        !DirectPtxAttentionAutotuner.TryLoad(
                         _directPtxRuntime, batch, queryHeads, keyValueHeads,
                         querySequence, keyValueSequence, isCausal, causalQueryOffset,
                         fuseLayerNormGelu, emitSoftmaxStats, scale, epsilon, out warps))
