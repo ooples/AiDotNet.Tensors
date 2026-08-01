@@ -997,6 +997,7 @@ public class DirectPtxScientificTests
         using var kernel = new PtxCapsuleContractionKernel(
             runtime, op, b, inCaps, inDim, outCount, outDim);
         Assert.True(kernel.UsesTensorCores);
+        Assert.Equal(PtxCapsuleContractionKernel.TensorCoreBlockThreads, kernel.LaunchThreads);
         Assert.Equal(38, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);

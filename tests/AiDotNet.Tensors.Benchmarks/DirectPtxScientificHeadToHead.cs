@@ -20,7 +20,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class DirectPtxScientificHeadToHead
 {
     private const double WinThreshold = 1.10;
-    private const int KernelsPerGraphReplay = 64;
+    private const int MinimumKernelsPerGraphReplay = 64;
+    private const int MaximumKernelsPerGraphReplay = 1_024;
+    private const double TargetGraphReplayMicroseconds = 2_000.0;
 
     /// <summary>
     /// Launches exactly one selected public scientific route for an external profiler.
@@ -123,8 +125,8 @@ internal static class DirectPtxScientificHeadToHead
             Console.WriteLine("DIRECT PTX SCIENTIFIC - public API incumbent vs experimental route");
             Console.WriteLine("device: {0}", backend.DeviceName);
             Console.WriteLine(
-                "gate: same backend/context/stream; {0}-kernel CUDA-graph batches; adjacent event batches; 5% stability ceiling",
-                KernelsPerGraphReplay);
+                "gate: same backend/context/stream; adaptive {0}-{1}-kernel CUDA graphs; adjacent event batches; 5% stability ceiling",
+                MinimumKernelsPerGraphReplay, MaximumKernelsPerGraphReplay);
             Console.WriteLine();
             Console.WriteLine("{0,-43} {1,14} {2,14} {3,8}  {4}",
                 "operator", "incumbent", "direct PTX", "ratio", "verdict");
@@ -190,34 +192,39 @@ internal static class DirectPtxScientificHeadToHead
         {
             // One graph launch per kernel still leaves the stream dependent on how quickly the
             // host can issue cuGraphLaunch. On WDDM that made a 14 us kernel appear anywhere
-            // between 30 and 90 us even though CUDA events bracketed the batch. Capture enough
-            // kernel nodes per replay to keep the stream fed, then normalize back to one kernel.
-            long beforeIncumbentCapture = backend.DirectPtxScientificDispatchCount;
-            incumbentGraph = backend.CaptureGraph(() =>
+            // between 30 and 90 us even though CUDA events bracketed the batch. Start with 64
+            // nodes, then scale both lanes to the same graph size until the faster replay holds
+            // about 2 ms of device work. This keeps the stream fed without inflating long kernels.
+            void CaptureGraphs(int kernelsPerReplay)
             {
-                for (int i = 0; i < KernelsPerGraphReplay; i++)
-                    item.Launch(existing: true);
-            });
-            if (backend.DirectPtxScientificDispatchCount != beforeIncumbentCapture)
-                return CaseResult.Rejected(
-                    "incumbent graph unexpectedly captured direct PTX");
+                long beforeIncumbentCapture = backend.DirectPtxScientificDispatchCount;
+                incumbentGraph = backend.CaptureGraph(() =>
+                {
+                    for (int i = 0; i < kernelsPerReplay; i++)
+                        item.Launch(existing: true);
+                });
+                if (backend.DirectPtxScientificDispatchCount != beforeIncumbentCapture)
+                    throw new InvalidOperationException(
+                        "incumbent graph unexpectedly captured direct PTX");
 
-            long beforeDirectCapture = backend.DirectPtxScientificDispatchCount;
-            directGraph = backend.CaptureGraph(() =>
-            {
-                for (int i = 0; i < KernelsPerGraphReplay; i++)
-                    item.Launch(existing: false);
-            });
-            long capturedDirectDispatches =
-                backend.DirectPtxScientificDispatchCount - beforeDirectCapture;
-            if (capturedDirectDispatches != KernelsPerGraphReplay)
-                return CaseResult.Rejected(string.Format(
-                    CultureInfo.InvariantCulture,
-                    "direct graph captured {0}/{1} direct-PTX launches: {2}",
-                    capturedDirectDispatches, KernelsPerGraphReplay,
-                    backend.DirectPtxLastError ?? "no direct-PTX error was recorded"));
-            if (incumbentGraph == IntPtr.Zero || directGraph == IntPtr.Zero)
-                return CaseResult.Rejected("CUDA graph capture returned a null executable");
+                long beforeDirectCapture = backend.DirectPtxScientificDispatchCount;
+                directGraph = backend.CaptureGraph(() =>
+                {
+                    for (int i = 0; i < kernelsPerReplay; i++)
+                        item.Launch(existing: false);
+                });
+                long capturedDirectDispatches =
+                    backend.DirectPtxScientificDispatchCount - beforeDirectCapture;
+                if (capturedDirectDispatches != kernelsPerReplay)
+                    throw new InvalidOperationException(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "direct graph captured {0}/{1} direct-PTX launches: {2}",
+                        capturedDirectDispatches, kernelsPerReplay,
+                        backend.DirectPtxLastError ?? "no direct-PTX error was recorded"));
+                if (incumbentGraph == IntPtr.Zero || directGraph == IntPtr.Zero)
+                    throw new InvalidOperationException(
+                        "CUDA graph capture returned a null executable");
+            }
 
             using var start = backend.CreateEvent(enableTiming: true);
             using var stop = backend.CreateEvent(enableTiming: true);
@@ -230,19 +237,48 @@ internal static class DirectPtxScientificHeadToHead
                 return backend.GetEventElapsedTime(start, stop) * 1_000.0 / iterations;
             }
 
-            long graphWorkUnits = checked(item.WorkUnits * KernelsPerGraphReplay);
+            int kernelsPerGraphReplay = MinimumKernelsPerGraphReplay;
+            CaptureGraphs(kernelsPerGraphReplay);
+            backend.EnqueueCapturedGraph(incumbentGraph);
+            backend.EnqueueCapturedGraph(directGraph);
+            backend.Synchronize();
+            double incumbentProbe = MeasureMicroseconds(
+                () => backend.EnqueueCapturedGraph(incumbentGraph), 8);
+            double directProbe = MeasureMicroseconds(
+                () => backend.EnqueueCapturedGraph(directGraph), 8);
+            double fasterProbe = Math.Min(incumbentProbe, directProbe);
+            if (double.IsFinite(fasterProbe) && fasterProbe > 0 &&
+                fasterProbe < TargetGraphReplayMicroseconds)
+            {
+                double desiredKernelCount = MinimumKernelsPerGraphReplay *
+                    Math.Ceiling(TargetGraphReplayMicroseconds / fasterProbe);
+                kernelsPerGraphReplay = (int)Math.Clamp(
+                    desiredKernelCount,
+                    MinimumKernelsPerGraphReplay,
+                    MaximumKernelsPerGraphReplay);
+                backend.DestroyCapturedGraph(directGraph);
+                directGraph = IntPtr.Zero;
+                backend.DestroyCapturedGraph(incumbentGraph);
+                incumbentGraph = IntPtr.Zero;
+                CaptureGraphs(kernelsPerGraphReplay);
+            }
+
+            long graphWorkUnits = checked(item.WorkUnits * kernelsPerGraphReplay);
             StableTimer.PairResult graphTiming = StableTimer.MeasureDevicePair(
                 () => backend.EnqueueCapturedGraph(incumbentGraph),
                 () => backend.EnqueueCapturedGraph(directGraph),
                 graphWorkUnits, graphWorkUnits,
                 backend.Synchronize, MeasureMicroseconds);
-            StableTimer.PairResult timing = PerKernel(graphTiming, KernelsPerGraphReplay);
-            if (!timing.Stable) return new(timing, Verdict.Rejected, "not measurable");
+            StableTimer.PairResult timing = PerKernel(graphTiming, kernelsPerGraphReplay);
+            if (!timing.Stable) return new(timing, Verdict.Rejected, string.Format(
+                CultureInfo.InvariantCulture,
+                "not measurable; graph {0}", kernelsPerGraphReplay));
             Verdict verdict = timing.Ratio >= WinThreshold
                 ? Verdict.Win
                 : timing.Ratio < 1.0 / WinThreshold ? Verdict.Loss : Verdict.Tie;
             return new(timing, verdict, string.Format(CultureInfo.InvariantCulture,
-                "{0}; abs {1:E1}, rel {2:E1}", verdict.ToString().ToUpperInvariant(), absolute, relative));
+                "{0}; graph {1}; abs {2:E1}, rel {3:E1}",
+                verdict.ToString().ToUpperInvariant(), kernelsPerGraphReplay, absolute, relative));
         }
         catch (Exception ex)
         {

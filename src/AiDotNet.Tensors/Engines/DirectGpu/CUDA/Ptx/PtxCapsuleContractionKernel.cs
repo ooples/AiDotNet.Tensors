@@ -25,12 +25,14 @@ internal enum DirectPtxCapsuleOp
 ///
 /// Logical dims are (batchSize B, inputCapsules I, inputDim K, outputCount C, outputDim D). Input is
 /// <c>[B,I,K]</c>; output is <c>[B,I,C,D]</c> row-major. Shape is baked into the PTX; the launch
-/// takes buffer pointers only. The selected output-group count divides the 256-thread launch
-/// exactly, with no bounds guard.
+/// takes buffer pointers only. Scalar paths use 256-thread blocks; the WMMA path uses four-warp
+/// 128-thread blocks so its fixed warp count is distributed evenly across the GPU. Both launch
+/// shapes divide their selected output tiles exactly and need no bounds guard.
 /// </summary>
 internal sealed class PtxCapsuleContractionKernel : IDisposable
 {
     internal const int BlockThreads = 256;
+    internal const int TensorCoreBlockThreads = 128;
     internal const int MaxOutputs = 2048 * 4096;
     internal const int MaxContraction = 4096;
 
@@ -45,6 +47,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
     internal int OutputDim { get; }
     internal int OutputsPerThread { get; }
     internal bool UsesTensorCores { get; }
+    internal int LaunchThreads { get; }
     internal string EntryPoint { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
@@ -85,6 +88,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         OutputDim = outputDim;
         UsesTensorCores = UseTensorCorePath(
             batchSize, inputCapsules, inputDim, outputCount, outputDim);
+        LaunchThreads = UsesTensorCores ? TensorCoreBlockThreads : BlockThreads;
         OutputsPerThread = UsesTensorCores
             ? 16
             : GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim);
@@ -93,10 +97,10 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, op, batchSize, inputCapsules, inputDim, outputCount, outputDim);
         _module = runtime.LoadModule(Ptx);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, LaunchThreads);
+        Blueprint.ResourceBudget.Validate(EntryPoint, info, LaunchThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, LaunchThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView weights, DirectPtxTensorView output)
@@ -116,10 +120,10 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         {
             _module.Launch(
                 _function,
-                (uint)(OutputCount / (BlockThreads / 32)),
+                (uint)(OutputCount / (TensorCoreBlockThreads / 32)),
                 (uint)InputCapsules,
                 (uint)(BatchSize / 16),
-                BlockThreads, 1, 1, 0, arguments);
+                TensorCoreBlockThreads, 1, 1, 0, arguments);
         }
         else
         {
@@ -154,7 +158,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         ptx.AppendLine("    .param .u64 weights_ptr,");
         ptx.AppendLine("    .param .u64 out_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {TensorCoreBlockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<16>;");
@@ -271,7 +275,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    shr.u32 %r1, %r0, 5;");                       // warp in block
         ptx.AppendLine("    mov.u32 %r2, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r4, %r2, {BlockThreads / 32}, %r1;"); // c/j
+        ptx.AppendLine($"    mad.lo.u32 %r4, %r2, {TensorCoreBlockThreads / 32}, %r1;"); // c/j
         ptx.AppendLine("    mov.u32 %r6, %ctaid.y;");                     // i
         ptx.AppendLine("    mov.u32 %r7, %ctaid.z;");                     // b tile
 
@@ -325,10 +329,10 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         var outputExtent = new DirectPtxExtent(batchSize * inputCapsules * outputCount * outputDim);
         return new DirectPtxKernelBlueprint(
             Operation: op == DirectPtxCapsuleOp.Predictions ? "capsule-predictions" : "capsule-transform",
-            Version: 3,
+            Version: 4,
             Architecture: architecture,
             Variant: UseTensorCorePath(batchSize, inputCapsules, inputDim, outputCount, outputDim)
-                ? $"tf32-wmma-b{batchSize}-i{inputCapsules}-k{inputDim}-c{outputCount}-d{outputDim}"
+                ? $"tf32-wmma-t{TensorCoreBlockThreads}-b{batchSize}-i{inputCapsules}-k{inputDim}-c{outputCount}-d{outputDim}"
                 : $"fp32-x{GetOutputsPerThread(batchSize, inputCapsules, outputCount, outputDim)}-b{batchSize}-i{inputCapsules}-k{inputDim}-c{outputCount}-d{outputDim}",
             Tensors:
             [
@@ -385,7 +389,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         int batchSize, int inputCapsules, int inputDim, int outputCount, int outputDim)
     {
         long tiles = (long)(batchSize / 16) * inputCapsules * outputCount;
-        return batchSize % 16 == 0 && outputCount % (BlockThreads / 32) == 0 &&
+        return batchSize % 16 == 0 && outputCount % (TensorCoreBlockThreads / 32) == 0 &&
             inputDim == 16 && outputDim == 16 && tiles > 0;
     }
 
