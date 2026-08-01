@@ -35,6 +35,29 @@ validated RTX 3080/SM86 shape `[2048,1024]`, eight cells are clear wins and the
 two standalone masking passes are exact bandwidth-floor ties. No tie is reported
 as a win and no benchmark result opens the production gate automatically.
 
+## Cross-backend parity inventory
+
+The direct-PTX specializations are CUDA-specific, but the public operations do
+not silently become CUDA-only. Their peer-backend status is recorded in
+`DirectPtxSoftmaxCoverageManifest` and is fail-closed as follows:
+
+- **HIP** implements softmax, softmax-rows, softmax-backward,
+  log-sum-exp-backward, masked-fill, and masked-fill-backward natively. The
+  missing log-softmax, log-sum-exp-axis, sparsemax, and Taylor-softmax variants
+  are tracked by #914.
+- **Metal** implements the same six common routes natively; its four missing
+  variants are tracked by #915.
+- **OpenCL** implements the same six common routes natively; its four missing
+  variants are tracked by #916.
+- **Vulkan** has native implementations for all ten public routes, so it has no
+  parity exception for this family.
+- **WebGPU** implements the six common routes natively; its four missing
+  variants are tracked by #917.
+
+The four follow-up issues are distinct, open backend-parity requirements. None
+of them is treated as implemented coverage, and no CUDA promotion in this pull
+request can waive them.
+
 ## SM86 head-to-head evidence (2026-07-31)
 
 Command: `--direct-ptx-softmax`. Both sides run on the same backend stream and
