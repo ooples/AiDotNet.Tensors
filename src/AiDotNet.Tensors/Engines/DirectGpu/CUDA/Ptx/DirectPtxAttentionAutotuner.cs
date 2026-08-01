@@ -74,7 +74,6 @@ internal static class DirectPtxAttentionAutotuner
         ShapeProfile shape = Shape(
             batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
             isCausal, causalQueryOffset, fused, emitStats, scale, epsilon);
-        MigrateLegacyCache(runtime, shape, querySequence);
 
         AutotuneResolution resolution = CommunityAutotune.Resolve(
             exchange ?? GpuTuningExchangeProvider.Current,
@@ -118,26 +117,8 @@ internal static class DirectPtxAttentionAutotuner
         ShapeProfile shape = Shape(
             batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
             isCausal, causalQueryOffset, fused, emitStats, scale, epsilon);
-        KernelId currentId = KernelId(runtime);
-        KernelChoice? current = AutotuneCache.Lookup(currentId, shape);
-        if (TryGetWarps(current, querySequence, out warps)) return true;
-
-        KernelChoice? legacy = AutotuneCache.Lookup(LegacyKernelId(runtime), shape);
-        if (!TryGetWarps(legacy, querySequence, out warps)) return false;
-
-        // Preserve the old attention cache across the shared-autotuner key
-        // migration. Persistence is advisory, so a read-only cache is harmless.
-        AutotuneCache.TryStore(currentId, shape, legacy!);
-        return true;
-    }
-
-    private static void MigrateLegacyCache(
-        DirectPtxRuntime runtime, ShapeProfile shape, int querySequence)
-    {
-        if (AutotuneCache.Lookup(KernelId(runtime), shape) is not null) return;
-        KernelChoice? legacy = AutotuneCache.Lookup(LegacyKernelId(runtime), shape);
-        if (TryGetWarps(legacy, querySequence, out _))
-            AutotuneCache.TryStore(KernelId(runtime), shape, legacy!);
+        KernelChoice? current = AutotuneCache.Lookup(KernelId(runtime), shape);
+        return TryGetWarps(current, querySequence, out warps);
     }
 
     internal static bool TryGetWarps(
@@ -166,9 +147,6 @@ internal static class DirectPtxAttentionAutotuner
 
     private static KernelId KernelId(DirectPtxRuntime runtime) =>
         GpuFirstRunAutotuner.GpuKernelId(Category, ShareableKernelName, runtime.Fingerprint);
-
-    private static KernelId LegacyKernelId(DirectPtxRuntime runtime) =>
-        new(Category, $"{ShareableKernelName}-{runtime.DeviceFingerprint}");
 
     private static ShapeProfile Shape(
         int batch,
