@@ -30,6 +30,7 @@ internal static class DirectPtxFeatureGate
     internal const string Solve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVE_4X4";
     internal const string TriangularSolve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRIANGULAR_SOLVE_4X4";
     internal const string SolverBackward4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVER_BACKWARD_4X4";
+    internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -56,12 +57,23 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentSolve4x4Enabled = ReadEnabled(Solve4x4EnvironmentVariable);
     private static readonly bool EnvironmentTriangularSolve4x4Enabled = ReadEnabled(TriangularSolve4x4EnvironmentVariable);
     private static readonly bool EnvironmentSolverBackward4x4Enabled = ReadEnabled(SolverBackward4x4EnvironmentVariable);
+    private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
+    internal static bool FusedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
+    internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
+    internal static bool QuantizedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
+    internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
+    internal static bool ConvolutionExperimentOverride { get; set; }
 
     [ThreadStatic] private static bool? s_cholesky4x4ExperimentOverride;
     [ThreadStatic] private static bool? s_solver4x4ExperimentOverride;
@@ -139,6 +151,9 @@ internal static class DirectPtxFeatureGate
     internal static bool IsSolverBackward4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentSolverBackward4x4Enabled);
 
+    internal static bool IsConvolutionEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
+
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
     internal static int CacheCapacity => EnvironmentCacheCapacity;
@@ -155,6 +170,7 @@ internal static class DirectPtxFeatureGate
 
 internal enum DirectPtxPhysicalType
 {
+    Int8,
     Float16,
     BFloat16,
     Float32,
@@ -169,6 +185,8 @@ internal enum DirectPtxPhysicalLayout
     RowMajor2D,
     /// <summary>Dense row-major [batch, row, column] matrices.</summary>
     BatchedRowMajorMatrix,
+    /// <summary>Dense canonical [batch, channel, spatial] (NCHW-flattened).</summary>
+    Nchw,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -177,12 +195,18 @@ internal enum DirectPtxPhysicalLayout
     PackedQkvWeights,
     /// <summary>Packed Q/K/V projection bias, [qkv,head,feature].</summary>
     PackedQkvBias,
+    /// <summary>Input-major row-major linear weights, [inputFeature,outputFeature].</summary>
+    LinearWeightInputMajor,
+    /// <summary>Output-major row-major linear weights, [outputFeature,inputFeature].</summary>
+    LinearWeightOutputMajor,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>
-    PagedKv
+    PagedKv,
+    /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
+    Oihw
 }
 
 /// <summary>

@@ -2129,6 +2129,8 @@ public sealed partial class CudaBackend
                 _directPtxCholesky4x4Plans.Clear();
             }
             DisposeDirectPtxSolver4x4Kernels();
+            _directPtxConvolutionKernels.Dispose();
+            _directPtxRegBlockedConvKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'solvers-4x4')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'solvers-4x4', 'convolution')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -39,6 +39,7 @@ $switch = switch ($Target) {
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'solvers-4x4' { '--direct-ptx-profile-solvers-4x4' }
+    'convolution' { '--direct-ptx-profile-convolution' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -49,6 +50,7 @@ $kernel = switch ($Target) {
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'solvers-4x4' { 'regex:aidotnet_register_(cholesky|lu_factor|qr_reduced|eigh_(upper|lower)|svd_reduced|lu_solve_vector|ldl_factor_lower|ldl_solve_lower_vector|solve_vector|triangular_solve_(lower|upper)_vector|cholesky_backward_lower|solve_backward_vector)_4x4_f32' }
+    'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
@@ -59,6 +61,7 @@ $expectedLaunches = switch ($Target) {
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'solvers-4x4' { 56 }
+    'convolution' { 1 }
 }
 $metricNames = @(
     'smsp__sass_inst_executed_op_local.sum',

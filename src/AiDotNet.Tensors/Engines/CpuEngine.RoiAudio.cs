@@ -608,14 +608,27 @@ public partial class CpuEngine
         // Phase vocoder: remap time axis with linear interpolation, update
         // phase by accumulating the phase difference scaled by the time
         // stretch. Operates on the (last-frame, freq) sub-axes.
+        // STFT returns [.., numFreqs, numFrames] — frequency is the OUTER of the two spectral axes
+        // and time is the contiguous inner one.
+        //
+        // This previously read nFrames = mag._shape[^2] and nFreq = mag._shape[^1], i.e. it took the
+        // FREQUENCY count as the frame count and vice versa. The vocoder therefore interpolated along
+        // the frequency axis and accumulated phase across adjacent frequency BINS, where a phase
+        // vocoder must interpolate along time and accumulate across time FRAMES. The op was not a
+        // slightly-wrong time stretch, it was non-functional: a 500 Hz sine came out with a dominant
+        // frequency of 0.0 Hz (no tonal content), and rate < 1 threw ArgumentOutOfRangeException
+        // because the transposed output shape disagreed with what ISTFT expected. Pinned by
+        // TimeStretchSemanticsTests.
         int rank = mag.Rank;
-        int nFreq = mag._shape[rank - 1];
-        int nFrames = mag._shape[rank - 2];
+        int nFreq = mag._shape[rank - 2];
+        int nFrames = mag._shape[rank - 1];
         int leading = mag.Length / (nFrames * nFreq);
         int outFrames = (int)Math.Floor(nFrames / rate);
+        if (outFrames < 1) outFrames = 1;
 
+        // The TIME axis is the last one, so that is the axis whose length changes.
         var newShape = (int[])mag._shape.Clone();
-        newShape[rank - 2] = outFrames;
+        newShape[rank - 1] = outFrames;
         var newMag = new Tensor<T>(newShape);
         var newPhase = new Tensor<T>(newShape);
 
@@ -626,31 +639,33 @@ public partial class CpuEngine
 
         for (int b = 0; b < leading; b++)
         {
-            int stride = nFrames * nFreq;
-            int outStride = outFrames * nFreq;
+            int stride = nFreq * nFrames;
+            int outStride = nFreq * outFrames;
+            // One phase accumulator per frequency bin, advanced along time.
             var accPhase = new double[nFreq];
             for (int t = 0; t < outFrames; t++)
             {
                 double srcT = t * rate;
                 int t0 = (int)Math.Floor(srcT);
+                if (t0 > nFrames - 1) t0 = nFrames - 1;
                 int t1 = Math.Min(t0 + 1, nFrames - 1);
                 double frac = srcT - t0;
                 for (int f = 0; f < nFreq; f++)
                 {
-                    double m0 = ops.ToDouble(mSpan[b * stride + t0 * nFreq + f]);
-                    double m1 = ops.ToDouble(mSpan[b * stride + t1 * nFreq + f]);
+                    int row = b * stride + f * nFrames;
+                    double m0 = ops.ToDouble(mSpan[row + t0]);
+                    double m1 = ops.ToDouble(mSpan[row + t1]);
                     double m = (1 - frac) * m0 + frac * m1;
-                    nmSpan[b * outStride + t * nFreq + f] = ops.FromDouble(m);
+                    nmSpan[b * outStride + f * outFrames + t] = ops.FromDouble(m);
                     double dp = 0;
                     if (t0 + 1 < nFrames)
                     {
-                        dp = ops.ToDouble(pSpan[b * stride + (t0 + 1) * nFreq + f])
-                           - ops.ToDouble(pSpan[b * stride + t0 * nFreq + f]);
+                        dp = ops.ToDouble(pSpan[row + t0 + 1]) - ops.ToDouble(pSpan[row + t0]);
                         // Wrap dp to [-pi, pi).
                         dp -= 2 * Math.PI * Math.Round(dp / (2 * Math.PI));
                     }
                     accPhase[f] += dp;
-                    npSpan[b * outStride + t * nFreq + f] = ops.FromDouble(accPhase[f]);
+                    npSpan[b * outStride + f * outFrames + t] = ops.FromDouble(accPhase[f]);
                 }
             }
         }

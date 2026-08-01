@@ -21,7 +21,7 @@ public class TapeGradientParityTests
     public TapeGradientParityTests(OpParityFixture fx) => _fx = fx;
 
     public static IEnumerable<object[]> AllOps() =>
-        OpParityRegistry.All().Select(op => new object[] { op.Name });
+        OpParityRegistry.All().Where(op => ParityShard.Include(op.Name)).Select(op => new object[] { op.Name });
 
     [SkippableTheory]
     [MemberData(nameof(AllOps))]
