@@ -281,6 +281,77 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Measures a microkernel geometry from a captured multi-launch graph so
+    /// host submission gaps cannot dominate the tuner. The returned values are
+    /// per-kernel milliseconds, matching <see cref="MeasureKernelSamples"/>.
+    /// </summary>
+    internal float[] MeasureCapturedKernelSamples(
+        Action launch, int warmup, int samples, int launchesPerSample)
+    {
+        PtxCompat.ThrowIfNull(launch, nameof(launch));
+        if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
+        if (samples <= 0) throw new ArgumentOutOfRangeException(nameof(samples));
+        if (launchesPerSample <= 0) throw new ArgumentOutOfRangeException(nameof(launchesPerSample));
+
+        using var _ = Enter();
+        IntPtr graph = IntPtr.Zero;
+        IntPtr graphExec = IntPtr.Zero;
+        IntPtr start = IntPtr.Zero;
+        IntPtr stop = IntPtr.Zero;
+        bool captureActive = false;
+        try
+        {
+            Check(CudaNativeBindings.cuStreamBeginCapture(
+                _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+                "cuStreamBeginCapture(tuner)");
+            captureActive = true;
+            for (int i = 0; i < launchesPerSample; i++) launch();
+            CudaResult endResult = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
+            captureActive = false;
+            Check(endResult, "cuStreamEndCapture(tuner)");
+            if (graph == IntPtr.Zero)
+                throw new InvalidOperationException("CUDA tuner capture returned a null graph.");
+            Check(CudaNativeBindings.cuGraphInstantiate(out graphExec, graph, 0),
+                "cuGraphInstantiate(tuner)");
+            CudaNativeBindings.cuGraphDestroy(graph);
+            graph = IntPtr.Zero;
+
+            for (int i = 0; i < warmup; i++)
+                Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch(tuner warmup)");
+            Synchronize();
+
+            Check(CudaNativeBindings.cuEventCreate(out start, CudaNativeBindings.CU_EVENT_DEFAULT),
+                "cuEventCreate(tuner start)");
+            Check(CudaNativeBindings.cuEventCreate(out stop, CudaNativeBindings.CU_EVENT_DEFAULT),
+                "cuEventCreate(tuner stop)");
+            var result = new float[samples];
+            for (int sample = 0; sample < samples; sample++)
+            {
+                Check(CudaNativeBindings.cuEventRecord(start, _stream), "cuEventRecord(tuner start)");
+                Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch(tuner sample)");
+                Check(CudaNativeBindings.cuEventRecord(stop, _stream), "cuEventRecord(tuner stop)");
+                Check(CudaNativeBindings.cuEventSynchronize(stop), "cuEventSynchronize(tuner stop)");
+                Check(CudaNativeBindings.cuEventElapsedTime(out float elapsed, start, stop),
+                    "cuEventElapsedTime(tuner)");
+                result[sample] = elapsed / launchesPerSample;
+            }
+            return result;
+        }
+        finally
+        {
+            if (captureActive)
+            {
+                CudaNativeBindings.cuStreamEndCapture(_stream, out IntPtr aborted);
+                if (aborted != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(aborted);
+            }
+            if (start != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(start);
+            if (stop != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(stop);
+            if (graphExec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(graphExec);
+            if (graph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(graph);
+        }
+    }
+
     internal static void Check(CudaResult result, string operation)
     {
         if (result != CudaResult.Success)
@@ -433,6 +504,25 @@ internal sealed class DirectPtxModule : IDisposable
         void** arguments)
     {
         using var _ = _runtime.Enter();
+        LaunchCurrentContext(
+            function, gridX, gridY, gridZ, blockX, blockY, blockZ,
+            sharedMemoryBytes, arguments);
+    }
+
+    /// <summary>
+    /// Launches after the owning backend has established the CUDA context on
+    /// the calling thread. Driver-only callers use <see cref="Launch"/>; this
+    /// entry point lets validated resident dispatch avoid a second
+    /// cuCtxGetCurrent call for every kernel submission.
+    /// </summary>
+    internal unsafe void LaunchCurrentContext(
+        IntPtr function,
+        uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ,
+        uint sharedMemoryBytes,
+        void** arguments)
+    {
+        PtxCompat.ThrowIfDisposed(_module == IntPtr.Zero, this);
         DirectPtxRuntime.Check(
             CudaNativeBindings.cuLaunchKernel(
                 function,

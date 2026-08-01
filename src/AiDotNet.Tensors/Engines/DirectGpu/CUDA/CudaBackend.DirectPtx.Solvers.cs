@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -10,6 +11,13 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         _directPtxSolver4x4Kernels = new(192);
     private readonly DirectPtxPlanCache<DirectPtxSolver4x4PlanKey, int>
         _directPtxSolver4x4Plans = new(64);
+    // One immutable, fully-built specialization per operation/batch cell.
+    // The backing LRU is deliberately large enough to retain every tuned
+    // geometry, so a published hot entry remains valid until backend disposal.
+    private readonly PtxRegisterSolver4x4F32Kernel?[] _directPtxSolver4x4HotKernels =
+        new PtxRegisterSolver4x4F32Kernel?[13 * 4];
+    private readonly DirectPtxSolver4x4Binding?[] _directPtxSolver4x4HotBindings =
+        new DirectPtxSolver4x4Binding?[13 * 4];
     private long _directPtxSolver4x4DispatchCount;
 
     internal long DirectPtxSolver4x4DispatchCount =>
@@ -30,6 +38,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.LuFactor;
         if (!ValidateOperation(operation, batchCount, m, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, input, output, pivots)) return true;
         if (!ValidateThreeBuffers(operation, input, MatrixBytes(batchCount), 16,
             output, MatrixBytes(batchCount), 16, pivots, VectorBytes(batchCount), 16)) return false;
         return Launch3(operation, batchCount, input, output, pivots);
@@ -41,6 +50,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.QrReduced;
         if (!ValidateOperation(operation, batchCount, m, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, input, q, r)) return true;
         long bytes = MatrixBytes(batchCount);
         if (!ValidateThreeBuffers(operation, input, bytes, 16, q, bytes, 16, r, bytes, 16)) return false;
         return Launch3(operation, batchCount, input, q, r);
@@ -52,6 +62,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.EighUpper;
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, input, eigenvalues, eigenvectors)) return true;
         if (!ValidateThreeBuffers(operation, input, MatrixBytes(batchCount), 16,
             eigenvalues, VectorBytes(batchCount), 16,
             eigenvectors, MatrixBytes(batchCount), 16)) return false;
@@ -66,6 +77,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             ? DirectPtxSolver4x4Operation.EighUpper
             : DirectPtxSolver4x4Operation.EighLower;
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, input, eigenvalues, eigenvectors)) return true;
         if (!ValidateThreeBuffers(operation, input, MatrixBytes(batchCount), 16,
             eigenvalues, VectorBytes(batchCount), 16,
             eigenvectors, MatrixBytes(batchCount), 16)) return false;
@@ -78,6 +90,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.SvdReduced;
         if (!ValidateOperation(operation, batchCount, m, n, extra: 4)) return false;
+        if (TryLaunchBound4(operation, batchCount, input, u, singularValues, vh)) return true;
         long matrixBytes = MatrixBytes(batchCount);
         if (!ValidateFourBuffers(operation,
             input, matrixBytes, 16, u, matrixBytes, 16,
@@ -96,6 +109,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             DirectPtxLastError = "lu-solve-4x4-rhs-layout-not-implemented";
             return false;
         }
+        if (TryLaunchBound4(operation, batchCount, lu, pivots, rhs, solution)) return true;
         if (!ValidateFourBuffers(operation,
             lu, MatrixBytes(batchCount), 16, pivots, VectorBytes(batchCount), 16,
             rhs, VectorBytes(batchCount), 16, solution, VectorBytes(batchCount), 16)) return false;
@@ -113,6 +127,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             return false;
         }
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, input, ld, pivots)) return true;
         if (!ValidateThreeBuffers(operation, input, MatrixBytes(batchCount), 16,
             ld, MatrixBytes(batchCount), 16, pivots, VectorBytes(batchCount), 16)) return false;
         return Launch3(operation, batchCount, input, ld, pivots);
@@ -129,6 +144,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             return false;
         }
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound4(operation, batchCount, ld, pivots, rhs, solution)) return true;
         if (!ValidateFourBuffers(operation, ld, MatrixBytes(batchCount), 16,
             pivots, VectorBytes(batchCount), 16, rhs, VectorBytes(batchCount), 16,
             solution, VectorBytes(batchCount), 16)) return false;
@@ -141,6 +157,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.GeneralSolveVector;
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound4(operation, batchCount, input, rhs, solution, info)) return true;
         if (!ValidateFourBuffers(operation, input, MatrixBytes(batchCount), 16,
             rhs, VectorBytes(batchCount), 16, solution, VectorBytes(batchCount), 16,
             info, ScalarBytes(batchCount), 16)) return false;
@@ -160,6 +177,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             return false;
         }
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, input, rhs, solution)) return true;
         if (!ValidateThreeBuffers(operation, input, MatrixBytes(batchCount), 16,
             rhs, VectorBytes(batchCount), 16, solution, VectorBytes(batchCount), 16)) return false;
         return Launch3(operation, batchCount, input, rhs, solution);
@@ -171,6 +189,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.CholeskyBackwardLower;
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound3(operation, batchCount, factor, gradOutput, gradInput)) return true;
         long bytes = MatrixBytes(batchCount);
         if (!ValidateThreeBuffers(operation, factor, bytes, 16,
             gradOutput, bytes, 16, gradInput, bytes, 16)) return false;
@@ -183,6 +202,8 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         const DirectPtxSolver4x4Operation operation = DirectPtxSolver4x4Operation.SolveBackwardVector;
         if (!ValidateOperation(operation, batchCount, n, n, extra: 4)) return false;
+        if (TryLaunchBound5(
+            operation, batchCount, input, solution, gradOutput, gradInput, gradRhs)) return true;
         if (!ValidateFiveBuffers(operation,
             input, MatrixBytes(batchCount), solution, VectorBytes(batchCount),
             gradOutput, VectorBytes(batchCount), gradInput, MatrixBytes(batchCount),
@@ -305,8 +326,10 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     blockThreads = DirectPtxSolver4x4Autotuner.DefaultBlockThreads;
                     _directPtxSolver4x4Plans.Set(planKey, blockThreads);
                 }
-                _ = GetOrCreateSolver4x4Kernel(
+                PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(
                     new DirectPtxSolver4x4Key(operation, batchCount, blockThreads));
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotKernels[SolverHotIndex(operation, batchCount)], kernel);
             }
             DirectPtxLastError = null;
             return true;
@@ -338,6 +361,90 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         return false;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryLaunchBound3(
+        DirectPtxSolver4x4Operation operation,
+        int batchCount,
+        IGpuBuffer first,
+        IGpuBuffer second,
+        IGpuBuffer third)
+    {
+        if (_backendStreamCaptureActive) return false;
+        int index = SolverHotIndex(operation, batchCount);
+        DirectPtxSolver4x4Binding? binding = System.Threading.Volatile.Read(
+            ref _directPtxSolver4x4HotBindings[index]);
+        if (binding is null || !binding.Matches3(first, second, third)) return false;
+        EnsureContextCurrent();
+        lock (GpuDispatchLock)
+        {
+            if (!ReferenceEquals(
+                binding, System.Threading.Volatile.Read(ref _directPtxSolver4x4HotBindings[index])))
+                return false;
+            binding.Kernel.Launch3ValidatedCurrentContext(
+                first.Handle, second.Handle, third.Handle);
+        }
+        System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
+        DirectPtxLastError = null;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryLaunchBound4(
+        DirectPtxSolver4x4Operation operation,
+        int batchCount,
+        IGpuBuffer first,
+        IGpuBuffer second,
+        IGpuBuffer third,
+        IGpuBuffer fourth)
+    {
+        if (_backendStreamCaptureActive) return false;
+        int index = SolverHotIndex(operation, batchCount);
+        DirectPtxSolver4x4Binding? binding = System.Threading.Volatile.Read(
+            ref _directPtxSolver4x4HotBindings[index]);
+        if (binding is null || !binding.Matches4(first, second, third, fourth)) return false;
+        EnsureContextCurrent();
+        lock (GpuDispatchLock)
+        {
+            if (!ReferenceEquals(
+                binding, System.Threading.Volatile.Read(ref _directPtxSolver4x4HotBindings[index])))
+                return false;
+            binding.Kernel.Launch4ValidatedCurrentContext(
+                first.Handle, second.Handle, third.Handle, fourth.Handle);
+        }
+        System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
+        DirectPtxLastError = null;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryLaunchBound5(
+        DirectPtxSolver4x4Operation operation,
+        int batchCount,
+        IGpuBuffer first,
+        IGpuBuffer second,
+        IGpuBuffer third,
+        IGpuBuffer fourth,
+        IGpuBuffer fifth)
+    {
+        if (_backendStreamCaptureActive) return false;
+        int index = SolverHotIndex(operation, batchCount);
+        DirectPtxSolver4x4Binding? binding = System.Threading.Volatile.Read(
+            ref _directPtxSolver4x4HotBindings[index]);
+        if (binding is null || !binding.Matches5(first, second, third, fourth, fifth)) return false;
+        EnsureContextCurrent();
+        lock (GpuDispatchLock)
+        {
+            if (!ReferenceEquals(
+                binding, System.Threading.Volatile.Read(ref _directPtxSolver4x4HotBindings[index])))
+                return false;
+            binding.Kernel.Launch5ValidatedCurrentContext(
+                first.Handle, second.Handle, third.Handle, fourth.Handle, fifth.Handle);
+        }
+        System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
+        DirectPtxLastError = null;
+        return true;
+    }
+
     private bool Launch3(
         DirectPtxSolver4x4Operation operation,
         int batchCount,
@@ -347,8 +454,23 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         try
         {
-            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
+            int hotIndex = SolverHotIndex(operation, batchCount);
+            bool capturing = _backendStreamCaptureActive;
+            PtxRegisterSolver4x4F32Kernel? hot = System.Threading.Volatile.Read(
+                ref _directPtxSolver4x4HotKernels[hotIndex]);
+            if (hot is not null && !capturing)
+            {
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotBindings[hotIndex],
+                    new DirectPtxSolver4x4Binding(hot, first, second, third));
+                lock (GpuDispatchLock)
+                    hot.Launch3ValidatedCurrentContext(first.Handle, second.Handle, third.Handle);
+                System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
+                DirectPtxLastError = null;
+                return true;
+            }
+            if (hot is null) capturing = IsStreamCapturingCurrentContext();
             var planKey = new DirectPtxSolver4x4PlanKey(operation, batchCount);
             lock (_directPtxLock)
             {
@@ -362,17 +484,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out blockThreads))
                 {
                     blockThreads = DirectPtxFeatureGate.IsAutotuneEnabled
-                        ? DirectPtxSolver4x4Autotuner.Select(candidate =>
-                        {
-                            var candidateKey = new DirectPtxSolver4x4Key(operation, batchCount, candidate);
-                            PtxRegisterSolver4x4F32Kernel candidateKernel = GetOrCreateSolver4x4Kernel(candidateKey);
-                            var firstView = DirectPtxTensorView.Create(first, candidateKernel.Blueprint.Tensors[0]);
-                            var secondView = DirectPtxTensorView.Create(second, candidateKernel.Blueprint.Tensors[1]);
-                            var thirdView = DirectPtxTensorView.Create(third, candidateKernel.Blueprint.Tensors[2]);
-                            return _directPtxRuntime.MeasureKernelSamples(
-                                () => { lock (GpuDispatchLock) candidateKernel.Launch3(firstView, secondView, thirdView); },
-                                warmup: 2, samples: 5, launchesPerSample: 1);
-                        })
+                        ? TuneLaunch3(operation, batchCount, first, second, third)
                         : DirectPtxSolver4x4Autotuner.DefaultBlockThreads;
                     _directPtxSolver4x4Plans.Set(planKey, blockThreads);
                 }
@@ -383,16 +495,18 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     return false;
                 }
                 PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
+                System.Threading.Volatile.Write(ref _directPtxSolver4x4HotKernels[hotIndex], kernel);
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotBindings[hotIndex],
+                    new DirectPtxSolver4x4Binding(kernel, first, second, third));
                 if (capturing && !_directPtxSolver4x4Kernels.Pin(key))
                 {
                     DirectPtxLastError = $"{OperationSlug(operation)}-capture-pin-failed";
                     return false;
                 }
                 lock (GpuDispatchLock)
-                    kernel.Launch3(
-                        DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]),
-                        DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(third, kernel.Blueprint.Tensors[2]));
+                    kernel.Launch3ValidatedCurrentContext(
+                        first.Handle, second.Handle, third.Handle);
             }
             System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
             DirectPtxLastError = null;
@@ -415,8 +529,24 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         try
         {
-            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
+            int hotIndex = SolverHotIndex(operation, batchCount);
+            bool capturing = _backendStreamCaptureActive;
+            PtxRegisterSolver4x4F32Kernel? hot = System.Threading.Volatile.Read(
+                ref _directPtxSolver4x4HotKernels[hotIndex]);
+            if (hot is not null && !capturing)
+            {
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotBindings[hotIndex],
+                    new DirectPtxSolver4x4Binding(hot, first, second, third, fourth));
+                lock (GpuDispatchLock)
+                    hot.Launch4ValidatedCurrentContext(
+                        first.Handle, second.Handle, third.Handle, fourth.Handle);
+                System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
+                DirectPtxLastError = null;
+                return true;
+            }
+            if (hot is null) capturing = IsStreamCapturingCurrentContext();
             var planKey = new DirectPtxSolver4x4PlanKey(operation, batchCount);
             lock (_directPtxLock)
             {
@@ -430,18 +560,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out blockThreads))
                 {
                     blockThreads = DirectPtxFeatureGate.IsAutotuneEnabled
-                        ? DirectPtxSolver4x4Autotuner.Select(candidate =>
-                        {
-                            var candidateKey = new DirectPtxSolver4x4Key(operation, batchCount, candidate);
-                            PtxRegisterSolver4x4F32Kernel candidateKernel = GetOrCreateSolver4x4Kernel(candidateKey);
-                            var firstView = DirectPtxTensorView.Create(first, candidateKernel.Blueprint.Tensors[0]);
-                            var secondView = DirectPtxTensorView.Create(second, candidateKernel.Blueprint.Tensors[1]);
-                            var thirdView = DirectPtxTensorView.Create(third, candidateKernel.Blueprint.Tensors[2]);
-                            var fourthView = DirectPtxTensorView.Create(fourth, candidateKernel.Blueprint.Tensors[3]);
-                            return _directPtxRuntime.MeasureKernelSamples(
-                                () => { lock (GpuDispatchLock) candidateKernel.Launch4(firstView, secondView, thirdView, fourthView); },
-                                warmup: 2, samples: 5, launchesPerSample: 1);
-                        })
+                        ? TuneLaunch4(operation, batchCount, first, second, third, fourth)
                         : DirectPtxSolver4x4Autotuner.DefaultBlockThreads;
                     _directPtxSolver4x4Plans.Set(planKey, blockThreads);
                 }
@@ -452,17 +571,18 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     return false;
                 }
                 PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
+                System.Threading.Volatile.Write(ref _directPtxSolver4x4HotKernels[hotIndex], kernel);
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotBindings[hotIndex],
+                    new DirectPtxSolver4x4Binding(kernel, first, second, third, fourth));
                 if (capturing && !_directPtxSolver4x4Kernels.Pin(key))
                 {
                     DirectPtxLastError = $"{OperationSlug(operation)}-capture-pin-failed";
                     return false;
                 }
                 lock (GpuDispatchLock)
-                    kernel.Launch4(
-                        DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]),
-                        DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(third, kernel.Blueprint.Tensors[2]),
-                        DirectPtxTensorView.Create(fourth, kernel.Blueprint.Tensors[3]));
+                    kernel.Launch4ValidatedCurrentContext(
+                        first.Handle, second.Handle, third.Handle, fourth.Handle);
             }
             System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
             DirectPtxLastError = null;
@@ -486,8 +606,24 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         try
         {
-            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
+            int hotIndex = SolverHotIndex(operation, batchCount);
+            bool capturing = _backendStreamCaptureActive;
+            PtxRegisterSolver4x4F32Kernel? hot = System.Threading.Volatile.Read(
+                ref _directPtxSolver4x4HotKernels[hotIndex]);
+            if (hot is not null && !capturing)
+            {
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotBindings[hotIndex],
+                    new DirectPtxSolver4x4Binding(hot, first, second, third, fourth, fifth));
+                lock (GpuDispatchLock)
+                    hot.Launch5ValidatedCurrentContext(
+                        first.Handle, second.Handle, third.Handle, fourth.Handle, fifth.Handle);
+                System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
+                DirectPtxLastError = null;
+                return true;
+            }
+            if (hot is null) capturing = IsStreamCapturingCurrentContext();
             var planKey = new DirectPtxSolver4x4PlanKey(operation, batchCount);
             lock (_directPtxLock)
             {
@@ -501,23 +637,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out blockThreads))
                 {
                     blockThreads = DirectPtxFeatureGate.IsAutotuneEnabled
-                        ? DirectPtxSolver4x4Autotuner.Select(candidate =>
-                        {
-                            var candidateKey = new DirectPtxSolver4x4Key(operation, batchCount, candidate);
-                            PtxRegisterSolver4x4F32Kernel candidateKernel = GetOrCreateSolver4x4Kernel(candidateKey);
-                            var firstView = DirectPtxTensorView.Create(first, candidateKernel.Blueprint.Tensors[0]);
-                            var secondView = DirectPtxTensorView.Create(second, candidateKernel.Blueprint.Tensors[1]);
-                            var thirdView = DirectPtxTensorView.Create(third, candidateKernel.Blueprint.Tensors[2]);
-                            var fourthView = DirectPtxTensorView.Create(fourth, candidateKernel.Blueprint.Tensors[3]);
-                            var fifthView = DirectPtxTensorView.Create(fifth, candidateKernel.Blueprint.Tensors[4]);
-                            return _directPtxRuntime.MeasureKernelSamples(
-                                () =>
-                                {
-                                    lock (GpuDispatchLock)
-                                        candidateKernel.Launch5(firstView, secondView, thirdView, fourthView, fifthView);
-                                },
-                                warmup: 2, samples: 5, launchesPerSample: 1);
-                        })
+                        ? TuneLaunch5(operation, batchCount, first, second, third, fourth, fifth)
                         : DirectPtxSolver4x4Autotuner.DefaultBlockThreads;
                     _directPtxSolver4x4Plans.Set(planKey, blockThreads);
                 }
@@ -528,18 +648,18 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     return false;
                 }
                 PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
+                System.Threading.Volatile.Write(ref _directPtxSolver4x4HotKernels[hotIndex], kernel);
+                System.Threading.Volatile.Write(
+                    ref _directPtxSolver4x4HotBindings[hotIndex],
+                    new DirectPtxSolver4x4Binding(kernel, first, second, third, fourth, fifth));
                 if (capturing && !_directPtxSolver4x4Kernels.Pin(key))
                 {
                     DirectPtxLastError = $"{OperationSlug(operation)}-capture-pin-failed";
                     return false;
                 }
                 lock (GpuDispatchLock)
-                    kernel.Launch5(
-                        DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]),
-                        DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(third, kernel.Blueprint.Tensors[2]),
-                        DirectPtxTensorView.Create(fourth, kernel.Blueprint.Tensors[3]),
-                        DirectPtxTensorView.Create(fifth, kernel.Blueprint.Tensors[4]));
+                    kernel.Launch5ValidatedCurrentContext(
+                        first.Handle, second.Handle, third.Handle, fourth.Handle, fifth.Handle);
             }
             System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
             DirectPtxLastError = null;
@@ -670,35 +790,96 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         IGpuBuffer fifth, long fifthBytes)
     {
         string slug = OperationSlug(operation);
-        IGpuBuffer[] buffers = [first, second, third, fourth, fifth];
-        long[] bytes = [firstBytes, secondBytes, thirdBytes, fourthBytes, fifthBytes];
-        for (int i = 0; i < buffers.Length; i++)
+        if (first is null || second is null || third is null || fourth is null || fifth is null)
         {
-            if (buffers[i] is null)
-            {
-                DirectPtxLastError = $"{slug}-null-buffer";
-                return false;
-            }
-            if (buffers[i].SizeInBytes != bytes[i])
-            {
-                DirectPtxLastError = $"{slug}-physical-extent-mismatch";
-                return false;
-            }
-            if (!ValidPointer(buffers[i], 16))
-            {
-                DirectPtxLastError = $"{slug}-pointer-or-alignment-mismatch";
-                return false;
-            }
+            DirectPtxLastError = $"{slug}-null-buffer";
+            return false;
         }
-        for (int i = 0; i < buffers.Length; i++)
-        for (int j = i + 1; j < buffers.Length; j++)
-            if (DirectPtxRangesOverlap(buffers[i], buffers[j]))
-            {
-                DirectPtxLastError = $"{slug}-alias-not-supported";
-                return false;
-            }
+        if (first.SizeInBytes != firstBytes || second.SizeInBytes != secondBytes ||
+            third.SizeInBytes != thirdBytes || fourth.SizeInBytes != fourthBytes ||
+            fifth.SizeInBytes != fifthBytes)
+        {
+            DirectPtxLastError = $"{slug}-physical-extent-mismatch";
+            return false;
+        }
+        if (!ValidPointer(first, 16) || !ValidPointer(second, 16) || !ValidPointer(third, 16) ||
+            !ValidPointer(fourth, 16) || !ValidPointer(fifth, 16))
+        {
+            DirectPtxLastError = $"{slug}-pointer-or-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxRangesOverlap(first, second) || DirectPtxRangesOverlap(first, third) ||
+            DirectPtxRangesOverlap(first, fourth) || DirectPtxRangesOverlap(first, fifth) ||
+            DirectPtxRangesOverlap(second, third) || DirectPtxRangesOverlap(second, fourth) ||
+            DirectPtxRangesOverlap(second, fifth) || DirectPtxRangesOverlap(third, fourth) ||
+            DirectPtxRangesOverlap(third, fifth) || DirectPtxRangesOverlap(fourth, fifth))
+        {
+            DirectPtxLastError = $"{slug}-alias-not-supported";
+            return false;
+        }
         return true;
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int TuneLaunch3(
+        DirectPtxSolver4x4Operation operation, int batchCount,
+        IGpuBuffer first, IGpuBuffer second, IGpuBuffer third) =>
+        DirectPtxSolver4x4Autotuner.Select(candidate =>
+        {
+            var key = new DirectPtxSolver4x4Key(operation, batchCount, candidate);
+            PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
+            var firstView = DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]);
+            var secondView = DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]);
+            var thirdView = DirectPtxTensorView.Create(third, kernel.Blueprint.Tensors[2]);
+            return _directPtxRuntime!.MeasureCapturedKernelSamples(
+                () => { lock (GpuDispatchLock) kernel.Launch3(firstView, secondView, thirdView); },
+                DirectPtxSolver4x4Autotuner.TuneWarmups,
+                DirectPtxSolver4x4Autotuner.TuneSamples,
+                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+        });
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int TuneLaunch4(
+        DirectPtxSolver4x4Operation operation, int batchCount,
+        IGpuBuffer first, IGpuBuffer second, IGpuBuffer third, IGpuBuffer fourth) =>
+        DirectPtxSolver4x4Autotuner.Select(candidate =>
+        {
+            var key = new DirectPtxSolver4x4Key(operation, batchCount, candidate);
+            PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
+            var firstView = DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]);
+            var secondView = DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]);
+            var thirdView = DirectPtxTensorView.Create(third, kernel.Blueprint.Tensors[2]);
+            var fourthView = DirectPtxTensorView.Create(fourth, kernel.Blueprint.Tensors[3]);
+            return _directPtxRuntime!.MeasureCapturedKernelSamples(
+                () => { lock (GpuDispatchLock) kernel.Launch4(firstView, secondView, thirdView, fourthView); },
+                DirectPtxSolver4x4Autotuner.TuneWarmups,
+                DirectPtxSolver4x4Autotuner.TuneSamples,
+                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+        });
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int TuneLaunch5(
+        DirectPtxSolver4x4Operation operation, int batchCount,
+        IGpuBuffer first, IGpuBuffer second, IGpuBuffer third, IGpuBuffer fourth, IGpuBuffer fifth) =>
+        DirectPtxSolver4x4Autotuner.Select(candidate =>
+        {
+            var key = new DirectPtxSolver4x4Key(operation, batchCount, candidate);
+            PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
+            var firstView = DirectPtxTensorView.Create(first, kernel.Blueprint.Tensors[0]);
+            var secondView = DirectPtxTensorView.Create(second, kernel.Blueprint.Tensors[1]);
+            var thirdView = DirectPtxTensorView.Create(third, kernel.Blueprint.Tensors[2]);
+            var fourthView = DirectPtxTensorView.Create(fourth, kernel.Blueprint.Tensors[3]);
+            var fifthView = DirectPtxTensorView.Create(fifth, kernel.Blueprint.Tensors[4]);
+            return _directPtxRuntime!.MeasureCapturedKernelSamples(
+                () =>
+                {
+                    lock (GpuDispatchLock)
+                        kernel.Launch5(firstView, secondView, thirdView, fourthView, fifthView);
+                },
+                DirectPtxSolver4x4Autotuner.TuneWarmups,
+                DirectPtxSolver4x4Autotuner.TuneSamples,
+                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+        });
 
     private static bool ValidPointer(IGpuBuffer buffer, int alignment) =>
         buffer.Handle != IntPtr.Zero &&
@@ -755,9 +936,30 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
 
     private void DisposeDirectPtxSolver4x4Kernels()
     {
-        _directPtxSolver4x4Kernels.Dispose();
-        _directPtxSolver4x4Plans.Clear();
+        lock (GpuDispatchLock)
+        {
+            Array.Clear(
+                _directPtxSolver4x4HotKernels, 0, _directPtxSolver4x4HotKernels.Length);
+            Array.Clear(
+                _directPtxSolver4x4HotBindings, 0, _directPtxSolver4x4HotBindings.Length);
+            _directPtxSolver4x4Kernels.Dispose();
+            _directPtxSolver4x4Plans.Clear();
+        }
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SolverHotIndex(DirectPtxSolver4x4Operation operation, int batchCount) =>
+        ((int)operation * 4) + SolverBatchIndex(batchCount);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SolverBatchIndex(int batchCount) => batchCount switch
+        {
+            1024 => 0,
+            4096 => 1,
+            16384 => 2,
+            65536 => 3,
+            _ => throw new ArgumentOutOfRangeException(nameof(batchCount))
+        };
 
     private readonly record struct DirectPtxSolver4x4PlanKey(
         DirectPtxSolver4x4Operation Operation,
@@ -766,4 +968,62 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         DirectPtxSolver4x4Operation Operation,
         int BatchCount,
         int BlockThreads);
+
+    private sealed class DirectPtxSolver4x4Binding
+    {
+        private readonly IGpuBuffer _first;
+        private readonly IGpuBuffer _second;
+        private readonly IGpuBuffer _third;
+        private readonly IGpuBuffer? _fourth;
+        private readonly IGpuBuffer? _fifth;
+        private readonly IntPtr _firstHandle;
+        private readonly IntPtr _secondHandle;
+        private readonly IntPtr _thirdHandle;
+        private readonly IntPtr _fourthHandle;
+        private readonly IntPtr _fifthHandle;
+        private readonly long _firstBytes;
+        private readonly long _secondBytes;
+        private readonly long _thirdBytes;
+        private readonly long _fourthBytes;
+        private readonly long _fifthBytes;
+
+        internal DirectPtxSolver4x4Binding(
+            PtxRegisterSolver4x4F32Kernel kernel,
+            IGpuBuffer first,
+            IGpuBuffer second,
+            IGpuBuffer third,
+            IGpuBuffer? fourth = null,
+            IGpuBuffer? fifth = null)
+        {
+            Kernel = kernel;
+            _first = first; _second = second; _third = third;
+            _fourth = fourth; _fifth = fifth;
+            _firstHandle = first.Handle; _secondHandle = second.Handle; _thirdHandle = third.Handle;
+            _fourthHandle = fourth?.Handle ?? IntPtr.Zero;
+            _fifthHandle = fifth?.Handle ?? IntPtr.Zero;
+            _firstBytes = first.SizeInBytes; _secondBytes = second.SizeInBytes;
+            _thirdBytes = third.SizeInBytes; _fourthBytes = fourth?.SizeInBytes ?? 0;
+            _fifthBytes = fifth?.SizeInBytes ?? 0;
+        }
+
+        internal PtxRegisterSolver4x4F32Kernel Kernel { get; }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool Matches3(IGpuBuffer first, IGpuBuffer second, IGpuBuffer third) =>
+            ReferenceEquals(_first, first) && ReferenceEquals(_second, second) && ReferenceEquals(_third, third) &&
+            first.Handle == _firstHandle && second.Handle == _secondHandle && third.Handle == _thirdHandle &&
+            first.SizeInBytes == _firstBytes && second.SizeInBytes == _secondBytes && third.SizeInBytes == _thirdBytes;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool Matches4(
+            IGpuBuffer first, IGpuBuffer second, IGpuBuffer third, IGpuBuffer fourth) =>
+            Matches3(first, second, third) && ReferenceEquals(_fourth, fourth) &&
+            fourth.Handle == _fourthHandle && fourth.SizeInBytes == _fourthBytes;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool Matches5(
+            IGpuBuffer first, IGpuBuffer second, IGpuBuffer third, IGpuBuffer fourth, IGpuBuffer fifth) =>
+            Matches4(first, second, third, fourth) && ReferenceEquals(_fifth, fifth) &&
+            fifth.Handle == _fifthHandle && fifth.SizeInBytes == _fifthBytes;
+    }
 }

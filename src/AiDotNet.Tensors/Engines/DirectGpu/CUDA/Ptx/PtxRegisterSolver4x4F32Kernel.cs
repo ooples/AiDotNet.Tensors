@@ -85,7 +85,14 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         IntPtr p0 = first.Pointer, p1 = second.Pointer, p2 = third.Pointer;
         void** args = stackalloc void*[3];
         args[0] = &p0; args[1] = &p1; args[2] = &p2;
-        Launch(args);
+        Launch(args, contextIsCurrent: false);
+    }
+
+    internal unsafe void Launch3ValidatedCurrentContext(IntPtr first, IntPtr second, IntPtr third)
+    {
+        void** args = stackalloc void*[3];
+        args[0] = &first; args[1] = &second; args[2] = &third;
+        Launch(args, contextIsCurrent: true);
     }
 
     internal unsafe void Launch4(
@@ -105,7 +112,15 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         IntPtr p0 = first.Pointer, p1 = second.Pointer, p2 = third.Pointer, p3 = fourth.Pointer;
         void** args = stackalloc void*[4];
         args[0] = &p0; args[1] = &p1; args[2] = &p2; args[3] = &p3;
-        Launch(args);
+        Launch(args, contextIsCurrent: false);
+    }
+
+    internal unsafe void Launch4ValidatedCurrentContext(
+        IntPtr first, IntPtr second, IntPtr third, IntPtr fourth)
+    {
+        void** args = stackalloc void*[4];
+        args[0] = &first; args[1] = &second; args[2] = &third; args[3] = &fourth;
+        Launch(args, contextIsCurrent: true);
     }
 
     internal unsafe void Launch5(
@@ -116,22 +131,40 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         DirectPtxTensorView fifth)
     {
         if (Blueprint.Tensors.Count != 5) throw new InvalidOperationException("Kernel ABI is not five pointers.");
-        DirectPtxTensorView[] views = [first, second, third, fourth, fifth];
-        for (int i = 0; i < views.Length; i++) Require(views[i], Blueprint.Tensors[i], $"argument{i}");
-        for (int i = 0; i < views.Length; i++)
-        for (int j = i + 1; j < views.Length; j++)
-            if (Overlaps(views[i], views[j]))
-                throw new ArgumentException("Register solver inputs and outputs must use disjoint allocations.");
+        Require(first, Blueprint.Tensors[0], nameof(first));
+        Require(second, Blueprint.Tensors[1], nameof(second));
+        Require(third, Blueprint.Tensors[2], nameof(third));
+        Require(fourth, Blueprint.Tensors[3], nameof(fourth));
+        Require(fifth, Blueprint.Tensors[4], nameof(fifth));
+        if (Overlaps(first, second) || Overlaps(first, third) || Overlaps(first, fourth) ||
+            Overlaps(first, fifth) || Overlaps(second, third) || Overlaps(second, fourth) ||
+            Overlaps(second, fifth) || Overlaps(third, fourth) || Overlaps(third, fifth) ||
+            Overlaps(fourth, fifth))
+            throw new ArgumentException("Register solver inputs and outputs must use disjoint allocations.");
         IntPtr p0 = first.Pointer, p1 = second.Pointer, p2 = third.Pointer,
             p3 = fourth.Pointer, p4 = fifth.Pointer;
         void** args = stackalloc void*[5];
         args[0] = &p0; args[1] = &p1; args[2] = &p2; args[3] = &p3; args[4] = &p4;
-        Launch(args);
+        Launch(args, contextIsCurrent: false);
     }
 
-    private unsafe void Launch(void** arguments) => _module.Launch(
-        _function, checked((uint)(BatchCount / BlockThreads)), 1, 1,
-        checked((uint)BlockThreads), 1, 1, 0, arguments);
+    internal unsafe void Launch5ValidatedCurrentContext(
+        IntPtr first, IntPtr second, IntPtr third, IntPtr fourth, IntPtr fifth)
+    {
+        void** args = stackalloc void*[5];
+        args[0] = &first; args[1] = &second; args[2] = &third; args[3] = &fourth; args[4] = &fifth;
+        Launch(args, contextIsCurrent: true);
+    }
+
+    private unsafe void Launch(void** arguments, bool contextIsCurrent)
+    {
+        uint grid = checked((uint)(BatchCount / BlockThreads));
+        uint block = checked((uint)BlockThreads);
+        if (contextIsCurrent)
+            _module.LaunchCurrentContext(_function, grid, 1, 1, block, 1, 1, 0, arguments);
+        else
+            _module.Launch(_function, grid, 1, 1, block, 1, 1, 0, arguments);
+    }
 
     public void Dispose() => _module.Dispose();
 

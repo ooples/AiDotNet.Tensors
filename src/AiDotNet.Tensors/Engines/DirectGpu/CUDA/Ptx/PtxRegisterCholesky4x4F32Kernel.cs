@@ -74,6 +74,21 @@ internal sealed class PtxRegisterCholesky4x4F32Kernel : IDisposable
             checked((uint)BlockThreads), 1, 1, 0, arguments);
     }
 
+    internal unsafe void LaunchValidatedCurrentContext(
+        IntPtr inputPointer,
+        IntPtr outputPointer,
+        IntPtr infoPointer)
+    {
+        void** arguments = stackalloc void*[3];
+        arguments[0] = &inputPointer;
+        arguments[1] = &outputPointer;
+        arguments[2] = &infoPointer;
+        _module.LaunchCurrentContext(
+            _function,
+            checked((uint)(BatchCount / BlockThreads)), 1, 1,
+            checked((uint)BlockThreads), 1, 1, 0, arguments);
+    }
+
     public void Dispose() => _module.Dispose();
 
     internal static bool IsSupportedBatchCount(int batchCount) =>

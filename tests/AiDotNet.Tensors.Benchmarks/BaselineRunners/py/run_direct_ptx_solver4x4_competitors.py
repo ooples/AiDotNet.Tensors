@@ -271,13 +271,21 @@ def emit_unavailable(run, operation, batch, method, error):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--operation", action="append", choices=OPERATIONS,
+        help="Run only this operation; repeat to select multiple operations.")
+    parser.add_argument(
+        "--batch", action="append", type=int, choices=BATCHES,
+        help="Run only this batch size; repeat to select multiple batch sizes.")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA PyTorch is required")
     torch.backends.cuda.matmul.allow_tf32 = False
+    operations = tuple(args.operation) if args.operation else OPERATIONS
+    batches = tuple(args.batch) if args.batch else BATCHES
     for run in range(1, args.runs + 1):
-        for operation in OPERATIONS:
-            for batch in BATCHES:
+        for operation in operations:
+            for batch in batches:
                 eager_method = "PyTorch CUDA eager/cuSOLVER"
                 graph_method = "PyTorch CUDA graph/cuSOLVER"
                 try:

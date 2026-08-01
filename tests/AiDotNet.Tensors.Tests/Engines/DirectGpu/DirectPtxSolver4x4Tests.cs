@@ -70,7 +70,10 @@ public class DirectPtxSolver4x4Tests
                 Assert.False(PtxRegisterSolver4x4F32Kernel.IsPromotedShape(operation, batch));
         }
         Assert.False(PtxRegisterSolver4x4F32Kernel.IsSupportedBatchCount(1));
-        Assert.Equal(new[] { 64, 128, 256 }, DirectPtxSolver4x4Autotuner.Candidates.ToArray());
+        Assert.Equal(new[] { 32, 64, 128, 256 }, DirectPtxSolver4x4Autotuner.Candidates.ToArray());
+        Assert.Equal(30, DirectPtxSolver4x4Autotuner.TuneWarmups);
+        Assert.Equal(101, DirectPtxSolver4x4Autotuner.TuneSamples);
+        Assert.Equal(10, DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             DirectPtxSolver4x4Autotuner.ValidateBlockThreads(32));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
@@ -168,15 +171,25 @@ public class DirectPtxSolver4x4Tests
             using var kernel = new PtxRegisterCholesky4x4F32Kernel(runtime, batch);
             using var output = runtime.AllocateBytes((nuint)(matrix.Length * sizeof(float)));
             using var info = runtime.AllocateBytes((nuint)(batch * sizeof(int)));
-            kernel.Launch(
-                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
-                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(info, kernel.Blueprint.Tensors[2]));
+            DirectPtxTensorView inputView = DirectPtxTensorView.CreateOwned(
+                input, kernel.Blueprint.Tensors[0]);
+            DirectPtxTensorView outputView = DirectPtxTensorView.CreateOwned(
+                output, kernel.Blueprint.Tensors[1]);
+            DirectPtxTensorView infoView = DirectPtxTensorView.CreateOwned(
+                info, kernel.Blueprint.Tensors[2]);
+            kernel.Launch(inputView, outputView, infoView);
             runtime.Synchronize();
             float[] factor = new float[matrix.Length]; output.Download<float>(factor);
             int[] status = new int[batch]; info.Download<int>(status);
             Assert.All(status, value => Assert.Equal(0, value));
             Assert.True(MaxCholeskyResidual(matrix, factor, 8) <= 2e-4f);
+            for (int i = 0; i < 8; i++) kernel.Launch(inputView, outputView, infoView);
+            runtime.Synchronize();
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 101; i++) kernel.Launch(inputView, outputView, infoView);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            runtime.Synchronize();
+            Assert.Equal(0, allocated);
             AssertResource(kernel.Audit);
             return;
         }

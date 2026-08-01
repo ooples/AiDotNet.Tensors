@@ -81,7 +81,8 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-solvers-4x4")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
-            DirectPtxSolver4x4Experiment.Run(runs);
+            bool componentOnly = args.Contains("--component-only", StringComparer.Ordinal);
+            DirectPtxSolver4x4Experiment.Run(runs, componentOnly);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")

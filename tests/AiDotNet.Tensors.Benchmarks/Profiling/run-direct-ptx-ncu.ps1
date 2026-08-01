@@ -14,6 +14,17 @@ $ncuSource = if ($NcuPath) {
 } else {
     (Get-Command ncu -ErrorAction Stop).Source
 }
+# NVIDIA's Windows installation puts ncu.bat on PATH. Passing a kernel regex
+# containing alternation through that wrapper lets cmd.exe interpret `|` as a
+# pipeline before ncu sees the argument. Resolve the wrapper to the native CLI
+# so PowerShell's argument boundaries are preserved for every profiler target.
+if ([System.IO.Path]::GetExtension($ncuSource) -in @('.bat', '.cmd')) {
+    $nativeNcu = Join-Path (Split-Path -Parent $ncuSource) 'target\windows-desktop-win7-x64\ncu.exe'
+    if (-not (Test-Path -LiteralPath $nativeNcu -PathType Leaf)) {
+        throw "Nsight Compute resolved to wrapper '$ncuSource', but its native CLI was not found at '$nativeNcu'. Pass -NcuPath explicitly."
+    }
+    $ncuSource = (Resolve-Path -LiteralPath $nativeNcu).Path
+}
 $targetDll = Join-Path $PSScriptRoot '..\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks.dll'
 if (-not (Test-Path -LiteralPath $targetDll -PathType Leaf)) {
     throw "Benchmark target is missing. Build AiDotNet.Tensors.Benchmarks in Release/net10.0 first."

@@ -13,6 +13,7 @@ internal static class DirectPtxSolver4x4Experiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int LaunchesPerSample = 10;
+    private const double MaximumAllowedError = 2e-5;
     private static readonly int[] Batches = [1024, 4096, 16384, 65536];
     private static readonly string[] Operations =
         [
@@ -26,12 +27,12 @@ internal static class DirectPtxSolver4x4Experiment
         int Run, string Operation, int Batch, string Method,
         Distribution Device, Distribution EndToEnd, double Gflops, double GbPerSecond,
         long ManagedBytes, long TemporaryDeviceBytes, double MaximumError,
-        int Registers, int SharedBytes, int LocalBytes, int MaxThreadsPerBlock,
+        int BlockThreads, int Registers, int SharedBytes, int LocalBytes, int MaxThreadsPerBlock,
         int ActiveBlocksPerSm, int PtxVersion, int BinaryVersion,
         string DeviceFingerprint, string PtxSha256, string JitInfoLog,
         string DotNetRuntime, string OperatingSystem);
 
-    internal static void Run(int independentRuns = 3)
+    internal static void Run(int independentRuns = 3, bool componentOnly = false)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
         Console.WriteLine(
@@ -46,6 +47,12 @@ internal static class DirectPtxSolver4x4Experiment
                 RunCell(backend, run, operation, batch, results);
         }
         Print(results);
+        if (componentOnly)
+        {
+            Console.WriteLine(
+                "COMPONENT PASS: AiDotNet correctness, routing, allocation, timing, and resource evidence is complete; external competitors and Nsight are joined by the release orchestrator.");
+            return;
+        }
         Console.WriteLine(
             "HOLD: PyTorch eager/graph and Nsight JSON/CSV must be joined before the release gate can pass.");
         Environment.ExitCode = 2;
@@ -124,6 +131,10 @@ internal static class DirectPtxSolver4x4Experiment
         direct(); backend.Synchronize();
         double error = Error(backend, operation, batch, matrixHost, vectorHost,
             matrix1, matrix2, vector, pivots, info);
+        if (!double.IsFinite(error) || error > MaximumAllowedError)
+            throw new InvalidOperationException(
+                $"Direct PTX correctness gate failed for {operation}/B={batch}: " +
+                $"maximum error {error:G9} exceeds {MaximumAllowedError:G9}.");
         DirectPtxKernelAudit audit = Audit(backend, operation, batch);
         Distribution directDevice = MeasureDevice(backend, direct);
         Distribution directE2e = MeasureEndToEnd(backend, direct);
@@ -177,6 +188,7 @@ internal static class DirectPtxSolver4x4Experiment
         return new Result(run, operation, batch, method, device, e2e,
             flops / seconds / 1e9, bytes / seconds / 1e9,
             managedBytes, tempBytes, error,
+            audit?.BlockThreads ?? -1,
             audit?.Function.RegistersPerThread ?? -1,
             audit?.Function.StaticSharedBytes ?? -1,
             audit?.Function.LocalBytesPerThread ?? -1,
@@ -517,14 +529,14 @@ internal static class DirectPtxSolver4x4Experiment
             $"{"Run",3} {"Operation",11} {"Batch",7} {"Method",25} {"dev mean",9} {"dev med",9} " +
             $"{"dev P95",9} {"dev P99",9} {"E2E mean",9} {"E2E med",9} {"E2E P95",9} {"E2E P99",9} " +
             $"{"GFLOPS",9} {"GB/s",9} {"alloc B",8} {"temp B",8} " +
-            $"{"max err",10} {"regs",5} {"shared",7} {"local",5} {"occ",4}");
+            $"{"max err",10} {"block",5} {"regs",5} {"shared",7} {"local",5} {"occ",4}");
         foreach (Result row in results)
         {
             Console.WriteLine($"{row.Run,3} {row.Operation,11} {row.Batch,7} {row.Method,25} " +
                 $"{row.Device.Mean,9:F2} {row.Device.Median,9:F2} {row.Device.P95,9:F2} {row.Device.P99,9:F2} " +
                 $"{row.EndToEnd.Mean,9:F2} {row.EndToEnd.Median,9:F2} {row.EndToEnd.P95,9:F2} {row.EndToEnd.P99,9:F2} " +
                 $"{row.Gflops,9:F2} {row.GbPerSecond,9:F2} {row.ManagedBytes,8} {row.TemporaryDeviceBytes,8} " +
-                $"{row.MaximumError,10:G4} {Dash(row.Registers),5} {Dash(row.SharedBytes),7} " +
+                $"{row.MaximumError,10:G4} {Dash(row.BlockThreads),5} {Dash(row.Registers),5} {Dash(row.SharedBytes),7} " +
                 $"{Dash(row.LocalBytes),5} {Dash(row.ActiveBlocksPerSm),4}");
             Console.WriteLine("solver_evidence_json=" + JsonSerializer.Serialize(row));
         }

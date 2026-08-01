@@ -7,12 +7,16 @@ param(
     [switch]$SkipExternal,
     [switch]$Issue834Only,
     [switch]$Issue835Only,
+    [switch]$Issue853Only,
     [ValidateRange(0, 10)]
     [int]$ContaminationRetries = 4,
     [switch]$AllowDirty
 )
 
 $ErrorActionPreference = 'Stop'
+if (@(@($Issue834Only, $Issue835Only, $Issue853Only) | Where-Object { $_ }).Count -gt 1) {
+    throw 'Only one issue-specific evidence switch may be selected.'
+}
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $project = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\AiDotNet.Tensors.Benchmarks.csproj'
 $targetDll = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks.dll'
@@ -167,6 +171,186 @@ function Assert-QkvReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExte
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
 }
 
+function Read-SolverDotnetRows([string]$Path) {
+    $prefix = 'solver_evidence_json='
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::Ordinal)
+    } | ForEach-Object {
+        $row = $_.Substring($prefix.Length) | ConvertFrom-Json
+        [pscustomobject]@{
+            status = 'ok'
+            operation = [string]$row.Operation
+            batch = [int]$row.Batch
+            method = [string]$row.Method
+            device_median_us = [double]$row.Device.Median
+            device_p95_us = [double]$row.Device.P95
+            e2e_median_us = [double]$row.EndToEnd.Median
+            max_error = [double]$row.MaximumError
+            managed_bytes = [long]$row.ManagedBytes
+            temporary_device_bytes = [long]$row.TemporaryDeviceBytes
+            static_shared_bytes = [int]$row.SharedBytes
+            local_bytes_per_thread = [int]$row.LocalBytes
+            active_blocks_per_sm = [int]$row.ActiveBlocksPerSm
+            device_fingerprint = [string]$row.DeviceFingerprint
+        }
+    })
+}
+
+function Read-SolverPythonRows([string]$Path) {
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.TrimStart().StartsWith('{', [StringComparison]::Ordinal)
+    } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
+    $operations = @(
+        'cholesky', 'lu-factor', 'qr', 'eigh', 'eigh-lower', 'svd', 'lu-solve',
+        'ldl-factor', 'ldl-solve', 'solve', 'tri-lower', 'tri-upper',
+        'chol-backward', 'solve-backward')
+    $batches = @(1024, 4096, 16384, 65536)
+    $currentOperations = @('cholesky', 'lu-factor', 'qr', 'eigh')
+    $verdicts = [System.Collections.Generic.List[object]]::new()
+    $findings = [System.Collections.Generic.List[object]]::new()
+    for ($run = 1; $run -le $RunCount; $run++) {
+        $prefix = 'run-{0:D2}' -f $run
+        $dotnetPath = Join-Path $Root ($prefix + '-solvers-4x4.log')
+        $dotnetRows = @(Read-SolverDotnetRows $dotnetPath)
+        if ($dotnetRows.Count -ne 128) {
+            throw "Solver release gate expected 128 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
+        }
+        $pythonRows = @()
+        if ($IncludeExternal) {
+            $pythonPath = Join-Path $Root ($prefix + '-solvers-4x4-pytorch.log')
+            $pythonRows = @(Read-SolverPythonRows $pythonPath)
+            if ($pythonRows.Count -ne 112) {
+                throw "Solver release gate expected 112 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
+            }
+        }
+
+        $fingerprints = @($dotnetRows.device_fingerprint | Sort-Object -Unique)
+        if ($fingerprints.Count -ne 1 -or [string]::IsNullOrWhiteSpace($fingerprints[0])) {
+            throw "Solver release gate found inconsistent .NET device fingerprints in '$dotnetPath'."
+        }
+
+        foreach ($operation in $operations) {
+            foreach ($batch in $batches) {
+                $cell = @($dotnetRows | Where-Object {
+                    $_.operation -eq $operation -and $_.batch -eq $batch
+                })
+                $resident = @($cell | Where-Object { $_.method -eq 'Direct PTX resident' })
+                $graph = @($cell | Where-Object { $_.method -eq 'Direct PTX CUDA graph' })
+                if ($resident.Count -ne 1 -or $graph.Count -ne 1) {
+                    throw "Solver release gate has an incomplete direct method set for run $run '$operation'/B=$batch."
+                }
+                foreach ($candidate in @($resident[0], $graph[0])) {
+                    if ([double]$candidate.max_error -gt 2e-5 -or
+                        [long]$candidate.managed_bytes -ne 0 -or
+                        [long]$candidate.temporary_device_bytes -ne 0 -or
+                        [int]$candidate.static_shared_bytes -ne 0 -or
+                        [int]$candidate.local_bytes_per_thread -ne 0 -or
+                        [int]$candidate.active_blocks_per_sm -lt 2) {
+                        throw "Solver correctness/resource gate failed for run $run '$operation'/B=$batch '$($candidate.method)'."
+                    }
+                }
+
+                $comparisons = [System.Collections.Generic.List[object]]::new()
+                if ($currentOperations -contains $operation) {
+                    $current = @($cell | Where-Object { $_.method -eq 'AiDotNet CUDA established' })
+                    if ($current.Count -ne 1) {
+                        throw "Solver release gate is missing the established AiDotNet baseline for run $run '$operation'/B=$batch."
+                    }
+                    $comparisons.Add([pscustomobject]@{ Candidate = $resident[0]; Peer = $current[0] })
+                }
+                elseif (@($cell | Where-Object { $_.method -eq 'AiDotNet CUDA established' }).Count -ne 0) {
+                    throw "Solver release gate found an unexpected established baseline for run $run '$operation'/B=$batch."
+                }
+
+                if ($IncludeExternal) {
+                    $externalCell = @($pythonRows | Where-Object {
+                        $_.operation -eq $operation -and [int]$_.batch -eq $batch
+                    })
+                    if ($externalCell.Count -ne 2) {
+                        throw "Solver release gate has an incomplete PyTorch method set for run $run '$operation'/B=$batch."
+                    }
+                    $eager = @($externalCell | Where-Object {
+                        $_.method -eq 'PyTorch CUDA eager/cuSOLVER'
+                    })
+                    $externalGraph = @($externalCell | Where-Object {
+                        $_.method -eq 'PyTorch CUDA graph/cuSOLVER'
+                    })
+                    if ($eager.Count -ne 1 -or $externalGraph.Count -ne 1) {
+                        throw "Solver release gate found duplicate or unknown PyTorch methods for run $run '$operation'/B=$batch."
+                    }
+                    if ($eager[0].status -ne 'ok') {
+                        throw "Required PyTorch eager competitor is unavailable for run $run '$operation'/B=${batch}: $($eager[0].reason)"
+                    }
+                    $comparisons.Add([pscustomobject]@{ Candidate = $resident[0]; Peer = $eager[0] })
+                    if ($externalGraph[0].status -eq 'ok') {
+                        $comparisons.Add([pscustomobject]@{ Candidate = $graph[0]; Peer = $externalGraph[0] })
+                    }
+                }
+
+                foreach ($comparison in $comparisons) {
+                    $candidate = $comparison.Candidate
+                    $peer = $comparison.Peer
+                    if ([double]$peer.max_error -gt 2e-5) {
+                        throw "Solver peer '$($peer.method)' exceeded correctness tolerance for run $run '$operation'/B=$batch."
+                    }
+                    $deviceSpeedup = [double]$peer.device_median_us / [double]$candidate.device_median_us
+                    $endToEndSpeedup = [double]$peer.e2e_median_us / [double]$candidate.e2e_median_us
+                    $p95Ratio = [double]$candidate.device_p95_us / [double]$peer.device_p95_us
+                    $passed = $deviceSpeedup -ge 1.10 -and $endToEndSpeedup -ge 1.10 -and $p95Ratio -le 1.10
+                    $verdicts.Add([ordered]@{
+                        run = $run
+                        operation = $operation
+                        batch = $batch
+                        candidate = $candidate.method
+                        competitor = $peer.method
+                        device_median_speedup = $deviceSpeedup
+                        e2e_median_speedup = $endToEndSpeedup
+                        device_p95_ratio = $p95Ratio
+                        status = if ($passed) { 'pass' } else { 'fail' }
+                    })
+                    if (-not $passed) {
+                        $findings.Add([ordered]@{
+                            run = $run
+                            operation = $operation
+                            batch = $batch
+                            candidate = $candidate.method
+                            competitor = $peer.method
+                            device_median_speedup = $deviceSpeedup
+                            required_device_median_speedup = 1.10
+                            device_median_deficit = [Math]::Max(0.0, 1.10 - $deviceSpeedup)
+                            e2e_median_speedup = $endToEndSpeedup
+                            required_e2e_median_speedup = 1.10
+                            e2e_median_deficit = [Math]::Max(0.0, 1.10 - $endToEndSpeedup)
+                            device_p95_ratio = $p95Ratio
+                            maximum_device_p95_ratio = 1.10
+                            device_p95_excess = [Math]::Max(0.0, $p95Ratio - 1.10)
+                        })
+                    }
+                }
+            }
+        }
+    }
+    $gatePath = Join-Path $Root 'solver-release-gate.json'
+    [ordered]@{
+        status = if ($findings.Count -ne 0) { 'fail' } elseif ($IncludeExternal) { 'pass' } else { 'partial-pass' }
+        required_device_and_e2e_median_speedup = 1.10
+        maximum_device_p95_ratio = 1.10
+        maximum_error = 2e-5
+        required_managed_temporary_shared_local_bytes = 0
+        minimum_active_blocks_per_sm = 2
+        runs = $RunCount
+        external_competitors_included = $IncludeExternal
+        verdicts = @($verdicts)
+        findings = @($findings)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
+    if ($findings.Count -ne 0) {
+        throw "Solver championship gate failed $($findings.Count) comparison(s); inspect '$gatePath' for the complete finding set."
+    }
+}
+
 function Get-GpuSnapshot {
     $output = & nvidia-smi `
         '--query-gpu=name,uuid,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used' `
@@ -227,9 +411,6 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
 
 Push-Location $repoRoot
 try {
-    if ($Issue834Only -and $Issue835Only) {
-        throw '-Issue834Only and -Issue835Only are mutually exclusive.'
-    }
     $gitCommit = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Git commit for the evidence manifest.' }
     $dirtyLines = @(& git status --porcelain)
@@ -252,7 +433,11 @@ try {
     }
 
     $suites = [System.Collections.Generic.List[object]]::new()
-    if (-not $Issue834Only -and -not $Issue835Only) {
+    if ($Issue853Only) {
+        $suites.Add((New-EvidenceSuite 'solvers-4x4' 'dotnet' @(
+            $targetDll, '--direct-ptx-solvers-4x4', '1', '--component-only')))
+    }
+    if (-not $Issue834Only -and -not $Issue835Only -and -not $Issue853Only) {
         $suites.Add((New-EvidenceSuite 'online-attention' 'dotnet' @($targetDll, '--direct-ptx-online-attention')))
         $suites.Add((New-EvidenceSuite 'gpu-matrix' 'dotnet' @($targetDll, '--direct-ptx-gpu-matrix')))
         $suites.Add((New-EvidenceSuite 'residual-rmsnorm' 'dotnet' @($targetDll, '--direct-ptx-residual-rmsnorm')))
@@ -261,28 +446,32 @@ try {
         }
     }
 
-    if (-not $Issue835Only) {
+    if (-not $Issue835Only -and -not $Issue853Only) {
         $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
         $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
         $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
         $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
         $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
     }
-    if (-not $Issue834Only) {
+    if (-not $Issue834Only -and -not $Issue853Only) {
         $suites.Add((New-EvidenceSuite 'qkv-rope-cache' 'dotnet' @(
             $targetDll, '--direct-ptx-qkv-rope-cache', '1', '--no-external')))
     }
 
     if (-not $SkipExternal) {
         $python = (Get-Command python -ErrorAction Stop).Source
-        if (-not $Issue835Only) {
+        if ($Issue853Only) {
+            $suites.Add((New-EvidenceSuite 'solvers-4x4-pytorch' $python @(
+                (Join-Path $pythonRoot 'run_direct_ptx_solver4x4_competitors.py'), '--runs', '1')))
+        }
+        if (-not $Issue835Only -and -not $Issue853Only) {
             $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
         }
-        if (-not $Issue834Only) {
+        if (-not $Issue834Only -and -not $Issue853Only) {
             $suites.Add((New-EvidenceSuite 'qkv-rope-cache-pytorch' $python @(
                 (Join-Path $pythonRoot 'run_direct_ptx_qkv_rope_cache_competitors.py'), '--runs', '1', '--json-lines')))
         }
@@ -290,8 +479,9 @@ try {
 
     $previousDirectPtx = $env:AIDOTNET_DIRECT_PTX
     $previousAutotune = $env:AIDOTNET_DIRECT_PTX_AUTOTUNE
+    $autotuneValue = if ($Issue853Only) { '1' } else { '0' }
     $env:AIDOTNET_DIRECT_PTX = '1'
-    $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+    $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $autotuneValue
     try {
         for ($run = 1; $run -le $Runs; $run++) {
             foreach ($suite in $suites) {
@@ -320,7 +510,7 @@ try {
                     $log = Join-Path $evidenceRoot ("{0}.log" -f $label)
                     "# independent process $run/$Runs; suite=$($suite.Name); attempt=$attempt; started_utc=$([DateTime]::UtcNow.ToString('O'))" |
                         Set-Content -LiteralPath $log -Encoding utf8
-                    "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=0" |
+                    "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=$autotuneValue" |
                         Add-Content -LiteralPath $log -Encoding utf8
                     "# host_os=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription); powershell=$($PSVersionTable.PSVersion); dotnet=$(& dotnet --version)" |
                         Add-Content -LiteralPath $log -Encoding utf8
@@ -379,12 +569,17 @@ try {
         $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $previousAutotune
     }
 
-    if (-not $Issue834Only) {
+    if ($Issue853Only) {
+        Assert-SolverReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
+    }
+    elseif (-not $Issue834Only) {
         Assert-QkvReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
     }
 
     $files = Get-ChildItem -LiteralPath $evidenceRoot -File | Where-Object {
-        $_.Extension -eq '.log' -or $_.Name -eq 'qkv-release-gate.json'
+        $_.Extension -eq '.log' -or
+        $_.Name -eq 'qkv-release-gate.json' -or
+        $_.Name -eq 'solver-release-gate.json'
     } | Sort-Object Name | ForEach-Object {
         $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
         [ordered]@{ file = $_.Name; sha256 = $hash.Hash.ToLowerInvariant() }
@@ -401,10 +596,11 @@ try {
         contamination_retries_per_suite = $ContaminationRetries
         issue_834_only = [bool]$Issue834Only
         issue_835_only = [bool]$Issue835Only
+        issue_853_only = [bool]$Issue853Only
         external_gpu_baselines_included = -not [bool]$SkipExternal
         feature_gates = [ordered]@{
             AIDOTNET_DIRECT_PTX = '1'
-            AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+            AIDOTNET_DIRECT_PTX_AUTOTUNE = $autotuneValue
         }
         commands = [ordered]@{
             build = "dotnet build `"$project`" -c Release -f net10.0"
