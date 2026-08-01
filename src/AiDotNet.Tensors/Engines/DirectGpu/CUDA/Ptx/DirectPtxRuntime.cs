@@ -35,6 +35,7 @@ internal sealed class DirectPtxRuntime : IDisposable
 
     internal DirectPtxRuntime(int deviceOrdinal = 0)
     {
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
         Check(CuBlasNative.cuInit(0), "cuInit");
         Check(CuBlasNative.cuDeviceGet(out int device, deviceOrdinal), "cuDeviceGet");
 
@@ -51,7 +52,7 @@ internal sealed class DirectPtxRuntime : IDisposable
             (int)CudaDeviceAttribute.MaxThreadsPerMultiprocessor, device),
             "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
 
-        Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
+        Check(CuBlasNative.cuCtxCreate(out _context, contextScheduling, device), "cuCtxCreate");
         Check(CudaNativeBindings.cuStreamCreate(out _stream, 1), "cuStreamCreate(non-blocking)");
         _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation

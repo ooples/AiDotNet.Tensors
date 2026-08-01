@@ -314,6 +314,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public CudaBackend(int deviceIndex)
     {
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
+        // Resolve explicit configuration before native probing or the availability fallback. A
+        // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
+        // be hidden by converting the backend into an unavailable instance.
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
@@ -362,7 +366,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // tracked as follow-up work.
             MaxBufferAllocBytes = (long)totalMem;
 
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuCtxCreate(
+                    out _cudaContext, contextScheduling, device),
+                "cuCtxCreate");
             LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live

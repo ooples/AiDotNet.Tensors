@@ -12,10 +12,16 @@ internal static class DirectPtxSolver4x4Experiment
 {
     private const int Warmups = 30;
     private const int Samples = 101;
-    // WDDM desktop scheduling can preempt a short GPU interval by milliseconds. A 1,000-launch
-    // captured batch amortizes that fixed interruption without hiding it, while external event
-    // nodes exclude host submission gaps from the CUDA-event interval entirely.
-    private const int LaunchesPerSample = 1000;
+    // WDDM desktop scheduling can preempt a short GPU interval by milliseconds. Start with a
+    // substantial captured batch, then calibrate every method to the same minimum device-time
+    // window. That amortizes fixed preemption without reducing the 101 independent samples or
+    // hiding host submission inside the event interval. The cap bounds graph size on very fast
+    // kernels while preserving at least the original 1,000 launches.
+    private const int BaseDeviceLaunchesPerSample = 1000;
+    private const int DeviceCalibrationSamples = 5;
+    private const double MinimumDeviceSampleMilliseconds = 32.0;
+    private const int MaximumDeviceLaunchesPerSample = 32_000;
+    private const int CalibratedGraphWarmups = 5;
     private const double MaximumAllowedError = 2e-5;
     private static readonly int[] Batches = [1024, 4096, 16384, 65536];
     private static readonly string[] Operations =
@@ -26,9 +32,12 @@ internal static class DirectPtxSolver4x4Experiment
         ];
 
     private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
+    private readonly record struct DeviceMeasurement(
+        Distribution Distribution, int LaunchesPerSample);
     private readonly record struct Result(
         int Run, string Operation, int Batch, string Method,
-        Distribution Device, Distribution EndToEnd, double Gflops, double GbPerSecond,
+        Distribution Device, int DeviceLaunchesPerSample, Distribution EndToEnd,
+        double Gflops, double GbPerSecond,
         long ManagedBytes, long TemporaryDeviceBytes, double MaximumError,
         int BlockThreads, int Registers, int SharedBytes, int LocalBytes, int MaxThreadsPerBlock,
         int ActiveBlocksPerSm, int PtxVersion, int BinaryVersion,
@@ -56,8 +65,9 @@ internal static class DirectPtxSolver4x4Experiment
                     nameof(batchFilter), batchFilter, "Unsupported solver batch size.");
         Console.WriteLine(
             $"Direct PTX solver family: {independentRuns} clean run(s), {Warmups} warmups + " +
-            $"{Samples} samples, {LaunchesPerSample} launches/device sample; resident device " +
-            "timing uses captured launch batches while end-to-end timing remains uncaptured.");
+            $"{Samples} samples, {BaseDeviceLaunchesPerSample}+ calibrated launches/device sample " +
+            $"(target >= {MinimumDeviceSampleMilliseconds:F0} ms, cap {MaximumDeviceLaunchesPerSample}); " +
+            "resident device timing uses captured launch batches while end-to-end timing remains uncaptured.");
         var results = new List<Result>();
         for (int run = 1; run <= independentRuns; run++)
         {
@@ -180,17 +190,17 @@ internal static class DirectPtxSolver4x4Experiment
                     matrix1, matrix2, vector, pivots, info);
             }
 
-            Dictionary<string, Distribution> device = current is null
+            Dictionary<string, DeviceMeasurement> device = current is null
                 ? MeasureResidentDeviceInterleaved(backend,
                     ("direct", () => Enable(operation, true), direct))
                 : MeasureResidentDeviceInterleaved(backend,
                     ("direct", () => Enable(operation, true), direct),
                     ("current", () => Enable(operation, false), current));
-            Distribution directDevice = device["direct"];
+            DeviceMeasurement directDevice = device["direct"];
             // Graph capture changes submission, not the kernel body. Reuse the isolated kernel
             // distribution so the graph row does not relabel host graph submissions as device
             // work; graph submission remains fully represented by the graph E2E distribution.
-            Distribution graphDevice = directDevice;
+            DeviceMeasurement graphDevice = directDevice;
 
             Dictionary<string, Distribution> endToEnd = current is null
                 ? MeasureEndToEndInterleaved(backend,
@@ -224,13 +234,14 @@ internal static class DirectPtxSolver4x4Experiment
 
     private static Result Create(
         int run, string operation, int batch, string method,
-        Distribution device, Distribution e2e, long managedBytes, long tempBytes,
+        DeviceMeasurement device, Distribution e2e, long managedBytes, long tempBytes,
         double error, DirectPtxKernelAudit? audit, string deviceFingerprint)
     {
         double flops = EstimatedFlops(operation, batch);
-        double seconds = device.Median * 1e-6;
+        double seconds = device.Distribution.Median * 1e-6;
         double bytes = BytesMoved(operation, batch);
-        return new Result(run, operation, batch, method, device, e2e,
+        return new Result(run, operation, batch, method,
+            device.Distribution, device.LaunchesPerSample, e2e,
             flops / seconds / 1e9, bytes / seconds / 1e9,
             managedBytes, tempBytes, error,
             audit?.BlockThreads ?? -1,
@@ -252,7 +263,7 @@ internal static class DirectPtxSolver4x4Experiment
     /// between disjoint windows from deciding the P95 comparison. Uncaptured submission is
     /// measured separately by <see cref="MeasureEndToEndInterleaved"/>.
     /// </summary>
-    private static Dictionary<string, Distribution> MeasureResidentDeviceInterleaved(
+    private static Dictionary<string, DeviceMeasurement> MeasureResidentDeviceInterleaved(
         CudaBackend backend,
         params (string Name, Action Prepare, Action Execute)[] methods)
     {
@@ -272,30 +283,67 @@ internal static class DirectPtxSolver4x4Experiment
         var graphs = new IntPtr[methods.Length];
         var starts = new IGpuEvent[methods.Length];
         var stops = new IGpuEvent[methods.Length];
+        var launchesPerSample = new int[methods.Length];
+        var calibrationValues = new double[methods.Length][];
         var values = new double[methods.Length][];
+        IntPtr CaptureMeasurementGraph(int methodIndex, int launches)
+        {
+            var method = methods[methodIndex];
+            method.Prepare();
+            IntPtr graph = backend.CaptureGraph(() =>
+            {
+                ((CudaEvent)starts[methodIndex]).RecordExternalDuringCapture(backend.DefaultStream);
+                for (int launch = 0; launch < launches; launch++) method.Execute();
+                ((CudaEvent)stops[methodIndex]).RecordExternalDuringCapture(backend.DefaultStream);
+            });
+            if (graph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    $"Resident device-timing graph capture failed for '{method.Name}'.");
+            return graph;
+        }
+
         try
         {
             for (int i = 0; i < methods.Length; i++)
             {
-                var method = methods[i];
                 starts[i] = backend.CreateEvent(true);
                 stops[i] = backend.CreateEvent(true);
+                launchesPerSample[i] = BaseDeviceLaunchesPerSample;
+                calibrationValues[i] = new double[DeviceCalibrationSamples];
                 values[i] = new double[Samples];
-                method.Prepare();
-                graphs[i] = backend.CaptureGraph(() =>
-                {
-                    ((CudaEvent)starts[i]).RecordExternalDuringCapture(backend.DefaultStream);
-                    for (int launch = 0; launch < LaunchesPerSample; launch++) method.Execute();
-                    ((CudaEvent)stops[i]).RecordExternalDuringCapture(backend.DefaultStream);
-                });
-                if (graphs[i] == IntPtr.Zero)
-                    throw new InvalidOperationException(
-                        $"Resident device-timing graph capture failed for '{method.Name}'.");
+                graphs[i] = CaptureMeasurementGraph(i, BaseDeviceLaunchesPerSample);
             }
             for (int warmup = 0; warmup < Warmups; warmup++)
                 for (int offset = 0; offset < methods.Length; offset++)
                     backend.EnqueueCapturedGraph(graphs[(warmup + offset) % methods.Length]);
             backend.Synchronize();
+
+            for (int sample = 0; sample < DeviceCalibrationSamples; sample++)
+            {
+                for (int offset = 0; offset < methods.Length; offset++)
+                    backend.EnqueueCapturedGraph(graphs[(sample + offset) % methods.Length]);
+                backend.Synchronize();
+                for (int method = 0; method < methods.Length; method++)
+                    calibrationValues[method][sample] = backend.GetEventElapsedTime(
+                        starts[method], stops[method]);
+            }
+
+            for (int method = 0; method < methods.Length; method++)
+            {
+                double baseBatchMilliseconds = Summarize(calibrationValues[method]).Median;
+                int calibratedLaunches = CalibrateDeviceLaunches(baseBatchMilliseconds);
+                launchesPerSample[method] = calibratedLaunches;
+                if (calibratedLaunches == BaseDeviceLaunchesPerSample) continue;
+
+                backend.DestroyCapturedGraph(graphs[method]);
+                graphs[method] = IntPtr.Zero;
+                graphs[method] = CaptureMeasurementGraph(method, calibratedLaunches);
+            }
+            for (int warmup = 0; warmup < CalibratedGraphWarmups; warmup++)
+                for (int offset = 0; offset < methods.Length; offset++)
+                    backend.EnqueueCapturedGraph(graphs[(warmup + offset) % methods.Length]);
+            backend.Synchronize();
+
             for (int sample = 0; sample < Samples; sample++)
             {
                 for (int offset = 0; offset < methods.Length; offset++)
@@ -308,11 +356,12 @@ internal static class DirectPtxSolver4x4Experiment
                 backend.Synchronize();
                 for (int method = 0; method < methods.Length; method++)
                     values[method][sample] = backend.GetEventElapsedTime(
-                        starts[method], stops[method]) * 1000.0 / LaunchesPerSample;
+                        starts[method], stops[method]) * 1000.0 / launchesPerSample[method];
             }
-            var result = new Dictionary<string, Distribution>(methods.Length, StringComparer.Ordinal);
+            var result = new Dictionary<string, DeviceMeasurement>(methods.Length, StringComparer.Ordinal);
             for (int method = 0; method < methods.Length; method++)
-                result.Add(methods[method].Name, Summarize(values[method]));
+                result.Add(methods[method].Name,
+                    new DeviceMeasurement(Summarize(values[method]), launchesPerSample[method]));
             return result;
         }
         finally
@@ -321,6 +370,19 @@ internal static class DirectPtxSolver4x4Experiment
             foreach (IGpuEvent? start in starts) start?.Dispose();
             foreach (IGpuEvent? stop in stops) stop?.Dispose();
         }
+    }
+
+    private static int CalibrateDeviceLaunches(double baseBatchMilliseconds)
+    {
+        if (!double.IsFinite(baseBatchMilliseconds) || baseBatchMilliseconds <= 0.0)
+            throw new InvalidOperationException(
+                $"Device timing calibration produced invalid elapsed time {baseBatchMilliseconds:G9} ms.");
+        double multiplier = Math.Ceiling(MinimumDeviceSampleMilliseconds / baseBatchMilliseconds);
+        if (multiplier <= 1.0) return BaseDeviceLaunchesPerSample;
+        double desired = BaseDeviceLaunchesPerSample * multiplier;
+        return desired >= MaximumDeviceLaunchesPerSample
+            ? MaximumDeviceLaunchesPerSample
+            : checked((int)desired);
     }
 
     /// <summary>
@@ -667,16 +729,22 @@ internal static class DirectPtxSolver4x4Experiment
 
     private static void Print(IReadOnlyList<Result> results)
     {
+        string contextScheduling = CudaContextScheduling.Describe(
+            CudaContextScheduling.ResolveFromEnvironment());
         foreach (string fingerprint in results.Select(row => row.DeviceFingerprint).Distinct())
-            Console.WriteLine($"solver_environment={fingerprint}; dotnet={Environment.Version}; os={Environment.OSVersion}");
+            Console.WriteLine(
+                $"solver_environment={fingerprint}; cuda_context_scheduling={contextScheduling}; " +
+                $"dotnet={Environment.Version}; os={Environment.OSVersion}");
         Console.WriteLine(
-            $"{"Run",3} {"Operation",11} {"Batch",7} {"Method",25} {"dev mean",9} {"dev med",9} " +
+            $"{"Run",3} {"Operation",11} {"Batch",7} {"Method",25} {"dev n",7} " +
+            $"{"dev mean",9} {"dev med",9} " +
             $"{"dev P95",9} {"dev P99",9} {"E2E mean",9} {"E2E med",9} {"E2E P95",9} {"E2E P99",9} " +
             $"{"GFLOPS",9} {"GB/s",9} {"alloc B",8} {"temp B",8} " +
             $"{"max err",10} {"block",5} {"regs",5} {"shared",7} {"local",5} {"occ",4}");
         foreach (Result row in results)
         {
             Console.WriteLine($"{row.Run,3} {row.Operation,11} {row.Batch,7} {row.Method,25} " +
+                $"{row.DeviceLaunchesPerSample,7} " +
                 $"{row.Device.Mean,9:F2} {row.Device.Median,9:F2} {row.Device.P95,9:F2} {row.Device.P99,9:F2} " +
                 $"{row.EndToEnd.Mean,9:F2} {row.EndToEnd.Median,9:F2} {row.EndToEnd.P95,9:F2} {row.EndToEnd.P99,9:F2} " +
                 $"{row.Gflops,9:F2} {row.GbPerSecond,9:F2} {row.ManagedBytes,8} {row.TemporaryDeviceBytes,8} " +

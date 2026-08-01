@@ -77,15 +77,48 @@ public class DirectPtxSolver4x4Tests
                 Assert.False(PtxRegisterSolver4x4F32Kernel.IsPromotedShape(operation, batch));
         }
         Assert.False(PtxRegisterSolver4x4F32Kernel.IsSupportedBatchCount(1));
-        Assert.Equal(new[] { 32, 64, 128, 256 }, DirectPtxSolver4x4Autotuner.Candidates.ToArray());
+        Assert.Equal(new[] { 16, 32, 64, 128, 256 }, DirectPtxSolver4x4Autotuner.Candidates.ToArray());
         Assert.Equal(30, DirectPtxSolver4x4Autotuner.TuneWarmups);
         Assert.Equal(101, DirectPtxSolver4x4Autotuner.TuneSamples);
         Assert.Equal(10, DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+        Assert.Equal(1000, DirectPtxSolver4x4Autotuner.LaunchesPerSample(1024));
+        Assert.Equal(10, DirectPtxSolver4x4Autotuner.LaunchesPerSample(4096));
         Assert.Equal(.01f, DirectPtxSolver4x4Autotuner.MinimumRelativeImprovement);
+        DirectPtxSolver4x4Autotuner.ValidateBlockThreads(16);
+        Assert.Contains(
+            "mad.lo.u32 %r2, %r1, 16, %r0;",
+            PtxRegisterCholesky4x4F32Kernel.EmitPtx(8, 6, 1024, 16),
+            StringComparison.Ordinal);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             DirectPtxSolver4x4Autotuner.ValidateBlockThreads(8));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxRegisterSolver4x4F32Kernel.EmitPtx(8, 6, DirectPtxSolver4x4Operation.LuFactor, 1));
+    }
+
+    [Theory]
+    [InlineData(null, 1, "spin")]
+    [InlineData("", 1, "spin")]
+    [InlineData(" SPIN ", 1, "spin")]
+    [InlineData("auto", 0, "auto")]
+    [InlineData("yield", 2, "yield")]
+    [InlineData("blocking", 4, "blocking")]
+    public void CudaContextScheduling_IsExplicitAndDefaultsToLowLatency(
+        string? value, int expectedFlags, string expectedDescription)
+    {
+        uint flags = CudaContextScheduling.Resolve(value);
+
+        Assert.Equal((uint)expectedFlags, flags);
+        Assert.Equal(expectedDescription, CudaContextScheduling.Describe(flags));
+    }
+
+    [Fact]
+    public void CudaContextScheduling_RejectsUnknownPolicy()
+    {
+        InvalidOperationException error = Assert.Throws<InvalidOperationException>(
+            () => CudaContextScheduling.Resolve("park-sometimes"));
+
+        Assert.Contains(CudaContextScheduling.EnvironmentVariable, error.Message, StringComparison.Ordinal);
+        Assert.Equal("unknown(99)", CudaContextScheduling.Describe(99));
     }
 
     [Fact]

@@ -184,6 +184,7 @@ function Read-SolverDotnetRows([string]$Path) {
             method = [string]$row.Method
             device_median_us = [double]$row.Device.Median
             device_p95_us = [double]$row.Device.P95
+            device_launches_per_sample = [int]$row.DeviceLaunchesPerSample
             e2e_median_us = [double]$row.EndToEnd.Median
             max_error = [double]$row.MaximumError
             managed_bytes = [long]$row.ManagedBytes
@@ -216,6 +217,9 @@ function Assert-SolverDotnetAcceptedAttempt([string]$Path, [int]$Run) {
     $fingerprints = @($rows.device_fingerprint | Sort-Object -Unique)
     if ($fingerprints.Count -ne 1 -or [string]::IsNullOrWhiteSpace($fingerprints[0])) {
         throw "Solver attempt found inconsistent .NET device fingerprints in '$Path'."
+    }
+    if (@($rows | Where-Object { [int]$_.device_launches_per_sample -lt 1000 }).Count -ne 0) {
+        throw "Solver attempt found a device distribution with fewer than 1,000 launches per sample in '$Path'."
     }
 
     $findings = [System.Collections.Generic.List[string]]::new()
@@ -323,6 +327,9 @@ function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeE
         $fingerprints = @($dotnetRows.device_fingerprint | Sort-Object -Unique)
         if ($fingerprints.Count -ne 1 -or [string]::IsNullOrWhiteSpace($fingerprints[0])) {
             throw "Solver release gate found inconsistent .NET device fingerprints in '$dotnetPath'."
+        }
+        if (@($dotnetRows | Where-Object { [int]$_.device_launches_per_sample -lt 1000 }).Count -ne 0) {
+            throw "Solver release gate found a device distribution with fewer than 1,000 launches per sample in '$dotnetPath'."
         }
 
         foreach ($operation in $operations) {

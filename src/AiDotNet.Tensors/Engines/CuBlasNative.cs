@@ -2,6 +2,7 @@
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -821,6 +822,7 @@ public sealed class CudaBlasContext : IDisposable
     public CudaBlasContext(int deviceId = 0)
     {
         _deviceId = deviceId;
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
 
         // Initialize CUDA
         CuBlasNative.CheckCudaResult(CuBlasNative.cuInit(0), "cuInit");
@@ -830,7 +832,9 @@ public sealed class CudaBlasContext : IDisposable
         CuBlasNative.CheckCudaResult(CuBlasNative.cuDeviceGet(out device, deviceId), "cuDeviceGet");
 
         // Create context
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+        CuBlasNative.CheckCudaResult(
+            CuBlasNative.cuCtxCreate(out _cudaContext, contextScheduling, device),
+            "cuCtxCreate");
 
         // Create cuBLAS handle
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");

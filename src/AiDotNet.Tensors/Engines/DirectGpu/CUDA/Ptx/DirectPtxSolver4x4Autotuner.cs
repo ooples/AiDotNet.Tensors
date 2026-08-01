@@ -9,14 +9,19 @@ internal static class DirectPtxSolver4x4Autotuner
     internal const int TuneWarmups = 30;
     internal const int TuneSamples = 101;
     internal const int TuneLaunchesPerSample = 10;
+    // At B=1024, competing geometries differ by fractions of a microsecond and a 10-launch
+    // graph is shorter than one WDDM scheduling quantum. A 1,000-launch captured window makes
+    // that one shape reproducible without multiplying the cost of the larger solver buckets.
+    internal const int SmallBatchTuneLaunchesPerSample = 1000;
     // Prefer the first (smaller) geometry when candidates are effectively tied. This prevents
     // sub-percent device jitter from making the same hardware choose a different launch plan on
     // every cold start while still admitting any reproducible improvement above the noise band.
     internal const float MinimumRelativeImprovement = 0.01f;
-    // B=1024 needs the one-warp geometry to expose at least one CTA per SM on
-    // common 20-32 SM devices. Starting at 64 threads caps that shape at 16
-    // CTAs and can leave half the GPU idle regardless of kernel quality.
-    internal static ReadOnlySpan<int> Candidates => [32, 64, 128, 256];
+    // Tiny batches are launch-wave limited. A 16-thread CTA still consumes one hardware warp,
+    // but B=1024 exposes 64 independent CTAs instead of the 32 available at one full warp per
+    // CTA. That can occupy every SM on 64-SM-class devices while preserving one-thread-per-matrix
+    // semantics; the measured tuner rejects it on devices where the half-warp waste costs more.
+    internal static ReadOnlySpan<int> Candidates => [16, 32, 64, 128, 256];
 
     internal static int Select(Func<int, float[]> measure)
     {
@@ -38,10 +43,13 @@ internal static class DirectPtxSolver4x4Autotuner
         return best;
     }
 
+    internal static int LaunchesPerSample(int batchCount) =>
+        batchCount == 1024 ? SmallBatchTuneLaunchesPerSample : TuneLaunchesPerSample;
+
     internal static void ValidateBlockThreads(int blockThreads)
     {
-        if (blockThreads is not (32 or 64 or 128 or 256))
+        if (blockThreads is not (16 or 32 or 64 or 128 or 256))
             throw new ArgumentOutOfRangeException(nameof(blockThreads),
-                "Solver autotune candidates are exactly 32, 64, 128, and 256 threads.");
+                "Solver autotune candidates are exactly 16, 32, 64, 128, and 256 threads.");
     }
 }

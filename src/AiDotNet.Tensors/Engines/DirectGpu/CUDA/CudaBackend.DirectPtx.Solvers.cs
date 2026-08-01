@@ -879,7 +879,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 () => { lock (GpuDispatchLock) kernel.Launch3(firstView, secondView, thirdView); },
                 DirectPtxSolver4x4Autotuner.TuneWarmups,
                 DirectPtxSolver4x4Autotuner.TuneSamples,
-                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+                DirectPtxSolver4x4Autotuner.LaunchesPerSample(batchCount));
         });
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -898,7 +898,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 () => { lock (GpuDispatchLock) kernel.Launch4(firstView, secondView, thirdView, fourthView); },
                 DirectPtxSolver4x4Autotuner.TuneWarmups,
                 DirectPtxSolver4x4Autotuner.TuneSamples,
-                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+                DirectPtxSolver4x4Autotuner.LaunchesPerSample(batchCount));
         });
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -922,7 +922,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 },
                 DirectPtxSolver4x4Autotuner.TuneWarmups,
                 DirectPtxSolver4x4Autotuner.TuneSamples,
-                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+                DirectPtxSolver4x4Autotuner.LaunchesPerSample(batchCount));
         });
 
     private static bool ValidPointer(IGpuBuffer buffer, int alignment) =>
@@ -1055,7 +1055,44 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         internal PtxRegisterSolver4x4F32Kernel Kernel { get; }
         internal bool HasGraph => _graphExec != IntPtr.Zero;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void Launch3(CudaBackend backend)
+        {
+            IntPtr graphExec = _graphExec;
+            if (graphExec != IntPtr.Zero)
+            {
+                backend.EnqueueCapturedGraphCurrentContext(graphExec);
+                return;
+            }
+            Launch3Slow(backend);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void Launch4(CudaBackend backend)
+        {
+            IntPtr graphExec = _graphExec;
+            if (graphExec != IntPtr.Zero)
+            {
+                backend.EnqueueCapturedGraphCurrentContext(graphExec);
+                return;
+            }
+            Launch4Slow(backend);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void Launch5(CudaBackend backend)
+        {
+            IntPtr graphExec = _graphExec;
+            if (graphExec != IntPtr.Zero)
+            {
+                backend.EnqueueCapturedGraphCurrentContext(graphExec);
+                return;
+            }
+            Launch5Slow(backend);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void Launch3Slow(CudaBackend backend)
         {
             if (!_graphAttempted)
                 EnsureGraph(backend, () => Kernel.Launch3ValidatedCurrentContext(
@@ -1064,7 +1101,8 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             else Kernel.Launch3ValidatedCurrentContext(_firstHandle, _secondHandle, _thirdHandle);
         }
 
-        internal void Launch4(CudaBackend backend)
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void Launch4Slow(CudaBackend backend)
         {
             if (!_graphAttempted)
                 EnsureGraph(backend, () => Kernel.Launch4ValidatedCurrentContext(
@@ -1074,7 +1112,8 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 _firstHandle, _secondHandle, _thirdHandle, _fourthHandle);
         }
 
-        internal void Launch5(CudaBackend backend)
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void Launch5Slow(CudaBackend backend)
         {
             if (!_graphAttempted)
                 EnsureGraph(backend, () => Kernel.Launch5ValidatedCurrentContext(

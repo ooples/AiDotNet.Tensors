@@ -402,7 +402,7 @@ public sealed partial class CudaBackend
                 () => { lock (GpuDispatchLock) kernel.Launch(inputView, outputView, infoView); },
                 DirectPtxSolver4x4Autotuner.TuneWarmups,
                 DirectPtxSolver4x4Autotuner.TuneSamples,
-                DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+                DirectPtxSolver4x4Autotuner.LaunchesPerSample(batchCount));
         });
 
     internal bool TryGetDirectPtxCholesky4x4Audit(
@@ -2170,7 +2170,22 @@ public sealed partial class CudaBackend
         internal PtxRegisterCholesky4x4F32Kernel Kernel { get; }
         internal bool HasGraph => _graphExec != IntPtr.Zero;
 
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         internal void Launch(CudaBackend backend)
+        {
+            IntPtr graphExec = _graphExec;
+            if (graphExec != IntPtr.Zero)
+            {
+                backend.EnqueueCapturedGraphCurrentContext(graphExec);
+                return;
+            }
+            LaunchSlow(backend);
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private void LaunchSlow(CudaBackend backend)
         {
             if (!_graphAttempted)
             {
