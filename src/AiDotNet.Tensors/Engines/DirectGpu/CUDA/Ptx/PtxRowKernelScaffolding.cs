@@ -85,6 +85,10 @@ internal static class PtxRowShape
 internal static class PtxElementwiseShape
 {
     internal const int BlockThreads = PtxRowShape.BlockThreads;
+    // Each thread owns two float4 packs striped across the tensor halves. Consecutive
+    // lanes therefore access consecutive 16-byte vectors in both transactions; making
+    // the packs adjacent per thread instead put lanes 32 bytes apart and doubled L1
+    // sector demand.
     internal const int VectorWidth = 8;
     internal const int MaxCount = 2048 * 4096;
 
@@ -100,6 +104,15 @@ internal static class PtxElementwiseShape
             throw new ArgumentOutOfRangeException(nameof(blockThreads));
         int elementsPerBlock = checked(blockThreads * VectorWidth);
         return checked((count + elementsPerBlock - 1) / elementsPerBlock);
+    }
+
+    internal static bool RequiresBoundsGuard(int count, int blockThreads = BlockThreads)
+    {
+        Validate(count, "Vectorized elementwise launch");
+        if (blockThreads <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockThreads));
+        int vectorCount = count / VectorWidth;
+        return vectorCount % blockThreads != 0;
     }
 
     internal static void Validate(int count, string operation)

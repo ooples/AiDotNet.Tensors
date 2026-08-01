@@ -148,6 +148,8 @@ public class DirectPtxSoftmaxTests
         Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(1280));
         Assert.Equal(2, PtxElementwiseShape.VectorGridBlocks(2304));
         Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(2304, 512));
+        Assert.False(PtxElementwiseShape.RequiresBoundsGuard(2048));
+        Assert.True(PtxElementwiseShape.RequiresBoundsGuard(1280));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxElementwiseShape.VectorGridBlocks(256, 0));
         Assert.True(PtxElementwiseShape.IsSupported(PtxElementwiseShape.BlockThreads));
@@ -276,6 +278,9 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("setp.neu.f32 %p0, %f4, 0f00000000", ptx);      // mask.x != 0
         Assert.Contains("selp.f32 %f12, %f8, %f3, %p3", ptx);           // fill : input.w
         Assert.Equal(2, Count(ptx, "st.global.cg.v4.f32"));
+        Assert.DoesNotContain("bra.uni MASKED_FILL_DONE", ptx, StringComparison.Ordinal);
+        Assert.Contains("bra.uni MASKED_FILL_DONE",
+            PtxMaskedFillKernel.EmitPtx(8, 6, 1280), StringComparison.Ordinal);
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -293,6 +298,9 @@ public class DirectPtxSoftmaxTests
         Assert.Contains("setp.neu.f32 %p0, %f4, 0f00000000", ptx);
         Assert.Contains("selp.f32 %f12, 0f00000000, %f3, %p3", ptx);    // 0 : gradOutput.w
         Assert.Equal(2, Count(ptx, "st.global.wt.v4.f32"));
+        Assert.DoesNotContain("bra.uni MASKED_FILL_BACKWARD_DONE", ptx, StringComparison.Ordinal);
+        Assert.Contains("bra.uni MASKED_FILL_BACKWARD_DONE",
+            PtxMaskedFillBackwardKernel.EmitPtx(8, 6, 1280), StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxMaskedFillBackwardKernel.IsSupportedCount(16384));

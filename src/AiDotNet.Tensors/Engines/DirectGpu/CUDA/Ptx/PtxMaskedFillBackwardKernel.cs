@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// Elementwise masked-fill backward <c>gradInput[i] = mask[i] != 0 ? 0 : gradOutput[i]</c>
 /// (issue #840): the gradient does not flow through positions overwritten by the fill
 /// constant. Purely elementwise over a flat element count, matching the backend's flat-
-/// <c>size</c> ABI — one thread owns two aligned float4 transactions, with no shared memory,
+/// <c>size</c> ABI — one thread owns two aligned float4 transactions striped across the tensor,
 /// reduction, or global intermediate. The result is exact.
 ///
 /// 256 threads/block, eight elements/thread; supported counts are positive multiples of 256.
@@ -91,17 +91,20 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");    // eight-element pack
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {count / PtxElementwiseShape.VectorWidth};");
-        ptx.AppendLine("    @%p0 bra.uni MASKED_FILL_BACKWARD_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 32;");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");    // two striped float4 packs
+        if (PtxElementwiseShape.RequiresBoundsGuard(count, BlockThreads))
+        {
+            ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {count / PtxElementwiseShape.VectorWidth};");
+            ptx.AppendLine("    @%p0 bra.uni MASKED_FILL_BACKWARD_DONE;");
+        }
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 16;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
         EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6");
-        ptx.AppendLine("    add.u64 %rd4, %rd4, 16;");
-        ptx.AppendLine("    add.u64 %rd5, %rd5, 16;");
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 16;");
+        ptx.AppendLine($"    add.u64 %rd4, %rd4, {count * 2};");
+        ptx.AppendLine($"    add.u64 %rd5, %rd5, {count * 2};");
+        ptx.AppendLine($"    add.u64 %rd6, %rd6, {count * 2};");
         EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6");
         ptx.AppendLine("MASKED_FILL_BACKWARD_DONE:");
         ptx.AppendLine("    ret;");
@@ -130,7 +133,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         var extent = new DirectPtxExtent(count);
         return new DirectPtxKernelBlueprint(
             Operation: "masked-fill-backward",
-            Version: 2,
+            Version: 3,
             Architecture: architecture,
             Variant: $"fp32-count{count}",
             Tensors:
@@ -151,7 +154,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
             {
                 ["formula"] = "gradInput[i] = mask[i] != 0 ? 0 : gradOutput[i]",
                 ["role"] = "masked-fill-gradient-gating",
-                ["vector-width"] = "8 (two aligned float4 transactions)",
+                ["vector-width"] = "8 (two striped, aligned float4 transactions)",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"
