@@ -113,10 +113,13 @@ public static class TensorPool<T>
         // results (which call TensorPermute on rank-3+ inputs, producing
         // strided views). GetLiveBackingArrayOrNull returns null for
         // non-owned layouts (non-contiguous, _storageOffset != 0, or
-        // storage length != logical length), giving exactly the
-        // discriminator we need. CPU-only — GPU-resident tensors also
-        // fail this check so we don't pool device buffers.
-        if (tensor.GetLiveBackingArrayOrNull() is null) return;
+        // storage length != logical length). A contiguous full-span view
+        // is the exception: it has offset zero and matching lengths while
+        // still sharing its owner's storage, so reject every explicit view
+        // before applying the backing-layout discriminator. CPU-only —
+        // GPU-resident tensors also fail this check so we don't pool device
+        // buffers.
+        if (tensor.IsView || tensor.GetLiveBackingArrayOrNull() is null) return;
 
         if (_totalPooled >= MaxTotalPooled) return;
 
