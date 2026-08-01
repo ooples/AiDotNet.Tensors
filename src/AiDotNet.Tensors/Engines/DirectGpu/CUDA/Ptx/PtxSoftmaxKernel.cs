@@ -12,8 +12,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// repeated row reads stay cacheable in L1. Uses <c>ex2.approx.f32</c>, so a
 /// promoted specialization carries ~1e-3 approximation error (disclosed on the release gate).
 ///
-/// One block per row (grid = M), 256 threads. Shared: 256 reduction floats. Supported N are
-/// multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads. Shared: 8 warp-leader reduction floats
+/// (<c>PtxRowReduce.SharedBytes</c>). Supported N are multiples of 256 so each thread strides
+/// the row exactly.
 /// </summary>
 internal sealed class PtxSoftmaxKernel : IDisposable
 {
