@@ -26,7 +26,7 @@ public static class CodegenAutotuneCache
         CodegenMeasurementProtocol.AutotuneGainNoiseFloor;
     private static readonly object Sync = new();
     private static Dictionary<CacheKey, string>? _winners;
-    private static string _cachePath = DefaultCachePath();
+    private static string _cachePath = ResolveDefaultCachePath();
 
     private readonly record struct CacheKey(
         string Kernel,
@@ -129,7 +129,7 @@ public static class CodegenAutotuneCache
         return map;
     }
 
-    private static string DefaultCachePath()
+    internal static string ResolveDefaultCachePath()
     {
         string? configured =
             Environment.GetEnvironmentVariable("AIDOTNET_CODEGEN_AUTOTUNE_CACHE");
