@@ -8,12 +8,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// Row-wise softmax backward <c>dX[m,n] = S[m,n] * (dY[m,n] - sum_n(dY[m,n] * S[m,n]))</c>
 /// over the last axis (issue #840), where <c>S</c> is the forward softmax output and
 /// <c>dY</c> the upstream gradient. One block owns one row: a single shared-resident pass
-/// caches <c>S</c> and reduces the dot <c>sum(dY * S)</c> with an in-block tree reduction,
-/// then an elementwise pass emits the gradient. No global intermediate; the exact Jacobian
+/// caches <c>S</c> and reduces the dot <c>sum(dY * S)</c> with warp shuffles and a
+/// warp-leader shared exchange, then an elementwise pass emits the gradient. No global
+/// intermediate; the exact Jacobian
 /// identity means the result is not approximation-limited.
 ///
-/// One block per row (grid = M), 256 threads. Shared: N floats (S cache) + 256 floats
-/// (reduction). Supported N are multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads. Shared: N floats (S cache) + 8 floats
+/// (warp-leader exchange). Supported N are multiples of 256 so each thread strides the row exactly.
 /// </summary>
 internal sealed class PtxSoftmaxBackwardKernel : IDisposable
 {
@@ -177,7 +178,7 @@ internal sealed class PtxSoftmaxBackwardKernel : IDisposable
                 ["formula"] = "dX[m,n] = S[m,n] * (dY[m,n] - sum_n(dY[m,n] * S[m,n]))",
                 ["axis"] = "last",
                 ["jacobian"] = "exact-softmax-jacobian-vector-product",
-                ["reduction"] = "in-block-tree-reduction-shared",
+                ["reduction"] = PtxRowReduce.Strategy,
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"

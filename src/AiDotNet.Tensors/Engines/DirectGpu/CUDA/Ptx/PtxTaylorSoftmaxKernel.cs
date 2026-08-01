@@ -9,12 +9,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// axis (issue #840), where <c>f(x) = 1 + x + x^2/2</c> is the second-order Taylor
 /// expansion of <c>exp</c>. Because <c>f</c> has no real roots (minimum 0.5 at x = -1) it is
 /// strictly positive, so no row-max shift is needed and a single sum reduction suffices. One
-/// block owns one row: a shared-resident pass caches <c>f(x)</c> and tree-reduces its sum,
-/// then the output pass normalizes. Polynomial-only, so the result is not
+/// block owns one row: a shared-resident pass caches <c>f(x)</c> and reduces its sum with
+/// warp shuffles plus a warp-leader shared exchange, then the output pass normalizes.
+/// Polynomial-only, so the result is not
 /// approximation-limited.
 ///
-/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 256 floats
-/// (reduction). Supported N are multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 8 floats
+/// (warp-leader exchange). Supported N are multiples of 256 so each thread strides the row exactly.
 /// </summary>
 internal sealed class PtxTaylorSoftmaxKernel : IDisposable
 {
@@ -170,7 +171,7 @@ internal sealed class PtxTaylorSoftmaxKernel : IDisposable
                 ["formula"] = "output[m,n] = (1 + x + x^2/2) / sum_n (1 + x + x^2/2)",
                 ["axis"] = "last",
                 ["positivity"] = "polynomial-has-no-real-roots-min-0.5",
-                ["reduction"] = "in-block-tree-reduction-shared",
+                ["reduction"] = PtxRowReduce.Strategy,
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"

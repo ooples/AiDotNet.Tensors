@@ -7,13 +7,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Row-wise numerically-stable log-sum-exp <c>output[m] = rowMax + log(sum exp(x[m,:] - rowMax))</c>
 /// over the last axis (issue #840), reducing an [M,N] logit matrix to an [M] log-partition
-/// vector. One block owns one row and computes the row max and exp-sum with in-block tree
-/// reductions in a single shared-resident pass; thread 0 writes the row result — no global
+/// vector. One block owns one row and computes the row max and exp-sum with warp shuffles
+/// and a warp-leader shared exchange; thread 0 writes the row result — no global
 /// max/sum intermediate. Uses <c>ex2.approx.f32</c>/<c>lg2.approx.f32</c>, so a promoted
 /// specialization carries ~1e-3 approximation error (disclosed on the release gate).
 ///
-/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 256 floats
-/// (reduction). Supported N are multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 8 floats
+/// (warp-leader exchange). Supported N are multiples of 256 so each thread strides the row exactly.
 /// </summary>
 internal sealed class PtxLogSumExpKernel : IDisposable
 {
@@ -180,7 +180,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
                 ["formula"] = "output[m] = rowMax[m] + log(sum_n exp(x[m,n] - rowMax[m]))",
                 ["axis"] = "last",
                 ["stability"] = "row-max-subtracted",
-                ["reduction"] = "in-block-tree-reduction-shared",
+                ["reduction"] = PtxRowReduce.Strategy,
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"

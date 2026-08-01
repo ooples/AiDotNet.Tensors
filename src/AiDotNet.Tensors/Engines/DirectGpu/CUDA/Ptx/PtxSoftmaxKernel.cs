@@ -171,7 +171,7 @@ internal sealed class PtxSoftmaxKernel : IDisposable
                 ["formula"] = "output[m,n] = exp(x[m,n] - rowMax[m]) / sum_n exp(x[m,n] - rowMax[m])",
                 ["axis"] = "last",
                 ["stability"] = "row-max-subtracted",
-                ["reduction"] = "warp-shuffle-plus-warp-leader-shared",
+                ["reduction"] = PtxRowReduce.Strategy,
                 ["global-intermediates"] = "none",
                 ["output-staging"] = "exponentials-normalized-in-place",
                 ["temporary-device-allocation"] = "none",

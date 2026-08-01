@@ -10,6 +10,7 @@ internal static class PtxRowReduce
 {
     internal const int WarpCount = 8;
     internal const int SharedBytes = WarpCount * sizeof(float);
+    internal const string Strategy = "warp-shuffle-plus-warp-leader-shared";
 
     internal static void Emit(StringBuilder ptx, string operation, string accumulator)
     {

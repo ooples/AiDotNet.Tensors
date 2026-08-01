@@ -191,6 +191,7 @@ public class DirectPtxSoftmaxTests
             "The checked-in sparsemax specialization is measured on GA10x/SM86.");
         using var kernel = new PtxSparsemaxKernel(runtime, m, n);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxRowReduce.Strategy, kernel.Blueprint.Semantics["reduction"]);
 
         var random = RandomHelper.CreateSeededRandom(20265400 + m + n);
         float[] zHost = Values(random, m * n, 3.0f);
@@ -237,6 +238,7 @@ public class DirectPtxSoftmaxTests
             "The checked-in Taylor-softmax specialization is measured on GA10x/SM86.");
         using var kernel = new PtxTaylorSoftmaxKernel(runtime, m, n);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxRowReduce.Strategy, kernel.Blueprint.Semantics["reduction"]);
 
         var random = RandomHelper.CreateSeededRandom(20265300 + m + n);
         float[] xHost = Values(random, m * n, 2.0f);
@@ -459,6 +461,7 @@ public class DirectPtxSoftmaxTests
             "The checked-in softmax-backward specialization is measured on GA10x/SM86.");
         using var kernel = new PtxSoftmaxBackwardKernel(runtime, m, n);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxRowReduce.Strategy, kernel.Blueprint.Semantics["reduction"]);
 
         var random = RandomHelper.CreateSeededRandom(20265000 + m + n);
         // S is a valid softmax distribution per row; dY is arbitrary upstream gradient.
@@ -528,6 +531,7 @@ public class DirectPtxSoftmaxTests
             "The checked-in log-sum-exp specialization is measured on GA10x/SM86.");
         using var kernel = new PtxLogSumExpKernel(runtime, m, n);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxRowReduce.Strategy, kernel.Blueprint.Semantics["reduction"]);
 
         var random = RandomHelper.CreateSeededRandom(20264900 + m + n);
         float[] xHost = Values(random, m * n, 3.0f);
@@ -583,6 +587,7 @@ public class DirectPtxSoftmaxTests
             "The checked-in log-softmax specialization is measured on GA10x/SM86.");
         using var kernel = new PtxLogSoftmaxKernel(runtime, m, n);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxRowReduce.Strategy, kernel.Blueprint.Semantics["reduction"]);
 
         var random = RandomHelper.CreateSeededRandom(20264800 + m + n);
         float[] xHost = Values(random, m * n, 3.0f);
@@ -644,6 +649,7 @@ public class DirectPtxSoftmaxTests
             "The checked-in softmax specialization is measured on GA10x/SM86.");
         using var kernel = new PtxSoftmaxKernel(runtime, m, n);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(PtxRowReduce.Strategy, kernel.Blueprint.Semantics["reduction"]);
 
         var random = RandomHelper.CreateSeededRandom(20264700 + m + n);
         float[] xHost = Values(random, m * n, 3.0f);   // wide range exercises stability

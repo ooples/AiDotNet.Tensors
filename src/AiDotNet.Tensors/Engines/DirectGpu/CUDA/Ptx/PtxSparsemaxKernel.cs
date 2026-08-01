@@ -11,11 +11,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// closed form, this finds <c>tau</c> by bisection: the sum is continuous and strictly
 /// decreasing in <c>tau</c> on <c>[rowMax - 1, rowMax]</c> (endpoints bracket 1 and 0), so
 /// <see cref="BisectionSteps"/> halvings resolve it to FP32 precision. One block owns one
-/// row and caches it in shared memory; each bisection step is one in-block tree-reduced sum.
+/// row and caches it in shared memory; each bisection step reduces its sum with warp shuffles
+/// and a warp-leader shared exchange.
 /// No sorting, no global intermediate; the projection is exact to the bisection tolerance.
 ///
-/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 256 floats
-/// (reduction). Supported N are multiples of 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 8 floats
+/// (warp-leader exchange). Supported N are multiples of 256 so each thread strides the row exactly.
 /// </summary>
 internal sealed class PtxSparsemaxKernel : IDisposable
 {
@@ -206,7 +207,7 @@ internal sealed class PtxSparsemaxKernel : IDisposable
                 ["formula"] = "output[m,n] = max(z[m,n] - tau[m], 0), tau s.t. sum_n max(z - tau, 0) = 1",
                 ["axis"] = "last",
                 ["method"] = $"bisection-{BisectionSteps}-steps-on-[rowMax-1,rowMax]",
-                ["reduction"] = "in-block-tree-reduction-shared",
+                ["reduction"] = PtxRowReduce.Strategy,
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"
