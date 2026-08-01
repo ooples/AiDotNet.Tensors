@@ -33,6 +33,10 @@ public class LosingShapeGemmBench
             ("xfmr-FFN b32",  1024,  64, 128),
             ("xfmr-QKV b32",  1024,  64, 192),
             ("xfmr-FFN b8",    256,  64, 128),
+            // DiT/SiT-XL inference GEMM shapes (M=256 tokens, hidden=1152) — the #1672 diffusion path.
+            ("dit-proj 256",   256, 1152, 1152),
+            ("dit-fc1 256",    256, 1152, 4608),
+            ("dit-fc2 256",    256, 4608, 1152),
         };
         var rng = new Random(11);
         bool hasBlas = BlasProvider.HasRawSgemm;
