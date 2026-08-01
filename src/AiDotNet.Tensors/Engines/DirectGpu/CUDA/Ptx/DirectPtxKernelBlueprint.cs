@@ -202,8 +202,35 @@ internal readonly record struct DirectPtxResourceBudget(
     int MaxRegistersPerThread,
     int MaxStaticSharedBytes,
     int MaxLocalBytesPerThread,
-    int MinBlocksPerMultiprocessor)
+    int MinBlocksPerMultiprocessor,
+    int MeasuredRegistersPerThread = 0)
 {
+    // NVIDIA allocates registers in 256-register warp quanta. For a full
+    // 32-thread warp, one occupancy bucket is therefore eight registers per
+    // thread. Keep measured baselines inside their current bucket: harmless
+    // driver/JIT variation within the bucket passes, while a change that can
+    // affect occupancy still trips the release gate.
+    private const int RegistersPerThreadAllocationQuantum = 256 / 32;
+
+    internal static DirectPtxResourceBudget FromDriverMeasurement(
+        int measuredRegistersPerThread,
+        int maxStaticSharedBytes,
+        int maxLocalBytesPerThread,
+        int minBlocksPerMultiprocessor)
+    {
+        if (measuredRegistersPerThread <= 0)
+            throw new ArgumentOutOfRangeException(nameof(measuredRegistersPerThread));
+        int maxRegistersPerThread = checked(
+            ((measuredRegistersPerThread + RegistersPerThreadAllocationQuantum - 1) /
+             RegistersPerThreadAllocationQuantum) * RegistersPerThreadAllocationQuantum);
+        return new DirectPtxResourceBudget(
+            maxRegistersPerThread,
+            maxStaticSharedBytes,
+            maxLocalBytesPerThread,
+            minBlocksPerMultiprocessor,
+            measuredRegistersPerThread);
+    }
+
     internal void Validate(
         string kernelName,
         DirectPtxFunctionInfo info,

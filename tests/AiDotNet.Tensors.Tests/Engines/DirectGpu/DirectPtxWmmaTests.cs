@@ -369,6 +369,7 @@ public class DirectPtxWmmaTests
             emitSoftmaxStats: true, warpsPerBlock);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
         Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, 255);
+        Assert.Equal(144, kernel.Blueprint.ResourceBudget.MeasuredRegistersPerThread);
 
         using var qDevice = runtime.AllocateBytes(kernel.QBytes);
         using var kDevice = runtime.AllocateBytes(kernel.KBytes);
@@ -428,6 +429,7 @@ public class DirectPtxWmmaTests
             isCausal, false, 0.125f, 1e-5f, emitSoftmaxStats: true,
             causalQueryOffset: causalQueryOffset);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
+        Assert.Equal(144, kernel.Blueprint.ResourceBudget.MeasuredRegistersPerThread);
         Assert.Equal((long)batch * queryHeads * querySequence * dimension * sizeof(float),
             (long)kernel.OutputBytes);
         Assert.Equal((long)batch * keyValueHeads * keyValueSequence * dimension * sizeof(ushort),
@@ -622,6 +624,34 @@ public class DirectPtxWmmaTests
     }
 
     [Theory]
+    [InlineData(14, 16)]
+    [InlineData(22, 24)]
+    [InlineData(26, 32)]
+    [InlineData(34, 40)]
+    [InlineData(40, 40)]
+    public void MeasuredResourceBudget_StaysWithinCurrentRegisterAllocationBucket(
+        int measuredRegisters, int expectedMaximum)
+    {
+        DirectPtxResourceBudget budget = DirectPtxResourceBudget.FromDriverMeasurement(
+            measuredRegisters, maxStaticSharedBytes: 0,
+            maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1);
+
+        Assert.Equal(measuredRegisters, budget.MeasuredRegistersPerThread);
+        Assert.Equal(expectedMaximum, budget.MaxRegistersPerThread);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void MeasuredResourceBudget_RejectsNonPositiveMeasurement(int measuredRegisters)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegisters, maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1));
+    }
+
+    [Theory]
     [InlineData(8, 0, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 6, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 9, (int)DirectPtxArchitectureFamily.Ada)]
@@ -635,6 +665,47 @@ public class DirectPtxWmmaTests
         Assert.Equal(expected, DirectPtxArchitecture.Classify(major, minor));
         Assert.Equal(major == 8 && minor == 6,
             DirectPtxArchitecture.HasValidatedOnlineAttention(major, minor));
+    }
+
+    [Fact]
+    public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
+    {
+        var resource = new TrackingDisposable();
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackingDisposable, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_CleanupFailureDoesNotMaskPrimaryFailure()
+    {
+        var resource = new TrackingDisposable { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackingDisposable, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_TransfersSuccessfulResourceOwnership()
+    {
+        var resource = new TrackingDisposable();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
     }
 
     [Fact]
@@ -3110,7 +3181,13 @@ public class DirectPtxWmmaTests
     private sealed class TrackingDisposable : IDisposable
     {
         internal bool IsDisposed { get; private set; }
-        public void Dispose() => IsDisposed = true;
+        internal bool ThrowOnDispose { get; set; }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
     }
 }
 #endif
