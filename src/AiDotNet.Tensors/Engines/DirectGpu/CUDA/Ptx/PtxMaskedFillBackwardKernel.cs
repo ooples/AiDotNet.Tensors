@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// (issue #840): the gradient does not flow through positions overwritten by the fill
 /// constant. Purely elementwise over a flat element count, matching the backend's flat-
 /// <c>size</c> ABI — one thread owns two aligned float4 transactions striped across the tensor,
-/// reduction, or global intermediate. The result is exact.
+/// with no shared memory, reduction, or global intermediate. The result is exact.
 ///
 /// 256 threads/block, eight elements/thread; supported counts are positive multiples of 256.
 /// </summary>
