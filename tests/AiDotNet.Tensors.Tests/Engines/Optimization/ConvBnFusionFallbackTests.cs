@@ -24,8 +24,8 @@ public sealed class ConvBnFusionFallbackTests
 
         Assert.Equal(new[] { 1, 2, 2, 3 }, fused.OutputBuffer._shape);
         float[] actual = fused.OutputBuffer.AsSpan().ToArray();
-        Assert.All(actual[..6], value => Assert.Equal(10f, value));
-        Assert.All(actual[6..], value => Assert.Equal(20f, value));
+        Assert.All(actual.Take(6), value => Assert.Equal(10f, value));
+        Assert.All(actual.Skip(6), value => Assert.Equal(20f, value));
     }
 
     [Fact]
@@ -38,8 +38,8 @@ public sealed class ConvBnFusionFallbackTests
 
         Assert.Equal(new[] { 2 }, forwarding.FusedConvBiasShape);
         float[] actual = fused.OutputBuffer.AsSpan().ToArray();
-        Assert.All(actual[..6], value => Assert.Equal(10f, value));
-        Assert.All(actual[6..], value => Assert.Equal(20f, value));
+        Assert.All(actual.Take(6), value => Assert.Equal(10f, value));
+        Assert.All(actual.Skip(6), value => Assert.Equal(20f, value));
     }
 
     private static CompiledStep<float> CreateFusedStep(bool depthwise, bool withActivation)
@@ -97,7 +97,7 @@ public sealed class ConvBnFusionFallbackTests
         return engine;
     }
 
-    private class ForwardingEngineProxy : DispatchProxy
+    public class ForwardingEngineProxy : DispatchProxy
     {
         internal CpuEngine Inner { get; set; } = null!;
         internal int[]? FusedConvBiasShape { get; private set; }
