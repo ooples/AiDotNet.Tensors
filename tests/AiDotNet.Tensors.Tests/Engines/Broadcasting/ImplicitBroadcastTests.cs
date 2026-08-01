@@ -150,6 +150,32 @@ public class ImplicitBroadcastTests
             Assert.Equal(explicitly[i], broadcast[i], 12);
     }
 
+    [Fact]
+    public void BroadcastElementwise_DensifiesSparseOperandsOnEitherSide()
+    {
+        var sparse = new SparseTensor<double>(
+            rows: 2,
+            columns: 1,
+            rowIndices: new[] { 0, 1 },
+            columnIndices: new[] { 0, 0 },
+            values: new[] { 2.0, 5.0 });
+        var dense = new Tensor<double>(new[] { 2, 3 });
+        for (int i = 0; i < dense.Length; i++) dense[i] = 10.0 + i;
+
+        var sparseLeft = sparse.BroadcastSubtract(dense);
+        var sparseRight = dense.BroadcastSubtract(sparse);
+
+        Assert.Equal(new[] { 2, 3 }, sparseLeft.Shape.ToArray());
+        Assert.Equal(new[] { 2, 3 }, sparseRight.Shape.ToArray());
+        for (int row = 0; row < 2; row++)
+        for (int col = 0; col < 3; col++)
+        {
+            double sparseValue = row == 0 ? 2.0 : 5.0;
+            Assert.Equal(sparseValue - dense[row, col], sparseLeft[row, col], 12);
+            Assert.Equal(dense[row, col] - sparseValue, sparseRight[row, col], 12);
+        }
+    }
+
     /// <summary>
     /// The gradient of a broadcast operand must be the SUM over the axes that were stretched.
     /// </summary>

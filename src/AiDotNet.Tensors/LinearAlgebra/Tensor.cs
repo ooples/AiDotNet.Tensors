@@ -2525,8 +2525,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // is handled by starting each operand's index at its own _storageOffset (rather than
         // forcing offset 0) and indexing the FULL backing span, since an arbitrary stride pattern
         // is not confined to the [offset, offset + Length) window a contiguous slice would occupy.
-        var aSrc = a.IsSparse ? a.Contiguous() : a;
-        var bSrc = b.IsSparse ? b.Contiguous() : b;
+        var aSrc = a is SparseTensor<T> sparseA ? sparseA.ToDense() : a;
+        var bSrc = b is SparseTensor<T> sparseB ? sparseB.ToDense() : b;
         aSrc.EnsureMaterialized();
         bSrc.EnsureMaterialized();
         ReadOnlySpan<T> aSpan = aSrc._data.AsSpan();
