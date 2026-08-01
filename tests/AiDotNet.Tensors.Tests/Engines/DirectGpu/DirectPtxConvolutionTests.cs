@@ -144,10 +144,13 @@ public sealed class DirectPtxConvolutionTests
             "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA",
             "CudaBackend.DirectPtx.Convolution.cs"));
         Assert.Contains("must be prewarmed before CUDA graph capture", backend, StringComparison.Ordinal);
-        Assert.Contains("_directPtxConvolutionKernels.Pin(key)", backend, StringComparison.Ordinal);
+        Assert.Contains("PinDirectPtxKernelForCapture(", backend, StringComparison.Ordinal);
+        Assert.Contains("_directPtxConvolutionKernels, key", backend, StringComparison.Ordinal);
         string owner = File.ReadAllText(SourcePath(
             "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA",
             "CudaBackend.DirectPtx.cs"));
+        Assert.Contains("cache.AcquireCapturePin(key)", owner, StringComparison.Ordinal);
+        Assert.Contains("cache.ReleaseCapturePin(key)", owner, StringComparison.Ordinal);
         Assert.Contains("_directPtxConvolutionKernels.Dispose()", owner, StringComparison.Ordinal);
     }
 
