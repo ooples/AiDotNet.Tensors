@@ -98,4 +98,130 @@ public class FftNdAxisIsolationProbe : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Sweeps the batch count with the transform length held fixed.
+    /// </summary>
+    /// <remarks>
+    /// BatchedFFT is the only FFT entry point the N-D path uses; FFT2D drives its own row/column
+    /// kernels and the 1-D entry points drive the single-signal kernel, which is why all of those
+    /// pass. Holding n fixed at 8 and walking batch from 1 upward separates "the transform is
+    /// wrong" from "the batching is wrong" — the batched kernels index by a flattened
+    /// get_global_id(0), so a dispatch that does not span batch*n leaves later signals untouched.
+    /// </remarks>
+    [SkippableFact]
+    public void WhichBatchCountDiverges()
+    {
+        Skip.If(!_available, "GPU backend not available");
+
+        _out.WriteLine("transform length n=8 held fixed, batch swept");
+        foreach (int batch in new[] { 1, 2, 3, 4, 8, 16 })
+        {
+            // Rank-1 for batch 1 so the N-D path sees exactly one signal.
+            int[] shape = batch == 1 ? [8] : [batch, 8];
+            int[] axes = batch == 1 ? [0] : [1];
+
+            var x = Rand(shape, 9);
+            try
+            {
+                var cpu = _cpu.NativeComplexFFTND(x, axes);
+                var gpu = _gpu!.NativeComplexFFTND(x, axes);
+                double err = MaxAbsErr(cpu, gpu);
+                _out.WriteLine($"  batch={batch,-3} -> max_abs_err {err:E3}{(err > 1e-2 ? "   <== DIVERGES" : "   ok")}");
+            }
+            catch (Exception ex)
+            {
+                _out.WriteLine($"  batch={batch,-3} -> threw {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // BatchedFFT derives the bit-reversal width as (int)MathHelper.Log2(n), which is
+        // Math.Log(x)/Math.Log(2). If that lands a hair under an integer, the cast truncates and the
+        // bit-reversal permutes the wrong number of bits — leaving n=2 (no swaps needed) correct and
+        // everything larger scrambled. The butterfly stage loop does not use it, so this would hit
+        // bit-reversal alone.
+        _out.WriteLine("bit-reversal width: (int)(Math.Log(n)/Math.Log(2)) vs exact log2");
+        foreach (int n in new[] { 2, 4, 8, 16, 32, 64, 128 })
+        {
+            double raw = Math.Log(n) / Math.Log(2);
+            int truncated = (int)raw;
+            int exact = System.Numerics.BitOperations.Log2((uint)n);
+            _out.WriteLine($"  n={n,-4} raw={raw:R}  (int)={truncated}  exact={exact}"
+                + (truncated != exact ? "   <== TRUNCATES LOW" : ""));
+        }
+
+        // Is the GPU output simply a PERMUTATION of the correct spectrum? n=2 passing is exactly the
+        // case where bit-reversal is the identity, which is the signature of the reversal being
+        // applied on the wrong side of the butterfly (decimation-in-time reversal paired with a
+        // decimation-in-frequency butterfly, or the reverse).
+        _out.WriteLine("is GPU output a bit-reversed permutation of CPU output?");
+        foreach (int n in new[] { 4, 8, 16 })
+        {
+            var x1 = Rand([1, n], 17);
+            var cpu1 = _cpu.NativeComplexFFTND(x1, [1]);
+            var gpu1 = _gpu!.NativeComplexFFTND(x1, [1]);
+
+            int bits = System.Numerics.BitOperations.Log2((uint)n);
+            static int Rev(int v, int bits)
+            {
+                int r = 0;
+                for (int k = 0; k < bits; k++) { r = (r << 1) | (v & 1); v >>= 1; }
+                return r;
+            }
+
+            double direct = 0, permuted = 0;
+            for (int k = 0; k < n; k++)
+            {
+                direct = Math.Max(direct, Math.Abs(cpu1[k].Real - gpu1[k].Real));
+                permuted = Math.Max(permuted, Math.Abs(cpu1[Rev(k, bits)].Real - gpu1[k].Real));
+            }
+            _out.WriteLine($"  n={n,-3} direct={direct:E3}  bitReversed={permuted:E3}"
+                + (permuted < 1e-3 ? "   <== GPU IS BIT-REVERSED" : ""));
+        }
+
+        // Which side is actually wrong? The parity test assumes the CPU is truth. Compare BOTH
+        // against a direct O(n^2) DFT, which has no algorithmic structure to get wrong.
+        _out.WriteLine("both engines vs a direct O(n^2) DFT reference");
+        foreach (int n in new[] { 4, 8, 16 })
+        {
+            var x1 = Rand([1, n], 19);
+            var cpu1 = _cpu.NativeComplexFFTND(x1, [1]);
+            var gpu1 = _gpu!.NativeComplexFFTND(x1, [1]);
+
+            double cpuErr = 0, gpuErr = 0;
+            for (int k = 0; k < n; k++)
+            {
+                double re = 0, im = 0;
+                for (int t = 0; t < n; t++)
+                {
+                    double ang = -2.0 * Math.PI * k * t / n;
+                    re += x1[0, t] * Math.Cos(ang);
+                    im += x1[0, t] * Math.Sin(ang);
+                }
+                cpuErr = Math.Max(cpuErr, Math.Max(Math.Abs(cpu1[k].Real - re), Math.Abs(cpu1[k].Imaginary - im)));
+                gpuErr = Math.Max(gpuErr, Math.Max(Math.Abs(gpu1[k].Real - re), Math.Abs(gpu1[k].Imaginary - im)));
+            }
+            _out.WriteLine($"  n={n,-3} cpu_vs_dft={cpuErr:E3}  gpu_vs_dft={gpuErr:E3}"
+                + (cpuErr > 1e-3 && gpuErr < 1e-3 ? "   <== CPU IS THE WRONG ONE" : "")
+                + (gpuErr > 1e-3 && cpuErr < 1e-3 ? "   <== GPU IS THE WRONG ONE" : "")
+                + (gpuErr > 1e-3 && cpuErr > 1e-3 ? "   <== BOTH WRONG" : ""));
+        }
+
+        _out.WriteLine("batch=4 held fixed, transform length swept");
+        foreach (int n in new[] { 2, 4, 8, 16, 32 })
+        {
+            var x = Rand([4, n], 11);
+            try
+            {
+                var cpu = _cpu.NativeComplexFFTND(x, [1]);
+                var gpu = _gpu!.NativeComplexFFTND(x, [1]);
+                double err = MaxAbsErr(cpu, gpu);
+                _out.WriteLine($"  n={n,-3} -> max_abs_err {err:E3}{(err > 1e-2 ? "   <== DIVERGES" : "   ok")}");
+            }
+            catch (Exception ex)
+            {
+                _out.WriteLine($"  n={n,-3} -> threw {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
 }
