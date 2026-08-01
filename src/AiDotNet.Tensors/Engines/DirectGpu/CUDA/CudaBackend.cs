@@ -13649,7 +13649,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             // Copy input to tempReal, zero tempImag
             CudaCopyBuffer(input, tempReal, n);
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(tempImag.Handle, 0, (ulong)n), "cuMemsetD32");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(tempImag.Handle, 0, (ulong)n * sizeof(float), _stream),
+                "cuMemsetD8Async (RFFT imaginary)");
+            GpuLaunchProbe.OnLaunch();
 
             // Perform full complex FFT
             FFT(tempReal, tempImag, tempReal, tempImag, n, false);
@@ -14099,8 +14102,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         ulong byteSize = (ulong)size * sizeof(float);
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(dst.Handle, src.Handle, byteSize),
-            "cuMemcpyDtoD");
+            CudaNativeBindings.cuMemcpyDtoDAsync(dst.Handle, src.Handle, byteSize, _stream),
+            "cuMemcpyDtoDAsync (FFT)");
+        GpuLaunchProbe.OnLaunch();
     }
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
