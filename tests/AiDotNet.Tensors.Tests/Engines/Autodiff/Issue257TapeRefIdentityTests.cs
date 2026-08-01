@@ -193,7 +193,7 @@ public class Issue257TapeRefIdentityTests
     /// <summary>
     /// Closer to the actual Transformer multi-head attention path: uses
     /// TensorMatMulBatched on the [B, H, S, Dh] permuted Q·K^T form, plus
-    /// TensorBroadcastAdd for bias, plus a second ComputeGradients call to
+    /// TensorAdd for bias, plus a second ComputeGradients call to
     /// catch any tape-state leakage that surfaces only on iteration 2+.
     /// </summary>
     [Fact]
@@ -252,7 +252,7 @@ public class Issue257TapeRefIdentityTests
 
             // 7. Output projection + bias
             var outProj = _engine.TensorMatMul(ctxFlat, Wo);
-            var withBias = _engine.TensorBroadcastAdd(outProj, bo);
+            var withBias = _engine.TensorAdd(outProj, bo);
 
             // 8. Loss
             var loss = _engine.ReduceSum(withBias, null);
@@ -300,10 +300,10 @@ public class Issue257TapeRefIdentityTests
         var xP = _engine.TensorPermute(x, new[] { 1, 0, 2 });   // [S, B, D]
         Tensor<float> y = opName switch
         {
-            "BroadcastAdd"      => _engine.TensorBroadcastAdd(xP, w),
-            "BroadcastSubtract" => _engine.TensorBroadcastSubtract(xP, w),
-            "BroadcastMultiply" => _engine.TensorBroadcastMultiply(xP, w),
-            "BroadcastDivide"   => _engine.TensorBroadcastDivide(xP, w),
+            "BroadcastAdd"      => _engine.TensorAdd(xP, w),
+            "BroadcastSubtract" => _engine.TensorSubtract(xP, w),
+            "BroadcastMultiply" => _engine.TensorMultiply(xP, w),
+            "BroadcastDivide"   => _engine.TensorDivide(xP, w),
             _ => throw new ArgumentException(opName)
         };
         var loss = _engine.ReduceSum(y, null);

@@ -293,7 +293,7 @@ public class Issue319TrainingLoopPerfTests
             for (int l = 0; l < weights.Length; l++)
             {
                 var z = engine.TensorMatMul(current, weights[l]);
-                var z2 = engine.TensorBroadcastAdd(z, biases[l]);
+                var z2 = engine.TensorAdd(z, biases[l]);
                 var a = engine.GELU(z2);
                 current = engine.LayerNorm(a, gammas[l], betas[l], 1e-5, out _, out _);
             }
@@ -345,7 +345,7 @@ public class Issue319TrainingLoopPerfTests
         for (int l = 0; l < weights.Length; l++)
         {
             var z = engine.TensorMatMul(current, weights[l]);
-            var z2 = engine.TensorBroadcastAdd(z, biases[l]);
+            var z2 = engine.TensorAdd(z, biases[l]);
             var a = engine.GELU(z2);
             current = engine.LayerNorm(a, gammas[l], betas[l], 1e-5, out _, out _);
         }

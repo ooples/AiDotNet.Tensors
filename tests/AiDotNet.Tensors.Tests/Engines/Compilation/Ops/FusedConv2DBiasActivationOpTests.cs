@@ -41,7 +41,7 @@ public class FusedConv2DBiasActivationOpTests
         var convResult = engine.Conv2D(input, kernel, stride, padding, dilation);
         // Reshape bias to [1, Cout, 1, 1] for broadcasting
         var biasReshaped = bias.Reshape(new[] { 1, bias._shape[0], 1, 1 });
-        var withBias = engine.TensorBroadcastAdd(convResult, biasReshaped);
+        var withBias = engine.TensorAdd(convResult, biasReshaped);
         var separateResult = activation switch
         {
             FusedActivationType.None    => withBias,

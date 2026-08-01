@@ -2716,13 +2716,13 @@ public static class OpParityRegistry
         yield return B("TensorLogAddExp", "arithmetic", (e, u, v) => e.TensorLogAddExp(u, v), (e, u, v) => e.TensorLogAddExp(u, v), ParityTol.Ulp(64, 1e-6), a, b);
 
         // Broadcast binary (row broadcast [1,64] over [4,64]).
-        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorBroadcastAdd(u, v), (e, u, v) => e.TensorBroadcastAdd(u, v), ParityTol.Exact, a, brow);
-        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, a, brow);
-        yield return B("TensorBroadcastMultiply", "arithmetic", (e, u, v) => e.TensorBroadcastMultiply(u, v), (e, u, v) => e.TensorBroadcastMultiply(u, v), ParityTol.Ulp(2, 1e-6), a, brow);
-        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
-        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorBroadcastAdd(u, v), (e, u, v) => e.TensorBroadcastAdd(u, v), ParityTol.Exact, square, bcol);
-        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, square, bcol);
-        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), square, OpInput.Rand(407, new[] { 64, 1 }, 0.5, 3.0));
+        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorAdd(u, v), (e, u, v) => e.TensorAdd(u, v), ParityTol.Exact, a, brow);
+        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorSubtract(u, v), (e, u, v) => e.TensorSubtract(u, v), ParityTol.Exact, a, brow);
+        yield return B("TensorBroadcastMultiply", "arithmetic", (e, u, v) => e.TensorMultiply(u, v), (e, u, v) => e.TensorMultiply(u, v), ParityTol.Ulp(2, 1e-6), a, brow);
+        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorDivide(u, v), (e, u, v) => e.TensorDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
+        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorAdd(u, v), (e, u, v) => e.TensorAdd(u, v), ParityTol.Exact, square, bcol);
+        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorSubtract(u, v), (e, u, v) => e.TensorSubtract(u, v), ParityTol.Exact, square, bcol);
+        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorDivide(u, v), (e, u, v) => e.TensorDivide(u, v), ParityTol.Ulp(4, 1e-6), square, OpInput.Rand(407, new[] { 64, 1 }, 0.5, 3.0));
 
         // Scalar-arg ops.
         yield return new OpCase("TensorAddScalar[4,64]", "arithmetic", e => e.TensorAddScalar(a.F(), 1.5f), e => e.TensorAddScalar(a.D(), 1.5), ParityTol.Exact, opMethod: "TensorAddScalar");

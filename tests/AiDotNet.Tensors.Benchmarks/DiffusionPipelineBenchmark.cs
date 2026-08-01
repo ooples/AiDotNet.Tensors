@@ -74,14 +74,14 @@ public class DiffusionPipelineBenchmark
         _planA = _cacheA.GetOrCompileInference(_aiInput, () =>
         {
             var h = _engine.TensorMatMul(_aiInput, _aiW1);
-            h = _engine.TensorBroadcastAdd(h, _aiB1);
+            h = _engine.TensorAdd(h, _aiB1);
             return _engine.ReLU(h);
         });
         _cacheB = new CompiledModelCache<float>();
         _planB = _cacheB.GetOrCompileInference(_aiHiddenSeed, () =>
         {
             var o = _engine.TensorMatMul(_aiHiddenSeed, _aiW2);
-            return _engine.TensorBroadcastAdd(o, _aiB2);
+            return _engine.TensorAdd(o, _aiB2);
         });
 
         _torchInput = torch.randn(BatchSize, Hidden);

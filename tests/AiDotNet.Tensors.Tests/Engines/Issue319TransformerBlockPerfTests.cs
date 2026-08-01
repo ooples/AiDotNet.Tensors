@@ -9,7 +9,7 @@
 // rather than promises.
 //
 // What it measures:
-//   * Per-op µs/call for TensorMatMul, TensorBroadcastAdd, GELU,
+//   * Per-op µs/call for TensorMatMul, TensorAdd, GELU,
 //     LayerNorm at canonical ViT-Base patch shape
 //     [197, 768] — the shapes that dominate every layer's wall-clock
 //   * End-to-end ms/iter for a 12-layer block performing matmul
@@ -221,7 +221,7 @@ public class Issue319TransformerBlockPerfTests
         // run so total-time numbers are comparable.
         int totalCalls = Iters * Layers;
         long matmulMs = TimeOp(totalCalls, () => engine.TensorMatMul(x, weight));
-        long biasAddMs = TimeOp(totalCalls, () => engine.TensorBroadcastAdd(x, bias));
+        long biasAddMs = TimeOp(totalCalls, () => engine.TensorAdd(x, bias));
         long geluMs = TimeOp(totalCalls, () => engine.GELU(x));
         long layerNormMs = TimeOp(totalCalls, () => engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
 
@@ -238,7 +238,7 @@ public class Issue319TransformerBlockPerfTests
         _output.WriteLine($"Per-op µs/call at ViT-Base shape [{Seq}, {Hidden}] "
             + $"(over {totalCalls} calls each):");
         _output.WriteLine($"  TensorMatMul       : {matmulUs,8:F1} µs/call (total {matmulMs} ms)");
-        _output.WriteLine($"  TensorBroadcastAdd : {biasAddUs,8:F1} µs/call (total {biasAddMs} ms)");
+        _output.WriteLine($"  TensorAdd : {biasAddUs,8:F1} µs/call (total {biasAddMs} ms)");
         _output.WriteLine($"  GELU               : {geluUs,8:F1} µs/call (total {geluMs} ms)");
         _output.WriteLine($"  LayerNorm          : {layerNormUs,8:F1} µs/call (total {layerNormMs} ms)");
         _output.WriteLine($"Full block chain     : {msPerIter:F2} ms/iter "
@@ -296,7 +296,7 @@ public class Issue319TransformerBlockPerfTests
             // matmul dominates compute; the others test that small-
             // op dispatch overhead doesn't accumulate.
             var z = engine.TensorMatMul(current, weight);
-            var z2 = engine.TensorBroadcastAdd(z, bias);
+            var z2 = engine.TensorAdd(z, bias);
             var a = engine.GELU(z2);
             current = engine.LayerNorm(a, gamma, beta, 1e-5, out _, out _);
         }

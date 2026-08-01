@@ -48,8 +48,8 @@ public class MultiConsumerGradZeroingTests
         ICompiledTrainingPlan<double> plan;
         using (var scope = GraphMode.Enable())
         {
-            var h1 = engine.TensorBroadcastAdd(x1, b); // b consumer #1
-            var h2 = engine.TensorBroadcastAdd(x2, b); // b consumer #2 → multi-consumer
+            var h1 = engine.TensorAdd(x1, b); // b consumer #1
+            var h2 = engine.TensorAdd(x2, b); // b consumer #2 → multi-consumer
             var s1 = engine.ReduceSum(h1, null);       // scalar
             var s2 = engine.ReduceSum(h2, null);       // scalar
             engine.TensorAdd(s1, s2);                  // scalar loss
@@ -106,8 +106,8 @@ public class MultiConsumerGradZeroingTests
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.Enable())
             {
-                var h1 = gpu.TensorBroadcastAdd(x1, b);
-                var h2 = gpu.TensorBroadcastAdd(x2, b);
+                var h1 = gpu.TensorAdd(x1, b);
+                var h2 = gpu.TensorAdd(x2, b);
                 var s1 = gpu.ReduceSum(h1, null);
                 var s2 = gpu.ReduceSum(h2, null);
                 gpu.TensorAdd(s1, s2);

@@ -29,28 +29,45 @@ public class BroadcastPerfProbe
         var scale = new Tensor<float>([1, 64, 1, 1]);
         for (int i = 0; i < scale.Length; i++) scale[i] = 1.0f + i % 3;
 
-        // Warm up both paths (JIT, pools).
-        for (int i = 0; i < 3; i++)
+        // Warm up both paths (JIT, tiering, pools).
+        for (int i = 0; i < 50; i++)
         {
             _ = engine.TensorAdd(x, scale);
             _ = engine.TensorBroadcastAdd(x, scale);
         }
 
-        const int reps = 10;
-        var sw = Stopwatch.StartNew();
-        for (int i = 0; i < reps; i++) _ = engine.TensorAdd(x, scale);
-        sw.Stop();
-        double implicitMs = sw.Elapsed.TotalMilliseconds / reps;
+        // Report the MINIMUM over many trials, not the mean. Each call allocates a 3.2 MB result,
+        // so GC and thermal noise land as large positive outliers; earlier runs of this probe read
+        // 10.8, 4.5 and 8.1 ms for the same unchanged code, which is too wide to optimize against.
+        // The floor is the stable quantity.
+        double Best(Func<Tensor<float>> call, int trials = 30)
+        {
+            double best = double.MaxValue;
+            for (int t = 0; t < trials; t++)
+            {
+                var sw = Stopwatch.StartNew();
+                _ = call();
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+            }
+            return best;
+        }
 
-        sw.Restart();
-        for (int i = 0; i < reps; i++) _ = engine.TensorBroadcastAdd(x, scale);
-        sw.Stop();
-        double explicitMs = sw.Elapsed.TotalMilliseconds / reps;
+        // Decompose the implicit path so the cost lands on a specific stage rather than a guess.
+        var preExpanded = scale.ExpandTo([1, 64, 112, 112]);      // view built once, outside the timer
+        var dense = preExpanded.Contiguous();                      // same shape, fully contiguous
 
-        _out.WriteLine($"shape [1,64,112,112] + [1,64,1,1], {reps} reps");
-        _out.WriteLine($"  implicit TensorAdd      : {implicitMs:F3} ms/call");
-        _out.WriteLine($"  explicit BroadcastAdd   : {explicitMs:F3} ms/call");
-        _out.WriteLine($"  ratio (implicit/explicit): {implicitMs / explicitMs:F2}x");
+        double implicitMs = Best(() => engine.TensorAdd(x, scale));
+        double explicitMs = Best(() => engine.TensorBroadcastAdd(x, scale));
+        double preExpandedMs = Best(() => engine.TensorAdd(x, preExpanded));
+        double contiguousMs = Best(() => engine.TensorAdd(x, dense));
+
+        _out.WriteLine("shape [1,64,112,112] + [1,64,1,1], min of 30 trials");
+        _out.WriteLine($"  implicit TensorAdd        : {implicitMs:F3} ms/call");
+        _out.WriteLine($"  explicit BroadcastAdd     : {explicitMs:F3} ms/call");
+        _out.WriteLine($"  TensorAdd(pre-expanded)   : {preExpandedMs:F3} ms/call   <- strided SIMD kernel alone");
+        _out.WriteLine($"  TensorAdd(contiguous)     : {contiguousMs:F3} ms/call   <- floor, no broadcast at all");
+        _out.WriteLine($"  ratio (implicit/explicit) : {implicitMs / explicitMs:F2}x");
 
         // Values must agree regardless of which path ran.
         var viaImplicit = engine.TensorAdd(x, scale);

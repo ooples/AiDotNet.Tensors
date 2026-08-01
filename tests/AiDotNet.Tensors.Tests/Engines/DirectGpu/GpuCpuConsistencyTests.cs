@@ -184,10 +184,10 @@ public class GpuCpuConsistencyTests
         using var gpu = new DirectGpuTensorEngine();
         var operations = new (string Name, Func<Tensor<float>, Tensor<float>, Tensor<float>> Run)[]
         {
-            ("add", gpu.TensorBroadcastAdd),
-            ("subtract", gpu.TensorBroadcastSubtract),
-            ("multiply", gpu.TensorBroadcastMultiply),
-            ("divide", gpu.TensorBroadcastDivide)
+            ("add", gpu.TensorAdd),
+            ("subtract", gpu.TensorSubtract),
+            ("multiply", gpu.TensorMultiply),
+            ("divide", gpu.TensorDivide)
         };
 
         foreach (var operation in operations)

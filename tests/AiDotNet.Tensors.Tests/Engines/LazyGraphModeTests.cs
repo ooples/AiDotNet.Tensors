@@ -468,7 +468,7 @@ namespace AiDotNet.Tensors.Tests.Engines
 
             // Eager: MatMul + broadcast bias add + ReLU (3 separate ops)
             var mm = engine.TensorMatMul(input, weights);
-            var biased = engine.TensorBroadcastAdd(mm, bias1D);
+            var biased = engine.TensorAdd(mm, bias1D);
             var eagerResult = engine.ReLU(biased);
 
             // Lazy: should fuse into FusedLinearReLU via CpuFusionPass
@@ -476,7 +476,7 @@ namespace AiDotNet.Tensors.Tests.Engines
             using (var scope = GraphMode.Enable())
             {
                 var lazyMm = engine.TensorMatMul(input, weights);
-                var lazyBiased = engine.TensorBroadcastAdd(lazyMm, bias1D);
+                var lazyBiased = engine.TensorAdd(lazyMm, bias1D);
                 lazyResult = engine.ReLU(lazyBiased);
 
                 // NodeCount reflects recorded lazy nodes (always 3 here: MatMul, Add, ReLU).
