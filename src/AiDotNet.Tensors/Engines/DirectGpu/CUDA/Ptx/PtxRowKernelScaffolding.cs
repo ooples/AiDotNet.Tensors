@@ -5,6 +5,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Shared hierarchical warp reduction used by row-normalization PTX kernels.
+///
+/// Caller preconditions (the emitted code reads these registers):
+/// <c>%r0 = %tid.x</c>, <c>%rd5</c> is the base address of the <c>red</c> shared array
+/// (<see cref="SharedBytes"/> bytes), and <c>%rd10 = &amp;red[tid]</c>, computed as
+/// <c>%rd5 + tid * 4</c>.
+///
+/// The emitted code clobbers <c>%f10</c>, <c>%f11</c>, <c>%r10</c>, <c>%r11</c>,
+/// <c>%rd19</c>, and <c>%p3</c>. Callers must not keep live values in those registers
+/// across <see cref="Emit"/> and must declare at least <c>%f&lt;12&gt;</c>,
+/// <c>%r&lt;12&gt;</c>, <c>%rd&lt;20&gt;</c>, and <c>%p&lt;4&gt;</c>.
+///
+/// On return, <c>red[0]</c> contains the block-wide result and a <c>bar.sync</c> has
+/// published it to the block.
 /// </summary>
 internal static class PtxRowReduce
 {
