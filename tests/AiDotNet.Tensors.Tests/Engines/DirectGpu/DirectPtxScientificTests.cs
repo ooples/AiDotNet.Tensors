@@ -657,21 +657,24 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void ComplexMatVecEmitter_IsThreadPerRowSerialColumn()
+    public void ComplexMatVecEmitter_IsWarpPerRowWithCoalescedColumns()
     {
         string ptx = PtxComplexMatVecKernel.EmitPtx(8, 6, 4, 64);
         Assert.Contains(PtxComplexMatVecKernel.EntryPoint, ptx);
         Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));    // mr, mi, xr, xi in the loop
         Assert.Equal(2, Count(ptx, "st.global.f32"));        // outReal + outImag
         Assert.Equal(4, Count(ptx, "fma.rn.f32"));           // complex MAC: 2 for real, 2 for imag
+        Assert.Equal(10, Count(ptx, "shfl.sync.down.b32"));  // real + imag warp sums
         Assert.Contains("$CMV_COL_LOOP:", ptx);
-        Assert.Contains("div.u32 %r3, %r2, 64", ptx);        // b = idx / dim
-        Assert.Contains("rem.u32 %r4, %r2, 64", ptx);        // row = idx % dim
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);
+        Assert.Contains("div.u32 %r5, %r4, 64", ptx);        // b = idx / dim
+        Assert.Contains("rem.u32 %r6, %r4, 64", ptx);        // row = idx % dim
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxComplexMatVecKernel.IsSupportedShape(4, 64));
-        Assert.False(PtxComplexMatVecKernel.IsSupportedShape(3, 5));   // 15 not a multiple of 256
+        Assert.False(PtxComplexMatVecKernel.IsSupportedShape(3, 5));   // 15 not a multiple of 8
         Assert.False(PtxComplexMatVecKernel.IsPromotedShape(4, 64));
     }
 
@@ -680,7 +683,7 @@ public class DirectPtxScientificTests
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in complex-matvec specialization is measured on GA10x/SM86.");
-        const int batchSize = 16, dim = 64;   // rows = 1024 (multiple of 256)
+        const int batchSize = 16, dim = 64;   // rows = 1024
         using var kernel = new PtxComplexMatVecKernel(runtime, batchSize, dim);
         Assert.NotEqual(DirectPtxModuleImageKind.DriverJitPtx, kernel.Audit.ImageKind);
         Assert.NotEmpty(kernel.Audit.CubinSha256);
