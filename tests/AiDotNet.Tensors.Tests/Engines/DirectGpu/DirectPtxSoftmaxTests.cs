@@ -728,6 +728,49 @@ public class DirectPtxSoftmaxTests
     }
 
     [SkippableFact]
+    public void Backend_SoftmaxFamily_PrewarmedKernelCapturesAndReplays()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a validated Ampere CUDA backend.");
+            const int m = 64, n = 256;
+            using var input = backend.AllocateBuffer(new float[m * n]);
+            using var output = backend.AllocateBuffer(m);
+
+            Assert.True(backend.TryDirectPtxLogSumExp(input, output, m, n), backend.DirectPtxLastError);
+            backend.Synchronize();
+
+            bool captureLaunch = false;
+            IntPtr graph = backend.CaptureGraph(() =>
+                captureLaunch = backend.TryDirectPtxLogSumExp(input, output, m, n));
+            Assert.True(captureLaunch, backend.DirectPtxLastError);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            try
+            {
+                backend.LaunchCapturedGraph(graph);
+                float expected = MathF.Log(n);
+                Assert.All(backend.DownloadBuffer(output), value =>
+                    Assert.InRange(value, expected - 2e-3f, expected + 2e-3f));
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(graph);
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+        }
+    }
+
+    [SkippableFact]
     public void Backend_SoftmaxVariants_ThreeWayParity()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");

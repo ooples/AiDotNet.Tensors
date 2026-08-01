@@ -48,9 +48,9 @@ public sealed partial class CudaBackend
         if (input.SizeInBytes != checked((long)m * n * sizeof(float)) ||
             output.SizeInBytes != checked((long)m * sizeof(float)))
         { DirectPtxLastError = "logsumexp-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxSoftmaxKey(m, n);
+        return Dispatch2(_directPtxLogSumExpKernels, key, () =>
         {
-            var key = new DirectPtxSoftmaxKey(m, n);
             var kernel = _directPtxLogSumExpKernels.GetOrAdd(key, () => new PtxLogSumExpKernel(_directPtxRuntime!, m, n));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -71,9 +71,9 @@ public sealed partial class CudaBackend
             grad.SizeInBytes != checked((long)m * sizeof(float)) ||
             output.SizeInBytes != checked((long)m * n * sizeof(float)))
         { DirectPtxLastError = "logsumexp-backward-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxSoftmaxKey(m, n);
+        return Dispatch2(_directPtxLogSumExpBackwardKernels, key, () =>
         {
-            var key = new DirectPtxSoftmaxKey(m, n);
             var kernel = _directPtxLogSumExpBackwardKernels.GetOrAdd(key, () => new PtxLogSumExpBackwardKernel(_directPtxRuntime!, m, n));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -93,9 +93,9 @@ public sealed partial class CudaBackend
         long bytes = checked((long)m * n * sizeof(float));
         if (softmax.SizeInBytes != bytes || grad.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "softmax-backward-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxSoftmaxKey(m, n);
+        return Dispatch2(_directPtxSoftmaxBackwardKernels, key, () =>
         {
-            var key = new DirectPtxSoftmaxKey(m, n);
             var kernel = _directPtxSoftmaxBackwardKernels.GetOrAdd(key, () => new PtxSoftmaxBackwardKernel(_directPtxRuntime!, m, n));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -114,9 +114,9 @@ public sealed partial class CudaBackend
         long bytes = checked((long)m * n * sizeof(float));
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "taylor-softmax-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxSoftmaxKey(m, n);
+        return Dispatch2(_directPtxTaylorSoftmaxKernels, key, () =>
         {
-            var key = new DirectPtxSoftmaxKey(m, n);
             var kernel = _directPtxTaylorSoftmaxKernels.GetOrAdd(key, () => new PtxTaylorSoftmaxKernel(_directPtxRuntime!, m, n));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -134,9 +134,9 @@ public sealed partial class CudaBackend
         long bytes = checked((long)m * n * sizeof(float));
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "sparsemax-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxSoftmaxKey(m, n);
+        return Dispatch2(_directPtxSparsemaxKernels, key, () =>
         {
-            var key = new DirectPtxSoftmaxKey(m, n);
             var kernel = _directPtxSparsemaxKernels.GetOrAdd(key, () => new PtxSparsemaxKernel(_directPtxRuntime!, m, n));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -154,9 +154,9 @@ public sealed partial class CudaBackend
         long bytes = checked((long)count * sizeof(float));
         if (input.SizeInBytes != bytes || mask.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "masked-fill-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxMaskedFillKey(count, BitConverter.ToInt32(BitConverter.GetBytes(fill), 0));
+        return Dispatch2(_directPtxMaskedFillKernels, key, () =>
         {
-            var key = new DirectPtxMaskedFillKey(count, BitConverter.ToInt32(BitConverter.GetBytes(fill), 0));
             var kernel = _directPtxMaskedFillKernels.GetOrAdd(key, () => new PtxMaskedFillKernel(_directPtxRuntime!, count, fill));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -175,9 +175,9 @@ public sealed partial class CudaBackend
         long bytes = checked((long)count * sizeof(float));
         if (grad.SizeInBytes != bytes || mask.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "masked-fill-backward-physical-extent-mismatch"; return false; }
-        return Dispatch2(() =>
+        var key = new DirectPtxMaskedFillBackwardKey(count);
+        return Dispatch2(_directPtxMaskedFillBackwardKernels, key, () =>
         {
-            var key = new DirectPtxMaskedFillBackwardKey(count);
             var kernel = _directPtxMaskedFillBackwardKernels.GetOrAdd(key, () => new PtxMaskedFillBackwardKernel(_directPtxRuntime!, count));
             lock (GpuDispatchLock)
                 kernel.Launch(
@@ -189,19 +189,32 @@ public sealed partial class CudaBackend
     private long _directPtxMaskedFillBackwardDispatchCount;
 
     // Shared eligibility/dispatch shell: capture-safe context, cache locking, error trapping.
-    private bool Dispatch2(Action launch, ref long counter)
+    private bool Dispatch2<TKey, TKernel>(
+        DirectPtxKernelCache<TKey, TKernel> kernels,
+        TKey key,
+        Action launch,
+        ref long counter)
+        where TKey : notnull
+        where TKernel : class, IDisposable
     {
         try
         {
-            if (IsStreamCapturing())
-            {
-                DirectPtxLastError = "Direct PTX softmax-family kernels must be prewarmed before CUDA graph capture.";
-                return false;
-            }
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                if (!kernels.TryGetValue(key, out _))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError = "Direct PTX softmax-family kernels must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                }
+                if (capturing && !kernels.Pin(key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX softmax-family module for CUDA graph capture.");
                 launch();
             }
             System.Threading.Interlocked.Increment(ref counter);
