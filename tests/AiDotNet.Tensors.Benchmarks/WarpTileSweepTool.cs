@@ -66,6 +66,17 @@ internal static class WarpTileSweepTool
         // same kernel name looks alike to ncu.
         string? only = args.Length > 0 && args[0].Contains('x') ? args[0] : null;
         string? shapeOnly = args.Length > 1 ? args[1] : null;
+        bool fp64AnchorEstablished = false;
+        bool excludesFp64Anchor =
+            (only is not null && only != "2x2") ||
+            (shapeOnly is not null && !"256^3".StartsWith(shapeOnly, StringComparison.Ordinal));
+        if (excludesFp64Anchor)
+        {
+            Console.WriteLine(
+                "WARNING: filters exclude the 2x2-at-256^3 fp64 reference anchor; larger-shape " +
+                "comparisons are relative only and will be labeled unanchored.");
+            Console.WriteLine();
+        }
 
         foreach (var (label, spec, m, n, k) in Shapes())
         {
@@ -78,7 +89,7 @@ internal static class WarpTileSweepTool
                 foreach (bool async in AsyncForms)
                 {
                     double us = Measure(runtime, spec, major, minor, tm, tn, async,
-                                        m, n, k, label, ref baseline);
+                                        m, n, k, label, ref baseline, ref fp64AnchorEstablished);
                     if (us > 0 && baseline == 0) baseline = us;
                 }
 
@@ -95,7 +106,8 @@ internal static class WarpTileSweepTool
 
     private static double Measure(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        int tileM, int tileN, bool async, int m, int n, int k, string label, ref double baseline)
+        int tileM, int tileN, bool async, int m, int n, int k, string label,
+        ref double baseline, ref bool fp64AnchorEstablished)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -164,6 +176,7 @@ internal static class WarpTileSweepTool
             bool usesFp64Reference = (long)m * n * k <= 64L * 1024 * 1024;
             string correctnessReference = usesFp64Reference
                 ? "fp64"
+                : !fp64AnchorEstablished ? "unanchored"
                 : tileM == 2 && tileN == 2 ? "root@256" : "tile2x2";
             if (usesFp64Reference)
             {
@@ -186,6 +199,8 @@ internal static class WarpTileSweepTool
                 Report(label, tileM, tileN, emitter, correctnessReference, deviation, 0, 0, "WRONG");
                 return 0;
             }
+            if (usesFp64Reference && tileM == 2 && tileN == 2)
+                fp64AnchorEstablished = true;
 
             long macs = (long)m * n * k;
             double us = TimeIt(runtime, module, fn, pointers, blocks, threads, macs);
