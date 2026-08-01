@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Text;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -10,6 +11,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -2338,6 +2340,8 @@ public class DirectPtxScientificTests
         Assert.Contains("WRITE_LOOP:", ptx);
         Assert.Contains("COPY_LOOP:", ptx);            // zero-tangent branch
         Assert.Contains("tanh.approx.f32", ptx);
+        Assert.Contains("rcp.rn.f32 %f8, %f7", ptx);           // lambda_x / 2
+        Assert.Contains("min.f32 %f10, %f10, 0f41A00000", ptx);// clamp tanh argument to 20
         Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));    // vNorm + sqrtC
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
@@ -2361,27 +2365,14 @@ public class DirectPtxScientificTests
         float[] xHost = Values(random, batch * dim, 0.1f);   // base points inside the ball
         float[] vHost = Values(random, batch * dim, 0.15f);  // tangent vectors
         var expected = new float[batch * dim];
+        CpuHyperbolicManifoldEngine oracle = CpuHyperbolicManifoldEngine.Instance;
         for (int row = 0; row < batch; row++)
         {
-            double xn = 0, vn = 0, xv = 0;
+            var basePoint = new Vector<float>(xHost.Skip(row * dim).Take(dim));
+            var tangent = new Vector<float>(vHost.Skip(row * dim).Take(dim));
+            Vector<float> rowExpected = oracle.PoincareExpMap(basePoint, tangent, c);
             for (int i = 0; i < dim; i++)
-            {
-                double xi = xHost[row * dim + i], vi = vHost[row * dim + i];
-                xn += xi * xi; vn += vi * vi; xv += xi * vi;
-            }
-            double vNorm = Math.Sqrt(vn);
-            double sqrtC = Math.Sqrt(c);
-            double cf = 1.0 - c * xn;
-            double arg = sqrtC * vNorm * (cf / 2.0);
-            double scale = Math.Tanh(arg) / (sqrtC * vNorm);
-            double svNormSq = scale * scale * vn;
-            double xsvDot = scale * xv;
-            double numX = 1.0 + 2.0 * c * xsvDot + c * svNormSq;
-            double numSv = 1.0 - c * xn;
-            double denom = 1.0 + 2.0 * c * xsvDot + (double)c * c * xn * svNormSq;
-            if (Math.Abs(denom) < 1e-10) denom = 1e-10;
-            for (int i = 0; i < dim; i++)
-                expected[row * dim + i] = (float)((numX * xHost[row * dim + i] + numSv * (scale * vHost[row * dim + i])) / denom);
+                expected[row * dim + i] = rowExpected[i];
         }
 
         using var x = runtime.AllocateBytes((nuint)(xHost.Length * sizeof(float)));

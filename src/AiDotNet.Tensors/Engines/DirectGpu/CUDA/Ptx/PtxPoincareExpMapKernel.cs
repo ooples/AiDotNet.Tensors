@@ -7,7 +7,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Poincaré exponential map <c>exp_x(v)</c> per vector (issue #854), matching the established
 /// NVRTC kernel exactly. Thread-per-vector: one thread reduces <c>|x|²</c>, <c>|v|²</c> and
-/// <c>⟨x,v⟩</c> serially, forms the tangent scale <c>tanh(√c·|v|·(1−c|x|²)/2)/(√c·|v|)</c>,
+/// <c>⟨x,v⟩</c> serially, forms the tangent scale
+/// <c>tanh(√c·|v|/(1−c|x|²))/(√c·|v|)</c>,
 /// then writes the Möbius combination
 /// <c>(num_x·x + num_sv·(scale·v)) / denom</c> where the coefficients derive from the scaled
 /// tangent. A zero tangent (<c>|v| &lt; 1e-10</c>) copies the base point. No shared memory,
@@ -79,8 +80,8 @@ internal sealed class PtxPoincareExpMapKernel : IDisposable
         int rowBytes = checked(dim * sizeof(float));
         string tiny = "0f" + BitConverter.ToInt32(BitConverter.GetBytes(1e-10f), 0).ToString("X8");
         const string One = "0f3F800000";
-        const string Half = "0f3F000000";
         const string Two = "0f40000000";
+        const string Twenty = "0f41A00000";
 
         var ptx = new StringBuilder(9_000);
         ptx.AppendLine(".version 7.1");
@@ -137,13 +138,16 @@ internal sealed class PtxPoincareExpMapKernel : IDisposable
         ptx.AppendLine($"    setp.lt.f32 %p1, %f5, {tiny};");
         ptx.AppendLine("    @%p1 bra.uni COPY_BASE;");
 
-        // scale = tanh(sqrtC*vNorm*(1-c*xNormSq)/2) / (sqrtC*vNorm)
+        // lambda_x = 2/(1-c*xNormSq), so lambda_x/2 = 1/(1-c*xNormSq).
+        // scale = tanh(sqrtC*vNorm/(1-c*xNormSq)) / (sqrtC*vNorm)
         ptx.AppendLine("    sqrt.rn.f32 %f6, %f0;");            // sqrtC
         ptx.AppendLine("    mul.rn.f32 %f7, %f0, %f2;");        // c*xNormSq
-        ptx.AppendLine($"    sub.rn.f32 %f7, {One}, %f7;");     // conformalFactor = 1 - c*xNormSq (= num_sv)
-        ptx.AppendLine($"    mul.rn.f32 %f8, %f7, {Half};");    // lambda
+        ptx.AppendLine($"    sub.rn.f32 %f7, {One}, %f7;");     // 1 - c*xNormSq (= num_sv)
+        ptx.AppendLine($"    max.f32 %f7, %f7, {tiny};");       // CPU denominator clamp
+        ptx.AppendLine("    rcp.rn.f32 %f8, %f7;");             // lambda_x / 2
         ptx.AppendLine("    mul.rn.f32 %f9, %f6, %f5;");        // sqrtC*vNorm
-        ptx.AppendLine("    mul.rn.f32 %f10, %f9, %f8;");       // arg
+        ptx.AppendLine("    mul.rn.f32 %f10, %f9, %f8;");       // sqrtC*vNorm/(1-c*xNormSq)
+        ptx.AppendLine($"    min.f32 %f10, %f10, {Twenty};");   // CPU tanh overflow clamp
         ptx.AppendLine("    tanh.approx.f32 %f10, %f10;");
         ptx.AppendLine("    rcp.approx.f32 %f11, %f9;");        // 1/(sqrtC*vNorm)
         ptx.AppendLine("    mul.rn.f32 %f11, %f10, %f11;");     // scale
