@@ -164,14 +164,23 @@ internal static class DirectPtxConvolutionAutotuner
         KernelChoice? cached = AutotuneCache.Lookup(
             kernelId,
             ConvTileAutotune.Shape(batch, outputChannels, inputChannels, spatial));
-        if (cached is null)
+        return TryGetVariant(cached, outputChannels, inputChannels, spatial, out variant);
+    }
+
+    internal static bool TryGetVariant(
+        KernelChoice? choice,
+        int outputChannels,
+        int inputChannels,
+        int spatial,
+        out DirectPtxConvolutionVariant variant)
+    {
+        if (choice is null || string.IsNullOrWhiteSpace(choice.Variant))
         {
             variant = default;
             return false;
         }
-
         return TryGetVariant(
-            new AutotuneCandidate(cached.Variant, cached.Parameters),
+            new AutotuneCandidate(choice.Variant, choice.Parameters),
             outputChannels, inputChannels, spatial, out variant);
     }
 }

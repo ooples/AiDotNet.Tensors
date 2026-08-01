@@ -172,6 +172,11 @@ public sealed class DirectPtxConvolutionTests
             new AutotuneCandidate("unknown"), 64, 64, 256, out _));
         Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
             candidates[0], 0, 64, 256, out _));
+
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new KernelChoice { Variant = " " }, 64, 64, 256, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            default(KernelChoice), 64, 64, 256, out _));
     }
 
     [Fact]
