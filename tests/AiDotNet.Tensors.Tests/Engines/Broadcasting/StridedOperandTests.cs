@@ -30,7 +30,7 @@ public class StridedOperandTests
     {
         var rng = new Random(seed);
         var t = new Tensor<double>(shape);
-        for (int i = 0; i < t.Length; i++) t[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < t.Length; i++) t[i] = 0.5 + rng.NextDouble();
         return t;
     }
 
@@ -50,6 +50,8 @@ public class StridedOperandTests
                                   stridedOnLeft ? _engine.TensorSubtract(dense, other) : _engine.TensorSubtract(other, dense)),
                      ("multiply", stridedOnLeft ? _engine.TensorMultiply(strided, other) : _engine.TensorMultiply(other, strided),
                                   stridedOnLeft ? _engine.TensorMultiply(dense, other) : _engine.TensorMultiply(other, dense)),
+                     ("divide", stridedOnLeft ? _engine.TensorDivide(strided, other) : _engine.TensorDivide(other, strided),
+                                stridedOnLeft ? _engine.TensorDivide(dense, other) : _engine.TensorDivide(other, dense)),
                  })
         {
             Assert.Equal(viaDense.Shape.ToArray(), viaStrided.Shape.ToArray());
@@ -110,10 +112,17 @@ public class StridedOperandTests
 
         var strided = _engine.TensorAdd(a, b);
         var dense = _engine.TensorAdd(a.Contiguous(), b.Contiguous());
+        var stridedDivide = _engine.TensorDivide(a, b);
+        var denseDivide = _engine.TensorDivide(a.Contiguous(), b.Contiguous());
 
         for (int i = 0; i < dense.Length; i++)
+        {
             Assert.True(Math.Abs(dense[i] - strided[i]) < 1e-12,
                 $"both-strided add: element {i} is {strided[i]:G17} vs {dense[i]:G17} materialized");
+            Assert.True(Math.Abs(denseDivide[i] - stridedDivide[i]) < 1e-12,
+                $"both-strided divide: element {i} is {stridedDivide[i]:G17} vs " +
+                $"{denseDivide[i]:G17} materialized");
+        }
     }
 
     /// <summary>
