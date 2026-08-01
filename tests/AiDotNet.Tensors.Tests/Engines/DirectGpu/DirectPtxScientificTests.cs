@@ -1526,23 +1526,33 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void QuantumRotationEmitter_UnrollsQubitsWithBarriers()
+    public void QuantumRotationEmitter_CachesTrigAndScopesBarriers()
     {
         const int numQubits = 4;
         string ptx = PtxQuantumRotationKernel.EmitPtx(8, 6, numQubits, 16);
         Assert.Contains(PtxQuantumRotationKernel.EntryPoint, ptx);
         Assert.Contains("$QR_INIT:", ptx);
-        Assert.Equal(numQubits, Count(ptx, "cos.approx.f32"));   // one per qubit
+        Assert.Contains(".shared .align 8 .b8 trig[32]", ptx);
+        Assert.Contains(".shared .align 16 .b8 state_real[64]", ptx);
+        Assert.Contains(".shared .align 16 .b8 state_imag[64]", ptx);
+        Assert.Contains("$QR_STORE:", ptx);
+        Assert.Equal(numQubits, Count(ptx, "cos.approx.f32"));   // one predicated producer per qubit
         Assert.Equal(numQubits, Count(ptx, "sin.approx.f32"));
-        Assert.Equal(numQubits + 1, Count(ptx, "bar.sync 0"));   // init + one per qubit step
+        Assert.Equal(2, Count(ptx, "bar.sync 0"));               // init/cache visibility + final publish
+        Assert.Equal(3, Count(ptx, "bar.warp.sync"));            // q0->q1 through q2->q3
+        Assert.Equal(numQubits, Count(ptx, "ld.shared.f32 %f4, [trig"));
+        Assert.Equal(numQubits, Count(ptx, "ld.shared.f32 %f5, [trig"));
         for (int q = 0; q < numQubits; q++) Assert.Contains($"$QR_STEP{q}:", ptx);
         Assert.DoesNotContain("shfl.sync.bfly", ptx, StringComparison.Ordinal);   // discipline rule 1
-        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxQuantumRotationKernel.IsSupportedShape(numQubits, 16));
         Assert.False(PtxQuantumRotationKernel.IsSupportedShape(0, 16));
         Assert.False(PtxQuantumRotationKernel.IsSupportedShape(PtxQuantumRotationKernel.MaxQubits + 1, 16));
         Assert.False(PtxQuantumRotationKernel.IsPromotedShape(numQubits, 16));
+
+        string largePtx = PtxQuantumRotationKernel.EmitPtx(8, 6, 13, 1);
+        Assert.DoesNotContain("state_real", largePtx, StringComparison.Ordinal);
+        Assert.DoesNotContain("$QR_STORE:", largePtx, StringComparison.Ordinal);
     }
 
     [SkippableFact]
@@ -1553,6 +1563,7 @@ public class DirectPtxScientificTests
         const int numQubits = 6, batchSize = 16;
         int dim = 1 << numQubits;
         using var kernel = new PtxQuantumRotationKernel(runtime, numQubits, batchSize);
+        Assert.Equal(36, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20268300);
