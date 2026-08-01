@@ -13,6 +13,18 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class DirectPtxSoftmaxTests
 {
+    private sealed class TrackedResource : IDisposable
+    {
+        internal bool IsDisposed { get; private set; }
+        internal bool ThrowOnDispose { get; init; }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
+    }
+
     [SkippableFact]
     public void StandaloneRuntime_OrdersSynchronousUploadsBeforeLaunches()
     {
@@ -64,6 +76,34 @@ public class DirectPtxSoftmaxTests
             c => c.Status == DirectPtxSoftmaxCoverageStatus.PlannedDirectPtx);
         Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() =>
             DirectPtxSoftmaxCoverageManifest.Get("UnassignedSoftmaxApi"));
+    }
+
+    [Fact]
+    public void SoftmaxPostLoadInitialization_DisposesAndPreservesPrimaryFailure()
+    {
+        var resource = new TrackedResource { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("resource validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackedResource, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void SoftmaxPostLoadInitialization_TransfersSuccessfulOwnership()
+    {
+        var resource = new TrackedResource();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
+        Assert.True(resource.IsDisposed);
     }
 
     [Fact]
