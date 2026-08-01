@@ -1,5 +1,19 @@
 # Path to wins: every kernel, every competitor
 
+## Current status: the p13 catalog is closed
+
+The historical p4 and p9 investigation below is preserved, including predictions that
+hardware falsified. The completed p13 loop used those limiter findings to search the shared
+contraction, tiled-Conv2D, Winograd, cooperative-reduction, split-K, and parity families. A
+fresh consolidated run on the RTX 3080 produced **13 stable wins, zero ties, zero losses,
+and zero refused rows** against PyTorch 2.12.1/cuDNN 9.2 with true FP32 CUDA-graph replay.
+All 13 selected programs first passed the generated fp64 oracle.
+
+`--kernel-championship` now performs that complete loop for any catalog selector: exhaustive
+measured autotune, fp64 verification, competitor measurement, then Nsight + catalog-oracle
+diagnosis if any result remains below 1.10x. It checks the expected row count and fails the
+process when even one stable non-win remains.
+
 One table per kernel, three measured columns, and a named lever with a prediction that can
 be wrong. Nothing here is a plan on its own — each row says what is saturated, what the
 next change is, and what result would falsify it.
