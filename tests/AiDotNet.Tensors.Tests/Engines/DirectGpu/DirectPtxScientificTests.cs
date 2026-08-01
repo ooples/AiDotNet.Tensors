@@ -1606,17 +1606,22 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void MeasurementForwardEmitter_FusesMagnitudeAndNormalize()
+    public void MeasurementForwardEmitter_FusesMagnitudeAndWarpNormalize()
     {
         string ptx = PtxMeasurementForwardKernel.EmitPtx(8, 6, 32, 256);
         Assert.Contains(PtxMeasurementForwardKernel.EntryPoint, ptx);
-        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);
-        Assert.Contains("$MF_SUM:", ptx);                          // |z|^2 + partial sum
-        Assert.Contains("$MF_DIV:", ptx);                          // normalize
-        Assert.Equal(1, Count(ptx, "fma.rn.f32"));                 // re^2 + im^2
-        Assert.Equal(9, Count(ptx, "bar.sync 0"));                 // 1 after load + 8 tree strides
-        Assert.Equal(1, Count(ptx, "max.f32"));                    // clamp
-        Assert.Equal(1, Count(ptx, "div.rn.f32"));                 // normalize
+        Assert.Contains("$MF_SUM:", ptx);                         // |z|^2 + partial sum
+        Assert.Contains("$MF_DIV:", ptx);                         // normalize
+        Assert.Contains("ld.global.nc.v2.f32", ptx);              // interleaved complex load
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);              // warp owns row
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);             // lane owns states
+        Assert.Equal(1, Count(ptx, "fma.rn.f32"));                // re^2 + im^2
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));        // warp sum
+        Assert.Equal(1, Count(ptx, "shfl.sync.idx.b32"));         // broadcast row sum
+        Assert.Equal(1, Count(ptx, "max.f32"));                   // clamp
+        Assert.Equal(1, Count(ptx, "div.rn.f32"));                // normalize
+        Assert.DoesNotContain("bar.sync", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxMeasurementForwardKernel.IsSupportedShape(32, 256));
         Assert.False(PtxMeasurementForwardKernel.IsSupportedShape(32, 0));
@@ -1628,8 +1633,9 @@ public class DirectPtxScientificTests
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in measurement-forward specialization is measured on GA10x/SM86.");
-        const int batchSize = 32, stateSize = 256;   // state > blockDim exercises the strided loop
+        const int batchSize = 33, stateSize = 263;   // ragged row count and lane-strided state tail
         using var kernel = new PtxMeasurementForwardKernel(runtime, batchSize, stateSize);
+        Assert.Equal(24, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20268200);
