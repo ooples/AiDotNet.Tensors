@@ -2726,6 +2726,7 @@ public static class OpParityRegistry
         yield return Bb("TensorDivide", "bcast-row", "arithmetic", (e, u, v) => e.TensorDivide(u, v), (e, u, v) => e.TensorDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
         yield return Bb("TensorAdd", "bcast-col", "arithmetic", (e, u, v) => e.TensorAdd(u, v), (e, u, v) => e.TensorAdd(u, v), ParityTol.Exact, square, bcol);
         yield return Bb("TensorSubtract", "bcast-col", "arithmetic", (e, u, v) => e.TensorSubtract(u, v), (e, u, v) => e.TensorSubtract(u, v), ParityTol.Exact, square, bcol);
+        yield return Bb("TensorMultiply", "bcast-col", "arithmetic", (e, u, v) => e.TensorMultiply(u, v), (e, u, v) => e.TensorMultiply(u, v), ParityTol.Ulp(2, 1e-6), square, bcol);
         yield return Bb("TensorDivide", "bcast-col", "arithmetic", (e, u, v) => e.TensorDivide(u, v), (e, u, v) => e.TensorDivide(u, v), ParityTol.Ulp(4, 1e-6), square, OpInput.Rand(407, new[] { 64, 1 }, 0.5, 3.0));
 
         // Scalar-arg ops.
