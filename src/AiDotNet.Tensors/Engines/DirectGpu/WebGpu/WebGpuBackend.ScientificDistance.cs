@@ -13,13 +13,23 @@ public sealed partial class WebGpuBackend
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int m, int n, int dim)
         => DispatchScientificDistanceAsync(
             "PairwiseDistance", WebGpuParity210Kernels.CdistL2,
-            a, b, output, m * n, m, n, dim).GetAwaiter().GetResult();
+            a, b, output, CheckedPairwiseWorkItems(m, n), m, n, dim).GetAwaiter().GetResult();
 
     public void PairwiseDistanceSquared(
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int m, int n, int dim)
         => DispatchScientificDistanceAsync(
             "PairwiseDistanceSquared", WebGpuParity210Kernels.CdistL2Squared,
-            a, b, output, m * n, m, n, dim).GetAwaiter().GetResult();
+            a, b, output, CheckedPairwiseWorkItems(m, n), m, n, dim).GetAwaiter().GetResult();
+
+    private static int CheckedPairwiseWorkItems(int m, int n)
+    {
+        long total = (long)m * n;
+        if (total <= 0) return 0;
+        if (total > int.MaxValue)
+            throw new OverflowException(
+                $"Pairwise-distance work-item count {total} exceeds Int32.MaxValue.");
+        return (int)total;
+    }
 
     private async Task DispatchScientificDistanceAsync(
         string operation, string source, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
