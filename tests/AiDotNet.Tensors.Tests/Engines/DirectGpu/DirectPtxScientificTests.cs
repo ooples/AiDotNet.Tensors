@@ -1320,19 +1320,23 @@ public class DirectPtxScientificTests
     [Theory]
     [InlineData(AnnMetric.L2)]
     [InlineData(AnnMetric.InnerProduct)]
-    public void AnnIvfAssignEmitter_IsThreadPerVectorCentroidScan(AnnMetric metric)
+    public void AnnIvfAssignEmitter_IsWarpPerVectorCentroidScan(AnnMetric metric)
     {
         string ptx = PtxAnnIvfAssignKernel.EmitPtx(8, 6, metric, 256, 8, 12);
         Assert.Contains(PtxAnnIvfAssignKernel.EntryPoint, ptx);
         Assert.Contains("$IVF_C_LOOP:", ptx);   // scan over centroids
         Assert.Contains("$IVF_K_LOOP:", ptx);   // metric over dim
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));
         Assert.Equal(1, Count(ptx, "st.global.u32"));   // int32 assignment
-        Assert.Contains(metric == AnnMetric.InnerProduct ? "setp.gt.f32 %p1" : "setp.lt.f32 %p1", ptx);   // argmax vs argmin
+        Assert.Contains(metric == AnnMetric.InnerProduct ? "setp.gt.f32 %p2" : "setp.lt.f32 %p2", ptx);   // argmax vs argmin
         Assert.Contains(metric == AnnMetric.InnerProduct ? "mov.f32 %f0, 0fFF800000" : "mov.f32 %f0, 0f7F800000", ptx);   // best init
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxAnnIvfAssignKernel.IsSupportedShape(256, 8, 12));
-        Assert.False(PtxAnnIvfAssignKernel.IsSupportedShape(255, 8, 12));   // not a multiple of 256
+        Assert.True(PtxAnnIvfAssignKernel.IsSupportedShape(248, 8, 12));
+        Assert.False(PtxAnnIvfAssignKernel.IsSupportedShape(255, 8, 12));   // not a multiple of 8
         Assert.False(PtxAnnIvfAssignKernel.IsPromotedShape(256, 8, 12));
     }
 
