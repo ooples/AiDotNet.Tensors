@@ -518,16 +518,12 @@ internal static class MathOperators
 
         private static Tensor<T> MultiplyMaybeBroadcast(OnnxTranslationContext<T> ctx, Tensor<T> a, Tensor<T> b)
         {
-            return ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorMultiply(a, b)
-                : ctx.Engine.TensorMultiply(a, b);
+            return ctx.Engine.TensorMultiply(a, b);
         }
 
         private static Tensor<T> AddMaybeBroadcast(OnnxTranslationContext<T> ctx, Tensor<T> a, Tensor<T> b)
         {
-            return ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorAdd(a, b)
-                : ctx.Engine.TensorAdd(a, b);
+            return ctx.Engine.TensorAdd(a, b);
         }
     }
 

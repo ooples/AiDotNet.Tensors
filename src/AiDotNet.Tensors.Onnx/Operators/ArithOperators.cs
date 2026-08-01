@@ -201,8 +201,7 @@ internal static class ArithOperators
 
     /// <summary>
     /// ONNX Add — elementwise add with numpy-style broadcasting. Maps to
-    /// <c>TensorAdd</c> when shapes match and <c>TensorAdd</c>
-    /// otherwise.
+    /// <c>TensorAdd</c> for both equal and broadcast-compatible shapes.
     /// </summary>
     internal sealed class Add<T> : IOnnxOpTranslator<T> where T : unmanaged
     {
@@ -213,9 +212,7 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            var result = ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorAdd(a, b)
-                : ctx.Engine.TensorAdd(a, b);
+            var result = ctx.Engine.TensorAdd(a, b);
             ctx.PutTensor(node.Output[0], result);
         }
     }
@@ -232,9 +229,7 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            var result = ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorMultiply(a, b)
-                : ctx.Engine.TensorMultiply(a, b);
+            var result = ctx.Engine.TensorMultiply(a, b);
             ctx.PutTensor(node.Output[0], result);
         }
     }
@@ -249,9 +244,7 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            var result = ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorSubtract(a, b)
-                : ctx.Engine.TensorSubtract(a, b);
+            var result = ctx.Engine.TensorSubtract(a, b);
             ctx.PutTensor(node.Output[0], result);
         }
     }
@@ -266,18 +259,8 @@ internal static class ArithOperators
         {
             var a = ctx.GetTensor(node.Input[0]);
             var b = ctx.GetTensor(node.Input[1]);
-            var result = ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorDivide(a, b)
-                : ctx.Engine.TensorDivide(a, b);
+            var result = ctx.Engine.TensorDivide(a, b);
             ctx.PutTensor(node.Output[0], result);
         }
-    }
-
-    private static bool ShapesEqual(int[] a, int[] b)
-    {
-        if (a.Length != b.Length) return false;
-        for (int i = 0; i < a.Length; i++)
-            if (a[i] != b[i]) return false;
-        return true;
     }
 }
