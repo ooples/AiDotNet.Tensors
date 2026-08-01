@@ -152,6 +152,31 @@ public class NamedTensorTests
     }
 
     [Fact]
+    public void AddAndMultiply_PreserveNamesAndValuesForStridedLeftOperand()
+    {
+        var storage = new Tensor<float>(new[] { 2, 3 });
+        storage[0, 0] = 1; storage[0, 1] = 2; storage[0, 2] = 3;
+        storage[1, 0] = 4; storage[1, 1] = 5; storage[1, 2] = 6;
+        Tensor<float> strided = storage.Transpose(new[] { 1, 0 });
+        Assert.False(strided.IsContiguous);
+        var named = new NamedTensor<float>(strided, "features", "batch");
+
+        var perFeature = new Tensor<float>(new[] { 3 });
+        perFeature[0] = 10; perFeature[1] = 20; perFeature[2] = 30;
+        var namedPerFeature = new NamedTensor<float>(perFeature, "features");
+
+        NamedTensor<float> added = NamedOps.Add(named, namedPerFeature);
+        NamedTensor<float> multiplied = NamedOps.Multiply(named, namedPerFeature);
+
+        Assert.Equal(new string?[] { "features", "batch" }, added.Names);
+        Assert.Equal(new string?[] { "features", "batch" }, multiplied.Names);
+        Assert.Equal(new[] { 3, 2 }, added.Shape);
+        Assert.Equal(new[] { 3, 2 }, multiplied.Shape);
+        Assert.Equal(new float[] { 11, 14, 22, 25, 33, 36 }, added.Tensor.AsSpan().ToArray());
+        Assert.Equal(new float[] { 10, 40, 40, 100, 90, 180 }, multiplied.Tensor.AsSpan().ToArray());
+    }
+
+    [Fact]
     public void Sum_ReducesByName()
     {
         var t = new Tensor<float>(new[] { 2, 3 });
