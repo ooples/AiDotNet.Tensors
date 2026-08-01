@@ -32,8 +32,12 @@ public sealed partial class MetalBackend
         string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
         int m, int n, int dim)
     {
-        int total = m * n;
-        if (total <= 0) return;
+        long totalLong = (long)m * n;
+        if (totalLong <= 0) return;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException(
+                $"Pairwise-distance work-item count {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         ThrowIfDisposed();
         RequireMetal3(a, b, output, out var aBuffer, out var bBuffer, out var outputBuffer);
         var pipeline = GetParity210Pipeline(kernelName);
