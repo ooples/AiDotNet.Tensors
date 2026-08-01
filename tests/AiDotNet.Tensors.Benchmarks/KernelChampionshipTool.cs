@@ -34,22 +34,26 @@ internal static class KernelChampionshipTool
             : CodegenKernelCatalog.Find(selector) is null ? 0 : 1;
         RequireNonEmptySelection(selector, expected, "kernel-championship");
 
-        string evidenceDirectory = Path.GetFullPath(
-            ValueOf(args, "--evidence-dir") ?? Path.Combine("artifacts"));
+        string? requestedEvidenceDirectory = ValueOf(args, "--evidence-dir");
+        string autotunePath = requestedEvidenceDirectory is null
+            ? Path.GetFullPath(CodegenAutotuneCache.CachePath)
+            : Path.Combine(Path.GetFullPath(requestedEvidenceDirectory), "autotune.tsv");
+        string evidenceDirectory = Path.GetDirectoryName(autotunePath) ??
+            Directory.GetCurrentDirectory();
         Directory.CreateDirectory(evidenceDirectory);
-        string autotunePath = Path.Combine(evidenceDirectory, "autotune.tsv");
         string competitorPath = Path.Combine(evidenceDirectory, "competitor-ratios.tsv");
         string limiterPath = Path.Combine(evidenceDirectory, "limiter.tsv");
         string diagnosisPath = Path.Combine(evidenceDirectory, "kernel-diagnosis.tsv");
 
-        // The competitor lane launches a fresh copy of this assembly. Keep the standard
-        // repository-relative cache location unless the caller explicitly supplies an
-        // evidence directory, in which case publish its path for every child process.
+        // The competitor lane launches a fresh copy of this assembly. Preserve the
+        // caller's effective cache unless --evidence-dir explicitly requests isolation,
+        // and publish that effective path for every child process.
         string? priorCacheEnvironment =
             Environment.GetEnvironmentVariable("AIDOTNET_CODEGEN_AUTOTUNE_CACHE");
         string priorCachePath = CodegenAutotuneCache.CachePath;
         Environment.SetEnvironmentVariable("AIDOTNET_CODEGEN_AUTOTUNE_CACHE", autotunePath);
-        CodegenAutotuneCache.CachePath = autotunePath;
+        if (requestedEvidenceDirectory is not null)
+            CodegenAutotuneCache.CachePath = autotunePath;
         try
         {
             Console.WriteLine();
