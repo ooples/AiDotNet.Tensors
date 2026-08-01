@@ -907,7 +907,6 @@ internal static class BackwardFunctions<T>
     // Broadcast operations: reduce gradient along broadcast dims
     // ──────────────────────────────────────────────────────────────
 
-    /// <summary>d(broadcast_add(a,b))/da = reduce_grad(grad, a.shape), d/db = reduce_grad(grad, b.shape)</summary>
     /// <summary>
     /// d(expand(a))/da = sum of the gradient over every axis that was stretched.
     /// </summary>
@@ -928,6 +927,7 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>d(broadcast_add(a,b))/da = reduce_grad(grad, a.shape), d/db = reduce_grad(grad, b.shape)</summary>
     internal static void BroadcastAddBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
