@@ -24,8 +24,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Telemetry;
 /// <para><b>Never throws into dispatch.</b> Every network call is wrapped; on any
 /// error (offline, timeout, malformed response) Fetch returns empty and Publish
 /// no-ops. The publishable key is public-by-design; RLS on the table restricts
-/// the anon role to insert/select, and the client-side re-verification in
-/// <see cref="CommunityAutotune"/> means a hostile row can never harm a peer.</para>
+/// the anon role to insert/select. <see cref="CommunityAutotune"/> requires every
+/// downloaded row to pass a kernel-owned local allowlist and ignores reported
+/// throughput in favor of on-device remeasurement.</para>
 /// </summary>
 public sealed class SupabaseGpuTuningExchange : IGpuTuningExchange, IDisposable
 {

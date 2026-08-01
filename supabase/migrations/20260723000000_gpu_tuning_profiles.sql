@@ -3,10 +3,10 @@
 -- hardware class (not the per-card UUID) so a config tuned on one card reaches
 -- every card of that model on the same driver + architecture.
 --
--- Trust model: measured_gflops is advisory. Clients treat a downloaded row as a
--- candidate that must win their own on-device sweep before it is used, so a
--- poisoned or hardware-mismatched row cannot degrade a peer — it just loses.
--- Rows are therefore append-only community reports, never authoritative config.
+-- Trust model: measured_gflops is advisory. Clients first require a downloaded
+-- row to pass the kernel family's local variant allowlist, then ignore the
+-- reported score and remeasure on-device. Rows are append-only community
+-- reports, never authoritative configuration.
 
 create table if not exists public.gpu_tuning_profiles (
     id               bigint generated always as identity primary key,
