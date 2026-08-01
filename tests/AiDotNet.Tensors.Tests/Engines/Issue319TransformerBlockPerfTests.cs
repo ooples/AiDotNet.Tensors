@@ -203,6 +203,7 @@ public class Issue319TransformerBlockPerfTests
         const int Iters = 30;
 
         var engine = new CpuEngine();
+        AssertTensorAddBroadcastValues(engine);
         var rng = new Random(1);
 
         var x = MakeTensor(new[] { Seq, Hidden }, rng, 1.0);
@@ -226,9 +227,13 @@ public class Issue319TransformerBlockPerfTests
         long layerNormMs = TimeOp(totalCalls, () => engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
 
         var sw = Stopwatch.StartNew();
-        for (int it = 0; it < Iters; it++) RunFullBlock(engine, x, weight, bias, gamma, beta, Layers);
+        Tensor<float> fullBlockOutput = x;
+        for (int it = 0; it < Iters; it++)
+            fullBlockOutput = RunFullBlock(engine, x, weight, bias, gamma, beta, Layers);
         sw.Stop();
         double msPerIter = sw.Elapsed.TotalMilliseconds / Iters;
+
+        AssertFullBlockOutput(fullBlockOutput, Seq, Hidden);
 
         double matmulUs = (double)matmulMs * 1000.0 / totalCalls;
         double biasAddUs = (double)biasAddMs * 1000.0 / totalCalls;
@@ -285,7 +290,47 @@ public class Issue319TransformerBlockPerfTests
         return sw.ElapsedMilliseconds;
     }
 
-    private static void RunFullBlock(CpuEngine engine,
+    private static void AssertTensorAddBroadcastValues(CpuEngine engine)
+    {
+        var input = new Tensor<float>(new[] { 3, 4 });
+        var bias = new Tensor<float>(new[] { 4 });
+        for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 4; col++)
+            input[row, col] = row * 10f + col;
+        for (int col = 0; col < 4; col++) bias[col] = col + 0.25f;
+
+        var actual = engine.TensorAdd(input, bias);
+
+        Assert.Equal(new[] { 3, 4 }, actual.Shape.ToArray());
+        for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 4; col++)
+            Assert.Equal(input[row, col] + bias[col], actual[row, col]);
+    }
+
+    private static void AssertFullBlockOutput(Tensor<float> output, int rows, int columns)
+    {
+        Assert.Equal(new[] { rows, columns }, output.Shape.ToArray());
+        for (int row = 0; row < rows; row++)
+        {
+            double sum = 0;
+            double sumSquares = 0;
+            for (int col = 0; col < columns; col++)
+            {
+                float value = output[row, col];
+                Assert.False(float.IsNaN(value) || float.IsInfinity(value),
+                    $"Full transformer output is non-finite at [{row},{col}]: {value}.");
+                sum += value;
+                sumSquares += value * value;
+            }
+
+            double mean = sum / columns;
+            double meanSquare = sumSquares / columns;
+            Assert.InRange(mean, -5e-3, 5e-3);
+            Assert.InRange(meanSquare, 0.9, 1.1);
+        }
+    }
+
+    private static Tensor<float> RunFullBlock(CpuEngine engine,
         Tensor<float> x, Tensor<float> weight, Tensor<float> bias,
         Tensor<float> gamma, Tensor<float> beta, int layers)
     {
@@ -300,5 +345,7 @@ public class Issue319TransformerBlockPerfTests
             var a = engine.GELU(z2);
             current = engine.LayerNorm(a, gamma, beta, 1e-5, out _, out _);
         }
+
+        return current;
     }
 }
