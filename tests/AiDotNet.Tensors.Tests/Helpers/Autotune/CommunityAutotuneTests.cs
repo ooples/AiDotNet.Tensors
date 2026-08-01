@@ -139,6 +139,7 @@ public sealed class CommunityAutotuneTests : IDisposable
         exchange.Seed(Community("tile-999", 999, 999999.0));
         exchange.Seed(Community(" ", 32, 999998.0));
         bool unsupportedWasBenchmarked = false;
+        bool malformedWasBenchmarked = false;
 
         AutotuneResolution resolution = CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
@@ -149,12 +150,15 @@ public sealed class CommunityAutotuneTests : IDisposable
                     unsupportedWasBenchmarked = true;
                     return 999999.0;
                 }
+                if (string.IsNullOrWhiteSpace(candidate.Variant))
+                    malformedWasBenchmarked = true;
                 return candidate.Variant == "tile-16" ? 800.0 : 400.0;
             },
             candidate => candidate.Variant != "tile-999",
             autotuneEnabled: true);
 
         Assert.False(unsupportedWasBenchmarked);
+        Assert.False(malformedWasBenchmarked);
         Assert.Equal("tile-16", resolution.Variant);
         Assert.Equal("tile-16", Assert.Single(exchange.Published).Variant);
     }

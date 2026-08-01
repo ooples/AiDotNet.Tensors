@@ -132,7 +132,7 @@ public static class CommunityAutotune
 
         int added = 0;
         foreach (GpuTuningProfile profile in community
-                     .Where(p => p is not null && !string.IsNullOrEmpty(p.Variant))
+                     .Where(p => p is not null && !string.IsNullOrWhiteSpace(p.Variant))
                      .OrderByDescending(p => p.MeasuredGflops))
         {
             if (added >= maxCommunity) break;
