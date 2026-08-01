@@ -27,8 +27,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
             int m, int n, int dim)
         {
-            int total = m * n;
-            if (_context == null || total <= 0) return;
+            if (_context == null) return;
+            long totalLong = (long)m * n;
+            if (totalLong <= 0) return;
+            if (totalLong > int.MaxValue)
+                throw new OverflowException(
+                    $"Pairwise-distance work-item count {totalLong} exceeds Int32.MaxValue.");
+            int total = (int)totalLong;
             var kernel = _kernelCache[kernelName];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
             kernel.SetArg(1, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
