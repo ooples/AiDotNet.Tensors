@@ -7,13 +7,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// In-place probability normalization (issue #854), matching the NVRTC <c>normalize_probabilities</c>
 /// kernel: for each batch row, divide every entry by the row sum (clamped to at least 1e-10). One
-/// block owns one row; the 256 threads stride-accumulate a partial sum into shared memory, tree-reduce
-/// it to the row total, then each thread rescales its strided slice — matching the NVRTC shared-memory
-/// reduction. This is the quantum-measurement normalization pass, kept separate from the |amplitude|^2
-/// evaluation exactly as in the NVRTC split.
+/// warp owns one row; its lanes stride-accumulate partial sums, reduce with warp shuffles, then
+/// rescale their strided slices without shared memory or block barriers. This is the
+/// quantum-measurement normalization pass, kept separate from the |amplitude|^2 evaluation exactly
+/// as in the NVRTC split.
 ///
 /// Shape (batchSize, stateSize) is baked into the PTX, so the launch takes the buffer pointer only.
-/// One block per batch row (grid = batchSize), 256 threads/block; stateSize may exceed the block width.
+/// Eight rows per 256-thread block; stateSize may exceed the warp width and either dimension may be
+/// ragged.
 /// </summary>
 internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
 {
@@ -58,7 +59,9 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
         IntPtr probPointer = probabilities.Pointer;
         void** arguments = stackalloc void*[1];
         arguments[0] = &probPointer;
-        _module.Launch(_function, (uint)BatchSize, 1, 1, BlockThreads, 1, 1, 0, arguments);
+        _module.Launch(
+            _function, (uint)((BatchSize + (BlockThreads / 32) - 1) / (BlockThreads / 32)), 1, 1,
+            BlockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -78,61 +81,55 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<4>;");
+        ptx.AppendLine("    .reg .pred %p<3>;");
         ptx.AppendLine("    .reg .b32 %r<10>;");
-        ptx.AppendLine("    .reg .b64 %rd<16>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
         ptx.AppendLine("    .reg .f32 %f<8>;");
-        ptx.AppendLine($"    .shared .align 16 .b8 red[{BlockThreads * sizeof(float)}];");
         ptx.AppendLine("    ld.param.u64 %rd0, [prob_ptr];");
-        ptx.AppendLine("    mov.u64 %rd1, red;");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");                      // row (batch)
-        ptx.AppendLine($"    mul.wide.u32 %rd2, %r1, {stateSize * sizeof(float)};");
+        ptx.AppendLine($"    mad.lo.u32 %r0, %r1, {BlockThreads}, %r0;"); // global thread
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");                       // warp owns row
+        ptx.AppendLine("    and.b32 %r3, %r0, 31;");                      // lane owns state entries
+        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {batchSize};");
+        ptx.AppendLine("    @%p0 ret;");
+        ptx.AppendLine($"    mul.wide.u32 %rd2, %r2, {stateSize * sizeof(float)};");
         ptx.AppendLine("    add.u64 %rd3, %rd0, %rd2;");                   // &probs[row]
-        ptx.AppendLine("    mul.wide.u32 %rd4, %r0, 4;");
-        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd4;");                   // &red[tid]
+        ptx.AppendLine("    mul.wide.u32 %rd4, %r3, 4;");
 
-        // Pass 1: strided partial sum (i = tid; i < stateSize; i += 256)
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // sum
-        ptx.AppendLine("    mov.u32 %r2, %r0;");                          // i = tid
+        // Pass 1: lane-strided partial sum, then a full-warp reduction and broadcast.
+        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("    mov.u32 %r4, %r3;");
+        ptx.AppendLine("    add.u64 %rd5, %rd3, %rd4;");
+        ptx.AppendLine($"    setp.ge.u32 %p1, %r4, {stateSize};");
+        ptx.AppendLine("    @%p1 bra $NP_SUM_END;");
         ptx.AppendLine("$NP_SUM:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {stateSize};");
-        ptx.AppendLine("    @%p0 bra $NP_SUM_END;");
-        ptx.AppendLine("    mul.wide.u32 %rd6, %r2, 4;");
-        ptx.AppendLine("    add.u64 %rd7, %rd3, %rd6;");
-        ptx.AppendLine("    ld.global.f32 %f1, [%rd7];");
+        ptx.AppendLine("    ld.global.f32 %f1, [%rd5];");
         ptx.AppendLine("    add.rn.f32 %f0, %f0, %f1;");
-        ptx.AppendLine($"    add.u32 %r2, %r2, {BlockThreads};");
-        ptx.AppendLine("    bra.uni $NP_SUM;");
+        ptx.AppendLine("    add.u64 %rd5, %rd5, 128;");
+        ptx.AppendLine("    add.u32 %r4, %r4, 32;");
+        ptx.AppendLine($"    setp.lt.u32 %p1, %r4, {stateSize};");
+        ptx.AppendLine("    @%p1 bra $NP_SUM;");
         ptx.AppendLine("$NP_SUM_END:");
-        ptx.AppendLine("    st.shared.f32 [%rd5], %f0;");
-        ptx.AppendLine("    bar.sync 0;");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f0", "%r5", "%r6", "%f2");
+        ptx.AppendLine("    mov.b32 %r5, %f0;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r6, %r5, 0, 31, 0xffffffff;");
+        ptx.AppendLine("    mov.b32 %f4, %r6;");
+        ptx.AppendLine($"    max.f32 %f4, %f4, {minSum};");
 
-        // Tree reduction over 256 lanes (strides 128..1).
-        foreach (int stride in new[] { 128, 64, 32, 16, 8, 4, 2, 1 })
-        {
-            ptx.AppendLine($"    setp.lt.u32 %p1, %r0, {stride};");
-            ptx.AppendLine("    @%p1 ld.shared.f32 %f2, [%rd5];");
-            ptx.AppendLine($"    @%p1 ld.shared.f32 %f3, [%rd5+{stride * sizeof(float)}];");
-            ptx.AppendLine("    @%p1 add.rn.f32 %f2, %f2, %f3;");
-            ptx.AppendLine("    @%p1 st.shared.f32 [%rd5], %f2;");
-            ptx.AppendLine("    bar.sync 0;");
-        }
-        ptx.AppendLine("    ld.shared.f32 %f4, [%rd1];");                 // totalSum = red[0]
-        ptx.AppendLine($"    max.f32 %f4, %f4, {minSum};");              // clamp to >= 1e-10
-
-        // Pass 2: strided divide (probs[i] /= totalSum)
-        ptx.AppendLine("    mov.u32 %r2, %r0;");                          // i = tid
-        ptx.AppendLine("$NP_DIV:");
-        ptx.AppendLine($"    setp.ge.u32 %p2, %r2, {stateSize};");
+        // Pass 2: lane-strided divide (probs[i] /= totalSum).
+        ptx.AppendLine("    mov.u32 %r4, %r3;");
+        ptx.AppendLine("    add.u64 %rd5, %rd3, %rd4;");
+        ptx.AppendLine($"    setp.ge.u32 %p2, %r4, {stateSize};");
         ptx.AppendLine("    @%p2 bra $NP_DIV_END;");
-        ptx.AppendLine("    mul.wide.u32 %rd6, %r2, 4;");
-        ptx.AppendLine("    add.u64 %rd7, %rd3, %rd6;");
-        ptx.AppendLine("    ld.global.f32 %f5, [%rd7];");
+        ptx.AppendLine("$NP_DIV:");
+        ptx.AppendLine("    ld.global.f32 %f5, [%rd5];");
         ptx.AppendLine("    div.rn.f32 %f5, %f5, %f4;");
-        ptx.AppendLine("    st.global.f32 [%rd7], %f5;");
-        ptx.AppendLine($"    add.u32 %r2, %r2, {BlockThreads};");
-        ptx.AppendLine("    bra.uni $NP_DIV;");
+        ptx.AppendLine("    st.global.f32 [%rd5], %f5;");
+        ptx.AppendLine("    add.u64 %rd5, %rd5, 128;");
+        ptx.AppendLine("    add.u32 %r4, %r4, 32;");
+        ptx.AppendLine($"    setp.lt.u32 %p2, %r4, {stateSize};");
+        ptx.AppendLine("    @%p2 bra $NP_DIV;");
         ptx.AppendLine("$NP_DIV_END:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -144,23 +141,23 @@ internal sealed class PtxNormalizeProbabilitiesKernel : IDisposable
         var extent = new DirectPtxExtent(batchSize * stateSize);
         return new DirectPtxKernelBlueprint(
             Operation: "normalize-probabilities",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"fp32-b{batchSize}-s{stateSize}",
+            Variant: $"fp32-warp-b{batchSize}-s{stateSize}",
             Tensors:
             [
                 new("probabilities", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
                     extent, extent, 16, DirectPtxTensorAccess.ReadWrite, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 26,
-                maxStaticSharedBytes: BlockThreads * sizeof(float),
+                measuredRegistersPerThread: 24,
+                maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "probabilities[b,i] /= max(sum_i probabilities[b,i], 1e-10)",
-                ["reduction"] = "one block per batch row; 256-lane shared-memory tree reduction",
+                ["reduction"] = "one warp per batch row; shuffle sum; lane-strided state entries",
                 ["global-intermediates"] = "in-place on probabilities",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"

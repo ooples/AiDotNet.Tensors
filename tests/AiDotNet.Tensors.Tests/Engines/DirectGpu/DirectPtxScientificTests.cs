@@ -1662,16 +1662,20 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void NormalizeProbabilitiesEmitter_IsBlockPerRowTreeReduction()
+    public void NormalizeProbabilitiesEmitter_IsWarpPerRowShuffleReduction()
     {
         string ptx = PtxNormalizeProbabilitiesKernel.EmitPtx(8, 6, 64, 512);
         Assert.Contains(PtxNormalizeProbabilitiesKernel.EntryPoint, ptx);
-        Assert.Contains(".shared .align 16 .b8 red[1024]", ptx);   // 256-lane reduction scratch
-        Assert.Contains("$NP_SUM:", ptx);                          // strided partial-sum loop
-        Assert.Contains("$NP_DIV:", ptx);                          // strided divide loop
-        Assert.Equal(9, Count(ptx, "bar.sync 0"));                 // 1 after load + 8 tree-reduce strides
-        Assert.Equal(1, Count(ptx, "max.f32"));                    // clamp totalSum >= 1e-10
-        Assert.Equal(1, Count(ptx, "div.rn.f32"));                 // per-element divide
+        Assert.Contains("$NP_SUM:", ptx);                         // lane-strided partial-sum loop
+        Assert.Contains("$NP_DIV:", ptx);                         // lane-strided divide loop
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);              // warp owns row
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);             // lane owns state entries
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));        // warp sum
+        Assert.Equal(1, Count(ptx, "shfl.sync.idx.b32"));         // broadcast row sum
+        Assert.Equal(1, Count(ptx, "max.f32"));                   // clamp totalSum >= 1e-10
+        Assert.Equal(1, Count(ptx, "div.rn.f32"));                // per-element divide
+        Assert.DoesNotContain("bar.sync", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxNormalizeProbabilitiesKernel.IsSupportedShape(64, 512));
         Assert.False(PtxNormalizeProbabilitiesKernel.IsSupportedShape(0, 512));
@@ -1683,8 +1687,9 @@ public class DirectPtxScientificTests
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in normalize-probabilities specialization is measured on GA10x/SM86.");
-        const int batchSize = 64, stateSize = 512;   // state > blockDim exercises the strided loop
+        const int batchSize = 65, stateSize = 519;   // ragged row count and lane-strided state tail
         using var kernel = new PtxNormalizeProbabilitiesKernel(runtime, batchSize, stateSize);
+        Assert.Equal(24, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20268100);
