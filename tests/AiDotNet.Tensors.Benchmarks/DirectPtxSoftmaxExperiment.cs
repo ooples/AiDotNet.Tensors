@@ -2,6 +2,7 @@
 
 using System;
 using System.Globalization;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -120,8 +121,10 @@ internal static class DirectPtxSoftmaxExperiment
                 () => backend.DirectPtxTaylorSoftmaxDispatchCount);
 
             Console.WriteLine();
-            Console.WriteLine("ratio > 1 means direct PTX is faster. A win must clear the measured");
-            Console.WriteLine("paired-ratio spread; unstable rows and correctness mismatches are withheld.");
+            Console.WriteLine("A diagnostic device-median win must clear both the paired-ratio spread and");
+            Console.WriteLine("the production >=1.10x threshold. Promotion additionally requires device P95,");
+            Console.WriteLine("zero-allocation/resource, and three-independent-process release evidence.");
+            Console.WriteLine("measurement protocol: {0}", CodegenMeasurementProtocol.Tag);
         }
         finally
         {
@@ -221,10 +224,13 @@ internal static class DirectPtxSoftmaxExperiment
         }
         else
         {
-            double floor = 1.0 + timing.RelativeSpread;
-            verdict = timing.Ratio > floor ? "DIRECT WINS"
+            double noiseFloor = 1.0 + timing.RelativeSpread;
+            double productionFloor = DirectPtxReleaseGatePolicy
+                .ProductionDefault.MinimumMedianSpeedup;
+            double floor = Math.Max(noiseFloor, productionFloor);
+            verdict = timing.Ratio >= floor ? "DEVICE MEDIAN WIN -- release evidence pending"
                 : timing.Ratio < 1.0 / floor ? "incumbent wins -- diagnose"
-                : "TIE within noise -- diagnose";
+                : "BELOW PRODUCTION GATE -- diagnose";
         }
 
         Console.WriteLine("{0,-30} {1,14} {2,14} {3,9} {4,11}  {5}",
