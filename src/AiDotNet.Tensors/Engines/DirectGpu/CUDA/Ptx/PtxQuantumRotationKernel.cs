@@ -52,12 +52,22 @@ internal sealed class PtxQuantumRotationKernel : IDisposable
         BatchSize = batchSize;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, numQubits, batchSize);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, numQubits, batchSize);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx), module => InitializeModule(runtime, module));
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
+
+        (IntPtr Function, DirectPtxKernelAudit Audit) InitializeModule(
+            DirectPtxRuntime owner, DirectPtxModule module)
+        {
+            IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            var audit = DirectPtxKernelAudit.Create(
+                Blueprint, owner.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, module);
+            return (function, audit);
+        }
     }
 
     internal unsafe void Launch(
