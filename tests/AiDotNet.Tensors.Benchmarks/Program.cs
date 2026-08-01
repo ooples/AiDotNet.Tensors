@@ -133,6 +133,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--direct-ptx-scientific-once")
+        {
+            DirectPtxScientificHeadToHead.RunOnce(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-oracle")
         {
             KernelOracleTool.Run(args.Skip(1).ToArray());

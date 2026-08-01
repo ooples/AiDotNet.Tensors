@@ -20,6 +20,77 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class DirectPtxScientificHeadToHead
 {
     private const double WinThreshold = 1.10;
+    private const int KernelsPerGraphReplay = 64;
+
+    /// <summary>
+    /// Launches exactly one selected public scientific route for an external profiler.
+    /// </summary>
+    /// <remarks>
+    /// Profiling the championship command makes Nsight instrument its thousands of timing
+    /// launches after collecting the requested kernel. This bounded entry point preserves the
+    /// public dispatch path and fail-closed manifest checks while exiting after one launch.
+    /// </remarks>
+    internal static void RunOnce(string[] args)
+    {
+        if (args.Length != 2)
+            throw new ArgumentException(
+                "Usage: --direct-ptx-scientific-once <selector> <incumbent|direct>.");
+        bool existing = args[1] switch
+        {
+            "incumbent" => true,
+            "direct" => false,
+            _ => throw new ArgumentException(
+                "Scientific one-shot lane must be 'incumbent' or 'direct'.")
+        };
+
+        GpuBenchmarkEnvironment.RequireIdleGpu("direct-ptx-scientific-once-start");
+        bool? previousTestOverride = DirectPtxFeatureGate.TestOverride;
+        bool previousExperimentOverride = DirectPtxFeatureGate.ScientificExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            if (!backend.IsAvailable || !backend.IsDirectPtxScientificEnabled)
+                throw new InvalidOperationException(
+                    "Validated NVIDIA direct-PTX scientific backend unavailable.");
+
+            List<Func<ScientificCase>> factories = Cases(backend);
+            AssertCompleteManifestCoverage(factories);
+            List<Func<ScientificCase>> selected = factories.Where(factory =>
+            {
+                using ScientificCase item = factory();
+                return item.Api.Contains(args[0], StringComparison.OrdinalIgnoreCase) ||
+                    item.Label.Contains(args[0], StringComparison.OrdinalIgnoreCase);
+            }).ToList();
+            if (selected.Count != 1)
+                throw new InvalidOperationException(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "Scientific one-shot selector must match exactly one manifest entry; '{0}' matched {1}.",
+                    args[0], selected.Count));
+
+            using ScientificCase selectedCase = selected[0]();
+            long before = backend.DirectPtxScientificDispatchCount;
+            selectedCase.Launch(existing);
+            backend.Synchronize();
+            long dispatched = backend.DirectPtxScientificDispatchCount - before;
+            if (existing && dispatched != 0)
+                throw new InvalidOperationException(
+                    "Incumbent one-shot unexpectedly dispatched direct PTX.");
+            if (!existing && dispatched != 1)
+                throw new InvalidOperationException(
+                    "Direct one-shot did not dispatch exactly once: " +
+                    (backend.DirectPtxLastError ?? "no direct-PTX error was recorded"));
+
+            Console.WriteLine(
+                "scientific one-shot: {0}; lane={1}; direct dispatches={2}",
+                selectedCase.Api, existing ? "incumbent" : "direct", dispatched);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ScientificExperimentOverride = previousExperimentOverride;
+            DirectPtxFeatureGate.TestOverride = previousTestOverride;
+        }
+    }
 
     internal static void Run(string[] args)
     {
@@ -33,10 +104,8 @@ internal static class DirectPtxScientificHeadToHead
         {
             using var backend = new CudaBackend();
             if (!backend.IsAvailable || !backend.IsDirectPtxScientificEnabled)
-            {
-                Console.WriteLine("Validated NVIDIA direct-PTX scientific backend unavailable.");
-                return;
-            }
+                throw new InvalidOperationException(
+                    "Validated NVIDIA direct-PTX scientific backend unavailable.");
 
             List<Func<ScientificCase>> factories = Cases(backend);
             AssertCompleteManifestCoverage(factories);
@@ -46,11 +115,16 @@ internal static class DirectPtxScientificHeadToHead
                     using ScientificCase item = f();
                     return item.Api.Contains(filter, StringComparison.OrdinalIgnoreCase);
                 }).ToList();
+            if (factories.Count == 0)
+                throw new InvalidOperationException(
+                    "Scientific championship selector matched no manifest entries: " + filter);
 
             Console.WriteLine();
             Console.WriteLine("DIRECT PTX SCIENTIFIC - public API incumbent vs experimental route");
             Console.WriteLine("device: {0}", backend.DeviceName);
-            Console.WriteLine("gate: same backend/context/stream; adjacent CUDA-event batches; 5% stability ceiling");
+            Console.WriteLine(
+                "gate: same backend/context/stream; {0}-kernel CUDA-graph batches; adjacent event batches; 5% stability ceiling",
+                KernelsPerGraphReplay);
             Console.WriteLine();
             Console.WriteLine("{0,-43} {1,14} {2,14} {3,8}  {4}",
                 "operator", "incumbent", "direct PTX", "ratio", "verdict");
@@ -78,6 +152,11 @@ internal static class DirectPtxScientificHeadToHead
             Console.WriteLine("summary: {0} win, {1} tie, {2} loss, {3} rejected", wins, ties, losses, rejected);
             Console.WriteLine("ratio is incumbent/direct-PTX; a win requires equivalence, stable paired evidence, and >=1.10x.");
             GpuBenchmarkEnvironment.RequireNoForeignCompute("direct-ptx-scientific-head-to-head-end", afterSuite: true);
+            if (ties != 0 || losses != 0 || rejected != 0 || wins != factories.Count)
+                throw new InvalidOperationException(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "Scientific championship gate failed: {0}/{1} wins, {2} ties, {3} losses, {4} rejected.",
+                    wins, factories.Count, ties, losses, rejected));
         }
         finally
         {
@@ -105,29 +184,91 @@ internal static class DirectPtxScientificHeadToHead
             return CaseResult.Rejected(string.Format(CultureInfo.InvariantCulture,
                 "not equivalent (abs {0:E2}, rel {1:E2})", absolute, relative));
 
-        using var start = backend.CreateEvent(enableTiming: true);
-        using var stop = backend.CreateEvent(enableTiming: true);
-        double MeasureMicroseconds(Action launch, int iterations)
+        IntPtr incumbentGraph = IntPtr.Zero;
+        IntPtr directGraph = IntPtr.Zero;
+        try
         {
-            backend.RecordEvent(start, backend.DefaultStream);
-            for (int i = 0; i < iterations; i++) launch();
-            backend.RecordEvent(stop, backend.DefaultStream);
-            stop.Synchronize();
-            return backend.GetEventElapsedTime(start, stop) * 1_000.0 / iterations;
-        }
+            // One graph launch per kernel still leaves the stream dependent on how quickly the
+            // host can issue cuGraphLaunch. On WDDM that made a 14 us kernel appear anywhere
+            // between 30 and 90 us even though CUDA events bracketed the batch. Capture enough
+            // kernel nodes per replay to keep the stream fed, then normalize back to one kernel.
+            long beforeIncumbentCapture = backend.DirectPtxScientificDispatchCount;
+            incumbentGraph = backend.CaptureGraph(() =>
+            {
+                for (int i = 0; i < KernelsPerGraphReplay; i++)
+                    item.Launch(existing: true);
+            });
+            if (backend.DirectPtxScientificDispatchCount != beforeIncumbentCapture)
+                return CaseResult.Rejected(
+                    "incumbent graph unexpectedly captured direct PTX");
 
-        StableTimer.PairResult timing = StableTimer.MeasureDevicePair(
-            () => item.Launch(existing: true),
-            () => item.Launch(existing: false),
-            item.WorkUnits, item.WorkUnits,
-            backend.Synchronize, MeasureMicroseconds);
-        if (!timing.Stable) return new(timing, Verdict.Rejected, "not measurable");
-        Verdict verdict = timing.Ratio >= WinThreshold
-            ? Verdict.Win
-            : timing.Ratio < 1.0 / WinThreshold ? Verdict.Loss : Verdict.Tie;
-        return new(timing, verdict, string.Format(CultureInfo.InvariantCulture,
-            "{0}; abs {1:E1}, rel {2:E1}", verdict.ToString().ToUpperInvariant(), absolute, relative));
+            long beforeDirectCapture = backend.DirectPtxScientificDispatchCount;
+            directGraph = backend.CaptureGraph(() =>
+            {
+                for (int i = 0; i < KernelsPerGraphReplay; i++)
+                    item.Launch(existing: false);
+            });
+            long capturedDirectDispatches =
+                backend.DirectPtxScientificDispatchCount - beforeDirectCapture;
+            if (capturedDirectDispatches != KernelsPerGraphReplay)
+                return CaseResult.Rejected(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "direct graph captured {0}/{1} direct-PTX launches: {2}",
+                    capturedDirectDispatches, KernelsPerGraphReplay,
+                    backend.DirectPtxLastError ?? "no direct-PTX error was recorded"));
+            if (incumbentGraph == IntPtr.Zero || directGraph == IntPtr.Zero)
+                return CaseResult.Rejected("CUDA graph capture returned a null executable");
+
+            using var start = backend.CreateEvent(enableTiming: true);
+            using var stop = backend.CreateEvent(enableTiming: true);
+            double MeasureMicroseconds(Action launch, int iterations)
+            {
+                backend.RecordEvent(start, backend.DefaultStream);
+                for (int i = 0; i < iterations; i++) launch();
+                backend.RecordEvent(stop, backend.DefaultStream);
+                stop.Synchronize();
+                return backend.GetEventElapsedTime(start, stop) * 1_000.0 / iterations;
+            }
+
+            long graphWorkUnits = checked(item.WorkUnits * KernelsPerGraphReplay);
+            StableTimer.PairResult graphTiming = StableTimer.MeasureDevicePair(
+                () => backend.EnqueueCapturedGraph(incumbentGraph),
+                () => backend.EnqueueCapturedGraph(directGraph),
+                graphWorkUnits, graphWorkUnits,
+                backend.Synchronize, MeasureMicroseconds);
+            StableTimer.PairResult timing = PerKernel(graphTiming, KernelsPerGraphReplay);
+            if (!timing.Stable) return new(timing, Verdict.Rejected, "not measurable");
+            Verdict verdict = timing.Ratio >= WinThreshold
+                ? Verdict.Win
+                : timing.Ratio < 1.0 / WinThreshold ? Verdict.Loss : Verdict.Tie;
+            return new(timing, verdict, string.Format(CultureInfo.InvariantCulture,
+                "{0}; abs {1:E1}, rel {2:E1}", verdict.ToString().ToUpperInvariant(), absolute, relative));
+        }
+        catch (Exception ex)
+        {
+            return CaseResult.Rejected(
+                "CUDA graph measurement failed: " + ex.GetType().Name + ": " + ex.Message);
+        }
+        finally
+        {
+            if (directGraph != IntPtr.Zero) backend.DestroyCapturedGraph(directGraph);
+            if (incumbentGraph != IntPtr.Zero) backend.DestroyCapturedGraph(incumbentGraph);
+        }
     }
+
+    private static StableTimer.PairResult PerKernel(
+        StableTimer.PairResult graphTiming, int kernelsPerReplay) => new(
+        graphTiming.A with
+        {
+            Microseconds = graphTiming.A.Microseconds / kernelsPerReplay
+        },
+        graphTiming.B with
+        {
+            Microseconds = graphTiming.B.Microseconds / kernelsPerReplay
+        },
+        graphTiming.Ratio,
+        graphTiming.RelativeSpread,
+        graphTiming.Samples);
 
     private static string Describe(CaseResult result) => result.Detail;
 

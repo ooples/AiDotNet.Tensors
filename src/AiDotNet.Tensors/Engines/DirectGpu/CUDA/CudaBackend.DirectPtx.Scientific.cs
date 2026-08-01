@@ -107,11 +107,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxComplexMultiplyKernel.IsSupportedPairs(pairs)) return Fail("complex-multiply");
         long bytes = checked((long)pairs * 2 * sizeof(float));
         if (a.SizeInBytes != bytes || b.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("complex-multiply-extent");
+        var key = new SciCountKey(pairs);
         return SciDispatch(() =>
         {
-            var k = _sciComplexMul.GetOrAdd(new SciCountKey(pairs), () => new PtxComplexMultiplyKernel(_directPtxRuntime!, pairs));
+            var k = _sciComplexMul.GetOrAdd(key, () => new PtxComplexMultiplyKernel(_directPtxRuntime!, pairs));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
-        });
+        }, () => _sciComplexMul.Pin(key));
     }
 
     internal bool TryDirectPtxComplexConjugate(IGpuBuffer input, IGpuBuffer output, int pairs)
@@ -119,11 +120,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxComplexConjugateKernel.IsSupportedPairs(pairs)) return Fail("complex-conjugate");
         long bytes = checked((long)pairs * 2 * sizeof(float));
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("complex-conjugate-extent");
+        var key = new SciCountKey(pairs);
         return SciDispatch(() =>
         {
-            var k = _sciComplexConj.GetOrAdd(new SciCountKey(pairs), () => new PtxComplexConjugateKernel(_directPtxRuntime!, pairs));
+            var k = _sciComplexConj.GetOrAdd(key, () => new PtxComplexConjugateKernel(_directPtxRuntime!, pairs));
             Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
-        });
+        }, () => _sciComplexConj.Pin(key));
     }
 
     internal bool TryDirectPtxComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer mag, int count)
@@ -131,11 +133,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxComplexMagnitudeKernel.IsSupportedCount(count)) return Fail("complex-magnitude");
         long bytes = checked((long)count * sizeof(float));
         if (real.SizeInBytes != bytes || imag.SizeInBytes != bytes || mag.SizeInBytes != bytes) return Fail("complex-magnitude-extent");
+        var key = new SciCountKey(count);
         return SciDispatch(() =>
         {
-            var k = _sciComplexMag.GetOrAdd(new SciCountKey(count), () => new PtxComplexMagnitudeKernel(_directPtxRuntime!, count));
+            var k = _sciComplexMag.GetOrAdd(key, () => new PtxComplexMagnitudeKernel(_directPtxRuntime!, count));
             Launch3(k.Blueprint, real, imag, mag, (vr, vi, vm) => k.Launch(vr, vi, vm));
-        });
+        }, () => _sciComplexMag.Pin(key));
     }
 
     internal bool TryDirectPtxComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int count)
@@ -143,11 +146,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxComplexPhaseKernel.IsSupportedCount(count)) return Fail("complex-phase");
         long bytes = checked((long)count * sizeof(float));
         if (real.SizeInBytes != bytes || imag.SizeInBytes != bytes || phase.SizeInBytes != bytes) return Fail("complex-phase-extent");
+        var key = new SciCountKey(count);
         return SciDispatch(() =>
         {
-            var k = _sciComplexPhase.GetOrAdd(new SciCountKey(count), () => new PtxComplexPhaseKernel(_directPtxRuntime!, count));
+            var k = _sciComplexPhase.GetOrAdd(key, () => new PtxComplexPhaseKernel(_directPtxRuntime!, count));
             Launch3(k.Blueprint, real, imag, phase, (vr, vi, vp) => k.Launch(vr, vi, vp));
-        });
+        }, () => _sciComplexPhase.Pin(key));
     }
 
     internal bool TryDirectPtxOctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
@@ -155,11 +159,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxOctonionAddKernel.IsSupportedCount(count)) return Fail("octonion-add");
         long bytes = checked((long)count * 8 * sizeof(float));
         if (a.SizeInBytes != bytes || b.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("octonion-add-extent");
+        var key = new SciCountKey(count);
         return SciDispatch(() =>
         {
-            var k = _sciOctAdd.GetOrAdd(new SciCountKey(count), () => new PtxOctonionAddKernel(_directPtxRuntime!, count));
+            var k = _sciOctAdd.GetOrAdd(key, () => new PtxOctonionAddKernel(_directPtxRuntime!, count));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
-        });
+        }, () => _sciOctAdd.Pin(key));
     }
 
     internal bool TryDirectPtxOctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
@@ -167,11 +172,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxOctonionMultiplyKernel.IsSupportedCount(count)) return Fail("octonion-multiply");
         long bytes = checked((long)count * 8 * sizeof(float));
         if (a.SizeInBytes != bytes || b.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("octonion-multiply-extent");
+        var key = new SciCountKey(count);
         return SciDispatch(() =>
         {
-            var k = _sciOctMul.GetOrAdd(new SciCountKey(count), () => new PtxOctonionMultiplyKernel(_directPtxRuntime!, count));
+            var k = _sciOctMul.GetOrAdd(key, () => new PtxOctonionMultiplyKernel(_directPtxRuntime!, count));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
-        });
+        }, () => _sciOctMul.Pin(key));
     }
 
     internal bool TryDirectPtxMobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batch, int dim, float curvature)
@@ -179,11 +185,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxMobiusAddKernel.IsSupportedShape(batch, dim)) return Fail("mobius-add");
         long bytes = checked((long)batch * dim * sizeof(float));
         if (x.SizeInBytes != bytes || y.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("mobius-add-extent");
+        var key = new SciVectorKey(batch, dim, Bits(curvature));
         return SciDispatch(() =>
         {
-            var k = _sciMobius.GetOrAdd(new SciVectorKey(batch, dim, Bits(curvature)), () => new PtxMobiusAddKernel(_directPtxRuntime!, batch, dim, curvature));
+            var k = _sciMobius.GetOrAdd(key, () => new PtxMobiusAddKernel(_directPtxRuntime!, batch, dim, curvature));
             Launch3(k.Blueprint, x, y, output, (vx, vy, vo) => k.Launch(vx, vy, vo));
-        });
+        }, () => _sciMobius.Pin(key));
     }
 
     internal bool TryDirectPtxPoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batch, int dim, float curvature)
@@ -192,11 +199,12 @@ public sealed partial class CudaBackend
         if (x.SizeInBytes != checked((long)batch * dim * sizeof(float)) ||
             y.SizeInBytes != checked((long)batch * dim * sizeof(float)) ||
             output.SizeInBytes != checked((long)batch * sizeof(float))) return Fail("poincare-distance-extent");
+        var key = new SciVectorKey(batch, dim, Bits(curvature));
         return SciDispatch(() =>
         {
-            var k = _sciPoincareDist.GetOrAdd(new SciVectorKey(batch, dim, Bits(curvature)), () => new PtxPoincareDistanceKernel(_directPtxRuntime!, batch, dim, curvature));
+            var k = _sciPoincareDist.GetOrAdd(key, () => new PtxPoincareDistanceKernel(_directPtxRuntime!, batch, dim, curvature));
             Launch3(k.Blueprint, x, y, output, (vx, vy, vo) => k.Launch(vx, vy, vo));
-        });
+        }, () => _sciPoincareDist.Pin(key));
     }
 
     internal bool TryDirectPtxPoincareProject(IGpuBuffer input, IGpuBuffer output, int batch, int dim, float curvature, float epsilon)
@@ -204,13 +212,14 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxPoincareProjectKernel.IsSupportedShape(batch, dim)) return Fail("poincare-project");
         long bytes = checked((long)batch * dim * sizeof(float));
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("poincare-project-extent");
+        SciPoincareProjectKey key = PoincareProjectCacheKey(batch, dim, curvature, epsilon);
         return SciDispatch(() =>
         {
             var k = _sciPoincareProj.GetOrAdd(
-                PoincareProjectCacheKey(batch, dim, curvature, epsilon),
+                key,
                 () => new PtxPoincareProjectKernel(_directPtxRuntime!, batch, dim, curvature, epsilon));
             Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
-        });
+        }, () => _sciPoincareProj.Pin(key));
     }
 
     internal static SciPoincareProjectKey PoincareProjectCacheKey(
@@ -222,11 +231,12 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxPoincareExpMapKernel.IsSupportedShape(batch, dim)) return Fail("poincare-exp-map");
         long bytes = checked((long)batch * dim * sizeof(float));
         if (basePoint.SizeInBytes != bytes || tangent.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("poincare-exp-map-extent");
+        var key = new SciVectorKey(batch, dim, Bits(curvature));
         return SciDispatch(() =>
         {
-            var k = _sciPoincareExp.GetOrAdd(new SciVectorKey(batch, dim, Bits(curvature)), () => new PtxPoincareExpMapKernel(_directPtxRuntime!, batch, dim, curvature));
+            var k = _sciPoincareExp.GetOrAdd(key, () => new PtxPoincareExpMapKernel(_directPtxRuntime!, batch, dim, curvature));
             Launch3(k.Blueprint, basePoint, tangent, output, (vb, vt, vo) => k.Launch(vb, vt, vo));
-        });
+        }, () => _sciPoincareExp.Pin(key));
     }
 
     internal bool TryDirectPtxRbfForward(
@@ -238,12 +248,13 @@ public sealed partial class CudaBackend
             centers.SizeInBytes != checked((long)numCenters * inputDim * sizeof(float)) ||
             epsilons.SizeInBytes != checked((long)numCenters * sizeof(float)) ||
             output.SizeInBytes != checked((long)batchSize * numCenters * sizeof(float))) return Fail("rbf-forward-extent");
+        var key = new SciRbfKey(batchSize, numCenters, inputDim);
         return SciDispatch(() =>
         {
-            var k = _sciRbf.GetOrAdd(new SciRbfKey(batchSize, numCenters, inputDim),
+            var k = _sciRbf.GetOrAdd(key,
                 () => new PtxRbfForwardKernel(_directPtxRuntime!, batchSize, numCenters, inputDim));
             Launch4(k.Blueprint, input, centers, epsilons, output, (vi, vc, ve, vo) => k.Launch(vi, vc, ve, vo));
-        });
+        }, () => _sciRbf.Pin(key));
     }
 
     internal bool TryDirectPtxPairwiseDistance(
@@ -254,12 +265,13 @@ public sealed partial class CudaBackend
         if (a.SizeInBytes != checked((long)m * dim * sizeof(float)) ||
             b.SizeInBytes != checked((long)n * dim * sizeof(float)) ||
             output.SizeInBytes != checked((long)m * n * sizeof(float))) return Fail($"{tag}-extent");
+        var key = new SciPairwiseKey(m, n, dim, squared);
         return SciDispatch(() =>
         {
-            var k = _sciPairwise.GetOrAdd(new SciPairwiseKey(m, n, dim, squared),
+            var k = _sciPairwise.GetOrAdd(key,
                 () => new PtxPairwiseDistanceKernel(_directPtxRuntime!, m, n, dim, squared));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
-        });
+        }, () => _sciPairwise.Pin(key));
     }
 
     internal bool TryDirectPtxQuantumMeasurement(
@@ -271,12 +283,13 @@ public sealed partial class CudaBackend
         long bytes = checked(count * sizeof(float));
         if (realPart.SizeInBytes != bytes || imagPart.SizeInBytes != bytes ||
             probabilities.SizeInBytes != bytes) return Fail("quantum-measurement-extent");
+        var key = new SciCountKey((int)count);
         return SciDispatch(() =>
         {
-            var k = _sciQuantumMeasure.GetOrAdd(new SciCountKey((int)count),
+            var k = _sciQuantumMeasure.GetOrAdd(key,
                 () => new PtxQuantumMeasurementKernel(_directPtxRuntime!, (int)count));
             Launch3(k.Blueprint, realPart, imagPart, probabilities, (vr, vi, vp) => k.Launch(vr, vi, vp));
-        });
+        }, () => _sciQuantumMeasure.Pin(key));
     }
 
     internal bool TryDirectPtxComplexMatVec(
@@ -289,13 +302,14 @@ public sealed partial class CudaBackend
         if (matReal.SizeInBytes != matBytes || matImag.SizeInBytes != matBytes ||
             vecReal.SizeInBytes != vecBytes || vecImag.SizeInBytes != vecBytes ||
             outReal.SizeInBytes != vecBytes || outImag.SizeInBytes != vecBytes) return Fail("complex-matvec-extent");
+        var key = new SciMatVecKey(batchSize, dim);
         return SciDispatch(() =>
         {
-            var k = _sciComplexMatVec.GetOrAdd(new SciMatVecKey(batchSize, dim),
+            var k = _sciComplexMatVec.GetOrAdd(key,
                 () => new PtxComplexMatVecKernel(_directPtxRuntime!, batchSize, dim));
             Launch6(k.Blueprint, matReal, matImag, vecReal, vecImag, outReal, outImag,
                 (mr, mi, vr, vi, or, oi) => k.Launch(mr, mi, vr, vi, or, oi));
-        });
+        }, () => _sciComplexMatVec.Pin(key));
     }
 
     internal bool TryDirectPtxSphericalHarmonics(
@@ -310,13 +324,14 @@ public sealed partial class CudaBackend
         long outBytes = checked((long)numPoints * numChannels * sizeof(float));
         if (shCoefficients.SizeInBytes != coeffBytes || viewDirections.SizeInBytes != dirBytes ||
             output.SizeInBytes != outBytes) return Fail("spherical-harmonics-extent");
+        var key = new SciShKey(numPoints, basisCount, numChannels, degree, broadcast);
         return SciDispatch(() =>
         {
             var k = _sciSphericalHarmonics.GetOrAdd(
-                new SciShKey(numPoints, basisCount, numChannels, degree, broadcast),
+                key,
                 () => new PtxSphericalHarmonicsKernel(_directPtxRuntime!, numPoints, basisCount, numChannels, degree, broadcast));
             Launch3(k.Blueprint, shCoefficients, viewDirections, output, (vc, vd, vo) => k.Launch(vc, vd, vo));
-        });
+        }, () => _sciSphericalHarmonics.Pin(key));
     }
 
     internal bool TryDirectPtxSphericalHarmonicsBackward(
@@ -331,14 +346,15 @@ public sealed partial class CudaBackend
         long gradBytes = checked((long)numPoints * numChannels * sizeof(float));
         if (shCoefficients.SizeInBytes != coeffBytes || viewDirections.SizeInBytes != dirBytes ||
             outputGradient.SizeInBytes != gradBytes || shGrad.SizeInBytes != coeffBytes) return Fail("spherical-harmonics-backward-extent");
+        var key = new SciShKey(numPoints, basisCount, numChannels, degree, broadcast);
         return SciDispatch(() =>
         {
             var k = _sciSphericalHarmonicsBwd.GetOrAdd(
-                new SciShKey(numPoints, basisCount, numChannels, degree, broadcast),
+                key,
                 () => new PtxSphericalHarmonicsBackwardKernel(_directPtxRuntime!, numPoints, basisCount, numChannels, degree, broadcast));
             Launch4(k.Blueprint, shCoefficients, viewDirections, outputGradient, shGrad,
                 (vc, vd, vg, vs) => k.Launch(vc, vd, vg, vs));
-        });
+        }, () => _sciSphericalHarmonicsBwd.Pin(key));
     }
 
     private bool TryDirectPtxCapsuleContraction(
@@ -353,13 +369,15 @@ public sealed partial class CudaBackend
         long outputBytes = checked((long)batchSize * inputCapsules * outputCount * outputDim * sizeof(float));
         if (input.SizeInBytes != inputBytes || weights.SizeInBytes != weightBytes ||
             output.SizeInBytes != outputBytes) return Fail($"{tag}-extent");
+        var key = new SciCapsuleKey(
+            op, batchSize, inputCapsules, inputDim, outputCount, outputDim);
         return SciDispatch(() =>
         {
             var k = _sciCapsuleContraction.GetOrAdd(
-                new SciCapsuleKey(op, batchSize, inputCapsules, inputDim, outputCount, outputDim),
+                key,
                 () => new PtxCapsuleContractionKernel(_directPtxRuntime!, op, batchSize, inputCapsules, inputDim, outputCount, outputDim));
             Launch3(k.Blueprint, input, weights, output, (vi, vw, vo) => k.Launch(vi, vw, vo));
-        });
+        }, () => _sciCapsuleContraction.Pin(key));
     }
 
     internal bool TryDirectPtxCapsulePredictions(
@@ -385,13 +403,15 @@ public sealed partial class CudaBackend
         long outBytes = checked((long)batchSize * outputCapsules * capsuleDim * sizeof(float));
         if (coupling.SizeInBytes != couplingBytes || predictions.SizeInBytes != predBytes ||
             output.SizeInBytes != outBytes) return Fail("capsule-weighted-sum-extent");
+        var key = new SciCapsuleRoutingKey(
+            batchSize, inputCapsules, outputCapsules, capsuleDim);
         return SciDispatch(() =>
         {
             var k = _sciCapsuleWeightedSum.GetOrAdd(
-                new SciCapsuleRoutingKey(batchSize, inputCapsules, outputCapsules, capsuleDim),
+                key,
                 () => new PtxCapsuleWeightedSumKernel(_directPtxRuntime!, batchSize, inputCapsules, outputCapsules, capsuleDim));
             Launch3(k.Blueprint, coupling, predictions, output, (vc, vp, vo) => k.Launch(vc, vp, vo));
-        });
+        }, () => _sciCapsuleWeightedSum.Pin(key));
     }
 
     internal bool TryDirectPtxCapsuleAgreement(
@@ -405,13 +425,15 @@ public sealed partial class CudaBackend
         long agreeBytes = checked((long)batchSize * inputCapsules * outputCapsules * sizeof(float));
         if (predictions.SizeInBytes != predBytes || output.SizeInBytes != outBytes ||
             agreement.SizeInBytes != agreeBytes) return Fail("capsule-agreement-extent");
+        var key = new SciCapsuleRoutingKey(
+            batchSize, inputCapsules, outputCapsules, capsuleDim);
         return SciDispatch(() =>
         {
             var k = _sciCapsuleAgreement.GetOrAdd(
-                new SciCapsuleRoutingKey(batchSize, inputCapsules, outputCapsules, capsuleDim),
+                key,
                 () => new PtxCapsuleAgreementKernel(_directPtxRuntime!, batchSize, inputCapsules, outputCapsules, capsuleDim));
             Launch3(k.Blueprint, predictions, output, agreement, (vp, vo, va) => k.Launch(vp, vo, va));
-        });
+        }, () => _sciCapsuleAgreement.Pin(key));
     }
 
     internal bool TryDirectPtxCosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
@@ -420,12 +442,13 @@ public sealed partial class CudaBackend
         long vecBytes = checked((long)batchSize * dim * sizeof(float));
         long outBytes = checked((long)batchSize * sizeof(float));
         if (a.SizeInBytes != vecBytes || b.SizeInBytes != vecBytes || output.SizeInBytes != outBytes) return Fail("cosine-similarity-extent");
+        var key = new SciMatVecKey(batchSize, dim);
         return SciDispatch(() =>
         {
-            var k = _sciCosineSimilarity.GetOrAdd(new SciMatVecKey(batchSize, dim),
+            var k = _sciCosineSimilarity.GetOrAdd(key,
                 () => new PtxCosineSimilarityKernel(_directPtxRuntime!, batchSize, dim));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
-        });
+        }, () => _sciCosineSimilarity.Pin(key));
     }
 
     internal bool TryDirectPtxSphericalSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
@@ -433,12 +456,13 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxSphericalSoftmaxKernel.IsSupportedShape(outerSize, innerSize)) return Fail("spherical-softmax");
         long bytes = checked((long)outerSize * innerSize * sizeof(float));
         if (input.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("spherical-softmax-extent");
+        var key = new SciMatVecKey(outerSize, innerSize);
         return SciDispatch(() =>
         {
-            var k = _sciSphericalSoftmax.GetOrAdd(new SciMatVecKey(outerSize, innerSize),
+            var k = _sciSphericalSoftmax.GetOrAdd(key,
                 () => new PtxSphericalSoftmaxKernel(_directPtxRuntime!, outerSize, innerSize));
             Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
-        });
+        }, () => _sciSphericalSoftmax.Pin(key));
     }
 
     internal bool TryDirectPtxNormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
@@ -446,12 +470,13 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxNormalizeProbabilitiesKernel.IsSupportedShape(batchSize, stateSize)) return Fail("normalize-probabilities");
         long bytes = checked((long)batchSize * stateSize * sizeof(float));
         if (probabilities.SizeInBytes != bytes) return Fail("normalize-probabilities-extent");
+        var key = new SciMatVecKey(batchSize, stateSize);
         return SciDispatch(() =>
         {
-            var k = _sciNormalizeProbabilities.GetOrAdd(new SciMatVecKey(batchSize, stateSize),
+            var k = _sciNormalizeProbabilities.GetOrAdd(key,
                 () => new PtxNormalizeProbabilitiesKernel(_directPtxRuntime!, batchSize, stateSize));
             Launch1(k.Blueprint, probabilities, vp => k.Launch(vp));
-        });
+        }, () => _sciNormalizeProbabilities.Pin(key));
     }
 
     internal bool TryDirectPtxMeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
@@ -460,12 +485,13 @@ public sealed partial class CudaBackend
         long inBytes = checked((long)batchSize * stateSize * 2 * sizeof(float));
         long outBytes = checked((long)batchSize * stateSize * sizeof(float));
         if (input.SizeInBytes != inBytes || output.SizeInBytes != outBytes) return Fail("measurement-forward-extent");
+        var key = new SciMatVecKey(batchSize, stateSize);
         return SciDispatch(() =>
         {
-            var k = _sciMeasurementForward.GetOrAdd(new SciMatVecKey(batchSize, stateSize),
+            var k = _sciMeasurementForward.GetOrAdd(key,
                 () => new PtxMeasurementForwardKernel(_directPtxRuntime!, batchSize, stateSize));
             Launch2(k.Blueprint, input, output, (vi, vo) => k.Launch(vi, vo));
-        });
+        }, () => _sciMeasurementForward.Pin(key));
     }
 
     internal bool TryDirectPtxQuantumRotation(
@@ -478,13 +504,14 @@ public sealed partial class CudaBackend
         if (stateReal.SizeInBytes != stateBytes || stateImag.SizeInBytes != stateBytes ||
             outReal.SizeInBytes != stateBytes || outImag.SizeInBytes != stateBytes ||
             angles.SizeInBytes != angleBytes) return Fail("quantum-rotation-extent");
+        var key = new SciQuantumRotationKey(numQubits, batchSize);
         return SciDispatch(() =>
         {
-            var k = _sciQuantumRotation.GetOrAdd(new SciQuantumRotationKey(numQubits, batchSize),
+            var k = _sciQuantumRotation.GetOrAdd(key,
                 () => new PtxQuantumRotationKernel(_directPtxRuntime!, numQubits, batchSize));
             Launch5(k.Blueprint, stateReal, stateImag, outReal, outImag, angles,
                 (vsr, vsi, vor, voi, va) => k.Launch(vsr, vsi, vor, voi, va));
-        });
+        }, () => _sciQuantumRotation.Pin(key));
     }
 
     internal bool TryDirectPtxAnnComputeDistances(
@@ -495,12 +522,13 @@ public sealed partial class CudaBackend
         if (queries.SizeInBytes != checked((long)numQueries * dim * sizeof(float)) ||
             database.SizeInBytes != checked((long)numDatabase * dim * sizeof(float)) ||
             distances.SizeInBytes != checked((long)numQueries * numDatabase * sizeof(float))) return Fail("ann-compute-distances-extent");
+        var key = new SciAnnCdKey(metric, numQueries, numDatabase, dim);
         return SciDispatch(() =>
         {
-            var k = _sciAnnComputeDistances.GetOrAdd(new SciAnnCdKey(metric, numQueries, numDatabase, dim),
+            var k = _sciAnnComputeDistances.GetOrAdd(key,
                 () => new PtxAnnComputeDistancesKernel(_directPtxRuntime!, metric, numQueries, numDatabase, dim));
             Launch3(k.Blueprint, queries, database, distances, (vq, vd, vo) => k.Launch(vq, vd, vo));
-        });
+        }, () => _sciAnnComputeDistances.Pin(key));
     }
 
     internal bool TryDirectPtxAnnPqDistanceTables(
@@ -511,12 +539,13 @@ public sealed partial class CudaBackend
         if (queries.SizeInBytes != checked((long)numQueries * m * dsub * sizeof(float)) ||
             codebooks.SizeInBytes != checked((long)m * ksub * dsub * sizeof(float)) ||
             tables.SizeInBytes != checked((long)numQueries * m * ksub * sizeof(float))) return Fail("ann-pq-distance-tables-extent");
+        var key = new SciAnnPqKey(metric, numQueries, m, ksub, dsub);
         return SciDispatch(() =>
         {
-            var k = _sciAnnPqDistanceTables.GetOrAdd(new SciAnnPqKey(metric, numQueries, m, ksub, dsub),
+            var k = _sciAnnPqDistanceTables.GetOrAdd(key,
                 () => new PtxAnnPqDistanceTablesKernel(_directPtxRuntime!, metric, numQueries, m, ksub, dsub));
             Launch3(k.Blueprint, queries, codebooks, tables, (vq, vc, vt) => k.Launch(vq, vc, vt));
-        });
+        }, () => _sciAnnPqDistanceTables.Pin(key));
     }
 
     internal bool TryDirectPtxAnnIvfAssign(
@@ -527,12 +556,13 @@ public sealed partial class CudaBackend
         if (vectors.SizeInBytes != checked((long)numVectors * dim * sizeof(float)) ||
             centroids.SizeInBytes != checked((long)numCentroids * dim * sizeof(float)) ||
             assignments.SizeInBytes != checked((long)numVectors * sizeof(int))) return Fail("ann-ivf-assign-extent");
+        var key = new SciAnnCdKey(metric, numVectors, numCentroids, dim);
         return SciDispatch(() =>
         {
-            var k = _sciAnnIvfAssign.GetOrAdd(new SciAnnCdKey(metric, numVectors, numCentroids, dim),
+            var k = _sciAnnIvfAssign.GetOrAdd(key,
                 () => new PtxAnnIvfAssignKernel(_directPtxRuntime!, metric, numVectors, numCentroids, dim));
             Launch3(k.Blueprint, vectors, centroids, assignments, (vv, vc, va) => k.Launch(vv, vc, va));
-        });
+        }, () => _sciAnnIvfAssign.Pin(key));
     }
 
     internal bool TryDirectPtxAnnPqAdcScan(
@@ -543,12 +573,13 @@ public sealed partial class CudaBackend
         if (codes.SizeInBytes != checked((long)numCodes * m) ||                       // uint8 codes
             tables.SizeInBytes != checked((long)numQueries * m * ksub * sizeof(float)) ||
             distances.SizeInBytes != checked((long)numQueries * numCodes * sizeof(float))) return Fail("ann-pq-adc-scan-extent");
+        var key = new SciAnnAdcKey(numQueries, numCodes, m, ksub);
         return SciDispatch(() =>
         {
-            var k = _sciAnnPqAdcScan.GetOrAdd(new SciAnnAdcKey(numQueries, numCodes, m, ksub),
+            var k = _sciAnnPqAdcScan.GetOrAdd(key,
                 () => new PtxAnnPqAdcScanKernel(_directPtxRuntime!, numQueries, numCodes, m, ksub));
             Launch3(k.Blueprint, codes, tables, distances, (vc, vt, vd) => k.Launch(vc, vt, vd));
-        });
+        }, () => _sciAnnPqAdcScan.Pin(key));
     }
 
     internal bool TryDirectPtxInstantNgpHashEncode(
@@ -560,13 +591,15 @@ public sealed partial class CudaBackend
         if (positions.SizeInBytes != checked((long)numPoints * 3 * sizeof(float)) ||
             hashTable.SizeInBytes != checked((long)tableSize * featuresPerLevel * sizeof(float)) ||
             output.SizeInBytes != checked((long)numPoints * outputStride * sizeof(float))) return Fail("instant-ngp-hash-encode-extent");
+        var key = new SciNgpKey(
+            numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         return SciDispatch(() =>
         {
             var k = _sciNgpHashEncode.GetOrAdd(
-                new SciNgpKey(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride),
+                key,
                 () => new PtxInstantNgpHashEncodeKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
             Launch3(k.Blueprint, positions, hashTable, output, (vp, vt, vo) => k.Launch(vp, vt, vo));
-        });
+        }, () => _sciNgpHashEncode.Pin(key));
     }
 
     internal bool TryDirectPtxInstantNgpHashEncodeBackward(
@@ -578,13 +611,15 @@ public sealed partial class CudaBackend
         if (positions.SizeInBytes != checked((long)numPoints * 3 * sizeof(float)) ||
             outputGradient.SizeInBytes != checked((long)numPoints * outputStride * sizeof(float)) ||
             tableGradient.SizeInBytes != checked((long)tableSize * featuresPerLevel * sizeof(float))) return Fail("instant-ngp-hash-encode-backward-extent");
+        var key = new SciNgpKey(
+            numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         return SciDispatch(() =>
         {
             var k = _sciNgpHashEncodeBwd.GetOrAdd(
-                new SciNgpKey(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride),
+                key,
                 () => new PtxInstantNgpHashEncodeBackwardKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
             Launch3(k.Blueprint, positions, outputGradient, tableGradient, (vp, vg, vt) => k.Launch(vp, vg, vt));
-        });
+        }, () => _sciNgpHashEncodeBwd.Pin(key));
     }
 
     internal bool TryDirectPtxUniformMeshLaplacian(IGpuBuffer faces, IGpuBuffer output, int numFaces, int numVertices)
@@ -592,12 +627,13 @@ public sealed partial class CudaBackend
         if (!ScientificGateOpen || !PtxMeshLaplacianKernel.IsSupportedShape(numFaces, numVertices)) return Fail("mesh-laplacian");
         if (faces.SizeInBytes != checked((long)numFaces * 3 * sizeof(int)) ||
             output.SizeInBytes != checked((long)numVertices * numVertices * sizeof(float))) return Fail("mesh-laplacian-extent");
+        var key = new SciMatVecKey(numFaces, numVertices);
         return SciDispatch(() =>
         {
-            var k = _sciMeshLaplacian.GetOrAdd(new SciMatVecKey(numFaces, numVertices),
+            var k = _sciMeshLaplacian.GetOrAdd(key,
                 () => new PtxMeshLaplacianKernel(_directPtxRuntime!, numFaces, numVertices));
             Launch2(k.Blueprint, faces, output, (vf, vo) => k.Launch(vf, vo));
-        });
+        }, () => _sciMeshLaplacian.Pin(key));
     }
 
     private bool Fail(string reason)
@@ -663,18 +699,26 @@ public sealed partial class CudaBackend
                 DirectPtxTensorView.Create(f, bp.Tensors[5]));
     }
 
-    private bool SciDispatch(Action launch)
+    private bool SciDispatch(Action launch, Func<bool>? pinPrewarmedKernelForCapture = null)
     {
         try
         {
-            if (IsStreamCapturing())
-            {
-                DirectPtxLastError = "Direct PTX scientific kernels must be prewarmed before CUDA graph capture.";
-                return false;
-            }
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
+                // CUDA graphs retain CUfunction handles after capture. A capture may therefore
+                // use only an already-loaded specialization, and that module must not become an
+                // LRU victim while the graph can replay. The current cache contract releases
+                // conservative graph pins with the owning backend.
+                if (capturing &&
+                    (pinPrewarmedKernelForCapture is null ||
+                     !pinPrewarmedKernelForCapture()))
+                {
+                    DirectPtxLastError =
+                        "Direct PTX scientific kernels must be prewarmed before CUDA graph capture.";
+                    return false;
+                }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 launch();
             }

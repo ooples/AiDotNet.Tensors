@@ -209,6 +209,9 @@ internal static class StableTimer
 
         int iterationsA = IterationsFor(workUnitsA);
         int iterationsB = IterationsFor(workUnitsB);
+        bool traceSamples = string.Equals(
+            Environment.GetEnvironmentVariable("AIDOTNET_STABLE_TIMER_TRACE"),
+            "1", StringComparison.Ordinal);
         Warm(launchA, synchronize, iterationsA);
         Warm(launchB, synchronize, iterationsB);
         iterationsA = CalibrateDeviceIterations(
@@ -230,6 +233,11 @@ internal static class StableTimer
             double aSecond = measureMicroseconds(launchA, iterationsA);
             double a = (aFirst + aSecond) * 0.5;
             double b = (bFirst + bSecond) * 0.5;
+            if (traceSamples)
+                Console.WriteLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "  stable-timer sample {0}: A {1:F3} us, B {2:F3} us, ratio {3:F4}x",
+                    attempt + 1, a, b, a / b));
             AddToConsecutiveWindow(samplesA, a);
             AddToConsecutiveWindow(samplesB, b);
             AddToConsecutiveWindow(ratios, a / b);

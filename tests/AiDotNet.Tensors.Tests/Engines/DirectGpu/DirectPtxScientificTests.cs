@@ -1747,22 +1747,68 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void CosineSimilarityEmitter_IsThreadPerBatchSerialDim()
+    public void CosineSimilarityEmitter_IsWarpPerRowWithCoalescedLoads()
     {
         string ptx = PtxCosineSimilarityKernel.EmitPtx(8, 6, 256, 64);
         Assert.Contains(PtxCosineSimilarityKernel.EntryPoint, ptx);
         Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));    // ai + bi in the loop
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(3, Count(ptx, "fma.rn.f32"));           // dot + norm_a + norm_b
+        Assert.Equal(15, Count(ptx, "shfl.sync.down.b32")); // 5 stages x 3 reductions
         Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));          // ||a||, ||b||
         Assert.Equal(1, Count(ptx, "div.rn.f32"));           // dot / denom
         Assert.Contains("$COS_DIM_LOOP:", ptx);
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);        // warp owns the row
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);       // lane owns the feature
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxCosineSimilarityKernel.IsSupportedShape(256, 64));
-        Assert.False(PtxCosineSimilarityKernel.IsSupportedShape(255, 64));   // batch not a multiple of 256
+        Assert.False(PtxCosineSimilarityKernel.IsSupportedShape(255, 64));   // batch not a multiple of 8
         Assert.False(PtxCosineSimilarityKernel.IsPromotedShape(256, 64));
+    }
+
+    [SkippableFact]
+    public void PublicCosineSimilarity_PrewarmedDirectRouteRemainsDirectDuringGraphCapture()
+    {
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.ScientificExperimentOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ScientificExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxScientificEnabled,
+                "Requires a validated Ampere CUDA backend.");
+            const int batch = 256, dim = 64;
+            var random = RandomHelper.CreateSeededRandom(20267901);
+            using var a = backend.AllocateBuffer(Values(random, batch * dim, 1.0f));
+            using var b = backend.AllocateBuffer(Values(random, batch * dim, 1.0f));
+            using var output = backend.AllocateBuffer(batch);
+
+            backend.CosineSimilarity(a, b, output, batch, dim); // prewarm exact specialization
+            backend.Synchronize();
+            long beforeCapture = backend.DirectPtxScientificDispatchCount;
+            IntPtr graph = backend.CaptureGraph(
+                () => backend.CosineSimilarity(a, b, output, batch, dim));
+            Assert.NotEqual(IntPtr.Zero, graph);
+            try
+            {
+                Assert.Equal(beforeCapture + 1, backend.DirectPtxScientificDispatchCount);
+                backend.EnqueueCapturedGraph(graph);
+                backend.Synchronize();
+                Assert.Null(backend.DirectPtxLastError);
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(graph);
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ScientificExperimentOverride = previousExperiment;
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
     }
 
     [SkippableFact]
