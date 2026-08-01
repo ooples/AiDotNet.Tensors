@@ -2493,7 +2493,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </para>
     /// </summary>
     /// <summary>Element-wise binary operation kind for the broadcast fast path.</summary>
-    private enum BroadcastOp { Add, Subtract, Multiply, Divide }
+    internal enum BroadcastOp { Add, Subtract, Multiply, Divide }
 
     /// <summary>
     /// Writes <c>a op b</c> into <paramref name="result"/> using the coalescing SIMD kernel,
@@ -2504,11 +2504,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// element through <c>LogicalToStorageIndex</c> instead costs roughly 7x on a Conv+BN shape,
     /// which implicit broadcasting turned from a rare case into the common one.
     /// </remarks>
-    internal static void ElementwiseInto(Tensor<T> a, Tensor<T> b, Tensor<T> result, int op)
-        => BroadcastElementwise(a, b, result, result._shape, (BroadcastOp)op);
-
-    /// <summary>Op selectors for <see cref="ElementwiseInto"/>, mirroring <c>BroadcastOp</c>.</summary>
-    internal const int OpAdd = 0, OpSubtract = 1, OpMultiply = 2, OpDivide = 3;
+    internal static void ElementwiseInto(Tensor<T> a, Tensor<T> b, Tensor<T> result, BroadcastOp op)
+        => BroadcastElementwise(a, b, result, result._shape, op);
 
     private static void BroadcastElementwise(
         Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)

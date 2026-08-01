@@ -3073,7 +3073,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // shape the broadcast fast paths exist for — the walk cost 78.2 ms/call against 10.8 ms.
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpAdd);
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Add);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -5409,7 +5409,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
-            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpSubtract);
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Subtract);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -5570,7 +5570,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
-            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpMultiply);
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Multiply);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -6295,7 +6295,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
-            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.OpDivide);
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Divide);
         }
         else if (typeof(T) == typeof(float))
         {
