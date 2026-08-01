@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Resident PyTorch/cuSOLVER competitors for issue #853 (not run by CI)."""
+"""Resident PyTorch/cuSOLVER competitors for issue #853 (not run by CI).
+
+Each run/operation/batch cell owns a disposable child process. Unsupported CUDA-graph
+capture can invalidate a process's CUDA context; cell isolation keeps that failure from
+making the next required eager competitor unavailable and releases VRAM between shapes.
+"""
 
 import argparse
 import json
 import math
+import os
 import platform
 import statistics
+import subprocess
+import sys
 import time
 
 import torch
@@ -311,6 +319,24 @@ def emit_unavailable(run, operation, batch, method, error):
     }, separators=(",", ":")), flush=True)
 
 
+def run_isolated_cell(run, operation, batch):
+    """Runs one eager/graph pair in a disposable CUDA process."""
+    command = [
+        sys.executable, "-u", os.path.abspath(__file__),
+        "--runs", "1", "--operation", operation, "--batch", str(batch),
+        "--isolated-cell", "--run-number", str(run),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.stdout:
+        print(completed.stdout, end="", flush=True)
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr, flush=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "isolated competitor cell %s/B=%d failed with exit code %d" %
+            (operation, batch, completed.returncode))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
@@ -320,51 +346,61 @@ def main():
     parser.add_argument(
         "--batch", action="append", type=int, choices=BATCHES,
         help="Run only this batch size; repeat to select multiple batch sizes.")
+    parser.add_argument("--isolated-cell", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--run-number", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    operations = tuple(args.operation) if args.operation else OPERATIONS
+    batches = tuple(args.batch) if args.batch else BATCHES
+    if not args.isolated_cell:
+        for run in range(1, args.runs + 1):
+            for operation in operations:
+                for batch in batches:
+                    run_isolated_cell(run, operation, batch)
+        return
+
+    if (len(operations) != 1 or len(batches) != 1 or args.runs != 1 or
+            args.run_number is None or args.run_number <= 0):
+        raise SystemExit("isolated competitor mode requires one operation, one batch, "
+                         "--runs 1, and a positive --run-number")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA PyTorch is required")
     torch.backends.cuda.matmul.allow_tf32 = False
-    operations = tuple(args.operation) if args.operation else OPERATIONS
-    batches = tuple(args.batch) if args.batch else BATCHES
-    for run in range(1, args.runs + 1):
-        for operation in operations:
-            for batch in batches:
-                eager_method = "PyTorch CUDA eager/cuSOLVER"
-                graph_method = "PyTorch CUDA graph/cuSOLVER"
-                try:
-                    a, eager, outputs = build(operation, batch)
-                    eager()
-                    torch.cuda.synchronize()
-                    error = residual(operation, a, outputs)
-                    evidence = measure(eager)
-                    emit(
-                        run, operation, batch, eager_method,
-                        *evidence[:3], error, *evidence[3:])
-                except Exception as eager_error:
-                    emit_unavailable(run, operation, batch, eager_method, eager_error)
-                    emit_unavailable(run, operation, batch, graph_method, eager_error)
-                    continue
+    run, operation, batch = args.run_number, operations[0], batches[0]
+    eager_method = "PyTorch CUDA eager/cuSOLVER"
+    graph_method = "PyTorch CUDA graph/cuSOLVER"
+    try:
+        a, eager, outputs = build(operation, batch)
+        eager()
+        torch.cuda.synchronize()
+        error = residual(operation, a, outputs)
+        evidence = measure(eager)
+        emit(
+            run, operation, batch, eager_method,
+            *evidence[:3], error, *evidence[3:])
+    except Exception as eager_error:
+        emit_unavailable(run, operation, batch, eager_method, eager_error)
+        emit_unavailable(run, operation, batch, graph_method, eager_error)
+        return
 
-                try:
-                    graph = torch.cuda.CUDAGraph()
-                    stream = torch.cuda.Stream()
-                    stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(stream):
-                        for _ in range(3):
-                            eager()
-                    torch.cuda.current_stream().wait_stream(stream)
-                    with torch.cuda.graph(graph):
-                        eager()
-                    replay = graph.replay
-                    evidence = measure(replay)
-                    emit(
-                        run, operation, batch, graph_method,
-                        *evidence[:3], error, *evidence[3:])
-                except Exception as capture_error:
-                    # Some cuSOLVER paths are not capture-safe on every installed
-                    # CUDA/PyTorch pair. Preserve that result instead of aborting
-                    # the remaining competitor cells.
-                    emit_unavailable(run, operation, batch, graph_method, capture_error)
+    try:
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                eager()
+        torch.cuda.current_stream().wait_stream(stream)
+        with torch.cuda.graph(graph):
+            eager()
+        replay = graph.replay
+        evidence = measure(replay)
+        emit(
+            run, operation, batch, graph_method,
+            *evidence[:3], error, *evidence[3:])
+    except Exception as capture_error:
+        # The controller discards this process after the cell, so a failed capture
+        # cannot poison the next required eager competitor's CUDA context.
+        emit_unavailable(run, operation, batch, graph_method, capture_error)
 
 
 if __name__ == "__main__":

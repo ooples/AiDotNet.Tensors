@@ -435,6 +435,7 @@ function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeE
         required_managed_temporary_shared_local_bytes = 0
         minimum_active_blocks_per_sm = 2
         external_sampling = '101 samples below 1 ms; at least 21 samples at or above 1 ms; 1-10 calibrated launches/sample'
+        external_process_isolation = 'one disposable CUDA process per run/operation/batch cell'
         runs = $RunCount
         external_competitors_included = $IncludeExternal
         verdicts = @($verdicts)
