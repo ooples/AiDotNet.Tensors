@@ -206,6 +206,29 @@ public sealed class GpuFirstRunAutotunerTests : IDisposable
     }
 
     [Fact]
+    public void Resolve_Disabled_IgnoresExistingCachedWinner()
+    {
+        KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "disabled-cached", "gpu-disabled-sm86");
+        var shape = new ShapeProfile(1, 64, 64, 256);
+        AutotuneCache.Store(id, shape, new KernelChoice
+        {
+            Variant = "tile-32",
+            Parameters = new Dictionary<string, string>(StringComparer.Ordinal) { ["Tile"] = "32" },
+            MeasuredGflops = 1200.0
+        });
+
+        AutotuneResolution resolution = GpuFirstRunAutotuner.Resolve(
+            id, shape, Tiles(16, 32),
+            _ => throw new InvalidOperationException("disabled tuning must not benchmark"),
+            autotuneEnabled: false);
+
+        Assert.Equal("tile-16", resolution.Variant);
+        Assert.False(resolution.FromCache);
+        Assert.False(resolution.Measured);
+        Assert.Equal(0.0, resolution.MeasuredGflops);
+    }
+
+    [Fact]
     public void Resolve_StaleCachedVariantNoLongerOffered_Retunes()
     {
         KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "stale", "gpu-stale-sm86");

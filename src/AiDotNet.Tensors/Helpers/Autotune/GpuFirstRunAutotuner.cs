@@ -120,9 +120,11 @@ public static class GpuFirstRunAutotuner
     /// <paramref name="shape"/> on the current device.
     ///
     /// <list type="number">
+    /// <item>Autotuning disabled → the first candidate is used as the safe default;
+    ///   neither cache nor measurement can influence dispatch.</item>
     /// <item>Cache hit whose variant is still offered → returned immediately (no measurement).</item>
-    /// <item>Autotuning disabled, or a single candidate → the first candidate is used as
-    ///   the safe default and nothing is measured or stored.</item>
+    /// <item>A single candidate → the first candidate is used as the safe default and
+    ///   nothing is measured or stored.</item>
     /// <item>Otherwise every candidate is benchmarked on-device. The fastest alternative
     ///   replaces candidate zero only when it is at least five percent faster; otherwise
     ///   the measured baseline is stored. A candidate whose benchmark throws or
@@ -146,7 +148,15 @@ public static class GpuFirstRunAutotuner
             throw new ArgumentException("At least one candidate is required.", nameof(candidates));
         if (benchmark is null) throw new ArgumentNullException(nameof(benchmark));
 
-        // 1. Cache hit — but only honor a variant that is still on offer, so a
+        AutotuneCandidate fallback = candidates[0];
+
+        // 1. Disabled means the safe baseline, including when an older tuned
+        //    winner exists on disk. This makes the opt-out deterministic.
+        if (!autotuneEnabled)
+            return new AutotuneResolution(
+                fallback.Variant, fallback.Parameters, 0.0, fromCache: false, measured: false);
+
+        // 2. Cache hit — but only honor a variant that is still on offer, so a
         //    renamed/removed candidate re-tunes instead of launching a stale id.
         KernelChoice? cached = AutotuneCache.Lookup(kernelId, shape);
         if (cached is { } hit && TryFindByVariant(candidates, hit.Variant, out AutotuneCandidate cachedCandidate))
@@ -154,14 +164,12 @@ public static class GpuFirstRunAutotuner
                 cachedCandidate.Variant, cachedCandidate.Parameters,
                 hit.MeasuredGflops, fromCache: true, measured: false);
 
-        AutotuneCandidate fallback = candidates[0];
-
-        // 2. Disabled or nothing to choose between → safe default, unmeasured, unstored.
-        if (!autotuneEnabled || candidates.Count == 1)
+        // 3. Nothing to choose between → safe default, unmeasured, unstored.
+        if (candidates.Count == 1)
             return new AutotuneResolution(
                 fallback.Variant, fallback.Parameters, 0.0, fromCache: false, measured: false);
 
-        // 3. On-device sweep. A candidate that throws or returns a non-finite/non-positive score is skipped.
+        // 4. On-device sweep. A candidate that throws or returns a non-finite/non-positive score is skipped.
         //    A stable alternative still needs a material win over candidate zero before promotion.
         AutotuneCandidate best = default;
         double bestGflops = double.NegativeInfinity;
