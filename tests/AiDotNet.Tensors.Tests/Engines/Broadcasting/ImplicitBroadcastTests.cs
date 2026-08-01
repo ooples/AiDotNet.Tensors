@@ -35,26 +35,57 @@ public class ImplicitBroadcastTests
     /// <summary>
     /// The reference contract: which shape pairs broadcast, and to what.
     /// </summary>
-    public static TheoryData<int[], int[], int[]> Compatible => new()
+    private static readonly (int[] ShapeA, int[] ShapeB, int[] Expected)[] s_compatibleCases =
     {
         // rank-equal, one axis stretched
-        { new[] { 4, 3 }, new[] { 4, 1 }, new[] { 4, 3 } },
-        { new[] { 4, 1 }, new[] { 4, 3 }, new[] { 4, 3 } },
-        { new[] { 4, 3 }, new[] { 1, 3 }, new[] { 4, 3 } },
+        (new[] { 4, 3 }, new[] { 4, 1 }, new[] { 4, 3 }),
+        (new[] { 4, 1 }, new[] { 4, 3 }, new[] { 4, 3 }),
+        (new[] { 4, 3 }, new[] { 1, 3 }, new[] { 4, 3 }),
         // both stretched, different axes
-        { new[] { 4, 1 }, new[] { 1, 3 }, new[] { 4, 3 } },
+        (new[] { 4, 1 }, new[] { 1, 3 }, new[] { 4, 3 }),
         // rank padding
-        { new[] { 4, 3 }, new[] { 3 },    new[] { 4, 3 } },
-        { new[] { 3 },    new[] { 4, 3 }, new[] { 4, 3 } },
+        (new[] { 4, 3 }, new[] { 3 },    new[] { 4, 3 }),
+        (new[] { 3 },    new[] { 4, 3 }, new[] { 4, 3 }),
         // scalars in tensor form
-        { new[] { 4, 3 }, new[] { 1, 1 }, new[] { 4, 3 } },
-        { new[] { 1 },    new[] { 4, 3 }, new[] { 4, 3 } },
+        (new[] { 4, 3 }, new[] { 1, 1 }, new[] { 4, 3 }),
+        (new[] { 1 },    new[] { 4, 3 }, new[] { 4, 3 }),
         // rank 3
-        { new[] { 2, 4, 3 }, new[] { 4, 1 },    new[] { 2, 4, 3 } },
-        { new[] { 2, 1, 3 }, new[] { 1, 4, 1 }, new[] { 2, 4, 3 } },
+        (new[] { 2, 4, 3 }, new[] { 4, 1 },    new[] { 2, 4, 3 }),
+        (new[] { 2, 1, 3 }, new[] { 1, 4, 1 }, new[] { 2, 4, 3 }),
         // identical shapes must stay untouched
-        { new[] { 4, 3 }, new[] { 4, 3 }, new[] { 4, 3 } },
+        (new[] { 4, 3 }, new[] { 4, 3 }, new[] { 4, 3 })
     };
+
+    public static TheoryData<int[], int[], int[]> Compatible
+    {
+        get
+        {
+            var data = new TheoryData<int[], int[], int[]>();
+            foreach (var (shapeA, shapeB, expected) in s_compatibleCases)
+                data.Add(shapeA, shapeB, expected);
+            return data;
+        }
+    }
+
+    public static TheoryData<string> ElementwiseOperations => new()
+    {
+        "add",
+        "subtract",
+        "multiply",
+        "divide"
+    };
+
+    public static TheoryData<string, int[], int[], int[]> CompatibleOperations
+    {
+        get
+        {
+            var data = new TheoryData<string, int[], int[], int[]>();
+            foreach (string operation in new[] { "add", "subtract", "multiply", "divide" })
+            foreach (var (shapeA, shapeB, expected) in s_compatibleCases)
+                data.Add(operation, shapeA, shapeB, expected);
+            return data;
+        }
+    }
 
     public static TheoryData<int[], int[]> Incompatible => new()
     {
@@ -99,10 +130,11 @@ public class ImplicitBroadcastTests
         Assert.ThrowsAny<ArgumentException>(() => _engine.TensorDivide(a, b));
     }
 
-    [Fact]
-    public void BroadcastValues_MatchAnExplicitlyExpandedComputation()
+    [Theory]
+    [MemberData(nameof(ElementwiseOperations))]
+    public void BroadcastValues_MatchAnExplicitlyExpandedComputation(string operation)
     {
-        // [4,3] + [4,1] must equal the same sum against a manually tiled operand.
+        // [4,3] op [4,1] must equal the same operation against a manually tiled operand.
         var a = Filled(new[] { 4, 3 }, 5);
         var col = Filled(new[] { 4, 1 }, 6);
 
@@ -111,8 +143,8 @@ public class ImplicitBroadcastTests
             for (int c = 0; c < 3; c++)
                 tiled[r, c] = col[r, 0];
 
-        var broadcast = _engine.TensorAdd(a, col);
-        var explicitly = _engine.TensorAdd(a, tiled);
+        var broadcast = Apply(operation, a, col);
+        var explicitly = Apply(operation, a, tiled);
 
         for (int i = 0; i < broadcast.Length; i++)
             Assert.Equal(explicitly[i], broadcast[i], 12);
@@ -128,34 +160,52 @@ public class ImplicitBroadcastTests
     /// perfectly right while training goes the wrong way.
     /// </remarks>
     [Theory]
-    [MemberData(nameof(Compatible))]
-    public void BroadcastGradient_MatchesFiniteDifferences(int[] shapeA, int[] shapeB, int[] expected)
+    [MemberData(nameof(CompatibleOperations))]
+    public void BroadcastGradient_MatchesFiniteDifferences(
+        string operation, int[] shapeA, int[] shapeB, int[] expected)
     {
         _ = expected;
-        AssertGradientAgainstFiniteDifferences(shapeA, shapeB, differentiateSecondOperand: false);
-        AssertGradientAgainstFiniteDifferences(shapeA, shapeB, differentiateSecondOperand: true);
+        AssertGradientAgainstFiniteDifferences(operation, shapeA, shapeB, differentiateSecondOperand: false);
+        AssertGradientAgainstFiniteDifferences(operation, shapeA, shapeB, differentiateSecondOperand: true);
     }
 
-    private void AssertGradientAgainstFiniteDifferences(int[] shapeA, int[] shapeB, bool differentiateSecondOperand)
+    private Tensor<double> Apply(string operation, Tensor<double> a, Tensor<double> b)
+        => operation switch
+        {
+            "add" => _engine.TensorAdd(a, b),
+            "subtract" => _engine.TensorSubtract(a, b),
+            "multiply" => _engine.TensorMultiply(a, b),
+            "divide" => _engine.TensorDivide(a, b),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown element-wise operation.")
+        };
+
+    private void AssertGradientAgainstFiniteDifferences(
+        string operation, int[] shapeA, int[] shapeB, bool differentiateSecondOperand)
     {
         var a = Filled(shapeA, 7);
         var b = Filled(shapeB, 8);
+        if (operation == "divide")
+        {
+            // Keep denominator probes away from zero so the finite-difference comparison measures
+            // the broadcast gradient reduction rather than numerical conditioning at a pole.
+            for (int i = 0; i < b.Length; i++) b[i] = 0.5 + Math.Abs(b[i]);
+        }
         var target = differentiateSecondOperand ? b : a;
 
         double Loss()
         {
-            var product = _engine.TensorMultiply(a, b);
-            var summed = _engine.ReduceSum(product, null, keepDims: false);
+            var result = Apply(operation, a, b);
+            var summed = _engine.ReduceSum(result, null, keepDims: false);
             return summed[0];
         }
 
         using var tape = new GradientTape<double>();
-        var value = _engine.ReduceSum(_engine.TensorMultiply(a, b), null, keepDims: false);
+        var value = _engine.ReduceSum(Apply(operation, a, b), null, keepDims: false);
         var grads = tape.ComputeGradients(value, new[] { target });
 
         Assert.True(grads.ContainsKey(target),
             $"no gradient for the {(differentiateSecondOperand ? "second" : "first")} operand of " +
-            $"multiply([{string.Join(",", shapeA)}], [{string.Join(",", shapeB)}])");
+            $"{operation}([{string.Join(",", shapeA)}], [{string.Join(",", shapeB)}])");
 
         var g = grads[target];
         Assert.True(target.Shape.ToArray().SequenceEqual(g.Shape.ToArray()),
@@ -174,28 +224,29 @@ public class ImplicitBroadcastTests
 
             double numeric = (plus - minus) / (2 * eps);
             Assert.True(Math.Abs(numeric - g[k]) <= 1e-5 * Math.Max(1.0, Math.Abs(numeric)),
-                $"gradient[{k}] for multiply([{string.Join(",", shapeA)}], [{string.Join(",", shapeB)}]) " +
+                $"gradient[{k}] for {operation}([{string.Join(",", shapeA)}], [{string.Join(",", shapeB)}]) " +
                 $"is {g[k]:G10} but finite differences give {numeric:G10}. A stretched axis is most " +
                 "likely being counted once instead of once per broadcast position.");
         }
     }
 
-    [Fact]
-    public void StrictScope_RejectsBroadcastsThatWouldOtherwiseSucceed()
+    [Theory]
+    [MemberData(nameof(ElementwiseOperations))]
+    public void StrictScope_RejectsBroadcastsThatWouldOtherwiseSucceed(string operation)
     {
         var a = Filled(new[] { 4, 3 }, 9);
         var b = Filled(new[] { 4, 1 }, 10);
 
-        Assert.Equal(new[] { 4, 3 }, _engine.TensorAdd(a, b).Shape.ToArray());
+        Assert.Equal(new[] { 4, 3 }, Apply(operation, a, b).Shape.ToArray());
 
         using (ShapePolicy.Strict())
         {
-            var ex = Assert.ThrowsAny<ArgumentException>(() => _engine.TensorAdd(a, b));
+            var ex = Assert.ThrowsAny<ArgumentException>(() => Apply(operation, a, b));
             Assert.Contains("Strict", ex.Message, StringComparison.Ordinal);
         }
 
         // Policy is restored on scope exit.
-        Assert.Equal(new[] { 4, 3 }, _engine.TensorAdd(a, b).Shape.ToArray());
+        Assert.Equal(new[] { 4, 3 }, Apply(operation, a, b).Shape.ToArray());
     }
 
     [Fact]
@@ -210,6 +261,31 @@ public class ImplicitBroadcastTests
             Assert.True(ShapePolicy.IsStrict);
         }
         Assert.False(ShapePolicy.IsStrict);
+    }
+
+    [Fact]
+    public void StrictScope_AliasesCannotDisposeTheSameScopeTwice()
+    {
+        Assert.False(ShapePolicy.IsStrict);
+        using (ShapePolicy.Strict())
+        {
+            var inner = ShapePolicy.Strict();
+            var alias = inner;
+
+            inner.Dispose();
+            alias.Dispose();
+
+            // Both variables reference one idempotent handle. Disposing the alias must not consume
+            // the still-active outer scope, which was possible when StrictScope was a copyable struct.
+            Assert.True(ShapePolicy.IsStrict);
+        }
+        Assert.False(ShapePolicy.IsStrict);
+    }
+
+    [Fact]
+    public void StrictScope_HasNoPublicConstructor()
+    {
+        Assert.Empty(typeof(ShapePolicy.StrictScope).GetConstructors());
     }
 
     /// <summary>

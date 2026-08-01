@@ -52,12 +52,26 @@ public static class ShapePolicy
     /// <summary>
     /// The scope handle returned by <see cref="Strict"/>.
     /// </summary>
-    public readonly struct StrictScope : IDisposable
+    public sealed class StrictScope : IDisposable
     {
+        private readonly int _ownerThreadId;
+        private int _disposed;
+
         /// <summary>Enters a strict-shape scope. Prefer <see cref="ShapePolicy.Strict"/>.</summary>
-        public StrictScope() => _strictDepth++;
+        internal StrictScope()
+        {
+            _ownerThreadId = Environment.CurrentManagedThreadId;
+            _strictDepth++;
+        }
 
         /// <summary>Restores the previous shape policy.</summary>
-        public void Dispose() => _strictDepth--;
+        public void Dispose()
+        {
+            if (Environment.CurrentManagedThreadId != _ownerThreadId)
+                throw new InvalidOperationException(
+                    "A ShapePolicy.Strict scope must be disposed on the thread that created it.");
+            if (System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0)
+                _strictDepth--;
+        }
     }
 }
