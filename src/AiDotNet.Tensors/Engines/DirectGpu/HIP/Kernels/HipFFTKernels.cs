@@ -41,7 +41,8 @@ internal static class HipFFTKernels
 
 #define PI 3.14159265358979323846f
 
-// Bit reversal permutation for in-place FFT
+// Bit reversal permutation, OUT OF PLACE. `src` and `dst` must be distinct
+// allocations: each thread reads src[reversed] and writes dst[idx].
 extern ""C"" __global__ __launch_bounds__(256) void bit_reverse_permutation(
     const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int n, int log2n)
 {
@@ -258,8 +259,9 @@ extern ""C"" __global__ __launch_bounds__(256) void apply_window(
     output[idx] = input[idx] * window[idx];
 }
 
-// 2D FFT row-wise bit-reversal (permute each row of length `width`, in place). DIT butterflies operate
-// on bit-reversed input, so this MUST run before fft_rows_butterfly (previously omitted -> 2D garbage).
+// 2D FFT row-wise bit-reversal (permute each row of length `width`, OUT OF PLACE into `dst`; `src` and
+// `dst` must be distinct). DIT butterflies operate on bit-reversed input, so this MUST run before
+// fft_rows_butterfly (previously omitted -> 2D garbage).
 // Launched with blockDim.y==1 and gridY==height, so blockIdx.y is the row index.
 extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
     const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int height, int width, int log2width)
@@ -278,9 +280,10 @@ extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
     dstImag[base + idx] = srcImag[base + reversed];
 }
 
-// 2D FFT column-wise bit-reversal (permute each column of length `height`, stride `width`, in place).
-// Required before fft_cols_butterfly. Launched with blockDim.y==1 and gridY==width, so blockIdx.y is the
-// column index and blockIdx.x*blockDim.x+threadIdx.x is the position within the column.
+// 2D FFT column-wise bit-reversal (permute each column of length `height`, stride `width`, OUT OF PLACE
+// into `dst`; `src` and `dst` must be distinct). Required before fft_cols_butterfly. Launched
+// with blockDim.y==1 and gridY==width, so blockIdx.y is the column index and
+// blockIdx.x*blockDim.x+threadIdx.x is the position within the column.
 extern ""C"" __global__ __launch_bounds__(256) void fft_cols_bit_reverse(
     const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int height, int width, int log2height)
 {
