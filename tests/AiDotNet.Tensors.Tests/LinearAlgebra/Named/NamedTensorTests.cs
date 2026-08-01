@@ -129,6 +129,29 @@ public class NamedTensorTests
     }
 
     [Fact]
+    public void Add_BroadcastsSingletonAxisFromLeftOperand()
+    {
+        var a = new Tensor<float>(new[] { 1, 3 });
+        a[0, 0] = 1; a[0, 1] = 2; a[0, 2] = 3;
+        var aN = new NamedTensor<float>(a, "batch", "features");
+
+        var b = new Tensor<float>(new[] { 4, 3 });
+        for (int batch = 0; batch < 4; batch++)
+            for (int feature = 0; feature < 3; feature++)
+                b[batch, feature] = batch * 10 + feature;
+        var bN = new NamedTensor<float>(b, "batch", "features");
+
+        var result = NamedOps.Add(aN, bN);
+
+        Assert.Equal(new[] { 4, 3 }, result.Shape);
+        Assert.Equal(new string?[] { "batch", "features" }, result.Names);
+        Assert.Equal(1f, result.Tensor[0, 0]);
+        Assert.Equal(13f, result.Tensor[1, 1]);
+        Assert.Equal(25f, result.Tensor[2, 2]);
+        Assert.Equal(31f, result.Tensor[3, 0]);
+    }
+
+    [Fact]
     public void Sum_ReducesByName()
     {
         var t = new Tensor<float>(new[] { 2, 3 });
