@@ -1643,6 +1643,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
@@ -1711,6 +1712,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
