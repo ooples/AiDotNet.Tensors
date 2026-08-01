@@ -35,6 +35,18 @@ against fp64 CPU oracles under GPU-gated driver tests, and PTX-structure and
 manifest-completeness gates pass on no-GPU CI. The production admission table
 therefore remains fail-closed and production behavior is unchanged.
 
+## Cross-backend parity inventory
+
+The CUDA specializations do not create CUDA-only public operations. Native HIP,
+Metal, OpenCL, Vulkan, and WebGPU routes exist for complex mat-vec,
+normalize-probabilities, measurement-forward, all four ANN operations, and
+Instant-NGP hash-grid encoding forward/backward. Vulkan also implements
+spherical-softmax. The remaining spherical-softmax routes are explicitly owned
+by the existing per-backend softmax parity issues: HIP #914, Metal #915,
+OpenCL #916, and WebGPU #917. Those issue contracts include native dispatch,
+non-power-of-two row coverage, and no CPU fallback; no CUDA promotion can waive
+that work.
+
 This branch emits and validates **raw PTX**. The compiled-cubin pipeline
 (stages 2–9 below) — driver-linked cubin preservation, SASS audit, embedded
 `Artifacts/sm86/*.cubin` resources, and Nsight profiling — requires the pinned
