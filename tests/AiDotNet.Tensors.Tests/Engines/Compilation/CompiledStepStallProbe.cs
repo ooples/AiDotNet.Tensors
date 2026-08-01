@@ -4,7 +4,6 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
-using Xunit;
 using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -38,8 +37,8 @@ public class CompiledStepStallProbe
         return new Tensor<float>(data, shape);
     }
 
-    [Fact]
-    [Trait("Category", "Performance")]
+    // Manual diagnostic entry point. Intentionally has no xUnit attribute because it reports
+    // timing distributions without asserting a correctness or performance contract.
     public void CompiledTrainingStep_PerStepDistribution()
     {
         var engine = new CpuEngine();
