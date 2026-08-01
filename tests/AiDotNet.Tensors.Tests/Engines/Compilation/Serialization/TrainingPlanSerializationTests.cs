@@ -117,6 +117,38 @@ public class TrainingPlanSerializationTests
         loaded.Dispose();
     }
 
+    [Fact]
+    public async Task SaveLoad_TrainingPlanWithExpand_ReplaysShapeAndGradient()
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 1, 3 });
+
+        ICompiledTrainingPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            var expanded = weight.ExpandTo(new[] { 2, 3 });
+            engine.ReduceSum(expanded, null);
+            original = scope.CompileTraining(new[] { weight });
+        }
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+
+        var loadedWeight = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 1, 3 });
+        var loaded = await CompiledPlanLoader.LoadTrainingAsync<float>(
+            stream, engine, new[] { loadedWeight });
+        Assert.NotNull(loaded);
+
+        var loss = loaded!.Step();
+
+        Assert.InRange(loss[0], 11.9999f, 12.0001f);
+        Assert.Equal(new[] { 2f, 2f, 2f }, loaded.Gradients[0].AsSpan().ToArray());
+
+        original.Dispose();
+        loaded.Dispose();
+    }
+
     [Theory]
     [MemberData(nameof(SupportedFloatOptimizerCheckpointCases))]
     public async Task SaveLoad_TrainingPlanWithEverySupportedFloatOptimizer_RestoresContinuation(OptimizerType optimizer)

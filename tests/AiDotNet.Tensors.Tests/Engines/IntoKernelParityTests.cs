@@ -123,7 +123,7 @@ public class IntoKernelParityTests
     {
         var a = R([4, 8], 51);
         var b = R([1, 8], 52);
-        var expected = E.TensorBroadcastAdd(a, b);
+        var expected = E.TensorAdd(a, b);
         var dest = new Tensor<float>([4, 8]);
         E.TensorBroadcastAddInto(dest, a, b);
         AE(dest, expected, "broadcast-add-into");
@@ -135,7 +135,7 @@ public class IntoKernelParityTests
     {
         var a = R([4, 8], 61);
         var b = R([1, 8], 62);
-        var expected = E.TensorBroadcastMultiply(a, b);
+        var expected = E.TensorMultiply(a, b);
         var dest = new Tensor<float>([4, 8]);
         E.TensorBroadcastMultiplyInto(dest, a, b);
         AE(dest, expected, "broadcast-mul-into");

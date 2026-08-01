@@ -55,7 +55,7 @@ internal static class AttentionOperator
 
             // Project to [batch, seq, 3*hidden] then split along last dim.
             var projected = ctx.Engine.TensorMatMul(input, weights);
-            var biased = ctx.Engine.TensorBroadcastAdd(projected, bias);
+            var biased = ctx.Engine.TensorAdd(projected, bias);
 
             // Split into Q, K, V along the last dim (width 3*hidden → 3 × hidden).
             var qkv = ctx.Engine.TensorSplit(biased, 3, axis: 2);

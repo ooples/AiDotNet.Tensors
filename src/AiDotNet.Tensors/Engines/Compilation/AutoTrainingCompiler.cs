@@ -424,6 +424,17 @@ internal static class AutoTrainingCompiler
             valueHash *= unchecked((long)0x100000001b3L);
         }
 
+        // Strides too, because shape alone stopped identifying a leaf once broadcasting began
+        // stretching operands into views. A [1,2] and a [2,1] constant both reach here as [2,2]
+        // views over the same two stored numbers, differing ONLY in which axis carries stride 0 —
+        // so hashing shape and values would hand both the same plan key and let a plan compiled
+        // for the row broadcast be replayed for the column one.
+        foreach (int stride in leaf._strides)
+        {
+            valueHash ^= stride;
+            valueHash *= unchecked((long)0x100000001b3L);
+        }
+
         // EqualityComparer<T>.Default dispatches without boxing for value types; calling
         // GetHashCode() on the element directly would allocate once per element, which on a
         // per-step hash of up to MaxHashedConstantElements values is a hot-path regression.

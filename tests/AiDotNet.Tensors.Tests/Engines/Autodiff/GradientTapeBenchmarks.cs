@@ -571,7 +571,7 @@ public class GradientTapeBenchmarks
         {
             using var warmTape = new GradientTape<float>();
             var h = _engine.TensorMatMul(x, w);
-            var output = _engine.TensorBroadcastAdd(h, bias);
+            var output = _engine.TensorAdd(h, bias);
             var loss = _engine.TensorMSELoss(output, target);
             warmTape.ComputeGradients(loss, sources: new[] { w, bias });
         }
@@ -591,12 +591,12 @@ public class GradientTapeBenchmarks
         var tempH = _engine.TensorMatMul(x, w);
         sw.Restart();
         for (int i = 0; i < iterations; i++)
-            _engine.TensorBroadcastAdd(tempH, bias);
+            _engine.TensorAdd(tempH, bias);
         sw.Stop();
         _output.WriteLine($"  2. BroadcastAdd [32,128]+[1,128]: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
 
         // 3. MSELoss only
-        var tempOutput = _engine.TensorBroadcastAdd(tempH, bias);
+        var tempOutput = _engine.TensorAdd(tempH, bias);
         sw.Restart();
         for (int i = 0; i < iterations; i++)
             _engine.TensorMSELoss(tempOutput, target);
@@ -609,7 +609,7 @@ public class GradientTapeBenchmarks
         {
             using var tape = new GradientTape<float>();
             var fh = _engine.TensorMatMul(x, w);
-            var fo = _engine.TensorBroadcastAdd(fh, bias);
+            var fo = _engine.TensorAdd(fh, bias);
             var fl = _engine.TensorMSELoss(fo, target);
         }
         sw.Stop();
@@ -619,7 +619,7 @@ public class GradientTapeBenchmarks
         {
             using var tape = new GradientTape<float>();
             var h5 = _engine.TensorMatMul(x, w);
-            var o5 = _engine.TensorBroadcastAdd(h5, bias);
+            var o5 = _engine.TensorAdd(h5, bias);
             var l5 = _engine.TensorMSELoss(o5, target);
             _output.WriteLine($"  5. Tape entries: {tape.EntryCount}");
             // tape.ProfileBackward = true; // uncomment for per-op timing
@@ -635,7 +635,7 @@ public class GradientTapeBenchmarks
         {
             using var tape = new GradientTape<float>();
             var h = _engine.TensorMatMul(x, w);
-            var output = _engine.TensorBroadcastAdd(h, bias);
+            var output = _engine.TensorAdd(h, bias);
             var loss = _engine.TensorMSELoss(output, target);
             tape.ComputeGradients(loss, sources: new[] { w, bias });
         }
@@ -649,7 +649,7 @@ public class GradientTapeBenchmarks
             {
                 using var warmTape = new GradientTape<float>();
                 var wh = _engine.TensorMatMul(x, w);
-                var wo = _engine.TensorBroadcastAdd(wh, bias);
+                var wo = _engine.TensorAdd(wh, bias);
                 var wl = _engine.TensorMSELoss(wo, target);
                 warmTape.ComputeGradients(wl, sources: new[] { w, bias });
             }
@@ -661,7 +661,7 @@ public class GradientTapeBenchmarks
                 arena.Reset();
                 using var tape = new GradientTape<float>();
                 var h = _engine.TensorMatMul(x, w);
-                var output = _engine.TensorBroadcastAdd(h, bias);
+                var output = _engine.TensorAdd(h, bias);
                 var loss = _engine.TensorMSELoss(output, target);
                 tape.ComputeGradients(loss, sources: new[] { w, bias });
             }

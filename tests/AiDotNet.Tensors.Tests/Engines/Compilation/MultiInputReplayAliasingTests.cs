@@ -46,7 +46,7 @@ public class MultiInputReplayAliasingTests : IDisposable
         Func<Tensor<float>> forward = () =>
         {
             var h = engine.TensorMatMul(x, w1);
-            h = engine.TensorBroadcastAdd(h, t);       // inject the per-step input
+            h = engine.TensorAdd(h, t);       // inject the per-step input
             h = engine.ReLU(h);
             var o = engine.TensorMatMul(h, w2);
             return engine.TensorAdd(o, x);             // residual back to the input
@@ -78,7 +78,7 @@ public class MultiInputReplayAliasingTests : IDisposable
 
             // And the replay must match a clean eager evaluation computed from the ORIGINAL inputs.
             var hE = engine.TensorMatMul(x, w1);
-            hE = engine.TensorBroadcastAdd(hE, t);
+            hE = engine.TensorAdd(hE, t);
             hE = engine.ReLU(hE);
             var oE = engine.TensorMatMul(hE, w2);
             var eager = Snapshot(engine.TensorAdd(oE, x));
@@ -101,7 +101,7 @@ public class MultiInputReplayAliasingTests : IDisposable
         Func<Tensor<float>> forward = () =>
         {
             var h = engine.ReLU(x);
-            return engine.TensorBroadcastAdd(h, t);
+            return engine.TensorAdd(h, t);
         };
 
         var xBefore = Snapshot(x);
@@ -187,8 +187,8 @@ public class MultiInputReplayAliasingTests : IDisposable
             var modR = engine.Reshape(mod, new[] { 1, 6, 1, hidden });
             var shift = engine.TensorSliceAxis(modR, 1, 0);
             var scale = engine.TensorSliceAxis(modR, 1, 1);
-            var scaled = engine.TensorBroadcastMultiply(x, engine.TensorAddScalar(scale, 1f));
-            return engine.TensorBroadcastAdd(scaled, shift);
+            var scaled = engine.TensorMultiply(x, engine.TensorAddScalar(scale, 1f));
+            return engine.TensorAdd(scaled, shift);
         };
 
         var xBefore = Snapshot(x);
@@ -267,10 +267,10 @@ public class MultiInputReplayAliasingTests : IDisposable
             var scale1 = engine.TensorSliceAxis(modReshaped, 1, 1);
             var gate1  = engine.TensorSliceAxis(modReshaped, 1, 2);
             // y = x*(1+scale)+shift  (ApplyAdaLN)
-            var scaled = engine.TensorBroadcastMultiply(x, engine.TensorAddScalar(scale1, 1f));
-            var normed = engine.TensorBroadcastAdd(scaled, shift1);
+            var scaled = engine.TensorMultiply(x, engine.TensorAddScalar(scale1, 1f));
+            var normed = engine.TensorAdd(scaled, shift1);
             // gated residual: x + gate*normed
-            var gated = engine.TensorBroadcastMultiply(normed, gate1);
+            var gated = engine.TensorMultiply(normed, gate1);
             return engine.TensorAdd(x, gated);
         };
 
@@ -321,14 +321,14 @@ public class MultiInputReplayAliasingTests : IDisposable
             var x = (Tensor<float>)x0;
             for (int i = 0; i < blocks; i++)
             {
-                var n1 = engine.TensorBroadcastMultiply(engine.TensorLayerNorm(x, g, b), t);
+                var n1 = engine.TensorMultiply(engine.TensorLayerNorm(x, g, b), t);
                 var q = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(n1, wq[i]), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
                 var k = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(n1, wk[i]), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
                 var v = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(n1, wv[i]), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
                 var attn = engine.ScaledDotProductAttention(q, k, v, null, 1.0 / Math.Sqrt(headDim), out _);
                 var attnFlat = engine.Reshape(engine.TensorPermute(attn, new[] { 0, 2, 1, 3 }), new[] { seq, embed });
                 x = engine.TensorAdd(x, attnFlat);
-                var n2 = engine.TensorBroadcastMultiply(engine.TensorLayerNorm(x, g, b), t);
+                var n2 = engine.TensorMultiply(engine.TensorLayerNorm(x, g, b), t);
                 var mlp = engine.GELU(engine.TensorMatMul(n2, wm[i]));
                 x = engine.TensorAdd(x, mlp);
             }
@@ -367,7 +367,7 @@ public class MultiInputReplayAliasingTests : IDisposable
         {
             var p = engine.TensorPermute(x, new[] { 0, 2, 1, 3 });   // [B, seq, heads, hd] (strided in eager)
             var flat = engine.Reshape(p, new[] { B, seq, heads * hd });
-            return engine.TensorBroadcastAdd(flat, t);                // materialize
+            return engine.TensorAdd(flat, t);                // materialize
         };
         var eager = Snapshot(forward());
         var cache = new CompiledModelCache<float>();
@@ -399,7 +399,7 @@ public class MultiInputReplayAliasingTests : IDisposable
             var mm = engine.TensorMatMul(input2D, w);                                  // [seq, embed]
             var r = engine.Reshape(mm, new[] { 1, seq, heads, headDim });              // view
             var p = engine.TensorPermute(r, new[] { 0, 2, 1, 3 });                     // [1, heads, seq, headDim]
-            return engine.TensorBroadcastAdd(p, t);
+            return engine.TensorAdd(p, t);
         };
         var eager = Snapshot(forward());
         var cache = new CompiledModelCache<float>();
@@ -572,7 +572,7 @@ public class MultiInputReplayAliasingTests : IDisposable
             var attn = engine.ScaledDotProductAttention(qh, kh, vh, null, 1.0 / Math.Sqrt(headDim), out _);
             var back = engine.TensorPermute(attn, new[] { 0, 2, 1, 3 });
             var flat = engine.Reshape(back, new[] { 1, seq, embed });
-            return engine.TensorBroadcastAdd(flat, t);
+            return engine.TensorAdd(flat, t);
         };
 
         var inputBefore = Snapshot(input2D);
@@ -614,11 +614,11 @@ public class MultiInputReplayAliasingTests : IDisposable
         Func<Tensor<float>> forward = () =>
         {
             var n1 = engine.TensorLayerNorm(x, g, b);
-            var mod = engine.TensorBroadcastMultiply(n1, t);          // AdaLN scale by the 2nd input
+            var mod = engine.TensorMultiply(n1, t);          // AdaLN scale by the 2nd input
             var attnish = engine.TensorMatMul(mod, w1);
             var res1 = engine.TensorAdd(x, attnish);                  // residual 1
             var n2 = engine.TensorLayerNorm(res1, g, b);
-            var mod2 = engine.TensorBroadcastMultiply(n2, t);         // 2nd consumption of input t
+            var mod2 = engine.TensorMultiply(n2, t);         // 2nd consumption of input t
             var mlp = engine.GELU(engine.TensorMatMul(mod2, w2));
             return engine.TensorAdd(res1, mlp);                       // residual 2
         };
