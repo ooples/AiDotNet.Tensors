@@ -27,7 +27,7 @@ public class PermuteBroadcastAddCompiledBackwardTests
     /// Minimal repro of the NBEATS block forward chain. Batch B=4, input dim
     /// inSize=3, output dim outSize=2 — small enough to reason about but
     /// exercises the exact op sequence:
-    /// <c>x[B,in]  ─Permute[1,0]→  x[in,B]  ─MatMul(W[out,in], x[in,B])→  linear[out,B]  ─BroadcastAdd(linear, biasCol[out,1])→  y[out,B]</c>
+    /// <c>x[B,in]  ─Permute[1,0]→  x[in,B]  ─MatMul(W[out,in], x[in,B])→  linear[out,B]  ─TensorAdd(linear, biasCol[out,1])→  y[out,B]</c>
     /// Then a ReduceSum-to-scalar loss so a single scalar backward has clear
     /// analytic gradients w.r.t. W and bias.
     /// </summary>
@@ -277,7 +277,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });
 
     /// <summary>
     /// Exact NBEATS doubly-residual stack pattern (paper §3.2): two blocks share
-    /// the same Permute+MatMul+BroadcastAdd forward, block N's output is
+    /// the same Permute+MatMul+TensorAdd forward, block N's output is
     /// SUBTRACTED from the residual fed to block N+1, and per-block forecasts
     /// are SUMMED. The subtract-from-residual + sum-of-forecasts chain is what
     /// the junior dev's NBEATS PR comment blames for the "compiled fused

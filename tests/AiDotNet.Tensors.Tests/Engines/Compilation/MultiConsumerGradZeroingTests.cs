@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// backward step is specialized (genericBackwardCount == 0), on the assumption
 /// that a specialized delegate always OVERWRITES its gradient buffer (beta=0).
 /// That assumption is false for a MULTI-CONSUMER tensor: the specialized
-/// BroadcastAdd bias-grad delegate ACCUMULATES in place (+=) because a tensor
+/// TensorAdd bias-grad delegate ACCUMULATES in place (+=) because a tensor
 /// consumed by N ops receives the SUM of N gradient contributions. With the
 /// buffer never zeroed, each step's accumulation lands on top of the PRIOR
 /// step's gradient, so the gradient grows without bound — the N-BEATS
@@ -24,8 +24,8 @@ public class MultiConsumerGradZeroingTests
 {
     /// <summary>
     /// A single bias <c>b</c> broadcast-added to TWO distinct inputs, so <c>b</c>
-    /// is multi-consumer and its gradient accumulates from both BroadcastAdd
-    /// backwards. The whole graph (BroadcastAdd + scalar ReduceSum + Add) compiles
+    /// is multi-consumer and its gradient accumulates from both TensorAdd
+    /// backwards. The whole graph (TensorAdd + scalar ReduceSum + Add) compiles
     /// to an all-specialized backward, which is exactly the path that skipped
     /// zeroing. loss = sum(x1 + b) + sum(x2 + b), so d(loss)/db[f] = 2*batch on
     /// EVERY step (input- and b-independent). With the bug the second step reports

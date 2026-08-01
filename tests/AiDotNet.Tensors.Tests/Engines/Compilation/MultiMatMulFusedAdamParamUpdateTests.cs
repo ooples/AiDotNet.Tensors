@@ -140,7 +140,7 @@ public class MultiMatMulFusedAdamParamUpdateTests
     /// the exact code path AiDotNet's <c>DenseLayer.Forward</c> takes when
     /// it routes through the fused-linear kernel. Same shapes as the
     /// two-MatMul-chain test; the only difference is the op selection.
-    /// If MatMul+BroadcastAdd works but FusedLinear stacking doesn't, the
+    /// If MatMul+TensorAdd works but FusedLinear stacking doesn't, the
     /// bug is in <c>FusedLinearWithActivationBackward</c>'s graph plumbing.
     /// </summary>
     [Fact]
@@ -608,7 +608,7 @@ public class MultiMatMulFusedAdamParamUpdateTests
     /// Plus a Multiply downstream (which the trace showed at FWDSTEP 13,14
     /// after LayerNorm — residual or scale). Try inserting an Add between
     /// FusedLinear and LayerNorm — the residual connection — that uses
-    /// TensorAdd or TensorAdd, since the Transformer's residual
+    /// TensorAdd, since the Transformer's residual
     /// path goes: MHA_out + input → LayerNorm.
     /// </summary>
     [Fact]

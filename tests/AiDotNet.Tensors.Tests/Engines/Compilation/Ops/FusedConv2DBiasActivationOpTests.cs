@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation.Ops;
 
 /// <summary>
 /// Tests for <see cref="FusedConv2DBiasActivationOp{T}"/>. Validates numerical
-/// parity with the separate Conv + BroadcastAdd + Activation sequence, attribute
+/// parity with the separate Conv + TensorAdd + Activation sequence, attribute
 /// exposure for fusion passes, and factory round-trip.
 /// </summary>
 public class FusedConv2DBiasActivationOpTests
@@ -37,7 +37,7 @@ public class FusedConv2DBiasActivationOpTests
         var fusedOutput = new Tensor<float>(op.OutputShape);
         op.BuildForwardClosure()(engine, fusedOutput);
 
-        // Separate path: Conv → BroadcastAdd → Activation
+        // Separate path: Conv → TensorAdd → Activation
         var convResult = engine.Conv2D(input, kernel, stride, padding, dilation);
         // Reshape bias to [1, Cout, 1, 1] for broadcasting
         var biasReshaped = bias.Reshape(new[] { 1, bias._shape[0], 1, 1 });
