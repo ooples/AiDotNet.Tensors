@@ -202,6 +202,86 @@ function Read-SolverPythonRows([string]$Path) {
     } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
+function Assert-SolverDotnetAcceptedAttempt([string]$Path, [int]$Run) {
+    $operations = @(
+        'cholesky', 'lu-factor', 'qr', 'eigh', 'eigh-lower', 'svd', 'lu-solve',
+        'ldl-factor', 'ldl-solve', 'solve', 'tri-lower', 'tri-upper',
+        'chol-backward', 'solve-backward')
+    $batches = @(1024, 4096, 16384, 65536)
+    $currentOperations = @('cholesky', 'lu-factor', 'qr', 'eigh')
+    $rows = @(Read-SolverDotnetRows $Path)
+    if ($rows.Count -ne 128) {
+        throw "Solver attempt expected 128 .NET rows in '$Path'; found $($rows.Count)."
+    }
+    $fingerprints = @($rows.device_fingerprint | Sort-Object -Unique)
+    if ($fingerprints.Count -ne 1 -or [string]::IsNullOrWhiteSpace($fingerprints[0])) {
+        throw "Solver attempt found inconsistent .NET device fingerprints in '$Path'."
+    }
+
+    $findings = [System.Collections.Generic.List[string]]::new()
+    foreach ($operation in $operations) {
+        foreach ($batch in $batches) {
+            $cell = @($rows | Where-Object {
+                $_.operation -eq $operation -and $_.batch -eq $batch
+            })
+            $resident = @($cell | Where-Object { $_.method -eq 'Direct PTX resident' })
+            $graph = @($cell | Where-Object { $_.method -eq 'Direct PTX CUDA graph' })
+            if ($resident.Count -ne 1 -or $graph.Count -ne 1) {
+                throw "Solver attempt has an incomplete direct method set for run $Run '$operation'/B=$batch."
+            }
+            foreach ($candidate in @($resident[0], $graph[0])) {
+                $candidateMetrics = @(
+                    [double]$candidate.device_median_us,
+                    [double]$candidate.device_p95_us,
+                    [double]$candidate.e2e_median_us)
+                if (@($candidateMetrics | Where-Object {
+                        [double]::IsNaN($_) -or [double]::IsInfinity($_) -or $_ -le 0.0
+                    }).Count -ne 0 -or
+                    [double]$candidate.max_error -gt 2e-5 -or
+                    [long]$candidate.managed_bytes -ne 0 -or
+                    [long]$candidate.temporary_device_bytes -ne 0 -or
+                    [int]$candidate.static_shared_bytes -ne 0 -or
+                    [int]$candidate.local_bytes_per_thread -ne 0 -or
+                    [int]$candidate.active_blocks_per_sm -lt 2) {
+                    throw "Solver attempt correctness/resource gate failed for run $Run '$operation'/B=$batch '$($candidate.method)'."
+                }
+            }
+
+            $current = @($cell | Where-Object { $_.method -eq 'AiDotNet CUDA established' })
+            if ($currentOperations -notcontains $operation) {
+                if ($current.Count -ne 0) {
+                    throw "Solver attempt found an unexpected established baseline for run $Run '$operation'/B=$batch."
+                }
+                continue
+            }
+            if ($current.Count -ne 1) {
+                throw "Solver attempt is missing the established AiDotNet baseline for run $Run '$operation'/B=$batch."
+            }
+            $peerMetrics = @(
+                [double]$current[0].device_median_us,
+                [double]$current[0].device_p95_us,
+                [double]$current[0].e2e_median_us)
+            if (@($peerMetrics | Where-Object {
+                    [double]::IsNaN($_) -or [double]::IsInfinity($_) -or $_ -le 0.0
+                }).Count -ne 0 -or [double]$current[0].max_error -gt 2e-5) {
+                throw "Solver attempt peer has an invalid timing metric or exceeded correctness tolerance for run $Run '$operation'/B=$batch."
+            }
+
+            $deviceSpeedup = [double]$current[0].device_median_us / [double]$resident[0].device_median_us
+            $endToEndSpeedup = [double]$current[0].e2e_median_us / [double]$resident[0].e2e_median_us
+            $p95Ratio = [double]$resident[0].device_p95_us / [double]$current[0].device_p95_us
+            if ($deviceSpeedup -lt 1.10 -or $endToEndSpeedup -lt 1.10 -or $p95Ratio -gt 1.10) {
+                $findings.Add(
+                    "'$operation'/B=$batch device=$($deviceSpeedup.ToString('F3')), " +
+                    "E2E=$($endToEndSpeedup.ToString('F3')), P95 ratio=$($p95Ratio.ToString('F3'))")
+            }
+        }
+    }
+    if ($findings.Count -ne 0) {
+        throw "Solver attempt failed $($findings.Count) internal championship comparison(s): $($findings -join '; ')."
+    }
+}
+
 function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
     $operations = @(
         'cholesky', 'lu-factor', 'qr', 'eigh', 'eigh-lower', 'svd', 'lu-solve',
@@ -557,15 +637,23 @@ try {
                         throw "Evidence suite '$($suite.Name)' run $run failed with exit code $exitCode. See '$log'."
                     }
 
-                    $contamination = $null
+                    $rejection = $null
+                    $rejectionKind = 'environment'
                     try { Assert-GpuReady "$label-end" -AfterSuite }
-                    catch { $contamination = $_.Exception.Message }
-                    if ($contamination) {
-                        "# rejected_environment=$contamination" | Add-Content -LiteralPath $log -Encoding utf8
+                    catch { $rejection = $_.Exception.Message }
+                    if (-not $rejection -and $Issue853Only -and $suite.Name -eq 'solvers-4x4') {
+                        try { Assert-SolverDotnetAcceptedAttempt $log $run }
+                        catch {
+                            $rejection = $_.Exception.Message
+                            $rejectionKind = 'internal_gate'
+                        }
+                    }
+                    if ($rejection) {
+                        "# rejected_$rejectionKind=$rejection" | Add-Content -LiteralPath $log -Encoding utf8
                         $rejected = Join-Path $evidenceRoot ("{0}-attempt-{1:D2}.rejected.txt" -f $label, $attempt)
                         Move-Item -LiteralPath $log -Destination $rejected -Force
                         if ($attempt -gt $ContaminationRetries) {
-                            throw "Evidence suite '$($suite.Name)' run $run remained contaminated after $attempt attempts. Last reason: $contamination"
+                            throw "Evidence suite '$($suite.Name)' run $run was rejected after $attempt attempts. Last reason: $rejection"
                         }
                         Start-Sleep -Seconds 2
                         continue

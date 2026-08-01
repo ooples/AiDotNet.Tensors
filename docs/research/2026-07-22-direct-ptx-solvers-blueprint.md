@@ -95,6 +95,16 @@ Every result requires three independent clean processes, resident preallocated b
 
 The external PyTorch lane calibrates one CUDA-event-timed call before choosing its measurement plan. Calls below 1 ms retain 101 samples and one to ten launches per device sample; calls at or above 1 ms use at least 21 samples and one launch. Warmup work targets 10 ms but is bounded to 3–30 calls. This keeps close competitors on the full 101-sample protocol while preventing pathologically slow vendor calls from being repeated without bound. For example, PyTorch QR at batch 4096 measured about 0.60 seconds per eager call on the validation host; fixed 10x batching executed 1,212 calls per row, whereas 21 one-launch samples still produce a meaningful empirical P95 and are repeated in all three independent processes. The release gate validates this sampling metadata before accepting an external row; the correctness, 1.10x device/E2E median, and device-P95 requirements are unchanged.
 
+The orchestrator checks each complete AiDotNet solver attempt against the same
+internal correctness, resource, 1.10x device/E2E median, and device-P95 gates
+before starting its external competitor process. A failed attempt is preserved
+as rejected evidence and retried only within the configured contamination-retry
+budget. Every accepted process must still pass every unchanged threshold; a
+repeatable kernel loss exhausts that bounded budget and fails the run. This
+prevents a transient WDDM-wide latency excursion from launching hours of external
+work while retaining the excursion for diagnosis instead of silently averaging
+it away.
+
 Run the complete release orchestrator. It starts each AiDotNet and PyTorch run in
 a separate clean process and joins the rows through the release gate:
 
