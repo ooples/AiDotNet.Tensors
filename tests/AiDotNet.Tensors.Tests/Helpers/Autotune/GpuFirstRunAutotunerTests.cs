@@ -105,6 +105,48 @@ public sealed class GpuFirstRunAutotunerTests : IDisposable
     }
 
     [Fact]
+    public void Resolve_NearTieKeepsSafeBaselineAndCachesMeasuredBaseline()
+    {
+        KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "near-tie", "gpu-near-tie-sm86");
+        var shape = new ShapeProfile(32, 64, 64, 3136);
+
+        AutotuneResolution resolution = GpuFirstRunAutotuner.Resolve(
+            id, shape, Tiles(16, 32, 8),
+            candidate => candidate.Variant switch
+            {
+                "tile-32" => 1049.0,
+                "tile-8" => 900.0,
+                _ => 1000.0
+            },
+            autotuneEnabled: true);
+
+        Assert.Equal("tile-16", resolution.Variant);
+        Assert.True(resolution.Measured);
+        Assert.Equal(1000.0, resolution.MeasuredGflops, 3);
+
+        KernelChoice? cached = AutotuneCache.Lookup(id, shape);
+        Assert.NotNull(cached);
+        Assert.Equal("tile-16", cached!.Variant);
+        Assert.Equal(1000.0, cached.MeasuredGflops, 3);
+    }
+
+    [Fact]
+    public void Resolve_MaterialImprovementPromotesAlternative()
+    {
+        KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "material-win", "gpu-material-win-sm86");
+        var shape = new ShapeProfile(32, 64, 64, 3136);
+
+        AutotuneResolution resolution = GpuFirstRunAutotuner.Resolve(
+            id, shape, Tiles(16, 32),
+            candidate => candidate.Variant == "tile-32" ? 1050.0 : 1000.0,
+            autotuneEnabled: true);
+
+        Assert.Equal("tile-32", resolution.Variant);
+        Assert.True(resolution.Measured);
+        Assert.Equal(1050.0, resolution.MeasuredGflops, 3);
+    }
+
+    [Fact]
     public void Resolve_SkipsUnlaunchableNonFiniteAndNonPositiveCandidates()
     {
         KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "poison", "gpu-poison-sm86");

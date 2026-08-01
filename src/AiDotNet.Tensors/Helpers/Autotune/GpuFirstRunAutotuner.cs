@@ -65,7 +65,8 @@ public readonly struct AutotuneResolution
 /// Reusable "tune the first time this GPU is seen, then reuse" orchestration for
 /// direct-GPU kernels. It standardizes the pattern that the CUDA attention path
 /// already proves inline (<c>DirectPtxAttentionAutotuner</c>): on a cache miss,
-/// sweep the candidate launch configs on-device, keep the fastest, and persist
+/// sweep the candidate launch configs on-device, promote only a materially faster
+/// alternative, and persist
 /// it keyed by the GPU device fingerprint so every subsequent run — and every
 /// future process — reuses the tuned winner without re-measuring.
 ///
@@ -84,6 +85,14 @@ public readonly struct AutotuneResolution
 /// </summary>
 public static class GpuFirstRunAutotuner
 {
+    /// <summary>
+    /// Minimum measured throughput ratio required to replace candidate zero, the
+    /// safe baseline. Stable samples can still differ by tiny amounts because the
+    /// candidates are measured independently; a five-percent promotion floor keeps
+    /// measurement noise from becoming a persistent dispatch decision.
+    /// </summary>
+    public const double MinimumPromotionRatio = 1.05;
+
     /// <summary>
     /// Builds a <see cref="KernelId"/> that folds the GPU device fingerprint into
     /// the kernel name, so tuned configs are keyed per distinct card + driver.
@@ -115,8 +124,9 @@ public static class GpuFirstRunAutotuner
     /// <item>Cache hit whose variant is still offered → returned immediately (no measurement).</item>
     /// <item>Autotuning disabled, or a single candidate → the first candidate is used as
     ///   the safe default and nothing is measured or stored.</item>
-    /// <item>Otherwise every candidate is benchmarked on-device; the fastest is stored
-    ///   (keyed by GPU fingerprint) and returned. A candidate whose benchmark throws or
+    /// <item>Otherwise every candidate is benchmarked on-device. The fastest alternative
+    ///   replaces candidate zero only when it is at least five percent faster; otherwise
+    ///   the measured baseline is stored. A candidate whose benchmark throws or
     ///   returns a non-finite or non-positive score is skipped, so a launch-failing or slow config can
     ///   never be selected. If all candidates fail, the first candidate is used as the
     ///   default and nothing is stored.</item>
@@ -153,11 +163,14 @@ public static class GpuFirstRunAutotuner
                 fallback.Variant, fallback.Parameters, 0.0, fromCache: false, measured: false);
 
         // 3. On-device sweep. A candidate that throws or returns a non-finite/non-positive score is skipped.
+        //    A stable alternative still needs a material win over candidate zero before promotion.
         AutotuneCandidate best = default;
         double bestGflops = double.NegativeInfinity;
+        double fallbackGflops = double.NegativeInfinity;
         bool anyMeasured = false;
-        foreach (AutotuneCandidate candidate in candidates)
+        for (int i = 0; i < candidates.Count; i++)
         {
+            AutotuneCandidate candidate = candidates[i];
             double gflops;
             try
             {
@@ -168,6 +181,7 @@ public static class GpuFirstRunAutotuner
                 continue; // unlaunchable config (e.g. shared-mem over budget) — cannot win
             }
             if (double.IsNaN(gflops) || double.IsInfinity(gflops) || gflops <= 0.0) continue;
+            if (i == 0) fallbackGflops = gflops;
             if (gflops > bestGflops)
             {
                 bestGflops = gflops;
@@ -179,6 +193,17 @@ public static class GpuFirstRunAutotuner
         if (!anyMeasured)
             return new AutotuneResolution(
                 fallback.Variant, fallback.Parameters, 0.0, fromCache: false, measured: false);
+
+        // Candidate zero is the locally selected safe baseline. Do not turn an
+        // independently measured near-tie into a sticky cache decision. If the
+        // baseline itself could not be measured, retain the fastest valid candidate.
+        if (fallbackGflops > 0.0 &&
+            !string.Equals(best.Variant, fallback.Variant, StringComparison.Ordinal) &&
+            bestGflops / fallbackGflops < MinimumPromotionRatio)
+        {
+            best = fallback;
+            bestGflops = fallbackGflops;
+        }
 
         var winner = new KernelChoice
         {
