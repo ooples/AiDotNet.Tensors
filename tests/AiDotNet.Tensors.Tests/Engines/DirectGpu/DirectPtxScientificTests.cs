@@ -896,6 +896,7 @@ public class DirectPtxScientificTests
         // B=8, I=8, K=8, C=4, D=8 -> 2048 outputs = 256 eight-wide thread groups.
         string ptx = PtxCapsuleContractionKernel.EmitPtx(8, 6, op, 8, 8, 8, 4, 8);
         Assert.Contains(PtxCapsuleContractionKernel.EntryPointFor(op), ptx);
+        Assert.Contains($".maxntid {PtxCapsuleContractionKernel.BlockThreads}, 1, 1", ptx);
         Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));
         Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
         Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
@@ -924,6 +925,7 @@ public class DirectPtxScientificTests
         string ptx = PtxCapsuleContractionKernel.EmitPtx(
             8, 6, op, 64, 16, 16, 16, 16);
 
+        Assert.Contains($".maxntid {PtxCapsuleContractionKernel.TensorCoreBlockThreads}, 1, 1", ptx);
         Assert.Contains("wmma.load.a.sync.aligned.row.m16n16k8.global.tf32", ptx);
         Assert.Contains("wmma.load.b.sync.aligned.row.m16n16k8.global.tf32", ptx);
         Assert.Equal(2, Count(ptx, "wmma.mma.sync.aligned.row.row.m16n16k8"));

@@ -95,12 +95,21 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         EntryPoint = EntryPointFor(op);
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, op, batchSize, inputCapsules, inputDim, outputCount, outputDim);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, op, batchSize, inputCapsules, inputDim, outputCount, outputDim);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, LaunchThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, LaunchThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, LaunchThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, LaunchThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, LaunchThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info, LaunchThreads, activeBlocks,
+                    module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView weights, DirectPtxTensorView output)
@@ -158,7 +167,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         ptx.AppendLine("    .param .u64 weights_ptr,");
         ptx.AppendLine("    .param .u64 out_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {TensorCoreBlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<16>;");
@@ -262,7 +271,7 @@ internal sealed class PtxCapsuleContractionKernel : IDisposable
         ptx.AppendLine("    .param .u64 weights_ptr,");
         ptx.AppendLine("    .param .u64 out_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {TensorCoreBlockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<16>;");
         ptx.AppendLine("    .reg .b64 %rd<20>;");
