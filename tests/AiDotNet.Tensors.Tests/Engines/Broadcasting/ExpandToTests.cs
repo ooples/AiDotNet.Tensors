@@ -39,6 +39,19 @@ public class ExpandToTests
     }
 
     [Fact]
+    public void SparseTensor_IsRejectedBeforeSameShapeFastPath()
+    {
+        var sparse = new SparseTensor<double>(
+            rows: 2,
+            columns: 2,
+            rowIndices: [0, 1],
+            columnIndices: [0, 1],
+            values: [1.0, 2.0]);
+
+        Assert.Throws<InvalidOperationException>(() => sparse.ExpandTo([2, 2]));
+    }
+
+    [Fact]
     public void ExpandedView_SharesStorageWithItsSource()
     {
         var col = Filled(new[] { 4, 1 }, 2);

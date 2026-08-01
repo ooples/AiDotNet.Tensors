@@ -594,6 +594,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ExpandTo(int[] targetShape)
     {
+        ThrowIfSparse();
         if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
 
         // The overwhelmingly common case in an element-wise op is that no stretch is needed. Return
