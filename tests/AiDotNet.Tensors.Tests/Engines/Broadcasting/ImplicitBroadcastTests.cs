@@ -197,6 +197,36 @@ public class ImplicitBroadcastTests
         Assert.Contains("cannot be broadcast", exception.Message, StringComparison.Ordinal);
     }
 
+#if NET6_0_OR_GREATER
+    [Fact]
+    public void ElementwiseInto_FloatRejectsUnsafeOutOfRangeStride()
+    {
+        var a = new Tensor<float>(new[] { 2 });
+        var b = new Tensor<float>(new[] { 2 });
+        var result = new Tensor<float>(new[] { 2 });
+        a._strides[0] = int.MaxValue;
+
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() => Tensor<float>.ElementwiseInto(
+            a, b, result, Tensor<float>.BroadcastOp.Add));
+
+        Assert.Equal("aBase", exception.ParamName);
+    }
+
+    [Fact]
+    public void ElementwiseInto_DoubleRejectsUnsafeOutOfRangeStride()
+    {
+        var a = new Tensor<double>(new[] { 2 });
+        var b = new Tensor<double>(new[] { 2 });
+        var result = new Tensor<double>(new[] { 2 });
+        b._strides[0] = int.MaxValue;
+
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() => Tensor<double>.ElementwiseInto(
+            a, b, result, Tensor<double>.BroadcastOp.Multiply));
+
+        Assert.Equal("bBase", exception.ParamName);
+    }
+#endif
+
     /// <summary>
     /// The gradient of a broadcast operand must be the SUM over the axes that were stretched.
     /// </summary>
