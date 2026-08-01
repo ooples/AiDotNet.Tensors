@@ -6095,7 +6095,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // TensorAdd forward: route compiled-plan replay through
+        // Legacy TensorBroadcastAdd forward: route compiled-plan replay through
         // a copy-into-output + TensorBroadcastAddInPlace pair instead of the
         // generic "allocate fresh result + memcpy into plan output" closure.
         // Used in every SD UNet ResBlock for the time-embedding conditioning
