@@ -447,6 +447,21 @@ public class DirectPtxScientificTests
         }
     }
 
+    [Fact]
+    public void VulkanScientificDistanceDispatch_PreservesCompleteShapePayloads()
+    {
+        var cosine = VulkanBackend.CreateCosineSimilarityDispatch(17, 33);
+        Assert.Equal(17, cosine.WorkItems);
+        Assert.Equal(new uint[] { 17, 33 }, cosine.PushConstants);
+
+        var pairwise = VulkanBackend.CreatePairwiseDistanceDispatch(19, 23, 7);
+        Assert.Equal(19 * 23, pairwise.WorkItems);
+        Assert.Equal(new uint[] { 19, 23, 7 }, pairwise.PushConstants);
+
+        Assert.Throws<OverflowException>(() =>
+            VulkanBackend.CreatePairwiseDistanceDispatch(int.MaxValue, 2, 1));
+    }
+
     [SkippableFact]
     public void DriverOnlyOctonionAdd_MatchesOracle()
     {
