@@ -95,4 +95,20 @@ public sealed class GpuAutotuneMeasurementTests
                 }));
         Assert.Equal(1, calls);
     }
+
+    [Fact]
+    public void AdaptiveStableMedian_DoesNotRetryInvalidSamples()
+    {
+        int calls = 0;
+
+        Assert.Throws<InvalidOperationException>(() =>
+            GpuAutotuneMeasurement.AdaptiveStableMedianMilliseconds(
+                _ =>
+                {
+                    calls++;
+                    return new[] { 1.0f, float.NaN, 1.0f };
+                }));
+
+        Assert.Equal(1, calls);
+    }
 }

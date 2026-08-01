@@ -11,6 +11,11 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// </summary>
 public static class GpuAutotuneMeasurement
 {
+    private sealed class UnstableTimingException : InvalidOperationException
+    {
+        internal UnstableTimingException(string message) : base(message) { }
+    }
+
     /// <summary>The default maximum accepted p95/median timing ratio.</summary>
     public const double DefaultMaxP95ToMedian = 1.05;
 
@@ -22,6 +27,12 @@ public static class GpuAutotuneMeasurement
     public static double StableMedianMilliseconds(
         IReadOnlyList<float> milliseconds,
         double maxP95ToMedian = DefaultMaxP95ToMedian)
+        => StableMedianMillisecondsCore(milliseconds, maxP95ToMedian, retrySignal: false);
+
+    private static double StableMedianMillisecondsCore(
+        IReadOnlyList<float> milliseconds,
+        double maxP95ToMedian,
+        bool retrySignal)
     {
         if (milliseconds is null) throw new ArgumentNullException(nameof(milliseconds));
         if (milliseconds.Count < 3)
@@ -43,8 +54,12 @@ public static class GpuAutotuneMeasurement
         (double median, double p95) = SortedDistributionStatistics(sorted);
         double p95ToMedian = p95 / median;
         if (p95ToMedian > maxP95ToMedian)
-            throw new InvalidOperationException(
-                $"GPU timing is unstable: p95/median={p95ToMedian:F4}, limit={maxP95ToMedian:F4}.");
+        {
+            string message =
+                $"GPU timing is unstable: p95/median={p95ToMedian:F4}, limit={maxP95ToMedian:F4}.";
+            if (retrySignal) throw new UnstableTimingException(message);
+            throw new InvalidOperationException(message);
+        }
 
         return median;
     }
@@ -108,9 +123,9 @@ public static class GpuAutotuneMeasurement
             IReadOnlyList<float> samples = measureSamples(launches);
             try
             {
-                return StableMedianMilliseconds(samples, maxP95ToMedian);
+                return StableMedianMillisecondsCore(samples, maxP95ToMedian, retrySignal: true);
             }
-            catch (InvalidOperationException) when (launches < maxLaunchesPerSample)
+            catch (UnstableTimingException) when (launches < maxLaunchesPerSample)
             {
                 launches = launches > maxLaunchesPerSample / 4
                     ? maxLaunchesPerSample
