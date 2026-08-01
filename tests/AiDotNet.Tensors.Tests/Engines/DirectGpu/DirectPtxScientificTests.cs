@@ -2255,13 +2255,17 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void PoincareProjectEmitter_IsThreadPerVectorConditionalRescale()
+    public void PoincareProjectEmitter_IsWarpPerVectorConditionalRescale()
     {
         string ptx = PtxPoincareProjectKernel.EmitPtx(8, 6, 64);
         Assert.Contains(PtxPoincareProjectKernel.EntryPoint, ptx);
         Assert.Contains("ld.param.f32 %f1, [epsilon];", ptx);
         Assert.Contains("NORM_LOOP:", ptx);
         Assert.Contains("WRITE_LOOP:", ptx);
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));
+        Assert.Equal(1, Count(ptx, "shfl.sync.idx.b32"));
         Assert.Contains("setp.ge.f32 %p1, %f2, %f5", ptx);   // ||x||^2 >= maxNorm^2
         Assert.Contains("selp.f32 %f8, %f7, 0f3F800000, %p1", ptx); // scale or 1
         Assert.Equal(2, Count(ptx, "sqrt.rn.f32"));           // sqrt(c) + sqrt(sqNorm)
@@ -2290,6 +2294,7 @@ public class DirectPtxScientificTests
             "The checked-in poincare-project specialization is measured on GA10x/SM86.");
         const float c = 0.5f, eps = 1e-5f;
         using var kernel = new PtxPoincareProjectKernel(runtime, batch, dim, c, eps);
+        Assert.Equal(27, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20266500 + batch + dim);
