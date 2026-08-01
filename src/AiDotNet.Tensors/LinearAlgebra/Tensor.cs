@@ -2649,6 +2649,26 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             _ => _numOps.Multiply(x, y),
         };
 
+    private static void ValidateInnerBounds(
+        int resultLength, int rBase,
+        int aLength, int aBase, int aStride,
+        int bLength, int bBase, int bStride,
+        int len)
+    {
+        static bool Fits(int spanLength, int start, int stride, int count)
+        {
+            long end = (long)start + (long)(count - 1) * stride;
+            return start >= 0 && start < spanLength && end >= 0 && end < spanLength;
+        }
+
+        if (!Fits(resultLength, rBase, 1, len))
+            throw new ArgumentOutOfRangeException(nameof(rBase), "Inner result block exceeds its span.");
+        if (!Fits(aLength, aBase, aStride, len))
+            throw new ArgumentOutOfRangeException(nameof(aBase), "Inner left-operand block exceeds its span.");
+        if (!Fits(bLength, bBase, bStride, len))
+            throw new ArgumentOutOfRangeException(nameof(bBase), "Inner right-operand block exceeds its span.");
+    }
+
 #if NET6_0_OR_GREATER
     // Reinterprets a Span<T> as Span<TTo> after a runtime typeof(T)==typeof(TTo)
     // check. Tensor<T> is not struct-constrained (so MemoryMarshal.Cast is
@@ -2674,6 +2694,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Span<T> r, int rBase, ReadOnlySpan<T> a, int aBase, int aStride,
         ReadOnlySpan<T> b, int bBase, int bStride, int len)
     {
+        if (len <= 0) return;
+        ValidateInnerBounds(r.Length, rBase, a.Length, aBase, aStride,
+            b.Length, bBase, bStride, len);
+
 #if NET6_0_OR_GREATER
         // Tensor<T> is not struct-constrained, so MemoryMarshal.Cast<T,float>
         // is illegal here. After the runtime typeof check T IS float/double, so
@@ -2707,26 +2731,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
 #if NET6_0_OR_GREATER
-    private static void ValidateInnerBounds(
-        int resultLength, int rBase,
-        int aLength, int aBase, int aStride,
-        int bLength, int bBase, int bStride,
-        int len)
-    {
-        static bool Fits(int spanLength, int start, int stride, int count)
-        {
-            long end = (long)start + (long)(count - 1) * stride;
-            return start >= 0 && start < spanLength && end >= 0 && end < spanLength;
-        }
-
-        if (!Fits(resultLength, rBase, 1, len))
-            throw new ArgumentOutOfRangeException(nameof(rBase), "Inner result block exceeds its span.");
-        if (!Fits(aLength, aBase, aStride, len))
-            throw new ArgumentOutOfRangeException(nameof(aBase), "Inner left-operand block exceeds its span.");
-        if (!Fits(bLength, bBase, bStride, len))
-            throw new ArgumentOutOfRangeException(nameof(bBase), "Inner right-operand block exceeds its span.");
-    }
-
     /// <remarks>
     /// Pointer-based rather than span-based. The span form cost two bounds-checked <c>Slice</c>
     /// calls and a <c>CopyTo</c> per vector, which measured 5.2 ms against a 1.8 ms contiguous add
@@ -2737,10 +2741,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Span<float> r, int rBase, ReadOnlySpan<float> a, int aBase, int aStride,
         ReadOnlySpan<float> b, int bBase, int bStride, int len)
     {
-        if (len <= 0) return;
-        ValidateInnerBounds(r.Length, rBase, a.Length, aBase, aStride,
-            b.Length, bBase, bStride, len);
-
         int w = System.Numerics.Vector<float>.Count;
         int i = 0;
         fixed (float* rp = r, ap = a, bp = b)
@@ -2798,10 +2798,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Span<double> r, int rBase, ReadOnlySpan<double> a, int aBase, int aStride,
         ReadOnlySpan<double> b, int bBase, int bStride, int len)
     {
-        if (len <= 0) return;
-        ValidateInnerBounds(r.Length, rBase, a.Length, aBase, aStride,
-            b.Length, bBase, bStride, len);
-
         int w = System.Numerics.Vector<double>.Count;
         int i = 0;
         fixed (double* rp = r, ap = a, bp = b)

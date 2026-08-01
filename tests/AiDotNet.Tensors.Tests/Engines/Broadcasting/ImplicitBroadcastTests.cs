@@ -197,7 +197,6 @@ public class ImplicitBroadcastTests
         Assert.Contains("cannot be broadcast", exception.Message, StringComparison.Ordinal);
     }
 
-#if NET6_0_OR_GREATER
     [Fact]
     public void ElementwiseInto_FloatRejectsUnsafeOutOfRangeStride()
     {
@@ -225,8 +224,6 @@ public class ImplicitBroadcastTests
 
         Assert.Equal("bBase", exception.ParamName);
     }
-#endif
-
     /// <summary>
     /// The gradient of a broadcast operand must be the SUM over the axes that were stretched.
     /// </summary>
