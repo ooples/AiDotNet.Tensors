@@ -286,6 +286,34 @@ public sealed class CommunityAutotuneTests : IDisposable
     }
 
     [Fact]
+    public void CachedCommunityOnlyWinner_IsRehydratedWithoutRemeasuring()
+    {
+        var exchange = new InMemoryGpuTuningExchange();
+        exchange.Seed(Community("tile-11", 11, 1500.0));
+
+        AutotuneResolution first = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(), Local(),
+            candidate => candidate.Variant == "tile-11" ? 1400.0 : 500.0,
+            isCommunityCandidateAllowed: AllowAnyCandidate,
+            autotuneEnabled: true);
+
+        Assert.Equal("tile-11", first.Variant);
+        int fetchesAfterFirst = exchange.FetchCount;
+        int publishedAfterFirst = exchange.Published.Count;
+
+        AutotuneResolution second = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(), Local(),
+            _ => throw new InvalidOperationException("rehydrated cache hit must not benchmark"),
+            isCommunityCandidateAllowed: AllowAnyCandidate,
+            autotuneEnabled: true);
+
+        Assert.True(second.FromCache);
+        Assert.Equal("tile-11", second.Variant);
+        Assert.Equal(fetchesAfterFirst + 1, exchange.FetchCount);
+        Assert.Equal(publishedAfterFirst, exchange.Published.Count);
+    }
+
+    [Fact]
     public void ProfileConstructionFailure_DoesNotEscapeMeasuredResolution()
     {
         var exchange = new InMemoryGpuTuningExchange();

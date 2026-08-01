@@ -9,9 +9,10 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// (<see cref="GpuFirstRunAutotuner"/>) using a local-allowlist plus
 /// on-device remeasurement trust model.
 ///
-/// <para>On a cache miss it fetches community-reported winners for this exact
-/// hardware class + kernel + shape and folds them into the candidate list, then
-/// runs the normal on-device sweep. A community config must first pass the
+/// <para>On a cache miss, or when rehydrating a cached community-only winner, it
+/// fetches community-reported winners for this exact hardware class + kernel +
+/// shape and folds them into the candidate list, then runs the normal on-device
+/// sweep. A community config must first pass the
 /// caller's local variant allowlist, then its reported performance is ignored and
 /// re-measured on-device. A freshly measured local winner is then published back,
 /// corroborating the community record.</para>
@@ -62,10 +63,13 @@ public static class CommunityAutotune
         bool useCommunity = exchange.IsEnabled && autotuneEnabled && localCandidates.Count > 1;
 
         IReadOnlyList<AutotuneCandidate> candidates = localCandidates;
-        if (useCommunity && AutotuneCache.Lookup(kernelId, shape) is null)
+        KernelChoice? cached = useCommunity ? AutotuneCache.Lookup(kernelId, shape) : null;
+        if (useCommunity &&
+            (cached is null || !ContainsVariant(localCandidates, cached.Variant)))
         {
-            // Only seed on a genuine cache miss — no point fetching when we already
-            // have a local winner for this exact contract on this exact card.
+            // Fetch on a genuine cache miss, and also to rehydrate a cached
+            // community-only variant that is absent from the local candidate set.
+            // A cached local winner remains a zero-network fast path.
             IReadOnlyList<GpuTuningProfile> community = SafeFetch(
                 exchange, fingerprint.ModelKey, category, shareableKernelName, shape.ToFileStem());
             candidates = MergeCommunityCandidates(
@@ -90,6 +94,16 @@ public static class CommunityAutotune
         }
 
         return resolution;
+    }
+
+    private static bool ContainsVariant(
+        IReadOnlyList<AutotuneCandidate> candidates, string variant)
+    {
+        if (string.IsNullOrEmpty(variant)) return false;
+        for (int i = 0; i < candidates.Count; i++)
+            if (string.Equals(candidates[i].Variant, variant, StringComparison.Ordinal))
+                return true;
+        return false;
     }
 
     /// <summary>
