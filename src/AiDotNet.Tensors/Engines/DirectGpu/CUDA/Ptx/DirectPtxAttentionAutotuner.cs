@@ -90,6 +90,7 @@ internal static class DirectPtxAttentionAutotuner
                         $"Unsupported attention autotune candidate '{candidate.Variant}'.");
                 return benchmark(candidateWarps);
             },
+            candidate => TryGetWarps(candidate, querySequence, out _),
             autotuneEnabled);
 
         var selected = new AutotuneCandidate(resolution.Variant, resolution.Parameters);

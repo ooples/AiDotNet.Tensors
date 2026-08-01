@@ -12,10 +12,8 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 ///
 /// <para><b>Trust:</b> <see cref="MeasuredGflops"/> is the reporter's number and
 /// is treated as advisory only. A downloaded profile is never launched on faith;
-/// it is turned back into an <see cref="AutotuneCandidate"/> via
-/// <see cref="ToCandidate"/> and must win the local on-device sweep (see
-/// <see cref="CommunityAutotune"/>), so a poisoned or hardware-mismatched row
-/// simply loses instead of running.</para>
+/// it must pass the kernel family's local variant allowlist, then its performance
+/// is re-measured in the on-device sweep (see <see cref="CommunityAutotune"/>).</para>
 /// </summary>
 public sealed class GpuTuningProfile
 {
@@ -44,7 +42,7 @@ public sealed class GpuTuningProfile
     /// <summary>Structured launch parameters that reconstruct the config.</summary>
     public Dictionary<string, string> Parameters { get; set; } = new(StringComparer.Ordinal);
 
-    /// <summary>Reporter's measured throughput (GFLOPS) — advisory; re-verified locally before use.</summary>
+    /// <summary>Reporter's measured throughput (GFLOPS) — advisory; re-measured locally before use.</summary>
     public double MeasuredGflops { get; set; }
 
     /// <summary>Pseudonymous reporter id (no PII); optional.</summary>
@@ -53,7 +51,7 @@ public sealed class GpuTuningProfile
     /// <summary>Reporting library version; optional.</summary>
     public string? AiDotNetVersion { get; set; }
 
-    /// <summary>Turns a downloaded profile back into a sweep candidate to be re-verified on-device.</summary>
+    /// <summary>Turns a downloaded profile back into a candidate for local validation and measurement.</summary>
     public AutotuneCandidate ToCandidate()
     {
         var copy = new Dictionary<string, string>(

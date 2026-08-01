@@ -6,21 +6,23 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 
 /// <summary>
 /// Phase 2: layers opt-in community tuning over the local first-run sweep
-/// (<see cref="GpuFirstRunAutotuner"/>) using the "download-as-candidate,
-/// re-verify on-device" trust model.
+/// (<see cref="GpuFirstRunAutotuner"/>) using a local-allowlist plus
+/// on-device remeasurement trust model.
 ///
 /// <para>On a cache miss it fetches community-reported winners for this exact
 /// hardware class + kernel + shape and folds them into the candidate list, then
-/// runs the normal on-device sweep. Because the community configs simply compete
-/// as extra candidates, a poisoned or hardware-mismatched config loses (or is
-/// skipped when it fails to launch) rather than being trusted. A freshly measured
-/// local winner is then published back, corroborating the community record.</para>
+/// runs the normal on-device sweep. A community config must first pass the
+/// caller's local variant allowlist, then its reported performance is ignored and
+/// re-measured on-device. A freshly measured local winner is then published back,
+/// corroborating the community record.</para>
 ///
 /// <para><b>Safety invariants:</b> (1) community is consulted only when a sweep
 /// will actually run (autotune enabled, &gt; 1 candidate), so the disabled/default
 /// path is never influenced by the network; (2) local candidates stay first, so
 /// the unmeasured safe default (<c>candidates[0]</c>) is always a local config;
-/// (3) fetch/publish are best-effort and never throw into dispatch.</para>
+/// (3) remote candidates must pass a caller-owned local allowlist before they can
+/// be benchmarked; (4) fetch, conversion, validation, and publish failures never
+/// throw into dispatch.</para>
 /// </summary>
 public static class CommunityAutotune
 {
@@ -29,6 +31,10 @@ public static class CommunityAutotune
     /// <paramref name="maxCommunityCandidates"/> distinct community configs.
     /// Falls back to a pure local resolve when the exchange is disabled.
     /// </summary>
+    /// <param name="isCommunityCandidateAllowed">
+    /// Local structural allowlist for downloaded configurations. It must accept
+    /// only variants implemented and supported by this build for the current shape.
+    /// </param>
     public static AutotuneResolution Resolve(
         IGpuTuningExchange exchange,
         string category,
@@ -37,6 +43,7 @@ public static class CommunityAutotune
         ShapeProfile shape,
         IReadOnlyList<AutotuneCandidate> localCandidates,
         Func<AutotuneCandidate, double> benchmark,
+        Func<AutotuneCandidate, bool> isCommunityCandidateAllowed,
         bool autotuneEnabled,
         int maxCommunityCandidates = 3,
         string? clientHash = null,
@@ -45,6 +52,9 @@ public static class CommunityAutotune
         if (exchange is null) throw new ArgumentNullException(nameof(exchange));
         if (localCandidates is null || localCandidates.Count == 0)
             throw new ArgumentException("At least one local candidate is required.", nameof(localCandidates));
+        if (benchmark is null) throw new ArgumentNullException(nameof(benchmark));
+        if (isCommunityCandidateAllowed is null)
+            throw new ArgumentNullException(nameof(isCommunityCandidateAllowed));
 
         KernelId kernelId = GpuFirstRunAutotuner.GpuKernelId(category, shareableKernelName, fingerprint);
         // A single local candidate has no tuning decision to make. Keep that
@@ -58,7 +68,8 @@ public static class CommunityAutotune
             // have a local winner for this exact contract on this exact card.
             IReadOnlyList<GpuTuningProfile> community = SafeFetch(
                 exchange, fingerprint.ModelKey, category, shareableKernelName, shape.ToFileStem());
-            candidates = MergeCommunityCandidates(localCandidates, community, maxCommunityCandidates);
+            candidates = MergeCommunityCandidates(
+                localCandidates, community, isCommunityCandidateAllowed, maxCommunityCandidates);
         }
 
         AutotuneResolution resolution = GpuFirstRunAutotuner.Resolve(
@@ -85,14 +96,19 @@ public static class CommunityAutotune
     /// Merges community candidates into the local set: local first (so the safe
     /// default is preserved), then up to <paramref name="maxCommunity"/> distinct
     /// community variants not already offered, best-reported-first. A community
-    /// candidate that duplicates a local variant is dropped; one that cannot
-    /// launch simply loses the sweep later.
+    /// candidate that is malformed, rejected by the local allowlist, or duplicates
+    /// a local variant is dropped before the sweep.
     /// </summary>
     public static IReadOnlyList<AutotuneCandidate> MergeCommunityCandidates(
         IReadOnlyList<AutotuneCandidate> local,
         IReadOnlyList<GpuTuningProfile> community,
+        Func<AutotuneCandidate, bool> isCommunityCandidateAllowed,
         int maxCommunity)
     {
+        if (local is null) throw new ArgumentNullException(nameof(local));
+        if (isCommunityCandidateAllowed is null)
+            throw new ArgumentNullException(nameof(isCommunityCandidateAllowed));
+
         var result = new List<AutotuneCandidate>(local);
         if (community is null || community.Count == 0 || maxCommunity <= 0)
             return result;
@@ -106,11 +122,21 @@ public static class CommunityAutotune
                      .OrderByDescending(p => p.MeasuredGflops))
         {
             if (added >= maxCommunity) break;
-            if (seen.Add(profile.Variant))
+            AutotuneCandidate candidate;
+            bool allowed;
+            try
             {
-                result.Add(profile.ToCandidate());
-                added++;
+                candidate = profile.ToCandidate();
+                allowed = isCommunityCandidateAllowed(candidate);
             }
+            catch
+            {
+                continue;
+            }
+            if (!allowed || !seen.Add(candidate.Variant)) continue;
+
+            result.Add(candidate);
+            added++;
         }
         return result;
     }

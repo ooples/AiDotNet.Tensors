@@ -78,10 +78,9 @@ public readonly struct AutotuneResolution
 /// <para><b>Device-agnostic by design.</b> The actual measurement is supplied as
 /// a <c>benchmark</c> delegate (variant → GFLOPS, higher is better) that runs on
 /// the device; this orchestration is pure and unit-testable without a GPU. It is
-/// also the single seam where opt-in community tuning (Phase 2) plugs in: a
-/// downloaded config is simply prepended to <paramref name="candidates"/> so it
-/// competes in — and is re-verified by — the same on-device sweep, which makes a
-/// poisoned or hardware-mismatched config lose rather than launch blindly.</para>
+/// also the measurement seam used by opt-in community tuning (Phase 2), after
+/// that layer has validated downloaded configurations against the kernel family's
+/// local allowlist.</para>
 /// </summary>
 public static class GpuFirstRunAutotuner
 {

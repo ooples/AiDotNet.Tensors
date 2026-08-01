@@ -136,6 +136,8 @@ internal static class DirectPtxConvolutionAutotuner
                         $"Unsupported convolution autotune candidate '{candidate.Variant}'.");
                 return benchmark(decoded);
             },
+            candidate => TryGetVariant(
+                candidate, outputChannels, inputChannels, spatial, out _),
             autotuneEnabled);
 
         if (!TryGetVariant(

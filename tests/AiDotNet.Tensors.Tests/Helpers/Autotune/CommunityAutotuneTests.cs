@@ -40,7 +40,7 @@ internal sealed class InMemoryGpuTuningExchange : IGpuTuningExchange
 
 /// <summary>
 /// GPU-free tests for <see cref="CommunityAutotune"/> — the Phase-2
-/// "download-as-candidate, re-verify on-device" trust model. Shares the
+/// local-allowlist plus on-device remeasurement trust model. Shares the
 /// <c>AutotuneCacheTests</c> collection because it redirects the cache root.
 /// </summary>
 [Collection("AutotuneCacheTests")]
@@ -73,6 +73,7 @@ public sealed class CommunityAutotuneTests : IDisposable
 
     private static ShapeProfile Shape() => ConvTileAutotune.Shape(32, 64, 64, 3136);
     private static IReadOnlyList<AutotuneCandidate> Local() => ConvTileAutotune.Candidates(64, 64, 3136);
+    private static bool AllowAnyCandidate(AutotuneCandidate _) => true;
 
     private GpuTuningProfile Community(string variant, int tile, double gflops) => new()
     {
@@ -90,7 +91,7 @@ public sealed class CommunityAutotuneTests : IDisposable
     };
 
     [Fact]
-    public void GoodCommunityConfig_WinsOnReverify_IsUsed_AndPublished()
+    public void GoodCommunityConfig_WinsOnRemeasure_IsUsed_AndPublished()
     {
         var exchange = new InMemoryGpuTuningExchange();
         // A community peer reports tile-32 is great on this model.
@@ -100,11 +101,12 @@ public sealed class CommunityAutotuneTests : IDisposable
         AutotuneResolution r = CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
             c => c.Variant == "tile-32" ? 1400.0 : 500.0,
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(r.Measured);
         Assert.True(ConvTileAutotune.TryGetTile(r, out int tile));
-        Assert.Equal(32, tile);              // community config re-verified and selected
+        Assert.Equal(32, tile);              // community config re-measured and selected
         Assert.Single(exchange.Published);   // our own measurement corroborates it
         Assert.Equal("tile-32", exchange.Published[0].Variant);
         Assert.Equal(Card.ModelKey, exchange.Published[0].ModelKey);
@@ -122,11 +124,39 @@ public sealed class CommunityAutotuneTests : IDisposable
             c => c.Variant == "tile-999"
                 ? throw new InvalidOperationException("shared-mem over budget")
                 : (c.Variant == "tile-16" ? 800.0 : 400.0),
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(r.Measured);
         Assert.True(ConvTileAutotune.TryGetTile(r, out int tile));
         Assert.Equal(16, tile); // poison lost; a real local candidate won
+    }
+
+    [Fact]
+    public void UnsupportedAndMalformedCommunityConfigs_AreRejectedBeforeBenchmark()
+    {
+        var exchange = new InMemoryGpuTuningExchange();
+        exchange.Seed(Community("tile-999", 999, 999999.0));
+        exchange.Seed(Community(" ", 32, 999998.0));
+        bool unsupportedWasBenchmarked = false;
+
+        AutotuneResolution resolution = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(), Local(),
+            candidate =>
+            {
+                if (candidate.Variant == "tile-999")
+                {
+                    unsupportedWasBenchmarked = true;
+                    return 999999.0;
+                }
+                return candidate.Variant == "tile-16" ? 800.0 : 400.0;
+            },
+            candidate => candidate.Variant != "tile-999",
+            autotuneEnabled: true);
+
+        Assert.False(unsupportedWasBenchmarked);
+        Assert.Equal("tile-16", resolution.Variant);
+        Assert.Equal("tile-16", Assert.Single(exchange.Published).Variant);
     }
 
     [Fact]
@@ -143,6 +173,7 @@ public sealed class CommunityAutotuneTests : IDisposable
                 "tile-11" => 600.0,
                 _ => 400.0
             },
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(resolution.Measured);
@@ -161,6 +192,7 @@ public sealed class CommunityAutotuneTests : IDisposable
         AutotuneResolution r = CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
             _ => throw new InvalidOperationException("must not benchmark when disabled"),
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: false);
 
         Assert.False(r.Measured);
@@ -175,6 +207,7 @@ public sealed class CommunityAutotuneTests : IDisposable
         AutotuneResolution r = CommunityAutotune.Resolve(
             NullGpuTuningExchange.Instance, Category, Kernel, Card, Shape(), Local(),
             c => c.Variant == "tile-16" ? 700.0 : 300.0,
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(r.Measured);
@@ -191,6 +224,7 @@ public sealed class CommunityAutotuneTests : IDisposable
             exchange, Category, Kernel, Card, Shape(),
             new[] { ConvTileAutotune.CandidateFor(16) },
             _ => throw new InvalidOperationException("single-candidate path must not benchmark"),
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.Equal("tile-16", r.Variant);
@@ -212,7 +246,8 @@ public sealed class CommunityAutotuneTests : IDisposable
         };
 
         IReadOnlyList<AutotuneCandidate> merged =
-            CommunityAutotune.MergeCommunityCandidates(local, community, maxCommunity: 2);
+            CommunityAutotune.MergeCommunityCandidates(
+                local, community, AllowAnyCandidate, maxCommunity: 2);
 
         // Local candidates preserved and first (candidates[0] stays the local default).
         Assert.Equal("tile-16", merged[0].Variant);
@@ -232,7 +267,9 @@ public sealed class CommunityAutotuneTests : IDisposable
         // First call sweeps and caches a local winner.
         CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
-            c => c.Variant == "tile-16" ? 900.0 : 300.0, autotuneEnabled: true);
+            c => c.Variant == "tile-16" ? 900.0 : 300.0,
+            isCommunityCandidateAllowed: AllowAnyCandidate,
+            autotuneEnabled: true);
         int fetchesAfterFirst = exchange.FetchCount;
         int publishedAfterFirst = exchange.Published.Count;
 
@@ -240,6 +277,7 @@ public sealed class CommunityAutotuneTests : IDisposable
         AutotuneResolution second = CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
             _ => throw new InvalidOperationException("cache hit must not benchmark"),
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(second.FromCache);
@@ -262,6 +300,7 @@ public sealed class CommunityAutotuneTests : IDisposable
             exchange, "profile-fault", "profile-fault-kernel", Card,
             new ShapeProfile(17, 19), candidates,
             candidate => candidate.Variant == "local-fast" ? 900.0 : 100.0,
+            isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(resolution.Measured);
