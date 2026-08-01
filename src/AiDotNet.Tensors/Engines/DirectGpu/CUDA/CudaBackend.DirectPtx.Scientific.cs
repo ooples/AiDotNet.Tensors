@@ -11,6 +11,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 public sealed partial class CudaBackend
 {
+    private static int ScientificCacheCapacity() =>
+        Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2);
+
     internal bool IsDirectPtxScientificEnabled =>
         DirectPtxFeatureGate.IsScientificEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedScientific(_ccMajor, _ccMinor);
@@ -35,67 +38,67 @@ public sealed partial class CudaBackend
     private readonly record struct SciNgpKey(int NumPoints, int Resolution, int TableSize, int FeaturesPerLevel, int LevelOffset, int OutputStride);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexConjugateKernel> _sciComplexConj =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMagnitudeKernel> _sciComplexMag =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexPhaseKernel> _sciComplexPhase =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCountKey, PtxOctonionAddKernel> _sciOctAdd =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCountKey, PtxOctonionMultiplyKernel> _sciOctMul =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciVectorKey, PtxMobiusAddKernel> _sciMobius =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareDistanceKernel> _sciPoincareDist =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciPoincareProjectKey, PtxPoincareProjectKernel> _sciPoincareProj =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciVectorKey, PtxPoincareExpMapKernel> _sciPoincareExp =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciRbfKey, PtxRbfForwardKernel> _sciRbf =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciPairwiseKey, PtxPairwiseDistanceKernel> _sciPairwise =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCountKey, PtxQuantumMeasurementKernel> _sciQuantumMeasure =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxComplexMatVecKernel> _sciComplexMatVec =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsKernel> _sciSphericalHarmonics =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciShKey, PtxSphericalHarmonicsBackwardKernel> _sciSphericalHarmonicsBwd =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCapsuleKey, PtxCapsuleContractionKernel> _sciCapsuleContraction =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCapsuleRoutingKey, PtxCapsuleWeightedSumKernel> _sciCapsuleWeightedSum =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciCapsuleRoutingKey, PtxCapsuleAgreementKernel> _sciCapsuleAgreement =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxCosineSimilarityKernel> _sciCosineSimilarity =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxSphericalSoftmaxKernel> _sciSphericalSoftmax =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxNormalizeProbabilitiesKernel> _sciNormalizeProbabilities =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxMeasurementForwardKernel> _sciMeasurementForward =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciQuantumRotationKey, PtxQuantumRotationKernel> _sciQuantumRotation =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciAnnCdKey, PtxAnnComputeDistancesKernel> _sciAnnComputeDistances =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciAnnPqKey, PtxAnnPqDistanceTablesKernel> _sciAnnPqDistanceTables =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciAnnCdKey, PtxAnnIvfAssignKernel> _sciAnnIvfAssign =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciAnnAdcKey, PtxAnnPqAdcScanKernel> _sciAnnPqAdcScan =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciNgpKey, PtxInstantNgpHashEncodeKernel> _sciNgpHashEncode =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciNgpKey, PtxInstantNgpHashEncodeBackwardKernel> _sciNgpHashEncodeBwd =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
     private readonly DirectPtxKernelCache<SciMatVecKey, PtxMeshLaplacianKernel> _sciMeshLaplacian =
-        new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+        new(ScientificCacheCapacity());
 
     private long _sciDispatchCount;
     internal long DirectPtxScientificDispatchCount => System.Threading.Interlocked.Read(ref _sciDispatchCount);
