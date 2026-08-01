@@ -735,7 +735,7 @@ public sealed class DirectPtxVisionBoxIouTests
     }
 
     [SkippableFact]
-    public void DriverOnly_PublicNmsRouteInitializesScratchAndUnusedOutput()
+    public void DriverOnly_PublicNmsRouteInitializesScratchWithoutClearingUnusedOutput()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
@@ -767,7 +767,9 @@ public sealed class DirectPtxVisionBoxIouTests
             backend.Synchronize();
 
             Assert.Equal(1f, backend.DownloadBuffer(count)[0]);
-            Assert.All(backend.DownloadBuffer(output), value => Assert.Equal(0f, value));
+            float[] actual = backend.DownloadBuffer(output);
+            Assert.Equal(0f, actual[0]);
+            Assert.All(actual.Skip(1), value => Assert.Equal(-7f, value));
             Assert.True(backend.DirectPtxVisionDispatchCount(
                 DirectPtxVisionOperation.Nms) >= 1);
         }
