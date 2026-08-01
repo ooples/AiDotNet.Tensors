@@ -293,8 +293,12 @@ public static class AutotuneCache
             try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { /* best effort */ }
             throw;
         }
-        // No explicit memo update needed: the write bumps the file's last-write time, and Lookup's
-        // stat-validation (see _memo) re-reads whenever the on-disk timestamp changes.
+        // Do not rely on timestamp resolution to invalidate a parsed choice. A
+        // rapid rewrite can retain the same LastWriteTimeUtc on some filesystems;
+        // removing this exact entry guarantees the next lookup reads the atomic
+        // winner that is now on disk. Concurrent writers remain safe: at worst
+        // they cause one extra read of the latest complete file.
+        _memo.TryRemove(finalPath, out _);
     }
 
     /// <summary>
