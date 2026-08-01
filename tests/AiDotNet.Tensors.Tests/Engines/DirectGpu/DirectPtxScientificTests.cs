@@ -1388,35 +1388,41 @@ public class DirectPtxScientificTests
     [Theory]
     [InlineData(AnnMetric.L2)]
     [InlineData(AnnMetric.InnerProduct)]
-    public void AnnComputeDistancesEmitter_IsThreadPerCellSerialDim(AnnMetric metric)
+    public void AnnComputeDistancesEmitter_IsWarpPerCellWithCoalescedLoads(AnnMetric metric)
     {
         string ptx = PtxAnnComputeDistancesKernel.EmitPtx(8, 6, metric, 16, 16, 8);   // cells = 256
         Assert.Contains(PtxAnnComputeDistancesKernel.EntryPoint, ptx);
         Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Contains("$ANN_CD_LOOP:", ptx);
+        Assert.Equal(5, Count(ptx, "shfl.sync.down.b32"));
         Assert.Equal(metric == AnnMetric.L2 ? 1 : 0, Count(ptx, "sub.rn.f32"));   // L2 uses a-b
-        Assert.Contains("div.u32 %r3, %r2, 16", ptx);        // q = gid / numDatabase
-        Assert.Contains("rem.u32 %r4, %r2, 16", ptx);        // j = gid % numDatabase
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);         // warp owns the cell
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);        // lane owns the feature
+        Assert.Contains("div.u32 %r5, %r4, 16", ptx);        // q = cell / numDatabase
+        Assert.Contains("rem.u32 %r6, %r4, 16", ptx);        // j = cell % numDatabase
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxAnnComputeDistancesKernel.IsSupportedShape(16, 16, 8));
-        Assert.False(PtxAnnComputeDistancesKernel.IsSupportedShape(15, 16, 8));   // 240 not mult of 256
+        Assert.True(PtxAnnComputeDistancesKernel.IsSupportedShape(15, 16, 8));
+        Assert.False(PtxAnnComputeDistancesKernel.IsSupportedShape(15, 15, 8));   // 225 not mult of 8
         Assert.False(PtxAnnComputeDistancesKernel.IsPromotedShape(16, 16, 8));
     }
 
     [Theory]
     [InlineData(AnnMetric.L2)]
     [InlineData(AnnMetric.InnerProduct)]
-    public void AnnPqDistanceTablesEmitter_IsThreadPerCellSerialSubdim(AnnMetric metric)
+    public void AnnPqDistanceTablesEmitter_UsesShapeSelectedVectorLoads(AnnMetric metric)
     {
         string ptx = PtxAnnPqDistanceTablesKernel.EmitPtx(8, 6, metric, 8, 4, 8, 4);   // cells = 8*4*8 = 256
         Assert.Contains(PtxAnnPqDistanceTablesKernel.EntryPoint, ptx);
-        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(0, Count(ptx, "ld.global.nc.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Contains("$ANN_PQ_LOOP:", ptx);
-        Assert.Equal(metric == AnnMetric.L2 ? 1 : 0, Count(ptx, "sub.rn.f32"));
-        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // c = gid % ksub
+        Assert.Equal(0, Count(ptx, "shfl.sync.down.b32"));
+        Assert.Equal(metric == AnnMetric.L2 ? 4 : 0, Count(ptx, "sub.rn.f32"));
+        Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // c = cell % ksub
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxAnnPqDistanceTablesKernel.IsSupportedShape(8, 4, 8, 4));
@@ -1431,7 +1437,7 @@ public class DirectPtxScientificTests
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in ann-compute-distances specialization is measured on GA10x/SM86.");
-        const int numQueries = 32, numDatabase = 16, dim = 12;   // cells = 512
+        const int numQueries = 32, numDatabase = 16, dim = 12;   // ragged feature dimension exercises zero-contributing lanes
         using var kernel = new PtxAnnComputeDistancesKernel(runtime, metric, numQueries, numDatabase, dim);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
