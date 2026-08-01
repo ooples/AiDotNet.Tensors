@@ -28,8 +28,12 @@ public sealed partial class HipBackend
         string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
         int m, int n, int dim)
     {
-        int total = m * n;
-        if (total <= 0) return;
+        long totalLong = (long)m * n;
+        if (totalLong <= 0) return;
+        if (totalLong > int.MaxValue)
+            throw new OverflowException(
+                $"Pairwise-distance work-item count {totalLong} exceeds Int32.MaxValue.");
+        int total = (int)totalLong;
         var kernel = ResolveParity210Kernel(kernelName);
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outputPtr = output.Handle;
         void** args = stackalloc void*[6];
