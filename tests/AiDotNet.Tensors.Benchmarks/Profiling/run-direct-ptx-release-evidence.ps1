@@ -14,8 +14,52 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$hostCpuCeilingPercent = 20.0
+$benchmarkOwnedCpuAllowance = 1.5
 if (@(@($Issue834Only, $Issue835Only, $Issue853Only) | Where-Object { $_ }).Count -gt 1) {
     throw 'Only one issue-specific evidence switch may be selected.'
+}
+
+if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        [System.Runtime.InteropServices.OSPlatform]::Windows) -and
+    -not ('AiDotNetBenchmarkHostCpu' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AiDotNetBenchmarkHostCpu
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileTime
+    {
+        internal uint Low;
+        internal uint High;
+        internal long Ticks { get { return ((long)High << 32) | Low; } }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemTimes(
+        out FileTime idle, out FileTime kernel, out FileTime user);
+
+    public static long[] Snapshot()
+    {
+        FileTime idle, kernel, user;
+        if (!GetSystemTimes(out idle, out kernel, out user))
+            throw new InvalidOperationException(
+                "GetSystemTimes failed with Win32 error " + Marshal.GetLastWin32Error() + ".");
+        return new[] { idle.Ticks, kernel.Ticks, user.Ticks };
+    }
+
+    public static double UsagePercent(long[] before, long[] after)
+    {
+        double idle = after[0] - before[0];
+        double total = (after[1] - before[1]) + (after[2] - before[2]);
+        if (total <= 0.0 || idle < 0.0 || idle > total)
+            throw new InvalidOperationException("Invalid GetSystemTimes interval.");
+        return 100.0 * (total - idle) / total;
+    }
+}
+'@
 }
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $project = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\AiDotNet.Tensors.Benchmarks.csproj'
@@ -441,6 +485,8 @@ function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeE
         maximum_error = 2e-5
         required_managed_temporary_shared_local_bytes = 0
         minimum_active_blocks_per_sm = 2
+        maximum_adjusted_foreign_host_cpu_percent = $hostCpuCeilingPercent
+        benchmark_owned_cpu_allowance = $benchmarkOwnedCpuAllowance
         external_sampling = '101 samples below 1 ms; at least 21 samples at or above 1 ms; 1-10 calibrated launches/sample'
         external_process_isolation = 'uninterrupted resident eager phase, then one disposable CUDA-graph process per run/operation/batch cell'
         runs = $RunCount
@@ -459,6 +505,36 @@ function Get-GpuSnapshot {
         '--format=csv,noheader,nounits' 2>&1
     if ($LASTEXITCODE -ne 0) { throw "nvidia-smi snapshot failed: $output" }
     return ($output -join [Environment]::NewLine).Trim()
+}
+
+function Get-HostCpuSnapshot {
+    if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        return $null
+    }
+    return ,([AiDotNetBenchmarkHostCpu]::Snapshot())
+}
+
+function Get-HostCpuUsagePercent($Before, $After) {
+    if ($null -eq $Before -or $null -eq $After) { return $null }
+    return [AiDotNetBenchmarkHostCpu]::UsagePercent($Before, $After)
+}
+
+function Get-AdjustedForeignCpuPercent([double]$UsagePercent) {
+    $busyProcessors = $UsagePercent * [Environment]::ProcessorCount / 100.0
+    return 100.0 * [Math]::Max(0.0, $busyProcessors - $benchmarkOwnedCpuAllowance) /
+        [Environment]::ProcessorCount
+}
+
+function Assert-HostReady([string]$Label) {
+    $before = Get-HostCpuSnapshot
+    if ($null -eq $before) { return }
+    Start-Sleep -Milliseconds 250
+    $after = Get-HostCpuSnapshot
+    $usage = Get-HostCpuUsagePercent $before $after
+    if ($usage -gt $hostCpuCeilingPercent) {
+        throw "[$Label] Host CPU utilization $($usage.ToString('F1'))% exceeds the $($hostCpuCeilingPercent.ToString('F1'))% evidence ceiling."
+    }
 }
 
 function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
@@ -607,6 +683,7 @@ try {
                     for ($poll = 1; $poll -le 30; $poll++) {
                         try {
                             Assert-GpuReady "$label-start"
+                            Assert-HostReady "$label-start"
                             $consecutiveReadySamples++
                             if ($consecutiveReadySamples -ge 3) {
                                 $ready = $true
@@ -637,6 +714,7 @@ try {
                     # The complete TUI is emitted only to the immutable process log.
                     $arguments = $suite.Arguments
                     $savedErrorAction = $ErrorActionPreference
+                    $hostCpuBefore = Get-HostCpuSnapshot
                     try {
                         # Windows PowerShell wraps a native process's stderr as
                         # ErrorRecord objects. PyTorch uses stderr for backend
@@ -650,6 +728,18 @@ try {
                     finally {
                         $ErrorActionPreference = $savedErrorAction
                     }
+                    $hostCpuAfter = Get-HostCpuSnapshot
+                    $hostCpuUsage = Get-HostCpuUsagePercent $hostCpuBefore $hostCpuAfter
+                    $adjustedForeignCpu = if ($null -eq $hostCpuUsage) {
+                        $null
+                    }
+                    else {
+                        Get-AdjustedForeignCpuPercent $hostCpuUsage
+                    }
+                    if ($null -ne $hostCpuUsage) {
+                        "# host_cpu_average_percent=$($hostCpuUsage.ToString('F2')); adjusted_foreign_percent=$($adjustedForeignCpu.ToString('F2')); logical_processors=$([Environment]::ProcessorCount)" |
+                            Add-Content -LiteralPath $log -Encoding utf8
+                    }
                     "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
                     "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
                         Add-Content -LiteralPath $log -Encoding utf8
@@ -661,6 +751,10 @@ try {
                     $rejectionKind = 'environment'
                     try { Assert-GpuReady "$label-end" -AfterSuite }
                     catch { $rejection = $_.Exception.Message }
+                    if (-not $rejection -and $null -ne $adjustedForeignCpu -and
+                        $adjustedForeignCpu -gt $hostCpuCeilingPercent) {
+                        $rejection = "[$label] Average adjusted foreign CPU utilization $($adjustedForeignCpu.ToString('F1'))% exceeded the $($hostCpuCeilingPercent.ToString('F1'))% evidence ceiling."
+                    }
                     if (-not $rejection -and $Issue853Only -and $suite.Name -eq 'solvers-4x4') {
                         try { Assert-SolverDotnetAcceptedAttempt $log $run }
                         catch {
@@ -716,6 +810,8 @@ try {
         dirty_worktree = $dirtyLines.Count -ne 0
         requested_independent_runs = $Runs
         contamination_retries_per_suite = $ContaminationRetries
+        maximum_adjusted_foreign_host_cpu_percent = $hostCpuCeilingPercent
+        benchmark_owned_cpu_allowance = $benchmarkOwnedCpuAllowance
         issue_834_only = [bool]$Issue834Only
         issue_835_only = [bool]$Issue835Only
         issue_853_only = [bool]$Issue853Only

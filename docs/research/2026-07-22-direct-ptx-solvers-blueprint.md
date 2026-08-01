@@ -104,6 +104,14 @@ prioritize idle CPU usage can set `AIDOTNET_CUDA_CONTEXT_SCHEDULING` to `auto`,
 `yield`, or `blocking`; invalid values fail during context creation instead of
 silently selecting a policy.
 
+The release runner also admits a process only after both GPU and host are quiet. On
+Windows it samples `GetSystemTimes` before admission and across the complete child
+process, records average CPU occupancy, subtracts 1.5 logical processors for the
+benchmark's own submission/spin-wait work, and rejects an attempt when the remaining
+foreign CPU load exceeds 20%. This is an environment rejection, not a performance
+retry: saturated-host medians remain preserved in rejected evidence and cannot be
+promoted as a stable win.
+
 The external PyTorch lane calibrates one CUDA-event-timed call before choosing its measurement plan. Calls below 1 ms retain 101 samples and one to ten launches per device sample; calls at or above 1 ms use at least 21 samples and one launch. Warmup work targets 10 ms but is bounded to 3–30 calls. This keeps close competitors on the full 101-sample protocol while preventing pathologically slow vendor calls from being repeated without bound. For example, PyTorch QR at batch 4096 measured about 0.60 seconds per eager call on the validation host; fixed 10x batching executed 1,212 calls per row, whereas 21 one-launch samples still produce a meaningful empirical P95 and are repeated in all three independent processes. Required eager measurements run first in one uninterrupted resident process so context and library warm state are comparable across the matrix; the parent releases each shape's tensors before advancing. Only after that phase does each optional CUDA-graph capture execute in a disposable child. An unsupported capture may invalidate that child, but it cannot poison or context-switch the eager lane. The release gate validates the sampling metadata and requires every eager cell before accepting external evidence; the correctness, 1.10x device/E2E median, and device-P95 requirements are unchanged.
 
 The orchestrator checks each complete AiDotNet solver attempt against the same
