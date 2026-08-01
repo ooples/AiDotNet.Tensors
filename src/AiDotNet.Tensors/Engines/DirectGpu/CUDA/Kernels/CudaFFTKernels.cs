@@ -11,7 +11,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 
 #define PI 3.14159265358979323846f
 
-// Bit reversal permutation for in-place FFT
+// Bit reversal permutation, OUT OF PLACE. `src` and `dst` must be distinct
+// allocations: each thread reads src[reversed] and writes dst[idx].
 extern ""C"" __global__ __launch_bounds__(256) void bit_reverse_permutation(
     const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int n, int log2n)
 {
@@ -228,9 +229,9 @@ extern ""C"" __global__ __launch_bounds__(256) void apply_window(
     output[idx] = input[idx] * window[idx];
 }
 
-// 2D FFT row-wise bit-reversal (permute each row of length `width` in place).
-// Required before the DIT row butterflies — without it FFT2D transforms
-// un-permuted data and returns garbage.
+// 2D FFT row-wise bit-reversal (permute each row of length `width`, OUT OF PLACE
+// into `dst`; `src` and `dst` must be distinct). Required before the DIT row
+// butterflies — without it FFT2D transforms un-permuted data and returns garbage.
 extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
     const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int height, int width, int log2width)
 {
@@ -249,7 +250,8 @@ extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
 }
 
 // 2D FFT column-wise bit-reversal (permute each column of length `height`,
-// stride `width`, in place). Required before the DIT column butterflies.
+// stride `width`, OUT OF PLACE into `dst`; `src` and `dst` must be distinct).
+// Required before the DIT column butterflies.
 extern ""C"" __global__ __launch_bounds__(256) void fft_cols_bit_reverse(
     const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int height, int width, int log2height)
 {
