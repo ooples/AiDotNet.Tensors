@@ -2505,7 +2505,38 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// which implicit broadcasting turned from a rare case into the common one.
     /// </remarks>
     internal static void ElementwiseInto(Tensor<T> a, Tensor<T> b, Tensor<T> result, BroadcastOp op)
-        => BroadcastElementwise(a, b, result, result._shape, op);
+    {
+        ValidateBroadcastOperandShape(a._shape, result._shape, nameof(a));
+        ValidateBroadcastOperandShape(b._shape, result._shape, nameof(b));
+        BroadcastElementwise(a, b, result, result._shape, op);
+    }
+
+    private static void ValidateBroadcastOperandShape(
+        int[] operandShape, int[] resultShape, string operandName)
+    {
+        if (operandShape.Length > resultShape.Length)
+        {
+            throw new ArgumentException(
+                $"Tensor with shape [{string.Join(", ", operandShape)}] cannot be broadcast to " +
+                $"result shape [{string.Join(", ", resultShape)}]: operand rank exceeds result rank.",
+                operandName);
+        }
+
+        int offset = resultShape.Length - operandShape.Length;
+        for (int i = 0; i < operandShape.Length; i++)
+        {
+            int operandDim = operandShape[i];
+            int resultDim = resultShape[offset + i];
+            if (operandDim != 1 && operandDim != resultDim)
+            {
+                throw new ArgumentException(
+                    $"Tensor with shape [{string.Join(", ", operandShape)}] cannot be broadcast to " +
+                    $"result shape [{string.Join(", ", resultShape)}]: dimension {offset + i} has " +
+                    $"sizes {operandDim} and {resultDim} (operand must equal result or be 1).",
+                    operandName);
+            }
+        }
+    }
 
     private static void BroadcastElementwise(
         Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)

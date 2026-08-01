@@ -176,6 +176,27 @@ public class ImplicitBroadcastTests
         }
     }
 
+    [Fact]
+    public void ElementwiseInto_ValidatesOperandsAgainstTheResultShape()
+    {
+        var singletonA = new Tensor<double>(new[] { 1, 1 });
+        var singletonB = new Tensor<double>(new[] { 1 });
+        var widerResult = new Tensor<double>(new[] { 2, 3 });
+        singletonA[0] = 2.0;
+        singletonB[0] = 4.0;
+
+        Tensor<double>.ElementwiseInto(
+            singletonA, singletonB, widerResult, Tensor<double>.BroadcastOp.Add);
+
+        Assert.All(widerResult.AsSpan().ToArray(), value => Assert.Equal(6.0, value, 12));
+
+        var incompatible = new Tensor<double>(new[] { 2, 2 });
+        var exception = Assert.Throws<ArgumentException>(() => Tensor<double>.ElementwiseInto(
+            incompatible, singletonB, widerResult, Tensor<double>.BroadcastOp.Add));
+        Assert.Equal("a", exception.ParamName);
+        Assert.Contains("cannot be broadcast", exception.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// The gradient of a broadcast operand must be the SUM over the axes that were stretched.
     /// </summary>
