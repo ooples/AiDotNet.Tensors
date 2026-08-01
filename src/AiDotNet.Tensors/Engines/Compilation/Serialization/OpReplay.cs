@@ -23,7 +23,8 @@ internal static class OpReplay
         OpType opType,
         string opName,
         Tensor<T>[] inputs,
-        object[]? savedState)
+        object[]? savedState,
+        int[]? outputShape = null)
     {
         return opType switch
         {
@@ -46,6 +47,9 @@ internal static class OpReplay
             OpType.Round         => engine.TensorRound(inputs[0]),
             OpType.Sin           => engine.TensorSin(inputs[0]),
             OpType.Cos           => engine.TensorCos(inputs[0]),
+
+            // ── Metadata views ─────────────────────────────────────────
+            OpType.Expand        => ReplayExpand(inputs, outputShape),
 
             // ── Parameterless binary ────────────────────────────────
             OpType.TensorAdd      => engine.TensorAdd(inputs[0], inputs[1]),
@@ -131,6 +135,17 @@ internal static class OpReplay
         double alphaDouble = savedState is { Length: > 0 } && savedState[0] is double d ? d : 0.01;
         var alpha = MathHelper.GetNumericOperations<T>().FromDouble(alphaDouble);
         return engine.LeakyReLU(input, alpha);
+    }
+
+    private static Tensor<T> ReplayExpand<T>(Tensor<T>[] inputs, int[]? outputShape)
+    {
+        if (inputs.Length != 1)
+            throw new InvalidDataException(
+                $"Expand replay requires exactly 1 input, got {inputs.Length}.");
+        if (outputShape is null)
+            throw new InvalidDataException(
+                "Expand replay requires the serialized output shape.");
+        return inputs[0].ExpandTo(outputShape);
     }
 
     private static Tensor<T> ReplayMean<T>(IEngine engine, Tensor<T> input, object[]? savedState)

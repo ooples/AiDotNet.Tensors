@@ -44,6 +44,9 @@ internal static class OpSerializationRegistry<T>
             OpType.Sin           => Unary(inputs, (e, a) => e.TensorSin(a)),
             OpType.Cos           => Unary(inputs, (e, a) => e.TensorCos(a)),
 
+            // ── Metadata views ─────────────────────────────────────────
+            OpType.Expand        => RebuildExpand(inputs, output),
+
             // ── Parameterless binary ────────────────────────────────────
             OpType.TensorAdd      => Binary(inputs, (e, a, b) => e.TensorAdd(a, b)),
             OpType.TensorSubtract => Binary(inputs, (e, a, b) => e.TensorSubtract(a, b)),
@@ -115,6 +118,7 @@ internal static class OpSerializationRegistry<T>
         OpType.TensorLog or OpType.TensorSqrt or OpType.TensorAbs or
         OpType.TensorNegate or OpType.TensorTranspose or OpType.Floor or
         OpType.Ceiling or OpType.Round or OpType.Sin or OpType.Cos or
+        OpType.Expand or
         // Binary
         OpType.TensorAdd or OpType.TensorSubtract or OpType.TensorMultiply or
         OpType.TensorDivide or OpType.TensorMax or OpType.TensorMatMul or
@@ -157,6 +161,65 @@ internal static class OpSerializationRegistry<T>
                 $"Binary op rebuild requires exactly 2 inputs, got {inputs.Length}.");
         var a = inputs[0]; var b = inputs[1];
         return (eng, output) => { var r = op(eng, a, b); r.AsSpan().CopyTo(output.AsWritableSpan()); };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildExpand(Tensor<T>[] inputs, Tensor<T> output)
+    {
+        RequireInputs(inputs, 1, "Expand");
+        var input = inputs[0];
+        var targetShape = (int[])output._shape.Clone();
+        if (targetShape.Length < input.Rank)
+            throw new InvalidDataException(
+                $"Expand output rank {targetShape.Length} is lower than input rank {input.Rank}.");
+
+        int offset = targetShape.Length - input.Rank;
+        var expandedStrides = new int[targetShape.Length];
+        for (int i = 0; i < targetShape.Length; i++)
+        {
+            int target = targetShape[i];
+            int inputAxis = i - offset;
+            if (target < 0)
+                throw new InvalidDataException($"Expand output axis {i} has negative extent {target}.");
+            if (inputAxis < 0)
+            {
+                expandedStrides[i] = 0;
+                continue;
+            }
+
+            int source = input._shape[inputAxis];
+            if (source == target)
+                expandedStrides[i] = input._strides[inputAxis];
+            else if (source == 1)
+                expandedStrides[i] = 0;
+            else
+                throw new InvalidDataException(
+                    $"Expand cannot stretch input axis {inputAxis} from {source} to {target}.");
+        }
+
+        return (_, destination) =>
+        {
+            // Fresh plans keep Expand as a stride-0 view that shares input storage.
+            // Deserialized tensor tables intentionally allocate independent dense
+            // buffers, so materialize directly into the restored buffer. The
+            // odometer keeps mature plan replay allocation-free.
+            var source = input.RawStorageSpan;
+            var target = destination.AsWritableSpan();
+            Span<int> counter = stackalloc int[targetShape.Length];
+            int sourceIndex = input._storageOffset;
+            for (int flat = 0; flat < target.Length; flat++)
+            {
+                target[flat] = source[sourceIndex];
+                for (int axis = targetShape.Length - 1; axis >= 0; axis--)
+                {
+                    counter[axis]++;
+                    sourceIndex += expandedStrides[axis];
+                    if (counter[axis] < targetShape[axis])
+                        break;
+                    counter[axis] = 0;
+                    sourceIndex -= expandedStrides[axis] * targetShape[axis];
+                }
+            }
+        };
     }
 
     /// <summary>Shared arity check for rebuilders with a fixed input count.</summary>

@@ -108,6 +108,39 @@ public class InferencePlanSerializationTests : IDisposable
         loaded.Dispose();
     }
 
+    [Fact]
+    public async Task SaveLoad_Expand_PreservesShapeAndValues()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 1, 3 });
+
+        ICompiledPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            var output = input.ExpandTo(new[] { 2, 3 });
+            original = scope.CompileInference(output, input);
+        }
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+
+        var loaded = await CompiledPlanLoader.LoadInferenceAsync<float>(stream, engine);
+        Assert.NotNull(loaded);
+        var loadedInput = ((CompiledInferencePlan<float>)loaded!).CompiledInputTensor!;
+        input.AsWritableSpan().CopyTo(loadedInput.AsWritableSpan());
+
+        var expected = original.Execute();
+        var actual = loaded.Execute();
+
+        Assert.Equal(new[] { 2, 3 }, expected._shape);
+        Assert.Equal(expected._shape, actual._shape);
+        Assert.Equal(expected.Contiguous().AsSpan().ToArray(), actual.AsSpan().ToArray());
+
+        original.Dispose();
+        loaded.Dispose();
+    }
+
     // ── Negative: hardware fingerprint mismatch → null ──────────────────────
     [Fact]
     public async Task Load_WithMismatchedHardwareFingerprint_ReturnsNull()
