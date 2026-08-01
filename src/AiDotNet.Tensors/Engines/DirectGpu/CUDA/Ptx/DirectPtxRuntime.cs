@@ -302,11 +302,21 @@ internal sealed class DirectPtxRuntime : IDisposable
         bool captureActive = false;
         try
         {
+            Check(CudaNativeBindings.cuEventCreate(out start, CudaNativeBindings.CU_EVENT_DEFAULT),
+                "cuEventCreate(tuner start)");
+            Check(CudaNativeBindings.cuEventCreate(out stop, CudaNativeBindings.CU_EVENT_DEFAULT),
+                "cuEventCreate(tuner stop)");
             Check(CudaNativeBindings.cuStreamBeginCapture(
                 _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
                 "cuStreamBeginCapture(tuner)");
             captureActive = true;
+            Check(CudaNativeBindings.cuEventRecordWithFlags(
+                start, _stream, CudaNativeBindings.CU_EVENT_RECORD_EXTERNAL),
+                "cuEventRecordWithFlags(tuner start)");
             for (int i = 0; i < launchesPerSample; i++) launch();
+            Check(CudaNativeBindings.cuEventRecordWithFlags(
+                stop, _stream, CudaNativeBindings.CU_EVENT_RECORD_EXTERNAL),
+                "cuEventRecordWithFlags(tuner stop)");
             CudaResult endResult = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
             captureActive = false;
             Check(endResult, "cuStreamEndCapture(tuner)");
@@ -321,16 +331,10 @@ internal sealed class DirectPtxRuntime : IDisposable
                 Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch(tuner warmup)");
             Synchronize();
 
-            Check(CudaNativeBindings.cuEventCreate(out start, CudaNativeBindings.CU_EVENT_DEFAULT),
-                "cuEventCreate(tuner start)");
-            Check(CudaNativeBindings.cuEventCreate(out stop, CudaNativeBindings.CU_EVENT_DEFAULT),
-                "cuEventCreate(tuner stop)");
             var result = new float[samples];
             for (int sample = 0; sample < samples; sample++)
             {
-                Check(CudaNativeBindings.cuEventRecord(start, _stream), "cuEventRecord(tuner start)");
                 Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch(tuner sample)");
-                Check(CudaNativeBindings.cuEventRecord(stop, _stream), "cuEventRecord(tuner stop)");
                 Check(CudaNativeBindings.cuEventSynchronize(stop), "cuEventSynchronize(tuner stop)");
                 Check(CudaNativeBindings.cuEventElapsedTime(out float elapsed, start, stop),
                     "cuEventElapsedTime(tuner)");

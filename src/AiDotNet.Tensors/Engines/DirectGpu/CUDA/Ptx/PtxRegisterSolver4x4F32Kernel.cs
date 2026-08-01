@@ -237,7 +237,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         EmitMatrixPointer(ptx, 1, 5);
         EmitVectorPointer(ptx, 2, 2, 7, 16);
         EmitLoadMatrix(ptx, 4, 0);
-        for (int j = 0; j < 4; j++)
+        for (int j = 0; j < 3; j++)
         {
             int pivot = j * 4 + j;
             ptx.AppendLine($"    abs.f32 %f48, %f{pivot};");
@@ -263,16 +263,19 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             }
             ptx.AppendLine($"    setp.eq.f32 %p0, %f{pivot}, 0f00000000;");
             ptx.AppendLine($"    @%p0 bra LU_SKIP_{j};");
+            PtxSolverArithmetic.EmitRefinedReciprocal(ptx, pivot);
             for (int row = j + 1; row < 4; row++)
             {
                 int factor = row * 4 + j;
-                ptx.AppendLine($"    div.rn.f32 %f{factor}, %f{factor}, %f{pivot};");
+                PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, factor, factor);
                 for (int col = j + 1; col < 4; col++)
                     PtxSolverArithmetic.EmitSubtractProduct(
                         ptx, row * 4 + col, factor, j * 4 + col);
             }
             ptx.AppendLine($"LU_SKIP_{j}:");
         }
+        ptx.AppendLine("    mov.u32 %r4, 3;");
+        ptx.AppendLine("    st.global.u32 [%rd7+12], %r4;");
         EmitStoreMatrix(ptx, 5, 0);
     }
 
@@ -302,8 +305,10 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             ptx.AppendLine($"    sqrt.rn.f32 %f{diag}, %f{diag};");
             ptx.AppendLine($"    setp.gt.f32 %p0, %f{diag}, 0f0da24260;");
             ptx.AppendLine($"    @!%p0 bra QR_ZERO_{col};");
+            PtxSolverArithmetic.EmitRefinedReciprocal(ptx, diag);
             for (int row = 0; row < 4; row++)
-                ptx.AppendLine($"    div.rn.f32 %f{row * 4 + col}, %f{row * 4 + col}, %f{diag};");
+                PtxSolverArithmetic.EmitMultiplyByReciprocal(
+                    ptx, row * 4 + col, row * 4 + col);
             ptx.AppendLine($"    bra.uni QR_DONE_{col};");
             ptx.AppendLine($"QR_ZERO_{col}:");
             for (int row = 0; row < 4; row++)
@@ -715,13 +720,15 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             ptx.AppendLine($"    @%p0 bra {skip};");
             ptx.AppendLine($"    sub.rn.f32 %f49, %f{aqq}, %f{app};");
             ptx.AppendLine($"    add.rn.f32 %f50, %f{apq}, %f{apq};");
-            ptx.AppendLine("    div.rn.f32 %f49, %f49, %f50;");
+            PtxSolverArithmetic.EmitRefinedReciprocal(ptx, 50);
+            PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 49, 49);
             ptx.AppendLine("    abs.f32 %f50, %f49;");
             ptx.AppendLine("    mul.rn.f32 %f51, %f49, %f49;");
             ptx.AppendLine("    add.rn.f32 %f51, %f51, 0f3f800000;");
             ptx.AppendLine("    sqrt.rn.f32 %f51, %f51;");
             ptx.AppendLine("    add.rn.f32 %f50, %f50, %f51;");
-            ptx.AppendLine("    div.rn.f32 %f52, 0f3f800000, %f50;");
+            PtxSolverArithmetic.EmitRefinedReciprocal(ptx, 50);
+            ptx.AppendLine("    mov.f32 %f52, %solver_recip;");
             ptx.AppendLine("    setp.lt.f32 %p1, %f49, 0f00000000;");
             ptx.AppendLine("    @%p1 neg.f32 %f52, %f52;");
             ptx.AppendLine("    mul.rn.f32 %f53, %f52, %f52;");

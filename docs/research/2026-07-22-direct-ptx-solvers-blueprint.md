@@ -64,11 +64,16 @@ The master gate is `AIDOTNET_DIRECT_PTX=1`. Independent rollout gates are:
 
 The process-start gate is allocation-free. Benchmark/test overrides are thread-local.
 
-The module key is operation, exact batch, and selected block geometry. Device UUID, exact SM, and driver are implicit in the owning backend/runtime instance and recorded in every audit. The bounded cold-path tuner compares exactly 64, 128, and 256 threads. Plans are bounded to 4 Cholesky cells and 64 solver-family cells; modules are bounded to 12 and 192 variants respectively. Prewarm installs the deterministic 128-thread plan. Cold graph capture is rejected. A prewarmed selected module is pinned for the lifetime of the backend once captured, and every plan/module is deterministically disposed with the backend.
+The module key is operation, exact batch, and selected block geometry. Device UUID, exact SM, and driver are implicit in the owning backend/runtime instance and recorded in every audit. The bounded cold-path tuner compares exactly 32, 64, 128, and 256 threads. Its timing events are externally observable nodes inside the captured launch group, excluding host submission gaps, and a later geometry must beat the current smaller winner by at least 1% so a near-tie cannot become a different cold-start plan. Plans are bounded to 4 Cholesky cells and 64 solver-family cells; module caches are bounded to 12 and 192 entries respectively. Prewarm installs the deterministic 128-thread plan. Cold graph capture is rejected. A prewarmed selected module is pinned for the lifetime of the backend once captured, and every plan/module is deterministically disposed with the backend.
 
 ## Correctness matrix
 
 The opt-in driver theory covers every operation. Required evidence before promotion includes:
+
+The register Cholesky specialization derives each diagonal and its reusable inverse from a
+one-Newton-refined `rsqrt.approx.f32` seed; this avoids a serialized square-root-plus-divide
+sequence. The refined-seed arithmetic is part of the audited blueprint semantics and remains
+subject to the unchanged `2e-5` release residual gate.
 
 - SPD and non-SPD Cholesky with exact `info` parity;
 - LU ties, singular pivots, zero-based pivot order, and reconstruction;
@@ -86,13 +91,18 @@ None of these GPU assertions is claimed as passed in this change. Static emitter
 
 ## Championship evidence protocol
 
-Every result requires three independent clean runs, at least 30 warmups, 101 samples, resident preallocated buffers, CUDA-event device timing, synchronized end-to-end timing, and the complete GPU/SM/UUID/driver/runtime fingerprint.
+Every result requires three independent clean runs, at least 30 warmups, 101 samples, resident preallocated buffers, CUDA-event device timing, synchronized end-to-end timing, and the complete GPU/SM/UUID/driver/runtime fingerprint. Device timing captures a 1,000-launch measurement batch for each resident method, with externally observable start/stop event nodes inside that same graph. Host submission gaps therefore cannot be mislabeled as device work, while the longer interval amortizes fixed WDDM desktop-preemption quanta. Candidate and incumbent graphs rotate within every sample round so neither receives a different scheduler or power-state window. A captured method reuses the isolated candidate-kernel distribution because capture changes submission rather than kernel execution. End-to-end timing remains separately measured for resident and captured submission, with resident, graph, and incumbent actions interleaved across 101 rotating rounds so their production costs remain visible.
 
 Run AiDotNet candidates and established CUDA kernels:
 
 ```powershell
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -f net10.0 -- --direct-ptx-solvers-4x4 3
 ```
+
+For a diagnostic rerun of one oracle cell, append
+`--operation <name> --batch <1024|4096|16384|65536>`. Filtered output is
+diagnostic only; release evidence still requires the complete matrix in three
+independent processes.
 
 Run the PyTorch/cuSOLVER eager and CUDA-graph competitors:
 

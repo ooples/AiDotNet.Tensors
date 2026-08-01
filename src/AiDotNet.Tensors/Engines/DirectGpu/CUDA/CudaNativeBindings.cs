@@ -187,6 +187,10 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuEventRecord")]
     public static extern CudaResult cuEventRecord(IntPtr hEvent, IntPtr stream);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuEventRecordWithFlags")]
+    public static extern CudaResult cuEventRecordWithFlags(
+        IntPtr hEvent, IntPtr stream, uint flags);
+
     [DllImport(CudaLibrary, EntryPoint = "cuEventSynchronize")]
     public static extern CudaResult cuEventSynchronize(IntPtr hEvent);
 
@@ -211,6 +215,7 @@ internal static class CudaNativeBindings
     public const uint CU_EVENT_BLOCKING_SYNC = 1;
     public const uint CU_EVENT_DISABLE_TIMING = 2;
     public const uint CU_EVENT_INTERPROCESS = 4;
+    public const uint CU_EVENT_RECORD_EXTERNAL = 1;
 
     // Stream flag constants
     public const uint CU_STREAM_DEFAULT = 0;

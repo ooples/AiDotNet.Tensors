@@ -12,7 +12,10 @@ internal static class DirectPtxSolver4x4Experiment
 {
     private const int Warmups = 30;
     private const int Samples = 101;
-    private const int LaunchesPerSample = 10;
+    // WDDM desktop scheduling can preempt a short GPU interval by milliseconds. A 1,000-launch
+    // captured batch amortizes that fixed interruption without hiding it, while external event
+    // nodes exclude host submission gaps from the CUDA-event interval entirely.
+    private const int LaunchesPerSample = 1000;
     private const double MaximumAllowedError = 2e-5;
     private static readonly int[] Batches = [1024, 4096, 16384, 65536];
     private static readonly string[] Operations =
@@ -32,18 +35,35 @@ internal static class DirectPtxSolver4x4Experiment
         string DeviceFingerprint, string PtxSha256, string JitInfoLog,
         string DotNetRuntime, string OperatingSystem);
 
-    internal static void Run(int independentRuns = 3, bool componentOnly = false)
+    internal static void Run(
+        int independentRuns = 3,
+        bool componentOnly = false,
+        string? operationFilter = null,
+        int? batchFilter = null)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
+        string[] operations = operationFilter is null
+            ? Operations
+            : Operations.Contains(operationFilter, StringComparer.Ordinal)
+                ? [operationFilter]
+                : throw new ArgumentException(
+                    $"Unknown solver operation '{operationFilter}'.", nameof(operationFilter));
+        int[] batches = batchFilter is null
+            ? Batches
+            : Batches.Contains(batchFilter.Value)
+                ? [batchFilter.Value]
+                : throw new ArgumentOutOfRangeException(
+                    nameof(batchFilter), batchFilter, "Unsupported solver batch size.");
         Console.WriteLine(
             $"Direct PTX solver family: {independentRuns} clean run(s), {Warmups} warmups + " +
-            $"{Samples} samples, {LaunchesPerSample} launches/device sample.");
+            $"{Samples} samples, {LaunchesPerSample} launches/device sample; resident device " +
+            "timing uses captured launch batches while end-to-end timing remains uncaptured.");
         var results = new List<Result>();
         for (int run = 1; run <= independentRuns; run++)
         {
             using var backend = new CudaBackend();
-            foreach (string operation in Operations)
-            foreach (int batch in Batches)
+            foreach (string operation in operations)
+            foreach (int batch in batches)
                 RunCell(backend, run, operation, batch, results);
         }
         Print(results);
@@ -136,40 +156,65 @@ internal static class DirectPtxSolver4x4Experiment
                 $"Direct PTX correctness gate failed for {operation}/B={batch}: " +
                 $"maximum error {error:G9} exceeds {MaximumAllowedError:G9}.");
         DirectPtxKernelAudit audit = Audit(backend, operation, batch);
-        Distribution directDevice = MeasureDevice(backend, direct);
-        Distribution directE2e = MeasureEndToEnd(backend, direct);
         long directBytes = MeasureAllocation(backend, direct);
+        Enable(operation, true);
         IntPtr graph = backend.CaptureGraph(direct);
         if (graph == IntPtr.Zero) throw new InvalidOperationException($"Capture failed for {operation}/B={batch}.");
         try
         {
             Action graphLaunch = () => backend.EnqueueCapturedGraph(graph);
-            Distribution graphDevice = MeasureDevice(backend, graphLaunch);
-            Distribution graphE2e = MeasureEndToEnd(backend, graphLaunch);
-            results.Add(Create(run, operation, batch, "Direct PTX CUDA graph", graphDevice,
-                graphE2e, MeasureAllocation(backend, graphLaunch), 0, error, audit,
-                audit.DeviceFingerprint));
-        }
-        finally { backend.DestroyCapturedGraph(graph); }
-        results.Add(Create(run, operation, batch, "Direct PTX resident", directDevice,
-            directE2e, directBytes, 0, error, audit, audit.DeviceFingerprint));
+            long graphBytes = MeasureAllocation(backend, graphLaunch);
 
-        if (current is not null)
-        {
-            Enable(operation, false);
-            long establishedBefore = DispatchCount(backend, operation);
-            current(); backend.Synchronize();
-            if (DispatchCount(backend, operation) != establishedBefore)
-                throw new InvalidOperationException(
-                    $"Established baseline unexpectedly routed through direct PTX for {operation}/B={batch}.");
-            Distribution currentDevice = MeasureDevice(backend, current);
-            Distribution currentE2e = MeasureEndToEnd(backend, current);
-            results.Add(Create(run, operation, batch, "AiDotNet CUDA established", currentDevice,
-                currentE2e, MeasureAllocation(backend, current), 0,
-                Error(backend, operation, batch, matrixHost, vectorHost,
-                    matrix1, matrix2, vector, pivots, info), null, audit.DeviceFingerprint));
+            long currentBytes = 0;
+            double currentError = 0;
+            if (current is not null)
+            {
+                Enable(operation, false);
+                long establishedBefore = DispatchCount(backend, operation);
+                current(); backend.Synchronize();
+                if (DispatchCount(backend, operation) != establishedBefore)
+                    throw new InvalidOperationException(
+                        $"Established baseline unexpectedly routed through direct PTX for {operation}/B={batch}.");
+                currentBytes = MeasureAllocation(backend, current);
+                currentError = Error(backend, operation, batch, matrixHost, vectorHost,
+                    matrix1, matrix2, vector, pivots, info);
+            }
+
+            Dictionary<string, Distribution> device = current is null
+                ? MeasureResidentDeviceInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct))
+                : MeasureResidentDeviceInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct),
+                    ("current", () => Enable(operation, false), current));
+            Distribution directDevice = device["direct"];
+            // Graph capture changes submission, not the kernel body. Reuse the isolated kernel
+            // distribution so the graph row does not relabel host graph submissions as device
+            // work; graph submission remains fully represented by the graph E2E distribution.
+            Distribution graphDevice = directDevice;
+
+            Dictionary<string, Distribution> endToEnd = current is null
+                ? MeasureEndToEndInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct),
+                    ("graph", static () => { }, graphLaunch))
+                : MeasureEndToEndInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct),
+                    ("graph", static () => { }, graphLaunch),
+                    ("current", () => Enable(operation, false), current));
+
+            results.Add(Create(run, operation, batch, "Direct PTX CUDA graph", graphDevice,
+                endToEnd["graph"], graphBytes, 0, error, audit, audit.DeviceFingerprint));
+            results.Add(Create(run, operation, batch, "Direct PTX resident", directDevice,
+                endToEnd["direct"], directBytes, 0, error, audit, audit.DeviceFingerprint));
+            if (current is not null)
+                results.Add(Create(run, operation, batch, "AiDotNet CUDA established", device["current"],
+                    endToEnd["current"], currentBytes, 0, currentError, null,
+                    audit.DeviceFingerprint));
         }
-        Enable(operation, null);
+        finally
+        {
+            backend.DestroyCapturedGraph(graph);
+            Enable(operation, null);
+        }
     }
 
     private static long DispatchCount(CudaBackend backend, string operation) =>
@@ -200,48 +245,147 @@ internal static class DirectPtxSolver4x4Experiment
             Environment.Version.ToString(), Environment.OSVersion.ToString());
     }
 
-    private static Distribution MeasureDevice(CudaBackend backend, Action action)
+    /// <summary>
+    /// Measures resident kernels in one rotating event queue. Capturing each measurement batch
+    /// prevents an idle WDDM stream from recording host submission latency between the start
+    /// event and the kernel; interleaving prevents a scheduler, clock, or desktop-GPU change
+    /// between disjoint windows from deciding the P95 comparison. Uncaptured submission is
+    /// measured separately by <see cref="MeasureEndToEndInterleaved"/>.
+    /// </summary>
+    private static Dictionary<string, Distribution> MeasureResidentDeviceInterleaved(
+        CudaBackend backend,
+        params (string Name, Action Prepare, Action Execute)[] methods)
     {
-        for (int i = 0; i < Warmups; i++) action();
-        backend.Synchronize();
-        var values = new double[Samples];
-        using IGpuEvent start = backend.CreateEvent(true);
-        using IGpuEvent stop = backend.CreateEvent(true);
-        for (int i = 0; i < Samples; i++)
+        if (methods.Length == 0) throw new ArgumentException("At least one method is required.", nameof(methods));
+        if (methods.Select(method => method.Name).Distinct(StringComparer.Ordinal).Count() != methods.Length)
+            throw new ArgumentException("Method names must be unique.", nameof(methods));
+        for (int warmup = 0; warmup < Warmups; warmup++)
         {
-            backend.RecordEvent(start, backend.DefaultStream);
-            for (int launch = 0; launch < LaunchesPerSample; launch++) action();
-            backend.RecordEvent(stop, backend.DefaultStream);
-            stop.Synchronize();
-            values[i] = backend.GetEventElapsedTime(start, stop) * 1000.0 / LaunchesPerSample;
+            for (int offset = 0; offset < methods.Length; offset++)
+            {
+                var method = methods[(warmup + offset) % methods.Length];
+                method.Prepare();
+                method.Execute();
+            }
         }
-        return Summarize(values);
+        backend.Synchronize();
+        var graphs = new IntPtr[methods.Length];
+        var starts = new IGpuEvent[methods.Length];
+        var stops = new IGpuEvent[methods.Length];
+        var values = new double[methods.Length][];
+        try
+        {
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var method = methods[i];
+                starts[i] = backend.CreateEvent(true);
+                stops[i] = backend.CreateEvent(true);
+                values[i] = new double[Samples];
+                method.Prepare();
+                graphs[i] = backend.CaptureGraph(() =>
+                {
+                    ((CudaEvent)starts[i]).RecordExternalDuringCapture(backend.DefaultStream);
+                    for (int launch = 0; launch < LaunchesPerSample; launch++) method.Execute();
+                    ((CudaEvent)stops[i]).RecordExternalDuringCapture(backend.DefaultStream);
+                });
+                if (graphs[i] == IntPtr.Zero)
+                    throw new InvalidOperationException(
+                        $"Resident device-timing graph capture failed for '{method.Name}'.");
+            }
+            for (int warmup = 0; warmup < Warmups; warmup++)
+                for (int offset = 0; offset < methods.Length; offset++)
+                    backend.EnqueueCapturedGraph(graphs[(warmup + offset) % methods.Length]);
+            backend.Synchronize();
+            for (int sample = 0; sample < Samples; sample++)
+            {
+                for (int offset = 0; offset < methods.Length; offset++)
+                {
+                    int method = (sample + offset) % methods.Length;
+                    backend.EnqueueCapturedGraph(graphs[method]);
+                }
+                // The event records live inside each graph. Host scheduling around graph launch
+                // and synchronization is therefore excluded from the device interval.
+                backend.Synchronize();
+                for (int method = 0; method < methods.Length; method++)
+                    values[method][sample] = backend.GetEventElapsedTime(
+                        starts[method], stops[method]) * 1000.0 / LaunchesPerSample;
+            }
+            var result = new Dictionary<string, Distribution>(methods.Length, StringComparer.Ordinal);
+            for (int method = 0; method < methods.Length; method++)
+                result.Add(methods[method].Name, Summarize(values[method]));
+            return result;
+        }
+        finally
+        {
+            foreach (IntPtr graph in graphs) backend.DestroyCapturedGraph(graph);
+            foreach (IGpuEvent? start in starts) start?.Dispose();
+            foreach (IGpuEvent? stop in stops) stop?.Dispose();
+        }
     }
 
-    private static Distribution MeasureEndToEnd(CudaBackend backend, Action action)
+    /// <summary>
+    /// Measures competing submission paths in the same rounds, rotating their order. This retains
+    /// synchronized production latency while preventing a scheduler or power-state change between
+    /// three disjoint 101-sample windows from deciding the winner.
+    /// </summary>
+    private static Dictionary<string, Distribution> MeasureEndToEndInterleaved(
+        CudaBackend backend,
+        params (string Name, Action Prepare, Action Execute)[] methods)
     {
-        for (int i = 0; i < Warmups; i++) action();
-        backend.Synchronize();
-        var values = new double[Samples];
-        double scale = 1_000_000.0 / Stopwatch.Frequency;
-        for (int i = 0; i < Samples; i++)
+        if (methods.Length == 0) throw new ArgumentException("At least one method is required.", nameof(methods));
+        if (methods.Select(method => method.Name).Distinct(StringComparer.Ordinal).Count() != methods.Length)
+            throw new ArgumentException("Method names must be unique.", nameof(methods));
+        var samples = methods.ToDictionary(
+            method => method.Name,
+            _ => new double[Samples],
+            StringComparer.Ordinal);
+        for (int warmup = 0; warmup < Warmups; warmup++)
         {
-            long start = Stopwatch.GetTimestamp();
-            action(); backend.Synchronize();
-            values[i] = (Stopwatch.GetTimestamp() - start) * scale;
+            for (int offset = 0; offset < methods.Length; offset++)
+            {
+                var method = methods[(warmup + offset) % methods.Length];
+                method.Prepare();
+                method.Execute();
+            }
         }
-        return Summarize(values);
+        backend.Synchronize();
+        double scale = 1_000_000.0 / Stopwatch.Frequency;
+        for (int sample = 0; sample < Samples; sample++)
+        {
+            for (int offset = 0; offset < methods.Length; offset++)
+            {
+                var method = methods[(sample + offset) % methods.Length];
+                method.Prepare();
+                long start = Stopwatch.GetTimestamp();
+                method.Execute();
+                backend.Synchronize();
+                samples[method.Name][sample] = (Stopwatch.GetTimestamp() - start) * scale;
+            }
+        }
+        return samples.ToDictionary(
+            pair => pair.Key,
+            pair => Summarize(pair.Value),
+            StringComparer.Ordinal);
     }
 
     private static long MeasureAllocation(CudaBackend backend, Action action)
     {
-        for (int i = 0; i < 8; i++) action();
+        const int trials = 3;
+        const int callsPerTrial = 257;
+        for (int i = 0; i < 16; i++) action();
         backend.Synchronize();
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < Samples; i++) action();
-        long result = (GC.GetAllocatedBytesForCurrentThread() - before) / Samples;
-        backend.Synchronize();
-        return result;
+        var totals = new long[trials];
+        for (int trial = 0; trial < trials; trial++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < callsPerTrial; i++) action();
+            totals[trial] = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+        }
+        Array.Sort(totals);
+        // A steady-state allocation appears in every trial. The median rejects a one-time tiered-
+        // runtime or diagnostic allocation on the benchmark thread without hiding repeat churn.
+        return totals[trials / 2] / callsPerTrial;
     }
 
     private static Distribution Summarize(double[] values)

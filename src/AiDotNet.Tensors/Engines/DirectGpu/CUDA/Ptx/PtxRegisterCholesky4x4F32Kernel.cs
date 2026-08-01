@@ -136,32 +136,32 @@ internal sealed class PtxRegisterCholesky4x4F32Kernel : IDisposable
         ptx.AppendLine("    mov.u32 %r3, 0;");
         ptx.AppendLine("    setp.le.f32 %p0, %f0, 0f00000000;");
         ptx.AppendLine("    @%p0 bra FAIL_1;");
-        ptx.AppendLine("    sqrt.rn.f32 %f0, %f0;");
-        ptx.AppendLine("    div.rn.f32 %f4, %f4, %f0;");
-        ptx.AppendLine("    div.rn.f32 %f8, %f8, %f0;");
-        ptx.AppendLine("    div.rn.f32 %f12, %f12, %f0;");
+        PtxSolverArithmetic.EmitRefinedSquareRootAndReciprocal(ptx, 0);
+        PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 4, 4);
+        PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 8, 8);
+        PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 12, 12);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 5, 4, 4);
         ptx.AppendLine("    setp.le.f32 %p0, %f5, 0f00000000;");
         ptx.AppendLine("    @%p0 bra FAIL_2;");
-        ptx.AppendLine("    sqrt.rn.f32 %f5, %f5;");
+        PtxSolverArithmetic.EmitRefinedSquareRootAndReciprocal(ptx, 5);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 9, 8, 4);
-        ptx.AppendLine("    div.rn.f32 %f9, %f9, %f5;");
+        PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 9, 9);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 13, 12, 4);
-        ptx.AppendLine("    div.rn.f32 %f13, %f13, %f5;");
+        PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 13, 13);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 10, 8, 8);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 10, 9, 9);
         ptx.AppendLine("    setp.le.f32 %p0, %f10, 0f00000000;");
         ptx.AppendLine("    @%p0 bra FAIL_3;");
-        ptx.AppendLine("    sqrt.rn.f32 %f10, %f10;");
+        PtxSolverArithmetic.EmitRefinedSquareRootAndReciprocal(ptx, 10);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 14, 12, 8);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 14, 13, 9);
-        ptx.AppendLine("    div.rn.f32 %f14, %f14, %f10;");
+        PtxSolverArithmetic.EmitMultiplyByReciprocal(ptx, 14, 14);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 15, 12, 12);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 15, 13, 13);
         PtxSolverArithmetic.EmitSubtractProduct(ptx, 15, 14, 14);
         ptx.AppendLine("    setp.le.f32 %p0, %f15, 0f00000000;");
         ptx.AppendLine("    @%p0 bra FAIL_4;");
-        ptx.AppendLine("    sqrt.rn.f32 %f15, %f15;");
+        PtxSolverArithmetic.EmitRefinedSquareRootAndReciprocal(ptx, 15);
         ptx.AppendLine("    bra.uni STORE;");
         for (int failure = 1; failure <= 4; failure++)
         {
@@ -216,6 +216,7 @@ internal sealed class PtxRegisterCholesky4x4F32Kernel : IDisposable
                 ["factorization"] = "A=L*transpose(L)",
                 ["triangle"] = "lower-output-upper-zero",
                 ["failure"] = "info=first-non-positive-leading-minor; later-lower-elements-preserve-input",
+                ["square-root"] = "one-Newton-refined rsqrt.approx.f32 seed multiplied by the positive radicand; release tolerance <=2e-5",
                 ["ownership"] = "one-thread-per-matrix-register-resident",
                 ["global-reads"] = "one-16-float-input-read-per-matrix",
                 ["global-writes"] = "one-16-float-output-write-plus-one-info-write-per-matrix",

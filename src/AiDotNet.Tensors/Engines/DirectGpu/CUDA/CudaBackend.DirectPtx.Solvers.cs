@@ -27,6 +27,19 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
     {
         get { lock (_directPtxLock) return _directPtxSolver4x4Kernels.PinnedCount; }
     }
+    internal int DirectPtxSolver4x4BoundGraphCount
+    {
+        get
+        {
+            lock (GpuDispatchLock)
+            {
+                int count = 0;
+                foreach (DirectPtxSolver4x4Binding? binding in _directPtxSolver4x4HotBindings)
+                    if (binding?.HasGraph == true) count++;
+                return count;
+            }
+        }
+    }
 
     internal bool IsDirectPtxSolver4x4Enabled(DirectPtxSolver4x4Operation operation) =>
         SolverGate(operation) && IsAvailable &&
@@ -43,6 +56,24 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             output, MatrixBytes(batchCount), 16, pivots, VectorBytes(batchCount), 16)) return false;
         return Launch3(operation, batchCount, input, output, pivots);
     }
+
+    /// <summary>
+    /// Hot exact-contract route for a previously admitted three-buffer solver binding. Any miss
+    /// falls through to the existing full validator, preserving its stable rejection reason.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryDirectPtxSolver4x4Bound3(
+        DirectPtxSolver4x4Operation operation,
+        IGpuBuffer first,
+        IGpuBuffer second,
+        IGpuBuffer third,
+        int batchCount,
+        int m,
+        int n) =>
+        SolverGate(operation) && m == 4 && n == 4 &&
+        PtxRegisterSolver4x4F32Kernel.IsSupportedBatchCount(batchCount) &&
+        first is not null && second is not null && third is not null &&
+        TryLaunchBound3(operation, batchCount, first, second, third);
 
     internal bool TryDirectPtxQrReduced4x4(
         IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
@@ -374,14 +405,13 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         DirectPtxSolver4x4Binding? binding = System.Threading.Volatile.Read(
             ref _directPtxSolver4x4HotBindings[index]);
         if (binding is null || !binding.Matches3(first, second, third)) return false;
-        EnsureContextCurrent();
+        EnsureContextCurrentForBoundLaunch();
         lock (GpuDispatchLock)
         {
             if (!ReferenceEquals(
                 binding, System.Threading.Volatile.Read(ref _directPtxSolver4x4HotBindings[index])))
                 return false;
-            binding.Kernel.Launch3ValidatedCurrentContext(
-                first.Handle, second.Handle, third.Handle);
+            binding.Launch3(this);
         }
         System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
         DirectPtxLastError = null;
@@ -402,14 +432,13 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         DirectPtxSolver4x4Binding? binding = System.Threading.Volatile.Read(
             ref _directPtxSolver4x4HotBindings[index]);
         if (binding is null || !binding.Matches4(first, second, third, fourth)) return false;
-        EnsureContextCurrent();
+        EnsureContextCurrentForBoundLaunch();
         lock (GpuDispatchLock)
         {
             if (!ReferenceEquals(
                 binding, System.Threading.Volatile.Read(ref _directPtxSolver4x4HotBindings[index])))
                 return false;
-            binding.Kernel.Launch4ValidatedCurrentContext(
-                first.Handle, second.Handle, third.Handle, fourth.Handle);
+            binding.Launch4(this);
         }
         System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
         DirectPtxLastError = null;
@@ -431,14 +460,13 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         DirectPtxSolver4x4Binding? binding = System.Threading.Volatile.Read(
             ref _directPtxSolver4x4HotBindings[index]);
         if (binding is null || !binding.Matches5(first, second, third, fourth, fifth)) return false;
-        EnsureContextCurrent();
+        EnsureContextCurrentForBoundLaunch();
         lock (GpuDispatchLock)
         {
             if (!ReferenceEquals(
                 binding, System.Threading.Volatile.Read(ref _directPtxSolver4x4HotBindings[index])))
                 return false;
-            binding.Kernel.Launch5ValidatedCurrentContext(
-                first.Handle, second.Handle, third.Handle, fourth.Handle, fifth.Handle);
+            binding.Launch5(this);
         }
         System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
         DirectPtxLastError = null;
@@ -461,11 +489,12 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 ref _directPtxSolver4x4HotKernels[hotIndex]);
             if (hot is not null && !capturing)
             {
-                System.Threading.Volatile.Write(
-                    ref _directPtxSolver4x4HotBindings[hotIndex],
-                    new DirectPtxSolver4x4Binding(hot, first, second, third));
                 lock (GpuDispatchLock)
+                {
+                    ReplaceSolverBinding(
+                        hotIndex, new DirectPtxSolver4x4Binding(hot, first, second, third));
                     hot.Launch3ValidatedCurrentContext(first.Handle, second.Handle, third.Handle);
+                }
                 System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
                 DirectPtxLastError = null;
                 return true;
@@ -496,17 +525,20 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 }
                 PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
                 System.Threading.Volatile.Write(ref _directPtxSolver4x4HotKernels[hotIndex], kernel);
-                System.Threading.Volatile.Write(
-                    ref _directPtxSolver4x4HotBindings[hotIndex],
-                    new DirectPtxSolver4x4Binding(kernel, first, second, third));
                 if (capturing && !_directPtxSolver4x4Kernels.Pin(key))
                 {
                     DirectPtxLastError = $"{OperationSlug(operation)}-capture-pin-failed";
                     return false;
                 }
                 lock (GpuDispatchLock)
+                {
+                    if (!capturing)
+                        ReplaceSolverBinding(
+                            hotIndex,
+                            new DirectPtxSolver4x4Binding(kernel, first, second, third));
                     kernel.Launch3ValidatedCurrentContext(
                         first.Handle, second.Handle, third.Handle);
+                }
             }
             System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
             DirectPtxLastError = null;
@@ -536,12 +568,13 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 ref _directPtxSolver4x4HotKernels[hotIndex]);
             if (hot is not null && !capturing)
             {
-                System.Threading.Volatile.Write(
-                    ref _directPtxSolver4x4HotBindings[hotIndex],
-                    new DirectPtxSolver4x4Binding(hot, first, second, third, fourth));
                 lock (GpuDispatchLock)
+                {
+                    ReplaceSolverBinding(
+                        hotIndex, new DirectPtxSolver4x4Binding(hot, first, second, third, fourth));
                     hot.Launch4ValidatedCurrentContext(
                         first.Handle, second.Handle, third.Handle, fourth.Handle);
+                }
                 System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
                 DirectPtxLastError = null;
                 return true;
@@ -572,17 +605,21 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 }
                 PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
                 System.Threading.Volatile.Write(ref _directPtxSolver4x4HotKernels[hotIndex], kernel);
-                System.Threading.Volatile.Write(
-                    ref _directPtxSolver4x4HotBindings[hotIndex],
-                    new DirectPtxSolver4x4Binding(kernel, first, second, third, fourth));
                 if (capturing && !_directPtxSolver4x4Kernels.Pin(key))
                 {
                     DirectPtxLastError = $"{OperationSlug(operation)}-capture-pin-failed";
                     return false;
                 }
                 lock (GpuDispatchLock)
+                {
+                    if (!capturing)
+                        ReplaceSolverBinding(
+                            hotIndex,
+                            new DirectPtxSolver4x4Binding(
+                                kernel, first, second, third, fourth));
                     kernel.Launch4ValidatedCurrentContext(
                         first.Handle, second.Handle, third.Handle, fourth.Handle);
+                }
             }
             System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
             DirectPtxLastError = null;
@@ -613,12 +650,15 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 ref _directPtxSolver4x4HotKernels[hotIndex]);
             if (hot is not null && !capturing)
             {
-                System.Threading.Volatile.Write(
-                    ref _directPtxSolver4x4HotBindings[hotIndex],
-                    new DirectPtxSolver4x4Binding(hot, first, second, third, fourth, fifth));
                 lock (GpuDispatchLock)
+                {
+                    ReplaceSolverBinding(
+                        hotIndex,
+                        new DirectPtxSolver4x4Binding(
+                            hot, first, second, third, fourth, fifth));
                     hot.Launch5ValidatedCurrentContext(
                         first.Handle, second.Handle, third.Handle, fourth.Handle, fifth.Handle);
+                }
                 System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
                 DirectPtxLastError = null;
                 return true;
@@ -649,17 +689,21 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                 }
                 PtxRegisterSolver4x4F32Kernel kernel = GetOrCreateSolver4x4Kernel(key);
                 System.Threading.Volatile.Write(ref _directPtxSolver4x4HotKernels[hotIndex], kernel);
-                System.Threading.Volatile.Write(
-                    ref _directPtxSolver4x4HotBindings[hotIndex],
-                    new DirectPtxSolver4x4Binding(kernel, first, second, third, fourth, fifth));
                 if (capturing && !_directPtxSolver4x4Kernels.Pin(key))
                 {
                     DirectPtxLastError = $"{OperationSlug(operation)}-capture-pin-failed";
                     return false;
                 }
                 lock (GpuDispatchLock)
+                {
+                    if (!capturing)
+                        ReplaceSolverBinding(
+                            hotIndex,
+                            new DirectPtxSolver4x4Binding(
+                                kernel, first, second, third, fourth, fifth));
                     kernel.Launch5ValidatedCurrentContext(
                         first.Handle, second.Handle, third.Handle, fourth.Handle, fifth.Handle);
+                }
             }
             System.Threading.Interlocked.Increment(ref _directPtxSolver4x4DispatchCount);
             DirectPtxLastError = null;
@@ -940,11 +984,19 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         {
             Array.Clear(
                 _directPtxSolver4x4HotKernels, 0, _directPtxSolver4x4HotKernels.Length);
-            Array.Clear(
-                _directPtxSolver4x4HotBindings, 0, _directPtxSolver4x4HotBindings.Length);
+            foreach (DirectPtxSolver4x4Binding? binding in _directPtxSolver4x4HotBindings)
+                binding?.DisposeCurrentContext();
+            Array.Clear(_directPtxSolver4x4HotBindings, 0, _directPtxSolver4x4HotBindings.Length);
             _directPtxSolver4x4Kernels.Dispose();
             _directPtxSolver4x4Plans.Clear();
         }
+    }
+
+    private void ReplaceSolverBinding(int index, DirectPtxSolver4x4Binding replacement)
+    {
+        DirectPtxSolver4x4Binding? previous = System.Threading.Interlocked.Exchange(
+            ref _directPtxSolver4x4HotBindings[index], replacement);
+        previous?.DisposeCurrentContext();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -981,11 +1033,8 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
         private readonly IntPtr _thirdHandle;
         private readonly IntPtr _fourthHandle;
         private readonly IntPtr _fifthHandle;
-        private readonly long _firstBytes;
-        private readonly long _secondBytes;
-        private readonly long _thirdBytes;
-        private readonly long _fourthBytes;
-        private readonly long _fifthBytes;
+        private IntPtr _graphExec;
+        private bool _graphAttempted;
 
         internal DirectPtxSolver4x4Binding(
             PtxRegisterSolver4x4F32Kernel kernel,
@@ -1001,29 +1050,68 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             _firstHandle = first.Handle; _secondHandle = second.Handle; _thirdHandle = third.Handle;
             _fourthHandle = fourth?.Handle ?? IntPtr.Zero;
             _fifthHandle = fifth?.Handle ?? IntPtr.Zero;
-            _firstBytes = first.SizeInBytes; _secondBytes = second.SizeInBytes;
-            _thirdBytes = third.SizeInBytes; _fourthBytes = fourth?.SizeInBytes ?? 0;
-            _fifthBytes = fifth?.SizeInBytes ?? 0;
         }
 
         internal PtxRegisterSolver4x4F32Kernel Kernel { get; }
+        internal bool HasGraph => _graphExec != IntPtr.Zero;
+
+        internal void Launch3(CudaBackend backend)
+        {
+            if (!_graphAttempted)
+                EnsureGraph(backend, () => Kernel.Launch3ValidatedCurrentContext(
+                    _firstHandle, _secondHandle, _thirdHandle));
+            if (_graphExec != IntPtr.Zero) backend.EnqueueCapturedGraphCurrentContext(_graphExec);
+            else Kernel.Launch3ValidatedCurrentContext(_firstHandle, _secondHandle, _thirdHandle);
+        }
+
+        internal void Launch4(CudaBackend backend)
+        {
+            if (!_graphAttempted)
+                EnsureGraph(backend, () => Kernel.Launch4ValidatedCurrentContext(
+                    _firstHandle, _secondHandle, _thirdHandle, _fourthHandle));
+            if (_graphExec != IntPtr.Zero) backend.EnqueueCapturedGraphCurrentContext(_graphExec);
+            else Kernel.Launch4ValidatedCurrentContext(
+                _firstHandle, _secondHandle, _thirdHandle, _fourthHandle);
+        }
+
+        internal void Launch5(CudaBackend backend)
+        {
+            if (!_graphAttempted)
+                EnsureGraph(backend, () => Kernel.Launch5ValidatedCurrentContext(
+                    _firstHandle, _secondHandle, _thirdHandle, _fourthHandle, _fifthHandle));
+            if (_graphExec != IntPtr.Zero) backend.EnqueueCapturedGraphCurrentContext(_graphExec);
+            else Kernel.Launch5ValidatedCurrentContext(
+                _firstHandle, _secondHandle, _thirdHandle, _fourthHandle, _fifthHandle);
+        }
+
+        private void EnsureGraph(CudaBackend backend, Action launch)
+        {
+            if (_graphAttempted) return;
+            _graphAttempted = true;
+            _graphExec = backend.CaptureGraph(launch);
+        }
+
+        internal void DisposeCurrentContext()
+        {
+            CudaBackend.DestroyCapturedGraphCurrentContext(_graphExec);
+            _graphExec = IntPtr.Zero;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal bool Matches3(IGpuBuffer first, IGpuBuffer second, IGpuBuffer third) =>
             ReferenceEquals(_first, first) && ReferenceEquals(_second, second) && ReferenceEquals(_third, third) &&
-            first.Handle == _firstHandle && second.Handle == _secondHandle && third.Handle == _thirdHandle &&
-            first.SizeInBytes == _firstBytes && second.SizeInBytes == _secondBytes && third.SizeInBytes == _thirdBytes;
+            first.Handle == _firstHandle && second.Handle == _secondHandle && third.Handle == _thirdHandle;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal bool Matches4(
             IGpuBuffer first, IGpuBuffer second, IGpuBuffer third, IGpuBuffer fourth) =>
             Matches3(first, second, third) && ReferenceEquals(_fourth, fourth) &&
-            fourth.Handle == _fourthHandle && fourth.SizeInBytes == _fourthBytes;
+            fourth.Handle == _fourthHandle;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal bool Matches5(
             IGpuBuffer first, IGpuBuffer second, IGpuBuffer third, IGpuBuffer fourth, IGpuBuffer fifth) =>
             Matches4(first, second, third, fourth) && ReferenceEquals(_fifth, fifth) &&
-            fifth.Handle == _fifthHandle && fifth.SizeInBytes == _fifthBytes;
+            fifth.Handle == _fifthHandle;
     }
 }

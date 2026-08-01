@@ -130,8 +130,20 @@ public sealed partial class CudaBackend
     {
         if (graphExec == IntPtr.Zero) return;
         using var _ = PushContext();
+        EnqueueCapturedGraphCurrentContext(graphExec);
+    }
+
+    /// <summary>Enqueues a graph after the caller has validated this backend's context.</summary>
+    private void EnqueueCapturedGraphCurrentContext(IntPtr graphExec)
+    {
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+    }
+
+    /// <summary>Destroys a graph after the caller has validated this backend's context.</summary>
+    private static void DestroyCapturedGraphCurrentContext(IntPtr graphExec)
+    {
+        if (graphExec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(graphExec);
     }
 
     /// <summary>

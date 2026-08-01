@@ -96,6 +96,24 @@ public sealed class CudaEvent : IGpuEvent
         _isRecorded = true;
     }
 
+    /// <summary>
+    /// Records an externally observable event node while the stream is being captured. Ordinary
+    /// capture events represent graph dependencies and cannot subsequently be synchronized by the
+    /// host; the external flag gives timing harnesses a replay-visible event handle.
+    /// </summary>
+    internal void RecordExternalDuringCapture(IGpuStream stream)
+    {
+        ThrowIfDisposed();
+
+        if (stream is not CudaStream)
+            throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+
+        var result = CudaNativeBindings.cuEventRecordWithFlags(
+            _handle, stream.Handle, CudaNativeBindings.CU_EVENT_RECORD_EXTERNAL);
+        CuBlasNative.CheckCudaResult(result, "cuEventRecordWithFlags(external capture node)");
+        _isRecorded = true;
+    }
+
     /// <inheritdoc/>
     public void Synchronize()
     {

@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
@@ -24,6 +25,11 @@ public class DirectPtxSolver4x4Tests
         Assert.DoesNotContain("@%p0 bra.uni", cholesky, StringComparison.Ordinal);
         Assert.DoesNotContain(", -%f", cholesky, StringComparison.Ordinal);
         Assert.Contains(".reg .f32 %solver_neg;", cholesky, StringComparison.Ordinal);
+        Assert.Contains("rsqrt.approx.f32 %solver_recip", cholesky, StringComparison.Ordinal);
+        Assert.Contains(
+            "fma.rn.f32 %solver_recip_correction, %solver_neg, %solver_recip_correction, 0f3FC00000;",
+            cholesky,
+            StringComparison.Ordinal);
 
         foreach (DirectPtxSolver4x4Operation operation in Enum.GetValues<DirectPtxSolver4x4Operation>())
         {
@@ -48,6 +54,7 @@ public class DirectPtxSolver4x4Tests
             Assert.Contains("st.global", ptx, StringComparison.Ordinal);
             Assert.DoesNotContain(", -%f", ptx, StringComparison.Ordinal);
             Assert.Contains(".reg .f32 %solver_neg;", ptx, StringComparison.Ordinal);
+            Assert.Contains(".reg .f32 %solver_recip;", ptx, StringComparison.Ordinal);
             for (int parameter = 0; parameter < expectedPointers; parameter++)
                 Assert.DoesNotContain($"mul.wide.u32 %rd{parameter},", ptx, StringComparison.Ordinal);
         }
@@ -74,10 +81,25 @@ public class DirectPtxSolver4x4Tests
         Assert.Equal(30, DirectPtxSolver4x4Autotuner.TuneWarmups);
         Assert.Equal(101, DirectPtxSolver4x4Autotuner.TuneSamples);
         Assert.Equal(10, DirectPtxSolver4x4Autotuner.TuneLaunchesPerSample);
+        Assert.Equal(.01f, DirectPtxSolver4x4Autotuner.MinimumRelativeImprovement);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            DirectPtxSolver4x4Autotuner.ValidateBlockThreads(32));
+            DirectPtxSolver4x4Autotuner.ValidateBlockThreads(8));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxRegisterSolver4x4F32Kernel.EmitPtx(8, 6, DirectPtxSolver4x4Operation.LuFactor, 1));
+    }
+
+    [Fact]
+    public void Autotuner_Requires_Reproducible_Improvement_To_Replace_Smaller_Geometry()
+    {
+        int selected = DirectPtxSolver4x4Autotuner.Select(candidate => candidate switch
+        {
+            32 => Enumerable.Repeat(1.000f, 101).ToArray(),
+            64 => Enumerable.Repeat(0.995f, 101).ToArray(),
+            128 => Enumerable.Repeat(0.989f, 101).ToArray(),
+            _ => Enumerable.Repeat(1.100f, 101).ToArray()
+        });
+
+        Assert.Equal(128, selected);
     }
 
     [Fact]
@@ -263,6 +285,80 @@ public class DirectPtxSolver4x4Tests
             runtime.Synchronize();
         }
         AssertResource(solver.Audit);
+    }
+
+    [SkippableFact]
+    public void CudaBackend_StableBindingCapturesReplaysAndRetiresWithoutHotAllocations()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.Cholesky4x4ExperimentOverride;
+        DirectPtxFeatureGate.Cholesky4x4ExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxCholesky4x4Enabled,
+                "Requires the validated SM86 solver architecture.");
+
+            const int batch = 1024;
+            float[] matrix = RepeatMatrix(batch,
+            [
+                9f, 1f, 2f, 0.5f,
+                1f, 8f, 0.25f, 1f,
+                2f, 0.25f, 7f, 0.75f,
+                0.5f, 1f, 0.75f, 6f
+            ]);
+            using var input = backend.AllocateBuffer(matrix);
+            using var output = backend.AllocateBuffer(matrix.Length);
+            using var info = backend.AllocateByteBuffer(batch * sizeof(int));
+            Assert.True(backend.PrewarmDirectPtxCholesky4x4(batch), backend.DirectPtxLastError);
+
+            backend.LinalgCholesky(input, output, info, batch, 4, upper: false);
+            Assert.Equal(0, backend.DirectPtxCholesky4x4BoundGraphCount);
+            backend.LinalgCholesky(input, output, info, batch, 4, upper: false);
+            Assert.Equal(1, backend.DirectPtxCholesky4x4BoundGraphCount);
+            backend.Synchronize();
+
+            for (int i = 0; i < 64; i++)
+                backend.LinalgCholesky(input, output, info, batch, 4, upper: false);
+            backend.Synchronize();
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 101; i++)
+                backend.LinalgCholesky(input, output, info, batch, 4, upper: false);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+            Assert.Equal(0, allocated);
+            Assert.True(MaxCholeskyResidual(matrix, backend.DownloadBuffer(output), 8) <= 2e-4f);
+
+            using var replacementOutput = backend.AllocateBuffer(matrix.Length);
+            using var replacementInfo = backend.AllocateByteBuffer(batch * sizeof(int));
+            backend.LinalgCholesky(
+                input, replacementOutput, replacementInfo, batch, 4, upper: false);
+            Assert.Equal(0, backend.DirectPtxCholesky4x4BoundGraphCount);
+            backend.LinalgCholesky(
+                input, replacementOutput, replacementInfo, batch, 4, upper: false);
+            Assert.Equal(1, backend.DirectPtxCholesky4x4BoundGraphCount);
+            backend.Synchronize();
+            Assert.True(MaxCholeskyResidual(
+                matrix, backend.DownloadBuffer(replacementOutput), 8) <= 2e-4f);
+
+            IntPtr explicitGraph = backend.CaptureGraph(() => backend.LinalgCholesky(
+                input, replacementOutput, replacementInfo, batch, 4, upper: false));
+            Assert.NotEqual(IntPtr.Zero, explicitGraph);
+            try
+            {
+                backend.EnqueueCapturedGraph(explicitGraph);
+                backend.Synchronize();
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(explicitGraph);
+            }
+            Assert.Equal(1, backend.DirectPtxCholesky4x4BoundGraphCount);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.Cholesky4x4ExperimentOverride = previous;
+        }
     }
 
     private static void AssertResource(DirectPtxKernelAudit audit)

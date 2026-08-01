@@ -82,7 +82,20 @@ class Program
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
             bool componentOnly = args.Contains("--component-only", StringComparer.Ordinal);
-            DirectPtxSolver4x4Experiment.Run(runs, componentOnly);
+            int operationIndex = Array.IndexOf(args, "--operation");
+            string? operation = operationIndex >= 0 && operationIndex + 1 < args.Length
+                ? args[operationIndex + 1]
+                : null;
+            if (operationIndex >= 0 && operation is null)
+                throw new ArgumentException("--operation requires a value.");
+            int batchIndex = Array.IndexOf(args, "--batch");
+            int? batch = batchIndex >= 0 && batchIndex + 1 < args.Length &&
+                int.TryParse(args[batchIndex + 1], out int parsedBatch)
+                    ? parsedBatch
+                    : null;
+            if (batchIndex >= 0 && batch is null)
+                throw new ArgumentException("--batch requires an integer value.");
+            DirectPtxSolver4x4Experiment.Run(runs, componentOnly, operation, batch);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
@@ -1080,7 +1093,7 @@ class Program
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
-        Console.WriteLine("  --direct-ptx-solvers-4x4 [runs]: issue #853 resident solver-family evidence");
+        Console.WriteLine("  --direct-ptx-solvers-4x4 [runs] [--operation op] [--batch n]: issue #853 resident solver-family evidence");
         Console.WriteLine("  --direct-ptx-profile-solvers-4x4: deterministic Nsight solver-family target");
         Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");

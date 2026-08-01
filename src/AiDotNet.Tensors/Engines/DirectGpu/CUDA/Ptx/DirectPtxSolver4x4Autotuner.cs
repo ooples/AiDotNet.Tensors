@@ -9,6 +9,10 @@ internal static class DirectPtxSolver4x4Autotuner
     internal const int TuneWarmups = 30;
     internal const int TuneSamples = 101;
     internal const int TuneLaunchesPerSample = 10;
+    // Prefer the first (smaller) geometry when candidates are effectively tied. This prevents
+    // sub-percent device jitter from making the same hardware choose a different launch plan on
+    // every cold start while still admitting any reproducible improvement above the noise band.
+    internal const float MinimumRelativeImprovement = 0.01f;
     // B=1024 needs the one-warp geometry to expose at least one CTA per SM on
     // common 20-32 SM devices. Starting at 64 threads caps that shape at 16
     // CTAs and can leave half the GPU idle regardless of kernel quality.
@@ -25,7 +29,11 @@ internal static class DirectPtxSolver4x4Autotuner
             if (samples.Length == 0) throw new InvalidOperationException("Autotune returned no samples.");
             Array.Sort(samples);
             float median = samples[samples.Length / 2];
-            if (median < bestMedian) { bestMedian = median; best = candidate; }
+            if (median < bestMedian * (1f - MinimumRelativeImprovement))
+            {
+                bestMedian = median;
+                best = candidate;
+            }
         }
         return best;
     }
