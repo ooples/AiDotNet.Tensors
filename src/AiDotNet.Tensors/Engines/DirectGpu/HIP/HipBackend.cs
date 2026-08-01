@@ -9008,22 +9008,33 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         int log2n = (int)Math.Log(n, 2);
 
-        // Bit-reversal permutation
+        // Bit-reversal permutation, out of place through scratch. Input and output may be the same
+        // buffer here (the copies above are conditional), so this reads the output -- which already
+        // holds the input -- and copies back. See the kernel comment for why the in-place swap it
+        // replaces was unsafe.
+        using var permScratchReal = AllocateBuffer(n);
+        using var permScratchImag = AllocateBuffer(n);
         if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel))
         {
             uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[4];
+                IntPtr _p2 = permScratchReal.Handle;
+                IntPtr _p3 = permScratchImag.Handle;
+                void** args = stackalloc void*[6];
                 args[0] = &_p0;
                 args[1] = &_p1;
-                args[2] = &n;
-                args[3] = &log2n;
+                args[2] = &_p2;
+                args[3] = &_p3;
+                args[4] = &n;
+                args[5] = &log2n;
 
 
                 LaunchKernel(bitRevKernel, gridSize, (uint)DefaultBlockSize, args);
                 }
+            HipCopyBuffer(permScratchReal, outputReal, n);
+            HipCopyBuffer(permScratchImag, outputImag, n);
         }
 
         // Butterfly stages
@@ -9173,7 +9184,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         int log2n = (int)Math.Log(n, 2);
 
-        // Batched bit-reversal permutation
+        // Batched bit-reversal permutation, out of place through scratch. See the kernel comment:
+        // the in-place swap this replaces lost the second half of every exchange.
+        using var brScratchReal = AllocateBuffer(batch * n);
+        using var brScratchImag = AllocateBuffer(batch * n);
         if (_kernelCache.TryGetValue("batched_bit_reverse", out var bitRevKernel))
         {
             uint gridX = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -9182,16 +9196,22 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 {
                 IntPtr _p0 = outputReal.Handle;
                 IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[5];
+                IntPtr _p2 = brScratchReal.Handle;
+                IntPtr _p3 = brScratchImag.Handle;
+                void** args = stackalloc void*[7];
                 args[0] = &_p0;
                 args[1] = &_p1;
-                args[2] = &batch;
-                args[3] = &n;
-                args[4] = &log2n;
+                args[2] = &_p2;
+                args[3] = &_p3;
+                args[4] = &batch;
+                args[5] = &n;
+                args[6] = &log2n;
 
 
                 LaunchKernel2D(bitRevKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
                 }
+            HipCopyBuffer(brScratchReal, outputReal, batch * n);
+            HipCopyBuffer(brScratchImag, outputImag, batch * n);
         }
 
         // Batched butterfly stages
@@ -9261,6 +9281,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         HipCopyBuffer(inputReal, outputReal, total);
         HipCopyBuffer(inputImag, outputImag, total);
 
+        // Both bit-reversals below run out of place through this scratch pair and copy back. The
+        // in-place swap they used to perform lost the second half of every exchange -- see the
+        // kernel comment. The column pass cannot absorb a copy: it runs after the row butterflies,
+        // so its source is the output buffer itself.
+        using var brScratch2DReal = AllocateBuffer(total);
+        using var brScratch2DImag = AllocateBuffer(total);
+
         // Row-wise bit reversal (DIT operates on bit-reversed input) then row butterflies. The previous
         // code left an EMPTY per-row loop here (no bit reversal at all), so the DIT butterflies ran on
         // un-permuted data and the whole 2D FFT produced garbage. Now each row is bit-reversed first.
@@ -9272,16 +9299,22 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 uint gridBrY = (uint)height;
                 IntPtr _b0 = outputReal.Handle;
                 IntPtr _b1 = outputImag.Handle;
+                IntPtr _b2 = brScratch2DReal.Handle;
+                IntPtr _b3 = brScratch2DImag.Handle;
 #pragma warning disable CA2014
-                void** brArgs = stackalloc void*[5];
+                void** brArgs = stackalloc void*[7];
 #pragma warning restore CA2014
                 brArgs[0] = &_b0;
                 brArgs[1] = &_b1;
-                brArgs[2] = &height;
-                brArgs[3] = &width;
-                brArgs[4] = &log2Width;
+                brArgs[2] = &_b2;
+                brArgs[3] = &_b3;
+                brArgs[4] = &height;
+                brArgs[5] = &width;
+                brArgs[6] = &log2Width;
                 LaunchKernel2D(rowsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
                 }
+            HipCopyBuffer(brScratch2DReal, outputReal, total);
+            HipCopyBuffer(brScratch2DImag, outputImag, total);
 
             int inverseFlag = inverse ? 1 : 0;
             for (int stride = 2; stride <= width; stride *= 2)
@@ -9316,15 +9349,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 uint gridBrY = (uint)width;
                 IntPtr _b0 = outputReal.Handle;
                 IntPtr _b1 = outputImag.Handle;
+                IntPtr _b2 = brScratch2DReal.Handle;
+                IntPtr _b3 = brScratch2DImag.Handle;
 #pragma warning disable CA2014
-                void** brArgs = stackalloc void*[5];
+                void** brArgs = stackalloc void*[7];
 #pragma warning restore CA2014
                 brArgs[0] = &_b0;
                 brArgs[1] = &_b1;
-                brArgs[2] = &height;
-                brArgs[3] = &width;
-                brArgs[4] = &log2Height;
+                brArgs[2] = &_b2;
+                brArgs[3] = &_b3;
+                brArgs[4] = &height;
+                brArgs[5] = &width;
+                brArgs[6] = &log2Height;
                 LaunchKernel2D(colsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+                HipCopyBuffer(brScratch2DReal, outputReal, total);
+                HipCopyBuffer(brScratch2DImag, outputImag, total);
             }
 
             int inverseFlag = inverse ? 1 : 0;

@@ -13579,16 +13579,27 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
-        // Bit-reversal permutation
+        // Bit-reversal permutation, out of place through scratch. Input and output may be the same
+        // buffer here (the copies above are conditional on the handles differing), so this reads
+        // the output -- which already holds the input -- and copies back. See the kernel comment
+        // for why the in-place swap it replaces was unsafe.
+        using var permScratchReal = AllocateBuffer(n);
+        using var permScratchImag = AllocateBuffer(n);
+        IntPtr permRealPtr = permScratchReal.Handle;
+        IntPtr permImagPtr = permScratchImag.Handle;
         if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel))
         {
             uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args = stackalloc void*[4];
+            void** args = stackalloc void*[6];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
-            args[2] = &n;
-            args[3] = &log2n;
+            args[2] = &permRealPtr;
+            args[3] = &permImagPtr;
+            args[4] = &n;
+            args[5] = &log2n;
             LaunchKernel(bitRevKernel, grid, (uint)DefaultBlockSize, args);
+            CudaCopyBuffer(permScratchReal, outputReal, n);
+            CudaCopyBuffer(permScratchImag, outputImag, n);
         }
 
         // FFT butterfly stages
@@ -13726,16 +13737,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
-        // Batched bit-reversal
+        // Batched bit-reversal, out of place through scratch. See the kernel comment: the in-place
+        // swap this replaces lost the second half of every exchange.
+        using var brScratchReal = AllocateBuffer(batch * n);
+        using var brScratchImag = AllocateBuffer(batch * n);
+        IntPtr brRealPtr = brScratchReal.Handle;
+        IntPtr brImagPtr = brScratchImag.Handle;
         if (_kernelCache.TryGetValue("batched_bit_reverse", out var bitRevKernel))
         {
-            void** args = stackalloc void*[5];
+            void** args = stackalloc void*[7];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
-            args[2] = &batch;
-            args[3] = &n;
-            args[4] = &log2n;
+            args[2] = &brRealPtr;
+            args[3] = &brImagPtr;
+            args[4] = &batch;
+            args[5] = &n;
+            args[6] = &log2n;
             LaunchKernel2D(bitRevKernel, (uint)((n + 15) / 16), (uint)batch, 1, 16, 1, args);
+            CudaCopyBuffer(brScratchReal, outputReal, batch * n);
+            CudaCopyBuffer(brScratchImag, outputImag, batch * n);
         }
 
         // Batched FFT butterfly stages
@@ -13788,16 +13808,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
+        // Both bit-reversals below run out of place through scratch and copy back. The in-place
+        // swap they used to perform lost the second half of every exchange -- see the kernel
+        // comment. The column pass cannot absorb a copy the way a leading permutation could: it
+        // runs after the row butterflies, so its source is the output buffer itself.
+        using var brScratchReal = AllocateBuffer(height * width);
+        using var brScratchImag = AllocateBuffer(height * width);
+        IntPtr brRealPtr = brScratchReal.Handle;
+        IntPtr brImagPtr = brScratchImag.Handle;
+
         // Row-wise bit-reversal (prerequisite for the DIT row butterflies)
         if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowBitRev))
         {
-            void** brArgs = stackalloc void*[5];
+            void** brArgs = stackalloc void*[7];
             brArgs[0] = &outRealPtr;
             brArgs[1] = &outImagPtr;
-            brArgs[2] = &height;
-            brArgs[3] = &width;
-            brArgs[4] = &log2Width;
+            brArgs[2] = &brRealPtr;
+            brArgs[3] = &brImagPtr;
+            brArgs[4] = &height;
+            brArgs[5] = &width;
+            brArgs[6] = &log2Width;
             LaunchKernel2D(rowBitRev, (uint)((width + 15) / 16), (uint)((height + 15) / 16), 1, 16, 16, brArgs);
+            CudaCopyBuffer(brScratchReal, outputReal, height * width);
+            CudaCopyBuffer(brScratchImag, outputImag, height * width);
         }
 
         // Row-wise FFT (process each row as a separate FFT)
@@ -13821,13 +13854,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Column-wise bit-reversal (prerequisite for the DIT column butterflies)
         if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colBitRev))
         {
-            void** brArgs = stackalloc void*[5];
+            void** brArgs = stackalloc void*[7];
             brArgs[0] = &outRealPtr;
             brArgs[1] = &outImagPtr;
-            brArgs[2] = &height;
-            brArgs[3] = &width;
-            brArgs[4] = &log2Height;
+            brArgs[2] = &brRealPtr;
+            brArgs[3] = &brImagPtr;
+            brArgs[4] = &height;
+            brArgs[5] = &width;
+            brArgs[6] = &log2Height;
             LaunchKernel2D(colBitRev, (uint)((height + 15) / 16), (uint)((width + 15) / 16), 1, 16, 16, brArgs);
+            CudaCopyBuffer(brScratchReal, outputReal, height * width);
+            CudaCopyBuffer(brScratchImag, outputImag, height * width);
         }
 
         // Column-wise FFT
