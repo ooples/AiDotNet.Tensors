@@ -10,9 +10,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// expansion of <c>exp</c>. Because <c>f</c> has no real roots (minimum 0.5 at x = -1) it is
 /// strictly positive, so no row-max shift is needed and a single sum reduction suffices. One
 /// block owns one row: a shared-resident pass caches <c>f(x)</c> and reduces its sum with
-/// warp shuffles plus a warp-leader shared exchange, then the output pass normalizes.
-/// Polynomial-only, so the result is not
-/// approximation-limited.
+/// warp shuffles plus a warp-leader shared exchange, then the output pass normalizes. The
+/// polynomial uses round-to-nearest <c>mul.rn</c>/<c>fma.rn</c>/<c>add.rn</c>, avoiding the
+/// dominant <c>ex2.approx.f32</c> error; normalization still uses <c>rcp.approx.f32</c> and
+/// carries its reciprocal approximation error (disclosed on the release gate).
 ///
 /// One block per row (grid = M), 256 threads. Shared: N floats (row cache) + 8 floats
 /// (warp-leader exchange). Supported N are multiples of 256 so each thread strides the row exactly.
