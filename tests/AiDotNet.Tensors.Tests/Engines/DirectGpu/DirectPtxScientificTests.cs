@@ -1418,6 +1418,8 @@ public class DirectPtxScientificTests
         Assert.True(PtxAnnComputeDistancesKernel.IsSupportedShape(16, 16, 8));
         Assert.True(PtxAnnComputeDistancesKernel.IsSupportedShape(15, 16, 8));
         Assert.False(PtxAnnComputeDistancesKernel.IsSupportedShape(15, 15, 8));   // 225 not mult of 8
+        Assert.False(PtxAnnComputeDistancesKernel.IsSupportedShape(524288, 1, 4096)); // query extent exceeds Int32
+        Assert.False(PtxAnnComputeDistancesKernel.IsSupportedShape(1, 524288, 4096)); // database extent exceeds Int32
         Assert.False(PtxAnnComputeDistancesKernel.IsPromotedShape(16, 16, 8));
     }
 
@@ -1817,6 +1819,7 @@ public class DirectPtxScientificTests
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxCosineSimilarityKernel.IsSupportedShape(256, 64));
         Assert.False(PtxCosineSimilarityKernel.IsSupportedShape(255, 64));   // batch not a multiple of 8
+        Assert.False(PtxCosineSimilarityKernel.IsSupportedShape(524288, 4096)); // vector extent exceeds Int32
         Assert.False(PtxCosineSimilarityKernel.IsPromotedShape(256, 64));
     }
 

@@ -182,7 +182,9 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
     internal static bool IsSupportedShape(int batchSize, int dim)
     {
         if (batchSize <= 0 || dim <= 0 || dim > MaxDim) return false;
-        return batchSize % WarpsPerBlock == 0 && batchSize <= MaxBatch;
+        long vectorElements = (long)batchSize * dim;
+        return batchSize % WarpsPerBlock == 0 && batchSize <= MaxBatch &&
+               vectorElements <= int.MaxValue;
     }
 
     internal static bool IsPromotedShape(int batchSize, int dim) => false;
@@ -192,7 +194,7 @@ internal sealed class PtxCosineSimilarityKernel : IDisposable
         if (!IsSupportedShape(batchSize, dim))
             throw new ArgumentOutOfRangeException(
                 nameof(batchSize),
-                $"Cosine similarity requires positive dims with dim<={MaxDim} and batchSize a multiple of {WarpsPerBlock} up to {MaxBatch}.");
+                $"Cosine similarity requires positive dims with dim<={MaxDim}, vector extents within Int32, and batchSize a multiple of {WarpsPerBlock} up to {MaxBatch}.");
     }
 
 }

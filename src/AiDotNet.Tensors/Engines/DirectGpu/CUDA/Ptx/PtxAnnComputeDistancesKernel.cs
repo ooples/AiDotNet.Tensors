@@ -202,7 +202,10 @@ internal sealed class PtxAnnComputeDistancesKernel : IDisposable
     {
         if (numQueries <= 0 || numDatabase <= 0 || dim <= 0 || dim > MaxDim) return false;
         long cells = (long)numQueries * numDatabase;
-        return cells > 0 && cells % WarpsPerBlock == 0 && cells <= MaxCells;
+        long queryElements = (long)numQueries * dim;
+        long databaseElements = (long)numDatabase * dim;
+        return cells > 0 && cells % WarpsPerBlock == 0 && cells <= MaxCells &&
+               queryElements <= int.MaxValue && databaseElements <= int.MaxValue;
     }
 
     internal static bool IsPromotedShape(int numQueries, int numDatabase, int dim) => false;
@@ -212,7 +215,7 @@ internal sealed class PtxAnnComputeDistancesKernel : IDisposable
         if (!IsSupportedShape(numQueries, numDatabase, dim))
             throw new ArgumentOutOfRangeException(
                 nameof(numQueries),
-                $"ANN compute distances requires positive dims with dim<={MaxDim} and (numQueries*numDatabase) a multiple of {WarpsPerBlock} up to {MaxCells}.");
+                $"ANN compute distances requires positive dims with dim<={MaxDim}, input extents within Int32, and (numQueries*numDatabase) a multiple of {WarpsPerBlock} up to {MaxCells}.");
     }
 
 }
