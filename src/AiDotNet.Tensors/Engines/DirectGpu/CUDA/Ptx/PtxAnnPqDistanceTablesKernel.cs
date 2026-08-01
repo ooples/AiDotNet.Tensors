@@ -76,57 +76,6 @@ internal sealed class PtxAnnPqDistanceTablesKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    internal static void AppendVectorizedMetricLoop(
-        StringBuilder ptx, AnnMetric metric, int len, int vectorWidth)
-    {
-        if (vectorWidth is not (1 or 2 or 4) || len <= 0 || len % vectorWidth != 0)
-            throw new ArgumentOutOfRangeException(nameof(vectorWidth));
-
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
-        ptx.AppendLine("    mov.u32 %r9, 0;");
-        ptx.AppendLine("$ANN_PQ_LOOP:");
-        if (vectorWidth == 4)
-        {
-            ptx.AppendLine("    ld.global.nc.v4.f32 {%f1, %f2, %f3, %f4}, [%rd6];");
-            ptx.AppendLine("    ld.global.nc.v4.f32 {%f5, %f6, %f7, %f8}, [%rd7];");
-            for (int lane = 0; lane < 4; lane++)
-                AppendMetricTerm(ptx, metric, $"%f{lane + 1}", $"%f{lane + 5}", "%f9");
-        }
-        else if (vectorWidth == 2)
-        {
-            ptx.AppendLine("    ld.global.nc.v2.f32 {%f1, %f2}, [%rd6];");
-            ptx.AppendLine("    ld.global.nc.v2.f32 {%f3, %f4}, [%rd7];");
-            for (int lane = 0; lane < 2; lane++)
-                AppendMetricTerm(ptx, metric, $"%f{lane + 1}", $"%f{lane + 3}", "%f5");
-        }
-        else
-        {
-            ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
-            ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd7];");
-            AppendMetricTerm(ptx, metric, "%f1", "%f2", "%f3");
-        }
-        int byteStride = vectorWidth * sizeof(float);
-        ptx.AppendLine($"    add.u64 %rd6, %rd6, {byteStride};");
-        ptx.AppendLine($"    add.u64 %rd7, %rd7, {byteStride};");
-        ptx.AppendLine("    add.u32 %r9, %r9, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r9, {len / vectorWidth};");
-        ptx.AppendLine("    @%p0 bra $ANN_PQ_LOOP;");
-    }
-
-    private static void AppendMetricTerm(
-        StringBuilder ptx, AnnMetric metric, string left, string right, string difference)
-    {
-        if (metric == AnnMetric.InnerProduct)
-        {
-            ptx.AppendLine($"    fma.rn.f32 %f0, {left}, {right}, %f0;");
-        }
-        else
-        {
-            ptx.AppendLine($"    sub.rn.f32 {difference}, {left}, {right};");
-            ptx.AppendLine($"    fma.rn.f32 %f0, {difference}, {difference}, %f0;");
-        }
-    }
-
     internal static string EmitPtx(int ccMajor, int ccMinor, AnnMetric metric, int numQueries, int m, int ksub, int dsub)
     {
         ValidateShape(numQueries, m, ksub, dsub);
@@ -169,7 +118,8 @@ internal sealed class PtxAnnPqDistanceTablesKernel : IDisposable
         ptx.AppendLine($"    mad.lo.u32 %r8, %r3, {dsub}, %r8;");
         ptx.AppendLine("    mul.wide.u32 %rd5, %r8, 4;");
         ptx.AppendLine("    add.u64 %rd7, %rd1, %rd5;");                   // &codebooks[cbOff]
-        AppendVectorizedMetricLoop(ptx, metric, dsub, vectorWidth);
+        DirectPtxPtxText.AppendVectorizedPairReduction(
+            ptx, dsub, vectorWidth, squaredDifference: metric == AnnMetric.L2, loopLabel: "$ANN_PQ_LOOP");
         ptx.AppendLine("    mul.wide.u32 %rd8, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd2, %rd8;");
         ptx.AppendLine("    st.global.f32 [%rd9], %f0;");

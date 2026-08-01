@@ -7,8 +7,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Dynamic-routing agreement update (issue #854), matching the NVRTC <c>capsule_agreement</c> kernel:
 /// <c>agreement[b,i,c] = sum_d predictions[b,i,c,d] * output[b,c,d]</c>. One thread owns one agreement
-/// element and walks the capsule-dim axis <c>d = 0..capsuleDim-1</c> serially in registers (both
-/// operands are contiguous along <c>d</c>) — no shared memory, no reduction.
+/// element and uses aligned scalar/v2/v4 loads across the contiguous capsule-dim axis, retaining the
+/// original warp count while reducing memory transactions.
 ///
 /// Logical dims are (batchSize B, inputCapsules I, outputCapsules C, capsuleDim D). Predictions is
 /// <c>[B,I,C,D]</c>, output <c>[B,C,D]</c>, agreement <c>[B,I,C]</c> row-major (so the flat agreement
@@ -81,10 +81,11 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
         int predStrideB = inputCapsules * outputCapsules * capsuleDim;   // predictions [B,I,C,D]
         int predStrideI = outputCapsules * capsuleDim;
         int outStrideB = outputCapsules * capsuleDim;                    // output [B,C,D]
+        int vectorWidth = capsuleDim % 4 == 0 ? 4 : capsuleDim % 2 == 0 ? 2 : 1;
 
         var ptx = new StringBuilder(4_000);
         DirectPtxPtxText.AppendModuleHeader(ptx, ccMajor, ccMinor, disableLoopUnrolling: true);
-        ptx.AppendLine($"// capsule-agreement B={batchSize} I={inputCapsules} C={outputCapsules} D={capsuleDim}");
+        ptx.AppendLine($"// capsule-agreement B={batchSize} I={inputCapsules} C={outputCapsules} D={capsuleDim}; vector-width={vectorWidth}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 pred_ptr,");
@@ -96,7 +97,7 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
         ptx.AppendLine("    .reg .pred %p<2>;");
         ptx.AppendLine("    .reg .b32 %r<14>;");
         ptx.AppendLine("    .reg .b64 %rd<16>;");
-        ptx.AppendLine("    .reg .f32 %f<4>;");
+        ptx.AppendLine("    .reg .f32 %f<10>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [pred_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [out_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [agree_ptr];");
@@ -118,17 +119,8 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
         ptx.AppendLine($"    mad.lo.u32 %r8, %r3, {capsuleDim}, %r8;");
         ptx.AppendLine("    mul.wide.u32 %rd4, %r8, 4;");
         ptx.AppendLine("    add.u64 %rd7, %rd1, %rd4;");                   // &output[b,c,0]
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // sum
-        ptx.AppendLine("    mov.u32 %r9, 0;");                            // d = 0
-        ptx.AppendLine("$CAG_D_LOOP:");
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");             // predictions[b,i,c,d]
-        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd7];");             // output[b,c,d]
-        ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 4;");                    // both stride 1 elem
-        ptx.AppendLine("    add.u64 %rd7, %rd7, 4;");
-        ptx.AppendLine("    add.u32 %r9, %r9, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r9, {capsuleDim};");
-        ptx.AppendLine("    @%p0 bra $CAG_D_LOOP;");
+        DirectPtxPtxText.AppendVectorizedPairReduction(
+            ptx, capsuleDim, vectorWidth, squaredDifference: false, loopLabel: "$CAG_D_LOOP");
         ptx.AppendLine("    mul.wide.u32 %rd8, %r2, 4;");
         ptx.AppendLine("    add.u64 %rd9, %rd2, %rd8;");
         ptx.AppendLine("    st.global.f32 [%rd9], %f0;");
@@ -145,7 +137,7 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
         var agreeExtent = new DirectPtxExtent(batchSize * inputCapsules * outputCapsules);
         return new DirectPtxKernelBlueprint(
             Operation: "capsule-agreement",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
             Variant: $"fp32-b{batchSize}-i{inputCapsules}-c{outputCapsules}-d{capsuleDim}",
             Tensors:
@@ -158,7 +150,7 @@ internal sealed class PtxCapsuleAgreementKernel : IDisposable
                     agreeExtent, agreeExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
-                measuredRegistersPerThread: 26,
+                measuredRegistersPerThread: 20,
                 maxStaticSharedBytes: 0,
                 maxLocalBytesPerThread: 0,
                 minBlocksPerMultiprocessor: 1),

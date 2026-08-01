@@ -1894,17 +1894,18 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void CapsuleAgreementEmitter_IsThreadPerOutputSerialDReduction()
+    public void CapsuleAgreementEmitter_UsesVectorizedDReduction()
     {
         // B=4, I=8, C=8 -> outputs = 256.
         string ptx = PtxCapsuleAgreementKernel.EmitPtx(8, 6, 4, 8, 8, 12);
         Assert.Contains(PtxCapsuleAgreementKernel.EntryPoint, ptx);
-        Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
+        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(0, Count(ptx, "ld.global.nc.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
-        Assert.Equal(1, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(4, Count(ptx, "fma.rn.f32"));
         Assert.Contains("$CAG_D_LOOP:", ptx);
         Assert.Contains("rem.u32 %r3, %r2, 8", ptx);         // c = idx % outputCapsules
-        Assert.Equal(2, Count(ptx, "add.u64 %rd6, %rd6, 4") + Count(ptx, "add.u64 %rd7, %rd7, 4")); // both stride 1
+        Assert.Equal(2, Count(ptx, "add.u64 %rd6, %rd6, 16") + Count(ptx, "add.u64 %rd7, %rd7, 16"));
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
