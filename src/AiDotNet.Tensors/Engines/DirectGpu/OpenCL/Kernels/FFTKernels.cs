@@ -43,9 +43,25 @@ __kernel void bit_reverse_permutation(
 }
 
 // Batched bit-reversal permutation
+// Bit-reversal permutation, OUT OF PLACE: every work item writes exactly one destination -- its
+// own -- reading from the bit-reversed source index. It never writes a slot another work item
+// also writes, so no ordering between items can affect the result.
+//
+// The in-place form this replaces guarded a swap with `if (i < j)`, which reads correctly on
+// paper: exactly one work item of each pair fires, and an instrumented run confirmed the index
+// math and the guard were both right. What did not survive was the second half of the swap. For
+// input 1..8 the reversal produced [1,5,3,7,5,6,7,8] -- slots 1 and 3 took their partner's value
+// while slots 4 and 6 kept their originals, so `dst[i] = dst[j]` landed and `dst[j] = tmp` did
+// not, at every size above n=2. n=2 is the only case where the permutation is the identity, which
+// is exactly why it was the only size that passed.
+//
+// Reading and writing distinct buffers also lets this absorb the input copy that used to precede
+// it, so the transform does strictly less work than before.
 __kernel void batched_bit_reverse(
-    __global float* real,
-    __global float* imag,
+    __global const float* srcReal,
+    __global const float* srcImag,
+    __global float* dstReal,
+    __global float* dstImag,
     const int batch,
     const int n,
     const int log2n)
@@ -63,15 +79,9 @@ __kernel void batched_bit_reverse(
         temp >>= 1;
     }
 
-    if (i < j) {
-        int baseIdx = b * n;
-        float tmpReal = real[baseIdx + i];
-        float tmpImag = imag[baseIdx + i];
-        real[baseIdx + i] = real[baseIdx + j];
-        imag[baseIdx + i] = imag[baseIdx + j];
-        real[baseIdx + j] = tmpReal;
-        imag[baseIdx + j] = tmpImag;
-    }
+    int baseIdx = b * n;
+    dstReal[baseIdx + i] = srcReal[baseIdx + j];
+    dstImag[baseIdx + i] = srcImag[baseIdx + j];
 }
 
 // Cooley-Tukey FFT butterfly operation for a single stage.

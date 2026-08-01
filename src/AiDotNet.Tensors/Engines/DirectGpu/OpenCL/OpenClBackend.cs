@@ -11447,6 +11447,7 @@ KERNEL VARIANTS (A/B testing):
             }
         }
 
+
         /// <inheritdoc/>
         public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
         {
@@ -11457,10 +11458,8 @@ KERNEL VARIANTS (A/B testing):
             var outReal = ((DirectOpenClGpuBuffer)outputReal).Buffer;
             var outImag = ((DirectOpenClGpuBuffer)outputImag).Buffer;
 
-            // Copy input to output for in-place FFT
-            CopyBuffer(inputReal, outputReal, batch * n);
-            CopyBuffer(inputImag, outputImag, batch * n);
-
+            // No input copy: batched_bit_reverse reads the input and writes the permuted result
+            // straight into the output, so the permutation IS the copy.
             int log2n = (int)MathHelper.Log2(n);
 
             // Batched bit-reversal. NOTE: batched_bit_reverse / batched_fft_butterfly index via a
@@ -11471,11 +11470,13 @@ KERNEL VARIANTS (A/B testing):
             // FFT path that N-D IFFT / wideband / mel-spectrogram all route through).
             int bitRevItems = batch * n;
             var bitRevKernel = _kernelCache["batched_bit_reverse"];
-            bitRevKernel.SetArg(0, outReal.Handle);
-            bitRevKernel.SetArg(1, outImag.Handle);
-            bitRevKernel.SetArg(2, batch);
-            bitRevKernel.SetArg(3, n);
-            bitRevKernel.SetArg(4, log2n);
+            bitRevKernel.SetArg(0, inReal.Handle);
+            bitRevKernel.SetArg(1, inImag.Handle);
+            bitRevKernel.SetArg(2, outReal.Handle);
+            bitRevKernel.SetArg(3, outImag.Handle);
+            bitRevKernel.SetArg(4, batch);
+            bitRevKernel.SetArg(5, n);
+            bitRevKernel.SetArg(6, log2n);
             bitRevKernel.Execute1D(bitRevItems, Math.Min(256, bitRevItems));
 
             // Batched FFT butterfly stages (batch * (n/2) butterfly pairs per stage)

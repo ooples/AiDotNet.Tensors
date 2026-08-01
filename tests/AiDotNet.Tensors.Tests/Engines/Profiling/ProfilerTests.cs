@@ -418,7 +418,7 @@ public class ProfilerTests
         Assert.Equal("cpu_op", ev.Category);
         Assert.NotNull(ev.Args);
         Assert.Equal("true", ev.Args!["fused"]);
-        Assert.Equal("Conv2D,TensorAdd,ReLU", ev.Args["subops"]);
+        Assert.Equal("Conv2D,TensorBroadcastAdd,ReLU", ev.Args["subops"]);
     }
 
     [Fact]
