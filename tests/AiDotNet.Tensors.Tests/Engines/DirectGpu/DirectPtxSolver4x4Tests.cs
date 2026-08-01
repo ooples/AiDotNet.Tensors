@@ -22,6 +22,8 @@ public class DirectPtxSolver4x4Tests
         Assert.DoesNotContain("%n", cholesky, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", cholesky, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("@%p0 bra.uni", cholesky, StringComparison.Ordinal);
+        Assert.DoesNotContain(", -%f", cholesky, StringComparison.Ordinal);
+        Assert.Contains(".reg .f32 %solver_neg;", cholesky, StringComparison.Ordinal);
 
         foreach (DirectPtxSolver4x4Operation operation in Enum.GetValues<DirectPtxSolver4x4Operation>())
         {
@@ -44,6 +46,10 @@ public class DirectPtxSolver4x4Tests
             Assert.DoesNotContain("@!%p0 bra.uni", ptx, StringComparison.Ordinal);
             Assert.Contains("mul.wide.u32", ptx, StringComparison.Ordinal);
             Assert.Contains("st.global", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(", -%f", ptx, StringComparison.Ordinal);
+            Assert.Contains(".reg .f32 %solver_neg;", ptx, StringComparison.Ordinal);
+            for (int parameter = 0; parameter < expectedPointers; parameter++)
+                Assert.DoesNotContain($"mul.wide.u32 %rd{parameter},", ptx, StringComparison.Ordinal);
         }
     }
 

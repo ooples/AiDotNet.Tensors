@@ -170,6 +170,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             DirectPtxSolver4x4Operation.CholeskyBackwardLower => "    .reg .f32 %f<104>;",
             _ => "    .reg .f32 %f<64>;"
         });
+        PtxSolverArithmetic.Declare(ptx);
         for (int i = 0; i < parameters.Length; i++)
             ptx.AppendLine($"    ld.param.u64 %rd{i}, [{parameters[i]}];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
@@ -199,9 +200,9 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitLu(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitMatrixPointer(ptx, 1, 3, 5);
-        EmitVectorPointer(ptx, 2, 2, 6, 7, 16);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitMatrixPointer(ptx, 1, 5);
+        EmitVectorPointer(ptx, 2, 2, 7, 16);
         EmitLoadMatrix(ptx, 4, 0);
         for (int j = 0; j < 4; j++)
         {
@@ -234,7 +235,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
                 int factor = row * 4 + j;
                 ptx.AppendLine($"    div.rn.f32 %f{factor}, %f{factor}, %f{pivot};");
                 for (int col = j + 1; col < 4; col++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{row * 4 + col}, -%f{factor}, %f{j * 4 + col}, %f{row * 4 + col};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, row * 4 + col, factor, j * 4 + col);
             }
             ptx.AppendLine($"LU_SKIP_{j}:");
         }
@@ -243,9 +245,9 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitQr(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitMatrixPointer(ptx, 1, 3, 5);
-        EmitMatrixPointer(ptx, 2, 3, 6);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitMatrixPointer(ptx, 1, 5);
+        EmitMatrixPointer(ptx, 2, 6);
         EmitLoadMatrix(ptx, 4, 0);
         for (int i = 16; i < 32; i++) ptx.AppendLine($"    mov.f32 %f{i}, 0f00000000;");
         for (int col = 0; col < 4; col++)
@@ -257,7 +259,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
                 for (int row = 1; row < 4; row++)
                     ptx.AppendLine($"    fma.rn.f32 %f{r}, %f{row * 4 + previous}, %f{row * 4 + col}, %f{r};");
                 for (int row = 0; row < 4; row++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{row * 4 + col}, -%f{r}, %f{row * 4 + previous}, %f{row * 4 + col};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, row * 4 + col, r, row * 4 + previous);
             }
             int diag = 16 + col * 4 + col;
             ptx.AppendLine($"    mul.rn.f32 %f{diag}, %f{col}, %f{col};");
@@ -280,9 +283,9 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitEigh(StringBuilder ptx, bool upper)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitVectorPointer(ptx, 1, 2, 5, 6, 16);
-        EmitMatrixPointer(ptx, 2, 3, 7);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitVectorPointer(ptx, 1, 2, 6, 16);
+        EmitMatrixPointer(ptx, 2, 7);
         EmitLoadMatrix(ptx, 4, 0);
         if (upper) SymmetrizeUpper(ptx, 0);
         else SymmetrizeLower(ptx, 0);
@@ -296,10 +299,10 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitSvd(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitMatrixPointer(ptx, 1, 3, 5);
-        EmitVectorPointer(ptx, 2, 2, 6, 7, 16);
-        EmitMatrixPointer(ptx, 3, 3, 8);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitMatrixPointer(ptx, 1, 5);
+        EmitVectorPointer(ptx, 2, 2, 7, 16);
+        EmitMatrixPointer(ptx, 3, 8);
         EmitLoadMatrix(ptx, 4, 0);
         for (int row = 0; row < 4; row++)
         for (int col = 0; col < 4; col++)
@@ -337,10 +340,10 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitLuSolve(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitVectorPointer(ptx, 1, 2, 5, 6, 16);
-        EmitVectorPointer(ptx, 2, 2, 7, 8, 16);
-        EmitVectorPointer(ptx, 3, 2, 9, 10, 16);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitVectorPointer(ptx, 1, 2, 6, 16);
+        EmitVectorPointer(ptx, 2, 2, 8, 16);
+        EmitVectorPointer(ptx, 3, 2, 10, 16);
         EmitLoadMatrix(ptx, 4, 0);
         ptx.AppendLine("    ld.global.v4.u32 {%r4,%r5,%r6,%r7}, [%rd6];");
         ptx.AppendLine("    ld.global.v4.f32 {%f16,%f17,%f18,%f19}, [%rd8];");
@@ -354,11 +357,11 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         }
         for (int i = 1; i < 4; i++)
             for (int j = 0; j < i; j++)
-                ptx.AppendLine($"    fma.rn.f32 %f{16 + i}, -%f{i * 4 + j}, %f{16 + j}, %f{16 + i};");
+                PtxSolverArithmetic.EmitSubtractProduct(ptx, 16 + i, i * 4 + j, 16 + j);
         for (int i = 3; i >= 0; i--)
         {
             for (int j = i + 1; j < 4; j++)
-                ptx.AppendLine($"    fma.rn.f32 %f{16 + i}, -%f{i * 4 + j}, %f{16 + j}, %f{16 + i};");
+                PtxSolverArithmetic.EmitSubtractProduct(ptx, 16 + i, i * 4 + j, 16 + j);
             ptx.AppendLine($"    setp.eq.f32 %p0, %f{i * 5}, 0f00000000;");
             ptx.AppendLine($"    @%p0 mov.f32 %f{16 + i}, 0f7fffffff;");
             ptx.AppendLine($"    @!%p0 div.rn.f32 %f{16 + i}, %f{16 + i}, %f{i * 5};");
@@ -368,9 +371,9 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitLdlFactor(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitMatrixPointer(ptx, 1, 3, 5);
-        EmitVectorPointer(ptx, 2, 2, 6, 7, 16);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitMatrixPointer(ptx, 1, 5);
+        EmitVectorPointer(ptx, 2, 2, 7, 16);
         EmitLoadMatrix(ptx, 4, 0);
         for (int j = 0; j < 4; j++)
         {
@@ -409,7 +412,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
                 int factor = row * 4 + j;
                 ptx.AppendLine($"    div.rn.f32 %f{factor}, %f{factor}, %f{j * 5};");
                 for (int col = j + 1; col < 4; col++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{row * 4 + col}, -%f{factor}, %f{j * 4 + col}, %f{row * 4 + col};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, row * 4 + col, factor, j * 4 + col);
             }
             ptx.AppendLine($"LDL_SKIP_{j}:");
         }
@@ -421,10 +425,10 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitLdlSolve(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 4, 5);
-        EmitVectorPointer(ptx, 1, 2, 6, 7, 16);
-        EmitVectorPointer(ptx, 2, 2, 8, 9, 16);
-        EmitVectorPointer(ptx, 3, 2, 10, 11, 16);
+        EmitMatrixPointer(ptx, 0, 5);
+        EmitVectorPointer(ptx, 1, 2, 7, 16);
+        EmitVectorPointer(ptx, 2, 2, 9, 16);
+        EmitVectorPointer(ptx, 3, 2, 11, 16);
         EmitLoadMatrix(ptx, 5, 0);
         ptx.AppendLine("    ld.global.v4.u32 {%r4,%r5,%r6,%r7}, [%rd7];");
         ptx.AppendLine("    ld.global.v4.f32 {%f16,%f17,%f18,%f19}, [%rd9];");
@@ -438,7 +442,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         }
         for (int row = 1; row < 4; row++)
         for (int col = 0; col < row; col++)
-            ptx.AppendLine($"    fma.rn.f32 %f{16 + row}, -%f{row * 4 + col}, %f{16 + col}, %f{16 + row};");
+            PtxSolverArithmetic.EmitSubtractProduct(ptx, 16 + row, row * 4 + col, 16 + col);
         for (int row = 0; row < 4; row++)
         {
             ptx.AppendLine($"    setp.eq.f32 %p0, %f{row * 5}, 0f00000000;");
@@ -447,7 +451,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         }
         for (int row = 3; row >= 0; row--)
         for (int col = row + 1; col < 4; col++)
-            ptx.AppendLine($"    fma.rn.f32 %f{16 + row}, -%f{col * 4 + row}, %f{16 + col}, %f{16 + row};");
+            PtxSolverArithmetic.EmitSubtractProduct(ptx, 16 + row, col * 4 + row, 16 + col);
         for (int step = 3; step >= 0; step--)
         for (int pivot = step + 1; pivot < 4; pivot++)
         {
@@ -461,10 +465,10 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitGeneralSolve(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 4, 5);
-        EmitVectorPointer(ptx, 1, 2, 6, 7, 16);
-        EmitVectorPointer(ptx, 2, 2, 8, 9, 16);
-        EmitVectorPointer(ptx, 3, 2, 10, 11, 4);
+        EmitMatrixPointer(ptx, 0, 5);
+        EmitVectorPointer(ptx, 1, 2, 7, 16);
+        EmitVectorPointer(ptx, 2, 2, 9, 16);
+        EmitVectorPointer(ptx, 3, 2, 11, 4);
         EmitLoadMatrix(ptx, 5, 0);
         ptx.AppendLine("    ld.global.v4.f32 {%f16,%f17,%f18,%f19}, [%rd7];");
         ptx.AppendLine("    mov.u32 %r8, 0;");
@@ -475,9 +479,9 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitTriangularSolve(StringBuilder ptx, bool upper)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitVectorPointer(ptx, 1, 2, 5, 6, 16);
-        EmitVectorPointer(ptx, 2, 2, 7, 8, 16);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitVectorPointer(ptx, 1, 2, 6, 16);
+        EmitVectorPointer(ptx, 2, 2, 8, 16);
         EmitLoadMatrix(ptx, 4, 0);
         ptx.AppendLine("    ld.global.v4.f32 {%f16,%f17,%f18,%f19}, [%rd6];");
         if (upper)
@@ -485,7 +489,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             for (int row = 3; row >= 0; row--)
             {
                 for (int col = row + 1; col < 4; col++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{16 + row}, -%f{row * 4 + col}, %f{16 + col}, %f{16 + row};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, 16 + row, row * 4 + col, 16 + col);
                 EmitSafeDivision(ptx, 16 + row, row * 5);
             }
         }
@@ -494,7 +499,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             for (int row = 0; row < 4; row++)
             {
                 for (int col = 0; col < row; col++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{16 + row}, -%f{row * 4 + col}, %f{16 + col}, %f{16 + row};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, 16 + row, row * 4 + col, 16 + col);
                 EmitSafeDivision(ptx, 16 + row, row * 5);
             }
         }
@@ -503,9 +509,9 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitCholeskyBackward(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 3, 4);
-        EmitMatrixPointer(ptx, 1, 3, 5);
-        EmitMatrixPointer(ptx, 2, 3, 6);
+        EmitMatrixPointer(ptx, 0, 4);
+        EmitMatrixPointer(ptx, 1, 5);
+        EmitMatrixPointer(ptx, 2, 6);
         EmitLoadMatrix(ptx, 4, 0);
         EmitLoadMatrix(ptx, 5, 16);
         // tmp = L^T * gradL, then Phi(tmp).
@@ -538,7 +544,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             {
                 ptx.AppendLine($"    mov.f32 %f{dst}, 0f00000000;");
                 for (int k = col; k < row; k++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{dst}, -%f{row * 4 + k}, %f{48 + k * 4 + col}, %f{dst};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, dst, row * 4 + k, 48 + k * 4 + col);
                 ptx.AppendLine($"    div.rn.f32 %f{dst}, %f{dst}, %f{row * 5};");
             }
         }
@@ -565,11 +572,11 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
 
     private static void EmitSolveBackward(StringBuilder ptx)
     {
-        EmitMatrixPointer(ptx, 0, 5, 6);
-        EmitVectorPointer(ptx, 1, 2, 7, 8, 16);
-        EmitVectorPointer(ptx, 2, 2, 9, 10, 16);
-        EmitMatrixPointer(ptx, 3, 5, 11);
-        EmitVectorPointer(ptx, 4, 2, 12, 13, 16);
+        EmitMatrixPointer(ptx, 0, 6);
+        EmitVectorPointer(ptx, 1, 2, 8, 16);
+        EmitVectorPointer(ptx, 2, 2, 10, 16);
+        EmitMatrixPointer(ptx, 3, 11);
+        EmitVectorPointer(ptx, 4, 2, 13, 16);
         EmitLoadMatrix(ptx, 6, 0);
         // Factor A^T in registers.
         for (int row = 0; row < 4; row++)
@@ -632,15 +639,18 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
                 int factor = row * 4 + j;
                 ptx.AppendLine($"    div.rn.f32 %f{factor}, %f{factor}, %f{diagonal};");
                 for (int col = j + 1; col < 4; col++)
-                    ptx.AppendLine($"    fma.rn.f32 %f{row * 4 + col}, -%f{factor}, %f{j * 4 + col}, %f{row * 4 + col};");
-                ptx.AppendLine($"    fma.rn.f32 %f{rhsBase + row}, -%f{factor}, %f{rhsBase + j}, %f{rhsBase + row};");
+                    PtxSolverArithmetic.EmitSubtractProduct(
+                        ptx, row * 4 + col, factor, j * 4 + col);
+                PtxSolverArithmetic.EmitSubtractProduct(
+                    ptx, rhsBase + row, factor, rhsBase + j);
             }
             ptx.AppendLine($"{label}_SKIP_{j}:");
         }
         for (int row = 3; row >= 0; row--)
         {
             for (int col = row + 1; col < 4; col++)
-                ptx.AppendLine($"    fma.rn.f32 %f{rhsBase + row}, -%f{row * 4 + col}, %f{rhsBase + col}, %f{rhsBase + row};");
+                PtxSolverArithmetic.EmitSubtractProduct(
+                    ptx, rhsBase + row, row * 4 + col, rhsBase + col);
             EmitSafeDivision(ptx, rhsBase + row, row * 5);
         }
     }
@@ -689,8 +699,8 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             ptx.AppendLine($"    mul.rn.f32 %f56, %f54, %f54;");
             ptx.AppendLine($"    mul.rn.f32 %f57, %f54, %f53;");
             ptx.AppendLine($"    mul.rn.f32 %f58, %f55, %f{app};");
-            ptx.AppendLine($"    fma.rn.f32 %f58, -%f57, %f{apq}, %f58;");
-            ptx.AppendLine($"    fma.rn.f32 %f58, -%f57, %f{apq}, %f58;");
+            PtxSolverArithmetic.EmitSubtractProduct(ptx, 58, 57, apq);
+            PtxSolverArithmetic.EmitSubtractProduct(ptx, 58, 57, apq);
             ptx.AppendLine($"    fma.rn.f32 %f58, %f56, %f{aqq}, %f58;");
             ptx.AppendLine($"    mul.rn.f32 %f59, %f56, %f{app};");
             ptx.AppendLine($"    fma.rn.f32 %f59, %f57, %f{apq}, %f59;");
@@ -705,7 +715,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
                 if (k == p || k == q) continue;
                 int akp = aBase + k * 4 + p, akq = aBase + k * 4 + q;
                 ptx.AppendLine($"    mul.rn.f32 %f60, %f53, %f{akp};");
-                ptx.AppendLine($"    fma.rn.f32 %f60, -%f54, %f{akq}, %f60;");
+                PtxSolverArithmetic.EmitSubtractProduct(ptx, 60, 54, akq);
                 ptx.AppendLine($"    mul.rn.f32 %f61, %f54, %f{akp};");
                 ptx.AppendLine($"    fma.rn.f32 %f61, %f53, %f{akq}, %f61;");
                 ptx.AppendLine($"    mov.f32 %f{akp}, %f60;");
@@ -717,7 +727,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
             {
                 int vp = vBase + row * 4 + p, vq = vBase + row * 4 + q;
                 ptx.AppendLine($"    mul.rn.f32 %f60, %f53, %f{vp};");
-                ptx.AppendLine($"    fma.rn.f32 %f60, -%f54, %f{vq}, %f60;");
+                PtxSolverArithmetic.EmitSubtractProduct(ptx, 60, 54, vq);
                 ptx.AppendLine($"    mul.rn.f32 %f61, %f54, %f{vp};");
                 ptx.AppendLine($"    fma.rn.f32 %f61, %f53, %f{vq}, %f61;");
                 ptx.AppendLine($"    mov.f32 %f{vp}, %f60;");
@@ -757,17 +767,17 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         }
     }
 
-    private static void EmitMatrixPointer(StringBuilder ptx, int parameterRd, int offsetRd, int resultRd)
+    private static void EmitMatrixPointer(StringBuilder ptx, int parameterRd, int resultRd)
     {
-        ptx.AppendLine($"    mul.wide.u32 %rd{offsetRd}, %r2, 64;");
-        ptx.AppendLine($"    add.u64 %rd{resultRd}, %rd{parameterRd}, %rd{offsetRd};");
+        ptx.AppendLine($"    mul.wide.u32 %rd{resultRd}, %r2, 64;");
+        ptx.AppendLine($"    add.u64 %rd{resultRd}, %rd{parameterRd}, %rd{resultRd};");
     }
 
     private static void EmitVectorPointer(
-        StringBuilder ptx, int parameterRd, int indexRegister, int offsetRd, int resultRd, int bytes)
+        StringBuilder ptx, int parameterRd, int indexRegister, int resultRd, int bytes)
     {
-        ptx.AppendLine($"    mul.wide.u32 %rd{offsetRd}, %r{indexRegister}, {bytes};");
-        ptx.AppendLine($"    add.u64 %rd{resultRd}, %rd{parameterRd}, %rd{offsetRd};");
+        ptx.AppendLine($"    mul.wide.u32 %rd{resultRd}, %r{indexRegister}, {bytes};");
+        ptx.AppendLine($"    add.u64 %rd{resultRd}, %rd{parameterRd}, %rd{resultRd};");
     }
 
     private static void EmitLoadMatrix(StringBuilder ptx, int pointerRd, int floatBase)
