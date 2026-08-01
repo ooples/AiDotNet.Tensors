@@ -33,27 +33,12 @@ __kernel void bit_reverse_permutation(
         temp >>= 1;
     }
 
-    // Out of place: this work item writes exactly one destination, its own. The in-place swap this
-    // replaces lost the second half of each exchange on some drivers -- see batched_bit_reverse.
+    // Out of place: each work item writes one destination; src and dst must be distinct allocations.
     dstReal[i] = srcReal[j];
     dstImag[i] = srcImag[j];
 }
 
-// Batched bit-reversal permutation
-// Bit-reversal permutation, OUT OF PLACE: every work item writes exactly one destination -- its
-// own -- reading from the bit-reversed source index. It never writes a slot another work item
-// also writes, so no ordering between items can affect the result.
-//
-// The in-place form this replaces guarded a swap with `if (i < j)`, which reads correctly on
-// paper: exactly one work item of each pair fires, and an instrumented run confirmed the index
-// math and the guard were both right. What did not survive was the second half of the swap. For
-// input 1..8 the reversal produced [1,5,3,7,5,6,7,8] -- slots 1 and 3 took their partner's value
-// while slots 4 and 6 kept their originals, so `dst[i] = dst[j]` landed and `dst[j] = tmp` did
-// not, at every size above n=2. n=2 is the only case where the permutation is the identity, which
-// is exactly why it was the only size that passed.
-//
-// Reading and writing distinct buffers also lets this absorb the input copy that used to precede
-// it, so the transform does strictly less work than before.
+// Batched bit-reversal permutation, OUT OF PLACE; src and dst must be distinct allocations.
 __kernel void batched_bit_reverse(
     __global const float* srcReal,
     __global const float* srcImag,

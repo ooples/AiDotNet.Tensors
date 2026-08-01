@@ -26,10 +26,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bit_reverse_permutation(
         temp >>= 1;
     }
 
-    // Out of place: this thread writes exactly one destination, its own. The in-place swap this
-    // replaces lost the second half of every exchange on OpenCL -- `dst[i] = dst[j]` landed while
-    // `dst[j] = tmp` did not -- and this kernel had the identical structure. Only n=2 was immune,
-    // that being the one size whose permutation is the identity.
+    // Out of place: each thread writes one destination; src and dst must be distinct allocations.
     dstReal[idx] = srcReal[reversed];
     dstImag[idx] = srcImag[reversed];
 }
