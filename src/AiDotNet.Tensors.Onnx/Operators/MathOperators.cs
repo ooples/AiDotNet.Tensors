@@ -220,23 +220,24 @@ internal static class MathOperators
         const double P = 0.3275911;
         const double A1 = 0.254829592, A2 = -0.284496736, A3 = 1.421413741;
         const double A4 = -1.453152027, A5 = 1.061405429;
+        int[] coefficientShape = x.Rank == 0 ? Array.Empty<int>() : new[] { 1 };
         var absX = engine.TensorAbs(x);
-        var pAbsX = engine.TensorMultiply(absX, MakeScalar(P, new[] { 1 }));
-        var onePlusPAbsX = engine.TensorAdd(pAbsX, MakeScalar(1.0, new[] { 1 }));
+        var pAbsX = engine.TensorMultiply(absX, MakeScalar(P, coefficientShape));
+        var onePlusPAbsX = engine.TensorAdd(pAbsX, MakeScalar(1.0, coefficientShape));
         var ones = MakeScalar(1.0, x._shape);
         var t = engine.TensorDivide(ones, onePlusPAbsX);
         var poly = engine.TensorAdd(
-            engine.TensorMultiply(t, MakeScalar(A5, new[] { 1 })),
-            MakeScalar(A4, new[] { 1 }));
-        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A3, new[] { 1 }));
-        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A2, new[] { 1 }));
-        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A1, new[] { 1 }));
+            engine.TensorMultiply(t, MakeScalar(A5, coefficientShape)),
+            MakeScalar(A4, coefficientShape));
+        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A3, coefficientShape));
+        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A2, coefficientShape));
+        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A1, coefficientShape));
         poly = engine.TensorMultiply(poly, t);
         var negXsq = engine.TensorNegate(engine.TensorMultiply(x, x));
         var expNegXsq = engine.TensorExp(negXsq);
         var polyExp = engine.TensorMultiply(poly, expNegXsq);
         var erfMag = engine.TensorSubtract(ones, polyExp);
-        var epsAbsX = engine.TensorAdd(absX, MakeScalar(1e-30, new[] { 1 }));
+        var epsAbsX = engine.TensorAdd(absX, MakeScalar(1e-30, coefficientShape));
         var sign = engine.TensorDivide(x, epsAbsX);
         return engine.TensorMultiply(sign, erfMag);
     }
