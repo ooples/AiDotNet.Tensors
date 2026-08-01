@@ -31,9 +31,10 @@ oracles under GPU-gated driver tests; PTX-structure and manifest-completeness
 gates pass on no-GPU CI. The production admission table remains fail-closed and
 production behavior is unchanged. The checked-in head-to-head now measures all
 ten cells against the shipped CUDA incumbent on the same backend stream. On the
-validated RTX 3080/SM86 shape `[2048,1024]`, eight cells are clear wins and the
-two standalone masking passes are exact bandwidth-floor ties. No tie is reported
-as a win and no benchmark result opens the production gate automatically.
+validated RTX 3080/SM86 shape `[2048,1024]`, six cells clear the production
+device-median floor and four do not: Softmax (1.05x), LogSumExpBackward (1.09x),
+MaskedFill (1.00x), and MaskedFillBackward (1.01x). No below-threshold result is
+reported as a win and no benchmark result opens the production gate automatically.
 
 ## Cross-backend parity inventory
 
@@ -69,23 +70,26 @@ the harness asserts that the experimental direct-PTX dispatch counter advanced.
 
 | Operator | Shipped CUDA | Direct PTX | Paired ratio | Max error | Verdict |
 |---|---:|---:|---:|---:|---|
-| Softmax | 25.9 us | 24.7 us | 1.05x | 0 | direct wins |
+| Softmax | 25.9 us | 24.7 us | 1.05x | 0 | below 1.10x production gate |
 | SoftmaxRows | 31.8 us | 24.5 us | 1.27x | 2.33e-10 | direct wins |
 | SoftmaxBackward | 1742.7 us | 38.2 us | 45.69x | 5.82e-11 | direct wins |
 | LogSoftmax | 717.2 us | 28.3 us | 25.62x | 2.38e-6 | direct wins |
 | LogSumExpAxis | 306.1 us | 20.3 us | 14.94x | 2.38e-6 | direct wins |
-| LogSumExpBackward | 26.9 us | 25.5 us | 1.09x | 0 | direct wins |
-| MaskedFill | 35.5 us | 35.0 us | 1.00x | 0 | tie within noise |
-| MaskedFillBackward | 35.7 us | 35.0 us | 1.01x | 0 | tie within noise |
+| LogSumExpBackward | 26.9 us | 25.5 us | 1.09x | 0 | below 1.10x production gate |
+| MaskedFill | 35.5 us | 35.0 us | 1.00x | 0 | below 1.10x production gate |
+| MaskedFillBackward | 35.7 us | 35.0 us | 1.01x | 0 | below 1.10x production gate |
 | Sparsemax | 111405.6 us | 157.0 us | 709.90x | 5.96e-8 | direct wins |
 | TaylorSoftmax | 835.1 us | 24.9 us | 33.53x | 0 | direct wins |
 
-The two ties have the same irreducible standalone traffic as their incumbents:
-two FP32 input reads and one FP32 output write. The vectorized PTX forms already
-use read-only loads, L2/write-through stores, zero shared/local memory, and exact
-selection semantics. A material end-to-end win therefore requires fusing the
-mask predicate into its softmax consumer so the intermediate write and reread
-disappear; changing the standalone contract cannot remove those bytes.
+The four below-threshold cells remain optimization findings, not promotions.
+Softmax and LogSumExpBackward need at least another 5% and 1% respectively to
+clear the fixed median floor before tail/resource gates are considered. The two
+masking cells have the same standalone traffic as their incumbents: two FP32
+input reads and one FP32 output write. Their vectorized PTX forms already use
+read-only loads, L2/write-through stores, zero shared/local memory, and exact
+selection semantics. The oracle must test both a better standalone schedule and
+a separately contracted mask-plus-softmax fusion that removes the intermediate
+write and reread; the fused result cannot be relabeled as the standalone operator.
 
 This branch emits and validates **raw PTX**. The compiled-cubin pipeline
 (stages 2–9 below) — driver-linked cubin preservation, SASS audit, embedded
@@ -121,12 +125,12 @@ artifact-identity checks activate once stage 3 artifacts exist.
 | 2 | Coalesced vector memory access | Row reductions stride the row by `blockDim` for coalesced partials and write each normalized value once. Masked-fill and its backward use two aligned float4 transactions per thread with read-only loads and L2-only/write-through output policy. **Pass.** |
 | 3 | Shared memory only for reuse | Block-per-row reductions use eight float warp-leader slots for the hierarchical reduction; the old 256-element staging tree is gone. Pointwise masked-fill, masked-fill-backward, and log-sum-exp-backward use **zero** shared memory. **Pass.** |
 | 4 | Register-resident math | Loaded row values, the running max, exp-sum, backward dot-product, and sparsemax threshold remain in registers until the final store. Every kernel reports **zero local bytes** (asserted in the driver tests) and passes the PTX-discipline `.local` guard. **Pass.** |
-| 5 | Combined/fused kernels | Softmax fuses max-reduction, stable exponentiation, sum-reduction, and normalization in one block pass; softmax-backward fuses the `Σ(dY·S)` reduction with the `S·(dY − Σ)` epilogue. **Pass for the eight measured winning cells; standalone mask/softmax fusion is the remaining performance follow-up.** |
+| 5 | Combined/fused kernels | Softmax fuses max-reduction, stable exponentiation, sum-reduction, and normalization in one block pass; softmax-backward fuses the `Σ(dY·S)` reduction with the `S·(dY − Σ)` epilogue. **Pass for the six measured device-median wins; the four below-threshold cells remain active findings, including a separately contracted mask/softmax fusion.** |
 | 6 | Bounded global reductions | Row reductions use warp shuffles plus eight shared leaders, two barriers per logical reduction, no output-sized scratch, and no atomics; sparsemax runs a fixed 30-step τ-bisection with the same reducer. **Correctness and SM86 performance pass.** |
 | 7 | Asynchronous stream ordering | Launches use the backend stream with no host synchronization; the dispatch layer rejects launches during CUDA-graph capture unless prewarmed. `cp.async` is inapplicable to these single-use row loads. **Pass.** |
 | 8 | CUDA Graph/lifetime safety | Modules are pinned for capture lifetime and the dispatch shell rejects compilation/cache-miss during capture. **Pass.** |
 | 9 | Ahead-of-load binary control | PTX is emitted and blueprint-audited today; linking to cubin, SASS disasm, embedding, and content-addressed caching are staged for the SM86 pipeline. Raw PTX load is experiment-only and unpromoted. **Source-side pass; binary stages pending SM86.** |
-| 10 | Promotion evidence | Three independent corrected competitor comparisons plus correctness/determinism, zero hot allocation, resource, and tail gates must all pass. **HOLD:** the shipped-CUDA head-to-head is now wired and reports eight wins/two ties, but the two masking cells still need fusion evidence and no cell is promoted by this PR. |
+| 10 | Promotion evidence | Three independent corrected competitor comparisons plus correctness/determinism, zero hot allocation, resource, and tail gates must all pass. **HOLD:** the diagnostic shipped-CUDA head-to-head reports six device-median wins and four below-threshold findings; it does not yet collect the complete release evidence and no cell is promoted by this PR. |
 
 Tensor Core MMA is not a requirement for this family: softmax normalization is a
 row reduction, not a matrix multiply, so cargo-cult MMA instructions that add
