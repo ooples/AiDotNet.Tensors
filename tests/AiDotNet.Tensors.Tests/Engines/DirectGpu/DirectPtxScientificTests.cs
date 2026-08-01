@@ -2047,9 +2047,11 @@ public class DirectPtxScientificTests
     {
         string ptx = PtxOctonionMultiplyKernel.EmitPtx(8, 6, 16384);
         Assert.Contains(PtxOctonionMultiplyKernel.EntryPoint, ptx);
-        Assert.Equal(16, Count(ptx, "ld.global.nc.f32"));   // 8 a + 8 b into registers
-        Assert.Equal(8, Count(ptx, "st.global.f32"));        // 8 output components
-        Assert.Equal(8, Count(ptx, "mul.rn.f32 %f16"));      // one leading product per component
+        Assert.Equal(4, Count(ptx, "ld.global.nc.v4.f32")); // two vectors per operand
+        Assert.Equal(2, Count(ptx, "st.global.v4.f32"));    // two output vectors
+        Assert.Equal(7, Count(ptx, "neg.f32"));             // reused negative a1..a7
+        Assert.Equal(8, Count(ptx, "mul.rn.f32 %f1"));       // %f16..%f19 leading products
+        Assert.Equal(56, Count(ptx, "fma.rn.f32 %f1"));      // seven signed terms per component
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -2064,6 +2066,7 @@ public class DirectPtxScientificTests
             "The checked-in octonion-multiply specialization is measured on GA10x/SM86.");
         const int count = 16384;
         using var kernel = new PtxOctonionMultiplyKernel(runtime, count);
+        Assert.Equal(36, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20266200);

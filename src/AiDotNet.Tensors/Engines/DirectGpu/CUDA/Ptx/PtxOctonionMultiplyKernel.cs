@@ -7,9 +7,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Octonion multiply <c>r = a * b</c> over contiguous 8-component octonions (issue #854),
 /// using the explicit Cayley-Dickson multiplication table that matches the established NVRTC
-/// kernel exactly. One thread owns one octonion: it loads both operands into registers and
-/// emits each of the eight output components as a fully register-resident sum of eight signed
-/// products — no shared memory, no reduction, no global intermediate.
+/// kernel exactly. One thread owns one octonion: aligned 128-bit transfers load both operands into
+/// registers and each output is a register-resident chain of signed fused multiply-adds — no shared
+/// memory, no reduction, no global intermediate.
 ///
 /// 256 threads/block, grid = count/256 (positive multiple of 256). Buffers are contiguous of
 /// length <c>8·count</c> floats.
@@ -122,7 +122,7 @@ internal sealed class PtxOctonionMultiplyKernel : IDisposable
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<8>;");
         ptx.AppendLine("    .reg .b64 %rd<10>;");
-        ptx.AppendLine("    .reg .f32 %f<20>;");
+        ptx.AppendLine("    .reg .f32 %f<27>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [a_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [b_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
@@ -133,28 +133,31 @@ internal sealed class PtxOctonionMultiplyKernel : IDisposable
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");     // &a[oct]
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");     // &b[oct]
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");     // &out[oct]
-        // a -> %f0..%f7, b -> %f8..%f15.
-        for (int i = 0; i < Components; i++)
-            ptx.AppendLine($"    ld.global.nc.f32 %f{i}, [%rd4+{i * sizeof(float)}];");
-        for (int i = 0; i < Components; i++)
-            ptx.AppendLine($"    ld.global.nc.f32 %f{8 + i}, [%rd5+{i * sizeof(float)}];");
+        // a -> %f0..%f7, b -> %f8..%f15 via aligned 16-byte transactions.
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f0, %f1, %f2, %f3}, [%rd4];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f4, %f5, %f6, %f7}, [%rd4+16];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f8, %f9, %f10, %f11}, [%rd5];");
+        ptx.AppendLine("    ld.global.nc.v4.f32 {%f12, %f13, %f14, %f15}, [%rd5+16];");
+        for (int i = 1; i < Components; i++)
+            ptx.AppendLine($"    neg.f32 %f{19 + i}, %f{i};");
         // Each output component: register-resident signed sum of eight products.
         for (int k = 0; k < Components; k++)
         {
+            int accumulator = 16 + (k % 4);
             // First term (Sign[k][0] is always +1): acc = a[0] * b[BIndex[k][0]].
-            ptx.AppendLine($"    mul.rn.f32 %f16, %f0, %f{8 + BIndex[k][0]};");
+            ptx.AppendLine($"    mul.rn.f32 %f{accumulator}, %f0, %f{8 + BIndex[k][0]};");
             for (int i = 1; i < Components; i++)
             {
                 string bReg = $"%f{8 + BIndex[k][i]}";
                 if (Sign[k][i] > 0)
-                    ptx.AppendLine($"    fma.rn.f32 %f16, %f{i}, {bReg}, %f16;");
+                    ptx.AppendLine($"    fma.rn.f32 %f{accumulator}, %f{i}, {bReg}, %f{accumulator};");
                 else
-                {
-                    ptx.AppendLine($"    mul.rn.f32 %f17, %f{i}, {bReg};");
-                    ptx.AppendLine("    sub.rn.f32 %f16, %f16, %f17;");
-                }
+                    ptx.AppendLine($"    fma.rn.f32 %f{accumulator}, %f{19 + i}, {bReg}, %f{accumulator};");
             }
-            ptx.AppendLine($"    st.global.f32 [%rd6+{k * sizeof(float)}], %f16;");
+            if (k == 3)
+                ptx.AppendLine("    st.global.v4.f32 [%rd6], {%f16, %f17, %f18, %f19};");
+            else if (k == 7)
+                ptx.AppendLine("    st.global.v4.f32 [%rd6+16], {%f16, %f17, %f18, %f19};");
         }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -166,9 +169,9 @@ internal sealed class PtxOctonionMultiplyKernel : IDisposable
         var extent = new DirectPtxExtent(count, Components);
         return new DirectPtxKernelBlueprint(
             Operation: "octonion-multiply",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"fp32-count{count}",
+            Variant: $"fp32-v4-signed-fma-count{count}",
             Tensors:
             [
                 new("a", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -178,15 +181,17 @@ internal sealed class PtxOctonionMultiplyKernel : IDisposable
                 new("output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 40,
-                MaxStaticSharedBytes: 0,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 36,
+                maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "r = a * b via the explicit Cayley-Dickson octonion table",
                 ["layout"] = "contiguous-8-component-octonions",
+                ["vectorization"] = "two aligned v4 transfers per operand/output",
+                ["arithmetic"] = "one multiply plus seven signed fused multiply-adds per component",
                 ["register-resident"] = "both-operands-and-all-8-outputs",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
