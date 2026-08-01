@@ -54,6 +54,29 @@ internal static class DirectPtxPtxText
         }
     }
 
+    /// <summary>Appends a full-warp FP32 maximum reduction using five shuffle-down stages.</summary>
+    internal static void AppendWarpMax(
+        StringBuilder text,
+        string partialFloat,
+        string sourceBits,
+        string shuffledBits,
+        string shuffledFloat)
+    {
+        if (text is null) throw new ArgumentNullException(nameof(text));
+        if (string.IsNullOrWhiteSpace(partialFloat)) throw new ArgumentException("A partial register is required.", nameof(partialFloat));
+        if (string.IsNullOrWhiteSpace(sourceBits)) throw new ArgumentException("A source-bits register is required.", nameof(sourceBits));
+        if (string.IsNullOrWhiteSpace(shuffledBits)) throw new ArgumentException("A shuffled-bits register is required.", nameof(shuffledBits));
+        if (string.IsNullOrWhiteSpace(shuffledFloat)) throw new ArgumentException("A shuffled-float register is required.", nameof(shuffledFloat));
+
+        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+        {
+            text.AppendLine($"    mov.b32 {sourceBits}, {partialFloat};");
+            text.AppendLine($"    shfl.sync.down.b32 {shuffledBits}, {sourceBits}, {offset}, 31, 0xffffffff;");
+            text.AppendLine($"    mov.b32 {shuffledFloat}, {shuffledBits};");
+            text.AppendLine($"    max.f32 {partialFloat}, {partialFloat}, {shuffledFloat};");
+        }
+    }
+
     /// <summary>Appends a scalar/v2/v4 pair reduction while one thread retains one output.</summary>
     /// <remarks>
     /// The emitted contract uses <c>%f0</c> as the accumulator, <c>%rd6/%rd7</c> as input walkers,

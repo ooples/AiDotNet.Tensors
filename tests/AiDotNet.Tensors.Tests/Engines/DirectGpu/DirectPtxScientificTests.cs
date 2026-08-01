@@ -1709,7 +1709,7 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void SphericalSoftmaxEmitter_IsFourPassThreadPerRow()
+    public void SphericalSoftmaxEmitter_IsFourPassWarpPerRow()
     {
         string ptx = PtxSphericalSoftmaxKernel.EmitPtx(8, 6, 256, 32);
         Assert.Contains(PtxSphericalSoftmaxKernel.EntryPoint, ptx);
@@ -1718,9 +1718,13 @@ public class DirectPtxScientificTests
         Assert.Contains("$SS_P3:", ptx);   // exp + sum
         Assert.Contains("$SS_P4:", ptx);   // scale
         Assert.Equal(1, Count(ptx, "ex2.approx.f32"));       // stable exp
-        Assert.Equal(1, Count(ptx, "max.f32"));              // running max
+        Assert.Equal(6, Count(ptx, "max.f32"));              // lane max + five shuffle stages
+        Assert.Equal(15, Count(ptx, "shfl.sync.down.b32"));  // norm sum + max + exp sum
+        Assert.Equal(3, Count(ptx, "shfl.sync.idx.b32"));    // broadcast reductions
         Assert.Equal(2, Count(ptx, "div.rn.f32"));           // invNorm + inv_sum
         Assert.Contains("mov.f32 %f2, 0fFF800000", ptx);     // max init -inf
+        Assert.Contains("shr.u32 %r2, %r0, 5", ptx);
+        Assert.Contains("and.b32 %r3, %r0, 31", ptx);
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -1736,6 +1740,7 @@ public class DirectPtxScientificTests
             "The checked-in spherical-softmax specialization is measured on GA10x/SM86.");
         const int outerSize = 256, innerSize = 40;
         using var kernel = new PtxSphericalSoftmaxKernel(runtime, outerSize, innerSize);
+        Assert.Equal(24, kernel.Audit.Function.RegistersPerThread);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20268000);

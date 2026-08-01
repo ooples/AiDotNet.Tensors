@@ -7,14 +7,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Spherical softmax (issue #854), matching the NVRTC <c>spherical_softmax</c> kernel:
 /// L2-normalize each row (<c>x / sqrt(||x||^2 + 1e-12)</c>) then take a numerically-stable softmax
-/// over the normalized row. One thread owns one row and walks the <c>innerSize</c> axis serially in
-/// four passes (norm, normalize+max, exp+sum, scale) — no shared memory, no reduction; intermediate
-/// values round-trip through the output row exactly as in the NVRTC kernel. <c>expf</c> is
-/// reconstructed as <c>ex2.approx.f32(x * log2(e))</c>.
+/// over the normalized row. One warp owns one row and its lanes walk the <c>innerSize</c> axis in
+/// four passes (norm, normalize+max, exp+sum, scale). Warp shuffles reduce the norm, maximum, and
+/// exponential sum without shared memory; intermediate values round-trip through the output row
+/// exactly as in the NVRTC kernel. <c>expf</c> is reconstructed as
+/// <c>ex2.approx.f32(x * log2(e))</c>.
 ///
 /// Shape (outerSize, innerSize) is baked into the PTX, so the launch takes buffer pointers only.
-/// 256 threads/block, grid = outerSize/256 (a positive multiple of 256), so there is no divergent
-/// bounds guard.
+/// 256 threads/block (eight rows/block), grid = outerSize/8 (a positive multiple of eight), so
+/// there is no divergent row bounds guard.
 /// </summary>
 internal sealed class PtxSphericalSoftmaxKernel : IDisposable
 {
@@ -62,7 +63,9 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
         void** arguments = stackalloc void*[2];
         arguments[0] = &inputPointer;
         arguments[1] = &outputPointer;
-        _module.Launch(_function, (uint)(OuterSize / BlockThreads), 1, 1, BlockThreads, 1, 1, 0, arguments);
+        _module.Launch(
+            _function, (uint)(OuterSize / (BlockThreads / 32)), 1, 1,
+            BlockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -84,80 +87,107 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<4>;");
-        ptx.AppendLine("    .reg .b32 %r<8>;");
-        ptx.AppendLine("    .reg .b64 %rd<14>;");
-        ptx.AppendLine("    .reg .f32 %f<12>;");
+        ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b32 %r<10>;");
+        ptx.AppendLine("    .reg .b64 %rd<12>;");
+        ptx.AppendLine("    .reg .f32 %f<10>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [in_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [out_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");   // row
-        ptx.AppendLine($"    mul.lo.u32 %r3, %r2, {innerSize};");          // row*innerSize
-        ptx.AppendLine("    mul.wide.u32 %rd2, %r3, 4;");
+        ptx.AppendLine($"    mad.lo.u32 %r0, %r1, {BlockThreads}, %r0;"); // global thread
+        ptx.AppendLine("    shr.u32 %r2, %r0, 5;");                       // warp owns row
+        ptx.AppendLine("    and.b32 %r3, %r0, 31;");                      // lane owns feature
+        ptx.AppendLine($"    mul.lo.u32 %r4, %r2, {innerSize};");
+        ptx.AppendLine("    mul.wide.u32 %rd2, %r4, 4;");
         ptx.AppendLine("    add.u64 %rd3, %rd0, %rd2;");                   // inBase
         ptx.AppendLine("    add.u64 %rd4, %rd1, %rd2;");                   // outBase
 
-        // Pass 1: norm_sq = sum in[j]^2 ; norm = sqrt(norm_sq + 1e-12)
-        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // norm_sq
-        ptx.AppendLine("    mov.u64 %rd5, %rd3;");
-        ptx.AppendLine("    mov.u32 %r4, 0;");
+        // Pass 1: lane partial norm, then warp sum.
+        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("    mul.wide.u32 %rd5, %r3, 4;");
+        ptx.AppendLine("    add.u64 %rd6, %rd3, %rd5;");
+        ptx.AppendLine("    mov.u32 %r5, %r3;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @!%p0 bra $SS_P1_DONE;");
         ptx.AppendLine("$SS_P1:");
-        ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd5];");
+        ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd6];");
         ptx.AppendLine("    fma.rn.f32 %f0, %f5, %f5, %f0;");
-        ptx.AppendLine("    add.u64 %rd5, %rd5, 4;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p0, %r4, {innerSize};");
+        ptx.AppendLine("    add.u64 %rd6, %rd6, 128;");
+        ptx.AppendLine("    add.u32 %r5, %r5, 32;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
         ptx.AppendLine("    @%p0 bra $SS_P1;");
+        ptx.AppendLine("$SS_P1_DONE:");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f0", "%r6", "%r7", "%f6");
+        ptx.AppendLine("    mov.b32 %r6, %f0;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r7, %r6, 0, 31, 0xffffffff;");
+        ptx.AppendLine("    mov.b32 %f0, %r7;");
         ptx.AppendLine($"    add.rn.f32 %f0, %f0, {normEps};");
-        ptx.AppendLine("    sqrt.rn.f32 %f1, %f0;");                      // norm
-        ptx.AppendLine($"    div.rn.f32 %f1, {one}, %f1;");              // invNorm
+        ptx.AppendLine("    sqrt.rn.f32 %f1, %f0;");
+        ptx.AppendLine($"    div.rn.f32 %f1, {one}, %f1;");
 
-        // Pass 2: out[j] = in[j]*invNorm ; max_val = max over out[j]
-        ptx.AppendLine($"    mov.f32 %f2, {negInf};");                   // max_val
-        ptx.AppendLine("    mov.u64 %rd5, %rd3;");                       // in walker
-        ptx.AppendLine("    mov.u64 %rd6, %rd4;");                       // out walker
-        ptx.AppendLine("    mov.u32 %r4, 0;");
+        // Pass 2: normalize and store lane elements, then warp maximum.
+        ptx.AppendLine($"    mov.f32 %f2, {negInf};");
+        ptx.AppendLine("    add.u64 %rd6, %rd3, %rd5;");
+        ptx.AppendLine("    add.u64 %rd7, %rd4, %rd5;");
+        ptx.AppendLine("    mov.u32 %r5, %r3;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @!%p0 bra $SS_P2_DONE;");
         ptx.AppendLine("$SS_P2:");
-        ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd5];");
-        ptx.AppendLine("    mul.rn.f32 %f6, %f5, %f1;");                 // normalized
-        ptx.AppendLine("    st.global.f32 [%rd6], %f6;");
-        ptx.AppendLine("    max.f32 %f2, %f2, %f6;");
-        ptx.AppendLine("    add.u64 %rd5, %rd5, 4;");
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 4;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p1, %r4, {innerSize};");
-        ptx.AppendLine("    @%p1 bra $SS_P2;");
+        ptx.AppendLine("    ld.global.nc.f32 %f5, [%rd6];");
+        ptx.AppendLine("    mul.rn.f32 %f7, %f5, %f1;");
+        ptx.AppendLine("    st.global.f32 [%rd7], %f7;");
+        ptx.AppendLine("    max.f32 %f2, %f2, %f7;");
+        ptx.AppendLine("    add.u64 %rd6, %rd6, 128;");
+        ptx.AppendLine("    add.u64 %rd7, %rd7, 128;");
+        ptx.AppendLine("    add.u32 %r5, %r5, 32;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @%p0 bra $SS_P2;");
+        ptx.AppendLine("$SS_P2_DONE:");
+        DirectPtxPtxText.AppendWarpMax(ptx, "%f2", "%r6", "%r7", "%f6");
+        ptx.AppendLine("    mov.b32 %r6, %f2;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r7, %r6, 0, 31, 0xffffffff;");
+        ptx.AppendLine("    mov.b32 %f2, %r7;");
 
-        // Pass 3: out[j] = exp(out[j] - max_val) ; sum_exp += out[j]
-        ptx.AppendLine("    mov.f32 %f3, 0f00000000;");                  // sum_exp
-        ptx.AppendLine("    mov.u64 %rd6, %rd4;");
-        ptx.AppendLine("    mov.u32 %r4, 0;");
+        // Pass 3: exponentiate lane elements, then warp sum.
+        ptx.AppendLine("    mov.f32 %f3, 0f00000000;");
+        ptx.AppendLine("    add.u64 %rd7, %rd4, %rd5;");
+        ptx.AppendLine("    mov.u32 %r5, %r3;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @!%p0 bra $SS_P3_DONE;");
         ptx.AppendLine("$SS_P3:");
-        ptx.AppendLine("    ld.global.f32 %f5, [%rd6];");
-        ptx.AppendLine("    sub.rn.f32 %f6, %f5, %f2;");                 // out - max
-        ptx.AppendLine($"    mul.rn.f32 %f6, %f6, {log2e};");
-        ptx.AppendLine("    ex2.approx.f32 %f6, %f6;");                  // exp
-        ptx.AppendLine("    st.global.f32 [%rd6], %f6;");
-        ptx.AppendLine("    add.rn.f32 %f3, %f3, %f6;");
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 4;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p2, %r4, {innerSize};");
-        ptx.AppendLine("    @%p2 bra $SS_P3;");
+        ptx.AppendLine("    ld.global.f32 %f5, [%rd7];");
+        ptx.AppendLine("    sub.rn.f32 %f7, %f5, %f2;");
+        ptx.AppendLine($"    mul.rn.f32 %f7, %f7, {log2e};");
+        ptx.AppendLine("    ex2.approx.f32 %f7, %f7;");
+        ptx.AppendLine("    st.global.f32 [%rd7], %f7;");
+        ptx.AppendLine("    add.rn.f32 %f3, %f3, %f7;");
+        ptx.AppendLine("    add.u64 %rd7, %rd7, 128;");
+        ptx.AppendLine("    add.u32 %r5, %r5, 32;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @%p0 bra $SS_P3;");
+        ptx.AppendLine("$SS_P3_DONE:");
+        DirectPtxPtxText.AppendWarpSum(ptx, "%f3", "%r6", "%r7", "%f6");
+        ptx.AppendLine("    mov.b32 %r6, %f3;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r7, %r6, 0, 31, 0xffffffff;");
+        ptx.AppendLine("    mov.b32 %f3, %r7;");
         ptx.AppendLine($"    add.rn.f32 %f3, %f3, {sumEps};");
-        ptx.AppendLine($"    div.rn.f32 %f4, {one}, %f3;");             // inv_sum
+        ptx.AppendLine($"    div.rn.f32 %f4, {one}, %f3;");
 
-        // Pass 4: out[j] *= inv_sum
-        ptx.AppendLine("    mov.u64 %rd6, %rd4;");
-        ptx.AppendLine("    mov.u32 %r4, 0;");
+        // Pass 4: scale lane elements.
+        ptx.AppendLine("    add.u64 %rd7, %rd4, %rd5;");
+        ptx.AppendLine("    mov.u32 %r5, %r3;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @!%p0 bra $SS_DONE;");
         ptx.AppendLine("$SS_P4:");
-        ptx.AppendLine("    ld.global.f32 %f5, [%rd6];");
+        ptx.AppendLine("    ld.global.f32 %f5, [%rd7];");
         ptx.AppendLine("    mul.rn.f32 %f5, %f5, %f4;");
-        ptx.AppendLine("    st.global.f32 [%rd6], %f5;");
-        ptx.AppendLine("    add.u64 %rd6, %rd6, 4;");
-        ptx.AppendLine("    add.u32 %r4, %r4, 1;");
-        ptx.AppendLine($"    setp.lt.u32 %p3, %r4, {innerSize};");
-        ptx.AppendLine("    @%p3 bra $SS_P4;");
+        ptx.AppendLine("    st.global.f32 [%rd7], %f5;");
+        ptx.AppendLine("    add.u64 %rd7, %rd7, 128;");
+        ptx.AppendLine("    add.u32 %r5, %r5, 32;");
+        ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {innerSize};");
+        ptx.AppendLine("    @%p0 bra $SS_P4;");
+        ptx.AppendLine("$SS_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -168,9 +198,9 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
         var extent = new DirectPtxExtent(outerSize * innerSize);
         return new DirectPtxKernelBlueprint(
             Operation: "spherical-softmax",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"fp32-o{outerSize}-i{innerSize}",
+            Variant: $"fp32-warp-o{outerSize}-i{innerSize}",
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -187,6 +217,7 @@ internal sealed class PtxSphericalSoftmaxKernel : IDisposable
             {
                 ["formula"] = "out = softmax_stable(normalize_L2(x)); norm eps 1e-12, sum eps 1e-10",
                 ["approximation"] = "expf via ex2.approx.f32(x*log2e)",
+                ["reduction"] = "one warp per row; shuffle sum/max; lane-strided features",
                 ["global-intermediates"] = "output row reused across passes (matches NVRTC)",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"
