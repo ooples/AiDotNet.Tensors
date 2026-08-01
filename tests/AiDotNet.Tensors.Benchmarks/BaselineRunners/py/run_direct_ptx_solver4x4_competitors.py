@@ -11,9 +11,15 @@ import time
 import torch
 
 
-WARMUPS = 30
-SAMPLES = 101
-LAUNCHES = 10
+MAX_WARMUPS = 30
+MIN_WARMUPS = 3
+FAST_SAMPLES = 101
+SLOW_SAMPLES = 21
+SLOW_OPERATION_US = 1_000.0
+WARMUP_TARGET_US = 10_000.0
+DEVICE_BATCH_TARGET_US = 1_000.0
+MAX_DEVICE_LAUNCHES = 10
+ALLOCATION_SAMPLES = 5
 BATCHES = (1024, 4096, 16384, 65536)
 OPERATIONS = (
     "cholesky", "lu-factor", "qr", "eigh", "eigh-lower", "svd", "lu-solve",
@@ -51,6 +57,17 @@ def distribution(values):
         "p95_us": percentile(values, 0.95),
         "p99_us": percentile(values, 0.99),
     }
+
+
+def measurement_plan(calibration_us):
+    if not math.isfinite(calibration_us) or calibration_us <= 0.0:
+        raise ValueError("calibration_us must be finite and positive")
+    warmups = max(MIN_WARMUPS, min(
+        MAX_WARMUPS, math.ceil(WARMUP_TARGET_US / calibration_us)))
+    launches = max(1, min(
+        MAX_DEVICE_LAUNCHES, math.ceil(DEVICE_BATCH_TARGET_US / calibration_us)))
+    samples = SLOW_SAMPLES if calibration_us >= SLOW_OPERATION_US else FAST_SAMPLES
+    return warmups, launches, samples
 
 
 def flops(operation, batch):
@@ -218,34 +235,58 @@ def residual(operation, a, outputs):
 
 
 def measure(action):
-    for _ in range(WARMUPS):
+    # One untimed call absorbs lazy library initialization. A CUDA-event calibration
+    # then bounds both warmup work and launches per timed sample. Fixed 10x batching
+    # made a 0.70-second QR call execute 1,212 times per row and turned the three-process
+    # release gate into a multi-hour job without adding useful evidence.
+    action()
+    torch.cuda.synchronize()
+    calibration_start = torch.cuda.Event(enable_timing=True)
+    calibration_stop = torch.cuda.Event(enable_timing=True)
+    calibration_start.record()
+    action()
+    calibration_stop.record()
+    torch.cuda.synchronize()
+    calibration_us = max(calibration_start.elapsed_time(calibration_stop) * 1000.0, 0.001)
+
+    warmups, launches, samples = measurement_plan(calibration_us)
+
+    for _ in range(warmups):
         action()
     torch.cuda.synchronize()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(SAMPLES)]
-    stops = [torch.cuda.Event(enable_timing=True) for _ in range(SAMPLES)]
-    for index in range(SAMPLES):
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(samples)]
+    stops = [torch.cuda.Event(enable_timing=True) for _ in range(samples)]
+    for index in range(samples):
         starts[index].record()
-        for _ in range(LAUNCHES):
+        for _ in range(launches):
             action()
         stops[index].record()
     torch.cuda.synchronize()
-    device = [start.elapsed_time(stop) * 1000.0 / LAUNCHES for start, stop in zip(starts, stops)]
+    device = [
+        start.elapsed_time(stop) * 1000.0 / launches
+        for start, stop in zip(starts, stops)
+    ]
     e2e = []
-    for _ in range(SAMPLES):
+    for _ in range(samples):
         begin = time.perf_counter_ns()
         action()
         torch.cuda.synchronize()
         e2e.append((time.perf_counter_ns() - begin) / 1000.0)
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_allocated()
-    for _ in range(SAMPLES):
+    for _ in range(ALLOCATION_SAMPLES):
         action()
     torch.cuda.synchronize()
     temporary = max(0, torch.cuda.max_memory_allocated() - before)
-    return distribution(device), distribution(e2e), temporary
+    return (
+        distribution(device), distribution(e2e), temporary,
+        samples, launches, calibration_us,
+    )
 
 
-def emit(run, operation, batch, method, device, e2e, temporary, error):
+def emit(
+        run, operation, batch, method, device, e2e, temporary, error,
+        samples, launches, calibration_us):
     record = {
         "status": "ok", "run": run, "operation": operation, "batch": batch, "method": method,
         "device_mean_us": device["mean_us"], "device_median_us": device["median_us"],
@@ -255,6 +296,8 @@ def emit(run, operation, batch, method, device, e2e, temporary, error):
         "gflops": flops(operation, batch) / (device["median_us"] * 1e-6) / 1e9,
         "gb_per_second": bytes_moved(operation, batch) / (device["median_us"] * 1e-6) / 1e9,
         "managed_bytes": 0, "temporary_device_bytes": temporary, "max_error": error,
+        "samples": samples, "device_launches_per_sample": launches,
+        "calibration_us": calibration_us,
         **environment(),
     }
     print(json.dumps(record, separators=(",", ":")), flush=True)
@@ -293,8 +336,10 @@ def main():
                     eager()
                     torch.cuda.synchronize()
                     error = residual(operation, a, outputs)
-                    device, e2e, temporary = measure(eager)
-                    emit(run, operation, batch, eager_method, device, e2e, temporary, error)
+                    evidence = measure(eager)
+                    emit(
+                        run, operation, batch, eager_method,
+                        *evidence[:3], error, *evidence[3:])
                 except Exception as eager_error:
                     emit_unavailable(run, operation, batch, eager_method, eager_error)
                     emit_unavailable(run, operation, batch, graph_method, eager_error)
@@ -311,8 +356,10 @@ def main():
                     with torch.cuda.graph(graph):
                         eager()
                     replay = graph.replay
-                    device, e2e, temporary = measure(replay)
-                    emit(run, operation, batch, graph_method, device, e2e, temporary, error)
+                    evidence = measure(replay)
+                    emit(
+                        run, operation, batch, graph_method,
+                        *evidence[:3], error, *evidence[3:])
                 except Exception as capture_error:
                     # Some cuSOLVER paths are not capture-safe on every installed
                     # CUDA/PyTorch pair. Preserve that result instead of aborting

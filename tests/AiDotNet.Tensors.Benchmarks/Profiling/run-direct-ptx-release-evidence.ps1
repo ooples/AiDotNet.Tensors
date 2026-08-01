@@ -225,6 +225,19 @@ function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeE
             if ($pythonRows.Count -ne 112) {
                 throw "Solver release gate expected 112 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
             }
+            foreach ($pythonRow in @($pythonRows | Where-Object { $_.status -eq 'ok' })) {
+                $calibrationUs = [double]$pythonRow.calibration_us
+                $samples = [int]$pythonRow.samples
+                $launches = [int]$pythonRow.device_launches_per_sample
+                if ([double]::IsNaN($calibrationUs) -or
+                    [double]::IsInfinity($calibrationUs) -or $calibrationUs -le 0.0) {
+                    throw "Solver release gate found invalid PyTorch calibration metadata for run $run '$($pythonRow.operation)'/B=$($pythonRow.batch) '$($pythonRow.method)'."
+                }
+                $minimumSamples = if ($calibrationUs -ge 1000.0) { 21 } else { 101 }
+                if ($samples -lt $minimumSamples -or $launches -lt 1 -or $launches -gt 10) {
+                    throw "Solver release gate found insufficient PyTorch sampling metadata for run $run '$($pythonRow.operation)'/B=$($pythonRow.batch) '$($pythonRow.method)' (calibration=${calibrationUs}us, samples=$samples, launches=$launches)."
+                }
+            }
         }
 
         $fingerprints = @($dotnetRows.device_fingerprint | Sort-Object -Unique)
@@ -341,6 +354,7 @@ function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeE
         maximum_error = 2e-5
         required_managed_temporary_shared_local_bytes = 0
         minimum_active_blocks_per_sm = 2
+        external_sampling = '101 samples below 1 ms; at least 21 samples at or above 1 ms; 1-10 calibrated launches/sample'
         runs = $RunCount
         external_competitors_included = $IncludeExternal
         verdicts = @($verdicts)

@@ -91,12 +91,15 @@ None of these GPU assertions is claimed as passed in this change. Static emitter
 
 ## Championship evidence protocol
 
-Every result requires three independent clean runs, at least 30 warmups, 101 samples, resident preallocated buffers, CUDA-event device timing, synchronized end-to-end timing, and the complete GPU/SM/UUID/driver/runtime fingerprint. Device timing captures a 1,000-launch measurement batch for each resident method, with externally observable start/stop event nodes inside that same graph. Host submission gaps therefore cannot be mislabeled as device work, while the longer interval amortizes fixed WDDM desktop-preemption quanta. Candidate and incumbent graphs rotate within every sample round so neither receives a different scheduler or power-state window. A captured method reuses the isolated candidate-kernel distribution because capture changes submission rather than kernel execution. End-to-end timing remains separately measured for resident and captured submission, with resident, graph, and incumbent actions interleaved across 101 rotating rounds so their production costs remain visible.
+Every result requires three independent clean processes, resident preallocated buffers, CUDA-event device timing, synchronized end-to-end timing, and the complete GPU/SM/UUID/driver/runtime fingerprint. The AiDotNet lane uses at least 30 warmups and 101 samples. Device timing captures a 1,000-launch measurement batch for each resident method, with externally observable start/stop event nodes inside that same graph. Host submission gaps therefore cannot be mislabeled as device work, while the longer interval amortizes fixed WDDM desktop-preemption quanta. Candidate and incumbent graphs rotate within every sample round so neither receives a different scheduler or power-state window. A captured method reuses the isolated candidate-kernel distribution because capture changes submission rather than kernel execution. End-to-end timing remains separately measured for resident and captured submission, with resident, graph, and incumbent actions interleaved across 101 rotating rounds so their production costs remain visible.
 
-Run AiDotNet candidates and established CUDA kernels:
+The external PyTorch lane calibrates one CUDA-event-timed call before choosing its measurement plan. Calls below 1 ms retain 101 samples and one to ten launches per device sample; calls at or above 1 ms use at least 21 samples and one launch. Warmup work targets 10 ms but is bounded to 3–30 calls. This keeps close competitors on the full 101-sample protocol while preventing pathologically slow vendor calls from being repeated without bound. For example, PyTorch QR at batch 4096 measured about 0.60 seconds per eager call on the validation host; fixed 10x batching executed 1,212 calls per row, whereas 21 one-launch samples still produce a meaningful empirical P95 and are repeated in all three independent processes. The release gate validates this sampling metadata before accepting an external row; the correctness, 1.10x device/E2E median, and device-P95 requirements are unchanged.
+
+Run the complete release orchestrator. It starts each AiDotNet and PyTorch run in
+a separate clean process and joins the rows through the release gate:
 
 ```powershell
-dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -f net10.0 -- --direct-ptx-solvers-4x4 3
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1 -Runs 3 -Issue853Only
 ```
 
 For a diagnostic rerun of one oracle cell, append
@@ -104,13 +107,13 @@ For a diagnostic rerun of one oracle cell, append
 diagnostic only; release evidence still requires the complete matrix in three
 independent processes.
 
-Run the PyTorch/cuSOLVER eager and CUDA-graph competitors:
+Run only the PyTorch/cuSOLVER eager and CUDA-graph competitors for diagnosis:
 
 ```powershell
 python tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_solver4x4_competitors.py --runs 3
 ```
 
-The output is JSON-lines plus a TUI table. Group rows by `(run, operation, batch)` before selecting the winner. FLOP rates for iterative Eigh/SVD use the fixed algorithm counts documented in the harness, not vendor peak FLOPS.
+The output is JSON-lines. Group rows by `(run, operation, batch)` before selecting the winner. FLOP rates for iterative Eigh/SVD use the fixed algorithm counts documented in the harness, not vendor peak FLOPS.
 
 ### Pending grouped result table
 
