@@ -74,19 +74,26 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             isPaged, queryHeads, keyValueHeads, sequenceLength,
             blockSize, poolBlocks, scale, WarpsPerBlock);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(
-            isPaged ? PagedEntryPoint : DenseEntryPoint,
-            out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int blockThreads = WarpsPerBlock * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            isPaged ? PagedEntryPoint : DenseEntryPoint,
-            functionInfo, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module);
+        string entryPoint = isPaged ? PagedEntryPoint : DenseEntryPoint;
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    entryPoint, out DirectPtxFunctionInfo functionInfo);
+                int blockThreads = WarpsPerBlock * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    entryPoint, functionInfo, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, FunctionInfo: functionInfo, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void LaunchDense(

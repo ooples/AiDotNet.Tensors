@@ -65,27 +65,36 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             batch, heads, querySequence, keyValueSequence, scale, isCausal,
             biasBatchStride);
-        _module = runtime.LoadModule(Ptx);
-        _gradQueryFunction = _module.GetFunction(
-            GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
-        _gradKeyValueFunction = _module.GetFunction(
-            GradKeyValueEntryPoint, out DirectPtxFunctionInfo gradKeyValueInfo);
-
-        int blockThreads = WarpsPerBlock * 32;
-        int gradQueryBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _gradQueryFunction, blockThreads);
-        int gradKeyValueBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _gradKeyValueFunction, blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            GradQueryEntryPoint, gradQueryInfo, blockThreads, gradQueryBlocks);
-        Blueprint.ResourceBudget.Validate(
-            GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
-        GradQueryAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
-            blockThreads, gradQueryBlocks, _module);
-        GradKeyValueAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
-            blockThreads, gradKeyValueBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr gradQueryFunction = module.GetFunction(
+                    GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
+                IntPtr gradKeyValueFunction = module.GetFunction(
+                    GradKeyValueEntryPoint, out DirectPtxFunctionInfo gradKeyValueInfo);
+                int blockThreads = WarpsPerBlock * 32;
+                int gradQueryBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    gradQueryFunction, blockThreads);
+                int gradKeyValueBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    gradKeyValueFunction, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    GradQueryEntryPoint, gradQueryInfo, blockThreads, gradQueryBlocks);
+                Blueprint.ResourceBudget.Validate(
+                    GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
+                var gradQueryAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
+                    blockThreads, gradQueryBlocks, module);
+                var gradKeyValueAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
+                    blockThreads, gradKeyValueBlocks, module);
+                return (gradQueryFunction, gradKeyValueFunction, gradQueryAudit, gradKeyValueAudit);
+            });
+        _module = loaded.Resource;
+        _gradQueryFunction = loaded.Value.gradQueryFunction;
+        _gradKeyValueFunction = loaded.Value.gradKeyValueFunction;
+        GradQueryAudit = loaded.Value.gradQueryAudit;
+        GradKeyValueAudit = loaded.Value.gradKeyValueAudit;
     }
 
     internal unsafe void Launch(
