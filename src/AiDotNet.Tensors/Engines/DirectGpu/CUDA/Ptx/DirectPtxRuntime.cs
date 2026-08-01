@@ -66,7 +66,8 @@ internal sealed class DirectPtxRuntime : IDisposable
         // in the legacy default-stream ordering domain. A blocking stream preserves
         // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
         // and can let a freshly launched block observe pre-upload allocation contents.
-        Check(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate(blocking)");
+        Check(CudaNativeBindings.cuStreamCreate(out _stream, CudaNativeBindings.CU_STREAM_DEFAULT),
+            "cuStreamCreate(blocking)");
         _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation
         // below has an explicit, balanced push/pop boundary.

@@ -20,6 +20,8 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
     internal const int HeadDimension = 64;
     internal const int QueryTileRows = 16;
     internal const int KeyTileRows = 16;
+    private const int CausalMaxRegistersPerThread = 144;
+    private const int UnmaskedMaxRegistersPerThread = 96;
 
     internal static bool IsSupportedSequenceLength(int sequenceLength)
         => sequenceLength is 16 or 32 or 64 or 128;
@@ -212,7 +214,9 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                 // Driver-linked causal variants retain mask/epilogue state across the
                 // online tile and reach 144 registers on SM86. Unmasked variants keep
                 // the tighter historical ceiling. Both lanes remain zero-spill.
-                MaxRegistersPerThread: isCausal ? 144 : 96,
+                MaxRegistersPerThread: isCausal
+                    ? CausalMaxRegistersPerThread
+                    : UnmaskedMaxRegistersPerThread,
                 MaxStaticSharedBytes: 32 * 1024,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
