@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the online-attention family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -100,7 +119,7 @@ class Program
         {
             string outputDirectory = args.Length > 1
                 ? args[1]
-                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
             DirectPtxDenseLinearArtifactTool.Export(outputDirectory);
             return;
         }
@@ -108,7 +127,7 @@ class Program
         {
             string artifactDirectory = args.Length > 1
                 ? args[1]
-                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
             DirectPtxDenseLinearArtifactTool.Verify(artifactDirectory);
             return;
         }
@@ -118,7 +137,7 @@ class Program
                 throw new ArgumentException("Pass the absolute nvdisasm executable path.");
             string artifactDirectory = args.Length > 2
                 ? args[2]
-                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
             string evidenceDirectory = args.Length > 3
                 ? args[3]
                 : Path.Combine("artifacts", "direct-ptx", "dense-linear", "sass");

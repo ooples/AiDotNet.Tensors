@@ -81,7 +81,10 @@ internal static class DirectPtxCubinArtifactCache
             if (_freshCompileScopeDepth != 0)
                 return Compile(runtime, ptx, sourceKey, cachePath: null);
             DirectPtxCubinArtifact? embedded = TryReadEmbedded(
-                runtime, sourceKey, ComputePtxSha256(ptx));
+                runtime.ComputeCapabilityMajor,
+                runtime.ComputeCapabilityMinor,
+                sourceKey,
+                ComputePtxSha256(ptx));
             if (embedded != null)
                 return embedded;
 
@@ -169,6 +172,20 @@ internal static class DirectPtxCubinArtifactCache
                 : "used unavailable barriers",
             RegexOptions.CultureInvariant);
 
+    internal static DirectPtxCubinArtifact? TryResolveEmbedded(
+        string ptx,
+        int computeCapabilityMajor,
+        int computeCapabilityMinor)
+    {
+        PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
+        ptx = CanonicalizePtx(ptx);
+        return TryReadEmbedded(
+            computeCapabilityMajor,
+            computeCapabilityMinor,
+            ComputeSourceKey(ptx, computeCapabilityMajor, computeCapabilityMinor),
+            ComputePtxSha256(ptx));
+    }
+
     internal static string CanonicalizePtx(string ptx)
     {
         PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
@@ -178,11 +195,14 @@ internal static class DirectPtxCubinArtifactCache
     }
 
     private static DirectPtxCubinArtifact? TryReadEmbedded(
-        DirectPtxRuntime runtime, string sourceKey, string ptxSha256)
+        int computeCapabilityMajor,
+        int computeCapabilityMinor,
+        string sourceKey,
+        string ptxSha256)
     {
         string architecture = "sm" +
-            runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture);
+            computeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
+            computeCapabilityMinor.ToString(CultureInfo.InvariantCulture);
         string sourceIdentity = architecture + "|source|" + sourceKey;
         string ptxIdentity = architecture + "|ptx|" + ptxSha256;
         if (!EmbeddedArtifacts.Value.TryGetValue(sourceIdentity, out EmbeddedArtifact? artifact) &&
@@ -235,21 +255,13 @@ internal static class DirectPtxCubinArtifactCache
     {
         var result = new Dictionary<string, EmbeddedArtifact>(StringComparer.Ordinal);
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
-        foreach (string resourceName in assembly.GetManifestResourceNames())
+        string[] orderedResourceNames = assembly.GetManifestResourceNames()
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        foreach (string resourceName in orderedResourceNames)
         {
             if (!resourceName.EndsWith(".tsv", StringComparison.Ordinal) ||
-                resourceName.IndexOf(".Artifacts.sm", StringComparison.Ordinal) < 0)
-                continue;
-
-            const string marker = ".Artifacts.";
-            int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
-            int architectureStart = markerIndex + marker.Length;
-            int architectureEnd = resourceName.IndexOf('.', architectureStart);
-            if (markerIndex < 0 || architectureEnd <= architectureStart)
-                continue;
-            string architecture = resourceName.Substring(
-                architectureStart, architectureEnd - architectureStart);
-            if (!architecture.StartsWith("sm", StringComparison.Ordinal))
+                !TryParseEmbeddedArtifactArchitecture(resourceName, out string architecture))
                 continue;
 
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
@@ -289,8 +301,8 @@ internal static class DirectPtxCubinArtifactCache
                     throw new InvalidDataException(
                         "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
 
-                string? cubinResource = FindEmbeddedArtifactResource(
-                    assembly, architecture, columns[fileIndex]);
+                string? cubinResource = FindEmbeddedCubinResource(
+                    orderedResourceNames, architecture, columns[fileIndex]);
                 if (cubinResource == null)
                     throw new InvalidDataException(
                         "Embedded direct-PTX manifest references a missing cubin: " +
@@ -308,8 +320,8 @@ internal static class DirectPtxCubinArtifactCache
                     linkerLogHash = columns[linkerLogIndex];
                     string linkerFile = columns[fileIndex].Substring(
                         0, columns[fileIndex].Length - ".cubin".Length) + ".linker.txt";
-                    linkerResource = FindEmbeddedArtifactResource(
-                        assembly, architecture, linkerFile);
+                    linkerResource = FindEmbeddedCubinResource(
+                        orderedResourceNames, architecture, linkerFile);
                     if (linkerResource == null)
                         throw new InvalidDataException(
                             "Embedded direct-PTX manifest references a missing linker-log sidecar: " +
@@ -327,13 +339,39 @@ internal static class DirectPtxCubinArtifactCache
         return result;
     }
 
-    private static string? FindEmbeddedArtifactResource(
-        Assembly assembly, string architecture, string fileName)
+    internal static bool TryParseEmbeddedArtifactArchitecture(
+        string resourceName,
+        out string architecture)
+    {
+        const string marker = ".Artifacts.sm";
+        int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
+        if (markerIndex < 0)
+        {
+            architecture = string.Empty;
+            return false;
+        }
+
+        int architectureStart = markerIndex + ".Artifacts.".Length;
+        int architectureEnd = resourceName.IndexOf('.', architectureStart);
+        if (architectureEnd <= architectureStart)
+        {
+            architecture = string.Empty;
+            return false;
+        }
+
+        architecture = resourceName.Substring(
+            architectureStart, architectureEnd - architectureStart);
+        return true;
+    }
+
+    private static string? FindEmbeddedCubinResource(
+        IReadOnlyList<string> orderedResourceNames,
+        string architecture,
+        string fileName)
     {
         string architectureMarker = ".Artifacts." + architecture + ".";
         string suffix = "." + fileName;
-        foreach (string candidate in assembly.GetManifestResourceNames()
-                     .OrderBy(name => name, StringComparer.Ordinal))
+        foreach (string candidate in orderedResourceNames)
         {
             if (candidate.IndexOf(architectureMarker, StringComparison.Ordinal) >= 0 &&
                 candidate.EndsWith(suffix, StringComparison.Ordinal))

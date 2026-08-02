@@ -95,7 +95,7 @@ public partial class DirectPtxWmmaTests
         string[] resources = assembly.GetManifestResourceNames();
         string manifestName = Assert.Single(resources.Where(name =>
             name.EndsWith(
-                ".Artifacts.sm86.dense-linear-cubins.tsv",
+                ".Artifacts.sm86.dense_linear.dense-linear-cubins.tsv",
                 StringComparison.Ordinal)));
         using System.IO.Stream manifestStream =
             assembly.GetManifestResourceStream(manifestName)!;
@@ -111,10 +111,12 @@ public partial class DirectPtxWmmaTests
             string[] columns = line.Split('\t');
             Assert.Equal(6, columns.Length);
             string cubinName = Assert.Single(resources.Where(name =>
-                name.EndsWith("." + columns[4], StringComparison.Ordinal)));
+                name.EndsWith(
+                    ".Artifacts.sm86.dense_linear." + columns[4],
+                    StringComparison.Ordinal)));
             string linkerName = Assert.Single(resources.Where(name =>
                 name.EndsWith(
-                    "." + columns[2] + ".linker.txt",
+                    ".Artifacts.sm86.dense_linear." + columns[2] + ".linker.txt",
                     StringComparison.Ordinal)));
             using System.IO.Stream cubin =
                 assembly.GetManifestResourceStream(cubinName)!;
