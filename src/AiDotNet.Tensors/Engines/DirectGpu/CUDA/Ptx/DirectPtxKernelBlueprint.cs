@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -88,6 +87,14 @@ internal static class DirectPtxArchitecture
     /// whole Ampere family would run PTX that was never validated on SM80/SM87.
     /// </summary>
     internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// Issue #841's first convolution emitter deliberately targets one exact
+    /// GA102/SM86 tuning domain. It remains experimental until GPU evidence is
+    /// attached; other SMs must use the established backend.
+    /// </summary>
+    internal static bool HasExperimentalConvolution(int major, int minor) =>
         (major, minor) == (8, 6);
 }
 
@@ -253,7 +260,11 @@ internal sealed record DirectPtxKernelAudit(
     int BlockThreads,
     int ActiveBlocksPerMultiprocessor,
     string JitInfoLog,
-    DateTime RecordedAtUtc)
+    DateTime RecordedAtUtc,
+    DirectPtxModuleImageKind ImageKind = DirectPtxModuleImageKind.DriverLinkedCubin,
+    string CubinSha256 = "",
+    string CubinSourceKey = "",
+    string? CubinPath = null)
 {
     internal static DirectPtxKernelAudit Create(
         DirectPtxKernelBlueprint blueprint,
@@ -264,11 +275,28 @@ internal sealed record DirectPtxKernelAudit(
         int activeBlocksPerMultiprocessor,
         string jitInfoLog)
     {
-        using SHA256 sha = SHA256.Create();
-        string hash = PtxCompat.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(ptx))).ToLowerInvariant();
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
         return new DirectPtxKernelAudit(
             blueprint.Id, deviceFingerprint, hash, function, blockThreads,
             activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
+    }
+
+    internal static DirectPtxKernelAudit Create(
+        DirectPtxKernelBlueprint blueprint,
+        string deviceFingerprint,
+        string ptx,
+        DirectPtxFunctionInfo function,
+        int blockThreads,
+        int activeBlocksPerMultiprocessor,
+        DirectPtxModule module)
+    {
+        PtxCompat.ThrowIfNull(module, nameof(module));
+        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
+        return new DirectPtxKernelAudit(
+            blueprint.Id, deviceFingerprint, hash, function, blockThreads,
+            activeBlocksPerMultiprocessor, module.JitInfoLog, DateTime.UtcNow,
+            module.ImageKind, module.CubinSha256, module.CubinSourceKey,
+            module.CubinPath);
     }
 
     internal string ToJson() => JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
@@ -317,7 +345,7 @@ internal sealed record DirectPtxProfilerEvidence(
                 {
                     if (column >= data.Length || !TryParseCounter(data[column], out long value)) continue;
                     string metric = header[column].Trim();
-                    values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                    values[metric] = checked(PtxCompat.GetValueOrDefault(values, metric) + value);
                 }
                 nextHeader++;
             }
@@ -334,7 +362,7 @@ internal sealed record DirectPtxProfilerEvidence(
                 {
                     if (TryParseCounter(cells[valueIndex], out long value))
                     {
-                        values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                        values[metric] = checked(PtxCompat.GetValueOrDefault(values, metric) + value);
                         break;
                     }
                 }

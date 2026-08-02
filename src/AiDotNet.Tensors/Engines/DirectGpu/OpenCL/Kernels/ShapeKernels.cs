@@ -294,23 +294,28 @@ __kernel void stft_mag_phase(__global const float* padded, __global const float*
 // phase_vocoder: one thread per (b,f) runs the sequential t-scan internally (accPhase carries over t).
 // Mirrors CpuEngine.TimeStretch index math EXACTLY (its 'nFrames'=outer axis, 'nFreq'=inner axis).
 __kernel void phase_vocoder(__global const float* mag, __global const float* phase,
-    __global float* newMag, __global float* newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) {
-    int idx = get_global_id(0); if (idx >= leading*nFreqV) return;
-    int f = idx % nFreqV; int b = idx / nFreqV;
-    int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    __global float* newMag, __global float* newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate) {
+    // Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching build_spectrum and
+    // CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
+    int idx = get_global_id(0); if (idx >= leading*numFreqs) return;
+    int f = idx % numFreqs; int b = idx / numFreqs;
+    int row = b*numFreqs*numFrames + f*numFrames;
+    int outRow = b*numFreqs*outFrames + f*outFrames;
     float accPhase = 0.0f;
     for (int t = 0; t < outFrames; t++) {
         float srcT = (float)t * rate;
-        int t0 = (int)floor(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
-        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
-        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        int t0 = (int)floor(srcT);
+        if (t0 > numFrames-1) t0 = numFrames-1;
+        int t1 = min(t0+1, numFrames-1); float frac = srcT - (float)t0;
+        float m0 = mag[row + t0]; float m1 = mag[row + t1];
+        newMag[outRow + t] = (1.0f-frac)*m0 + frac*m1;
         float dp = 0.0f;
-        if (t0+1 < nFramesV) {
-            dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f];
+        if (t0+1 < numFrames) {
+            dp = phase[row + t0 + 1] - phase[row + t0];
             dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F));
         }
         accPhase += dp;
-        newPhase[b*outStride + t*nFreqV + f] = accPhase;
+        newPhase[outRow + t] = accPhase;
     }
 }
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
@@ -411,29 +416,44 @@ __kernel void unfold(__global const float* src, __global float* dst, int outerSi
     int w = tmp % nWindows; int outer = tmp / nWindows;
     dst[idx] = src[(outer * dimSize + (w * step + s)) * innerSize + inner];
 }
-// RWKV-7 (WKV7 generalized delta rule) sequence forward. One thread per (batch, head); the sequence is
-// scanned sequentially while a per-(b,h) state matrix S[headDim,headDim] lives in global scratch Sbuf.
-// State: S[di,vi] = sig(A)*S[di,vi] + (sig(B[di])*K[di])*V[vi]; readout: out[di] = sig(R[di]) * sum_vi S[di,vi]*K[vi].
-__kernel void rwkv7_forward(__global const float* R, __global const float* K, __global const float* V,
-    __global const float* A, __global const float* B, __global float* outp, __global float* Sbuf,
+// RWKV-7 ""Goose"" generalized-delta-rule sequence forward (arXiv:2503.14456, Eq. 17). One thread per
+// (batch, head); the sequence is scanned sequentially while the per-(b,h) state S[d_v, d_k] plus the
+// kappaHat/w/a gate vectors live in global scratch Sbuf.
+//   S_t[vi,ki] = S_{t-1}[vi,ki]*w[ki] - (S_{t-1}[vi,:] . kappaHat)*a[ki]*kappaHat[ki] + v[vi]*kTilde[ki]
+//   out[vi]    = sum_ki S_t[vi,ki] * r[ki]
+// w = exp(-e^(-1/2)*sigmoid(D)) and kappaHat = kappa/||kappa||_2 are applied here; AR is post-sigmoid.
+__kernel void rwkv7_forward(__global const float* R, __global const float* KAP, __global const float* KT,
+    __global const float* V, __global const float* D, __global const float* AR,
+    __global float* outp, __global float* Sbuf,
     int batch, int seqLen, int modelDim, int numHeads, int headDim) {
     int bh = get_global_id(0); if (bh >= batch * numHeads) return;
     int b = bh / numHeads; int h = bh % numHeads;
     int hOff = h * headDim; int hh = headDim * headDim;
-    __global float* S = Sbuf + bh * hh;
+    __global float* S = Sbuf + bh * (hh + 3 * headDim);
+    __global float* kh = S + hh;
+    __global float* wv = S + hh + headDim;
+    __global float* av = S + hh + 2 * headDim;
     for (int i = 0; i < hh; i++) S[i] = 0.0f;
     for (int t = 0; t < seqLen; t++) {
         int baseOff = (b * seqLen + t) * modelDim + hOff;
-        for (int di = 0; di < headDim; di++) {
-            float ga = 1.0f / (1.0f + exp(-A[baseOff + di]));
-            float gbk = (1.0f / (1.0f + exp(-B[baseOff + di]))) * K[baseOff + di];
-            int srow = di * headDim;
-            for (int vi = 0; vi < headDim; vi++) S[srow + vi] = ga * S[srow + vi] + gbk * V[baseOff + vi];
+        float ss = 1e-12f;
+        for (int ki = 0; ki < headDim; ki++) { float kp = KAP[baseOff + ki]; ss += kp * kp; }
+        float invN = 1.0f / sqrt(ss);
+        for (int ki = 0; ki < headDim; ki++) {
+            kh[ki] = KAP[baseOff + ki] * invN;
+            wv[ki] = exp(-0.60653065971263342f / (1.0f + exp(-D[baseOff + ki])));
+            av[ki] = AR[baseOff + ki];
         }
-        for (int di = 0; di < headDim; di++) {
-            int srow = di * headDim; float sk = 0.0f;
-            for (int vi = 0; vi < headDim; vi++) sk += S[srow + vi] * K[baseOff + vi];
-            outp[baseOff + di] = (1.0f / (1.0f + exp(-R[baseOff + di]))) * sk;
+        for (int vi = 0; vi < headDim; vi++) {
+            int srow = vi * headDim; float p = 0.0f;
+            for (int ki = 0; ki < headDim; ki++) p += S[srow + ki] * kh[ki];
+            float vv = V[baseOff + vi]; float o = 0.0f;
+            for (int ki = 0; ki < headDim; ki++) {
+                float sv = S[srow + ki] * wv[ki] - p * av[ki] * kh[ki] + vv * KT[baseOff + ki];
+                S[srow + ki] = sv;
+                o += sv * R[baseOff + ki];
+            }
+            outp[baseOff + vi] = o;
         }
     }
 }
@@ -592,7 +612,9 @@ __kernel void istft_from_spectrum(__global const float* specRe, __global const f
     int outIdx = idx % outputLength; int b = idx / outputLength;
     float resultAcc = 0.0f; float windowAcc = 0.0f;
     for (int frame = 0; frame < numFrames; frame++) {
-        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop;
+        // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+        // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8.
+        int writeStart = center ? frame*hop - nFft/2 : frame*hop;
         int i = outIdx - writeStart;
         if (i >= 0 && i < nFft) {
             int specOff = (b*numFrames + frame) * nFft;
