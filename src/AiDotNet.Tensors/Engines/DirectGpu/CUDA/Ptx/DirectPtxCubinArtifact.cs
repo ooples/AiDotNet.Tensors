@@ -146,7 +146,10 @@ internal static class DirectPtxCubinArtifactCache
     {
         var result = new Dictionary<string, EmbeddedArtifact>(StringComparer.Ordinal);
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
-        foreach (string resourceName in assembly.GetManifestResourceNames())
+        string[] orderedResourceNames = assembly.GetManifestResourceNames()
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        foreach (string resourceName in orderedResourceNames)
         {
             if (!resourceName.EndsWith(".tsv", StringComparison.Ordinal) ||
                 !TryParseEmbeddedArtifactArchitecture(resourceName, out string architecture))
@@ -188,7 +191,7 @@ internal static class DirectPtxCubinArtifactCache
                         "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
 
                 string? cubinResource = FindEmbeddedCubinResource(
-                    assembly, architecture, columns[fileIndex]);
+                    orderedResourceNames, architecture, columns[fileIndex]);
                 if (cubinResource == null)
                     throw new InvalidDataException(
                         "Embedded direct-PTX manifest references a missing cubin: " +
@@ -230,12 +233,13 @@ internal static class DirectPtxCubinArtifactCache
     }
 
     private static string? FindEmbeddedCubinResource(
-        Assembly assembly, string architecture, string fileName)
+        IReadOnlyList<string> orderedResourceNames,
+        string architecture,
+        string fileName)
     {
         string architectureMarker = ".Artifacts." + architecture + ".";
         string suffix = "." + fileName;
-        foreach (string candidate in assembly.GetManifestResourceNames()
-                     .OrderBy(name => name, StringComparer.Ordinal))
+        foreach (string candidate in orderedResourceNames)
         {
             if (candidate.IndexOf(architectureMarker, StringComparison.Ordinal) >= 0 &&
                 candidate.EndsWith(suffix, StringComparison.Ordinal))
