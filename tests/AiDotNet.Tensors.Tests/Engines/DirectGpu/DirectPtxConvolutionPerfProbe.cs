@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// each a launch followed by a device sync). Not a pass/fail gate — it prints
 /// honest measured numbers for the #841 evidence table. Skips without a GPU.
 /// </summary>
-[Collection("AutotuneCacheTests")]
+[Collection("DirectGpuSerial")]
 public sealed class DirectPtxConvolutionPerfProbe
 {
     private readonly ITestOutputHelper _out;
