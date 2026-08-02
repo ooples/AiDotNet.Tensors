@@ -68,6 +68,25 @@ public class DirectPtxSgdMomentumTests
     }
 
     [Fact]
+    public void OptimizerOfflinePackage_CoversEveryReleaseModule()
+    {
+        foreach (int size in new[] { 65_536, 262_144, 1_048_576, 4_194_304 })
+        foreach (bool weightDecay in new[] { false, true })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, size, weightDecay), 8, 6));
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, size, weightDecay), 8, 6));
+        }
+
+        Assert.Contains(
+            typeof(PtxFusedSgdMomentumF32Kernel).Assembly.GetManifestResourceNames(),
+            name => name.EndsWith(
+                ".sm86.optimizer.optimizer-cubins.tsv",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void OptimizerCoverageManifest_AssignsEveryCellExactlyOnce()
     {
         Assert.NotEmpty(DirectPtxOptimizerCoverageManifest.All);

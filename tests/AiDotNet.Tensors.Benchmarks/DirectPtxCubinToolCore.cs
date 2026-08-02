@@ -7,11 +7,16 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>One emitted module: what it is, and the PTX that defines it.</summary>
-internal sealed record DirectPtxModuleSource(string BlueprintId, string EntryPoint, string Ptx);
+internal sealed record DirectPtxModuleSource(
+    string BlueprintId,
+    string EntryPoint,
+    string Ptx,
+    int BlockThreads = 256);
 
 /// <summary>
 /// Shared machinery for producing and verifying architecture-specific
@@ -65,10 +70,11 @@ internal static class DirectPtxCubinToolCore
         int failures = 0;
         foreach (DirectPtxModuleSource module in modules)
         {
-            string ptxSha = Sha256(Encoding.UTF8.GetBytes(module.Ptx));
+            string canonicalPtx = DirectPtxCubinArtifactCache.CanonicalizePtx(module.Ptx);
+            string ptxSha = DirectPtxCubinArtifactCache.ComputePtxSha256(canonicalPtx);
             string ptxPath = Path.Combine(outputDirectory, ptxSha + ".ptx");
             string cubinPath = Path.Combine(outputDirectory, ptxSha + ".cubin.tmp");
-            File.WriteAllText(ptxPath, module.Ptx);
+            File.WriteAllText(ptxPath, canonicalPtx);
 
             // -O3 and the exact arch are pinned so the output depends only on
             // the PTX and the toolkit version, never on the host.
@@ -117,7 +123,7 @@ internal static class DirectPtxCubinToolCore
                 cubin.Length.ToString(CultureInfo.InvariantCulture),
                 usage.Registers.ToString(CultureInfo.InvariantCulture),
                 usage.SharedBytes.ToString(CultureInfo.InvariantCulture),
-                MaxBlocksPerSm(usage).ToString(CultureInfo.InvariantCulture),
+                MaxBlocksPerSm(usage, module.BlockThreads).ToString(CultureInfo.InvariantCulture),
                 cubinSha + ".cubin"));
             File.Delete(ptxPath);
         }
@@ -272,11 +278,11 @@ internal static class DirectPtxCubinToolCore
     }
 
     /// <summary>
-    /// Blocks per SM this kernel can hold on SM86, from the two limits a
-    /// direct-PTX kernel can actually influence: the 65536-entry register file
-    /// and 100 KB of shared memory per SM. Registers are allocated per warp in
-    /// units of 256, which is why the per-warp figure is rounded up before the
-    /// division.
+    /// Blocks per SM this kernel can hold on SM86. In addition to the
+    /// 65536-entry register file and 100 KB shared-memory pool, Ampere GA10x
+    /// admits at most 1536 resident threads and 16 resident blocks per SM.
+    /// Registers are allocated per warp in units of 256, which is why the
+    /// per-warp figure is rounded up before the division.
     ///
     /// This is the number MinBlocksPerMultiprocessor should be set from.
     /// </summary>
@@ -284,16 +290,21 @@ internal static class DirectPtxCubinToolCore
     {
         const int RegistersPerSm = 65_536;
         const int SharedBytesPerSm = 100 * 1024;
+        const int ThreadsPerSm = 1_536;
+        const int ResidentBlocksPerSm = 16;
         const int WarpAllocationGranularity = 256;
 
-        if (usage.Registers <= 0) return 0;
+        if (usage.Registers <= 0 || blockThreads <= 0) return 0;
         int warps = (blockThreads + 31) / 32;
         int registersPerWarp =
             ((usage.Registers * 32) + WarpAllocationGranularity - 1)
             / WarpAllocationGranularity * WarpAllocationGranularity;
         int byRegisters = RegistersPerSm / (registersPerWarp * warps);
         int byShared = usage.SharedBytes > 0 ? SharedBytesPerSm / usage.SharedBytes : int.MaxValue;
-        return Math.Max(0, Math.Min(byRegisters, byShared));
+        int byThreads = ThreadsPerSm / blockThreads;
+        return Math.Max(0, Math.Min(
+            ResidentBlocksPerSm,
+            Math.Min(byThreads, Math.Min(byRegisters, byShared))));
     }
 
     internal static string ManifestName(string family) => family + "-cubins.tsv";

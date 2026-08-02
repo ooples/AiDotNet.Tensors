@@ -31,13 +31,15 @@ internal static class DirectPtxOptimizerCubinTool
                 yield return new DirectPtxModuleSource(
                     $"sgd-momentum-f32-v1-n{size}-wd{(weightDecay ? 1 : 0)}",
                     PtxFusedSgdMomentumF32Kernel.EntryPoint,
-                    PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, size, weightDecay));
+                    PtxFusedSgdMomentumF32Kernel.EmitPtx(8, 6, size, weightDecay),
+                    PtxFusedSgdMomentumF32Kernel.DefaultBlockThreads);
 
             if (PtxFusedAdamUpdateF32Kernel.IsSupportedShape(size))
                 yield return new DirectPtxModuleSource(
                     $"adam-update-f32-v1-n{size}-wd{(weightDecay ? 1 : 0)}",
                     PtxFusedAdamUpdateF32Kernel.EntryPoint,
-                    PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, size, weightDecay));
+                    PtxFusedAdamUpdateF32Kernel.EmitPtx(8, 6, size, weightDecay),
+                    PtxFusedAdamUpdateF32Kernel.DefaultBlockThreads);
         }
     }
 
