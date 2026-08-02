@@ -367,6 +367,7 @@ public class DirectPtxWmmaTests
         using var kernel = new PtxOnlineFusedAttention128x64Kernel(
             runtime, 1, isCausal, fuseLayerNormGelu, 0.125f, 1e-5f, sequence,
             emitSoftmaxStats: true, warpsPerBlock);
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
         int registerCeiling = isCausal ? 144 : 96;
         Assert.Equal(registerCeiling, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
@@ -429,6 +430,7 @@ public class DirectPtxWmmaTests
             runtime, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
             isCausal, false, 0.125f, 1e-5f, emitSoftmaxStats: true,
             causalQueryOffset: causalQueryOffset);
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
         int registerCeiling = isCausal ? 144 : 96;
         Assert.Equal(registerCeiling, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
