@@ -13,6 +13,7 @@ internal static class GpuBenchmarkEnvironment
     private const int DeviceTemperatureCeilingCelsius = 75;
     private const int HostUtilizationCeilingPercent = 20;
     private const int HostUtilizationSampleMilliseconds = 750;
+    private const int HostUtilizationSampleSliceMilliseconds = 100;
 
     internal static void RequireIdleGpu(string label)
     {
@@ -67,21 +68,32 @@ internal static class GpuBenchmarkEnvironment
 
     private static void RequireHostQuiescence(string label)
     {
-        Dictionary<int, TimeSpan> before = ReadForeignProcessCpuTimes();
         var interval = Stopwatch.StartNew();
-        System.Threading.Thread.Sleep(HostUtilizationSampleMilliseconds);
-        Dictionary<int, TimeSpan> after = ReadForeignProcessCpuTimes();
-        interval.Stop();
-
+        Dictionary<int, ForeignProcessCpuSample> before = ReadForeignProcessCpuTimes();
+        DateTime sliceStartedUtc = DateTime.UtcNow;
         double busyMilliseconds = 0;
-        foreach (KeyValuePair<int, TimeSpan> sample in after)
+        do
         {
-            if (before.TryGetValue(sample.Key, out TimeSpan start) && sample.Value > start)
-                busyMilliseconds += (sample.Value - start).TotalMilliseconds;
+            int remainingMilliseconds = Math.Max(1,
+                HostUtilizationSampleMilliseconds - (int)interval.Elapsed.TotalMilliseconds);
+            System.Threading.Thread.Sleep(Math.Min(
+                HostUtilizationSampleSliceMilliseconds, remainingMilliseconds));
+
+            DateTime sliceEndedUtc = DateTime.UtcNow;
+            Dictionary<int, ForeignProcessCpuSample> after = ReadForeignProcessCpuTimes();
+            busyMilliseconds += MeasureForeignCpuMilliseconds(
+                before, after, sliceStartedUtc, sliceEndedUtc);
+            before = after;
+            sliceStartedUtc = sliceEndedUtc;
         }
+        while (interval.Elapsed.TotalMilliseconds < HostUtilizationSampleMilliseconds);
+        interval.Stop();
 
         double capacityMilliseconds = interval.Elapsed.TotalMilliseconds *
             Math.Max(1, Environment.ProcessorCount);
+        if (capacityMilliseconds <= 0)
+            throw new InvalidOperationException(
+                $"[{label}] Host quiescence sampling produced no measurable interval.");
         int utilizationPercent = (int)Math.Round(
             busyMilliseconds / capacityMilliseconds * 100.0,
             MidpointRounding.AwayFromZero);
@@ -91,9 +103,50 @@ internal static class GpuBenchmarkEnvironment
                 $"{utilizationPercent}%, ceiling={HostUtilizationCeilingPercent}%).");
     }
 
-    private static Dictionary<int, TimeSpan> ReadForeignProcessCpuTimes()
+    private static double MeasureForeignCpuMilliseconds(
+        IReadOnlyDictionary<int, ForeignProcessCpuSample> before,
+        IReadOnlyDictionary<int, ForeignProcessCpuSample> after,
+        DateTime sliceStartedUtc,
+        DateTime sliceEndedUtc)
     {
-        var times = new Dictionary<int, TimeSpan>();
+        int processorCount = Math.Max(1, Environment.ProcessorCount);
+        double sliceMilliseconds = Math.Max(0,
+            (sliceEndedUtc - sliceStartedUtc).TotalMilliseconds);
+        double busyMilliseconds = 0;
+        foreach (KeyValuePair<int, ForeignProcessCpuSample> entry in after)
+        {
+            ForeignProcessCpuSample sample = entry.Value;
+            double contribution;
+            if (before.TryGetValue(entry.Key, out ForeignProcessCpuSample start) &&
+                start.StartTimeUtc == sample.StartTimeUtc)
+            {
+                contribution = Math.Max(0,
+                    (sample.TotalProcessorTime - start.TotalProcessorTime).TotalMilliseconds);
+            }
+            else
+            {
+                // A newly observed process may have started during this slice. Its
+                // accumulated CPU time is relevant, but never count work older than
+                // the slice or more CPU time than its observed lifetime can contain.
+                DateTime observedStartUtc = sample.StartTimeUtc > sliceStartedUtc
+                    ? sample.StartTimeUtc
+                    : sliceStartedUtc;
+                double observedLifetimeMilliseconds = Math.Max(0,
+                    (sliceEndedUtc - observedStartUtc).TotalMilliseconds);
+                contribution = Math.Min(
+                    sample.TotalProcessorTime.TotalMilliseconds,
+                    observedLifetimeMilliseconds * processorCount);
+            }
+
+            busyMilliseconds += Math.Min(
+                contribution, sliceMilliseconds * processorCount);
+        }
+        return busyMilliseconds;
+    }
+
+    private static Dictionary<int, ForeignProcessCpuSample> ReadForeignProcessCpuTimes()
+    {
+        var times = new Dictionary<int, ForeignProcessCpuSample>();
         int currentProcessId = Environment.ProcessId;
         foreach (Process process in Process.GetProcesses())
         {
@@ -102,17 +155,28 @@ internal static class GpuBenchmarkEnvironment
                 try
                 {
                     if (process.Id != 0 && process.Id != currentProcessId)
-                        times[process.Id] = process.TotalProcessorTime;
+                        times[process.Id] = new ForeignProcessCpuSample(
+                            process.TotalProcessorTime, process.StartTime.ToUniversalTime());
                 }
-                catch (Exception)
+                catch (InvalidOperationException)
                 {
-                    // A process can exit or become inaccessible between enumeration
-                    // and sampling. Other surviving processes still form the gate.
+                    // The process exited between enumeration and property access.
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    // The process became inaccessible between enumeration and sampling.
                 }
             }
         }
+        if (times.Count == 0)
+            throw new InvalidOperationException(
+                "Host quiescence sampling observed no accessible foreign processes.");
         return times;
     }
+
+    private readonly record struct ForeignProcessCpuSample(
+        TimeSpan TotalProcessorTime,
+        DateTime StartTimeUtc);
 
     private static void RequirePostSuiteDeviceQuiescence(string label)
     {
