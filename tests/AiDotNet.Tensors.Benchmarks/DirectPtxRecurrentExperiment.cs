@@ -299,16 +299,21 @@ internal static class DirectPtxRecurrentExperiment
         double incumbentMedian = MedianAcross(native
             .Where(record => record.Oracle.Timing.Stable)
             .Select(record => record.Oracle.Timing.B.Microseconds));
+        double directDeviceMedian = MedianAcross(native
+            .Select(record => record.DirectGraph.Median));
         double fastestExternalMedian = eligibleExternal.Length == 0
             ? double.NaN
             : eligibleExternal.Min(record => record.MedianUs);
-        double fastestCompetitorMedian = IsFinite(fastestExternalMedian)
-            ? Math.Min(incumbentMedian, fastestExternalMedian)
-            : incumbentMedian;
-        double fastestCompetitorOverDirect =
-            directMedian > 0 && IsFinite(fastestCompetitorMedian)
-                ? fastestCompetitorMedian / directMedian
+        double incumbentOverDirect = directMedian > 0 && IsFinite(incumbentMedian)
+            ? incumbentMedian / directMedian
+            : double.NaN;
+        double externalOverDirect =
+            directDeviceMedian > 0 && IsFinite(fastestExternalMedian)
+                ? fastestExternalMedian / directDeviceMedian
                 : double.NaN;
+        double fastestCompetitorOverDirect = IsFinite(externalOverDirect)
+            ? Math.Min(incumbentOverDirect, externalOverDirect)
+            : incumbentOverDirect;
         bool championshipPassed = nativeWins && tailsPass && externalComplete &&
             fastestCompetitorOverDirect >= RequiredGain;
 
@@ -320,9 +325,11 @@ internal static class DirectPtxRecurrentExperiment
             native_runs = native.Count,
             eligible_external_rows = eligibleExternal.Length,
             direct_median_us = FiniteOrNull(directMedian),
+            direct_device_median_us = FiniteOrNull(directDeviceMedian),
             incumbent_median_us = FiniteOrNull(incumbentMedian),
             fastest_external_median_us = FiniteOrNull(fastestExternalMedian),
-            fastest_competitor_median_us = FiniteOrNull(fastestCompetitorMedian),
+            incumbent_over_direct_host_paired = FiniteOrNull(incumbentOverDirect),
+            external_over_direct_device_event = FiniteOrNull(externalOverDirect),
             fastest_competitor_over_direct = FiniteOrNull(fastestCompetitorOverDirect),
             required_gain = RequiredGain,
             native_stable = nativeStable,
