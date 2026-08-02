@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Testing;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -85,7 +86,7 @@ internal static class DirectPtxRecurrentExperiment
         float[] recurrenceHost = Values(random, elements, 0.25f, 0.5f);
         float[] inputGateHost = Values(random, elements, 0.25f, 0.5f);
         float[] decayHost = Values(random, Dimension, 0.5f);
-        double[] oracle = Oracle(valueHost, recurrenceHost, inputGateHost, decayHost);
+        double[] oracle = RgLruFp64Oracle.Evaluate(valueHost, recurrenceHost, inputGateHost, decayHost);
         using var value = backend.AllocateBuffer(valueHost);
         using var recurrence = backend.AllocateBuffer(recurrenceHost);
         using var inputGate = backend.AllocateBuffer(inputGateHost);
@@ -561,25 +562,6 @@ internal static class DirectPtxRecurrentExperiment
         for (int index = 0; index < result.Length; index++)
             result[index] = bias + ((float)random.NextDouble() - 0.5f) * scale;
         return result;
-    }
-
-    private static double[] Oracle(float[] value, float[] recurrence, float[] inputGate, float[] decay)
-    {
-        var output = new double[value.Length];
-        for (int channel = 0; channel < Dimension; channel++)
-        {
-            double state = 0;
-            double channelDecay = 1.0 / (1.0 + Math.Exp(decay[channel]));
-            for (int timestep = 0; timestep < Sequence; timestep++)
-            {
-                int offset = timestep * Dimension + channel;
-                double a = recurrence[offset] * channelDecay;
-                double scale = Math.Sqrt(Math.Max(0, 1 - a * a));
-                state = a * state + scale * inputGate[offset] * value[offset];
-                output[offset] = state;
-            }
-        }
-        return output;
     }
 
     private static double MaximumError(float[] actual, double[] expected)

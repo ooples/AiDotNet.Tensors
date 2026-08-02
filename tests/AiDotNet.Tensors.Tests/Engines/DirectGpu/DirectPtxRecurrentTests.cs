@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Testing;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -118,7 +119,7 @@ public sealed class DirectPtxRecurrentTests
             for (int i = 0; i < decay.Length; i++)
                 decay[i] = (float)(Math.Cos(i * 0.031) * 0.25);
 
-            double[] expected = RgLruOracle(value, recurrence, inputGate, decay);
+            double[] expected = RgLruFp64Oracle.Evaluate(value, recurrence, inputGate, decay);
             using var valueBuffer = backend.AllocateBuffer(value);
             using var recurrenceBuffer = backend.AllocateBuffer(recurrence);
             using var inputGateBuffer = backend.AllocateBuffer(inputGate);
@@ -243,28 +244,6 @@ public sealed class DirectPtxRecurrentTests
             0x140000, sequenceBytes,
             0x160000, decayBytes,
             0x180000, sequenceBytes);
-    }
-
-    private static double[] RgLruOracle(
-        float[] value, float[] recurrence, float[] inputGate, float[] decay)
-    {
-        const int sequence = PtxFusedRgLruScan128x256Kernel.SequenceLength;
-        const int dimension = PtxFusedRgLruScan128x256Kernel.RecurrentDimension;
-        var output = new double[value.Length];
-        for (int channel = 0; channel < dimension; channel++)
-        {
-            double state = 0;
-            double channelDecay = 1.0 / (1.0 + Math.Exp(decay[channel]));
-            for (int timestep = 0; timestep < sequence; timestep++)
-            {
-                int offset = timestep * dimension + channel;
-                double a = recurrence[offset] * channelDecay;
-                double scale = Math.Sqrt(Math.Max(0, 1 - a * a));
-                state = a * state + scale * inputGate[offset] * value[offset];
-                output[offset] = state;
-            }
-        }
-        return output;
     }
 
     private static int Count(string source, string value)
