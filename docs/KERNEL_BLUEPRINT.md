@@ -177,6 +177,11 @@ only `scope=full` rows produced by the complete finite search. This prevents a h
 candidate subset from masquerading as the measured winner even when its spec, device, target,
 emitter fingerprint, and measurement protocol are otherwise current.
 
+A full search is complete only when every applicable, numerically-correct promotable candidate
+also produces a stable paired timing window. An unstable candidate is not evidence that the
+modelled lowering won: it leaves the ordering unknown, so the run fails without replacing the
+last identity-valid artifact. Material foreign host CPU load also refuses current evidence.
+
 Candidates are paired with the same live modelled baseline, but different candidates are still
 measured in independent windows. A challenger therefore has to clear the sum of its paired-ratio
 spread and the current winner's spread before it can replace that winner. Comparing only their

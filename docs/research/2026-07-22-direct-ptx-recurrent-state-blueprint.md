@@ -156,7 +156,12 @@ The target launches exactly `aidotnet_rglru_scan_b1_s128_d256` once. The shared
 CSV verifier requires all requested local/spill/resource/occupancy metrics and
 fails on nonzero executed local/spill traffic or incomplete evidence.
 
-## Current SM86 evidence
+## Historical p13 SM86 evidence
+
+Protocol p14 supersedes this table by adding complete stable promotable-search and host-
+quiescence admission. These results remain the diagnostic baseline, but they cannot support a
+current promotion decision until the same three-run RG-LRU championship passes cleanly under
+p14.
 
 | Operation | Competitor | Median us | P95 us | P99 us | Mean us | Gupdates/s | GFLOPS est. | Managed B/call | Temp/peak device B | Max error | Registers | Shared B | Local B | Blocks/SM | Zero executed spills |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -183,9 +188,9 @@ Promotion requires all three clean runs, high-precision/current-AiDotNet
 correctness, at least 1.10x median speedup over the fastest eligible competitor,
 candidate P95 no worse than competitor P95 +10%, zero hot managed allocation,
 zero avoidable temporary VRAM, JIT local bytes zero, and complete Nsight zero
-executed spill/local evidence. This exact cell satisfies those conditions and
-emits `diagnostic_only=false`, `promotion=true`; no other recurrent cell inherits
-that status without its own evidence.
+executed spill/local evidence. This exact cell satisfied those conditions under p13 and emitted
+`diagnostic_only=false`, `promotion=true`. Under p14 its current promotion evidence is pending
+the clean rerun; no other recurrent cell inherits the historical status without its own evidence.
 
 ## Assembly-line extension order
 

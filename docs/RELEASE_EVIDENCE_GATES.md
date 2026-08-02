@@ -22,6 +22,10 @@ A row stamped with an older protocol is treated exactly like a missing one, beca
 number measured under a superseded protocol is not comparable — verified by stamping a
 row `p3` and watching it read MISSING.
 
+Protocol p14 also requires every applicable, numerically-correct promotable candidate to
+produce a stable paired timing window and rejects material foreign host CPU load. An incomplete
+run preserves the last identity-valid artifact rather than publishing a modelled fallback.
+
 ## The limiter gate, measured
 
 `--kernel-limiter` profiles each kernel with Nsight Compute and records which unit is

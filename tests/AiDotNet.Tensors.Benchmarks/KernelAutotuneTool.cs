@@ -57,6 +57,7 @@ internal static class KernelAutotuneTool
         internal double BestUs { get; set; }
         internal double BestModelledUs { get; set; }
         internal double BestGain { get; set; } = 1.0;
+        internal List<string> InconclusivePromotableCandidates { get; } = new();
         internal CandidateProgram? BestProgram { get; private set; }
 
         internal void Adopt(CandidateProgram candidate)
@@ -241,7 +242,6 @@ internal static class KernelAutotuneTool
         bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
         var rows = LoadUnselectedCurrentRows(outputPath, runtime, entries);
-        if (File.Exists(outputPath)) File.Delete(outputPath);
         int improved = 0;
         var failures = new List<string>();
         try
@@ -693,6 +693,11 @@ internal static class KernelAutotuneTool
                               "no winner recorded");
             return null;
         }
+        if (state.InconclusivePromotableCandidates.Count != 0)
+            throw new InvalidOperationException(
+                "promotable candidate timing did not stabilize: " +
+                string.Join(", ", state.InconclusivePromotableCandidates) +
+                "; the selected search is incomplete");
         return new TuneResult(
             state.BestName, state.BestUs, state.BestModelledUs, state.BestGain);
     }
@@ -744,6 +749,8 @@ internal static class KernelAutotuneTool
                               (timing.RelativeSpread * 100).ToString(
                                   "0.0", CultureInfo.InvariantCulture) + "%); rejected");
             ReportPhases(runtime, candidate);
+            if (candidate.Promotable)
+                state.InconclusivePromotableCandidates.Add(candidate.Name);
             return;
         }
 
