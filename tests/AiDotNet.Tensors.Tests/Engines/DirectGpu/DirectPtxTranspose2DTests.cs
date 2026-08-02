@@ -173,6 +173,10 @@ public class DirectPtxTranspose2DTests
         using var kernel = new PtxFusedTranspose2DF32Kernel(runtime, rows, columns);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(PtxFusedTranspose2DF32Kernel.SharedBytes, kernel.Audit.Function.StaticSharedBytes);
+        Assert.Equal(1536 / PtxFusedTranspose2DF32Kernel.BlockThreads,
+            kernel.Blueprint.ResourceBudget.MinBlocksPerMultiprocessor);
+        Assert.Equal(kernel.Blueprint.ResourceBudget.MinBlocksPerMultiprocessor,
+            kernel.Audit.ActiveBlocksPerMultiprocessor);
         Assert.Equal("transpose2d-f32", kernel.Blueprint.Operation);
 
         var random = RandomHelper.CreateSeededRandom(20260722 + rows * 31 + columns);

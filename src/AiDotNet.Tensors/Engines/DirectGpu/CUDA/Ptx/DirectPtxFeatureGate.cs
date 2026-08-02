@@ -22,6 +22,7 @@ internal static class DirectPtxFeatureGate
     internal const string CastFp32EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP32";
     internal const string Transpose2DEnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRANSPOSE2D";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -40,6 +41,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentCastFp32Enabled = ReadEnabled(CastFp32EnvironmentVariable);
     private static readonly bool EnvironmentTranspose2DEnabled = ReadEnabled(Transpose2DEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
@@ -52,6 +54,16 @@ internal static class DirectPtxFeatureGate
     internal static bool CastFp32ExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to transpose cells that have not passed promotion.</summary>
     internal static bool Transpose2DExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
+    internal static bool FusedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
+    internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
+    internal static bool QuantizedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
+    internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
+    internal static bool ConvolutionExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -88,6 +100,9 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    internal static bool IsConvolutionEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
+
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
     internal static int CacheCapacity => EnvironmentCacheCapacity;
@@ -104,6 +119,7 @@ internal static class DirectPtxFeatureGate
 
 internal enum DirectPtxPhysicalType
 {
+    Int8,
     Float16,
     BFloat16,
     Float32,
@@ -116,6 +132,8 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense canonical [batch, channel, spatial] (NCHW-flattened).</summary>
+    Nchw,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -124,12 +142,18 @@ internal enum DirectPtxPhysicalLayout
     PackedQkvWeights,
     /// <summary>Packed Q/K/V projection bias, [qkv,head,feature].</summary>
     PackedQkvBias,
+    /// <summary>Input-major row-major linear weights, [inputFeature,outputFeature].</summary>
+    LinearWeightInputMajor,
+    /// <summary>Output-major row-major linear weights, [outputFeature,inputFeature].</summary>
+    LinearWeightOutputMajor,
     /// <summary>Dense additive attention bias, [H,Sq,Skv] or [B,H,Sq,Skv].</summary>
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>
-    PagedKv
+    PagedKv,
+    /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
+    Oihw
 }
 
 /// <summary>

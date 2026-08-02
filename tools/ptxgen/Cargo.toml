@@ -1,0 +1,12 @@
+[package]
+name = "ptxgen"
+version = "0.1.0"
+edition = "2021"
+description = "Rust half of the AiDotNet codegen bake-off: index-map IR -> SM86 PTX"
+
+[[bin]]
+name = "ptxgen"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

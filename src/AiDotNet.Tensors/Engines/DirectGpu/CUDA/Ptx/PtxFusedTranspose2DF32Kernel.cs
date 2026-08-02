@@ -204,12 +204,16 @@ internal sealed class PtxFusedTranspose2DF32Kernel : IDisposable
                     outputExtent, outputExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                // Measured by the offline gate: 24 registers and exactly
-                // SharedBytes of smem at sm86, giving 10 blocks/SM.
+                // Measured by the driver gate: 24 registers and exactly
+                // SharedBytes of smem at SM86. A 256-thread block is capped by
+                // SM86's 1,536 resident-thread limit at 6 blocks/SM, which is
+                // full thread occupancy; a larger block-count floor is
+                // architecturally impossible regardless of register or shared
+                // memory use.
                 MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: SharedBytes,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 8),
+                MinBlocksPerMultiprocessor: 1536 / BlockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output[c, r] = input[r, c]",
@@ -222,6 +226,7 @@ internal sealed class PtxFusedTranspose2DF32Kernel : IDisposable
                 ["global-output-writes"] = "one-coalesced-float-per-element",
                 ["shared-intermediate"] = $"one {TileDim}x{TileStride} fp32 tile ({SharedBytes} bytes)",
                 ["shared-bank-conflicts"] = "none-odd-row-stride-33",
+                ["occupancy-floor"] = $"{1536 / BlockThreads} blocks/SM x {BlockThreads} threads = 1536 resident threads/SM",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none",

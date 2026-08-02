@@ -885,21 +885,27 @@ kernel void parity210_phase_vocoder(
     device float* newMag [[buffer(2)]],
     device float* newPhase [[buffer(3)]],
     constant int& leading [[buffer(4)]],
-    constant int& nFramesV [[buffer(5)]],
-    constant int& nFreqV [[buffer(6)]],
+    constant int& numFrames [[buffer(5)]],
+    constant int& numFreqs [[buffer(6)]],
     constant int& outFrames [[buffer(7)]],
     constant float& rate [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; if (idx >= leading*nFreqV) return;
-    int f = idx % nFreqV; int b = idx / nFreqV; int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    // Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching build_spectrum and
+    // CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
+    int idx = (int)gid; if (idx >= leading*numFreqs) return;
+    int f = idx % numFreqs; int b = idx / numFreqs;
+    int row = b*numFreqs*numFrames + f*numFrames;
+    int outRow = b*numFreqs*outFrames + f*outFrames;
     float accPhase = 0.0f;
     for (int t = 0; t < outFrames; t++) {
-        float srcT = (float)t * rate; int t0 = (int)floor(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
-        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
-        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        float srcT = (float)t * rate; int t0 = (int)floor(srcT);
+        if (t0 > numFrames-1) t0 = numFrames-1;
+        int t1 = min(t0+1, numFrames-1); float frac = srcT - (float)t0;
+        float m0 = mag[row + t0]; float m1 = mag[row + t1];
+        newMag[outRow + t] = (1.0f-frac)*m0 + frac*m1;
         float dp = 0.0f;
-        if (t0+1 < nFramesV) { dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f]; dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F)); }
-        accPhase += dp; newPhase[b*outStride + t*nFreqV + f] = accPhase;
+        if (t0+1 < numFrames) { dp = phase[row + t0 + 1] - phase[row + t0]; dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F)); }
+        accPhase += dp; newPhase[outRow + t] = accPhase;
     }
 }
 
@@ -936,7 +942,9 @@ kernel void parity210_istft_from_spectrum(
     int idx = (int)gid; int total = batch*outputLength; if (idx >= total) return;
     int outIdx = idx % outputLength; int b = idx / outputLength; float resultAcc = 0.0f; float windowAcc = 0.0f;
     for (int frame = 0; frame < numFrames; frame++) {
-        int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int i = outIdx - writeStart;
+        // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+        // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8.
+        int writeStart = center ? frame*hop - nFft/2 : frame*hop; int i = outIdx - writeStart;
         if (i >= 0 && i < nFft) {
             int specOff = (b*numFrames + frame) * nFft; float acc = 0.0f;
             for (int k = 0; k < nFft; k++) { float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
@@ -1352,26 +1360,37 @@ kernel void parity210_polygamma(
     int i = (int)gid; if (i>=size) return; out[i]=p210_polygamma_scalar(n, x[i]);
 }
 
+// RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17); see the CUDA twin for the derivation.
 kernel void parity210_rwkv7_forward(
     device const float* R [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* A [[buffer(3)]],
-    device const float* B [[buffer(4)]],
-    device float* outp [[buffer(5)]],
-    device float* Sbuf [[buffer(6)]],
-    constant int& batch [[buffer(7)]],
-    constant int& seqLen [[buffer(8)]],
-    constant int& modelDim [[buffer(9)]],
-    constant int& numHeads [[buffer(10)]],
-    constant int& headDim [[buffer(11)]],
+    device const float* KAP [[buffer(1)]],
+    device const float* KT [[buffer(2)]],
+    device const float* V [[buffer(3)]],
+    device const float* D [[buffer(4)]],
+    device const float* AR [[buffer(5)]],
+    device float* outp [[buffer(6)]],
+    device float* Sbuf [[buffer(7)]],
+    constant int& batch [[buffer(8)]],
+    constant int& seqLen [[buffer(9)]],
+    constant int& modelDim [[buffer(10)]],
+    constant int& numHeads [[buffer(11)]],
+    constant int& headDim [[buffer(12)]],
     uint gid [[thread_position_in_grid]]) {
-    int bh = (int)gid; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim; float* S=Sbuf+bh*hh;
+    int bh = (int)gid; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim;
+    device float* S=Sbuf+bh*(hh+3*headDim); device float* kh=S+hh; device float* wv=S+hh+headDim; device float* av=S+hh+2*headDim;
     for (int i=0;i<hh;i++) S[i]=0.0f;
     for (int t=0;t<seqLen;t++) {
         int baseOff=(b*seqLen+t)*modelDim+hOff;
-        for (int di=0;di<headDim;di++) { float ga=1.0f/(1.0f+exp(-A[baseOff+di])); float gbk=(1.0f/(1.0f+exp(-B[baseOff+di])))*K[baseOff+di]; int srow=di*headDim; for (int vi=0;vi<headDim;vi++) S[srow+vi]=ga*S[srow+vi]+gbk*V[baseOff+vi]; }
-        for (int di=0;di<headDim;di++) { int srow=di*headDim; float sk=0.0f; for (int vi=0;vi<headDim;vi++) sk+=S[srow+vi]*K[baseOff+vi]; outp[baseOff+di]=(1.0f/(1.0f+exp(-R[baseOff+di])))*sk; }
+        float ss=1e-12f; for (int ki=0;ki<headDim;ki++) { float kp=KAP[baseOff+ki]; ss+=kp*kp; }
+        float invN=1.0f/sqrt(ss);
+        for (int ki=0;ki<headDim;ki++) { kh[ki]=KAP[baseOff+ki]*invN; wv[ki]=exp(-0.60653065971263342f/(1.0f+exp(-D[baseOff+ki]))); av[ki]=AR[baseOff+ki]; }
+        for (int vi=0;vi<headDim;vi++) {
+            int srow=vi*headDim; float p=0.0f;
+            for (int ki=0;ki<headDim;ki++) p+=S[srow+ki]*kh[ki];
+            float vv=V[baseOff+vi]; float o=0.0f;
+            for (int ki=0;ki<headDim;ki++) { float sv=S[srow+ki]*wv[ki]-p*av[ki]*kh[ki]+vv*KT[baseOff+ki]; S[srow+ki]=sv; o+=sv*R[baseOff+ki]; }
+            outp[baseOff+vi]=o;
+        }
     }
 }
 ";

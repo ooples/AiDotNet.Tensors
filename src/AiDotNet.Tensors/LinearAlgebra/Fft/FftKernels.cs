@@ -56,6 +56,17 @@ internal static class FftKernels
     internal static void IterativeRadix2NoCache(Span<double> buf, int n, bool inverse)
         => IterativeRadix2(buf, n, inverse);
 
+    /// <summary>
+    /// Unnormalized transform for a length that is NOT a power of two.
+    /// </summary>
+    /// <remarks>
+    /// Same raw contract as <see cref="IterativeRadix2NoCache"/>: no 1/n scaling is applied, the
+    /// caller owns normalization. Exposed for the engine's native FFT paths, whose radix-2
+    /// butterfly reads past the end of the buffer for any other length.
+    /// </remarks>
+    internal static void BluesteinNoScale(Span<double> buf, int n, bool inverse)
+        => Bluestein(buf, n, inverse);
+
     // ── Cooley-Tukey radix-2, iterative, in place ───────────────────────────
     // Standard decimation-in-time formulation: bit-reverse permute, then
     // log₂ n stages of butterflies. Each stage is dispatched to the SIMD
