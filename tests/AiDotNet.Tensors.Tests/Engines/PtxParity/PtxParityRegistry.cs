@@ -85,6 +85,18 @@ public static class PtxParityRegistry
             "CudaBackend.MaskedFillBackward",
             "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity compares incumbent CUDA and direct PTX " +
             "bit-for-bit against the masked-gradient contract."),
+        new PtxParitySpec("PtxMaskedSoftmaxKernel", PtxParityStatus.Deferred,
+            "driver-only fused masked-fill + softmax candidate",
+            "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX result against the stable " +
+            "double-precision composed oracle. The candidate has no CudaBackend/public dispatch route, so it " +
+            "cannot yet run the required incumbent-vs-direct-PTX-vs-CPU parity test and remains unpromoted. " +
+            "Wire a backend route and its incumbent composed path before converting this entry to ThreeWayParity."),
+        new PtxParitySpec("PtxMaskedSoftmaxBackwardKernel", PtxParityStatus.Deferred,
+            "driver-only fused masked-softmax backward candidate",
+            "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX gradient against the same " +
+            "double-precision Jacobian-vector-product oracle with the gradient mask applied. The candidate has " +
+            "no CudaBackend/public dispatch route, so it cannot yet run the required three-way parity test and " +
+            "remains unpromoted. Wire that route and incumbent composition before promoting it."),
 
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
