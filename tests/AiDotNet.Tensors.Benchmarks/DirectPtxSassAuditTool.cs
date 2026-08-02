@@ -15,16 +15,19 @@ internal static class DirectPtxSassAuditTool
     internal static void Run(
         string nvdisasmPath,
         string artifactDirectory,
-        string evidenceDirectory)
+        string evidenceDirectory,
+        string manifestFileName = "normalization-cubins.tsv",
+        string reportFileName = "normalization-sass-audit.tsv",
+        string label = "normalization")
     {
         nvdisasmPath = Path.GetFullPath(nvdisasmPath);
         artifactDirectory = Path.GetFullPath(artifactDirectory);
         evidenceDirectory = Path.GetFullPath(evidenceDirectory);
         if (!File.Exists(nvdisasmPath))
             throw new FileNotFoundException("nvdisasm is required for the release SASS gate.", nvdisasmPath);
-        string manifestPath = Path.Combine(artifactDirectory, "normalization-cubins.tsv");
+        string manifestPath = Path.Combine(artifactDirectory, manifestFileName);
         if (!File.Exists(manifestPath))
-            throw new FileNotFoundException("Normalization cubin manifest is missing.", manifestPath);
+            throw new FileNotFoundException("The " + label + " cubin manifest is missing.", manifestPath);
         Directory.CreateDirectory(evidenceDirectory);
 
         IReadOnlyDictionary<string, ManifestCell> manifest = ReadManifest(manifestPath);
@@ -73,10 +76,10 @@ internal static class DirectPtxSassAuditTool
                 metrics.LocalStores.ToString(CultureInfo.InvariantCulture)));
         }
 
-        string reportPath = Path.Combine(evidenceDirectory, "normalization-sass-audit.tsv");
+        string reportPath = Path.Combine(evidenceDirectory, reportFileName);
         File.WriteAllLines(reportPath, report);
         Console.WriteLine("SASS gate passed for " + manifest.Count.ToString(CultureInfo.InvariantCulture) +
-            " compiled normalization cubins; no direct entry uses LDL/STL.");
+            " compiled " + label + " cubins; no direct entry uses LDL/STL.");
         Console.WriteLine("Evidence: " + reportPath);
     }
 
@@ -146,6 +149,14 @@ internal static class DirectPtxSassAuditTool
             }
             if (!line.StartsWith("/*", StringComparison.Ordinal))
                 continue;
+            // --print-instruction-encoding emits TWO lines per instruction: the
+            // disassembly line, prefixed with a 4-hex-digit address (/*0a30*/), and
+            // an encoding line (/* 0x... */). Both start with "/*", so counting every
+            // such line double-counts -- which silently inflated every reported
+            // instruction count by exactly 2x. Only the address-prefixed form is an
+            // instruction.
+            if (!IsInstructionAddressPrefix(line))
+                continue;
             instructions++;
             if (HasMnemonic(line, "LDL")) ldl++;
             if (HasMnemonic(line, "STL")) stl++;
@@ -191,6 +202,26 @@ internal static class DirectPtxSassAuditTool
                 ", RED=" + metrics.GlobalReductions.ToString(CultureInfo.InvariantCulture) +
                 ", ATOMG=" + metrics.GlobalAtomics.ToString(CultureInfo.InvariantCulture) +
                 ", SHFL=" + metrics.Shuffles.ToString(CultureInfo.InvariantCulture) + ".");
+    }
+
+    /// <summary>
+    /// True when a trimmed SASS line is an instruction line, i.e. it opens with a
+    /// 4-hex-digit address comment such as <c>/*0a30*/</c>. Encoding lines emitted by
+    /// --print-instruction-encoding look like <c>/* 0x00000a00... */</c> and are not
+    /// instructions.
+    /// </summary>
+    private static bool IsInstructionAddressPrefix(string line)
+    {
+        // "/*" + 4 hex + "*/" == 8 characters minimum.
+        if (line.Length < 8) return false;
+        if (line[0] != '/' || line[1] != '*') return false;
+        for (int i = 2; i < 6; i++)
+        {
+            char c = line[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return line[6] == '*' && line[7] == '/';
     }
 
     private static bool HasMnemonic(string instruction, string mnemonic)

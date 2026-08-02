@@ -7381,6 +7381,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841 golden slice: the direct PTX path owns the complete
+            // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
+            // Every other shape/semantic contract continues through the
+            // established convolution, bias, and activation kernels below.
+            //
+            // Promoted register-blocked specialization first: for the ResNet c64
+            // 1x1 contract it beats cuDNN's best ~1.60x on SM86. It fails closed on
+            // any other contract, falling through to the v1 golden slice and then
+            // the established path.
+            if (typeof(T) == typeof(float) && bias is { } rbBias &&
+                activation == FusedActivationType.ReLU &&
+                kernelH == 1 && kernelW == 1 && strideH == 1 && strideW == 1 &&
+                padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1 &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend rbCuda &&
+                rbCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var rbBiasBuffer = GetWeightBufferPreferResident(
+                    backend, rbBias, PersistentTensorRole.Biases);
+                if (rbCuda.TryDirectPtxRegBlockedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, rbBiasBuffer.Buffer,
+                    outputBuffer.Buffer, batch, inChannels, inHeight, inWidth, outChannels))
+                {
+                    var rbResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(rbResult, outputBuffer.Buffer, backend);
+                    return rbResult;
+                }
+            }
+            if (typeof(T) == typeof(float) && bias is { } directBias &&
+                activation == FusedActivationType.ReLU &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var directBiasBuffer = GetWeightBufferPreferResident(
+                    backend, directBias, PersistentTensorRole.Biases);
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, dilationH, dilationW);
+                if (directCuda.TryDirectPtxFusedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, directBiasBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+
             // Execute GPU convolution
             backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,

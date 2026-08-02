@@ -3599,6 +3599,8 @@ public sealed partial class CudaBackend
             _directPtxQuantizedLinearKernels.Dispose();
             _directPtxNormalizationWorkspace?.Dispose();
             _directPtxNormalizationWorkspace = null;
+            _directPtxConvolutionKernels.Dispose();
+            _directPtxRegBlockedConvKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
