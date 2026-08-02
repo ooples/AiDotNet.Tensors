@@ -59,7 +59,12 @@ The four follow-up issues are distinct, open backend-parity requirements. None
 of them is treated as implemented coverage, and no CUDA promotion in this pull
 request can waive them.
 
-## SM86 head-to-head evidence (2026-07-31)
+## Historical p13 SM86 head-to-head evidence (2026-07-31)
+
+Protocol p14 supersedes these diagnostic numbers by adding host-quiescence admission and
+complete stable promotable searches. The table remains useful for locating the four non-wins,
+but it cannot support a current promotion decision; all candidates must be remeasured under
+p14 before any gate changes.
 
 Command: `--direct-ptx-softmax`. Both sides run on the same backend stream and
 are timed with CUDA events. Each side is independently calibrated to a roughly
