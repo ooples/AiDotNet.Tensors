@@ -68,20 +68,22 @@ public class EnableCheckpointingInterfaceTests
         var weightBaseline = Tensor<float>.CreateRandom([3, 2]);
         var weightCheckpointed = weightBaseline.Clone();
 
+        var baselineParameters = new[] { weightBaseline };
         ICompiledTrainingPlan<float> baseline;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(baselineParameters))
         {
             var output = engine.TensorMatMul(input, weightBaseline);
             engine.ReduceSum(output, null);
-            baseline = scope.CompileTraining(new[] { weightBaseline });
+            baseline = scope.CompileTraining(baselineParameters);
         }
 
+        var checkpointedParameters = new[] { weightCheckpointed };
         ICompiledTrainingPlan<float> checkpointed;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(checkpointedParameters))
         {
             var output = engine.TensorMatMul(input, weightCheckpointed);
             engine.ReduceSum(output, null);
-            checkpointed = scope.CompileTraining(new[] { weightCheckpointed });
+            checkpointed = scope.CompileTraining(checkpointedParameters);
         }
 
         using (baseline)
@@ -165,7 +167,7 @@ public class EnableCheckpointingInterfaceTests
         }
 
         ICompiledTrainingPlan<float> baseline;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(baselineWeights))
         {
             var h = input;
             for (int i = 0; i < depth; i++)
@@ -175,7 +177,7 @@ public class EnableCheckpointingInterfaceTests
         }
 
         ICompiledTrainingPlan<float> checkpointed;
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(checkpointedWeights))
         {
             var h = input;
             for (int i = 0; i < depth; i++)

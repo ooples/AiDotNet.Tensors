@@ -18,6 +18,59 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// </summary>
 internal static class FusedOptimizer
 {
+    // ── Element-parallel dispatch (foundation-scale optimizer step) ───────────
+    // The per-tensor update kernels below are single SIMD passes over param/grad/
+    // m/v. For foundation-scale models the optimizer state is several GB and COLD
+    // each step (evicted from cache by the forward+backward), so a single-thread
+    // pass is memory-latency-bound and dominates the training step (measured ~48%
+    // of a 385M-param step). Splitting the element range across the pool issues
+    // many concurrent loads — latency hiding + more of the machine's memory
+    // bandwidth — a 2-4x win on large tensors. Each worker owns a DISJOINT
+    // [start,end) slice and chunk boundaries are multiples of the SIMD width, so
+    // the AVX region [0,length&~(w-1)) tiles exactly across full-width chunks and
+    // the scalar tail stays in the last chunk: the result is BIT-IDENTICAL to the
+    // serial loop (no cross-chunk state; bias corrections are step-global). Small
+    // tensors (biases, norms) run inline on the caller thread with NO closure
+    // allocation. Kill switch: AIDOTNET_FUSED_OPT_PARALLEL=0.
+    /// <summary>
+    /// Elements per SIMD register for <see cref="float"/> kernels: Vector256&lt;float&gt; holds
+    /// 8 lanes. Chunk boundaries are aligned to this so every non-final chunk's AVX region
+    /// tiles exactly and the scalar tail stays in the last chunk, keeping the parallel result
+    /// BIT-IDENTICAL to the serial loop.
+    /// </summary>
+    private const int FloatSimdWidth = 8;
+
+    /// <summary>
+    /// Minimum element count per worker before parallel dispatch pays for itself. Below this
+    /// the tensor runs inline on the caller thread with no closure allocation. Overridable via
+    /// AIDOTNET_FUSED_OPT_PARALLEL_MIN.
+    /// </summary>
+    private const int DefaultParallelThreshold = 1 << 18; // 262144 elements
+
+    internal static int ParallelThreshold =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_FUSED_OPT_PARALLEL_MIN"), out var _mn) && _mn > 0
+            ? _mn : DefaultParallelThreshold;
+    internal static readonly int ParallelMaxDop =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FUSED_OPT_PARALLEL") == "0"
+            ? 1 : System.Environment.ProcessorCount;
+
+    /// <summary>
+    /// Number of disjoint SIMD-width-aligned chunks to split [0,length) into, or 1
+    /// to run inline. Keeps each chunk &gt;= <see cref="ParallelThreshold"/> so tiny
+    /// partitions never pay dispatch overhead for no bandwidth gain.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ChunkPlan(int length, int simdWidth, out int chunk)
+    {
+        chunk = length;
+        if (ParallelMaxDop <= 1 || length < ParallelThreshold) return 1;
+        int workers = System.Math.Min(ParallelMaxDop, length / ParallelThreshold);
+        if (workers <= 1) return 1;
+        int mask = simdWidth - 1;
+        chunk = ((length + workers - 1) / workers + mask) & ~mask;
+        return (length + chunk - 1) / chunk;
+    }
+
     /// <summary>AVX2 SGD: param -= lr * grad</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void SgdUpdateSimd(float* param, float* grad, int length, float lr)
@@ -756,15 +809,42 @@ internal static class FusedOptimizer
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
     {
-        // SINGLE-PASS fused AdamW — see the double overload above. Folds the
-        // decoupled weight decay into the Adam update loop so `param` is read+
-        // written once instead of twice. Bit-identical to the prior two-pass form.
+        // Element-parallel dispatch: inline (no closure) for small tensors, else
+        // disjoint FloatSimdWidth-aligned chunks across the pool. See ChunkPlan / the
+        // class header — bit-identical to the serial loop.
+        int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
+        if (nChunks <= 1)
+        {
+            AdamWUpdateRangeF(param, grad, m, v, 0, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            return;
+        }
+        nint pP = (nint)param, pG = (nint)grad, pM = (nint)m, pV = (nint)v;
+        System.Threading.Tasks.Parallel.For(0, nChunks, c =>
+        {
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            unsafe
+            {
+                AdamWUpdateRangeF((float*)pP, (float*)pG, (float*)pM, (float*)pV, s, e,
+                    lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            }
+        });
+    }
+
+    /// <summary>Single-pass fused AdamW (float) over the element range [start,end).
+    /// Folds decoupled weight decay into the Adam update so `param` is read+written
+    /// once. SIMD head runs from `start` (8-aligned for every non-final chunk) + a
+    /// scalar tail, so it is bit-identical to the whole-tensor serial loop.</summary>
+    private static unsafe void AdamWUpdateRangeF(
+        float* param, float* grad, float* m, float* v, int start, int end,
+        float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
+    {
         float lrAdj = lr / bc1;
         float wdScale = 1f - weightDecay * lr;
 
-        int i = 0;
+        int i = start;
 #if NET5_0_OR_GREATER
-        if (Fma.IsSupported && length >= 8)
+        if (Fma.IsSupported && end - start >= 8)
         {
             var vB1 = Vector256.Create(beta1);
             var v1mB1 = Vector256.Create(1f - beta1);
@@ -774,9 +854,9 @@ internal static class FusedOptimizer
             var vEps = Vector256.Create(eps);
             var vBc2Inv = Vector256.Create(1f / bc2);
             var vWd = Vector256.Create(wdScale);
-            int simdLen = length & ~7;
+            int simdEnd = start + ((end - start) & ~7);
 
-            for (; i < simdLen; i += 8)
+            for (; i < simdEnd; i += 8)
             {
                 var g = Avx.LoadVector256(grad + i);
                 var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
@@ -791,7 +871,7 @@ internal static class FusedOptimizer
             }
         }
 #endif
-        for (; i < length; i++)
+        for (; i < end; i++)
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];

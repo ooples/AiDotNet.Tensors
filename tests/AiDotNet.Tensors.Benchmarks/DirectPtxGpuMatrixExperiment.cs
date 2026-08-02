@@ -75,7 +75,7 @@ internal static class DirectPtxGpuMatrixExperiment
         GpuBenchmarkEnvironment.RequireIdleGpu("gpu-matrix-framework-baselines");
         RunAiDotNet();
         RunPyTorch();
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("gpu-matrix-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("gpu-matrix-end", afterSuite: true);
         GpuBenchmarkEnvironment.PrintSnapshot("end");
     }
 
