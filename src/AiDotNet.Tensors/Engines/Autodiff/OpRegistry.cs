@@ -114,13 +114,13 @@ internal static class OpRegistry
         // Parity-210 indexing family (forward only in v1).
         // TensorBroadcastTo deliberately omitted here — it's classified under
         // "composed from recorded sub-ops" below because our implementation
-        // dispatches through Reshape or TensorBroadcastAdd (both record
+        // dispatches through Reshape or TensorAdd (both record
         // their own autograd steps), so it gets backward for free.
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
         "TensorGatherPacked", "TensorScatterPacked",
         "TensorMaskedScatter", "TensorScatterReduce",
         // TensorBroadcastTo belongs to the Delegator set below (composed
-        // from Reshape / TensorBroadcastAdd which record themselves) —
+        // from Reshape / TensorAdd which record themselves) —
         // listing it here too tripped the duplicate-check in
         // TapeCompletenessTests.OpRegistry_HasNoDuplicates.
         "TensorExpandAs", "TensorBroadcastTensors",
@@ -210,6 +210,12 @@ internal static class OpRegistry
 
         // Audio element-wise / linear ops — backward wired.
         "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
+
+        // Mel spectrogram — |STFT|^2, mel filterbank matmul and the optional dB conversion are
+        // all differentiable, so the op records one node with BackwardFunctions<T>.
+        // MelSpectrogramBackward. Was previously misclassified as non-differentiable, which
+        // silently zeroed the gradient for every mel-based objective.
+        "MelSpectrogram",
     };
 
     /// <summary>
@@ -321,8 +327,31 @@ internal static class OpRegistry
         "TensorArgMax", "TensorArgMin", "ArgSort",
         "GenerateSpiralIndices",
 
-        // Signal processing (non-differentiable spectral ops)
-        "ISTFT", "MelSpectrogram", "GriffinLim",
+        // Signal processing.
+        //
+        // ISTFT is synthesis (overlap-add with window-sum normalization) and is used as a
+        // reconstruction operator, not on a training path — note it is specifically NOT the
+        // adjoint of the STFT analysis, which is why BackwardFunctions has its own
+        // MagnitudeStftAdjoint rather than delegating here.
+        //
+        // GriffinLim is an iterative phase-reconstruction ALGORITHM (60 fixed-point iterations
+        // by default), not a single differentiable op.
+        //
+        // MelSpectrogram moved to DifferentiableOps — every stage of it is differentiable and
+        // mel-based objectives need the gradient.
+        "ISTFT", "GriffinLim",
+
+        // Raw transforms that emit their outputs through `out` parameters. These are
+        // deliberately NOT recorded: they are primitives that the recorded ops above are built
+        // from (Spectrogram and MelSpectrogram call STFT internally and record a single node
+        // with a proper adjoint), and their out-parameter signatures cannot flow through the
+        // Record* helpers, which key on a returned tensor.
+        //
+        // They were previously in NO registry set at all: TapeCompletenessTests only inspected
+        // methods whose RETURN type is a tensor, so nothing ever required them to be classified.
+        // AllTensorOutParameterMethods_AreClassified now closes that hole.
+        "STFT", "FFT", "IFFT", "FFT2D", "IFFT2D", "FFTND",
+        "GroupNormInto", "ProjectGaussians3DTo2D",
 
         // Native Complex<T> operations (no backward functions implemented yet)
         "NativeComplexFFT", "NativeComplexIFFT", "NativeComplexIFFTReal",
@@ -422,7 +451,7 @@ internal static class OpRegistry
         "TensorConv2D",      // -> Conv2D (records)
 
         // Composed from recorded sub-ops (backward through constituents)
-        "TensorBroadcastTo", // -> Reshape or TensorBroadcastAdd (both record)
+        "TensorBroadcastTo", // -> Reshape or TensorAdd (both record)
         "TensorLogSumExp",   // ReduceMax + BroadcastSubtract + TensorExp + ReduceSum + TensorLog + TensorAdd
         "TensorNorm",        // TensorMultiply + ReduceSum + TensorSqrt
         "TensorNormalize",   // TensorNorm + TensorDivide
@@ -435,7 +464,7 @@ internal static class OpRegistry
         "GlobalAvgPool2D",   // reshape + ReduceMean
         "GlobalMaxPool2D",   // reshape + ReduceMax
         "TensorLerp",        // TensorAdd + TensorSubtract + TensorMultiplyScalar
-        "FusedLinear",       // TensorMatMul + TensorBroadcastAdd (both record)
+        "FusedLinear",       // TensorMatMul + TensorAdd (both record)
         "TensorEinsum",      // TensorMatMul / BatchMatMul / Split (record)
         "OctonionAddTensor",  // TensorAdd (records)
         "GeGLU",             // composed with GELU + Tanh

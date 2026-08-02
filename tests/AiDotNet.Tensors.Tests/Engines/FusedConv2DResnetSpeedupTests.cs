@@ -71,7 +71,7 @@ public class FusedConv2DResnetSpeedupTests
         {
             var c = _engine.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
             var biasView = _engine.Reshape(bias, new[] { 1, outC, 1, 1 });
-            var add = _engine.TensorBroadcastAdd(c, biasView);
+            var add = _engine.TensorAdd(c, biasView);
             _ = _engine.FusedConv2D(input, kernel, bias,
                 strideH: 1, strideW: 1, padH: 0, padW: 0,
                 dilationH: 1, dilationW: 1,
@@ -85,7 +85,7 @@ public class FusedConv2DResnetSpeedupTests
             var sw1 = Stopwatch.StartNew();
             var c = _engine.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
             var biasView = _engine.Reshape(bias, new[] { 1, outC, 1, 1 });
-            var sum = _engine.TensorBroadcastAdd(c, biasView);
+            var sum = _engine.TensorAdd(c, biasView);
             sw1.Stop();
             unfusedSamples[it] = sw1.Elapsed.TotalMilliseconds;
 

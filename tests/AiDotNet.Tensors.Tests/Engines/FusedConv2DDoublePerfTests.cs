@@ -36,7 +36,7 @@ public class FusedConv2DDoublePerfTests
         // Reference: unfused sequence (same shape/activation gate as the fused path).
         var convRef = _engine.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
         var biasView = _engine.Reshape(bias, new[] { 1, outC, 1, 1 });
-        var refOut = _engine.TensorBroadcastAdd(convRef, biasView);
+        var refOut = _engine.TensorAdd(convRef, biasView);
 
         // Fused path under test.
         var fused = _engine.FusedConv2D(input, kernel, bias,
@@ -58,7 +58,7 @@ public class FusedConv2DDoublePerfTests
 
         var convRef = _engine.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
         var biasView = _engine.Reshape(bias, new[] { 1, outC, 1, 1 });
-        var refAdd = _engine.TensorBroadcastAdd(convRef, biasView);
+        var refAdd = _engine.TensorAdd(convRef, biasView);
         var refOut = _engine.ReLU(refAdd);
 
         var fused = _engine.FusedConv2D(input, kernel, bias,

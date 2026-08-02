@@ -30,7 +30,7 @@ public class MultiInputCompiledInferenceTests : IDisposable
     private static float[] EagerForward(CpuEngine engine, Tensor<float> x, Tensor<float> w, Tensor<float> t)
     {
         var mm = engine.TensorMatMul(x, w);
-        var o = engine.TensorBroadcastAdd(mm, t);
+        var o = engine.TensorAdd(mm, t);
         var arr = new float[o.Length];
         o.AsSpan().CopyTo(arr);
         return arr;
@@ -51,7 +51,7 @@ public class MultiInputCompiledInferenceTests : IDisposable
             var plan = cache.GetOrCompileInference(new[] { x0, t0 }, () =>
             {
                 var mm = engine.TensorMatMul(x0, w);
-                return engine.TensorBroadcastAdd(mm, t0);
+                return engine.TensorAdd(mm, t0);
             });
 
             // Every (x, t) pair must reproduce the eager result — both slots re-bind.

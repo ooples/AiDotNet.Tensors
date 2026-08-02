@@ -3002,10 +3002,32 @@ public partial class CpuEngine : ITensorLevelEngine
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorAdd");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastAdd(a, b);
+            }
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
@@ -3042,15 +3064,16 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
-        // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
-        // IMPORTANT: use _storage.GetDataArray() (raw backing array) not tensor.GetDataArray() (which copies for views)
+        // Stride-aware: a non-contiguous operand is consumed where it lies, never materialized.
+        //
+        // Routed to the coalescing SIMD kernel rather than walked element-by-element through
+        // LogicalToStorageIndex. The per-element walk was affordable while only the occasional
+        // transposed operand reached here; implicit broadcasting sends every stretched operand down
+        // this branch as a stride-0 view. Measured on [1,64,112,112] + [1,64,1,1] — the Conv+BN
+        // shape the broadcast fast paths exist for — the walk cost 78.2 ms/call against 10.8 ms.
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aRaw = a._storage.GetDataArray(); var bRaw = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[aOff + i], bRaw[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[b.LogicalToStorageIndex(i)]); }
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Add);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -3388,7 +3411,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // breaks CUDA-graph capture); else the eager allocating path.
                         if (eng is DirectGpuTensorEngine baGpu && baGpu.TryBroadcastAddResidentInto(output, capturedA, capturedB))
                             return;
-                        var eager = eng.TensorBroadcastAdd(capturedA, capturedB);
+                        var eager = eng.TensorAdd(capturedA, capturedB);
                         DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                     },
                     BackwardFunctions<T>.BroadcastAddBackward);
@@ -3423,7 +3446,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
             }
             return res;
         }
@@ -3454,7 +3477,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
             }
             return res;
         }
@@ -3465,7 +3488,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (AutoTracer.ShouldRecord)
         {
             var ca = a; var cb = b;
-            AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorBroadcastAdd(ca, cb));
+            AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorAdd(ca, cb));
         }
         return result;
     }
@@ -3489,7 +3512,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // a._shape is not always the final broadcast shape.
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorSubtract(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastSubtractBackward);
             }
         }
@@ -3514,7 +3537,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb));
             }
             return res;
         }
@@ -3537,7 +3560,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         rf[off + c] = af[off + c] - bf[c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb)); }
                 return res;
             }
         }
@@ -3570,14 +3593,14 @@ public partial class CpuEngine : ITensorLevelEngine
                         rd[rRow + c] = ad[aRow + c] - bd[bOff + c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb)); }
                 return res;
             }
         }
 
         var result = a.BroadcastSubtract(b);
         DifferentiableOps.RecordBinary("TensorBroadcastSubtract", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", result, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", result, eng => eng.TensorSubtract(ca, cb)); }
         return result;
     }
 
@@ -3599,7 +3622,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Same broadcast-shape fix as TensorBroadcastMultiply.
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorDivide(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastDivideBackward);
             }
         }
@@ -3623,14 +3646,14 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorBroadcastDivide(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorDivide(ca, cb));
             }
             return res;
         }
 
         var result = a.BroadcastDivide(b);
         DifferentiableOps.RecordBinary("TensorBroadcastDivide", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastDivide", result, eng => eng.TensorBroadcastDivide(ca, cb)); }
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastDivide", result, eng => eng.TensorDivide(ca, cb)); }
         return result;
     }
 
@@ -3657,7 +3680,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // inside the closure overran it with "Destination is too short".
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastMultiplyBackward);
             }
         }
@@ -3684,7 +3707,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb));
             }
             return res;
         }
@@ -3715,13 +3738,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
             DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
-            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
+            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb)); }
             return res;
         }
 
         var result = a.BroadcastMultiply(b);
         DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorBroadcastMultiply(ca, cb)); }
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorMultiply(ca, cb)); }
         return result;
     }
 
@@ -5310,10 +5333,32 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastSubtract(a, b);
+            }
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         // Pin the active gradient tape (if any) to THIS engine — same
         // reasoning as the scope.BindEngineIfUnset call below, but for the
@@ -5362,9 +5407,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Subtract);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -5460,10 +5505,32 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
-            // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
-            return TensorBroadcastMultiply(a, b);
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastMultiply(a, b);
+            }
+
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
@@ -5501,9 +5568,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Multiply);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -6173,10 +6240,32 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastDivide(a, b);
+            }
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
 
         // Lazy graph mode: record and return placeholder
@@ -6204,9 +6293,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Divide);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -6766,13 +6855,45 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+
+        // Detaching blocks BACKWARD traversal; it does not make the value a
+        // compile-time constant. Keep the input in the lazy forward graph and
+        // deliberately omit a backward function so replay refreshes the value
+        // while gradient propagation terminates at this node.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                scope.BindEngineIfUnset(this);
+                var captured = tensor;
+                return scope.RecordUnary(
+                    LazyNodeType.Custom,
+                    "StopGradient",
+                    tensor,
+                    tensor._shape,
+                    (eng, output) =>
+                    {
+                        var source = captured.IsContiguous ? captured : captured.Contiguous();
+                        DirectGpuTensorEngine.CopyResultInto(eng, source, output);
+                    },
+                    backwardFn: null);
+            }
+        }
+
+        // Preserve the caller's tensor/view for transparent replay. The eager copy below
+        // may need a contiguous snapshot, but closing over that snapshot would freeze a
+        // non-contiguous view at trace time instead of observing later source mutations.
+        var tracedInput = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Copy data to a new tensor with no tape connection.
         // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         tensor.AsSpan().CopyTo(result.AsWritableSpan());
+        // Transparent inference tracing has the same forward-dependency contract as
+        // GraphMode, while remaining outside the autodiff tape.
+        { var c = tracedInput; AutoTracer.RecordOp("StopGradient", result, eng => eng.StopGradient(c)); }
         return result;
     }
 
@@ -12658,6 +12779,26 @@ public partial class CpuEngine : ITensorLevelEngine
 
         throw new ArgumentException(
             $"TensorMatMulFloatInto: unsupported rank combination {a.Rank} and {b.Rank}");
+    }
+
+    /// <summary>
+    /// Whether two shapes can be broadcast against each other under NumPy rules.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="ComputeBroadcastShape"/>'s compatibility test without allocating a result
+    /// shape or throwing, so the element-wise operators can ask the question cheaply before deciding
+    /// whether to stretch or to reject.
+    /// </remarks>
+    internal static bool CanBroadcast(int[] shape1, int[] shape2)
+    {
+        int maxRank = Math.Max(shape1.Length, shape2.Length);
+        for (int i = 0; i < maxRank; i++)
+        {
+            int dim1 = i < shape1.Length ? shape1[shape1.Length - 1 - i] : 1;
+            int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
+            if (dim1 != dim2 && dim1 != 1 && dim2 != 1) return false;
+        }
+        return true;
     }
 
     private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
@@ -19444,8 +19585,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gridBaseIdx = ((b * outHeight + oh) * outWidth + ow) * 2;
                     double gx = numOps.ToDouble(gridData[gridBaseIdx]);
                     double gy = numOps.ToDouble(gridData[gridBaseIdx + 1]);
-                    double srcH = (gy + 1) / 2 * (height - 1);
-                    double srcW = (gx + 1) / 2 * (width - 1);
+                    // align_corners=false mapping, matching the forward: ((g + 1) * size - 1) / 2.
+                    // Was (g + 1) / 2 * (size - 1) — the align_corners=TRUE form — so this kernel was
+                    // not the adjoint of the forward it serves.
+                    double srcH = ((gy + 1) * height - 1) / 2.0;
+                    double srcW = ((gx + 1) * width - 1) / 2.0;
                     if (srcH <= -1 || srcH >= height || srcW <= -1 || srcW >= width) continue;
 
                     int h0 = (int)Math.Floor(srcH), h1 = h0 + 1;
@@ -19523,9 +19667,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     double gx = numOps.ToDouble(gridData[gridBaseIdx]);
                     double gy = numOps.ToDouble(gridData[gridBaseIdx + 1]);
 
-                    // Convert to pixel coordinates
-                    double srcH = (gy + 1) / 2 * (height - 1);
-                    double srcW = (gx + 1) / 2 * (width - 1);
+                    // Convert to pixel coordinates — align_corners=false, matching the forward.
+                    double srcH = ((gy + 1) * height - 1) / 2.0;
+                    double srcW = ((gx + 1) * width - 1) / 2.0;
 
                     // Compute d(output)/d(gx) and d(output)/d(gy) by summing over all channels
                     T gradGx = numOps.Zero;
@@ -19541,10 +19685,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         int plane = (b * channels + c) * height * width;
                         var (dH, dW) = BilinearGradientNCHW(inputData, plane, height, width, srcH, srcW, numOps);
 
-                        // Chain rule: d/dgx = d/dw * dw/dgx where dw/dgx = (width-1)/2
-                        // Chain rule: d/dgy = d/dh * dh/dgy where dh/dgy = (height-1)/2
-                        T scaledDW = numOps.Multiply(dW, numOps.FromDouble((width - 1) / 2.0));
-                        T scaledDH = numOps.Multiply(dH, numOps.FromDouble((height - 1) / 2.0));
+                        // Chain rule: d/dgx = d/dw * dw/dgx where, for align_corners=false
+                        // (w = ((gx + 1) * width - 1) / 2), dw/dgx = width/2 — NOT (width-1)/2, which
+                        // is the align_corners=true derivative and did not match the forward.
+                        T scaledDW = numOps.Multiply(dW, numOps.FromDouble(width / 2.0));
+                        T scaledDH = numOps.Multiply(dH, numOps.FromDouble(height / 2.0));
 
                         gradGx = numOps.Add(gradGx, numOps.Multiply(gradOutVal, scaledDW));
                         gradGy = numOps.Add(gradGy, numOps.Multiply(gradOutVal, scaledDH));
@@ -30860,6 +31005,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Match ReduceSum and the eager reduction contract: null means reduce
+        // every axis. Normalize before graph-shape construction so tracing does
+        // not enumerate a null array even though the eager path supports it.
+        axes ??= Enumerable.Range(0, input.Rank).ToArray();
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -31519,21 +31669,37 @@ public partial class CpuEngine : ITensorLevelEngine
         var variance = ReduceVariance(input, axes, keepDims);
         var varianceData = variance.GetDataArray();
 
-        // Apply log(variance + epsilon)
+        // Apply log(variance + epsilon) into SEPARATE buffers.
+        //
+        // This used to write the log back over varianceData, which aliases `variance`'s own array.
+        // `variance` is then handed to the backward as saved state, so the backward — which needs
+        // the raw variance for 2*(x-mean)/(N*variance) — was dividing by LOG(variance). For
+        // variance < 1 that is negative, tripping the backward's "variance <= 0" guard which
+        // substitutes 1e-8 and inflated the gradient by variance/1e-8 (measured ~3e6 at variance
+        // ~0.03). For variance > 1 the guard never fires and the gradient is instead silently wrong
+        // by a data-dependent factor, which is why this never surfaced as a crash.
+        //
+        // The backward also needs variance + epsilon, not variance: d/dx log(variance + epsilon)
+        // has that sum as its denominator. Passing the raw variance was wrong by
+        // (variance + epsilon)/variance — negligible at the 1e-8 default, 17.5x at epsilon 0.5.
         T eps = numOps.FromDouble(epsilon);
+        var logVarData = new T[varianceData.Length];
+        var varPlusEpsData = new T[varianceData.Length];
         for (int i = 0; i < varianceData.Length; i++)
         {
-            varianceData[i] = numOps.Log(numOps.Add(varianceData[i], eps));
+            varPlusEpsData[i] = numOps.Add(varianceData[i], eps);
+            logVarData[i] = numOps.Log(varPlusEpsData[i]);
         }
 
-        var logVarResult = TensorAllocator.Rent<T>(variance._shape, varianceData);
+        var logVarResult = TensorAllocator.Rent<T>(variance._shape, logVarData);
+        var varianceForBackward = TensorAllocator.Rent<T>(variance._shape, varPlusEpsData);
         // Compute mean inside NoGradScope to avoid adding disconnected tape entries
         Tensor<T> mean;
         using (new NoGradScope<T>())
         {
             mean = ReduceMean(input, axes, keepDims);
         }
-        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, variance });
+        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, varianceForBackward });
         { var ci = input; var ca = axes; var ck = keepDims; var ce = epsilon; AutoTracer.RecordOp("ReduceLogVariance", logVarResult, eng => eng.ReduceLogVariance(ci, ca, ck, ce)); }
         return logVarResult;
     }
@@ -32205,8 +32371,15 @@ public partial class CpuEngine : ITensorLevelEngine
         var inData = input.GetDataArray();
         var gridData = grid.GetDataArray();
         var outData = output.GetDataArray();
-        double widthScaleD = (inW - 1) / 2.0;
-        double heightScaleD = (inH - 1) / 2.0;
+        // torchvision / PyTorch DEFAULT convention: align_corners=false, padding_mode='zeros'.
+        //   src = ((g + 1) * size - 1) / 2  ==  (g + 1) * (size / 2) - 0.5
+        // This previously used (size - 1) / 2, which is the align_corners=TRUE mapping, and clamped
+        // the four sample indices into [0, size-1], which is BORDER padding — so despite this file
+        // documenting the narrow overload as a torchvision-default shim it implemented neither
+        // default. It disagreed with GridSample(..., Bilinear, Zeros, alignCorners:false) by 5.553e-2
+        // on interior coordinates. See GridSampleForwardConventionTests.
+        double widthScaleD = inW / 2.0;
+        double heightScaleD = inH / 2.0;
         long totalWork = (long)batch * outH * outW * channels;
         int lInH = inH, lInW = inW, lOutH = outH, lOutW = outW, lCh = channels;
 
@@ -32221,19 +32394,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int w = 0; w < lOutW; w++)
                 {
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
-                    double srcX = (gr[gBase] + 1.0) * widthScaleD;
-                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD;
-                    int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
-                    int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
+                    double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
+                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
+                    int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     double wx1 = srcX - x0, wx0 = 1.0 - wx1, wy1 = srcY - y0, wy0 = 1.0 - wy1;
+                    // Zeros padding: an out-of-range corner contributes nothing (rather than being
+                    // clamped to the border pixel). The gates are channel-independent, so they are
+                    // computed once per output pixel and the inner loop stays branch-predictable.
+                    bool okX0 = x0 >= 0 && x0 < lInW, okX1 = x1 >= 0 && x1 < lInW;
+                    bool okY0 = y0 >= 0 && y0 < lInH, okY1 = y1 >= 0 && y1 < lInH;
                     int outSpatial = h * lOutW + w;
                     int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
                     {
                         int inPlane = (b * lCh + c) * lInH * lInW;
-                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] =
-                            (inp[inPlane + s00] * wx0 * wy0 + inp[inPlane + s01] * wx1 * wy0)
-                          + (inp[inPlane + s10] * wx0 * wy1 + inp[inPlane + s11] * wx1 * wy1);
+                        double acc = 0.0;
+                        if (okY0 & okX0) acc += inp[inPlane + s00] * wx0 * wy0;
+                        if (okY0 & okX1) acc += inp[inPlane + s01] * wx1 * wy0;
+                        if (okY1 & okX0) acc += inp[inPlane + s10] * wx0 * wy1;
+                        if (okY1 & okX1) acc += inp[inPlane + s11] * wx1 * wy1;
+                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] = acc;
                     }
                 }
             });
@@ -32249,19 +32430,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int w = 0; w < lOutW; w++)
                 {
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
-                    double srcX = (gr[gBase] + 1.0) * widthScaleD;
-                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD;
-                    int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
-                    int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
+                    double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
+                    double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
+                    int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     float fwx1 = (float)(srcX - x0), fwx0 = 1f - fwx1, fwy1 = (float)(srcY - y0), fwy0 = 1f - fwy1;
+                    // Zeros padding — see the double branch above.
+                    bool okX0 = x0 >= 0 && x0 < lInW, okX1 = x1 >= 0 && x1 < lInW;
+                    bool okY0 = y0 >= 0 && y0 < lInH, okY1 = y1 >= 0 && y1 < lInH;
                     int outSpatial = h * lOutW + w;
                     int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
                     {
                         int inPlane = (b * lCh + c) * lInH * lInW;
-                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] =
-                            (inp[inPlane + s00] * fwx0 * fwy0 + inp[inPlane + s01] * fwx1 * fwy0)
-                          + (inp[inPlane + s10] * fwx0 * fwy1 + inp[inPlane + s11] * fwx1 * fwy1);
+                        float acc = 0f;
+                        if (okY0 & okX0) acc += inp[inPlane + s00] * fwx0 * fwy0;
+                        if (okY0 & okX1) acc += inp[inPlane + s01] * fwx1 * fwy0;
+                        if (okY1 & okX0) acc += inp[inPlane + s10] * fwx0 * fwy1;
+                        if (okY1 & okX1) acc += inp[inPlane + s11] * fwx1 * fwy1;
+                        outp[(b * lCh + c) * lOutH * lOutW + outSpatial] = acc;
                     }
                 }
             });
@@ -32274,22 +32461,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int w = 0; w < lOutW; w++)
                 {
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
-                    double srcX = (numOps.ToDouble(gridData[gBase]) + 1.0) * widthScaleD;
-                    double srcY = (numOps.ToDouble(gridData[gBase + 1]) + 1.0) * heightScaleD;
-                    int x0 = Math.Max(0, Math.Min((int)Math.Floor(srcX), lInW - 1)), x1 = Math.Max(0, Math.Min(x0 + 1, lInW - 1));
-                    int y0 = Math.Max(0, Math.Min((int)Math.Floor(srcY), lInH - 1)), y1 = Math.Max(0, Math.Min(y0 + 1, lInH - 1));
+                    double srcX = (numOps.ToDouble(gridData[gBase]) + 1.0) * widthScaleD - 0.5;
+                    double srcY = (numOps.ToDouble(gridData[gBase + 1]) + 1.0) * heightScaleD - 0.5;
+                    int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
+                    int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     T twx1 = numOps.FromDouble(srcX - x0), twx0 = numOps.Subtract(numOps.One, twx1);
                     T twy1 = numOps.FromDouble(srcY - y0), twy0 = numOps.Subtract(numOps.One, twy1);
+                    // Zeros padding — see the double branch above.
+                    bool okX0 = x0 >= 0 && x0 < lInW, okX1 = x1 >= 0 && x1 < lInW;
+                    bool okY0 = y0 >= 0 && y0 < lInH, okY1 = y1 >= 0 && y1 < lInH;
                     int outSpatial = h * lOutW + w;
                     int s00 = y0 * lInW + x0, s01 = y0 * lInW + x1, s10 = y1 * lInW + x0, s11 = y1 * lInW + x1;
                     for (int c = 0; c < lCh; c++)
                     {
                         int inPlane = (b * lCh + c) * lInH * lInW;
-                        outData[(b * lCh + c) * lOutH * lOutW + outSpatial] = numOps.Add(
-                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[inPlane + s00], twx0), twy0),
-                                       numOps.Multiply(numOps.Multiply(inData[inPlane + s01], twx1), twy0)),
-                            numOps.Add(numOps.Multiply(numOps.Multiply(inData[inPlane + s10], twx0), twy1),
-                                       numOps.Multiply(numOps.Multiply(inData[inPlane + s11], twx1), twy1)));
+                        T acc = numOps.Zero;
+                        if (okY0 & okX0) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s00], twx0), twy0));
+                        if (okY0 & okX1) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s01], twx1), twy0));
+                        if (okY1 & okX0) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s10], twx0), twy1));
+                        if (okY1 & okX1) acc = numOps.Add(acc, numOps.Multiply(numOps.Multiply(inData[inPlane + s11], twx1), twy1));
+                        outData[(b * lCh + c) * lOutH * lOutW + outSpatial] = acc;
                     }
                 }
             });
@@ -34026,6 +34217,15 @@ public partial class CpuEngine : ITensorLevelEngine
             dest[i] = isTrue ? xSpan[i] : ySpan[i];
         }
 
+        // Tape registration — condition is non-trainable; the gradient routes through x
+        // where the condition is true and through y otherwise. This overload previously
+        // recorded NOTHING, so TensorWhere(Tensor<T>, ...) silently produced no gradient
+        // for x or y even though it is classified differentiable in OpRegistry — the
+        // xOrig/yOrig/conditionOrig locals above were captured for a tape call that was
+        // never made. The Tensor<bool>/Tensor<Bit> overloads and the GPU override all
+        // record; only this one did not.
+        DifferentiableOps.RecordBinary("TensorWhere", result, xOrig, yOrig,
+            BackwardFunctions<T>.WhereBackward, new object[] { condition });
         return result;
     }
 
@@ -37260,6 +37460,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = value;
         }
 
+        // Eager tape registration. This overload recorded for GraphMode and AutoTracer but never
+        // called DifferentiableOps.Record*, so a Bit-masked fill produced NO gradient while the
+        // Tensor<bool> overload above produced one. The mask is converted to bool[] because
+        // MaskedFillBackward handles Tensor<T>, Tensor<bool> and bool[] but not Tensor<Bit> — reusing
+        // the already-tested bool[] branch rather than adding a fourth.
+        {
+            var maskBools = new bool[maskSpan.Length];
+            for (int i = 0; i < maskSpan.Length; i++) maskBools[i] = (bool)maskSpan[i];
+            DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensorOrig,
+                BackwardFunctions<T>.MaskedFillBackward, new object[] { maskBools });
+        }
         { var ct = tensor; var cm = mask; var cv = value; AutoTracer.RecordOp("MaskedFill", result, eng => eng.TensorMaskedFill(ct, cm, cv)); }
         return result;
     }
@@ -39523,13 +39734,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("RFFT", result, input, static (gradOutput, inputs, output, savedState, engine, grads) =>
-        {
-            // RFFT backward is IRFFT
-            var nFftSaved = (int)savedState[0];
-            var grad = engine.IRFFT(gradOutput, nFftSaved);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-        }, new object[] { n });
+        // RFFT backward is the ADJOINT of the forward transform, which is NOT IRFFT. IRFFT is the
+        // inverse: it carries a 1/nFft and doubles the interior Hermitian bins. Using it made the
+        // gradient uniformly too small by roughly the bin count — at n=16 the adjoint of an
+        // all-ones output gradient is 9 at j=0 while IRFFT returned 1. Derivation in
+        // BackwardFunctions<T>.RFFTAdjointBackward.
+        DifferentiableOps.RecordUnary("RFFT", result, input,
+            BackwardFunctions<T>.RFFTAdjointBackward, new object[] { n, nFft });
         { var ci = input; AutoTracer.RecordOp("RFFT", result, eng => eng.RFFT(ci)); }
         return result;
     }
@@ -39579,12 +39790,29 @@ public partial class CpuEngine : ITensorLevelEngine
             var work = FftScratch<T>(nFft);
             int inputOffset = batchIdx * numFreqs * 2;
 
+            // FftScratch hands back a REUSED thread-static buffer and does not clear it. When the
+            // spectrum is narrower than the transform (nFft > 2*(numFreqs-1), reachable once
+            // outputLength drives nFft past the spectrum's natural length) the slots between the
+            // positive frequencies and their mirrors are never written here, so they would carry
+            // whatever the previous call left there — a different result for identical inputs
+            // depending on what ran before. Zero-padding those bins is also the correct spectral
+            // interpretation of a spectrum shorter than the transform.
+            for (int t = 0; t < nFft; t++)
+                work[t] = new Complex<T>(numOps.Zero, numOps.Zero);
+
             // Positive frequencies as given.
             for (int k = 0; k < numFreqs; k++)
                 work[k] = new Complex<T>(inputData[inputOffset + k * 2], inputData[inputOffset + k * 2 + 1]);
 
-            // Negative frequencies by conjugate symmetry: X[n-k] = conj(X[k]).
-            for (int k = 1; k < numFreqs - 1; k++)
+            // Negative frequencies by conjugate symmetry: X[nFft-k] = conj(X[k]).
+            //
+            // Mirror every bin whose partner slot is a DIFFERENT slot, rather than stopping at
+            // numFreqs-1. Those coincide only when nFft is even and numFreqs is exactly its
+            // half-spectrum width, where numFreqs-1 IS the self-conjugate Nyquist bin. For an odd
+            // nFft (reachable when outputLength exceeds the spectrum's natural length) there is no
+            // Nyquist bin, so the old bound silently dropped the last bin's conjugate and left a
+            // zero in its place — a spectrum that is not Hermitian, whose inverse is not real.
+            for (int k = 1; k < numFreqs && nFft - k > k; k++)
                 work[nFft - k] = new Complex<T>(work[k].Real, numOps.Negate(work[k].Imaginary));
 
             NativeFFTInPlace(work, inverse: true, numOps);
@@ -39596,12 +39824,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 resultData[outputOffset + i] = numOps.Multiply(work[i].Real, scale);
         });
 
-        DifferentiableOps.RecordUnary("IRFFT", result, inputOrig, static (gradOutput, inputs, output, savedState, engine, grads) =>
-        {
-            // IRFFT backward is RFFT
-            var grad = engine.RFFT(gradOutput);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-        }, Array.Empty<object>());
+        // IRFFT backward is the ADJOINT, not RFFT. Beyond the missing 1/nFft and Hermitian
+        // weighting, RFFT returns 2*(nFft/2+1) interleaved values, so it could not even produce a
+        // gradient shaped like this op's input — that mismatch is how the defect first surfaced.
+        DifferentiableOps.RecordUnary("IRFFT", result, inputOrig,
+            BackwardFunctions<T>.IRFFTAdjointBackward,
+            new object[] { numFreqs, nFft, outputLength });
         { var ci = input; var col = outputLength; AutoTracer.RecordOp("IRFFT", result, eng => eng.IRFFT(ci, col)); }
         return result;
     }
@@ -39865,6 +40093,20 @@ public partial class CpuEngine : ITensorLevelEngine
         if (center)
         {
             int padAmount = nFft / 2;
+
+            // Reflection needs a strictly longer signal than the pad: the start pad reads
+            // input[padAmount - i], whose first access is input[padAmount]. Without this check
+            // that access runs off the end and surfaces as an opaque IndexOutOfRangeException
+            // from inside the padding loop. It also mattered for the adjoint — the backward
+            // folds padded gradient back only where the source index is in range, so a
+            // too-short signal would have silently dropped gradient contributions rather than
+            // failing. Validate once, here, so forward and backward agree on the domain.
+            if (signalLength <= padAmount)
+                throw new ArgumentException(
+                    $"Signal length {signalLength} must be greater than nFft/2 ({padAmount}) when " +
+                    $"center is true, because reflection padding reflects across the signal. " +
+                    $"Either pass center: false or use nFft < {2 * signalLength}.",
+                    nameof(input));
             var paddedShape = input.Shape.ToArray();
             paddedShape[^1] = signalLength + 2 * padAmount;
             paddedInput = AutoTensorCache.RentOrAllocate<T>(paddedShape);
@@ -39899,6 +40141,18 @@ public partial class CpuEngine : ITensorLevelEngine
         // Calculate number of frames
         int numFrames = (signalLength - nFft) / hopLength + 1;
         int numFreqs = nFft / 2 + 1;
+
+        // A signal shorter than one analysis window yields ZERO frames — integer division makes
+        // (257 - 512) / 128 + 1 == 0 rather than anything negative, so nothing downstream notices.
+        // Returning an empty spectrogram then detonated in ISTFT as an opaque
+        // DivideByZeroException (magnitude.Length / (numFreqs * numFrames)), which is a terrible
+        // diagnostic for "your signal is too short". Fail here, where the cause is visible.
+        if (numFrames <= 0)
+            throw new ArgumentException(
+                $"Signal length {signalLength} is too short for nFft {nFft} with hopLength " +
+                $"{hopLength}: that yields {numFrames} frames. Use center: true (which pads by " +
+                $"nFft/2 on each side), a smaller nFft, or a longer signal.",
+                nameof(input));
 
         // Output shapes
         var outputShape = input.Shape.ToArray();
@@ -39972,10 +40226,28 @@ public partial class CpuEngine : ITensorLevelEngine
         int numFreqs = magnitude._shape[^2];
         int numFrames = magnitude._shape[^1];
 
-        // Calculate output length
-        int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
-        if (center)
-            outputLength -= nFft; // Remove padding
+        // Calculate output length.
+        //
+        // An explicitly supplied length is honoured VERBATIM (librosa / torch semantics:
+        // istft(..., length: n) returns exactly n samples). The centering adjustment applies
+        // only to the DERIVED length, where it removes the nFft of analysis padding.
+        //
+        // Previously the `if (center)` subtraction ran unconditionally, so an explicit
+        // length came back nFft samples short. That silently broke SpectrogramBackward,
+        // which passes length: origLength — the gradient it returned was shaped
+        // [origLength - nFft] instead of [origLength], misaligning every sample and
+        // corrupting any objective built on a spectrogram (vocoder / TTS / RIR losses).
+        int outputLength;
+        if (length.HasValue)
+        {
+            outputLength = length.Value;
+        }
+        else
+        {
+            outputLength = (numFrames - 1) * hopLength + nFft;
+            if (center)
+                outputLength -= nFft; // Remove analysis padding
+        }
 
         // Output shape
         var outputShape = magnitude._shape.Take(magnitude._shape.Length - 2).ToArray();
@@ -39987,6 +40259,32 @@ public partial class CpuEngine : ITensorLevelEngine
         var windowData = window.GetDataArray();
         var resultData = result.GetDataArray();
         var windowSumData = windowSum.GetDataArray();
+
+        // ZERO the accumulators. Both are overlap-ADD targets (resultData[idx] += ...,
+        // windowSumData[idx] += ...), but AutoTensorCache.RentOrAllocate hands back POOLED memory
+        // whose contents are arbitrary — it does not zero-fill, precisely so callers that fully
+        // overwrite their output pay nothing. An accumulator is not such a caller.
+        //
+        // Reading a recycled buffer that happened to contain NaN (or any stale float) poisoned the
+        // whole reconstruction: ISTFT(STFT(x)) returned RMS NaN for a clean sine whose STFT magnitude
+        // had RMS 6.89. The window-sum guard below (winSumD > 1e-8) does not help — a NaN windowSum
+        // fails that comparison, so the already-poisoned sample is simply left unnormalised.
+        //
+        // This was latent until the explicit-length fix earlier in this branch: ISTFT used to subtract
+        // nFft from a caller-requested length, returning a shorter span that happened to avoid the
+        // stale region often enough to look correct. It is what made TimeStretch appear "silent" (a
+        // NaN output has no detectable dominant frequency) and made the pitch test flaky run to run,
+        // since the reading depended on whatever the pool last held.
+        System.Array.Clear(resultData, 0, resultData.Length);
+        System.Array.Clear(windowSumData, 0, windowSumData.Length);
+
+        // Defence in depth: STFT now refuses to emit a zero-frame spectrogram, but ISTFT can be
+        // handed a spectrogram from anywhere, and dividing by numFreqs * numFrames == 0 gave a bare
+        // DivideByZeroException with no indication of which argument was wrong.
+        if (numFrames <= 0 || numFreqs <= 0)
+            throw new ArgumentException(
+                $"Spectrogram has no data to invert: numFreqs={numFreqs}, numFrames={numFrames}. " +
+                $"Both must be positive.", nameof(magnitude));
 
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
@@ -40021,8 +40319,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 var (realOut, _) = FFTCore<T>(realIn, imagIn, inverse: true);
                 T scale = numOps.FromDouble(1.0 / nFft);
 
-                // Overlap-add
-                int writeStart = center ? Math.Max(0, frame * hopLength - nFft / 2) : frame * hopLength;
+                // Overlap-add.
+                // With center: true, STFT frames the PADDED signal, so analysis frame `frame` starts at
+                // frame*hopLength in the padded signal and therefore at frame*hopLength - nFft/2 in the
+                // ORIGINAL signal. Synthesis must place it there and let the bounds check below TRIM the
+                // part that falls before sample 0.
+                //
+                // This previously read Math.Max(0, frame * hopLength - nFft / 2). Clamping the start and
+                // then indexing writeStart + i does not trim the frame, it SHIFTS it right: for frame 0
+                // (start -nFft/2) window sample 0 landed on output sample 0 instead of window sample
+                // nFft/2 landing there. Every frame whose centre precedes sample 0 was displaced, so the
+                // first nFft output samples were reconstructed from the wrong window positions
+                // (measured: ISTFT(STFT(x)) reproduced the interior to 5.55e-16 but the head was wrong by
+                // 0.985 on a signal bounded by 1).
+                //
+                // It also destroyed the CONDITIONING of the normalisation below: output 0 should sit at
+                // the window's centre, where win[nFft/2] is approximately 1, giving a window sum of O(1);
+                // the shift aligned win[0] = 0 with output 0 instead, collapsing the sum to ~1e-8. That
+                // near-zero divisor amplified fp32 differences by ~1e7 and was the reason CPU and GPU
+                // TimeStretch differed by 1e-1 at index 3 while every kernel was algorithmically
+                // identical (amplification measured at 1.46e7-4.38e7 across rates 0.5-2.0).
+                int writeStart = center ? frame * hopLength - nFft / 2 : frame * hopLength;
 
                 for (int i = 0; i < nFft; i++)
                 {
@@ -40071,8 +40388,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Compute STFT
-        STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
+        // Compute STFT. The phase is retained (it used to be discarded) because the backward
+        // needs it to reconstruct the complex spectrum for the magnitude adjoint.
+        STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
+        int origLength = input._shape[^1];
 
         // Convert to power spectrum (magnitude squared)
         var powerSpec = TensorMultiply(magnitude, magnitude);
@@ -40113,11 +40432,34 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // The pre-dB mel is kept for the backward: the log derivative is 10/(mel·ln10), which
+        // needs the LINEAR value, and both clamps below have to be detectable to zero the
+        // gradient where the output saturates.
+        //
+        // Snapshotted into a fresh tensor by explicit element copy rather than Clone(): the dB
+        // loop below mutates melSpecData in place, and if Clone() shares storage (copy-on-write)
+        // the snapshot would be overwritten with dB values. Those can be negative, which made the
+        // backward divide by a negative number and flip the gradient's sign — caught by
+        // MelSpectrogram_Backward_MatchesFiniteDifferences(powerToDb: true).
+        Tensor<T> linearMel;
+        if (powerToDb)
+        {
+            linearMel = new Tensor<T>(melShape);
+            var linearMelData = linearMel.GetDataArray();
+            Array.Copy(melSpecData, linearMelData, melSpec.Length);
+        }
+        else
+        {
+            linearMel = melSpec;
+        }
+
         // Convert to dB scale if requested
         if (powerToDb)
         {
-            double minDbD = -80.0;
-            double epsilonD = 1e-10;
+            // Shared with MelSpectrogramBackward so the backward zeroes the gradient at exactly
+            // the thresholds the forward clamps at.
+            const double minDbD = Audio.MelSpectrogramConstants.MinDb;
+            const double epsilonD = Audio.MelSpectrogramConstants.PowerFloor;
 
             for (int i = 0; i < melSpec.Length; i++)
             {
@@ -40128,6 +40470,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 melSpecData[i] = numOps.FromDouble(db);
             }
         }
+
+        // Record one tape node for the whole op. Previously MelSpectrogram was classified
+        // NonDifferentiable, so mel-based objectives (vocoder / TTS) received no gradient at all
+        // even though every stage — |STFT|, squaring, the filterbank matmul, the dB conversion —
+        // is differentiable.
+        DifferentiableOps.RecordUnary(
+            "MelSpectrogram", melSpec, input,
+            BackwardFunctions<T>.MelSpectrogramBackward,
+            new object[]
+            {
+                nFft, hopLength, window, phase, origLength,
+                magnitude, melFilterbank, nMels, powerToDb, linearMel,
+            });
 
         return melSpec;
     }
@@ -40339,6 +40694,48 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < n; i++)
             imagInput[i] = numOps.Zero;
         return FFTCore(realInput, imagInput, inverse);
+    }
+
+    /// <summary>
+    /// Unnormalized complex inverse transform, exposed for the Spectrogram adjoint.
+    /// </summary>
+    /// <remarks>
+    /// Computes <c>Σ_k c[k] e^(+2πik n/N)</c> with NO 1/N factor — <see cref="FFTCore{T}(Vector{T}, Vector{T}, bool)"/>
+    /// only flips the twiddle sign for the inverse direction. That is precisely the adjoint of
+    /// the unnormalized forward DFT the STFT performs, which is what
+    /// <c>BackwardFunctions{T}.SpectrogramBackward</c> needs. Deliberately NOT ISTFT: ISTFT is a
+    /// synthesis operator that divides by the window-sum, which is not the adjoint.
+    /// </remarks>
+    /// <remarks>
+    /// Must be a TRUE n-point transform. <see cref="FFTCore{T}(Vector{T}, Vector{T}, bool)"/>
+    /// zero-pads a non-power-of-two length up to the next power of two, which is a different
+    /// transform entirely — its bins sit at k/nPadded rather than k/n — so an adjoint built on it
+    /// does not transpose the forward it is paired with. That is fine for the power-of-two lengths
+    /// this used to see and wrong for every other one, so those route to Bluestein instead.
+    /// </remarks>
+    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransformForAdjoint<T>(
+        Vector<T> realInput, Vector<T> imagInput, bool inverse)
+    {
+        int n = realInput.Length;
+        if (n <= 1 || AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+            return FFTCore<T>(realInput, imagInput, inverse);
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var work = new Complex<T>[n];
+        for (int i = 0; i < n; i++)
+            work[i] = new Complex<T>(realInput[i], imagInput[i]);
+
+        NativeFFTBluestein(work, n, inverse, ops);
+
+        var real = new Vector<T>(n);
+        var imag = new Vector<T>(n);
+        for (int i = 0; i < n; i++)
+        {
+            real[i] = work[i].Real;
+            imag[i] = work[i].Imaginary;
+        }
+
+        return (real, imag);
     }
 
     /// <summary>
@@ -43785,7 +44182,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Narrow", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        var result = tensor.Slice(dim, start, start + length);
+        var result = tensor.CreateNarrowView(dim, start, start + length, recordAutodiff: false);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
         AutoTracer.RecordOp("Narrow", result, eng => eng.TensorNarrow(tensor, dim, start, length));
@@ -48384,6 +48781,32 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Unnormalized transform for a non-power-of-two length, routed to Bluestein.
+    /// </summary>
+    /// <remarks>
+    /// The butterfly below is radix-2 only: its stage loop doubles <c>size</c> up to <c>n</c> and
+    /// indexes <c>data[start + k + halfSize]</c>, which runs past the end as soon as <c>n</c> is
+    /// not a power of two (n=10 reads index 12). That surfaced as an IndexOutOfRangeException from
+    /// inside IRFFT for any outputLength above the spectrum's natural length, since the clamp
+    /// there can hand this method a length like 9, 10 or 12.
+    /// </remarks>
+    private static void NativeFFTBluestein<T>(Complex<T>[] data, int n, bool inverse,
+        INumericOperations<T> ops)
+    {
+        var buf = new double[2 * n];
+        for (int i = 0; i < n; i++)
+        {
+            buf[2 * i] = ops.ToDouble(data[i].Real);
+            buf[2 * i + 1] = ops.ToDouble(data[i].Imaginary);
+        }
+
+        AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.BluesteinNoScale(buf, n, inverse);
+
+        for (int i = 0; i < n; i++)
+            data[i] = new Complex<T>(ops.FromDouble(buf[2 * i]), ops.FromDouble(buf[2 * i + 1]));
+    }
+
     private static void NativeFFTInPlace<T>(Complex<T>[] data, bool inverse,
         INumericOperations<T> ops)
     {
@@ -48404,6 +48827,14 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         int n = data.Length;
+
+        // Radix-2 butterfly below cannot express any other length; route those to Bluestein.
+        if (n >= 2 && !AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            NativeFFTBluestein(data, n, inverse, ops);
+            return;
+        }
+
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
@@ -48497,6 +48928,15 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 #endif
+        if (n >= 2 && !AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            // Radix-2 only below — see NativeFFTBluestein.
+            var arbitrary = data.ToArray();
+            NativeFFTBluestein<double>(arbitrary, n, inverse, MathHelper.GetNumericOperations<double>());
+            arbitrary.AsSpan().CopyTo(data);
+            return;
+        }
+
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 
@@ -48577,6 +49017,15 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 #endif
+        if (n >= 2 && !AiDotNet.Tensors.LinearAlgebra.Fft.FftKernels.IsPowerOfTwo(n))
+        {
+            // Radix-2 only below — see NativeFFTBluestein.
+            var arbitrary = data.ToArray();
+            NativeFFTBluestein<float>(arbitrary, n, inverse, MathHelper.GetNumericOperations<float>());
+            arbitrary.AsSpan().CopyTo(data);
+            return;
+        }
+
         int bits = 0;
         for (int tmp = n >> 1; tmp > 0; tmp >>= 1) bits++;
 

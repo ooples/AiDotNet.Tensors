@@ -14,6 +14,11 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 public static class TensorAllocator
 {
+    // Diagnostic counters (AIDOTNET_ALLOC_DIAG=1): where RentUninitialized's arena tier lands.
+    internal static readonly bool AllocDiag =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_ALLOC_DIAG") == "1";
+    internal static long ArenaHit, ArenaMiss, ArenaNull, ArenaHitBytes, ArenaMissBytes, ArenaNullBytes;
+
     /// <summary>
     /// Threshold above which ArrayPool is used instead of standard allocation.
     /// ArrayPool avoids GC pressure for repeated large allocations (e.g., GEMM temporaries).
@@ -376,8 +381,10 @@ public static class TensorAllocator
         if (arena != null)
         {
             var pooledTensor = arena.TryRentTensor<T>(totalSize, shape);
-            if (pooledTensor != null) return pooledTensor;
+            if (pooledTensor != null) { if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaHit); System.Threading.Interlocked.Add(ref ArenaHitBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); } return pooledTensor; }
+            if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaMiss); System.Threading.Interlocked.Add(ref ArenaMissBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); }
         }
+        else if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaNull); System.Threading.Interlocked.Add(ref ArenaNullBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); }
 
 #if NET5_0_OR_GREATER
         // Thread-local cache: skip Array.Clear

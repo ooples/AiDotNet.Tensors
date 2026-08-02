@@ -1624,7 +1624,28 @@ internal static class BlasProvider
         // Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, the static-ctor
         // resolver redirects libopenblas → MklImports; the call below
         // then dispatches into MKL's cblas_sgemm transparently.
-        if (!_nativeAvailable.Value) return false;
+        //
+        // No native library at all: serve from the managed kernel rather than reporting failure.
+        // Returning false here is not free — every caller reads it as "no GEMM available" and takes
+        // a fallback, and those fallbacks allocate. The compiled training plan's specialized MatMul
+        // backward writes dA/dB straight into pre-allocated gradient buffers through this call; when
+        // it returned false the plan dropped to the generic dictionary backward, renting fresh
+        // gradients and transposes at 136 KB per step on a [32,128]x[128,64] MLP. That was enough to
+        // force a Gen0 collection roughly every 100 steps, each costing a 20-50 ms pause.
+        //
+        // Placed HERE rather than in ShouldRouteManaged deliberately: routing there would bypass the
+        // autotune cache that PrefersManagedCacheTest covers. This only intercepts the case where
+        // the alternative is failing outright.
+        if (!_nativeAvailable.Value)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            LogShape(m, n, k, transA, transB);
+            return true;
+        }
         bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
         if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
         {
@@ -1682,7 +1703,18 @@ internal static class BlasProvider
             LogShape(m, n, k, transA, transB);
             return true;
         }
-        if (!_nativeAvailable.Value) return false;
+        // See the float overload: with no native library, serve from the managed kernel instead of
+        // reporting failure and pushing every caller onto an allocating fallback.
+        if (!_nativeAvailable.Value)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            LogShape(m, n, k, transA, transB);
+            return true;
+        }
         bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
         if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
         {
