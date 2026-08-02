@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("DirectGpuSerial")]
 public sealed class DirectPtxRecurrentTests
 {
     [Fact]
@@ -63,25 +65,101 @@ public sealed class DirectPtxRecurrentTests
         Assert.Equal("0", blueprint.Semantics["intermediate-global-bytes"]);
         Assert.Equal("0", blueprint.Semantics["temporary-device-bytes"]);
         Assert.Equal(0, blueprint.ResourceBudget.MaxLocalBytesPerThread);
-        Assert.Contains("pending-gpu-evidence", blueprint.Semantics["promotion"]);
+        Assert.Equal("validated-exact-sm86-opt-in", blueprint.Semantics["promotion"]);
     }
 
     [Fact]
-    public void RgLruEmitter_IsExactShapeUnrolledAndHasNoDynamicStrideBranch()
+    public void RgLruEmitter_IsSingleBlockFourStepPipelineWithFixedLoop()
     {
         string ptx = PtxFusedRgLruScan128x256Kernel.EmitPtx(8, 6);
         Assert.Contains(".target sm_86", ptx);
         Assert.Contains(PtxFusedRgLruScan128x256Kernel.EntryPoint, ptx);
-        Assert.Equal(1 + 3 * PtxFusedRgLruScan128x256Kernel.SequenceLength,
-            Count(ptx, "ld.global.f32"));
-        Assert.Equal(PtxFusedRgLruScan128x256Kernel.SequenceLength,
-            Count(ptx, "st.global.f32"));
+        Assert.Equal(256, PtxFusedRgLruScan128x256Kernel.BlockThreads);
+        Assert.Equal(1, PtxFusedRgLruScan128x256Kernel.GridBlocks);
+        Assert.Contains(".maxntid 256, 1, 1", ptx);
+        Assert.Equal(13, Count(ptx, "ld.global.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.f32"));
+        Assert.Equal(4, Count(ptx, "sqrt.approx.ftz.f32"));
+        Assert.Equal(4, Count(ptx, "fma.rn.ftz.f32"));
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
+        Assert.Equal(1, Count(ptx, " bra $RGLRU_LOOP"));
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain("%ctaid", ptx, StringComparison.Ordinal);
-        Assert.DoesNotContain("bra", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.Throws<NotSupportedException>(
             () => PtxFusedRgLruScan128x256Kernel.EmitPtx(8, 9));
+    }
+
+    [SkippableFact]
+    public void DriverRgLru_MatchesDoubleOracleAndRoutesDirectPtxRepeatedly()
+    {
+        Skip.IfNot(CudaNativeBindings.IsAvailable,
+            "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxRgLruEnabled,
+                "The recurrent candidate is admitted only on SM86.");
+
+            int elements = PtxFusedRgLruScan128x256Kernel.Batch *
+                PtxFusedRgLruScan128x256Kernel.SequenceLength *
+                PtxFusedRgLruScan128x256Kernel.RecurrentDimension;
+            var value = new float[elements];
+            var recurrence = new float[elements];
+            var inputGate = new float[elements];
+            var decay = new float[PtxFusedRgLruScan128x256Kernel.RecurrentDimension];
+            for (int i = 0; i < elements; i++)
+            {
+                value[i] = (float)(Math.Sin(i * 0.017) * 0.125);
+                recurrence[i] = 0.5f + (float)(Math.Cos(i * 0.013) * 0.125);
+                inputGate[i] = 0.5f + (float)(Math.Sin(i * 0.011) * 0.125);
+            }
+            for (int i = 0; i < decay.Length; i++)
+                decay[i] = (float)(Math.Cos(i * 0.031) * 0.25);
+
+            double[] expected = RgLruOracle(value, recurrence, inputGate, decay);
+            using var valueBuffer = backend.AllocateBuffer(value);
+            using var recurrenceBuffer = backend.AllocateBuffer(recurrence);
+            using var inputGateBuffer = backend.AllocateBuffer(inputGate);
+            using var decayBuffer = backend.AllocateBuffer(decay);
+            using var outputBuffer = backend.AllocateBuffer(elements);
+            using var incumbentOutputBuffer = backend.AllocateBuffer(elements);
+
+            Assert.True(backend.PrewarmDirectPtxRgLruScan(), backend.DirectPtxLastError);
+            long before = backend.DirectPtxRgLruDispatchCount;
+            for (int launch = 0; launch < 16; launch++)
+                Assert.True(backend.TryDirectPtxRgLruScanForward(
+                    valueBuffer, recurrenceBuffer, inputGateBuffer, decayBuffer,
+                    outputBuffer, 1, 128, 256), backend.DirectPtxLastError);
+            backend.LaunchLegacyRgLruScanForward(
+                valueBuffer, recurrenceBuffer, inputGateBuffer, decayBuffer,
+                incumbentOutputBuffer, 1, 128, 256);
+            backend.Synchronize();
+
+            Assert.Equal(16, backend.DirectPtxRgLruDispatchCount - before);
+            float[] actual = backend.DownloadBuffer(outputBuffer);
+            float[] incumbent = backend.DownloadBuffer(incumbentOutputBuffer);
+            for (int i = 0; i < actual.Length; i++)
+            {
+                Assert.True(Math.Abs(actual[i] - expected[i]) <= 2e-5,
+                    $"RG-LRU mismatch at {i}: expected={expected[i]:R}, actual={actual[i]:R}");
+                Assert.True(Math.Abs(incumbent[i] - expected[i]) <= 2e-5,
+                    $"incumbent RG-LRU mismatch at {i}: " +
+                    $"expected={expected[i]:R}, actual={incumbent[i]:R}");
+            }
+
+            Assert.True(backend.TryGetDirectPtxRgLruAudit(out DirectPtxKernelAudit audit));
+            Assert.Equal(256, audit.BlockThreads);
+            Assert.InRange(audit.Function.RegistersPerThread, 1, 32);
+            Assert.Equal(0, audit.Function.StaticSharedBytes);
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+            Assert.True(audit.ActiveBlocksPerMultiprocessor >= 2);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
     }
 
     [Fact]
@@ -126,7 +204,9 @@ public sealed class DirectPtxRecurrentTests
             Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
         });
         Assert.Equal(2, DirectPtxRecurrentCoverageManifest.All.Count(cell =>
-            cell.Status == DirectPtxRecurrentCoverageStatus.ExperimentalDirectPtx));
+            cell.Status == DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx));
+        Assert.DoesNotContain(DirectPtxRecurrentCoverageManifest.All, cell =>
+            cell.Status == DirectPtxRecurrentCoverageStatus.ExperimentalDirectPtx);
     }
 
     [Fact]
@@ -163,6 +243,28 @@ public sealed class DirectPtxRecurrentTests
             0x140000, sequenceBytes,
             0x160000, decayBytes,
             0x180000, sequenceBytes);
+    }
+
+    private static double[] RgLruOracle(
+        float[] value, float[] recurrence, float[] inputGate, float[] decay)
+    {
+        const int sequence = PtxFusedRgLruScan128x256Kernel.SequenceLength;
+        const int dimension = PtxFusedRgLruScan128x256Kernel.RecurrentDimension;
+        var output = new double[value.Length];
+        for (int channel = 0; channel < dimension; channel++)
+        {
+            double state = 0;
+            double channelDecay = 1.0 / (1.0 + Math.Exp(decay[channel]));
+            for (int timestep = 0; timestep < sequence; timestep++)
+            {
+                int offset = timestep * dimension + channel;
+                double a = recurrence[offset] * channelDecay;
+                double scale = Math.Sqrt(Math.Max(0, 1 - a * a));
+                state = a * state + scale * inputGate[offset] * value[offset];
+                output[offset] = state;
+            }
+        }
+        return output;
     }
 
     private static int Count(string source, string value)

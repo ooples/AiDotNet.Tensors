@@ -22,12 +22,13 @@ public sealed partial class CudaBackend
 
     internal bool IsDirectPtxRgLruEnabled =>
         _directPtxRecurrentStateOptedIn && IsAvailable &&
-        DirectPtxArchitecture.HasExperimentalRgLruScan(_ccMajor, _ccMinor);
+        DirectPtxArchitecture.HasValidatedRgLruScan(_ccMajor, _ccMinor);
 
     /// <summary>
     /// Attempts the exact FP32 [1,128,256] channel-persistent RG-LRU scan.
     /// Shape, extent, layout, alignment, and alias contracts are admitted once;
-    /// the emitted PTX has no dynamic shape, layout, stride, or loop branch.
+    /// the emitted PTX has no dynamic shape, layout, or stride parameters. Its
+    /// fixed 32-iteration loop advances four timesteps per branch.
     /// </summary>
     internal bool TryDirectPtxRgLruScanForward(
         IGpuBuffer value,

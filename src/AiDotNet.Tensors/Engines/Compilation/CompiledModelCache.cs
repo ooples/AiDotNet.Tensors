@@ -195,7 +195,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             // live forward activation and corrupt it on replay (silent zero-gradient / frozen training
             // at large activation sizes). See TensorArena.Suspend.
             using var arenaSuspend = Helpers.TensorArena.Suspend();
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableTraining(parameters);
             var explicitLoss = forwardAndLoss();
             ThrowIfForwardRecordedNothing(scope, explicitLoss);
             var plan = scope.CompileTraining(parameters, explicitLoss);

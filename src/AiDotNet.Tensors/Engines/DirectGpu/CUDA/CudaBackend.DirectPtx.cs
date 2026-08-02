@@ -1787,6 +1787,8 @@ public sealed partial class CudaBackend
             _directPtxFlashAttentionBackwardKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxRgLruKernels.Dispose();
+            _directPtxConvolutionKernels.Dispose();
+            _directPtxRegBlockedConvKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

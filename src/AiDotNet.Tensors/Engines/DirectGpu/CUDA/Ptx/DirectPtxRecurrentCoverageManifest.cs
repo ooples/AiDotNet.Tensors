@@ -7,6 +7,7 @@ internal enum DirectPtxRecurrentCoverageStatus
 {
     BaselineOnly,
     ExperimentalDirectPtx,
+    ValidatedDirectPtx,
     PlannedDirectPtx
 }
 
@@ -44,7 +45,7 @@ internal static class DirectPtxRecurrentCoverageManifest
             "row-persistent exact-head families"),
         new("CpuEngine.RgLruScanForward", "CudaBackend.RgLruScanForward (NVRTC)",
             "RG-LRU channel recurrence forward and CPU-tape backward", "dense [B,S,D], decay [D]", "generic public; CUDA FP32",
-            DirectPtxRecurrentCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx,
             "v1 direct PTX forward [1,128,256] on exact SM86; backward and other shapes planned"),
         Public("CpuEngine.Rwkv4WkvForward", "CudaBackend.Rwkv4WkvForward (NVRTC)",
             "RWKV-4 numerically stable WKV scan", "[B,S,D], time vectors [D]", "generic public; CUDA FP32",
@@ -73,7 +74,7 @@ internal static class DirectPtxRecurrentCoverageManifest
         Backend("IDirectGpuBackend.XLstmScanForward", "xlstm_scan_forward (NVRTC)", "xLSTM forward", "dense token/head", "FP32", "head-persistent forward"),
         Backend("IDirectGpuBackend.GatedDeltaNetScanForward", "gated_delta_scan_forward (NVRTC)", "delta-rule forward", "dense token/head", "FP32", "row-persistent forward"),
         new("IDirectGpuBackend.RgLruScanForward", "rglru_scan_forward (NVRTC)", "RG-LRU forward", "dense [B,S,D], decay [D]", "FP32",
-            DirectPtxRecurrentCoverageStatus.ExperimentalDirectPtx,
+            DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx,
             "v1 direct PTX exact [1,128,256]/SM86 with deterministic NVRTC fallback"),
         Backend("IDirectGpuBackend.Rwkv4WkvForward", "rwkv4_wkv_forward (NVRTC)", "RWKV-4 forward", "dense [B,S,D]", "FP32", "channel-persistent forward"),
         Backend("IDirectGpuBackend.Rwkv7Forward", "rwkv7_forward (NVRTC)", "RWKV-7 forward", "dense token/head state", "FP32", "head-persistent forward"),

@@ -13,6 +13,9 @@ internal static class DirectPtxRecurrentExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int LaunchesPerDeviceSample = 10;
+    private const int OracleOperationsPerGraph = 64;
+    private const double SemanticTolerance = 2e-5;
+    private const double RequiredGain = 1.10;
     private const int Batch = PtxFusedRgLruScan128x256Kernel.Batch;
     private const int Sequence = PtxFusedRgLruScan128x256Kernel.SequenceLength;
     private const int Dimension = PtxFusedRgLruScan128x256Kernel.RecurrentDimension;
@@ -23,6 +26,20 @@ internal static class DirectPtxRecurrentExperiment
         string Status, int Run, string Method,
         double MeanUs, double MedianUs, double P95Us, double P99Us,
         long PeakDeviceBytes, long TemporaryDeviceBytes, double MaxError);
+    private sealed record PairedTailEvidence(
+        Distribution Direct,
+        Distribution Incumbent,
+        Distribution DirectOverIncumbent);
+    private sealed record OracleEvidence(
+        StableTimer.PairResult Timing,
+        PairedTailEvidence Tail);
+    private sealed record NativeEvidence(
+        int Run,
+        Distribution DirectGraph,
+        Distribution Incumbent,
+        double DirectError,
+        double IncumbentError,
+        OracleEvidence Oracle);
 
     internal static void Run(int independentRuns = 3, bool includeExternal = true)
     {
@@ -37,20 +54,27 @@ internal static class DirectPtxRecurrentExperiment
                 $"{Warmups} warmups + {Samples} samples x {LaunchesPerDeviceSample} device launches; " +
                 $"{independentRuns} independent runs");
             PrintHeader();
-            for (int run = 1; run <= independentRuns; run++) RunAiDotNet(run);
+            var nativeEvidence = new List<NativeEvidence>(independentRuns);
+            for (int run = 1; run <= independentRuns; run++)
+                nativeEvidence.Add(RunAiDotNet(run));
+            IReadOnlyList<ExternalRecord> externalEvidence = Array.Empty<ExternalRecord>();
             if (includeExternal)
-                foreach (ExternalRecord record in RunPython(independentRuns)) Print(record);
-            Console.WriteLine(
-                "release_gate=NOT_PROMOTED_UNTIL_3_RUN_CORRECTNESS_PERFORMANCE_AND_NSIGHT_EVIDENCE_PASS");
+            {
+                externalEvidence = RunPython(independentRuns);
+                foreach (ExternalRecord record in externalEvidence) Print(record);
+            }
+            PrintChampionshipOracle(
+                nativeEvidence, externalEvidence, includeExternal, independentRuns);
         }
         finally
         {
             DirectPtxFeatureGate.TestOverride = previous;
-            GpuBenchmarkEnvironment.RequireNoForeignCompute("direct-ptx-rglru-end");
+            GpuBenchmarkEnvironment.RequireNoForeignCompute(
+                "direct-ptx-rglru-end", afterSuite: true);
         }
     }
 
-    private static void RunAiDotNet(int run)
+    private static NativeEvidence RunAiDotNet(int run)
     {
         using var backend = new CudaBackend();
         if (!backend.IsDirectPtxRgLruEnabled)
@@ -85,6 +109,11 @@ internal static class DirectPtxRecurrentExperiment
         backend.Synchronize();
         double directError = MaximumError(backend.DownloadBuffer(directOutput), oracle);
         double currentError = MaximumError(backend.DownloadBuffer(currentOutput), oracle);
+        if (!IsFinite(directError) || !IsFinite(currentError) ||
+            directError > SemanticTolerance || currentError > SemanticTolerance)
+            throw new InvalidOperationException(
+                $"RG-LRU correctness gate failed: direct={directError:E3}, " +
+                $"incumbent={currentError:E3}, tolerance={SemanticTolerance:E1}.");
         IntPtr graph = backend.CaptureGraph(DirectLaunch);
         if (graph == IntPtr.Zero)
             throw new InvalidOperationException("Could not capture prewarmed RG-LRU direct PTX.");
@@ -106,18 +135,217 @@ internal static class DirectPtxRecurrentExperiment
                 launches_per_device_sample = LaunchesPerDeviceSample
             }));
             Console.WriteLine("rglru_audit_json=" + audit.ToJson());
-            Print(run, "Direct PTX CUDA graph", MeasureDevice(backend, GraphLaunch),
+            Distribution directGraphTiming = MeasureDevice(backend, GraphLaunch);
+            Print(run, "Direct PTX CUDA graph", directGraphTiming,
                 MeasureAllocation(backend, GraphLaunch), 0, directError, audit);
             Print(run, "Direct PTX fused", MeasureDevice(backend, DirectLaunch),
                 MeasureAllocation(backend, DirectLaunch), 0, directError, audit);
-            Print(run, "AiDotNet current NVRTC", MeasureDevice(backend, CurrentLaunch),
+            Distribution incumbentTiming = MeasureDevice(backend, CurrentLaunch);
+            Print(run, "AiDotNet current NVRTC", incumbentTiming,
                 MeasureAllocation(backend, CurrentLaunch), 0, currentError, null);
+            OracleEvidence oracleEvidence = RunPairedOracle(
+                run, backend, GraphLaunch, DirectLaunch, CurrentLaunch,
+                directError, currentError, audit);
+            return new NativeEvidence(
+                run, directGraphTiming, incumbentTiming,
+                directError, currentError, oracleEvidence);
         }
         finally
         {
             backend.DestroyCapturedGraph(graph);
         }
     }
+
+    private static OracleEvidence RunPairedOracle(
+        int run,
+        CudaBackend backend,
+        Action directTailLaunch,
+        Action directLaunch,
+        Action incumbentLaunch,
+        double directError,
+        double incumbentError,
+        DirectPtxKernelAudit audit)
+    {
+        PairedTailEvidence tail = MeasurePairedDeviceDistributions(
+            backend, directTailLaunch, incumbentLaunch);
+        IntPtr directGraph = IntPtr.Zero;
+        IntPtr incumbentGraph = IntPtr.Zero;
+        string lane;
+        StableTimer.PairResult timing;
+        long directDispatchesBefore = backend.DirectPtxRgLruDispatchCount;
+        try
+        {
+            directGraph = CaptureRepeatedGraph(
+                backend, directLaunch, OracleOperationsPerGraph);
+            incumbentGraph = CaptureRepeatedGraph(
+                backend, incumbentLaunch, OracleOperationsPerGraph);
+            if (directGraph != IntPtr.Zero && incumbentGraph != IntPtr.Zero)
+            {
+                lane = "repeated-cuda-graph-host-paired";
+                timing = StableTimer.MeasureCalibratedHostPair(
+                    () => backend.EnqueueCapturedGraph(directGraph), backend.Synchronize,
+                    () => backend.EnqueueCapturedGraph(incumbentGraph), backend.Synchronize,
+                    operationsPerLaunchA: OracleOperationsPerGraph,
+                    operationsPerLaunchB: OracleOperationsPerGraph,
+                    targetBatchMilliseconds: 50.0);
+            }
+            else
+            {
+                lane = "public-launch-host-paired-capture-fallback";
+                timing = StableTimer.MeasureCalibratedHostPair(
+                    directLaunch, backend.Synchronize,
+                    incumbentLaunch, backend.Synchronize,
+                    targetBatchMilliseconds: 50.0);
+            }
+        }
+        finally
+        {
+            if (directGraph != IntPtr.Zero) backend.DestroyCapturedGraph(directGraph);
+            if (incumbentGraph != IntPtr.Zero) backend.DestroyCapturedGraph(incumbentGraph);
+        }
+
+        if (backend.DirectPtxRgLruDispatchCount - directDispatchesBefore <
+            OracleOperationsPerGraph)
+            throw new InvalidOperationException(
+                "The paired RG-LRU candidate capture did not enter direct PTX.");
+
+        bool measurable = timing.Stable;
+        bool tailPassed = tail.Direct.P95 <= tail.Incumbent.P95 * RequiredGain;
+        double incumbentOverDirect = measurable ? 1.0 / timing.Ratio : double.NaN;
+        string measurementStatus = measurable ? "stable" : "unstable";
+        string verdict = !measurable
+            ? "not-measurable"
+            : incumbentOverDirect >= RequiredGain
+                ? "win"
+                : incumbentOverDirect <= 1.0 / RequiredGain
+                    ? "loss"
+                    : "tie";
+
+        Console.WriteLine(
+            $"oracle | {run} | rglru-b1-s128-d256 | lane={lane} | " +
+            $"direct={timing.A.Describe()} | incumbent={timing.B.Describe()} | " +
+            $"incumbent/direct={(measurable ? incumbentOverDirect.ToString("0.00") + "x" : "-")} | " +
+            $"paired-tail-p95={tail.DirectOverIncumbent.P95:0.00}x | " +
+            $"correctness=passed (direct={directError:E3}, incumbent={incumbentError:E3}, " +
+            $"tolerance={SemanticTolerance:E1}) | {verdict}");
+        Console.WriteLine("rglru_oracle_json=" + JsonSerializer.Serialize(new
+        {
+            kind = "direct-ptx-rglru-oracle",
+            run,
+            operation = "rglru-b1-s128-d256",
+            lane,
+            logical_operations_per_graph = lane.StartsWith(
+                "repeated-cuda-graph", StringComparison.Ordinal)
+                    ? OracleOperationsPerGraph
+                    : 1,
+            direct_median_us = timing.A.Stable ? timing.A.Microseconds : (double?)null,
+            incumbent_median_us = timing.B.Stable ? timing.B.Microseconds : (double?)null,
+            incumbent_over_direct = measurable ? incumbentOverDirect : (double?)null,
+            direct_relative_spread = FiniteOrNull(timing.A.RelativeSpread),
+            incumbent_relative_spread = FiniteOrNull(timing.B.RelativeSpread),
+            paired_ratio_relative_spread = FiniteOrNull(timing.RelativeSpread),
+            direct_tail_p95_us = tail.Direct.P95,
+            incumbent_tail_p95_us = tail.Incumbent.P95,
+            direct_over_incumbent_tail_p95 = tail.DirectOverIncumbent.P95,
+            tail_passed = tailPassed,
+            attempts = timing.Samples,
+            required_gain = RequiredGain,
+            direct_semantic_error = directError,
+            incumbent_semantic_error = incumbentError,
+            semantic_tolerance = SemanticTolerance,
+            correctness_passed = true,
+            measurement_status = measurementStatus,
+            verdict,
+            registers_per_thread = audit.Function.RegistersPerThread,
+            static_shared_bytes = audit.Function.StaticSharedBytes,
+            local_bytes_per_thread = audit.Function.LocalBytesPerThread,
+            active_blocks_per_sm = audit.ActiveBlocksPerMultiprocessor,
+            diagnostic_only = false,
+            promotion = measurable && tailPassed
+        }));
+        return new OracleEvidence(timing, tail);
+    }
+
+    private static void PrintChampionshipOracle(
+        IReadOnlyList<NativeEvidence> native,
+        IReadOnlyList<ExternalRecord> external,
+        bool includeExternal,
+        int requestedRuns)
+    {
+        bool nativeComplete = requestedRuns >= 3 && native.Count == requestedRuns;
+        bool nativeStable = nativeComplete && native.All(record =>
+            record.Oracle.Timing.Stable &&
+            record.DirectError <= SemanticTolerance &&
+            record.IncumbentError <= SemanticTolerance);
+        bool nativeWins = nativeStable && native.All(record =>
+            1.0 / record.Oracle.Timing.Ratio >= RequiredGain);
+        bool tailsPass = nativeStable && native.All(record =>
+            record.Oracle.Tail.Direct.P95 <=
+                record.Oracle.Tail.Incumbent.P95 * RequiredGain);
+
+        ExternalRecord[] eligibleExternal = external.Where(record =>
+            string.Equals(record.Status, "ok", StringComparison.Ordinal) &&
+            IsFinite(record.MedianUs) && record.MedianUs > 0 &&
+            IsFinite(record.MaxError) && record.MaxError <= SemanticTolerance).ToArray();
+        bool externalComplete = includeExternal &&
+            eligibleExternal.Length == requestedRuns * 2 &&
+            Enumerable.Range(1, requestedRuns).All(run =>
+                eligibleExternal.Count(record => record.Run == run) == 2);
+
+        double directMedian = MedianAcross(native
+            .Where(record => record.Oracle.Timing.Stable)
+            .Select(record => record.Oracle.Timing.A.Microseconds));
+        double incumbentMedian = MedianAcross(native
+            .Where(record => record.Oracle.Timing.Stable)
+            .Select(record => record.Oracle.Timing.B.Microseconds));
+        double fastestExternalMedian = eligibleExternal.Length == 0
+            ? double.NaN
+            : eligibleExternal.Min(record => record.MedianUs);
+        double fastestCompetitorMedian = IsFinite(fastestExternalMedian)
+            ? Math.Min(incumbentMedian, fastestExternalMedian)
+            : incumbentMedian;
+        double fastestCompetitorOverDirect =
+            directMedian > 0 && IsFinite(fastestCompetitorMedian)
+                ? fastestCompetitorMedian / directMedian
+                : double.NaN;
+        bool championshipPassed = nativeWins && tailsPass && externalComplete &&
+            fastestCompetitorOverDirect >= RequiredGain;
+
+        Console.WriteLine("rglru_championship_json=" + JsonSerializer.Serialize(new
+        {
+            kind = "direct-ptx-rglru-championship",
+            operation = "rglru-b1-s128-d256",
+            requested_runs = requestedRuns,
+            native_runs = native.Count,
+            eligible_external_rows = eligibleExternal.Length,
+            direct_median_us = FiniteOrNull(directMedian),
+            incumbent_median_us = FiniteOrNull(incumbentMedian),
+            fastest_external_median_us = FiniteOrNull(fastestExternalMedian),
+            fastest_competitor_median_us = FiniteOrNull(fastestCompetitorMedian),
+            fastest_competitor_over_direct = FiniteOrNull(fastestCompetitorOverDirect),
+            required_gain = RequiredGain,
+            native_stable = nativeStable,
+            native_wins = nativeWins,
+            tails_passed = tailsPass,
+            external_complete = externalComplete,
+            championship_passed = championshipPassed,
+            promotion = championshipPassed
+        }));
+        Console.WriteLine(championshipPassed
+            ? "release_gate=PROMOTED_EXACT_SM86_FROM_COMPLETE_CHAMPIONSHIP_EVIDENCE"
+            : "release_gate=NOT_PROMOTED_INCOMPLETE_OR_FAILED_CHAMPIONSHIP_EVIDENCE");
+
+        if (requestedRuns >= 3 && includeExternal && !championshipPassed)
+            throw new InvalidOperationException(
+                "RG-LRU championship evidence did not satisfy every promotion gate.");
+    }
+
+    private static IntPtr CaptureRepeatedGraph(
+        CudaBackend backend, Action launch, int operations) =>
+        backend.CaptureGraph(() =>
+        {
+            for (int i = 0; i < operations; i++) launch();
+        });
 
     private static Distribution MeasureDevice(CudaBackend backend, Action action)
     {
@@ -136,6 +364,61 @@ internal static class DirectPtxRecurrentExperiment
                 LaunchesPerDeviceSample;
         }
         return Summarize(timings);
+    }
+
+    private static PairedTailEvidence MeasurePairedDeviceDistributions(
+        CudaBackend backend,
+        Action direct,
+        Action incumbent)
+    {
+        for (int index = 0; index < Warmups; index++)
+        {
+            direct();
+            incumbent();
+        }
+        backend.Synchronize();
+
+        var directTimings = new double[Samples];
+        var incumbentTimings = new double[Samples];
+        var ratios = new double[Samples];
+        using IGpuEvent start = backend.CreateEvent(enableTiming: true);
+        using IGpuEvent stop = backend.CreateEvent(enableTiming: true);
+        for (int sample = 0; sample < Samples; sample++)
+        {
+            if ((sample & 1) == 0)
+            {
+                directTimings[sample] = MeasureDeviceBatch(
+                    backend, direct, start, stop);
+                incumbentTimings[sample] = MeasureDeviceBatch(
+                    backend, incumbent, start, stop);
+            }
+            else
+            {
+                incumbentTimings[sample] = MeasureDeviceBatch(
+                    backend, incumbent, start, stop);
+                directTimings[sample] = MeasureDeviceBatch(
+                    backend, direct, start, stop);
+            }
+            ratios[sample] = directTimings[sample] / incumbentTimings[sample];
+        }
+        return new PairedTailEvidence(
+            Summarize(directTimings),
+            Summarize(incumbentTimings),
+            Summarize(ratios));
+    }
+
+    private static double MeasureDeviceBatch(
+        CudaBackend backend,
+        Action action,
+        IGpuEvent start,
+        IGpuEvent stop)
+    {
+        backend.RecordEvent(start, backend.DefaultStream);
+        for (int launch = 0; launch < LaunchesPerDeviceSample; launch++) action();
+        backend.RecordEvent(stop, backend.DefaultStream);
+        stop.Synchronize();
+        return backend.GetEventElapsedTime(start, stop) * 1_000.0 /
+            LaunchesPerDeviceSample;
     }
 
     private static long MeasureAllocation(CudaBackend backend, Action action)
@@ -162,6 +445,8 @@ internal static class DirectPtxRecurrentExperiment
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
+        start.Environment["AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"] =
+            Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         start.ArgumentList.Add(script);
         start.ArgumentList.Add("--runs");
         start.ArgumentList.Add(runs.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -227,6 +512,18 @@ internal static class DirectPtxRecurrentExperiment
     }
 
     private static string Value(int? value) => value?.ToString() ?? "-";
+
+    private static bool IsFinite(double value) =>
+        !double.IsNaN(value) && !double.IsInfinity(value);
+
+    private static double? FiniteOrNull(double value) =>
+        IsFinite(value) ? value : null;
+
+    private static double MedianAcross(IEnumerable<double> values)
+    {
+        double[] ordered = values.Where(IsFinite).OrderBy(value => value).ToArray();
+        return ordered.Length == 0 ? double.NaN : Percentile(ordered, 0.50);
+    }
 
     private static Distribution Summarize(double[] values)
     {

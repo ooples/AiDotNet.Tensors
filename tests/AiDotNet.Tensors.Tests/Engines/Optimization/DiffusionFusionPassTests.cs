@@ -76,7 +76,7 @@ public class DiffusionFusionPassTests
         var ca = a; var cb = b;
         return new CompiledStep<float>(
             "TensorBroadcastAdd",
-            (eng, o) => { var r = eng.TensorBroadcastAdd(ca, cb); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+            (eng, o) => { var r = eng.TensorAdd(ca, cb); r.AsSpan().CopyTo(o.AsWritableSpan()); },
             output,
             new[] { a, b });
     }

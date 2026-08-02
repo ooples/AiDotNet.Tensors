@@ -1272,6 +1272,24 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return new HipGpuBuffer(devicePtr, size, ReturnBufferToPool);
     }
 
+    /// <summary>
+    /// Allocates an uninitialized device buffer for kernels that overwrite every element.
+    /// </summary>
+    private IGpuBuffer AllocateBufferUninitialized(int size)
+    {
+        IntPtr devicePtr = IntPtr.Zero;
+        long sizeInBytes = (long)size * sizeof(float);
+        GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
+        var sizeBytes = (UIntPtr)sizeInBytes;
+
+        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+            return pooled;
+
+        var allocResult = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+        HipNativeBindings.CheckError(allocResult, "hipMalloc");
+        return new HipGpuBuffer(devicePtr, size, ReturnBufferToPool);
+    }
+
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
         var hipBuffer = (HipGpuBuffer)buffer;
@@ -8312,14 +8330,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
-    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
         int __total = batch*numHeads; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
-        void** args = stackalloc void*[12];
-        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        IntPtr la0 = r.Handle; IntPtr la1 = kappa.Handle; IntPtr la2 = kTilde.Handle; IntPtr la3 = v.Handle; IntPtr la4 = decayLogit.Handle; IntPtr la5 = iclRate.Handle; IntPtr la6 = output.Handle; IntPtr la7 = sbuf.Handle; int la8 = batch; int la9 = seqLen; int la10 = modelDim; int la11 = numHeads; int la12 = headDim;
+        void** args = stackalloc void*[13];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11; args[12] = &la12;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
@@ -8411,12 +8429,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
-    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
         var kernel = ResolveParity210Kernel("parity210_phase_vocoder");
-        int __total = leading*nFreqV; if (__total <= 0) return;
+        int __total = leading*numFreqs; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = nFramesV; int la6 = nFreqV; int la7 = outFrames; float la8 = rate;
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = numFrames; int la6 = numFreqs; int la7 = outFrames; float la8 = rate;
         void** args = stackalloc void*[9];
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
@@ -8992,6 +9010,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     #region FFT and Signal Processing
 
+    private IntPtr GetRequiredFftKernel(string kernelName)
+    {
+        if (_kernelCache.TryGetValue(kernelName, out var kernel))
+            return kernel;
+
+        throw new InvalidOperationException(
+            $"HIP kernel not found: {kernelName}. The FFT module is unavailable on this device " +
+            $"({DeviceName}); the transform cannot run.");
+    }
+
     /// <summary>
     /// Performs in-place FFT or IFFT using the Cooley-Tukey radix-2 algorithm.
     /// </summary>
@@ -9000,61 +9028,74 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend not available");
 
-        // Copy input to output buffers for in-place operation
-        if (inputReal.Handle != outputReal.Handle)
-            HipCopyBuffer(inputReal, outputReal, n);
-        if (inputImag.Handle != outputImag.Handle)
-            HipCopyBuffer(inputImag, outputImag, n);
+        IntPtr bitRevKernel = GetRequiredFftKernel("bit_reverse_permutation");
+        IntPtr butterflyKernel = GetRequiredFftKernel("fft_butterfly");
+        IntPtr scaleKernel = inverse ? GetRequiredFftKernel("scale_inverse") : IntPtr.Zero;
 
         int log2n = (int)Math.Log(n, 2);
+        bool inputAliasesOutput =
+            inputReal.Handle == outputReal.Handle || inputReal.Handle == outputImag.Handle ||
+            inputImag.Handle == outputReal.Handle || inputImag.Handle == outputImag.Handle;
+        bool needsScratch = inputAliasesOutput;
+        using var permScratchReal = needsScratch ? AllocateBufferUninitialized(n) : null;
+        using var permScratchImag = needsScratch ? AllocateBufferUninitialized(n) : null;
+        IGpuBuffer transformReal = permScratchReal ?? outputReal;
+        IGpuBuffer transformImag = permScratchImag ?? outputImag;
 
-        // Bit-reversal permutation
-        if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel))
+        // Distinct outputs receive the permutation directly. Aliased calls use scratch as the
+        // transform buffer and copy only the completed FFT back to the caller.
         {
             uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-                {
-                IntPtr _p0 = outputReal.Handle;
-                IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[4];
-                args[0] = &_p0;
-                args[1] = &_p1;
-                args[2] = &n;
-                args[3] = &log2n;
-
-
-                LaunchKernel(bitRevKernel, gridSize, (uint)DefaultBlockSize, args);
-                }
-        }
-
-        // Butterfly stages
-        if (_kernelCache.TryGetValue("fft_butterfly", out var butterflyKernel))
-        {
-            int inverseFlag = inverse ? 1 : 0;
-            for (int stride = 2; stride <= n; stride *= 2)
             {
-                int numButterflies = n / 2;
-                uint gridSize = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
-
-                    {
-                    IntPtr _p0 = outputReal.Handle;
-                    IntPtr _p1 = outputImag.Handle;
-                    #pragma warning disable CA2014
-                    void** args = stackalloc void*[5];
-                    #pragma warning restore CA2014
-                    args[0] = &_p0;
-                    args[1] = &_p1;
-                    args[2] = &n;
-                    args[3] = &stride;
-                    args[4] = &inverseFlag;
+            IntPtr _p0 = inputReal.Handle;
+            IntPtr _p1 = inputImag.Handle;
+            IntPtr _p2 = transformReal.Handle;
+            IntPtr _p3 = transformImag.Handle;
+            void** args = stackalloc void*[6];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &n;
+            args[5] = &log2n;
 
 
-                    LaunchKernel(butterflyKernel, gridSize, (uint)DefaultBlockSize, args);
-                    }
+            LaunchKernel(bitRevKernel, gridSize, (uint)DefaultBlockSize, args);
             }
         }
 
+        // Butterfly stages
+        int inverseFlag = inverse ? 1 : 0;
+        for (int stride = 2; stride <= n; stride *= 2)
+        {
+            int numButterflies = n / 2;
+            uint gridSize = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
+
+                {
+                IntPtr _p0 = transformReal.Handle;
+                IntPtr _p1 = transformImag.Handle;
+                #pragma warning disable CA2014
+                void** args = stackalloc void*[5];
+                #pragma warning restore CA2014
+                args[0] = &_p0;
+                args[1] = &_p1;
+                args[2] = &n;
+                args[3] = &stride;
+                args[4] = &inverseFlag;
+
+
+                LaunchKernel(butterflyKernel, gridSize, (uint)DefaultBlockSize, args);
+                }
+        }
+
+        if (needsScratch)
+        {
+            HipCopyBuffer(transformReal, outputReal, n);
+            HipCopyBuffer(transformImag, outputImag, n);
+        }
+
         // Scale by 1/n for inverse FFT (n elements, factor 1/n).
-        if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
+        if (inverse)
         {
             uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
@@ -9167,65 +9208,78 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend not available");
 
-        // Copy input to output buffers for in-place operation
-        HipCopyBuffer(inputReal, outputReal, batch * n);
-        HipCopyBuffer(inputImag, outputImag, batch * n);
+        IntPtr bitRevKernel = GetRequiredFftKernel("batched_bit_reverse");
+        IntPtr butterflyKernel = GetRequiredFftKernel("batched_fft_butterfly");
+        IntPtr scaleKernel = inverse ? GetRequiredFftKernel("scale_inverse") : IntPtr.Zero;
 
         int log2n = (int)Math.Log(n, 2);
+        bool inputAliasesOutput =
+            inputReal.Handle == outputReal.Handle || inputReal.Handle == outputImag.Handle ||
+            inputImag.Handle == outputReal.Handle || inputImag.Handle == outputImag.Handle;
+        bool needsScratch = inputAliasesOutput;
+        int total = batch * n;
+        using var brScratchReal = needsScratch ? AllocateBufferUninitialized(total) : null;
+        using var brScratchImag = needsScratch ? AllocateBufferUninitialized(total) : null;
+        IGpuBuffer transformReal = brScratchReal ?? outputReal;
+        IGpuBuffer transformImag = brScratchImag ?? outputImag;
 
-        // Batched bit-reversal permutation
-        if (_kernelCache.TryGetValue("batched_bit_reverse", out var bitRevKernel))
         {
             uint gridX = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
             uint gridY = (uint)batch;
 
+            {
+            IntPtr _p0 = inputReal.Handle;
+            IntPtr _p1 = inputImag.Handle;
+            IntPtr _p2 = transformReal.Handle;
+            IntPtr _p3 = transformImag.Handle;
+            void** args = stackalloc void*[7];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &batch;
+            args[5] = &n;
+            args[6] = &log2n;
+
+
+            LaunchKernel2D(bitRevKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+            }
+        }
+
+        // Batched butterfly stages
+        int inverseFlag = inverse ? 1 : 0;
+        for (int stride = 2; stride <= n; stride *= 2)
+        {
+            int numButterflies = n / 2;
+            uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint gridZ = (uint)batch;
+
                 {
-                IntPtr _p0 = outputReal.Handle;
-                IntPtr _p1 = outputImag.Handle;
-                void** args = stackalloc void*[5];
+                IntPtr _p0 = transformReal.Handle;
+                IntPtr _p1 = transformImag.Handle;
+#pragma warning disable CA2014
+                void** args = stackalloc void*[6];
+#pragma warning restore CA2014
                 args[0] = &_p0;
                 args[1] = &_p1;
                 args[2] = &batch;
                 args[3] = &n;
-                args[4] = &log2n;
+                args[4] = &stride;
+                args[5] = &inverseFlag;
 
-
-                LaunchKernel2D(bitRevKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+                LaunchKernel3D(butterflyKernel, gridX, 1, gridZ, (uint)DefaultBlockSize, 1, 1, args);
                 }
         }
 
-        // Batched butterfly stages
-        if (_kernelCache.TryGetValue("batched_fft_butterfly", out var butterflyKernel))
+        if (needsScratch)
         {
-            int inverseFlag = inverse ? 1 : 0;
-            for (int stride = 2; stride <= n; stride *= 2)
-            {
-                int numButterflies = n / 2;
-                uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
-                uint gridZ = (uint)batch;
-
-                    {
-                    IntPtr _p0 = outputReal.Handle;
-                    IntPtr _p1 = outputImag.Handle;
-#pragma warning disable CA2014
-                    void** args = stackalloc void*[6];
-#pragma warning restore CA2014
-                    args[0] = &_p0;
-                    args[1] = &_p1;
-                    args[2] = &batch;
-                    args[3] = &n;
-                    args[4] = &stride;
-                    args[5] = &inverseFlag;
-
-                    LaunchKernel3D(butterflyKernel, gridX, 1, gridZ, (uint)DefaultBlockSize, 1, 1, args);
-                    }
-            }
+            HipCopyBuffer(transformReal, outputReal, total);
+            HipCopyBuffer(transformImag, outputImag, total);
         }
 
         // Scale batched inverse: touch batch*n elements but scale each by 1/n (NOT 1/(batch*n)).
-        if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
+        if (inverse)
         {
-            int total = batch * n;
             uint gridSize = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
                 {
                 IntPtr _p0 = outputReal.Handle;
@@ -9253,108 +9307,115 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend not available");
 
+        IntPtr rowsBitRevKernel = GetRequiredFftKernel("fft_rows_bit_reverse");
+        IntPtr rowsButterflyKernel = GetRequiredFftKernel("fft_rows_butterfly");
+        IntPtr colsBitRevKernel = GetRequiredFftKernel("fft_cols_bit_reverse");
+        IntPtr colsButterflyKernel = GetRequiredFftKernel("fft_cols_butterfly");
+        IntPtr scaleKernel = inverse ? GetRequiredFftKernel("scale_inverse") : IntPtr.Zero;
+
         int total = height * width;
         int log2Width = (int)Math.Log(width, 2);
         int log2Height = (int)Math.Log(height, 2);
 
-        // Copy input to output buffers for in-place operation
-        HipCopyBuffer(inputReal, outputReal, total);
-        HipCopyBuffer(inputImag, outputImag, total);
+        // Row permutation writes input -> scratch; after the row butterflies, the column
+        // permutation writes scratch -> output. Both permutation kernels therefore remain
+        // out of place without any full-buffer copy-back.
+        using var brScratch2DReal = AllocateBufferUninitialized(total);
+        using var brScratch2DImag = AllocateBufferUninitialized(total);
 
         // Row-wise bit reversal (DIT operates on bit-reversed input) then row butterflies. The previous
         // code left an EMPTY per-row loop here (no bit reversal at all), so the DIT butterflies ran on
         // un-permuted data and the whole 2D FFT produced garbage. Now each row is bit-reversed first.
-        if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowsBitRevKernel) &&
-            _kernelCache.TryGetValue("fft_rows_butterfly", out var rowsButterflyKernel))
         {
+            uint gridBrX = (uint)((width + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint gridBrY = (uint)height;
+            IntPtr _b0 = inputReal.Handle;
+            IntPtr _b1 = inputImag.Handle;
+            IntPtr _b2 = brScratch2DReal.Handle;
+            IntPtr _b3 = brScratch2DImag.Handle;
+#pragma warning disable CA2014
+            void** brArgs = stackalloc void*[7];
+#pragma warning restore CA2014
+            brArgs[0] = &_b0;
+            brArgs[1] = &_b1;
+            brArgs[2] = &_b2;
+            brArgs[3] = &_b3;
+            brArgs[4] = &height;
+            brArgs[5] = &width;
+            brArgs[6] = &log2Width;
+            LaunchKernel2D(rowsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+        }
+
+        int inverseFlag = inverse ? 1 : 0;
+        for (int stride = 2; stride <= width; stride *= 2)
+        {
+            int numButterflies = width / 2;
+            uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint gridY = (uint)height;
                 {
-                uint gridBrX = (uint)((width + DefaultBlockSize - 1) / DefaultBlockSize);
-                uint gridBrY = (uint)height;
-                IntPtr _b0 = outputReal.Handle;
-                IntPtr _b1 = outputImag.Handle;
+                IntPtr _p0 = brScratch2DReal.Handle;
+                IntPtr _p1 = brScratch2DImag.Handle;
 #pragma warning disable CA2014
-                void** brArgs = stackalloc void*[5];
+                void** args = stackalloc void*[6];
 #pragma warning restore CA2014
-                brArgs[0] = &_b0;
-                brArgs[1] = &_b1;
-                brArgs[2] = &height;
-                brArgs[3] = &width;
-                brArgs[4] = &log2Width;
-                LaunchKernel2D(rowsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+                args[0] = &_p0;
+                args[1] = &_p1;
+                args[2] = &height;
+                args[3] = &width;
+                args[4] = &stride;
+                args[5] = &inverseFlag;
+
+                LaunchKernel2D(rowsButterflyKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
                 }
-
-            int inverseFlag = inverse ? 1 : 0;
-            for (int stride = 2; stride <= width; stride *= 2)
-            {
-                int numButterflies = width / 2;
-                uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
-                uint gridY = (uint)height;
-                    {
-                    IntPtr _p0 = outputReal.Handle;
-                    IntPtr _p1 = outputImag.Handle;
-#pragma warning disable CA2014
-                    void** args = stackalloc void*[6];
-#pragma warning restore CA2014
-                    args[0] = &_p0;
-                    args[1] = &_p1;
-                    args[2] = &height;
-                    args[3] = &width;
-                    args[4] = &stride;
-                    args[5] = &inverseFlag;
-
-                    LaunchKernel2D(rowsButterflyKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
-                    }
-            }
         }
 
         // Column-wise bit reversal then column butterflies (same missing-bit-reversal fix as the rows).
-        if (_kernelCache.TryGetValue("fft_cols_butterfly", out var colsButterflyKernel))
         {
-            if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colsBitRevKernel))
-            {
-                uint gridBrX = (uint)((height + DefaultBlockSize - 1) / DefaultBlockSize);
-                uint gridBrY = (uint)width;
-                IntPtr _b0 = outputReal.Handle;
-                IntPtr _b1 = outputImag.Handle;
+            uint gridBrX = (uint)((height + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint gridBrY = (uint)width;
+            IntPtr _b0 = brScratch2DReal.Handle;
+            IntPtr _b1 = brScratch2DImag.Handle;
+            IntPtr _b2 = outputReal.Handle;
+            IntPtr _b3 = outputImag.Handle;
 #pragma warning disable CA2014
-                void** brArgs = stackalloc void*[5];
+            void** brArgs = stackalloc void*[7];
 #pragma warning restore CA2014
-                brArgs[0] = &_b0;
-                brArgs[1] = &_b1;
-                brArgs[2] = &height;
-                brArgs[3] = &width;
-                brArgs[4] = &log2Height;
-                LaunchKernel2D(colsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
-            }
+            brArgs[0] = &_b0;
+            brArgs[1] = &_b1;
+            brArgs[2] = &_b2;
+            brArgs[3] = &_b3;
+            brArgs[4] = &height;
+            brArgs[5] = &width;
+            brArgs[6] = &log2Height;
+            LaunchKernel2D(colsBitRevKernel, gridBrX, gridBrY, (uint)DefaultBlockSize, 1, brArgs);
+        }
 
-            int inverseFlag = inverse ? 1 : 0;
-            for (int stride = 2; stride <= height; stride *= 2)
-            {
-                int numButterflies = height / 2;
-                uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
-                uint gridY = (uint)width;
+        for (int stride = 2; stride <= height; stride *= 2)
+        {
+            int numButterflies = height / 2;
+            uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint gridY = (uint)width;
 
-                    {
-                    IntPtr _p0 = outputReal.Handle;
-                    IntPtr _p1 = outputImag.Handle;
+                {
+                IntPtr _p0 = outputReal.Handle;
+                IntPtr _p1 = outputImag.Handle;
 #pragma warning disable CA2014
-                    void** args = stackalloc void*[6];
+                void** args = stackalloc void*[6];
 #pragma warning restore CA2014
-                    args[0] = &_p0;
-                    args[1] = &_p1;
-                    args[2] = &height;
-                    args[3] = &width;
-                    args[4] = &stride;
-                    args[5] = &inverseFlag;
+                args[0] = &_p0;
+                args[1] = &_p1;
+                args[2] = &height;
+                args[3] = &width;
+                args[4] = &stride;
+                args[5] = &inverseFlag;
 
 
-                    LaunchKernel2D(colsButterflyKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
-                    }
-            }
+                LaunchKernel2D(colsButterflyKernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+                }
         }
 
         // Scale by 1/(height*width) for inverse 2D FFT.
-        if (inverse && _kernelCache.TryGetValue("scale_inverse", out var scaleKernel))
+        if (inverse)
         {
             uint gridSize = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
                 {

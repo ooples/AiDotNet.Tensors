@@ -7,6 +7,7 @@ import os
 import statistics
 import subprocess
 import sys
+import time
 
 import torch
 
@@ -17,6 +18,10 @@ DIMENSION = 256
 WARMUPS = 30
 SAMPLES = 101
 LAUNCHES_PER_SAMPLE = 10
+MIXED_COMPUTE_CONFLICT_PERCENT = 5
+DEVICE_UTILIZATION_CEILING_PERCENT = 20
+DEVICE_MEMORY_CEILING_MIB = 2048
+DEVICE_TEMPERATURE_CEILING_C = 75
 
 
 def percentile(values, q):
@@ -27,11 +32,24 @@ def percentile(values, q):
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def require_no_foreign_compute(label):
+def query_gpu_status():
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
+         "--format=csv,noheader,nounits"],
+        check=True, capture_output=True, text=True, timeout=5)
+    cells = [cell.strip() for cell in result.stdout.strip().split(",")]
+    if len(cells) < 3:
+        raise RuntimeError("nvidia-smi returned incomplete GPU status")
+    return tuple(int(cell) for cell in cells[:3])
+
+
+def require_no_foreign_compute(label, after_suite=False):
     result = subprocess.run(
         ["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
         check=True, capture_output=True, text=True, timeout=5)
     conflicts = []
+    trusted_text = os.environ.get("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID", "")
+    trusted_orchestrator = int(trusted_text) if trusted_text.isdigit() else None
     for line in result.stdout.splitlines():
         cells = line.split()
         if not cells or cells[0].startswith("#") or len(cells) < 4:
@@ -41,10 +59,45 @@ def require_no_foreign_compute(label):
             sm = int(cells[3]) if cells[3] != "-" else 0
         except ValueError:
             continue
-        if pid != os.getpid() and "C" in cells[2].upper() and sm > 5:
-            conflicts.append(f"pid={pid} type={cells[2]} sm={sm}%")
+        process_type = cells[2].upper()
+        if pid == os.getpid():
+            continue
+        if pid == trusted_orchestrator and sm <= MIXED_COMPUTE_CONFLICT_PERCENT:
+            continue
+        is_compute_only = process_type == "C"
+        is_active_mixed = (
+            not after_suite and "C" in process_type and
+            sm > MIXED_COMPUTE_CONFLICT_PERCENT)
+        if is_compute_only or is_active_mixed:
+            conflicts.append(f"pid={pid} type={process_type} sm={sm}%")
     if conflicts:
         raise RuntimeError(f"[{label}] foreign GPU compute: " + "; ".join(conflicts))
+    if after_suite:
+        utilization = 0
+        for attempt in range(6):
+            utilization, _, temperature = query_gpu_status()
+            if temperature > DEVICE_TEMPERATURE_CEILING_C:
+                raise RuntimeError(
+                    f"[{label}] GPU temperature {temperature} C exceeds "
+                    f"{DEVICE_TEMPERATURE_CEILING_C} C")
+            if utilization <= DEVICE_UTILIZATION_CEILING_PERCENT:
+                return
+            if attempt < 5:
+                time.sleep(0.25)
+        raise RuntimeError(
+            f"[{label}] GPU utilization remains {utilization}% after bounded quiescence")
+
+
+def require_idle_gpu(label):
+    require_no_foreign_compute(label)
+    utilization, memory_mib, temperature = query_gpu_status()
+    if (utilization > DEVICE_UTILIZATION_CEILING_PERCENT or
+            memory_mib > DEVICE_MEMORY_CEILING_MIB or
+            temperature > DEVICE_TEMPERATURE_CEILING_C):
+        raise RuntimeError(
+            f"[{label}] GPU is not benchmark-ready "
+            f"(utilization={utilization}%, memory.used={memory_mib} MiB, "
+            f"temperature={temperature} C)")
 
 
 def rglru(value, recurrence_gate, input_gate, decay):
@@ -102,7 +155,7 @@ def main():
     torch.use_deterministic_algorithms(True)
 
     for run in range(1, args.runs + 1):
-        require_no_foreign_compute(f"rglru-pytorch-run-{run}")
+        require_idle_gpu(f"rglru-pytorch-run-{run}")
         torch.manual_seed(846_000 + run)
         generator = torch.Generator(device="cuda")
         generator.manual_seed(846_000 + run)
@@ -151,7 +204,7 @@ def main():
                 print(record)
         del reference, value, recurrence, input_gate, decay, compiled
         torch.cuda.empty_cache()
-        require_no_foreign_compute(f"rglru-pytorch-run-{run}-end")
+        require_no_foreign_compute(f"rglru-pytorch-run-{run}-end", after_suite=True)
     return 0
 
 

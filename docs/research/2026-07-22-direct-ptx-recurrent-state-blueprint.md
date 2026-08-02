@@ -2,18 +2,22 @@
 
 Issue: #846
 
-Status: experimental, disabled by default, not promoted
+Status: validated and promoted for exact SM86; global and per-family opt-in gates remain
 
 Representative operation: RG-LRU forward, FP32 `[batch=1, sequence=128, recurrentDimension=256]`
 
 Architecture: exact SM86 only
 
-## What this PR proves without a GPU run
+## Current evidence and scope
 
 This PR establishes the reusable implementation surface for recurrent and
-state-space kernels. It does **not** claim numerical correctness, a speed win,
-occupancy, or zero executed spills. Those claims require the checked-in GPU
-harnesses and Nsight target to run on the admitted device.
+state-space kernels. Live SM86 execution now proves numerical correctness,
+route entry, the JIT resource contract, and zero executed local/spill traffic.
+The exact `[1,128,256]` SM86 route is promoted by three clean, stable
+head-to-head wins against the incumbent, three external PyTorch runs, and a
+complete Nsight zero-spill capture. The rollout remains opt-in through the
+existing global or recurrent-family gate; unsupported architectures and shapes
+continue to fail closed to the incumbent.
 
 RG-LRU is the first slice because it is an actual public AiDotNet recurrent
 operation and exposes the defining scan constraint: `h[t]` depends on
@@ -24,7 +28,7 @@ register state and exact layout admission without misrepresenting scope.
 `DirectPtxRecurrentCoverageManifest` is the executable family inventory. It
 assigns the public tensor operations, `IDeviceRnn` surface, and all CUDA backend
 LSTM/GRU/GLA/xLSTM/GatedDelta/RG-LRU/RWKV/Mamba entry points. Only the exact
-RG-LRU cell is `ExperimentalDirectPtx`; every other cell is explicitly planned.
+RG-LRU cell is `ValidatedDirectPtx`; every other cell is explicitly planned.
 
 ## Mathematical and physical ABI
 
@@ -57,12 +61,16 @@ layout, or loop parameters.
 
 ## Dataflow and memory proof obligations
 
-One 256-thread block maps one thread to each recurrent channel. The 128 time
-steps are emitted as straight-line PTX. Each thread:
+One 256-thread block maps one thread to each recurrent channel. A fixed
+32-iteration loop handles four timesteps per iteration. The kernel loads and
+prepares the four independent gate tuples before sequentially committing the
+four state updates, exposing instruction-level parallelism without violating
+the recurrence. Each thread:
 
 1. reads its channel's `decay` once and computes `base`;
 2. keeps `base` and recurrent `h` live in registers;
-3. reads `value`, `recurrenceGate`, and `inputGate` once per step;
+3. reads `value`, `recurrenceGate`, and `inputGate` once per step in four-step
+   software-pipelined groups;
 4. writes only the final public output for that step.
 
 There are no global gate/state intermediates and no temporary device
@@ -78,9 +86,11 @@ Tensor Cores and asynchronous tiles where their data reuse makes that choice
 measurably beneficial.
 
 The static blueprint budgets at most 32 registers/thread, zero static shared
-bytes, zero local bytes/thread, and at least two active blocks/SM. Module load
-fails if the CUDA JIT report violates any budget. This is only a JIT resource
-gate; executed local/spill counters still require Nsight Compute.
+bytes, zero local bytes/thread, and at least two active blocks/SM. On the
+validated RTX 3080 / SM86 driver build, the kernel uses 31 registers/thread,
+zero static shared bytes, zero local bytes/thread, and admits six blocks/SM.
+Module load fails if any build violates the budget. Nsight Compute additionally
+verified zero executed local loads/stores and zero executed spill loads/stores.
 
 ## Runtime, cache, capture, and fallback
 
@@ -121,11 +131,20 @@ There is no cuDNN primitive with RG-LRU semantics, so a cuDNN LSTM/GRU result
 would not be apples-to-apples and is deliberately excluded. The later LSTM and
 GRU cells must add cuDNN and PyTorch `nn.LSTM`/`nn.GRU` competitors.
 
-Each lane uses 30 warmups, 101 CUDA-event samples, ten resident launches per
-sample, and three independent runs. It reports mean/median/P95/P99,
-Gupdates/s, estimated GFLOPS, managed bytes/call, temporary or peak device
-bytes, maximum error, and candidate registers/shared/local bytes/blocks per SM.
-No value is checked into this document until the clean run completes.
+The descriptive table uses 30 warmups, 101 CUDA-event samples, and ten resident
+launches per sample. Promotion is decided separately by the paired oracle. It
+captures 64 logical operations into both candidate and incumbent CUDA graphs,
+calibrates equal host exposure, alternates AB/BA order, takes the median of five
+brackets, and requires candidate, incumbent, and paired-ratio spreads all to be
+at most 5%. A result below that stability standard is emitted as `UNSTABLE` and
+cannot become a win. Correctness is checked first against a double oracle at
+`2e-5`, and route-entry counters prove the candidate capture actually entered
+direct PTX. A second AB/BA-interleaved CUDA-event distribution records 101
+candidate/incumbent pairs and requires candidate P95 to be no worse than
+incumbent P95 +10%; sequential unpaired P95 rows remain descriptive and cannot
+fail or promote a candidate based on measurement-order bias. The within-pair
+ratio P95 is also emitted as a diagnostic, but it does not replace the stated
+tail contract.
 
 ## Deterministic Nsight target
 
@@ -137,21 +156,36 @@ The target launches exactly `aidotnet_rglru_scan_b1_s128_d256` once. The shared
 CSV verifier requires all requested local/spill/resource/occupancy metrics and
 fails on nonzero executed local/spill traffic or incomplete evidence.
 
-## Promotion table (pending GPU execution)
+## Current SM86 evidence
 
 | Operation | Competitor | Median us | P95 us | P99 us | Mean us | Gupdates/s | GFLOPS est. | Managed B/call | Temp/peak device B | Max error | Registers | Shared B | Local B | Blocks/SM | Zero executed spills |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| RG-LRU B1 S128 D256 | Direct PTX CUDA graph | pending | pending | pending | pending | pending | pending | pending | 0 expected | pending | pending | pending | pending | pending | pending |
-| RG-LRU B1 S128 D256 | Direct PTX fused | pending | pending | pending | pending | pending | pending | pending | 0 expected | pending | pending | pending | pending | pending | pending |
-| RG-LRU B1 S128 D256 | AiDotNet current NVRTC | pending | pending | pending | pending | pending | pending | pending | pending | pending | n/a | n/a | n/a | n/a | n/a |
-| RG-LRU B1 S128 D256 | PyTorch CUDA eager | pending | pending | pending | pending | pending | pending | n/a | pending | pending | n/a | n/a | n/a | n/a | n/a |
-| RG-LRU B1 S128 D256 | PyTorch compile max-autotune | pending | pending | pending | pending | pending | pending | n/a | pending | pending | n/a | n/a | n/a | n/a | n/a |
+| RG-LRU B1 S128 D256 | Direct PTX CUDA graph | 13.00 | 20.28 | 36.15 | 14.10 | 2.520 | 30.315 | 0 | 0 | 1.318e-8 | 31 | 0 | 0 | 6 | yes |
+| RG-LRU B1 S128 D256 | Direct PTX fused | 14.34 | 29.49 | 62.98 | 17.35 | 2.286 | 27.500 | 0 | 0 | 1.318e-8 | 31 | 0 | 0 | 6 | yes |
+| RG-LRU B1 S128 D256 | AiDotNet current NVRTC | 24.06 | 29.80 | 47.00 | 25.44 | 1.362 | 16.383 | 0 | 0 | 1.199e-8 | n/a | n/a | n/a | n/a | n/a |
+| RG-LRU B1 S128 D256 | PyTorch CUDA eager | 31,650.31 | 35,525.12 | 37,362.59 | 32,001.48 | 0.001 | 0.012 | n/a | 396,288 peak / 265,216 temp | 1.218e-8 | n/a | n/a | n/a | n/a | n/a |
+| RG-LRU B1 S128 D256 | PyTorch compile max-autotune | 167.01 | 194.46 | 206.13 | 169.09 | 0.196 | 2.361 | n/a | 0 | 9.289e-9 | n/a | n/a | n/a | n/a | n/a |
+
+The table reports the median of each statistic across the three independent
+runs. The promotion oracle, which uses equal-exposure repeated CUDA graphs,
+reported direct/incumbent medians of `9.275/22.792`, `9.404/23.115`, and
+`9.341/23.110` microseconds: `2.440x`, `2.437x`, and `2.468x` wins. The
+machine-readable championship aggregate selects the 23.110-us incumbent over
+the 165.581-us fastest external median and reports a `2.474x` final ratio.
+Every lane and paired-ratio spread was below 3.0%, each correctness error was below
+`1.32e-8`, every interleaved candidate P95 stayed within incumbent P95 +10%,
+and all three post-suite environment gates passed. The earlier
+one-step candidate produced a stable 1.01x tie; incumbent SASS then pinpointed
+its four-timestep software pipeline, and matching that pipeline plus its
+single-block topology produced the promoted win.
 
 Promotion requires all three clean runs, high-precision/current-AiDotNet
 correctness, at least 1.10x median speedup over the fastest eligible competitor,
 candidate P95 no worse than competitor P95 +10%, zero hot managed allocation,
 zero avoidable temporary VRAM, JIT local bytes zero, and complete Nsight zero
-executed spill/local evidence.
+executed spill/local evidence. This exact cell satisfies those conditions and
+emits `diagnostic_only=false`, `promotion=true`; no other recurrent cell inherits
+that status without its own evidence.
 
 ## Assembly-line extension order
 

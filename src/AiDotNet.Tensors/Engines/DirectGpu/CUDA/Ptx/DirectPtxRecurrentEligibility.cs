@@ -22,7 +22,7 @@ internal static class DirectPtxRecurrentEligibility
 {
     internal static DirectPtxEligibilityResult Evaluate(in DirectPtxRgLruRequest request)
     {
-        if (!DirectPtxArchitecture.HasExperimentalRgLruScan(
+        if (!DirectPtxArchitecture.HasValidatedRgLruScan(
             request.ComputeCapabilityMajor, request.ComputeCapabilityMinor))
             return DirectPtxEligibilityResult.Reject("rglru-sm-version-not-implemented");
         if (request.PhysicalType != DirectPtxPhysicalType.Float32)
