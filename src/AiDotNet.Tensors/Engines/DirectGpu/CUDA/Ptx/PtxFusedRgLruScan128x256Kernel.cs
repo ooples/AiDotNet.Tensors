@@ -41,14 +41,30 @@ internal sealed class PtxFusedRgLruScan128x256Kernel : IDisposable
 
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+        DirectPtxModule module = runtime.LoadModule(Ptx);
+        try
+        {
+            _function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
+            FunctionInfo = functionInfo;
+            int activeBlocks = module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                BlockThreads, activeBlocks, module.JitInfoLog);
+        }
+        catch
+        {
+            try
+            {
+                module.Dispose();
+            }
+            catch
+            {
+                // Initialization cleanup must not hide the original failure.
+            }
+            throw;
+        }
+        _module = module;
     }
 
     internal static DirectPtxKernelBlueprint CreateBlueprint(
