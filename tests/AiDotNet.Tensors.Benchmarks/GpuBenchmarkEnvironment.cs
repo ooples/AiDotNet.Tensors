@@ -158,14 +158,19 @@ internal static class GpuBenchmarkEnvironment
                         times[process.Id] = new ForeignProcessCpuSample(
                             process.TotalProcessorTime, process.StartTime.ToUniversalTime());
                 }
-                catch (Exception)
+                catch (InvalidOperationException)
                 {
-                    // A process can exit or become inaccessible between enumeration
-                    // and sampling. The short rolling slices ensure a process seen
-                    // before it exits still contributes to an earlier interval.
+                    // The process exited between enumeration and property access.
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    // The process became inaccessible between enumeration and sampling.
                 }
             }
         }
+        if (times.Count == 0)
+            throw new InvalidOperationException(
+                "Host quiescence sampling observed no accessible foreign processes.");
         return times;
     }
 
