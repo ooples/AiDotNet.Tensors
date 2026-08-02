@@ -166,11 +166,13 @@ public class CodegenAdjointTests
                      Forward.Depthwise(2, 4, 8, 8),
                      Forward.Conv1x1(2, 6, 5, 8, 8),
                      Forward.Conv3x3(2, 3, 4, 8, 8),
+                     Forward.DepthwiseStrided(2, 4, 8, 8, 2),
                  })
         {
             var backward = CodegenAdjoint.BackwardWeights(forward, 1);
             string ptx = new PtxAffineEmitter().Emit(backward, 8, 6);
             Assert.Contains(".visible .entry", ptx, StringComparison.Ordinal);
+            Assert.Contains(backward.Name, ptx, StringComparison.Ordinal);
         }
     }
 

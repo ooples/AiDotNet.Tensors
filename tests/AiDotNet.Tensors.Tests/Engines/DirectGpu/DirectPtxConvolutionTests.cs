@@ -179,6 +179,20 @@ public sealed class DirectPtxConvolutionTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void AutotuneEvidence_FailsClosedOnAnIncompletePromotableSearch()
+    {
+        string autotune = File.ReadAllText(SourcePath(
+            "tests", "AiDotNet.Tensors.Benchmarks", "KernelAutotuneTool.cs"));
+
+        Assert.Contains("InconclusivePromotableCandidates.Add(candidate.Name)", autotune,
+            StringComparison.Ordinal);
+        Assert.Contains("the selected search is incomplete", autotune,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("if (File.Exists(outputPath)) File.Delete(outputPath)", autotune,
+            StringComparison.Ordinal);
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,

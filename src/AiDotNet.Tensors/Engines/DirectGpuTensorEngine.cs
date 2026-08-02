@@ -11696,8 +11696,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
-            int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
-            if (center) outputLength -= nFft;
+            // An explicitly requested length is honoured VERBATIM; the centre-padding trim applies only
+            // to the length this method INFERS. Previously the `-= nFft` ran unconditionally, so
+            // ISTFT(..., center: true, length: 514) with nFft=512 returned TWO samples — the same
+            // defect fixed in CpuEngine.ISTFT earlier in this branch, still live here. Measured by
+            // TimeStretchStageDiffTests.Stage3_Istft_CpuMatchesGpu: cpu=514, gpu=2.
+            int outputLength;
+            if (length.HasValue)
+            {
+                outputLength = length.Value;
+            }
+            else
+            {
+                outputLength = (numFrames - 1) * hopLength + nFft;
+                if (center) outputLength -= nFft;
+            }
             int totalOutput = batch * outputLength;
 
             using var magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
@@ -11751,7 +11764,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             ((IEngine)this).STFT(input, nFft, hopLength, window, center: true,
                 out var magnitude, out var phase);
-            _ = phase;
+            // `phase` is retained (it used to be discarded via `_ = phase`) because
+            // MelSpectrogramBackward needs it to rebuild the complex spectrum when propagating the
+            // gradient back through |STFT|.
+            bool tapeActive = IsTapeActive<T>();
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
@@ -11774,8 +11790,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             framesMajorShape[^2] = numFrames;
             framesMajorShape[^1] = nMels;
             Tensor<T> framesMajorResult;
+            // MelSpectrogramBackward needs the PRE-dB mel, element-aligned with the OUTPUT, to
+            // differentiate the log. Snapshot it while melBuffer is still alive, permuted the same
+            // way the result is, and force the deferred download now because melBuffer is disposed at
+            // scope exit. Gated on an active tape so inference pays nothing for it.
+            Tensor<T>? linearMel = null;
             if (powerToDb)
             {
+                if (tapeActive)
+                {
+                    var linearFramesMajor = DeferTensorResult<T>(
+                        backend, melBuffer.Buffer, melLength, (int[])framesMajorShape.Clone());
+                    linearMel = PermuteResidentGpu(backend, linearFramesMajor, swapLastTwo);
+                    _ = linearMel.GetDataArray();
+                }
                 using var dbBuffer = AllocateOutputBuffer(backend, melLength);
                 backend.PowerToDb(melBuffer.Buffer, dbBuffer.Buffer, melLength, 1f, -80f);
                 backend.Synchronize();
@@ -11789,7 +11817,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 melBuffer.RelinquishOwnership();
             }
 
-            return PermuteResidentGpu(backend, framesMajorResult, swapLastTwo);
+            var melResult = PermuteResidentGpu(backend, framesMajorResult, swapLastTwo);
+
+            // Without powerToDb the output IS the linear mel, so no snapshot is needed.
+            if (!powerToDb) linearMel = melResult;
+
+            // Tape registration. This override recorded NOTHING, so a GPU MelSpectrogram produced no
+            // gradient at all while CpuEngine's produced one — mel-based objectives (vocoder / TTS)
+            // silently lost their gradient whenever the GPU path won. Same savedState contract as
+            // CpuEngine.MelSpectrogram.
+            if (tapeActive)
+            {
+                Autodiff.DifferentiableOps.RecordUnary(
+                    "MelSpectrogram", melResult, input,
+                    Autodiff.BackwardFunctions<T>.MelSpectrogramBackward,
+                    new object[]
+                    {
+                        nFft, hopLength, window, phase, input._shape[^1],
+                        magnitude, filterbank, nMels, powerToDb, linearMel!,
+                    });
+            }
+            return melResult;
         }
         catch
         {
@@ -19973,9 +20021,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGrid = GetOrAllocateBuffer(backend, grid);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
-            // Match CpuEngine.GridSample (2-arg): align_corners=True + border/clamp padding.
+            // torchvision defaults, matching the corrected CpuEngine narrow forward:
+            // paddingMode 0 == zeros (the kernels treat 1 as border and anything else as zeros),
+            // alignCorners false. This previously passed border + alignCorners:true, which matched
+            // the old (size-1)/2 CPU mapping; the OpParity oracle scored that ~1e9 ULP off while the
+            // corrected CPU sits at 6-71 ULP. The kernels themselves are already general — both
+            // conventions are runtime branches inside them.
             backend.GridSample(bufIn.Buffer, bufGrid.Buffer, bufOut.Buffer,
-                batch, channels, inH, inW, outH, outW, paddingMode: 1, alignCorners: true);
+                batch, channels, inH, inW, outH, outW, paddingMode: 0, alignCorners: false);
             return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
         }
@@ -23462,6 +23515,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
+        // The compiled graph must retain StopGradient as a forward dependency.
+        // Bypassing CpuEngine here would eagerly snapshot a lazy input and replay
+        // stale data, so let the base implementation record the no-backward node.
+        if (Compilation.GraphMode.IsActive) return base.StopGradient(tensor);
+
         try
         {
             if (TryGetBackend(out var backend))

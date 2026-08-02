@@ -26,9 +26,11 @@ Sampling the SM clock either side of each kernel's three runs showed it plainly:
 | conv_transpose2d_3x3_stride2 | 1.8% | 2025 -> 2010 MHz (-0.7%) |
 | depthwise_conv2d_3x3_bwd_data | 1.9% | 2010 -> 2025 MHz (+0.7%) |
 
-The clock swings up to **12.6% inside a single kernel's measurement**, and the
-correlation is the right way round: the two rows whose clock held still are the two
-with low spread, while every row that moved more than a few percent is elevated.
+The clock swings up to **12.6% inside a single kernel's measurement**. The table does
+not support a simple row-by-row correlation between drift and spread: one row moved
+12.6% with only 0.5% spread, while a nearly steady row reached 1.8%. It does establish
+that the machine state can change materially inside a measurement, so an individual
+attempt cannot be accepted without observing that state.
 
 `RequireIdleGpu` and `RequireNoForeignCompute` only check the start and end of a run,
 so they never saw this. A kernel can be measured across a 12% clock change and the
@@ -38,7 +40,7 @@ result reported as evidence with nothing flagged.
 
 Locking the clock is the textbook answer and is not available here:
 
-```
+```text
 $ nvidia-smi -lgc 1770,1770
 The current user does not have permission to change clocks for GPU 00000000:21:00.0.
 ```

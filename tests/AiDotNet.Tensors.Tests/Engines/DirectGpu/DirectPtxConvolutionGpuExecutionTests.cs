@@ -254,6 +254,41 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         }
     }
 
+    [SkippableFact]
+    public void Winograd3x3_LinearReductionMajorFlipped_MatchesAdjointReference()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
+
+        const int n = 2, cch = 4, h = 8, w = 8, k = 4;
+        var shape = new Conv2DWinogradShape(
+            n, cch, h, w, k,
+            linear: true, reductionMajor: true, invertFilter: true);
+        var input = new float[n * cch * h * w];
+        var weights = new float[cch * k * 9];
+        var unusedBias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+
+        float[] expected = ReferenceLinearReductionMajorFlipped(
+            input, weights, n, cch, h, w, k);
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Experimental generated convolution is unavailable on this GPU architecture.");
+
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            float[] actual = LaunchWinograd(runtime, shape, input, weights, unusedBias);
+            AssertClose(expected, actual, 2e-3f);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
     [Fact]
     public void Winograd3x3_FilterPretransformed_MatchesDirectConvReference()
     {
@@ -3381,6 +3416,32 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
                                            weights[((oc * c + ic) * 3 + gi) * 3 + gj];
                                 }
                         output[((b * k + oc) * h + oh) * w + ow] = (float)Math.Max(acc, 0.0);
+                    }
+        return output;
+    }
+
+    private static float[] ReferenceLinearReductionMajorFlipped(
+        float[] input, float[] weights, int n, int c, int h, int w, int k)
+    {
+        var output = new float[n * k * h * w];
+        for (int b = 0; b < n; b++)
+            for (int oc = 0; oc < k; oc++)
+                for (int oh = 0; oh < h; oh++)
+                    for (int ow = 0; ow < w; ow++)
+                    {
+                        double acc = 0;
+                        for (int ic = 0; ic < c; ic++)
+                            for (int gi = 0; gi < 3; gi++)
+                                for (int gj = 0; gj < 3; gj++)
+                                {
+                                    int ih = oh + gi - 1, iw = ow + gj - 1;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                    int source = ((ic * k + oc) * 3 + (2 - gi)) * 3 +
+                                        (2 - gj);
+                                    acc += (double)input[((b * c + ic) * h + ih) * w + iw] *
+                                        weights[source];
+                                }
+                        output[((b * k + oc) * h + oh) * w + ow] = (float)acc;
                     }
         return output;
     }

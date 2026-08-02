@@ -22,7 +22,7 @@ public sealed record CodegenConvAttributes(
     /// <summary>Unit stride with no padding.</summary>
     public static CodegenConvAttributes Valid { get; } = new(1, 1, 0, 0);
 
-    /// <summary>Unit stride with one-pixel padding, which keeps a 3x3 output size.</summary>
+    /// <summary>Unit stride with one-pixel padding, preserving spatial size for a 3x3 kernel.</summary>
     public static CodegenConvAttributes Same3x3 { get; } = new(1, 1, 1, 1);
 
     /// <summary>Same stride and padding on both axes.</summary>

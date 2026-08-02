@@ -44,6 +44,9 @@ internal static class WarpTileSweepTool
         (4, 4),        // 128x128 block, 0.50 -- and 128 accumulator registers per thread
     };
 
+    /// <summary>Staging forms, swept alongside the tile so the comparison is paired.</summary>
+    private static readonly bool[] AsyncForms = { true, false };
+
     internal static void Run(string[] args)
     {
         using var runtime = new DirectPtxRuntime();
@@ -54,14 +57,26 @@ internal static class WarpTileSweepTool
         Console.WriteLine("device sm_{0}{1}", major, minor);
         Console.WriteLine();
         Console.WriteLine(
-            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
-            "shape", "tile", "block", "acc reg", "ld/mma", "shared B", "max abs dev", "us", "TFLOP/s");
+            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}",
+            "shape", "tile", "staging", "acc reg", "ld/mma", "shared B", "reference",
+            "max abs dev", "us", "TFLOP/s");
 
         // A single tile can be selected so a profiler can attribute counters to it: the sweep
         // otherwise launches the 2x2 reference between candidates, and every launch of the
         // same kernel name looks alike to ncu.
         string? only = args.Length > 0 && args[0].Contains('x') ? args[0] : null;
         string? shapeOnly = args.Length > 1 ? args[1] : null;
+        bool fp64AnchorEstablished = false;
+        bool excludesFp64Anchor =
+            (only is not null && only != "2x2") ||
+            (shapeOnly is not null && !"256^3".StartsWith(shapeOnly, StringComparison.Ordinal));
+        if (excludesFp64Anchor)
+        {
+            Console.WriteLine(
+                "WARNING: filters exclude the 2x2-at-256^3 fp64 reference anchor; larger-shape " +
+                "comparisons are relative only and will be labeled unanchored.");
+            Console.WriteLine();
+        }
 
         foreach (var (label, spec, m, n, k) in Shapes())
         {
@@ -71,9 +86,19 @@ internal static class WarpTileSweepTool
             foreach (var (tm, tn) in Candidates)
             {
                 if (only is not null && only != tm + "x" + tn) continue;
-                double us = Measure(runtime, spec, major, minor, tm, tn, m, n, k, label,
-                                    ref baseline);
-                if (us > 0 && baseline == 0) baseline = us;
+                foreach (bool async in AsyncForms)
+                {
+                    double us = Measure(runtime, spec, major, minor, tm, tn, async,
+                                        m, n, k, label, ref baseline, ref fp64AnchorEstablished);
+                    if (us > 0 && baseline == 0) baseline = us;
+                }
+
+                // THE CEILING: the same tile and the same mma instructions with the fragment
+                // loads hoisted out of the K loop. It computes the wrong answer on purpose --
+                // it exists to bound what this instruction mix can reach with memory traffic
+                // removed, so progress is measured against a ceiling rather than against a
+                // competitor.
+                MeasureCeiling(runtime, spec, major, minor, tm, tn, m, n, k, label);
             }
             Console.WriteLine();
         }
@@ -81,22 +106,26 @@ internal static class WarpTileSweepTool
 
     private static double Measure(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        int tileM, int tileN, int m, int n, int k, string label, ref double baseline)
+        int tileM, int tileN, bool async, int m, int n, int k, string label,
+        ref double baseline, ref bool fp64AnchorEstablished)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
         {
-            var emitter = new PtxTensorCoreEmitter { WarpTilesM = tileM, WarpTilesN = tileN, PinWarpTile = true };
+            var emitter = new PtxTensorCoreEmitter
+            {
+                WarpTilesM = tileM, WarpTilesN = tileN, PinWarpTile = true, EnableAsyncCopy = async,
+            };
 
             if (!PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out string why))
             {
-                Report(label, tileM, tileN, emitter, 0, 0, 0, "not a wmma shape: " + why);
+                Report(label, tileM, tileN, emitter, "-", 0, 0, 0, "not a wmma shape: " + why);
                 return 0;
             }
 
             if (!emitter.CanStage(plan!, out string stageWhy))
             {
-                Report(label, tileM, tileN, emitter, 0, 0, 0, stageWhy);
+                Report(label, tileM, tileN, emitter, "-", 0, 0, 0, stageWhy);
                 return 0;
             }
 
@@ -133,7 +162,7 @@ internal static class WarpTileSweepTool
             uint blocks = (uint)emitter.BlockCount(plan!);
             uint threads = (uint)emitter.BlockThreads;
 
-            Launch(module, fn, pointers, blocks, threads);
+            DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
             runtime.Synchronize();
 
             // CORRECTNESS FIRST. Verified against the fp64 interpretation where the shape is
@@ -144,7 +173,12 @@ internal static class WarpTileSweepTool
             var got = new float[outCount];
             outBuffer.Download<float>(got);
 
-            if ((long)m * n * k <= 64L * 1024 * 1024)
+            bool usesFp64Reference = (long)m * n * k <= 64L * 1024 * 1024;
+            string correctnessReference = usesFp64Reference
+                ? "fp64"
+                : !fp64AnchorEstablished ? "unanchored"
+                : tileM == 2 && tileN == 2 ? "root@256" : "tile2x2";
+            if (usesFp64Reference)
             {
                 double[] want = spec.Interpret(wide);
                 deviation = 0;
@@ -162,19 +196,21 @@ internal static class WarpTileSweepTool
 
             if (deviation > 1e-3)
             {
-                Report(label, tileM, tileN, emitter, deviation, 0, 0, "WRONG");
+                Report(label, tileM, tileN, emitter, correctnessReference, deviation, 0, 0, "WRONG");
                 return 0;
             }
+            if (usesFp64Reference && tileM == 2 && tileN == 2)
+                fp64AnchorEstablished = true;
 
             long macs = (long)m * n * k;
             double us = TimeIt(runtime, module, fn, pointers, blocks, threads, macs);
-            Report(label, tileM, tileN, emitter, deviation, us, macs, null);
+            Report(label, tileM, tileN, emitter, correctnessReference, deviation, us, macs, null);
             return us;
         }
         catch (Exception ex)
         {
-            Console.WriteLine("{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}  {9}",
-                label, tileM + "x" + tileN, "-", "-", "-", "-", "-", "-", "-",
+            Console.WriteLine("{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}  {10}",
+                label, tileM + "x" + tileN, "-", "-", "-", "-", "-", "-", "-", "-",
                 ex.Message.Replace("\n", " "));
             return 0;
         }
@@ -202,7 +238,7 @@ internal static class WarpTileSweepTool
             var refPointers = (IntPtr[])pointers.Clone();
             refPointers[2] = refBuffer.Pointer;
 
-            Launch(module, fn, refPointers,
+            DirectPtxLaunchHelper.Launch(module, fn, refPointers,
                 (uint)reference.BlockCount(plan!), (uint)reference.BlockThreads);
             runtime.Synchronize();
 
@@ -221,19 +257,20 @@ internal static class WarpTileSweepTool
 
     private static void Report(
         string label, int tileM, int tileN, PtxTensorCoreEmitter emitter,
-        double deviation, double us, long macs, string? note)
+        string correctnessReference, double deviation, double us, long macs, string? note)
     {
         int accRegisters = tileM * tileN * 8;
         double loadsPerMma = (tileM + tileN) / (double)(tileM * tileN);
 
         Console.WriteLine(
-            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}{9}",
+            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}{10}",
             label,
             tileM + "x" + tileN,
-            emitter.BlockTileM + "x" + emitter.BlockTileN,
+            emitter.AsyncCopy ? "cp.async" : "registers",
             accRegisters.ToString(CultureInfo.InvariantCulture),
             loadsPerMma.ToString("0.00", CultureInfo.InvariantCulture),
             note is null ? emitter.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) : "-",
+            correctnessReference,
             note is null ? deviation.ToString("0.000E+000", CultureInfo.InvariantCulture) : "-",
             us > 0 ? us.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
             (us > 0 && macs > 0)
@@ -248,14 +285,16 @@ internal static class WarpTileSweepTool
         int iterations = (int)Math.Max(5, Math.Min(200, 20_000_000_000L / Math.Max(1, macs)));
         int warmup = Math.Max(2, iterations / 10);
 
-        for (int i = 0; i < warmup; i++) Launch(module, fn, pointers, blocks, threads);
+        for (int i = 0; i < warmup; i++)
+            DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
         runtime.Synchronize();
 
         double best = double.MaxValue;
         for (int attempt = 0; attempt < 3; attempt++)
         {
             var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iterations; i++) Launch(module, fn, pointers, blocks, threads);
+            for (int i = 0; i < iterations; i++)
+                DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
             runtime.Synchronize();
             sw.Stop();
             best = Math.Min(best, sw.Elapsed.TotalMilliseconds * 1000.0 / iterations);
@@ -263,14 +302,60 @@ internal static class WarpTileSweepTool
         return best;
     }
 
-    private static unsafe void Launch(
-        DirectPtxModule module, IntPtr fn, IntPtr[] pointers, uint blocks, uint threads)
+    /// <summary>Times the mma ceiling probe: same instructions, no loop-carried memory.</summary>
+    private static void MeasureCeiling(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
+        int tileM, int tileN, int m, int n, int k, string label)
     {
-        fixed (IntPtr* pinned = pointers)
+        var buffers = new List<DirectPtxBuffer>();
+        try
         {
-            void** argv = stackalloc void*[pointers.Length];
-            for (int i = 0; i < pointers.Length; i++) argv[i] = pinned + i;
-            module.Launch(fn, blocks, 1, 1, threads, 1, 1, 0, argv);
+            var emitter = new PtxTensorCoreEmitter
+            {
+                WarpTilesM = tileM, WarpTilesN = tileN, PinWarpTile = true,
+                MmaCeilingProbe = true,
+            };
+
+            PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _);
+            if (plan is null || !emitter.CanStage(plan, out _)) return;
+
+            string ptx = emitter.Emit(spec, major, minor);
+            using var module = runtime.LoadModule(ptx);
+            IntPtr fn = module.GetFunction(emitter.EmittedEntryName, out _);
+
+            var pointers = new IntPtr[spec.ParameterCount];
+            for (int i = 0; i < 2; i++)
+            {
+                long count = spec.Inputs[i].ElementCount;
+                var buffer = runtime.AllocateBytes((nuint)(count * sizeof(ushort)));
+                var bits = new ushort[count];
+                Array.Fill(bits, BitConverter.HalfToUInt16Bits((Half)1.0f));
+                buffer.Upload<ushort>(bits);
+                buffers.Add(buffer);
+                pointers[i] = buffer.Pointer;
+            }
+            var outBuffer = runtime.AllocateBytes((nuint)(spec.Output.ElementCount * sizeof(float)));
+            buffers.Add(outBuffer);
+            pointers[2] = outBuffer.Pointer;
+
+            long macs = (long)m * n * k;
+            double us = TimeIt(runtime, module, fn, pointers,
+                (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads, macs);
+
+            Console.WriteLine(
+                "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}",
+                label, tileM + "x" + tileN, "CEILING", "-", "0.00", "-", "-", "(no answer)",
+                us.ToString("0.0", CultureInfo.InvariantCulture) + " us",
+                (2.0 * macs / us / 1e6).ToString("0.0", CultureInfo.InvariantCulture));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("{0,-16} {1,7} {2,10}  ceiling failed: {3}",
+                label, tileM + "x" + tileN, "CEILING", ex.Message.Replace('\n', ' '));
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
         }
     }
 

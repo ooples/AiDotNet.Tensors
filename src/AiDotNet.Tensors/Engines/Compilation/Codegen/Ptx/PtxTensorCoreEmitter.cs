@@ -281,38 +281,37 @@ public sealed partial class PtxTensorCoreEmitter
     public int BlockThreads => Staged ? StageThreads : WarpsPerBlock * 32;
 
     /// <summary>
-    /// Picks the largest warp tile whose block tile divides the output, unless the caller
-    /// pinned one.
+    /// Picks the warp tile for a plan: the measured winner for that shape, else the fallback
+    /// ladder. Skipped when the caller pinned one.
     /// </summary>
     /// <remarks>
-    /// A LADDER DERIVED FROM MEASUREMENT, not from a cost model. `--warp-tile-sweep` timed
-    /// every candidate at four shapes on an idle GPU, and the bigger tile won wherever it
-    /// fits, by 1.28x at 2048^3 and 1.32x at 4096^3, for the reason the profile gave: L1TEX
-    /// falls from 92.34% to 61.38% and the tensor pipe rises from 26.79% to 35.74%.
-    ///
-    /// It is not optimal everywhere. At 1024^3 the measured best was 4x2 at 71.9us against
-    /// 4x4's 75.0us -- this rule gives up 4% there. Closing that needs a per-shape autotune
-    /// pass (`--kernel-autotune` already exists for the affine kernels), not a cleverer rule:
-    /// a static model picked lowerings four times on this branch and lost to the hardware
+    /// See <see cref="TensorCoreWarpTileCatalog"/>. The measured shapes are recorded rather
+    /// than re-derived, because the obvious rule -- largest tile that fits -- is right at
+    /// 2048^3 and 4096^3 and WRONG at 1024^3, where 4x2 measured 71.9us against 4x4's 75.0us.
+    /// A static model picked lowerings four times on this branch and lost to the hardware
     /// every time it was checked.
     /// </remarks>
     private void SelectWarpTile(Plan plan)
     {
         if (PinWarpTile) return;
 
-        foreach (var (m, n) in new[] { (4, 4), (4, 2), (2, 4), (2, 2) })
-        {
-            if (plan.M % (m * 32) == 0 && plan.N % (n * 32) == 0)
-            {
-                WarpTilesM = m;
-                WarpTilesN = n;
-                return;
-            }
-        }
+        var choice = TensorCoreWarpTileCatalog.Select(plan.M, plan.N, plan.K, out bool measured);
 
-        WarpTilesM = 2;
-        WarpTilesN = 2;
+        WarpTilesM = choice.TileM;
+        WarpTilesN = choice.TileN;
+        EnableAsyncCopy = choice.AsyncCopy;
+        WarpTileWasMeasured = measured;
     }
+
+    /// <summary>
+    /// Whether the warp tile came from a measurement rather than the fallback ladder.
+    /// </summary>
+    /// <remarks>
+    /// Reported because a cache miss is otherwise indistinguishable from "the modelled choice
+    /// already won" -- which is exactly how an earlier autotune cache on this campaign hid
+    /// that every depthwise kernel was running untuned.
+    /// </remarks>
+    public bool WarpTileWasMeasured { get; private set; }
 
     /// <summary>
     /// Keeps the caller's <see cref="WarpTilesM"/>/<see cref="WarpTilesN"/> instead of
@@ -351,8 +350,10 @@ public sealed partial class PtxTensorCoreEmitter
         MmaInstructions = 0;
         Staged = false;
         DoubleBuffered = false;
+        AsyncCopy = false;
         SharedMemoryBytes = 0;
         LoopBarriers = 0;
+        EmittedEntryName = spec.Name;
         _reg = FixedRegisters;
         _reg64 = FixedRegisters64;
         _pred = FixedPredicates;

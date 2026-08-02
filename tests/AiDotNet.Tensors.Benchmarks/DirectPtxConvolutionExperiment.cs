@@ -49,7 +49,8 @@ internal static class DirectPtxConvolutionExperiment
         }
 
         if (includeExternal) RunPyTorchCompetitors();
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("direct-ptx-convolution-end");
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "direct-ptx-convolution-end", afterSuite: true);
         GpuBenchmarkEnvironment.PrintSnapshot("direct-ptx-convolution-end");
     }
 

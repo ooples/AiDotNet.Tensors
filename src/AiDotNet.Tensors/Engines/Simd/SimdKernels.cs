@@ -3200,13 +3200,19 @@ namespace AiDotNet.Tensors.Engines.Simd
             pVal = Fma.MultiplyAdd(pVal, f, p1);
             pVal = Fma.MultiplyAdd(pVal, f, p0);
 
-            // Denominator Q(f) = q0 + q1*f + q2*f^2 + ... + q5*f^5
-            var q0 = Vector256.Create(1.54360888658065167530e1);
-            var q1 = Vector256.Create(4.44568781543509296375e1);
-            var q2 = Vector256.Create(4.51227709466894823867e1);
-            var q3 = Vector256.Create(1.86960070067819026681e1);
-            var q4 = Vector256.Create(2.60098586801477581364e0);
-            // q5 = 1.0 (monic)
+            // Denominator Q(f) = q0 + q1*f + q2*f^2 + ... + q5*f^5, monic (q5 = 1).
+            //
+            // These are the Cephes log.c Q table. The previous values did not belong to Cephes'
+            // natural-log denominator at all, which is why this kernel returned up to 2.9e-2
+            // relative error while documenting ~1e-14 — the P table was correct, so the mismatch
+            // was purely in Q. Mapping: the Horner chain below evaluates
+            //   f^5 + q4*f^4 + q3*f^3 + q2*f^2 + q1*f + q0
+            // so q4..q0 correspond to Cephes Q[0]..Q[4] in that order.
+            var q0 = Vector256.Create(2.31251620126765340583e1);   // Cephes Q[4]
+            var q1 = Vector256.Create(7.11544750618563894466e1);   // Cephes Q[3]
+            var q2 = Vector256.Create(8.29875266912776603211e1);   // Cephes Q[2]
+            var q3 = Vector256.Create(4.52279145837532221105e1);   // Cephes Q[1]
+            var q4 = Vector256.Create(1.12873587189167450590e1);   // Cephes Q[0]
             var qVal = Fma.MultiplyAdd(one, f, q4);
             qVal = Fma.MultiplyAdd(qVal, f, q3);
             qVal = Fma.MultiplyAdd(qVal, f, q2);

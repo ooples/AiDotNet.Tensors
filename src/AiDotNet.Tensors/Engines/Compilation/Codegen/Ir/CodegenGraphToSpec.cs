@@ -16,7 +16,7 @@
 // for fusion chains. This version translates the reduction forms the spec can express
 // exactly. The spec's body is
 //
-//     out = activation( reduce(product of operands) + bias ) * scale
+//     out = activation( reduce(product of operands) + bias )
 //
 // and a matmul is exactly that: the product is A*B, the reduction is over k. What differs
 // from a pointwise chain is only the INDEX MAPS, which is what the spec was built to
@@ -100,6 +100,12 @@ public static class CodegenGraphToSpec
             var node = graph[cursor];
             if (activation == CodegenActivationKind.None && TryMapActivation(node.Op) is { } mapped)
             {
+                if (node.Inputs.Length != 1)
+                {
+                    declineReason = "activation " + node.Op + " needs exactly one input, got " +
+                                    node.Inputs.Length;
+                    return false;
+                }
                 activation = mapped;
                 cursor = node.Inputs[0];
                 continue;
@@ -181,7 +187,7 @@ public static class CodegenGraphToSpec
 
             default:
                 declineReason = "op " + core.Op + " is outside the spec's body form " +
-                                "(activation(reduce(product) + bias) * scale)";
+                                "(activation(reduce(product) + bias))";
                 return false;
         }
 
@@ -362,13 +368,22 @@ public static class CodegenGraphToSpec
                      "padding are unknown; guessing them would silently change the operator";
             return false;
         }
-        conv.Validate();
+        try
+        {
+            conv.Validate();
+        }
+        catch (ArgumentException ex)
+        {
+            reason = core.Op + " has invalid convolution geometry: " + ex.Message;
+            return false;
+        }
 
-        bool depthwise = core.Op == CodegenOpKind.DepthwiseConv2D;
         bool transposed = core.Op == CodegenOpKind.ConvTranspose2D;
 
         int[] inShape = graph[core.Inputs[0]].Shape;
         int[] wShape = graph[core.Inputs[1]].Shape;
+        bool depthwise = core.Op == CodegenOpKind.DepthwiseConv2D ||
+                         (transposed && wShape.Length == 3);
         if (inShape.Length != 4 || outShape.Length != 4)
         {
             reason = core.Op + " expects NCHW operands; got input rank " + inShape.Length +
@@ -604,7 +619,7 @@ public static class CodegenGraphToSpec
             if (node.Op != CodegenOpKind.Mul || node.Inputs.Length != 2)
             {
                 reason = "op " + node.Op + " is outside the spec's body form " +
-                         "(activation(reduce(product) + bias) * scale)";
+                         "(activation(reduce(product) + bias))";
                 return false;
             }
 

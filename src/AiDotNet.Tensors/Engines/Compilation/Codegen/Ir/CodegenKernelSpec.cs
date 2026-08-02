@@ -333,6 +333,21 @@ public sealed class CodegenKernelSpec
         if (extraOutputs is not null) extras.AddRange(extraOutputs);
         _extraOutputs = extras.ToArray();
 
+        // Parameter order is the launch ABI. A binding whose ParameterIndex disagrees
+        // with its position makes the emitter load a different pointer while the
+        // interpreter continues to use the array position, so both can look internally
+        // consistent and still compute different operators.
+        for (int i = 0; i < _inputs.Length; i++)
+            if (_inputs[i].ParameterIndex != i)
+                throw new ArgumentException(
+                    "Input '" + _inputs[i].Name + "' is at position " + i +
+                    " but binds parameter " + _inputs[i].ParameterIndex + ".", nameof(inputs));
+        if (output.ParameterIndex != _inputs.Length)
+            throw new ArgumentException(
+                "Output '" + output.Name + "' must bind parameter " + _inputs.Length +
+                ", immediately after the inputs; got " + output.ParameterIndex + ".",
+                nameof(output));
+
         // WHAT A NON-REAL ALGEBRA CANNOT COMBINE WITH. Each of these is refused because it
         // is not defined on the number system, not because it is unimplemented -- and the
         // difference matters: an approximation here would produce a kernel that runs and
@@ -403,6 +418,13 @@ public sealed class CodegenKernelSpec
                     extra.Binding.ParameterIndex + ", which another output already writes. " +
                     "Two outputs on one buffer race with no ordering between them.");
 
+            int expectedParameter = _inputs.Length + 1 + i;
+            if (extra.Binding.ParameterIndex != expectedParameter)
+                throw new ArgumentException(
+                    "Extra output '" + extra.Binding.Name + "' is at output position " +
+                    (i + 1) + " but binds parameter " + extra.Binding.ParameterIndex +
+                    "; expected " + expectedParameter + ".");
+
             if (extra.Kind == CodegenExtraOutputKind.ArgMaxIndex)
             {
                 if (extra.IndexExpr is null)
@@ -442,6 +464,16 @@ public sealed class CodegenKernelSpec
         for (int i = 0; i < _inputs.Length; i++) ValidateIndirection(_inputs[i], "input " + i);
         if (secondaryOutput is not null) ValidateIndirection(secondaryOutput, "secondary output");
 
+        ValidateAxes(output, "output");
+        for (int i = 0; i < _inputs.Length; i++) ValidateAxes(_inputs[i], "input " + i);
+        for (int i = 0; i < _extraOutputs.Length; i++)
+        {
+            ValidateAxes(_extraOutputs[i].Binding, "extra output " + i);
+            if (_extraOutputs[i].IndexExpr is not null)
+                ValidateExpressionAxes(_extraOutputs[i].IndexExpr!,
+                    "extra output " + i + " index expression");
+        }
+
         if (double.IsNaN(preBiasScale) || double.IsInfinity(preBiasScale))
             throw new ArgumentException(
                 "PreBiasScale must be finite; got " + preBiasScale + ".", nameof(preBiasScale));
@@ -473,6 +505,22 @@ public sealed class CodegenKernelSpec
                 if (reductionSet.Contains(term.Axis))
                     throw new ArgumentException(
                         $"Output dimension {d} depends on reduction axis '{space.Axes[term.Axis].Name}'.", nameof(output));
+
+        void ValidateAxes(CodegenTensorBinding binding, string role)
+        {
+            for (int d = 0; d < binding.Map.Count; d++)
+                ValidateExpressionAxes(binding.Map[d],
+                    role + " '" + binding.Name + "' dimension " + d);
+        }
+
+        void ValidateExpressionAxes(CodegenAffineExpr expression, string role)
+        {
+            foreach (var term in expression.Terms)
+                if (term.Axis < 0 || term.Axis >= space.Axes.Count)
+                    throw new ArgumentException(
+                        role + " references affine axis " + term.Axis + " but the iteration " +
+                        "space has " + space.Axes.Count + " axes.");
+        }
     }
 
     /// <summary>

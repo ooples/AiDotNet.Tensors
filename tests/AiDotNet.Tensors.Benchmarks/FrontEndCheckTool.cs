@@ -20,6 +20,13 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class FrontEndCheckTool
 {
     /// <summary>
+    /// Upper limit for fp32 contraction tolerance. This matches the conveyor and
+    /// autotuner, while the front-end check still scales its bound with reduction length.
+    /// </summary>
+    private const double AccumulationTolerance =
+        CodegenMeasurementProtocol.AccumulationTolerance;
+
+    /// <summary>
     /// Whether timings may be reported. Correctness does not care what else is on the
     /// GPU; a ratio does. Gating the whole check on an idle device would mean a busy box
     /// could not verify anything, and reporting microseconds taken against a foreign
@@ -198,13 +205,22 @@ internal static class FrontEndCheckTool
     {
         long longest = 1;
         foreach (var pass in program.Passes)
-        {
-            long trips = 1;
-            foreach (int axis in pass.Space.ReductionAxes) trips *= pass.Space.Axes[axis].Extent;
-            longest = Math.Max(longest, trips);
-        }
+            longest = Math.Max(longest, ReductionTrips(pass.Space));
         return longest;
     }
+
+    /// <summary>Number of values accumulated into each output element.</summary>
+    private static long ReductionTrips(CodegenIterationSpace space)
+    {
+        long trips = 1;
+        foreach (int axis in space.ReductionAxes) trips *= space.Axes[axis].Extent;
+        return trips;
+    }
+
+    /// <summary>Fp32 accumulation error bound scaled by reduction length.</summary>
+    private static double AccumulationBound(long trips) => trips > 1
+        ? Math.Min(AccumulationTolerance, Math.Max(1e-6, trips * 1.2e-7))
+        : 0.0;
 
     private static IEnumerable<(string Label, CodegenProgram Program)> Programs()
     {
@@ -334,15 +350,8 @@ internal static class FrontEndCheckTool
             }
             double deviation = scale > 0 ? worst / scale : worst;
 
-            // THE TOLERANCE IS A FUNCTION OF THE REDUCTION LENGTH, not a constant.
-            // Sequential fp32 accumulation drifts with the number of terms, and measuring
-            // the same operator at two lengths showed exactly that: the LayerNorm variance
-            // read 8.316E-007 over 64 terms and 3.335E-006 over 256 -- a 4.01x rise for a
-            // 4x longer reduction, which is n*eps and not a defect. A fixed 1e-6 gate is
-            // the wrong SHAPE for that, the same way an absolute tolerance was the wrong
-            // shape for the autotuner's agreement check.
             long trips = LongestReduction(program);
-            double bound = Math.Max(1e-6, trips * 1.2e-7);
+            double bound = AccumulationBound(trips);
             bool ok = deviation <= bound;
 
             Console.WriteLine(label.PadRight(38) +
@@ -616,11 +625,9 @@ internal static class FrontEndCheckTool
                 scale = Math.Max(scale, Math.Abs(want[e]));
             }
 
-            // A reduction accumulates, so the tolerance has to be relative to the result's
-            // own magnitude; an absolute 1e-6 would be a fp32 epsilon test, not a
-            // correctness test. Pointwise graphs still land on exact zero.
             double deviation = scale > 0 ? worst / scale : worst;
-            bool ok = deviation <= 1e-6;
+            double bound = AccumulationBound(ReductionTrips(spec.Space));
+            bool ok = deviation <= bound;
             double singleUs = Measure(runtime.Synchronize, LaunchSingle);
             Console.WriteLine(label.PadRight(38) +
                 count.ToString("N0", CultureInfo.InvariantCulture).PadLeft(10) +
@@ -641,7 +648,7 @@ internal static class FrontEndCheckTool
             // reference rather than trusted. A two-kernel path through a temporary is
             // exactly the shape that produces a fast wrong answer.
             if (gpu.LastSplitProgram is { } split)
-                ok &= CheckSplit(runtime, label, split, spec, host, want);
+                ok &= CheckSplit(runtime, label, split, spec, host, want, bound);
 
             return ok;
         }
@@ -658,7 +665,7 @@ internal static class FrontEndCheckTool
     /// </summary>
     private static bool CheckSplit(
         DirectPtxRuntime runtime, string label, PtxSplitProgram split,
-        CodegenKernelSpec spec, float[][] host, double[] want)
+        CodegenKernelSpec spec, float[][] host, double[] want, double bound)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -731,7 +738,7 @@ internal static class FrontEndCheckTool
                 scale2 = Math.Max(scale2, Math.Abs(want[e]));
             }
             double deviation = scale2 > 0 ? worst / scale2 : worst;
-            bool ok = deviation <= 1e-6;
+            bool ok = deviation <= bound;
 
             // The emitter ADVERTISES this as the faster route, so the claim is measured
             // rather than asserted. A split offered on a shape it does not help is a bug

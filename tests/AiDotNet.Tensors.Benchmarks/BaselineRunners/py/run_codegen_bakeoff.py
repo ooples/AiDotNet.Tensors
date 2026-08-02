@@ -7,7 +7,8 @@
 #     per-call sync latency is amortised instead of dominating (the C# harness measured
 #     a 21.5 us launch floor and a 5.5 P95/median ratio without this);
 #   * SAMPLES samples per run, median reported;
-#   * RUNS runs, and the full spread is printed rather than the best.
+#   * up to STABILITY_ATTEMPTS runs, retaining the latest RUNS until they agree;
+#     the median and full spread of that accepted window are printed.
 #
 # Fairness note that the numbers cannot show on their own: our kernels are FUSED
 # (conv + bias + ReLU in one kernel). PyTorch runs conv+bias through cuDNN and then a
@@ -16,6 +17,7 @@
 # actually executes", and the unfused conv-only time is printed alongside so the
 # fusion component of any win is visible rather than hidden.
 
+import os
 import sys
 import time
 
@@ -25,6 +27,23 @@ WARMUP = 20
 SAMPLES = 51
 LAUNCHES_PER_SAMPLE = 50
 RUNS = 3
+STABILITY_ATTEMPTS = 15
+STABLE_SPREAD_PCT = 5.0
+
+
+def conv_transpose_contract():
+    """Returns N,C,IH,IW,OH,OW,output_padding from the .NET catalog authority."""
+    raw = os.environ.get("BAKEOFF_CONV_TRANSPOSE_CONTRACT", "")
+    try:
+        values = tuple(int(value) for value in raw.split(","))
+    except ValueError as exc:
+        raise RuntimeError("invalid BAKEOFF_CONV_TRANSPOSE_CONTRACT") from exc
+    if len(values) != 7:
+        raise RuntimeError("BAKEOFF_CONV_TRANSPOSE_CONTRACT must contain 7 integers")
+    n, c, ih, iw, oh, ow, output_padding = values
+    if min(n, c, ih, iw, oh, ow) <= 0 or output_padding not in (0, 1):
+        raise RuntimeError("invalid transposed-convolution catalog contract")
+    return values
 
 
 def time_op(fn):
@@ -48,16 +67,25 @@ def time_op(fn):
 
 
 def best_of_runs(fn):
-    """Median of the RUNS medians, plus the observed spread across runs."""
+    """Median of the latest three agreeing runs, with contaminated runs aged out."""
     medians = []
-    worst_tail = 0.0
-    for _ in range(RUNS):
+    tails = []
+    for _ in range(STABILITY_ATTEMPTS):
         mid, p95 = time_op(fn)
         medians.append(mid)
-        worst_tail = max(worst_tail, p95 / mid if mid > 0 else float("nan"))
-    medians.sort()
-    spread = (medians[-1] / medians[0] - 1.0) * 100.0 if medians[0] > 0 else float("nan")
-    return medians[len(medians) // 2], worst_tail, spread
+        tails.append(p95 / mid if mid > 0 else float("nan"))
+        if len(medians) > RUNS:
+            medians.pop(0)
+            tails.pop(0)
+        if len(medians) == RUNS:
+            spread = ((max(medians) / min(medians) - 1.0) * 100.0
+                      if min(medians) > 0 else float("nan"))
+            if spread <= STABLE_SPREAD_PCT:
+                break
+    ordered = sorted(medians)
+    spread = ((ordered[-1] / ordered[0] - 1.0) * 100.0
+              if ordered[0] > 0 else float("nan"))
+    return ordered[len(ordered) // 2], max(tails), spread
 
 
 def emit(name, fn, note=""):
@@ -130,7 +158,17 @@ def main():
         print("ERROR\tno CUDA device", flush=True)
         return 1
 
-    torch.backends.cudnn.benchmark = True   # let cuDNN pick its best algorithm
+    search = os.environ.get("BAKEOFF_CUDNN_SEARCH", "")
+    if search == "default":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark_limit = 10
+    elif search == "exhaustive":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark_limit = 0
+    elif search == "heuristic":
+        torch.backends.cudnn.benchmark = False
+    else:
+        raise RuntimeError("BAKEOFF_CUDNN_SEARCH must be default, exhaustive, or heuristic")
 
     # TRUE FP32, NOT TF32. PyTorch defaults allow_tf32=True, which routes dense
     # convolution to tensor cores at 10-bit mantissa -- a DIFFERENT operation from the
@@ -146,6 +184,10 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     dev = torch.device("cuda")
     torch.manual_seed(0)
+    selector = os.environ.get("BAKEOFF_SELECTOR", "all")
+
+    def selected(name):
+        return selector == "all" or selector == name
 
     print("DEVICE\t%s\ttorch %s\tcudnn %s"
           % (torch.cuda.get_device_name(0), torch.__version__, torch.backends.cudnn.version()),
@@ -156,36 +198,43 @@ def main():
     dw = torch.randn(64, 1, 3, 3, device=dev)
     dwb = torch.randn(64, device=dev)
 
-    emit_both("depthwise_conv2d_3x3",
-         lambda: torch.nn.functional.conv2d(x, dw, None, 1, 1, 1, 64))
-    emit_both("depthwise_conv2d_3x3_bias_relu",
-         lambda: torch.relu(torch.nn.functional.conv2d(x, dw, dwb, 1, 1, 1, 64)),
-         "conv+bias then a separate relu kernel")
-    emit("depthwise_conv2d_3x3_conv_only",
-         lambda: torch.nn.functional.conv2d(x, dw, dwb, 1, 1, 1, 64),
-         "unfused reference: conv+bias, no relu")
+    if selected("depthwise_conv2d_3x3"):
+        emit_both("depthwise_conv2d_3x3",
+             lambda: torch.nn.functional.conv2d(x, dw, None, 1, 1, 1, 64))
+    if selected("depthwise_conv2d_3x3_bias_relu"):
+        emit_both("depthwise_conv2d_3x3_bias_relu",
+             lambda: torch.relu(torch.nn.functional.conv2d(x, dw, dwb, 1, 1, 1, 64)),
+             "conv+bias then a separate relu kernel")
+    if selector == "all":
+        emit("depthwise_conv2d_3x3_conv_only",
+             lambda: torch.nn.functional.conv2d(x, dw, dwb, 1, 1, 1, 64),
+             "unfused reference: conv+bias, no relu")
 
     # ---- dense 1x1, N16/C64->K64/28x28
     x1 = torch.randn(16, 64, 28, 28, device=dev)
     w1 = torch.randn(64, 64, 1, 1, device=dev)
     b1 = torch.randn(64, device=dev)
-    emit_both("conv2d_1x1_bias_relu",
-         lambda: torch.relu(torch.nn.functional.conv2d(x1, w1, b1)),
-         "conv+bias then a separate relu kernel")
-    emit("conv2d_1x1_conv_only",
-         lambda: torch.nn.functional.conv2d(x1, w1, b1),
-         "unfused reference: conv+bias, no relu")
+    if selected("conv2d_1x1_bias_relu"):
+        emit_both("conv2d_1x1_bias_relu",
+             lambda: torch.relu(torch.nn.functional.conv2d(x1, w1, b1)),
+             "conv+bias then a separate relu kernel")
+    if selector == "all":
+        emit("conv2d_1x1_conv_only",
+             lambda: torch.nn.functional.conv2d(x1, w1, b1),
+             "unfused reference: conv+bias, no relu")
 
     # ---- dense 3x3, N8/C32->K64/28x28
     x3 = torch.randn(8, 32, 28, 28, device=dev)
     w3 = torch.randn(64, 32, 3, 3, device=dev)
     b3 = torch.randn(64, device=dev)
-    emit_both("conv2d_3x3_bias_relu",
-         lambda: torch.relu(torch.nn.functional.conv2d(x3, w3, b3, 1, 1)),
-         "conv+bias then a separate relu kernel")
-    emit("conv2d_3x3_conv_only",
-         lambda: torch.nn.functional.conv2d(x3, w3, b3, 1, 1),
-         "unfused reference: conv+bias, no relu")
+    if selected("conv2d_3x3_bias_relu"):
+        emit_both("conv2d_3x3_bias_relu",
+             lambda: torch.relu(torch.nn.functional.conv2d(x3, w3, b3, 1, 1)),
+             "conv+bias then a separate relu kernel")
+    if selector == "all":
+        emit("conv2d_3x3_conv_only",
+             lambda: torch.nn.functional.conv2d(x3, w3, b3, 1, 1),
+             "unfused reference: conv+bias, no relu")
 
     # ---- DEEP EPILOGUE, N16/C64->K64/28x28. The structural exploit: PyTorch cannot
     # fuse through a cuDNN call, so each elementwise stage costs it a kernel launch and
@@ -193,35 +242,49 @@ def main():
     # already running. Measured marginal cost on this shape: bias +2.84 us, relu +8.14,
     # scale +6.42 -- 17.40 us of epilogue against a 23.75 us convolution.
     s1 = torch.randn(64, 1, 1, device=dev)
-    emit_both("conv2d_1x1_deep_epilogue",
-         lambda: torch.relu(torch.nn.functional.conv2d(x1, w1, b1) * s1),
-         "conv+bias then scale then relu: three kernels PyTorch cannot fuse")
+    if selected("conv2d_1x1_deep_epilogue"):
+        emit_both("conv2d_1x1_deep_epilogue",
+             lambda: torch.relu(torch.nn.functional.conv2d(x1, w1, b1) * s1),
+             "conv+bias then scale then relu: three kernels PyTorch cannot fuse")
 
     # ---- 2x2 max pool, N32/C64/112x112
     xp = torch.randn(32, 64, 112, 112, device=dev)
-    emit_both("maxpool2d_2x2", lambda: torch.nn.functional.max_pool2d(xp, 2, 2))
+    if selected("maxpool2d_2x2"):
+        emit_both("maxpool2d_2x2", lambda: torch.nn.functional.max_pool2d(xp, 2, 2))
 
-    # ---- transposed depthwise 3x3 stride 2, N16/C64, 28x28 -> 56x56
-    xt = torch.randn(16, 64, 28, 28, device=dev)
-    wt = torch.randn(64, 1, 3, 3, device=dev)
-    emit_both("conv_transpose2d_3x3_stride2",
-         lambda: torch.nn.functional.conv_transpose2d(
-             xt, wt, None, stride=2, padding=1, output_padding=1, groups=64))
+    # ---- transposed depthwise 3x3 stride 2; shape comes from the .NET catalog
+    if selected("conv_transpose2d_3x3_stride2"):
+        tn, tc, tih, tiw, toh, tow, output_padding = conv_transpose_contract()
+        xt = torch.randn(tn, tc, tih, tiw, device=dev)
+        wt = torch.randn(tc, 1, 3, 3, device=dev)
+        probe = torch.nn.functional.conv_transpose2d(
+            xt, wt, None, stride=2, padding=1,
+            output_padding=output_padding, groups=tc)
+        if tuple(probe.shape) != (tn, tc, toh, tow):
+            raise RuntimeError("cuDNN transposed-convolution result disagrees with catalog contract")
+        del probe
+        emit_both("conv_transpose2d_3x3_stride2",
+             lambda: torch.nn.functional.conv_transpose2d(
+                 xt, wt, None, stride=2, padding=1,
+                 output_padding=output_padding, groups=tc))
 
     # ---- gradient with respect to the data, matching the derived adjoint kernels
     from torch.nn.grad import conv2d_input
 
     gdw = torch.randn(32, 64, 56, 56, device=dev)
-    emit_both("depthwise_conv2d_3x3_bwd_data",
-         lambda: conv2d_input(list(x.shape), dw, gdw, 1, 1, 1, 64))
+    if selected("depthwise_conv2d_3x3_bwd_data"):
+        emit_both("depthwise_conv2d_3x3_bwd_data",
+             lambda: conv2d_input(list(x.shape), dw, gdw, 1, 1, 1, 64))
 
     g1 = torch.randn(16, 64, 28, 28, device=dev)
-    emit_both("conv2d_1x1_bwd_data",
-         lambda: conv2d_input(list(x1.shape), w1, g1))
+    if selected("conv2d_1x1_bwd_data"):
+        emit_both("conv2d_1x1_bwd_data",
+             lambda: conv2d_input(list(x1.shape), w1, g1))
 
     g3 = torch.randn(8, 64, 28, 28, device=dev)
-    emit_both("conv2d_3x3_bwd_data",
-         lambda: conv2d_input(list(x3.shape), w3, g3, 1, 1))
+    if selected("conv2d_3x3_bwd_data"):
+        emit_both("conv2d_3x3_bwd_data",
+             lambda: conv2d_input(list(x3.shape), w3, g3, 1, 1))
 
     # ---- gradient with respect to the WEIGHTS.
     #
@@ -235,14 +298,17 @@ def main():
     # rest of this file follows.
     from torch.nn.grad import conv2d_weight
 
-    emit_both("depthwise_conv2d_3x3_bwd_weights",
-         lambda: conv2d_weight(x, list(dw.shape), gdw, 1, 1, 1, 64))
+    if selected("depthwise_conv2d_3x3_bwd_weights"):
+        emit_both("depthwise_conv2d_3x3_bwd_weights",
+             lambda: conv2d_weight(x, list(dw.shape), gdw, 1, 1, 1, 64))
 
-    emit_both("conv2d_1x1_bwd_weights",
-         lambda: conv2d_weight(x1, list(w1.shape), g1))
+    if selected("conv2d_1x1_bwd_weights"):
+        emit_both("conv2d_1x1_bwd_weights",
+             lambda: conv2d_weight(x1, list(w1.shape), g1))
 
-    emit_both("conv2d_3x3_bwd_weights",
-         lambda: conv2d_weight(x3, list(w3.shape), g3, 1, 1))
+    if selected("conv2d_3x3_bwd_weights"):
+        emit_both("conv2d_3x3_bwd_weights",
+             lambda: conv2d_weight(x3, list(w3.shape), g3, 1, 1))
 
     return 0
 

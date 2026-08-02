@@ -316,6 +316,30 @@ public class CodegenMultiOutputTests
         Assert.Contains("Max reduction", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>An argmax expression cannot name an axis outside the iteration space.</summary>
+    [Fact]
+    public void ArgMaxExtraWithInvalidIndexAxis_IsRefusedAtConstruction()
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", 8), CodegenAxis.Reduce("k", 4));
+        var rowMap = new[] { CodegenAffineExpr.Axis(0) };
+        var x = new CodegenTensorBinding(0, "x", new[] { 8, 4 },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var values = new CodegenTensorBinding(1, "out", new[] { 8 }, rowMap, isOutput: true);
+        var indices = new CodegenTensorBinding(2, "idx", new[] { 8 }, rowMap, isOutput: true);
+
+        var ex = Assert.Throws<ArgumentException>(() => new CodegenKernelSpec(
+            "bad_index_axis", space, new[] { x }, values, new[] { 0 }, CodegenReduceKind.Max,
+            extraOutputs: new[]
+            {
+                new CodegenExtraOutput(indices, CodegenExtraOutputKind.ArgMaxIndex,
+                    CodegenAffineExpr.Axis(2)),
+            }));
+
+        Assert.Contains("index expression references affine axis 2", ex.Message,
+            StringComparison.Ordinal);
+    }
+
     /// <summary>An extra binding not marked IsOutput would be read-addressed.</summary>
     [Fact]
     public void ExtraNotMarkedAsOutput_IsRefused()
