@@ -26,11 +26,13 @@ internal static class DirectPtxReductionCubinTool
             yield return new DirectPtxModuleSource(
                 $"row-sum-f32-v1-r{rows}-c{columns}",
                 PtxFusedRowReduceF32Kernel.EntryPoint,
-                PtxFusedRowReduceF32Kernel.EmitPtx(8, 6, rows, columns));
+                PtxFusedRowReduceF32Kernel.EmitPtx(8, 6, rows, columns),
+                PtxFusedRowReduceF32Kernel.DefaultBlockThreads);
             yield return new DirectPtxModuleSource(
                 $"row-l2normalize-f32-v1-r{rows}-c{columns}",
                 PtxFusedRowL2NormalizeF32Kernel.EntryPoint,
-                PtxFusedRowL2NormalizeF32Kernel.EmitPtx(8, 6, rows, columns));
+                PtxFusedRowL2NormalizeF32Kernel.EmitPtx(8, 6, rows, columns),
+                PtxFusedRowL2NormalizeF32Kernel.DefaultBlockThreads);
         }
 
         var operators = new[]
@@ -51,7 +53,8 @@ internal static class DirectPtxReductionCubinTool
             yield return new DirectPtxModuleSource(
                 $"row-reduce-{op}-f32-v1-r{rows}-c{columns}",
                 PtxFusedRowReduceOpF32Kernel.EntryPointFor(op),
-                PtxFusedRowReduceOpF32Kernel.EmitPtx(8, 6, op, rows, columns));
+                PtxFusedRowReduceOpF32Kernel.EmitPtx(8, 6, op, rows, columns),
+                PtxFusedRowReduceOpF32Kernel.DefaultBlockThreads);
         }
     }
 

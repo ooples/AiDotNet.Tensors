@@ -55,6 +55,40 @@ public class DirectPtxReductionTests
             PtxFusedRowReduceF32Kernel.EmitPtx(8, 6, 17, 128));
     }
 
+    [Fact]
+    public void ReductionOfflinePackage_CoversEveryReleaseModule()
+    {
+        foreach ((int rows, int columns) in new[]
+                 { (256, 128), (2048, 64), (2048, 128), (8192, 128) })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedRowReduceF32Kernel.EmitPtx(8, 6, rows, columns), 8, 6));
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedRowL2NormalizeF32Kernel.EmitPtx(8, 6, rows, columns), 8, 6));
+        }
+
+        foreach (int rows in new[] { 256, 512, 1024, 2048, 4096 })
+        foreach (int columns in new[] { 64, 128, 256, 512, 1024 })
+        foreach (DirectPtxRowReduceOp op in new[]
+                 {
+                     DirectPtxRowReduceOp.Mean,
+                     DirectPtxRowReduceOp.Max,
+                     DirectPtxRowReduceOp.Min,
+                     DirectPtxRowReduceOp.SumOfSquares,
+                 })
+        {
+            if (!PtxFusedRowReduceOpF32Kernel.IsSupportedShape(rows, columns)) continue;
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedRowReduceOpF32Kernel.EmitPtx(8, 6, op, rows, columns), 8, 6));
+        }
+
+        Assert.Contains(
+            typeof(PtxFusedRowReduceF32Kernel).Assembly.GetManifestResourceNames(),
+            name => name.EndsWith(
+                ".sm86.reduction.reduction-cubins.tsv",
+                StringComparison.Ordinal));
+    }
+
     [SkippableFact]
     public void StandaloneBufferTransfers_OrderTheNonBlockingLaunchStream()
     {
