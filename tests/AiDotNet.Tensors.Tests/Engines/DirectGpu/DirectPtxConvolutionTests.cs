@@ -180,6 +180,20 @@ public sealed class DirectPtxConvolutionTests
     }
 
     [Fact]
+    public void AutotuneEvidence_FailsClosedOnAnIncompletePromotableSearch()
+    {
+        string autotune = File.ReadAllText(SourcePath(
+            "tests", "AiDotNet.Tensors.Benchmarks", "KernelAutotuneTool.cs"));
+
+        Assert.Contains("InconclusivePromotableCandidates.Add(candidate.Name)", autotune,
+            StringComparison.Ordinal);
+        Assert.Contains("the selected search is incomplete", autotune,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("if (File.Exists(outputPath)) File.Delete(outputPath)", autotune,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void DepthwiseEmitter_IsPointerOnlyHaloPredicatedSm86Ptx()
     {
         string ptx = PtxFusedDepthwiseConv2D3x3F32Kernel.EmitPtx(8, 6);
