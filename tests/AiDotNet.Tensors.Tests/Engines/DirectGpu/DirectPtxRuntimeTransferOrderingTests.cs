@@ -36,9 +36,17 @@ public sealed class DirectPtxRuntimeTransferOrderingTests
         // must establish their own ordering edges to the non-blocking stream.
         var actual = new float[elements];
         output.Download<float>(actual);
+        int mismatch = -1;
         for (int index = 0; index < actual.Length; index++)
-            Assert.True(actual[index] == expected[index],
-                $"transfer ordering failed at {index}: expected {expected[index]}, actual {actual[index]}");
+        {
+            if (actual[index] == expected[index]) continue;
+            mismatch = index;
+            break;
+        }
+        if (mismatch >= 0)
+            Assert.Fail(
+                $"transfer ordering failed at {mismatch}: expected {expected[mismatch]}, " +
+                $"actual {actual[mismatch]}");
     }
 
     private static string EmitCopyPtx(int major, int minor) =>
