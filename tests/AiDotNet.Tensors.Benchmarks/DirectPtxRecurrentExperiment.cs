@@ -461,10 +461,22 @@ internal static class DirectPtxRecurrentExperiment
         start.ArgumentList.Add("--json-lines");
         using Process process = Process.Start(start) ??
             throw new InvalidOperationException("Could not start the PyTorch RG-LRU baseline.");
+        Task<string> outputReader = process.StandardOutput.ReadToEndAsync();
+        Task<string> errorReader = process.StandardError.ReadToEndAsync();
+        Task.WhenAll(outputReader, errorReader).GetAwaiter().GetResult();
+        process.WaitForExit();
+        string output = outputReader.GetAwaiter().GetResult();
+        string error = errorReader.GetAwaiter().GetResult();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"PyTorch CUDA RG-LRU baseline failed with exit {process.ExitCode}: {error}");
+
         var records = new List<ExternalRecord>();
-        while (process.StandardOutput.ReadLine() is { } line)
+        foreach (string line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
         {
-            using JsonDocument document = JsonDocument.Parse(line);
+            string json = line.TrimStart();
+            if (!json.StartsWith('{')) continue;
+            using JsonDocument document = JsonDocument.Parse(json);
             JsonElement root = document.RootElement;
             records.Add(new ExternalRecord(
                 root.GetProperty("status").GetString() ?? "",
@@ -478,11 +490,6 @@ internal static class DirectPtxRecurrentExperiment
                 root.GetProperty("temporary_device_bytes").GetInt64(),
                 root.GetProperty("max_error").GetDouble()));
         }
-        string error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"PyTorch CUDA RG-LRU baseline failed with exit {process.ExitCode}: {error}");
         return records;
     }
 
