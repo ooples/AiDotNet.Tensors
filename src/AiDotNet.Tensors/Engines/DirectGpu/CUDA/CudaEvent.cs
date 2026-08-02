@@ -56,6 +56,18 @@ public sealed class CudaEvent : IGpuEvent
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         _enableTiming = enableTiming;
+
+        CudaStream? cudaStream = null;
+        if (stream is not null)
+        {
+            cudaStream = stream as CudaStream ??
+                throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+            if (!ReferenceEquals(cudaStream.Backend, _backend))
+                throw new ArgumentException(
+                    "Event and stream must belong to the same CUDA backend.", nameof(stream));
+            cudaStream.ThrowIfDisposed();
+        }
+
         _backend.EnsureContextCurrent();
 
         IntPtr eventHandle;
@@ -74,10 +86,25 @@ public sealed class CudaEvent : IGpuEvent
         CuBlasNative.CheckCudaResult(result, "cuEventCreate");
         _handle = eventHandle;
 
-        // Record on the stream if provided
-        if (stream != null)
+        try
         {
-            Record(stream);
+            if (cudaStream is not null)
+                Record(cudaStream);
+        }
+        catch
+        {
+            try
+            {
+                _backend.EnsureContextCurrent();
+                if (_handle != IntPtr.Zero)
+                    _ = CudaNativeBindings.cuEventDestroy(_handle);
+            }
+            catch
+            {
+                // Constructor cleanup must not hide the original recording failure.
+            }
+            _handle = IntPtr.Zero;
+            throw;
         }
     }
 

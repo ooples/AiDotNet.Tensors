@@ -159,7 +159,7 @@ public sealed class CudaStream : IGpuStream
         return false;
     }
 
-    private void ThrowIfDisposed()
+    internal void ThrowIfDisposed()
     {
         if (_disposed)
         {
