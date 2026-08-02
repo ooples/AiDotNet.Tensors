@@ -146,21 +146,13 @@ internal static class DirectPtxCubinArtifactCache
     {
         var result = new Dictionary<string, EmbeddedArtifact>(StringComparer.Ordinal);
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
-        foreach (string resourceName in assembly.GetManifestResourceNames())
+        string[] orderedResourceNames = assembly.GetManifestResourceNames()
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        foreach (string resourceName in orderedResourceNames)
         {
             if (!resourceName.EndsWith(".tsv", StringComparison.Ordinal) ||
-                resourceName.IndexOf(".Artifacts.sm", StringComparison.Ordinal) < 0)
-                continue;
-
-            const string marker = ".Artifacts.";
-            int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
-            int architectureStart = markerIndex + marker.Length;
-            int architectureEnd = resourceName.IndexOf('.', architectureStart);
-            if (markerIndex < 0 || architectureEnd <= architectureStart)
-                continue;
-            string architecture = resourceName.Substring(
-                architectureStart, architectureEnd - architectureStart);
-            if (!architecture.StartsWith("sm", StringComparison.Ordinal))
+                !TryParseEmbeddedArtifactArchitecture(resourceName, out string architecture))
                 continue;
 
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
@@ -199,7 +191,7 @@ internal static class DirectPtxCubinArtifactCache
                         "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
 
                 string? cubinResource = FindEmbeddedCubinResource(
-                    assembly, architecture, columns[fileIndex]);
+                    orderedResourceNames, architecture, columns[fileIndex]);
                 if (cubinResource == null)
                     throw new InvalidDataException(
                         "Embedded direct-PTX manifest references a missing cubin: " +
@@ -215,13 +207,39 @@ internal static class DirectPtxCubinArtifactCache
         return result;
     }
 
+    internal static bool TryParseEmbeddedArtifactArchitecture(
+        string resourceName,
+        out string architecture)
+    {
+        const string marker = ".Artifacts.sm";
+        int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
+        if (markerIndex < 0)
+        {
+            architecture = string.Empty;
+            return false;
+        }
+
+        int architectureStart = markerIndex + ".Artifacts.".Length;
+        int architectureEnd = resourceName.IndexOf('.', architectureStart);
+        if (architectureEnd <= architectureStart)
+        {
+            architecture = string.Empty;
+            return false;
+        }
+
+        architecture = resourceName.Substring(
+            architectureStart, architectureEnd - architectureStart);
+        return true;
+    }
+
     private static string? FindEmbeddedCubinResource(
-        Assembly assembly, string architecture, string fileName)
+        IReadOnlyList<string> orderedResourceNames,
+        string architecture,
+        string fileName)
     {
         string architectureMarker = ".Artifacts." + architecture + ".";
         string suffix = "." + fileName;
-        foreach (string candidate in assembly.GetManifestResourceNames()
-                     .OrderBy(name => name, StringComparer.Ordinal))
+        foreach (string candidate in orderedResourceNames)
         {
             if (candidate.IndexOf(architectureMarker, StringComparison.Ordinal) >= 0 &&
                 candidate.EndsWith(suffix, StringComparison.Ordinal))
