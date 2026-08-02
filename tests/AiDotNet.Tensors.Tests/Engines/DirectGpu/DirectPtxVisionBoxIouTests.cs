@@ -428,7 +428,8 @@ public sealed class DirectPtxVisionBoxIouTests
             StringComparison.Ordinal);
         Assert.Equal("analytical reverse mode; CIoU alpha detached",
             aligned.Blueprint.Semantics["method"]);
-        Assert.Contains("rcp.approx.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.Contains("rcp.approx.ftz.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rcp.approx.f32", aligned.Ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("div.rn.f32", aligned.Ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("0.001", aligned.Ptx, StringComparison.Ordinal);
 

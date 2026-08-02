@@ -204,7 +204,10 @@ internal static class StableTimer
         Action launchB,
         int warmups = 5,
         int maxAttempts = 15,
-        double targetBatchMilliseconds = 50.0)
+        double targetBatchMilliseconds = 50.0,
+        int operationsPerLaunchA = 1,
+        int operationsPerLaunchB = 1,
+        int bracketsPerAttempt = 1)
     {
         if (backend is null) throw new ArgumentNullException(nameof(backend));
         if (launchA is null) throw new ArgumentNullException(nameof(launchA));
@@ -216,6 +219,13 @@ internal static class StableTimer
         if (!(targetBatchMilliseconds > 0) ||
             double.IsInfinity(targetBatchMilliseconds))
             throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
+        if (operationsPerLaunchA <= 0)
+            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchA));
+        if (operationsPerLaunchB <= 0)
+            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchB));
+        if (bracketsPerAttempt <= 0 || (bracketsPerAttempt & 1) == 0)
+            throw new ArgumentOutOfRangeException(nameof(bracketsPerAttempt),
+                "Use a positive odd bracket count so its median is an observed sample.");
 
         for (int i = 0; i < warmups; i++)
         {
@@ -256,26 +266,38 @@ internal static class StableTimer
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             attempts++;
-            // AB then BA inside every sample removes first/second-order bias
-            // without pretending it is kernel speed. Average each lane's two
-            // positions before forming the within-sample ratio.
-            EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
-            EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
-            endB.Synchronize();
-            double aFirst = backend.GetEventElapsedTime(startA, endA);
-            double bSecond = backend.GetEventElapsedTime(startB, endB);
+            var bracketA = new List<double>(bracketsPerAttempt);
+            var bracketB = new List<double>(bracketsPerAttempt);
+            var bracketRatios = new List<double>(bracketsPerAttempt);
+            for (int bracket = 0; bracket < bracketsPerAttempt; bracket++)
+            {
+                // AB then BA inside every bracket removes first/second-order bias
+                // without pretending it is kernel speed. Median-of-brackets can
+                // reject an isolated WDDM preemption; the outer consecutive-window
+                // gate still requires three independently agreeing samples.
+                EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
+                EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
+                endB.Synchronize();
+                double aFirst = backend.GetEventElapsedTime(startA, endA);
+                double bSecond = backend.GetEventElapsedTime(startB, endB);
 
-            EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
-            EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
-            endA.Synchronize();
-            double bFirst = backend.GetEventElapsedTime(startB, endB);
-            double aSecond = backend.GetEventElapsedTime(startA, endA);
+                EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
+                EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
+                endA.Synchronize();
+                double bFirst = backend.GetEventElapsedTime(startB, endB);
+                double aSecond = backend.GetEventElapsedTime(startA, endA);
 
-            double a = (aFirst + aSecond) * 500.0 / iterationsA;
-            double b = (bFirst + bSecond) * 500.0 / iterationsB;
-            AddToConsecutiveWindow(samplesA, a);
-            AddToConsecutiveWindow(samplesB, b);
-            AddToConsecutiveWindow(ratios, a / b);
+                double a = (aFirst + aSecond) * 500.0 /
+                    (iterationsA * (double)operationsPerLaunchA);
+                double b = (bFirst + bSecond) * 500.0 /
+                    (iterationsB * (double)operationsPerLaunchB);
+                bracketA.Add(a);
+                bracketB.Add(b);
+                bracketRatios.Add(a / b);
+            }
+            AddToConsecutiveWindow(samplesA, Median(bracketA));
+            AddToConsecutiveWindow(samplesB, Median(bracketB));
+            AddToConsecutiveWindow(ratios, Median(bracketRatios));
             if (samplesA.Count >= 3 &&
                 SpreadOf(samplesA) <= StableSpread &&
                 SpreadOf(samplesB) <= StableSpread &&
@@ -285,7 +307,10 @@ internal static class StableTimer
             }
         }
 
-        return Pair(samplesA, samplesB, ratios, attempts, iterationsA, iterationsB);
+        return Pair(
+            samplesA, samplesB, ratios, attempts,
+            checked(iterationsA * operationsPerLaunchA),
+            checked(iterationsB * operationsPerLaunchB));
     }
 
     /// <summary>

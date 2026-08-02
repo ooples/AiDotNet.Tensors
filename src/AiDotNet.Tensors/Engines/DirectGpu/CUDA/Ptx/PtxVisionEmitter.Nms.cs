@@ -142,7 +142,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    min.f32 %f22, %f7, %f17; max.f32 %f23, %f5, %f15; sub.rn.f32 %f22, %f22, %f23; max.f32 %f22, %f22, 0f00000000;");
         ptx.AppendLine("    mul.rn.f32 %f24, %f21, %f22; add.rn.f32 %f25, %f10, %f20; sub.rn.f32 %f25, %f25, %f24;");
         ptx.AppendLine("    setp.gt.f32 %p6, %f25, 0f00000000; @!%p6 bra NMS_SUPPRESS_LOCAL_NEXT;");
-        ptx.AppendLine("    div.approx.f32 %f26, %f24, %f25;");
+        ptx.AppendLine("    div.approx.ftz.f32 %f26, %f24, %f25;");
         ptx.AppendLine($"    setp.gt.f32 %p7, %f26, {F(threshold)}; @%p7 st.global.f32 [%rd21], %f28;");
         ptx.AppendLine($"NMS_SUPPRESS_LOCAL_NEXT: add.u32 %r7, %r7, {blockThreads}; bra NMS_SUPPRESS_LOCAL;");
         ptx.AppendLine("NMS_SUPPRESS_LOCAL_DONE:");

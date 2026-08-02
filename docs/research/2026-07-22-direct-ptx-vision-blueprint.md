@@ -118,7 +118,7 @@ pay for tiling, that becomes a new separately measured blueprint version.
   evaluations per cell as well as temporary tensors and atomics.
 - The fused BoxIoU forward kernel uses IEEE round-to-nearest `div.rn.f32` in
   `PtxFusedPairwiseBoxIouF32Kernel.EmitPtx`. The analytical backward emitter
-  uses `rcp.approx.f32` followed by multiplication, matching the established
+  uses `rcp.approx.ftz.f32` followed by multiplication, matching the established
   CUDA route's `--use_fast_math` contract. Promotion still requires each
   specialization to pass both the established-route and high-precision
   correctness gates.

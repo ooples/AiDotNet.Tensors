@@ -114,7 +114,7 @@ internal static partial class PtxVisionEmitter
             ptx.AppendLine("ROI_REDUCE_DONE:");
             if (positionSensitive)
             {
-                ptx.AppendLine("    setp.eq.u32 %p9, %r18, 0; @%p9 bra ROI_ZERO; cvt.rn.f32.u32 %f26, %r18; div.approx.f32 %f20, %f20, %f26;");
+                ptx.AppendLine("    setp.eq.u32 %p9, %r18, 0; @%p9 bra ROI_ZERO; cvt.rn.f32.u32 %f26, %r18; div.approx.ftz.f32 %f20, %f20, %f26;");
             }
         }
 

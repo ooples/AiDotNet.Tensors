@@ -206,7 +206,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    mul.rn.f32 %f19, %f17, %f18;");
         ptx.AppendLine("    add.rn.f32 %f20, %f11, %f14; sub.rn.f32 %f20, %f20, %f19;");
         ptx.AppendLine("    mov.f32 %f21, 0f00000000; setp.gt.f32 %p1, %f20, %f8;");
-        ptx.AppendLine("    @%p1 div.approx.f32 %f21, %f19, %f20;");
+        ptx.AppendLine("    @%p1 div.approx.ftz.f32 %f21, %f19, %f20;");
         if (metric == BoxMetric.Iou)
         {
             ptx.AppendLine($"    mov.f32 {result}, %f21;");
@@ -220,7 +220,7 @@ internal static partial class PtxVisionEmitter
             ptx.AppendLine("    mul.rn.f32 %f28, %f26, %f27;");
             ptx.AppendLine("    mov.f32 %f29, 0f00000000; setp.gt.f32 %p2, %f28, %f8;");
             ptx.AppendLine("    sub.rn.f32 %f30, %f28, %f20;");
-            ptx.AppendLine("    @%p2 div.approx.f32 %f29, %f30, %f28;");
+            ptx.AppendLine("    @%p2 div.approx.ftz.f32 %f29, %f30, %f28;");
             ptx.AppendLine($"    sub.rn.f32 {result}, %f21, %f29;");
             return;
         }
@@ -232,7 +232,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    mul.rn.f32 %f34, %f32, %f32; fma.rn.f32 %f34, %f33, %f33, %f34;");
         ptx.AppendLine("    mul.rn.f32 %f35, %f26, %f26; fma.rn.f32 %f35, %f27, %f27, %f35;");
         ptx.AppendLine("    mov.f32 %f36, 0f00000000; setp.gt.f32 %p3, %f35, %f8;");
-        ptx.AppendLine("    @%p3 div.approx.f32 %f36, %f34, %f35;");
+        ptx.AppendLine("    @%p3 div.approx.ftz.f32 %f36, %f34, %f35;");
         ptx.AppendLine("    sub.rn.f32 %f37, %f21, %f36;");
         if (metric == BoxMetric.DistanceIou)
         {
@@ -248,7 +248,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine($"    mul.rn.f32 %f41, %f40, %f40; mul.rn.f32 %f41, %f41, {F(4f / (MathF.PI * MathF.PI))};");
         ptx.AppendLine($"    sub.rn.f32 %f42, {F(1f)}, %f21; add.rn.f32 %f42, %f42, %f41;");
         ptx.AppendLine("    mov.f32 %f43, 0f00000000; setp.gt.f32 %p6, %f42, %f8;");
-        ptx.AppendLine("    @%p6 div.approx.f32 %f43, %f41, %f42;");
+        ptx.AppendLine("    @%p6 div.approx.ftz.f32 %f43, %f41, %f42;");
         ptx.AppendLine("    mul.rn.f32 %f44, %f43, %f41;");
         ptx.AppendLine($"    sub.rn.f32 {result}, %f37, %f44;");
     }
@@ -257,9 +257,9 @@ internal static partial class PtxVisionEmitter
         StringBuilder ptx, string numerator, string denominator, string result, int predicate)
     {
         ptx.AppendLine($"    setp.gt.f32 %p{predicate}, {denominator}, 0f00000000;");
-        ptx.AppendLine($"    mov.f32 %f50, 0f00000000; @%p{predicate} div.approx.f32 %f50, {numerator}, {denominator};");
+        ptx.AppendLine($"    mov.f32 %f50, 0f00000000; @%p{predicate} div.approx.ftz.f32 %f50, {numerator}, {denominator};");
         ptx.AppendLine("    setp.gt.f32 %p7, %f50, 0f3F800000;");
-        ptx.AppendLine("    mov.f32 %f51, %f50; @%p7 div.approx.f32 %f51, 0f3F800000, %f50;");
+        ptx.AppendLine("    mov.f32 %f51, %f50; @%p7 div.approx.ftz.f32 %f51, 0f3F800000, %f50;");
         ptx.AppendLine("    mul.rn.f32 %f53, %f51, %f51;");
         ptx.AppendLine($"    mov.f32 %f54, {F(0.0208351f)};");
         ptx.AppendLine($"    fma.rn.f32 %f54, %f54, %f53, {F(-0.0851330f)};");
@@ -440,7 +440,7 @@ internal static partial class PtxVisionEmitter
         ptx.AppendLine("    mul.rn.f32 %f27, %f25, %f26; add.rn.f32 %f28, %f17, %f18; sub.rn.f32 %f28, %f28, %f27;");
         ptx.AppendLine("    mov.f32 %f29, 0f00000000; setp.gt.f32 %p9, %f28, %f8;");
         if (variant == 3)
-            ptx.AppendLine("    @%p9 div.approx.f32 %f29, %f27, %f28;");
+            ptx.AppendLine("    @%p9 div.approx.ftz.f32 %f29, %f27, %f28;");
         ptx.AppendLine("    mov.f32 %f30, 0f00000000; mov.f32 %f31, 0f00000000;");
 
         if (variant == 1)
@@ -448,7 +448,7 @@ internal static partial class PtxVisionEmitter
             // GIoU = IoU + union/enclose - 1.
             ptx.AppendLine("    min.f32 %f32, %f0, %f4; min.f32 %f33, %f1, %f5; max.f32 %f34, %f2, %f6; max.f32 %f35, %f3, %f7;");
             ptx.AppendLine("    sub.rn.f32 %f32, %f34, %f32; sub.rn.f32 %f33, %f35, %f33; max.f32 %f34, %f32, %f8; max.f32 %f35, %f33, %f8; mul.rn.f32 %f36, %f34, %f35;");
-            ptx.AppendLine("    setp.gt.f32 %p2, %f36, %f8; mov.f32 %f37, 0f00000000; @%p2 rcp.approx.f32 %f37, %f36; mul.rn.f32 %f38, %f58, %f37;");
+            ptx.AppendLine("    setp.gt.f32 %p2, %f36, %f8; mov.f32 %f37, 0f00000000; @%p2 rcp.approx.ftz.f32 %f37, %f36; mul.rn.f32 %f38, %f58, %f37;");
             ptx.AppendLine("    neg.f32 %f39, %f28; mul.rn.f32 %f39, %f58, %f39; mul.rn.f32 %f39, %f39, %f37; mul.rn.f32 %f40, %f39, %f37;");
             ptx.AppendLine("    add.rn.f32 %f31, %f31, %f38; sub.rn.f32 %f30, %f30, %f38;");
             ptx.AppendLine("    mul.rn.f32 %f41, %f40, %f35; mul.rn.f32 %f42, %f40, %f34; setp.gt.f32 %p3, %f32, %f8; setp.gt.f32 %p4, %f33, %f8; selp.f32 %f41, %f41, %f8, %p3; selp.f32 %f42, %f42, %f8, %p4;");
@@ -472,7 +472,7 @@ internal static partial class PtxVisionEmitter
             ptx.AppendLine("    sub.rn.f32 %f36, %f32, %f34; sub.rn.f32 %f37, %f33, %f35; mul.rn.f32 %f38, %f36, %f36; fma.rn.f32 %f38, %f37, %f37, %f38;");
             ptx.AppendLine("    min.f32 %f39, %f0, %f4; min.f32 %f40, %f1, %f5; max.f32 %f41, %f2, %f6; max.f32 %f42, %f3, %f7; sub.rn.f32 %f43, %f41, %f39; sub.rn.f32 %f44, %f42, %f40;");
             ptx.AppendLine("    mul.rn.f32 %f45, %f43, %f43; fma.rn.f32 %f45, %f44, %f44, %f45; setp.gt.f32 %p2, %f45, %f8;");
-            ptx.AppendLine("    mov.f32 %f47, 0f00000000; @%p2 rcp.approx.f32 %f47, %f45; neg.f32 %f46, %f58; mul.rn.f32 %f46, %f46, %f47;");
+            ptx.AppendLine("    mov.f32 %f47, 0f00000000; @%p2 rcp.approx.ftz.f32 %f47, %f45; neg.f32 %f46, %f58; mul.rn.f32 %f46, %f46, %f47;");
             ptx.AppendLine("    mul.rn.f32 %f59, %f58, %f38; mul.rn.f32 %f59, %f59, %f47; mul.rn.f32 %f59, %f59, %f47;");
 
             if (variant == 3)
@@ -482,12 +482,12 @@ internal static partial class PtxVisionEmitter
                 EmitPositiveAtan(ptx, "%f15", "%f16", "%f49", 11);
                 ptx.AppendLine("    sub.rn.f32 %f50, %f48, %f49; mul.rn.f32 %f51, %f50, %f50;");
                 ptx.AppendLine($"    mul.rn.f32 %f51, %f51, {F(4f / (MathF.PI * MathF.PI))}; sub.rn.f32 %f52, {F(1f)}, %f29; add.rn.f32 %f52, %f52, %f51;");
-                ptx.AppendLine("    mov.f32 %f53, 0f00000000; setp.gt.f32 %p12, %f52, %f8; @%p12 rcp.approx.f32 %f53, %f52; mul.rn.f32 %f53, %f51, %f53;");
+                ptx.AppendLine("    mov.f32 %f53, 0f00000000; setp.gt.f32 %p12, %f52, %f8; @%p12 rcp.approx.ftz.f32 %f53, %f52; mul.rn.f32 %f53, %f51, %f53;");
                 ptx.AppendLine($"    neg.f32 %f54, %f53; mul.rn.f32 %f54, %f58, %f54; mul.rn.f32 %f55, %f54, %f50; mul.rn.f32 %f55, %f55, {F(8f / (MathF.PI * MathF.PI))};");
                 if (!ownerA) ptx.AppendLine("    neg.f32 %f55, %f55;");
                 ptx.AppendLine($"    mov.f32 %f56, {(ownerA ? "%f13" : "%f15")}; mov.f32 %f57, {(ownerA ? "%f14" : "%f16")};");
                 ptx.AppendLine("    mul.rn.f32 %f48, %f56, %f56; fma.rn.f32 %f48, %f57, %f57, %f48; setp.gt.f32 %p12, %f14, %f8; setp.gt.f32 %p13, %f16, %f8; and.pred %p12, %p12, %p13; setp.gt.f32 %p13, %f48, %f8; and.pred %p13, %p12, %p13;");
-                ptx.AppendLine("    mov.f32 %f52, 0f00000000; @%p13 rcp.approx.f32 %f52, %f48; mul.rn.f32 %f49, %f55, %f57; mul.rn.f32 %f50, %f49, %f52; neg.f32 %f49, %f56; mul.rn.f32 %f49, %f55, %f49; mul.rn.f32 %f51, %f49, %f52;");
+                ptx.AppendLine("    mov.f32 %f52, 0f00000000; @%p13 rcp.approx.ftz.f32 %f52, %f48; mul.rn.f32 %f49, %f55, %f57; mul.rn.f32 %f50, %f49, %f52; neg.f32 %f49, %f56; mul.rn.f32 %f49, %f55, %f49; mul.rn.f32 %f51, %f49, %f52;");
                 ptx.AppendLine($"    setp.gt.f32 %p14, {(ownerA ? "%f9" : "%f11")}, %f8; and.pred %p14, %p13, %p14; @%p14 sub.rn.f32 {x1Gradient}, {x1Gradient}, %f50; @%p14 add.rn.f32 {x2Gradient}, {x2Gradient}, %f50;");
                 ptx.AppendLine($"    setp.gt.f32 %p15, {(ownerA ? "%f10" : "%f12")}, %f8; and.pred %p15, %p13, %p15; @%p15 sub.rn.f32 {y1Gradient}, {y1Gradient}, %f51; @%p15 add.rn.f32 {y2Gradient}, {y2Gradient}, %f51;");
             }
@@ -512,7 +512,7 @@ internal static partial class PtxVisionEmitter
         }
 
         // IoU-proper reverse pass.
-        ptx.AppendLine("    mul.rn.f32 %f32, %f28, %f28; mov.f32 %f35, 0f00000000; @%p9 rcp.approx.f32 %f35, %f32; add.rn.f32 %f33, %f28, %f27; mul.rn.f32 %f34, %f58, %f33; fma.rn.f32 %f30, %f34, %f35, %f30;");
+        ptx.AppendLine("    mul.rn.f32 %f32, %f28, %f28; mov.f32 %f35, 0f00000000; @%p9 rcp.approx.ftz.f32 %f35, %f32; add.rn.f32 %f33, %f28, %f27; mul.rn.f32 %f34, %f58, %f33; fma.rn.f32 %f30, %f34, %f35, %f30;");
         ptx.AppendLine("    neg.f32 %f33, %f27; mul.rn.f32 %f34, %f58, %f33; fma.rn.f32 %f31, %f34, %f35, %f31;");
 
         ptx.AppendLine("    mul.rn.f32 %f32, %f30, %f26; mul.rn.f32 %f33, %f30, %f25; setp.gt.f32 %p3, %f23, %f8; setp.gt.f32 %p4, %f24, %f8; selp.f32 %f32, %f32, %f8, %p3; selp.f32 %f33, %f33, %f8, %p4; neg.f32 %f34, %f32; neg.f32 %f35, %f33;");

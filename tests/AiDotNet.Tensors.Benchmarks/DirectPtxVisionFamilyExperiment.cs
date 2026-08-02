@@ -21,6 +21,7 @@ internal static class DirectPtxVisionFamilyExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int Launches = 25;
+    private const int ThroughputOperationsPerGraph = 64;
 
     private readonly record struct Distribution(
         double Mean, double Median, double P95, double P99);
@@ -167,12 +168,38 @@ internal static class DirectPtxVisionFamilyExperiment
         WorkModel model = Model(spec, definition, pairedDefinition);
         IntPtr directGraph = backend.CaptureGraph(cell.LaunchDirect);
         IntPtr currentGraph = IntPtr.Zero;
+        IntPtr directThroughputGraph = IntPtr.Zero;
+        IntPtr currentThroughputGraph = IntPtr.Zero;
         try
         {
             currentGraph = backend.CaptureGraph(cell.LaunchCurrent);
             if (directGraph == IntPtr.Zero || currentGraph == IntPtr.Zero)
                 throw new InvalidOperationException(
                     $"Graph capture failed after prewarm for {spec.Operation}.");
+            directThroughputGraph = CaptureRepeatedGraph(
+                backend, cell.LaunchDirect, ThroughputOperationsPerGraph);
+            currentThroughputGraph = CaptureRepeatedGraph(
+                backend, cell.LaunchCurrent, ThroughputOperationsPerGraph);
+            if (directThroughputGraph == IntPtr.Zero || currentThroughputGraph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    $"Throughput graph capture failed after prewarm for {spec.Operation}.");
+            // Measure the host-gap-free diagnostic first. Raw single-launch and
+            // single-graph replay lanes can spend seconds waiting for a clean WDDM
+            // window; they must not contaminate the kernel-level diagnosis that
+            // tells the autotuner which implementation actually needs work.
+            StableTimer.PairResult throughputComparison = StableTimer.MeasureDevicePair(
+                backend,
+                () => backend.EnqueueCapturedGraph(directThroughputGraph),
+                () => backend.EnqueueCapturedGraph(currentThroughputGraph),
+                // Keep each ABBA bracket below the desktop compositor cadence.
+                // The 64-node graphs provide timer resolution without forcing
+                // every bracket to overlap a WDDM display preemption.
+                targetBatchMilliseconds: 0.5,
+                operationsPerLaunchA: ThroughputOperationsPerGraph,
+                operationsPerLaunchB: ThroughputOperationsPerGraph,
+                bracketsPerAttempt: 21);
+            PrintComparison(run, spec, pairedSpec is not null,
+                "kernel-throughput", throughputComparison);
             StableTimer.PairResult launchComparison = StableTimer.MeasureDevicePair(
                 backend, cell.LaunchDirect, cell.LaunchCurrent);
             PrintComparison(run, spec, pairedSpec is not null,
@@ -204,8 +231,19 @@ internal static class DirectPtxVisionFamilyExperiment
         {
             backend.DestroyCapturedGraph(directGraph);
             backend.DestroyCapturedGraph(currentGraph);
+            backend.DestroyCapturedGraph(directThroughputGraph);
+            backend.DestroyCapturedGraph(currentThroughputGraph);
         }
         return true;
+    }
+
+    private static IntPtr CaptureRepeatedGraph(
+        CudaBackend backend, Action launch, int operations)
+    {
+        return backend.CaptureGraph(() =>
+        {
+            for (int i = 0; i < operations; i++) launch();
+        });
     }
 
     private static void PrintComparison(
@@ -233,6 +271,8 @@ internal static class DirectPtxVisionFamilyExperiment
             direct_median_us = timing.A.Microseconds,
             incumbent_median_us = timing.B.Microseconds,
             incumbent_over_direct = incumbentOverDirect,
+            direct_relative_spread = timing.A.RelativeSpread,
+            incumbent_relative_spread = timing.B.RelativeSpread,
             paired_ratio_relative_spread = timing.RelativeSpread,
             required_gain = requiredGain,
             promotion_gain = promotionGain,
