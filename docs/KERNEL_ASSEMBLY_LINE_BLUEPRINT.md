@@ -398,7 +398,9 @@ The assembly line now exposes the complete schedule loop as one fail-closed comm
  -> otherwise Nsight counters + catalog-oracle diagnosis, then FAIL
 ```
 
-This is the reusable foundation behind the p13 13/13 catalog result. An ignored or stale
+This is the reusable foundation behind the historical p13 13/13 catalog result. Under p14,
+an unstable applicable promotable candidate makes the search incomplete instead of silently
+electing the modelled fallback, and material foreign host CPU load refuses the suite. An ignored or stale
 autotune cache can no longer make the championship command benchmark the modelled fallback,
 and a partial competitor table cannot be mistaken for a complete pass. The cache path is
 propagated to every fresh child process, while the existing device, target, semantic-spec,

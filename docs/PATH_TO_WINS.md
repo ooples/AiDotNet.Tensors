@@ -1,13 +1,19 @@
 # Path to wins: every kernel, every competitor
 
-## Current status: the p13 catalog is closed
+## Current status: p14 revalidation required
 
 The historical p4 and p9 investigation below is preserved, including predictions that
 hardware falsified. The completed p13 loop used those limiter findings to search the shared
 contraction, tiled-Conv2D, Winograd, cooperative-reduction, split-K, and parity families. A
-fresh consolidated run on the RTX 3080 produced **13 stable wins, zero ties, zero losses,
+consolidated run on the RTX 3080 produced **13 stable wins, zero ties, zero losses,
 and zero refused rows** against PyTorch 2.12.1/cuDNN 9.2 with true FP32 CUDA-graph replay.
 All 13 selected programs first passed the generated fp64 oracle.
+
+Protocol p14 invalidates that result for current promotion: p13 could publish the modelled
+fallback after an applicable promotable candidate failed to stabilize. p14 requires every
+such candidate to produce stable evidence and rejects material foreign host CPU load before
+and after the suite. The p13 table remains historical evidence, but no current catalog closure
+is claimed until a clean p14 championship reproduces 13/13.
 
 `--kernel-championship` now performs that complete loop for any catalog selector: exhaustive
 measured autotune, fp64 verification, competitor measurement, then Nsight + catalog-oracle
