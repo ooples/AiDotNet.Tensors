@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
+    internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
 
@@ -36,6 +37,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
+    private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
@@ -55,6 +57,14 @@ internal static class DirectPtxFeatureGate
         get => _fusedLinearExperimentOverride;
         set => _fusedLinearExperimentOverride = value;
     }
+    /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
+    internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
+    internal static bool QuantizedLinearExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
+    internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
+    internal static bool ConvolutionExperimentOverride { get; set; }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -84,6 +94,8 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFusedLinearEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFusedLinearEnabled);
+    internal static bool IsConvolutionEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
 
     internal static bool IsAutotuneEnabled => EnvironmentAutotuneEnabled;
 
@@ -101,6 +113,7 @@ internal static class DirectPtxFeatureGate
 
 internal enum DirectPtxPhysicalType
 {
+    Int8,
     Float16,
     BFloat16,
     Float32,
@@ -115,6 +128,8 @@ internal enum DirectPtxPhysicalLayout
     RowMajor2D,
     /// <summary>Dense row-major [batch, row, feature].</summary>
     RowMajor3D,
+    /// <summary>Dense canonical [batch, channel, spatial] (NCHW-flattened).</summary>
+    Nchw,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -132,7 +147,9 @@ internal enum DirectPtxPhysicalLayout
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>
-    PagedKv
+    PagedKv,
+    /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
+    Oihw
 }
 
 /// <summary>

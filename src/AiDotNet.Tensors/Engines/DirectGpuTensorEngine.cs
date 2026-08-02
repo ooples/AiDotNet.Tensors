@@ -7356,6 +7356,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841 golden slice: the direct PTX path owns the complete
+            // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
+            // Every other shape/semantic contract continues through the
+            // established convolution, bias, and activation kernels below.
+            //
+            // Promoted register-blocked specialization first: for the ResNet c64
+            // 1x1 contract it beats cuDNN's best ~1.60x on SM86. It fails closed on
+            // any other contract, falling through to the v1 golden slice and then
+            // the established path.
+            if (typeof(T) == typeof(float) && bias is { } rbBias &&
+                activation == FusedActivationType.ReLU &&
+                kernelH == 1 && kernelW == 1 && strideH == 1 && strideW == 1 &&
+                padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1 &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend rbCuda &&
+                rbCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var rbBiasBuffer = GetWeightBufferPreferResident(
+                    backend, rbBias, PersistentTensorRole.Biases);
+                if (rbCuda.TryDirectPtxRegBlockedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, rbBiasBuffer.Buffer,
+                    outputBuffer.Buffer, batch, inChannels, inHeight, inWidth, outChannels))
+                {
+                    var rbResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(rbResult, outputBuffer.Buffer, backend);
+                    return rbResult;
+                }
+            }
+            if (typeof(T) == typeof(float) && bias is { } directBias &&
+                activation == FusedActivationType.ReLU &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var directBiasBuffer = GetWeightBufferPreferResident(
+                    backend, directBias, PersistentTensorRole.Biases);
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, dilationH, dilationW);
+                if (directCuda.TryDirectPtxFusedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, directBiasBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+
             // Execute GPU convolution
             backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
@@ -11612,8 +11671,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
-            int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
-            if (center) outputLength -= nFft;
+            // An explicitly requested length is honoured VERBATIM; the centre-padding trim applies only
+            // to the length this method INFERS. Previously the `-= nFft` ran unconditionally, so
+            // ISTFT(..., center: true, length: 514) with nFft=512 returned TWO samples — the same
+            // defect fixed in CpuEngine.ISTFT earlier in this branch, still live here. Measured by
+            // TimeStretchStageDiffTests.Stage3_Istft_CpuMatchesGpu: cpu=514, gpu=2.
+            int outputLength;
+            if (length.HasValue)
+            {
+                outputLength = length.Value;
+            }
+            else
+            {
+                outputLength = (numFrames - 1) * hopLength + nFft;
+                if (center) outputLength -= nFft;
+            }
             int totalOutput = batch * outputLength;
 
             using var magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
@@ -11667,7 +11739,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             ((IEngine)this).STFT(input, nFft, hopLength, window, center: true,
                 out var magnitude, out var phase);
-            _ = phase;
+            // `phase` is retained (it used to be discarded via `_ = phase`) because
+            // MelSpectrogramBackward needs it to rebuild the complex spectrum when propagating the
+            // gradient back through |STFT|.
+            bool tapeActive = IsTapeActive<T>();
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
@@ -11690,8 +11765,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             framesMajorShape[^2] = numFrames;
             framesMajorShape[^1] = nMels;
             Tensor<T> framesMajorResult;
+            // MelSpectrogramBackward needs the PRE-dB mel, element-aligned with the OUTPUT, to
+            // differentiate the log. Snapshot it while melBuffer is still alive, permuted the same
+            // way the result is, and force the deferred download now because melBuffer is disposed at
+            // scope exit. Gated on an active tape so inference pays nothing for it.
+            Tensor<T>? linearMel = null;
             if (powerToDb)
             {
+                if (tapeActive)
+                {
+                    var linearFramesMajor = DeferTensorResult<T>(
+                        backend, melBuffer.Buffer, melLength, (int[])framesMajorShape.Clone());
+                    linearMel = PermuteResidentGpu(backend, linearFramesMajor, swapLastTwo);
+                    _ = linearMel.GetDataArray();
+                }
                 using var dbBuffer = AllocateOutputBuffer(backend, melLength);
                 backend.PowerToDb(melBuffer.Buffer, dbBuffer.Buffer, melLength, 1f, -80f);
                 backend.Synchronize();
@@ -11705,7 +11792,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 melBuffer.RelinquishOwnership();
             }
 
-            return PermuteResidentGpu(backend, framesMajorResult, swapLastTwo);
+            var melResult = PermuteResidentGpu(backend, framesMajorResult, swapLastTwo);
+
+            // Without powerToDb the output IS the linear mel, so no snapshot is needed.
+            if (!powerToDb) linearMel = melResult;
+
+            // Tape registration. This override recorded NOTHING, so a GPU MelSpectrogram produced no
+            // gradient at all while CpuEngine's produced one — mel-based objectives (vocoder / TTS)
+            // silently lost their gradient whenever the GPU path won. Same savedState contract as
+            // CpuEngine.MelSpectrogram.
+            if (tapeActive)
+            {
+                Autodiff.DifferentiableOps.RecordUnary(
+                    "MelSpectrogram", melResult, input,
+                    Autodiff.BackwardFunctions<T>.MelSpectrogramBackward,
+                    new object[]
+                    {
+                        nFft, hopLength, window, phase, input._shape[^1],
+                        magnitude, filterbank, nMels, powerToDb, linearMel!,
+                    });
+            }
+            return melResult;
         }
         catch
         {
@@ -19892,9 +19999,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGrid = GetOrAllocateBuffer(backend, grid);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
-            // Match CpuEngine.GridSample (2-arg): align_corners=True + border/clamp padding.
+            // torchvision defaults, matching the corrected CpuEngine narrow forward:
+            // paddingMode 0 == zeros (the kernels treat 1 as border and anything else as zeros),
+            // alignCorners false. This previously passed border + alignCorners:true, which matched
+            // the old (size-1)/2 CPU mapping; the OpParity oracle scored that ~1e9 ULP off while the
+            // corrected CPU sits at 6-71 ULP. The kernels themselves are already general — both
+            // conventions are runtime branches inside them.
             backend.GridSample(bufIn.Buffer, bufGrid.Buffer, bufOut.Buffer,
-                batch, channels, inH, inW, outH, outW, paddingMode: 1, alignCorners: true);
+                batch, channels, inH, inW, outH, outW, paddingMode: 0, alignCorners: false);
             return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
         }
@@ -23381,6 +23493,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
+        // The compiled graph must retain StopGradient as a forward dependency.
+        // Bypassing CpuEngine here would eagerly snapshot a lazy input and replay
+        // stale data, so let the base implementation record the no-backward node.
+        if (Compilation.GraphMode.IsActive) return base.StopGradient(tensor);
+
         try
         {
             if (TryGetBackend(out var backend))

@@ -1,5 +1,7 @@
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -106,5 +108,115 @@ public class ReshapeGradientTests
             "Weight gradient must exist after reshape+matmul");
         Assert.True(grads.ContainsKey(input),
             "Input gradient must flow through reshape");
+    }
+
+    [Fact]
+    public void MetadataViewChain_ExpandSqueezeAndPermute_PropagatesGradient()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 2f, 3f }, new[] { 1, 2 });
+
+        using var tape = new GradientTape<float>();
+        var expanded = parameter.ExpandDims(0);       // [1,1,2]
+        var squeezed = expanded.Squeeze(0);          // [1,2]
+        var permuted = squeezed.Transpose(new[] { 1, 0 }); // [2,1]
+        var loss = engine.ReduceSum(permuted, null);
+
+        Assert.NotNull(expanded.GradFn);
+        Assert.NotNull(squeezed.GradFn);
+        Assert.NotNull(permuted.GradFn);
+
+        var gradients = tape.ComputeGradients(loss);
+
+        Assert.True(gradients.ContainsKey(parameter));
+        Assert.Equal(new[] { 1f, 1f }, gradients[parameter].ToArray());
+    }
+
+    [Fact]
+    public void SubTensorViewChain_ScattersGradientToFixedLeadingIndices()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f },
+            new[] { 2, 2, 2 });
+
+        using var tape = new GradientTape<float>();
+        var selected = parameter.SubTensor(1, 0);
+        var loss = engine.ReduceSum(selected, null);
+        var gradients = tape.ComputeGradients(loss);
+
+        Assert.Equal(
+            new[] { 0f, 0f, 0f, 0f, 1f, 1f, 0f, 0f },
+            gradients[parameter].ToArray());
+    }
+
+    [Fact]
+    public void NarrowView_ScattersGradientToSelectedRange()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+            new[] { 2, 3 });
+
+        using var tape = new GradientTape<float>();
+        var selected = parameter.Slice(axis: 1, start: 1, end: 3);
+        var loss = engine.ReduceSum(selected, null);
+        var gradients = tape.ComputeGradients(loss);
+
+        Assert.Equal(
+            new[] { 0f, 1f, 1f, 0f, 1f, 1f },
+            gradients[parameter].ToArray());
+    }
+
+    [Fact]
+    public void NonContiguousReshape_RecordsMaterializationAndViewAsDistinctEdges()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 2, 3 });
+
+        using var tape = new GradientTape<float>();
+        var transposed = parameter.Transpose();
+        var reshaped = transposed.Reshape(6);
+        var loss = engine.ReduceSum(reshaped, null);
+
+        var reshapeNode = Assert.IsType<GradNode<float>>(reshaped.GradFn);
+        var materialized = Assert.IsType<Tensor<float>>(reshapeNode.Input0);
+        Assert.NotSame(transposed, materialized);
+        Assert.Same(transposed, Assert.IsType<GradNode<float>>(materialized.GradFn).Input0);
+
+        var gradients = tape.ComputeGradients(loss);
+        Assert.Equal(new[] { 1f, 1f, 1f, 1f, 1f, 1f }, gradients[parameter].ToArray());
+    }
+
+    [Fact]
+    public void NonContiguousReshape_CompiledReplayPreservesGradientChain()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(
+            new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 2, 3 });
+        var parameters = new[] { parameter };
+
+        using var scope = GraphMode.EnableTraining(parameters);
+        var reshaped = parameter.Transpose().Reshape(6);
+        var loss = engine.ReduceSum(engine.TensorMultiply(reshaped, reshaped), null);
+        using var plan = scope.CompileTraining(parameters, loss);
+        plan.ConfigureOptimizer(OptimizerType.SGD, 0.01f, 0.9f, 0.999f, 1e-8f, 0f);
+
+        plan.Step();
+
+        var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+        Assert.Equal(new[] { 2f, 4f, 6f, 8f, 10f, 12f }, compiled.Gradients[0].ToArray());
+    }
+
+    [Fact]
+    public void SubTensor_InvalidLaterIndex_DoesNotConstructPartialViews()
+    {
+        var tensor = new Tensor<float>(new float[8], new[] { 2, 2, 2 });
+        int refCountBefore = tensor._storage.RefCount;
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => tensor.SubTensor(1, 2));
+
+        Assert.Equal(refCountBefore, tensor._storage.RefCount);
     }
 }

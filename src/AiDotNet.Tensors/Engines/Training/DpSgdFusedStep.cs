@@ -145,7 +145,7 @@ public sealed class DpSgdFusedStep<T> : IDisposable
             {
                 CopySlotData(firstExample);
                 using var arenaSuspend = TensorArena.Suspend();
-                using var scope = GraphMode.Enable();
+                using var scope = GraphMode.EnableTraining(_cachedParameters);
                 var pred = forward(_persistentSlots);
                 var loss = computeLoss(pred, _persistentSlots);
                 _plan = scope.CompileTraining(_cachedParameters, loss);

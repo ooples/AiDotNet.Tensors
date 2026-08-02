@@ -52,6 +52,40 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasValidatedFusedLinear(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The mixed-precision (FP16 / W8A8) fused-linear decode specializations are
+    /// measured and promoted only on GA10x/SM86. Other Ampere variants (SM80,
+    /// SM87) are independent tuning domains and must supply and benchmark their
+    /// own specialization rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedMixedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The fused residual + bias + LayerNorm + GELU decode specialization is
+    /// measured and promoted only on GA10x/SM86. Other Ampere variants (SM80,
+    /// SM87) are independent tuning domains and must supply and benchmark their
+    /// own specialization rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The quantized (W8A8) decode-linear specialization is measured only on
+    /// GA102/SM86, matching the other fused-linear predicates. Admitting the
+    /// whole Ampere family would run PTX that was never validated on SM80/SM87.
+    /// </summary>
+    internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// Issue #841's first convolution emitter deliberately targets one exact
+    /// GA102/SM86 tuning domain. It remains experimental until GPU evidence is
+    /// attached; other SMs must use the established backend.
+    /// </summary>
+    internal static bool HasExperimentalConvolution(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
@@ -156,6 +190,7 @@ internal readonly record struct DirectPtxTensorContract
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
     internal int ElementBytes => PhysicalType switch
     {
+        DirectPtxPhysicalType.Int8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
@@ -303,7 +338,7 @@ internal sealed record DirectPtxProfilerEvidence(
                 {
                     if (column >= data.Length || !TryParseCounter(data[column], out long value)) continue;
                     string metric = header[column].Trim();
-                    values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                    values[metric] = checked(PtxCompat.GetValueOrDefault(values, metric) + value);
                 }
                 nextHeader++;
             }
@@ -320,7 +355,7 @@ internal sealed record DirectPtxProfilerEvidence(
                 {
                     if (TryParseCounter(cells[valueIndex], out long value))
                     {
-                        values[metric] = checked(values.GetValueOrDefault(metric) + value);
+                        values[metric] = checked(PtxCompat.GetValueOrDefault(values, metric) + value);
                         break;
                     }
                 }

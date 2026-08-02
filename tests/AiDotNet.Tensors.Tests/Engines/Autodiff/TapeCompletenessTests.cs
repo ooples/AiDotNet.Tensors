@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
@@ -7,9 +9,15 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 /// <summary>
-/// Reflection-based test ensuring every IEngine Tensor-returning method is classified
+/// Reflection-based tests ensuring every IEngine method that produces a tensor is classified
 /// in OpRegistry. Fails CI when a new method is added without classification.
 /// </summary>
+/// <remarks>
+/// A method can produce a tensor two ways: by RETURNING one, or by emitting one through an
+/// <c>out</c>/<c>ref</c> parameter. Both are covered — historically only the first was, which let
+/// STFT, FFT, IFFT, FFT2D, IFFT2D, FFTND, GroupNormInto and ProjectGaussians3DTo2D sit in no
+/// registry set at all.
+/// </remarks>
 public class TapeCompletenessTests
 {
     [Fact]
@@ -101,5 +109,51 @@ public class TapeCompletenessTests
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Companion to <see cref="AllTensorReturningMethods_AreClassified"/> for ops that emit their
+    /// tensors through <c>out</c>/<c>ref</c> parameters instead of returning them.
+    /// </summary>
+    /// <remarks>
+    /// Without this, such an op can silently record nothing on the tape and no test notices —
+    /// which is how STFT, FFT, IFFT, FFT2D, IFFT2D, FFTND, GroupNormInto and
+    /// ProjectGaussians3DTo2D all ended up unclassified.
+    /// </remarks>
+    [Fact]
+    public void AllTensorOutParameterMethods_AreClassified()
+    {
+        var methods = typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance);
+        var unclassified = new List<string>();
+
+        foreach (var method in methods)
+        {
+            if (method.IsSpecialName)
+                continue;
+
+            bool emitsTensorByRef = method.GetParameters().Any(p =>
+                (p.IsOut || p.ParameterType.IsByRef) && ReturnsTensor(
+                    p.ParameterType.IsByRef ? p.ParameterType.GetElementType()! : p.ParameterType));
+
+            if (!emitsTensorByRef)
+                continue;
+
+            var name = method.Name;
+            if (name.Contains('`'))
+                name = name.Substring(0, name.IndexOf('`'));
+
+            if (!OpRegistry.IsClassified(name))
+                unclassified.Add($"  - {name}");
+        }
+
+        if (unclassified.Count > 0)
+        {
+            var message =
+                $"The following {unclassified.Distinct().Count()} IEngine method(s) emit a Tensor through an " +
+                "out/ref parameter but are not classified in OpRegistry.\n" +
+                "Add each to DifferentiableOps, NonDifferentiableOps, or DelegatorOps:\n" +
+                string.Join("\n", unclassified.Distinct());
+            Assert.Fail(message);
+        }
     }
 }

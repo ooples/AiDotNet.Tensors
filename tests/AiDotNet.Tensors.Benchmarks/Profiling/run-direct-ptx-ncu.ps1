@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'dense-linear')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'dense-linear', 'convolution')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -29,6 +29,7 @@ $switch = switch ($Target) {
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'fused-linear' { '--direct-ptx-profile-fused-linear' }
     'dense-linear' { '--direct-ptx-profile-dense-linear' }
+    'convolution' { '--direct-ptx-profile-convolution' }
 }
 $kernel = switch ($Target) {
     'attention' { 'regex:aidotnet_online_attention_128x64' }
@@ -40,6 +41,7 @@ $kernel = switch ($Target) {
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
     'dense-linear' { 'regex:aidotnet_(fused_linear_gelu_m1|fused_linear_tiled|fused_linear_gelu_fp16_m16|fp16_gemm|fused_lora_forward|fused_linear_ce_index|fused_linear_backward|dense_(dot|outer)|batched_dot|strided_dot)' }
+    'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
@@ -51,6 +53,7 @@ $expectedLaunches = switch ($Target) {
     'qkv-rope-cache' { 3 }
     'fused-linear' { 10 }
     'dense-linear' { 16 }
+    'convolution' { 1 }
 }
 $metricNames = @(
     'sass__inst_executed_register_spilling',

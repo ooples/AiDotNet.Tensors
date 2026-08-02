@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -64,12 +65,8 @@ internal static class DirectPtxCubinArtifactCache
     private static readonly object Sync = new();
     [ThreadStatic]
     private static int _freshCompileScopeDepth;
-    private static readonly Lazy<IReadOnlyDictionary<string, EmbeddedManifestEntry>>
-        EmbeddedManifest = new(ReadEmbeddedManifest);
-
-    private sealed record EmbeddedManifestEntry(
-        string CubinSha256,
-        string LinkerLogSha256);
+    private static readonly Lazy<IReadOnlyDictionary<string, EmbeddedArtifact>> EmbeddedArtifacts =
+        new(ReadEmbeddedArtifacts);
 
     internal static DirectPtxCubinArtifact Resolve(DirectPtxRuntime runtime, string ptx)
     {
@@ -83,7 +80,8 @@ internal static class DirectPtxCubinArtifactCache
         {
             if (_freshCompileScopeDepth != 0)
                 return Compile(runtime, ptx, sourceKey, cachePath: null);
-            DirectPtxCubinArtifact? embedded = TryReadEmbedded(runtime, sourceKey);
+            DirectPtxCubinArtifact? embedded = TryReadEmbedded(
+                runtime, sourceKey, ComputePtxSha256(ptx));
             if (embedded != null)
                 return embedded;
 
@@ -180,114 +178,193 @@ internal static class DirectPtxCubinArtifactCache
     }
 
     private static DirectPtxCubinArtifact? TryReadEmbedded(
-        DirectPtxRuntime runtime, string sourceKey)
+        DirectPtxRuntime runtime, string sourceKey, string ptxSha256)
     {
-        string suffix = ".Artifacts.sm" +
+        string architecture = "sm" +
             runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + "." +
-            sourceKey + ".cubin";
-        Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
-        string? resourceName = null;
-        foreach (string candidate in assembly.GetManifestResourceNames())
-        {
-            if (candidate.EndsWith(suffix, StringComparison.Ordinal))
-            {
-                resourceName = candidate;
-                break;
-            }
-        }
-        if (resourceName == null)
+            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture);
+        string sourceIdentity = architecture + "|source|" + sourceKey;
+        string ptxIdentity = architecture + "|ptx|" + ptxSha256;
+        if (!EmbeddedArtifacts.Value.TryGetValue(sourceIdentity, out EmbeddedArtifact? artifact) &&
+            !EmbeddedArtifacts.Value.TryGetValue(ptxIdentity, out artifact))
             return null;
 
-        using Stream? stream = assembly.GetManifestResourceStream(resourceName);
+        Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
+        using Stream? stream = assembly.GetManifestResourceStream(artifact.ResourceName);
         if (stream == null)
             throw new InvalidDataException(
-                "The embedded direct-PTX cubin resource could not be opened: " + resourceName);
+                "The embedded direct-PTX cubin resource could not be opened: " + artifact.ResourceName);
         using var memory = new MemoryStream();
         stream.CopyTo(memory);
         byte[] image = memory.ToArray();
-        ValidateCubin(image, "embedded resource " + resourceName);
+        ValidateCubin(image, "embedded resource " + artifact.ResourceName);
         string cubinHash = Sha256(image);
-        string manifestKey = "sm" +
-            runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + "|" + sourceKey;
-        if (!EmbeddedManifest.Value.TryGetValue(
-                manifestKey, out EmbeddedManifestEntry? manifest) ||
-            !string.Equals(
-                manifest.CubinSha256, cubinHash, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(artifact.CubinSha256, cubinHash, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException(
-                "Embedded direct-PTX cubin failed its release-manifest hash: " + resourceName);
-        string linkerResourceName = resourceName.Substring(
-            0, resourceName.Length - ".cubin".Length) + ".linker.txt";
-        using Stream? linkerStream = assembly.GetManifestResourceStream(linkerResourceName);
-        if (linkerStream == null)
-            throw new InvalidDataException(
-                "Embedded direct-PTX cubin is missing its linker-log sidecar: " + resourceName);
-        using var linkerMemory = new MemoryStream();
-        linkerStream.CopyTo(linkerMemory);
-        byte[] linkerBytes = linkerMemory.ToArray();
-        if (!string.Equals(
-                manifest.LinkerLogSha256, Sha256(linkerBytes),
-                StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException(
-                "Embedded direct-PTX linker log failed its release-manifest hash: " +
-                linkerResourceName);
+                "Embedded direct-PTX cubin failed its release-manifest hash: " + artifact.ResourceName);
+        string compilerLog = "precompiled package cubin";
+        if (artifact.LinkerLogSha256 != null)
+        {
+            if (artifact.LinkerResourceName == null)
+                throw new InvalidDataException(
+                    "Embedded direct-PTX cubin is missing its linker-log sidecar: " +
+                    artifact.ResourceName);
+            using Stream? linkerStream = assembly.GetManifestResourceStream(
+                artifact.LinkerResourceName);
+            if (linkerStream == null)
+                throw new InvalidDataException(
+                    "The embedded direct-PTX linker-log resource could not be opened: " +
+                    artifact.LinkerResourceName);
+            using var linkerMemory = new MemoryStream();
+            linkerStream.CopyTo(linkerMemory);
+            byte[] linkerBytes = linkerMemory.ToArray();
+            if (!string.Equals(
+                    artifact.LinkerLogSha256, Sha256(linkerBytes),
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException(
+                    "Embedded direct-PTX linker log failed its release-manifest hash: " +
+                    artifact.LinkerResourceName);
+            compilerLog = Encoding.UTF8.GetString(linkerBytes);
+        }
         return new DirectPtxCubinArtifact(
             image, sourceKey, cubinHash, DirectPtxModuleImageKind.EmbeddedCubin,
-            resourceName, Encoding.UTF8.GetString(linkerBytes));
+            artifact.ResourceName, compilerLog);
     }
 
-    private static IReadOnlyDictionary<string, EmbeddedManifestEntry>
-        ReadEmbeddedManifest()
+    private static IReadOnlyDictionary<string, EmbeddedArtifact> ReadEmbeddedArtifacts()
     {
-        var result = new Dictionary<string, EmbeddedManifestEntry>(StringComparer.Ordinal);
+        var result = new Dictionary<string, EmbeddedArtifact>(StringComparer.Ordinal);
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
         foreach (string resourceName in assembly.GetManifestResourceNames())
         {
-            const string suffix = "-cubins.tsv";
-            if (!resourceName.EndsWith(suffix, StringComparison.Ordinal))
+            if (!resourceName.EndsWith(".tsv", StringComparison.Ordinal) ||
+                resourceName.IndexOf(".Artifacts.sm", StringComparison.Ordinal) < 0)
                 continue;
-            string marker = ".Artifacts.sm";
+
+            const string marker = ".Artifacts.";
             int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
-            if (markerIndex < 0)
-                continue;
             int architectureStart = markerIndex + marker.Length;
             int architectureEnd = resourceName.IndexOf('.', architectureStart);
-            if (architectureEnd <= architectureStart)
+            if (markerIndex < 0 || architectureEnd <= architectureStart)
                 continue;
-            string architecture = "sm" + resourceName.Substring(
+            string architecture = resourceName.Substring(
                 architectureStart, architectureEnd - architectureStart);
+            if (!architecture.StartsWith("sm", StringComparison.Ordinal))
+                continue;
+
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
             if (stream == null)
-                continue;
+                throw new InvalidDataException(
+                    "The embedded direct-PTX manifest could not be opened: " + resourceName);
             using var reader = new StreamReader(stream, Encoding.UTF8, true, 1024, leaveOpen: false);
+            string[]? header = null;
+            int ptxIndex = -1;
+            int sourceIndex = -1;
+            int cubinIndex = -1;
+            int fileIndex = -1;
+            int linkerLogIndex = -1;
             string? line;
             while ((line = reader.ReadLine()) != null)
             {
-                if (line.Length == 0 || line[0] == '#' || line.StartsWith("blueprint-id", StringComparison.Ordinal))
+                if (line.Length == 0 || line[0] == '#')
                     continue;
+                if (header == null)
+                {
+                    header = line.Split('\t');
+                    ptxIndex = Array.IndexOf(header, "ptx-sha256");
+                    sourceIndex = Array.IndexOf(header, "source-key");
+                    cubinIndex = Array.IndexOf(header, "cubin-sha256");
+                    fileIndex = Array.IndexOf(header, "file");
+                    linkerLogIndex = Array.IndexOf(header, "linker-log-sha256");
+                    // Artifact directories can also contain non-manifest TSV
+                    // evidence. Only a table with the release-manifest identity
+                    // columns participates in executable resolution.
+                    if (ptxIndex < 0 || cubinIndex < 0 || fileIndex < 0)
+                        break;
+                    continue;
+                }
+
                 string[] columns = line.Split('\t');
-                if (columns.Length != 6)
+                if (columns.Length <= Math.Max(fileIndex, Math.Max(ptxIndex, cubinIndex)))
                     throw new InvalidDataException(
-                        "Malformed embedded direct-PTX cubin manifest row in " +
-                        resourceName + ": " + line);
-                string key = architecture + "|" + columns[2];
-                var entry = new EmbeddedManifestEntry(columns[3], columns[5]);
-                if (result.TryGetValue(
-                        key, out EmbeddedManifestEntry? existing) &&
-                    (!string.Equals(
-                        existing.CubinSha256, entry.CubinSha256,
-                        StringComparison.OrdinalIgnoreCase) ||
-                     !string.Equals(
-                        existing.LinkerLogSha256, entry.LinkerLogSha256,
-                        StringComparison.OrdinalIgnoreCase)))
+                        "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
+
+                string? cubinResource = FindEmbeddedArtifactResource(
+                    assembly, architecture, columns[fileIndex]);
+                if (cubinResource == null)
                     throw new InvalidDataException(
-                        "Conflicting embedded direct-PTX cubin manifests for " + key + ".");
-                result[key] = entry;
+                        "Embedded direct-PTX manifest references a missing cubin: " +
+                        resourceName + " -> " + columns[fileIndex]);
+                string? linkerLogHash = null;
+                string? linkerResource = null;
+                if (linkerLogIndex >= 0)
+                {
+                    if (linkerLogIndex >= columns.Length ||
+                        string.IsNullOrWhiteSpace(columns[linkerLogIndex]) ||
+                        !columns[fileIndex].EndsWith(".cubin", StringComparison.Ordinal))
+                        throw new InvalidDataException(
+                            "Malformed embedded direct-PTX linker-log manifest row in " +
+                            resourceName + ": " + line);
+                    linkerLogHash = columns[linkerLogIndex];
+                    string linkerFile = columns[fileIndex].Substring(
+                        0, columns[fileIndex].Length - ".cubin".Length) + ".linker.txt";
+                    linkerResource = FindEmbeddedArtifactResource(
+                        assembly, architecture, linkerFile);
+                    if (linkerResource == null)
+                        throw new InvalidDataException(
+                            "Embedded direct-PTX manifest references a missing linker-log sidecar: " +
+                            resourceName + " -> " + linkerFile);
+                }
+                var artifact = new EmbeddedArtifact(
+                    columns[cubinIndex], cubinResource, linkerLogHash, linkerResource);
+                AddEmbeddedArtifact(result, architecture + "|ptx|" + columns[ptxIndex], artifact);
+                if (sourceIndex >= 0 && sourceIndex < columns.Length &&
+                    !string.IsNullOrWhiteSpace(columns[sourceIndex]))
+                    AddEmbeddedArtifact(
+                        result, architecture + "|source|" + columns[sourceIndex], artifact);
             }
         }
         return result;
     }
+
+    private static string? FindEmbeddedArtifactResource(
+        Assembly assembly, string architecture, string fileName)
+    {
+        string architectureMarker = ".Artifacts." + architecture + ".";
+        string suffix = "." + fileName;
+        foreach (string candidate in assembly.GetManifestResourceNames()
+                     .OrderBy(name => name, StringComparer.Ordinal))
+        {
+            if (candidate.IndexOf(architectureMarker, StringComparison.Ordinal) >= 0 &&
+                candidate.EndsWith(suffix, StringComparison.Ordinal))
+                return candidate;
+        }
+        return null;
+    }
+
+    private static void AddEmbeddedArtifact(
+        IDictionary<string, EmbeddedArtifact> artifacts,
+        string identity,
+        EmbeddedArtifact artifact)
+    {
+        if (artifacts.TryGetValue(identity, out EmbeddedArtifact? existing))
+        {
+            if (!string.Equals(existing.CubinSha256, artifact.CubinSha256,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(existing.LinkerLogSha256, artifact.LinkerLogSha256,
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException(
+                    "Embedded direct-PTX manifests disagree for identity " + identity + ".");
+            return;
+        }
+        artifacts.Add(identity, artifact);
+    }
+
+    private sealed record EmbeddedArtifact(
+        string CubinSha256,
+        string ResourceName,
+        string? LinkerLogSha256,
+        string? LinkerResourceName);
 
     private static DirectPtxCubinArtifact? TryReadDisk(
         DirectPtxRuntime runtime,
