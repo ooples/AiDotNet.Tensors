@@ -56,6 +56,34 @@ public class DirectPtxMseLossTests
     }
 
     [Fact]
+    public void LossOfflinePackage_CoversEveryReleaseModule()
+    {
+        foreach ((int rows, int columns) in new[]
+                 { (256, 128), (2048, 64), (2048, 128), (8192, 128) })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedMseLossF32Kernel.EmitPtx(8, 6, rows, columns), 8, 6));
+        }
+
+        foreach (int size in new[] { 65_536, 262_144, 1_048_576, 4_194_304 })
+        foreach (DirectPtxLossBackwardOp op in new[]
+                 {
+                     DirectPtxLossBackwardOp.MeanSquaredError,
+                     DirectPtxLossBackwardOp.MeanAbsoluteError,
+                 })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, size), 8, 6));
+        }
+
+        Assert.Contains(
+            typeof(PtxFusedMseLossF32Kernel).Assembly.GetManifestResourceNames(),
+            name => name.EndsWith(
+                ".sm86.loss.loss-cubins.tsv",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void LossCoverageManifest_AssignsEveryCellExactlyOnce()
     {
         Assert.NotEmpty(DirectPtxLossCoverageManifest.All);

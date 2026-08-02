@@ -28,7 +28,8 @@ internal static class DirectPtxLossCubinTool
             yield return new DirectPtxModuleSource(
                 $"mse-loss-f32-v1-r{rows}-c{columns}",
                 PtxFusedMseLossF32Kernel.EntryPoint,
-                PtxFusedMseLossF32Kernel.EmitPtx(8, 6, rows, columns));
+                PtxFusedMseLossF32Kernel.EmitPtx(8, 6, rows, columns),
+                PtxFusedMseLossF32Kernel.DefaultBlockThreads);
         }
 
         // The two gradient operators have different launch ABIs - MSE takes a
@@ -46,7 +47,8 @@ internal static class DirectPtxLossCubinTool
                 yield return new DirectPtxModuleSource(
                     $"loss-backward-{op}-f32-v1-n{size}",
                     PtxFusedLossBackwardF32Kernel.EntryPointFor(op),
-                    PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, size));
+                    PtxFusedLossBackwardF32Kernel.EmitPtx(8, 6, op, size),
+                    PtxFusedLossBackwardF32Kernel.DefaultBlockThreads);
             }
         }
     }

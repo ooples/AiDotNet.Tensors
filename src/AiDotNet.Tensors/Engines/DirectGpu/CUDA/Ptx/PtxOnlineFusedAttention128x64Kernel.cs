@@ -40,6 +40,9 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
     internal bool EmitSoftmaxStats { get; }
     internal float Scale { get; }
     internal float Epsilon { get; }
+
+    /// <summary>The register the epsilon launch parameter is loaded into.</summary>
+    private const string EpsilonRegister = "%eps";
     internal string Ptx { get; }
     internal DirectPtxFunctionInfo FunctionInfo { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
@@ -263,7 +266,8 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         IntPtr b = beta.Pointer;
         IntPtr o = output.Pointer;
         IntPtr s = EmitSoftmaxStats ? softmaxStats.Pointer : IntPtr.Zero;
-        void** args = stackalloc void*[7];
+        float epsilon = Epsilon;
+        void** args = stackalloc void*[8];
         args[0] = &q;
         args[1] = &k;
         args[2] = &v;
@@ -271,6 +275,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         args[4] = &b;
         args[5] = &o;
         args[6] = &s;
+        args[7] = &epsilon;
 
         _module.Launch(
             _function,
@@ -356,7 +361,6 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         int warps = selectedWarpsPerBlock;
         string target = $"sm_{ccMajor}{ccMinor}";
         string scaleHex = FloatLiteral(scale);
-        string epsilonHex = FloatLiteral(epsilon);
         const string log2E = "0f3FB8AA3B";
         const string ln2 = "0f3F317218";
         const string inv64 = "0f3C800000";
@@ -383,7 +387,12 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         ptx.AppendLine("    .param .u64 gamma_ptr,");
         ptx.AppendLine("    .param .u64 beta_ptr,");
         ptx.AppendLine("    .param .u64 o_ptr,");
-        ptx.AppendLine("    .param .u64 stats_ptr");
+        ptx.AppendLine("    .param .u64 stats_ptr,");
+        // epsilon is a launch parameter rather than a baked literal. Baking it
+        // made the module key depend on a value the blueprint id does not carry,
+        // so a caller using a non-default epsilon emitted PTX that no checked-in
+        // cubin matched and silently fell back to driver JIT.
+        ptx.AppendLine("    .param .f32 epsilon");
         ptx.AppendLine(")");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<8>;");
@@ -397,6 +406,8 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         ptx.AppendLine("    .reg .f32 %f<40>;");
         ptx.AppendLine($"    .shared .align 16 .b8 smem[{sharedBytes}];");
         ptx.AppendLine();
+        ptx.AppendLine($"    .reg .f32 {EpsilonRegister};");
+        ptx.AppendLine($"    ld.param.f32 {EpsilonRegister}, [epsilon];");
         ptx.AppendLine("    ld.param.u64 %rd0, [q_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [k_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [v_ptr];");
@@ -579,7 +590,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         }
 
         if (fuseLayerNormGelu)
-            EmitLayerNormGelu(ptx, gammaShared, betaShared, inv64, epsilonHex, geluA, geluB);
+            EmitLayerNormGelu(ptx, gammaShared, betaShared, inv64, EpsilonRegister, geluA, geluB);
 
         EmitOutputStores(ptx);
         ptx.AppendLine("    ret;");
