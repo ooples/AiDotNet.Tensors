@@ -55,6 +55,37 @@ public class DirectPtxReductionTests
             PtxFusedRowReduceF32Kernel.EmitPtx(8, 6, 17, 128));
     }
 
+    [SkippableFact]
+    public void StandaloneBufferTransfers_OrderTheNonBlockingLaunchStream()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedRowReduction(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in row-sum specialization is measured on GA10x/SM86.");
+
+        const int rows = 8192;
+        const int columns = 128;
+        using var kernel = new PtxFusedRowReduceF32Kernel(runtime, rows, columns);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        var values = new float[rows * columns];
+        for (int index = 0; index < values.Length; index++)
+            values[index] = 1f;
+
+        input.Upload<float>(values);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+
+        // Deliberately omit runtime.Synchronize(). Upload and Download are
+        // synchronous host-transfer APIs and must establish their own ordering
+        // edges to the standalone runtime's CU_STREAM_NON_BLOCKING stream.
+        var actual = new float[rows];
+        output.Download<float>(actual);
+        Assert.All(actual, value => Assert.Equal((float)columns, value));
+    }
+
     [SkippableTheory]
     [InlineData(256, 128)]
     [InlineData(2048, 64)]

@@ -4308,10 +4308,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (B.Size < outerSize)
             throw new ArgumentException("Output buffer size is too small for the specified dimensions.");
 
-#if NET5_0_OR_GREATER
         if (TryDirectPtxRowSum(A, B, outerSize, reduceSize))
             return;
-#endif
 
         if (!_kernelCache.TryGetValue("sum_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sum_axis");
@@ -16508,10 +16506,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size) => LaunchFusedScalar("scalar_minus_tensor", input, output, scalar, size);
     public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
     {
-#if NET5_0_OR_GREATER
         if (TryDirectPtxRowL2Normalize(input, output, outerSize, innerSize))
             return;
-#endif
         LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
     }
     public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
