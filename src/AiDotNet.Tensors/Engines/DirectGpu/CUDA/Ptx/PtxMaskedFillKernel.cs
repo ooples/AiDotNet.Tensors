@@ -25,18 +25,17 @@ internal sealed class PtxMaskedFillKernel : IDisposable
     private readonly PtxElementwiseVariant _variant;
 
     internal int Count { get; }
-    internal float FillValue { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxMaskedFillKernel(DirectPtxRuntime runtime, int count, float fillValue)
-        : this(runtime, count, fillValue, PtxElementwiseVariant.MaskedFillDefault)
+    internal PtxMaskedFillKernel(DirectPtxRuntime runtime, int count)
+        : this(runtime, count, PtxElementwiseVariant.MaskedFillDefault)
     {
     }
 
     internal PtxMaskedFillKernel(
-        DirectPtxRuntime runtime, int count, float fillValue, PtxElementwiseVariant variant)
+        DirectPtxRuntime runtime, int count, PtxElementwiseVariant variant)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedSoftmax(
@@ -46,7 +45,6 @@ internal sealed class PtxMaskedFillKernel : IDisposable
         PtxElementwiseShape.Validate(count, "Masked fill");
         variant.Validate(count);
         Count = count;
-        FillValue = fillValue;
         _variant = variant;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, count, variant);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, count, variant);
@@ -68,7 +66,8 @@ internal sealed class PtxMaskedFillKernel : IDisposable
     }
 
     internal unsafe void Launch(
-        DirectPtxTensorView input, DirectPtxTensorView mask, DirectPtxTensorView output)
+        DirectPtxTensorView input, DirectPtxTensorView mask, DirectPtxTensorView output,
+        float fill)
     {
         PtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
         PtxAbiGuard.Require(mask, Blueprint.Tensors[1], nameof(mask));
@@ -77,7 +76,6 @@ internal sealed class PtxMaskedFillKernel : IDisposable
         IntPtr inputPointer = input.Pointer;
         IntPtr maskPointer = mask.Pointer;
         IntPtr outputPointer = output.Pointer;
-        float fill = FillValue;
         void** arguments = stackalloc void*[4];
         arguments[0] = &inputPointer;
         arguments[1] = &maskPointer;

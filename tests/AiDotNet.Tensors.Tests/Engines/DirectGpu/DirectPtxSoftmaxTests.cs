@@ -428,21 +428,24 @@ public class DirectPtxSoftmaxTests
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
             "The checked-in masked-fill specialization is measured on GA10x/SM86.");
         const float fill = -1e9f;
+        const float secondFill = 17.25f;
         var random = RandomHelper.CreateSeededRandom(20265200 + m + n);
         float[] inHost = Values(random, m * n, 2.0f);
         float[] maskHost = new float[m * n];
         for (int i = 0; i < maskHost.Length; i++) maskHost[i] = random.NextDouble() < 0.3 ? 1f : 0f;
 
         var expFill = new float[m * n];
+        var expSecondFill = new float[m * n];
         var expBwd = new float[m * n];
         for (int i = 0; i < inHost.Length; i++)
         {
             bool masked = maskHost[i] != 0f;
             expFill[i] = masked ? fill : inHost[i];
+            expSecondFill[i] = masked ? secondFill : inHost[i];
             expBwd[i] = masked ? 0f : inHost[i];   // treat inHost as gradOutput for the backward
         }
 
-        using var fwd = new PtxMaskedFillKernel(runtime, m * n, fill);
+        using var fwd = new PtxMaskedFillKernel(runtime, m * n);
         using var bwd = new PtxMaskedFillBackwardKernel(runtime, m * n);
         Assert.Equal(0, fwd.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, bwd.Audit.Function.LocalBytesPerThread);
@@ -456,7 +459,8 @@ public class DirectPtxSoftmaxTests
         fwd.Launch(
             DirectPtxTensorView.CreateOwned(inBuf, fwd.Blueprint.Tensors[0]),
             DirectPtxTensorView.CreateOwned(maskBuf, fwd.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(outFill, fwd.Blueprint.Tensors[2]));
+            DirectPtxTensorView.CreateOwned(outFill, fwd.Blueprint.Tensors[2]),
+            fill);
         bwd.Launch(
             DirectPtxTensorView.CreateOwned(inBuf, bwd.Blueprint.Tensors[0]),
             DirectPtxTensorView.CreateOwned(maskBuf, bwd.Blueprint.Tensors[1]),
@@ -468,6 +472,16 @@ public class DirectPtxSoftmaxTests
         outBwd.Download<float>(actualBwd);
         AssertVectorClose(actualFill, expFill, 0f, $"masked-fill {m}x{n}");
         AssertVectorClose(actualBwd, expBwd, 0f, $"masked-fill-backward {m}x{n}");
+
+        fwd.Launch(
+            DirectPtxTensorView.CreateOwned(inBuf, fwd.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(maskBuf, fwd.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(outFill, fwd.Blueprint.Tensors[2]),
+            secondFill);
+        runtime.Synchronize();
+        outFill.Download<float>(actualFill);
+        AssertVectorClose(actualFill, expSecondFill, 0f,
+            $"masked-fill reused module {m}x{n}");
     }
 
     [SkippableFact]
@@ -1302,6 +1316,15 @@ public class DirectPtxSoftmaxTests
                     "direct-PTX vs incumbent masked fill");
                 AssertVectorClose(directPtxBwd, incumbentBwd, 0f,
                     "direct-PTX vs incumbent masked-fill backward");
+
+                int maskedFillKernelCount = backend.DirectPtxMaskedFillKernelCount;
+                const float secondFill = 17.25f;
+                backend.MaskedFillKernel(inBuf, maskBuf, outFill, secondFill, size);
+                backend.Synchronize();
+                Assert.Equal(maskedFillKernelCount, backend.DirectPtxMaskedFillKernelCount);
+                AssertMaskedFillResults(
+                    inFlat, maskFlat, backend.DownloadBuffer(outFill), directPtxBwd,
+                    secondFill, "direct-PTX reused masked-fill module");
             }
         }
         finally

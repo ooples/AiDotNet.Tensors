@@ -26,7 +26,7 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<DirectPtxMaskedFillKey, PtxMaskedFillKernel>
         _directPtxMaskedFillKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
-    private readonly record struct DirectPtxMaskedFillKey(int Count, int FillBits);
+    private readonly record struct DirectPtxMaskedFillKey(int Count);
     private readonly record struct DirectPtxMaskedFillBackwardKey(int Count);
 
     internal long DirectPtxLogSumExpDispatchCount => System.Threading.Interlocked.Read(ref _directPtxLogSumExpDispatchCount);
@@ -36,6 +36,7 @@ public sealed partial class CudaBackend
     internal long DirectPtxSparsemaxDispatchCount => System.Threading.Interlocked.Read(ref _directPtxSparsemaxDispatchCount);
     internal long DirectPtxMaskedFillDispatchCount => System.Threading.Interlocked.Read(ref _directPtxMaskedFillDispatchCount);
     internal long DirectPtxMaskedFillBackwardDispatchCount => System.Threading.Interlocked.Read(ref _directPtxMaskedFillBackwardDispatchCount);
+    internal int DirectPtxMaskedFillKernelCount => _directPtxMaskedFillKernels.Count;
 
     private bool SoftmaxFamilyGateOpen =>
         IsDirectPtxSoftmaxEnabled && DirectPtxFeatureGate.SoftmaxExperimentOverride;
@@ -154,15 +155,17 @@ public sealed partial class CudaBackend
         long bytes = checked((long)count * sizeof(float));
         if (input.SizeInBytes != bytes || mask.SizeInBytes != bytes || output.SizeInBytes != bytes)
         { DirectPtxLastError = "masked-fill-physical-extent-mismatch"; return false; }
-        var key = new DirectPtxMaskedFillKey(count, BitConverter.ToInt32(BitConverter.GetBytes(fill), 0));
+        var key = new DirectPtxMaskedFillKey(count);
         return Dispatch2(_directPtxMaskedFillKernels, key, () =>
         {
-            var kernel = _directPtxMaskedFillKernels.GetOrAdd(key, () => new PtxMaskedFillKernel(_directPtxRuntime!, count, fill));
+            var kernel = _directPtxMaskedFillKernels.GetOrAdd(
+                key, () => new PtxMaskedFillKernel(_directPtxRuntime!, count));
             lock (GpuDispatchLock)
                 kernel.Launch(
                     DirectPtxTensorView.Create(input, kernel.Blueprint.Tensors[0]),
                     DirectPtxTensorView.Create(mask, kernel.Blueprint.Tensors[1]),
-                    DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+                    DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]),
+                    fill);
         }, ref _directPtxMaskedFillDispatchCount);
     }
     private long _directPtxMaskedFillDispatchCount;

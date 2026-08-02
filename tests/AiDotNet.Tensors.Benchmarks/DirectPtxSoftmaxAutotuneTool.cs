@@ -306,7 +306,7 @@ internal static class DirectPtxSoftmaxAutotuneTool
         }
         else
         {
-            using var kernel = new PtxMaskedFillKernel(runtime, Count, -10_000f, variant);
+            using var kernel = new PtxMaskedFillKernel(runtime, Count, variant);
             DirectPtxTensorView inputView = DirectPtxTensorView.Create(
                 input, kernel.Blueprint.Tensors[0]);
             DirectPtxTensorView maskView = DirectPtxTensorView.Create(
@@ -320,7 +320,8 @@ internal static class DirectPtxSoftmaxAutotuneTool
                 backend.MaskedFillKernel(input, mask, incumbentOutput, -10_000f, Count);
             }
 
-            void LaunchCandidate() => kernel.Launch(inputView, maskView, outputView);
+            void LaunchCandidate() => kernel.Launch(
+                inputView, maskView, outputView, -10_000f);
             MeasureAndReport(
                 backend, runtime, variant.Name, kernel.Audit, expected, candidateOutput,
                 LaunchIncumbent, LaunchCandidate, tolerance: 0.0);
