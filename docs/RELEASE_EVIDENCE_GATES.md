@@ -126,3 +126,39 @@ The p9 run explains all eight non-wins:
 | depthwise_conv2d_3x3_bwd_weights | 0.82x | default (2.7%) | partial is 98% of time; L1 75%, long-scoreboard 84% | tile/prefetch the partial |
 | conv2d_1x1_bwd_weights | 0.75x | default (43%) | partial is 95% of time; L1 77%, long-scoreboard 76% | GEMM-style reuse in the partial |
 | conv2d_3x3_bwd_weights | 0.35x | default (118%) | partial is 96% of time; L1 77%, 2.7x minimum traffic | GEMM-style reuse in the partial |
+
+## p13 closure: every non-win converted
+
+The p9 diagnoses above were used as search directions, not as permanent explanations.
+Under p13, a full measured candidate search selected nine different schedules and a fresh
+consolidated process produced 13/13 stable wins. Before competitor timing, the same selected
+dispatch passed all 13 generated fp64 interpretations. The device was an RTX 3080 locked at
+1770 MHz; the competitor was PyTorch 2.12.1+cu130/cuDNN 9.2, `allow_tf32=False`, with both
+sides replayed through CUDA graphs.
+
+| kernel | selected schedule | ours us | cuDNN us | ratio |
+|---|---|---:|---:|---:|
+| conv2d_1x1_bias_relu | tiled contraction m64n112k16 | 14.7 | 28.3 | **1.92x** |
+| conv2d_1x1_bwd_data | tiled contraction m64n56k32 | 15.1 | 20.4 | **1.35x** |
+| conv2d_1x1_bwd_weights | tiled split-K outer product | 26.4 | 44.0 | **1.67x** |
+| conv2d_1x1_deep_epilogue | tiled contraction + register prefetch | 13.6 | 33.8 | **2.48x** |
+| conv2d_3x3_bias_relu | tiled Conv2D m8r14c8 | 22.5 | 26.6 | **1.18x** |
+| conv2d_3x3_bwd_data | compact inline outer-product Winograd | 16.3 | 19.0 | **1.17x** |
+| conv2d_3x3_bwd_weights | tiled chunked split-K x14 | 33.2 | 41.2 | **1.24x** |
+| conv_transpose2d_3x3_stride2 | parity-specialized transpose | 22.4 | 98.9 | **4.42x** |
+| depthwise_conv2d_3x3 | modelled affine | 67.2 | 153.9 | **2.29x** |
+| depthwise_conv2d_3x3_bias_relu | modelled affine | 68.0 | 221.6 | **3.26x** |
+| depthwise_conv2d_3x3_bwd_data | modelled affine | 66.5 | 201.3 | **3.03x** |
+| depthwise_conv2d_3x3_bwd_weights | cooperative weight gradient | 128.2 | 200.1 | **1.56x** |
+| maxpool2d_2x2 | modelled affine | 154.9 | 225.2 | **1.45x** |
+
+The complete selected dispatch shared fingerprint
+`sha256-98dc6432c407fbbe75e72f08bd4a3781a342059c89b439a828230073f7b3357d`.
+Every generated and competitor spread was at or below the 5% acceptance gate; there were
+zero refused rows.
+
+Run `--kernel-championship` to reproduce the loop. It always performs a full search and
+fp64 verification before the competitor lane. When a selected operation is still below
+1.10x, it profiles the selected dispatch, writes `artifacts/kernel-diagnosis.tsv`, and exits
+non-zero. When all selected operations win, it reports the exact passed row count and does
+not spend time profiling already-closed findings.
