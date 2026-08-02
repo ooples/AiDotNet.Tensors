@@ -494,9 +494,13 @@ public class CodegenTensorCoreStagingTests
     /// value outside the measured 2/4 ladder at assignment time.
     /// </summary>
     [Theory]
+    [InlineData(-1)]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(3)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
     [InlineData(8)]
     public void WarpTileExtents_RejectUnsupportedValues(int extent)
     {
