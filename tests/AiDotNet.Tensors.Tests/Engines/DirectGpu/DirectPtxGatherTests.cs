@@ -55,6 +55,30 @@ public class DirectPtxGatherTests
     }
 
     [Fact]
+    public void GatherOfflinePackage_CoversEveryReleaseModule()
+    {
+        foreach ((int numIndices, int featureSize) in new[]
+                 { (256, 128), (2048, 64), (2048, 128), (8192, 128) })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedGatherF32Kernel.EmitPtx(8, 6, numIndices, featureSize), 8, 6));
+        }
+
+        foreach (int numIndices in new[] { 1024, 4096, 16_384, 65_536 })
+        foreach (int innerSize in new[] { 32, 64, 128, 256, 512 })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedIndexSelectF32Kernel.EmitPtx(8, 6, numIndices, innerSize), 8, 6));
+        }
+
+        Assert.Contains(
+            typeof(PtxFusedGatherF32Kernel).Assembly.GetManifestResourceNames(),
+            name => name.EndsWith(
+                ".sm86.gather.gather-cubins.tsv",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void GatherCoverageManifest_AssignsEveryCellExactlyOnce()
     {
         Assert.NotEmpty(DirectPtxGatherCoverageManifest.All);

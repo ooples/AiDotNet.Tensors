@@ -28,7 +28,8 @@ internal static class DirectPtxGatherCubinTool
             yield return new DirectPtxModuleSource(
                 $"gather-f32-v1-n{numIndices}-f{featureSize}",
                 PtxFusedGatherF32Kernel.EntryPoint,
-                PtxFusedGatherF32Kernel.EmitPtx(8, 6, numIndices, featureSize));
+                PtxFusedGatherF32Kernel.EmitPtx(8, 6, numIndices, featureSize),
+                PtxFusedGatherF32Kernel.DefaultBlockThreads);
         }
 
         // Index-select takes FLOAT indices with a truncating cast, a different
@@ -40,7 +41,8 @@ internal static class DirectPtxGatherCubinTool
             yield return new DirectPtxModuleSource(
                 $"index-select-f32-v1-n{numIndices}-i{innerSize}",
                 PtxFusedIndexSelectF32Kernel.EntryPoint,
-                PtxFusedIndexSelectF32Kernel.EmitPtx(8, 6, numIndices, innerSize));
+                PtxFusedIndexSelectF32Kernel.EmitPtx(8, 6, numIndices, innerSize),
+                PtxFusedIndexSelectF32Kernel.DefaultBlockThreads);
         }
     }
 
