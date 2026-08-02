@@ -28,13 +28,15 @@ internal static class DirectPtxPoolingCubinTool
                 yield return new DirectPtxModuleSource(
                     $"global-avgpool-f32-v1-r{rows}-s{spatial}",
                     PtxFusedGlobalAvgPoolF32Kernel.EntryPoint,
-                    PtxFusedGlobalAvgPoolF32Kernel.EmitPtx(8, 6, rows, spatial));
+                    PtxFusedGlobalAvgPoolF32Kernel.EmitPtx(8, 6, rows, spatial),
+                    PtxFusedGlobalAvgPoolF32Kernel.DefaultBlockThreads);
 
             if (PtxFusedGlobalMaxPoolF32Kernel.IsSupportedShape(rows, spatial))
                 yield return new DirectPtxModuleSource(
                     $"global-maxpool-f32-v1-r{rows}-s{spatial}",
                     PtxFusedGlobalMaxPoolF32Kernel.EntryPoint,
-                    PtxFusedGlobalMaxPoolF32Kernel.EmitPtx(8, 6, rows, spatial));
+                    PtxFusedGlobalMaxPoolF32Kernel.EmitPtx(8, 6, rows, spatial),
+                    PtxFusedGlobalMaxPoolF32Kernel.DefaultBlockThreads);
         }
     }
 

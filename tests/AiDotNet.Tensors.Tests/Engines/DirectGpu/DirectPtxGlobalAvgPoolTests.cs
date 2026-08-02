@@ -115,6 +115,25 @@ public class DirectPtxGlobalAvgPoolTests
     }
 
     [Fact]
+    public void PoolingOfflinePackage_CoversEveryReleaseModule()
+    {
+        var planeShapes = new[] { (256, 128), (2048, 64), (2048, 128), (8192, 128) };
+        foreach ((int rows, int spatial) in planeShapes)
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedGlobalAvgPoolF32Kernel.EmitPtx(8, 6, rows, spatial), 8, 6));
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedGlobalMaxPoolF32Kernel.EmitPtx(8, 6, rows, spatial), 8, 6));
+        }
+
+        Assert.Contains(
+            typeof(PtxFusedGlobalAvgPoolF32Kernel).Assembly.GetManifestResourceNames(),
+            name => name.EndsWith(
+                ".sm86.pooling.pooling-cubins.tsv",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void GlobalAvgPoolExperimentOverride_IsThreadLocal()
     {
         bool original = DirectPtxFeatureGate.GlobalAvgPoolExperimentOverride;
