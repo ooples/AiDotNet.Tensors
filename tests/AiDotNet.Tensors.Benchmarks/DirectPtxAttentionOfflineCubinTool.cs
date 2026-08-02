@@ -15,34 +15,10 @@ internal static class DirectPtxAttentionOfflineCubinTool
     private const float Scale = 0.125f;
     private const float Epsilon = 1e-5f;
 
-    private static readonly (int Sequence, bool Causal, bool Epilogue, int Warps)[] BasicCases =
-    [
-        (16, false, false, 1),
-        (16, true, true, 1),
-        (32, false, false, 1),
-        (32, true, true, 2),
-        (64, false, false, 2),
-        (64, true, true, 4),
-        (128, false, false, 4),
-        (128, false, true, 8),
-        (128, true, false, 4),
-        (128, true, true, 8)
-    ];
-
-    private static readonly
-        (int Batch, int QueryHeads, int KeyValueHeads, int QuerySequence,
-         int KeyValueSequence, bool Causal, int CausalQueryOffset)[] FamilyCases =
-    [
-        (2, 4, 2, 32, 64, false, 0),
-        (2, 8, 1, 32, 64, true, 0),
-        (2, 8, 2, 32, 64, true, 32),
-        (1, 4, 4, 128, 32, true, 0),
-        (1, 4, 2, 128, 64, true, -64)
-    ];
-
     internal static IEnumerable<DirectPtxModuleSource> EnumerateModules()
     {
-        foreach ((int sequence, bool causal, bool epilogue, int warps) in BasicCases)
+        foreach ((int sequence, bool causal, bool epilogue, int warps) in
+                 DirectPtxOnlineAttentionReleaseMatrix.BasicCases)
         {
             yield return new DirectPtxModuleSource(
                 $"online-attention-d64-v3-basic-s{sequence}-c{Bool(causal)}-e{Bool(epilogue)}-w{warps}",
@@ -54,7 +30,8 @@ internal static class DirectPtxAttentionOfflineCubinTool
         }
 
         foreach ((int batch, int queryHeads, int keyValueHeads, int querySequence,
-                  int keyValueSequence, bool causal, int causalQueryOffset) in FamilyCases)
+                  int keyValueSequence, bool causal, int causalQueryOffset) in
+                 DirectPtxOnlineAttentionReleaseMatrix.FamilyCases)
         {
             int warps = System.Math.Min(8, querySequence / 16);
             yield return new DirectPtxModuleSource(
