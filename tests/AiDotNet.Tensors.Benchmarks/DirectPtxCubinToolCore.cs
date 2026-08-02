@@ -7,6 +7,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Benchmarks;
@@ -85,7 +86,7 @@ internal static class DirectPtxCubinToolCore
                 Console.Error.WriteLine($"[FAIL] ptxas rejected {module.BlueprintId}");
                 Console.Error.WriteLine(stderr.Trim());
                 failures++;
-                File.Delete(ptxPath);
+                DeleteTemporaryArtifacts(ptxPath, cubinPath);
                 continue;
             }
 
@@ -103,7 +104,7 @@ internal static class DirectPtxCubinToolCore
                     $"[FAIL] {module.BlueprintId}: {stackFrame} bytes stack frame, " +
                     $"{spillStores} bytes spill stores, {spillLoads} bytes spill loads.");
                 failures++;
-                File.Delete(ptxPath);
+                DeleteTemporaryArtifacts(ptxPath, cubinPath);
                 continue;
             }
 
@@ -309,6 +310,12 @@ internal static class DirectPtxCubinToolCore
 
     internal static string ManifestName(string family) => family + "-cubins.tsv";
 
+    private static void DeleteTemporaryArtifacts(string ptxPath, string cubinPath)
+    {
+        File.Delete(ptxPath);
+        File.Delete(cubinPath);
+    }
+
     private static Dictionary<string, string> ReadManifest(IEnumerable<string> lines)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -330,8 +337,15 @@ internal static class DirectPtxCubinToolCore
         return Convert.ToHexString(sha.ComputeHash(bytes)).ToLowerInvariant();
     }
 
-    internal static (int ExitCode, string StdOut, string StdErr) Run(string file, string arguments)
+    internal static (int ExitCode, string StdOut, string StdErr) Run(
+        string file,
+        string arguments,
+        int timeoutMilliseconds = 10 * 60 * 1000)
     {
+        if (timeoutMilliseconds <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(timeoutMilliseconds), "Process timeout must be positive.");
+
         var info = new ProcessStartInfo(file, arguments)
         {
             RedirectStandardOutput = true,
@@ -340,9 +354,26 @@ internal static class DirectPtxCubinToolCore
         };
         using Process process = Process.Start(info)
             ?? throw new InvalidOperationException($"could not start {file}");
-        string stdout = process.StandardOutput.ReadToEnd();
-        string stderr = process.StandardError.ReadToEnd();
-        process.WaitForExit();
+        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(timeoutMilliseconds))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                _ = process.WaitForExit(5000);
+            }
+            catch (InvalidOperationException)
+            {
+                // The process exited between the timeout and cleanup attempt.
+            }
+
+            throw new TimeoutException(
+                $"{file} did not exit within {timeoutMilliseconds} ms.");
+        }
+
+        string stdout = stdoutTask.GetAwaiter().GetResult();
+        string stderr = stderrTask.GetAwaiter().GetResult();
         return (process.ExitCode, stdout, stderr);
     }
 }
