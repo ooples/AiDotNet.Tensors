@@ -189,8 +189,10 @@ correctness, at least 1.10x median speedup over the fastest eligible competitor,
 candidate P95 no worse than competitor P95 +10%, zero hot managed allocation,
 zero avoidable temporary VRAM, JIT local bytes zero, and complete Nsight zero
 executed spill/local evidence. This exact cell satisfied those conditions under p13 and emitted
-`diagnostic_only=false`, `promotion=true`. Under p14 its current promotion evidence is pending
-the clean rerun; no other recurrent cell inherits the historical status without its own evidence.
+`diagnostic_only=false`, `promotion=true`; that promotion flag belongs only to the superseded
+p13 artifact. The live p14 admission was rejected when foreign CPU usage reached 46%, so no
+current p14 promotion artifact exists. A host-clean p14 rerun is still required, and no other
+recurrent cell inherits the historical status without its own evidence.
 
 ## Assembly-line extension order
 
