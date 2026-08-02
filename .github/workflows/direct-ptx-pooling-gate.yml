@@ -101,7 +101,7 @@ jobs:
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
           --verify-direct-ptx-pooling-cubins
           "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
-          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86/pooling"
 
       # The disassembly is the machine-code evidence the promotion gate asks
       # for, and it needs no device: LDL/STL in the SASS means a spill reached
@@ -111,7 +111,7 @@ jobs:
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
           --audit-direct-ptx-pooling-sass
           "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
-          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86/pooling"
           "artifacts/direct-ptx/pooling/sass"
 
       # Always upload: when the verify or SASS step fails, the generated
