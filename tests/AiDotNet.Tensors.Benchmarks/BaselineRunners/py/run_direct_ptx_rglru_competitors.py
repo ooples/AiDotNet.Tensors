@@ -37,7 +37,11 @@ def query_gpu_status():
         ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
          "--format=csv,noheader,nounits"],
         check=True, capture_output=True, text=True, timeout=5)
-    cells = [cell.strip() for cell in result.stdout.strip().split(",")]
+    rows = result.stdout.strip().splitlines()
+    if not rows:
+        raise RuntimeError("nvidia-smi returned incomplete GPU status")
+    first_row = rows[0]
+    cells = [cell.strip() for cell in first_row.split(",")]
     if len(cells) < 3:
         raise RuntimeError("nvidia-smi returned incomplete GPU status")
     return tuple(int(cell) for cell in cells[:3])
