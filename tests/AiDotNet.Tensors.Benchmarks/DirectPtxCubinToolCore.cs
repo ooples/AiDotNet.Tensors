@@ -85,7 +85,7 @@ internal static class DirectPtxCubinToolCore
                 Console.Error.WriteLine($"[FAIL] ptxas rejected {module.BlueprintId}");
                 Console.Error.WriteLine(stderr.Trim());
                 failures++;
-                File.Delete(ptxPath);
+                DeleteTemporaryArtifacts(ptxPath, cubinPath);
                 continue;
             }
 
@@ -103,7 +103,7 @@ internal static class DirectPtxCubinToolCore
                     $"[FAIL] {module.BlueprintId}: {stackFrame} bytes stack frame, " +
                     $"{spillStores} bytes spill stores, {spillLoads} bytes spill loads.");
                 failures++;
-                File.Delete(ptxPath);
+                DeleteTemporaryArtifacts(ptxPath, cubinPath);
                 continue;
             }
 
@@ -308,6 +308,12 @@ internal static class DirectPtxCubinToolCore
     }
 
     internal static string ManifestName(string family) => family + "-cubins.tsv";
+
+    private static void DeleteTemporaryArtifacts(string ptxPath, string cubinPath)
+    {
+        File.Delete(ptxPath);
+        File.Delete(cubinPath);
+    }
 
     private static Dictionary<string, string> ReadManifest(IEnumerable<string> lines)
     {
