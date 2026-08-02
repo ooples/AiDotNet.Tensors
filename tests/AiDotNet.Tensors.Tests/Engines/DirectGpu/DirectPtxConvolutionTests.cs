@@ -254,6 +254,36 @@ public sealed class DirectPtxConvolutionTests
         }
     }
 
+    [Fact]
+    public void AutotuneEvidence_FailureBlocksEvenADiagnosticProbeArtifact()
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-failure-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune-probe.tsv");
+            var evidence = new CodegenAutotuneEvidenceGate();
+            evidence.RecordFailure("conv2d_3x3: module load failed");
+
+            InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
+                evidence.CommitArtifact(
+                    outputPath, "diagnostic-probe-artifact", requireCompleteSearch: false));
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "conv2d_3x3: module load failed" }, evidence.Failures);
+            Assert.Contains("failed autotuning", error.Message, StringComparison.Ordinal);
+            Assert.Contains("the previous artifact was preserved", error.Message,
+                StringComparison.Ordinal);
+            Assert.Empty(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
     private static string? Validate(
         bool enabled, bool available, int major, int minor,
         DirectPtxConvolutionShape shape, IGpuBuffer? input, IGpuBuffer? weights,
