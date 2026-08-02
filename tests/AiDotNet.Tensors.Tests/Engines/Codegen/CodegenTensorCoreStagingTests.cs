@@ -358,6 +358,26 @@ public class CodegenTensorCoreStagingTests
         Assert.Equal(128, emitter.BlockThreads);
     }
 
+    /// <summary>
+    /// The staged emitter has a fixed 2x2 warp layout. A tuning value for the naive lowering
+    /// must not leak into its launch geometry and create out-of-bounds shared-memory offsets.
+    /// </summary>
+    [Fact]
+    public void BlockThreads_TracksTheLoweringThatWasEmitted()
+    {
+        var staged = new PtxTensorCoreEmitter { WarpsPerBlock = 8 };
+        staged.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.True(staged.Staged);
+        Assert.Equal(128, staged.BlockThreads);
+
+        var naive = new PtxTensorCoreEmitter { EnableStaging = false, WarpsPerBlock = 8 };
+        naive.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
+
+        Assert.False(naive.Staged);
+        Assert.Equal(256, naive.BlockThreads);
+    }
+
     /// <summary>Turning staging off must restore the naive grid, or the A/B measurement lies.</summary>
     [Fact]
     public void StagingDisabled_RestoresTheNaiveLowering()
@@ -464,6 +484,23 @@ public class CodegenTensorCoreStagingTests
 
         Assert.Equal(2, emitter.WarpTilesM);
         Assert.Equal(2, emitter.WarpTilesN);
+    }
+
+    /// <summary>
+    /// Pinned extents feed block-tile divisors and fixed fragment addressing, so reject every
+    /// value outside the measured 2/4 ladder at assignment time.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(8)]
+    public void WarpTileExtents_RejectUnsupportedValues(int extent)
+    {
+        var emitter = new PtxTensorCoreEmitter();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => emitter.WarpTilesM = extent);
+        Assert.Throws<ArgumentOutOfRangeException>(() => emitter.WarpTilesN = extent);
     }
 
     /// <summary>

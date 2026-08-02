@@ -57,14 +57,26 @@ internal static class WarpTileSweepTool
         Console.WriteLine("device sm_{0}{1}", major, minor);
         Console.WriteLine();
         Console.WriteLine(
-            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
-            "shape", "tile", "staging", "acc reg", "ld/mma", "shared B", "max abs dev", "us", "TFLOP/s");
+            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}",
+            "shape", "tile", "staging", "acc reg", "ld/mma", "shared B", "reference",
+            "max abs dev", "us", "TFLOP/s");
 
         // A single tile can be selected so a profiler can attribute counters to it: the sweep
         // otherwise launches the 2x2 reference between candidates, and every launch of the
         // same kernel name looks alike to ncu.
         string? only = args.Length > 0 && args[0].Contains('x') ? args[0] : null;
         string? shapeOnly = args.Length > 1 ? args[1] : null;
+        bool fp64AnchorEstablished = false;
+        bool excludesFp64Anchor =
+            (only is not null && only != "2x2") ||
+            (shapeOnly is not null && !"256^3".StartsWith(shapeOnly, StringComparison.Ordinal));
+        if (excludesFp64Anchor)
+        {
+            Console.WriteLine(
+                "WARNING: filters exclude the 2x2-at-256^3 fp64 reference anchor; larger-shape " +
+                "comparisons are relative only and will be labeled unanchored.");
+            Console.WriteLine();
+        }
 
         foreach (var (label, spec, m, n, k) in Shapes())
         {
@@ -77,11 +89,11 @@ internal static class WarpTileSweepTool
                 foreach (bool async in AsyncForms)
                 {
                     double us = Measure(runtime, spec, major, minor, tm, tn, async,
-                                        m, n, k, label, ref baseline);
+                                        m, n, k, label, ref baseline, ref fp64AnchorEstablished);
                     if (us > 0 && baseline == 0) baseline = us;
                 }
 
-                // THE ORACLE: the same tile and the same mma instructions with the fragment
+                // THE CEILING: the same tile and the same mma instructions with the fragment
                 // loads hoisted out of the K loop. It computes the wrong answer on purpose --
                 // it exists to bound what this instruction mix can reach with memory traffic
                 // removed, so progress is measured against a ceiling rather than against a
@@ -94,7 +106,8 @@ internal static class WarpTileSweepTool
 
     private static double Measure(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        int tileM, int tileN, bool async, int m, int n, int k, string label, ref double baseline)
+        int tileM, int tileN, bool async, int m, int n, int k, string label,
+        ref double baseline, ref bool fp64AnchorEstablished)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -106,13 +119,13 @@ internal static class WarpTileSweepTool
 
             if (!PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out string why))
             {
-                Report(label, tileM, tileN, emitter, 0, 0, 0, "not a wmma shape: " + why);
+                Report(label, tileM, tileN, emitter, "-", 0, 0, 0, "not a wmma shape: " + why);
                 return 0;
             }
 
             if (!emitter.CanStage(plan!, out string stageWhy))
             {
-                Report(label, tileM, tileN, emitter, 0, 0, 0, stageWhy);
+                Report(label, tileM, tileN, emitter, "-", 0, 0, 0, stageWhy);
                 return 0;
             }
 
@@ -160,7 +173,12 @@ internal static class WarpTileSweepTool
             var got = new float[outCount];
             outBuffer.Download<float>(got);
 
-            if ((long)m * n * k <= 64L * 1024 * 1024)
+            bool usesFp64Reference = (long)m * n * k <= 64L * 1024 * 1024;
+            string correctnessReference = usesFp64Reference
+                ? "fp64"
+                : !fp64AnchorEstablished ? "unanchored"
+                : tileM == 2 && tileN == 2 ? "root@256" : "tile2x2";
+            if (usesFp64Reference)
             {
                 double[] want = spec.Interpret(wide);
                 deviation = 0;
@@ -178,19 +196,21 @@ internal static class WarpTileSweepTool
 
             if (deviation > 1e-3)
             {
-                Report(label, tileM, tileN, emitter, deviation, 0, 0, "WRONG");
+                Report(label, tileM, tileN, emitter, correctnessReference, deviation, 0, 0, "WRONG");
                 return 0;
             }
+            if (usesFp64Reference && tileM == 2 && tileN == 2)
+                fp64AnchorEstablished = true;
 
             long macs = (long)m * n * k;
             double us = TimeIt(runtime, module, fn, pointers, blocks, threads, macs);
-            Report(label, tileM, tileN, emitter, deviation, us, macs, null);
+            Report(label, tileM, tileN, emitter, correctnessReference, deviation, us, macs, null);
             return us;
         }
         catch (Exception ex)
         {
-            Console.WriteLine("{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}  {9}",
-                label, tileM + "x" + tileN, "-", "-", "-", "-", "-", "-", "-",
+            Console.WriteLine("{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}  {10}",
+                label, tileM + "x" + tileN, "-", "-", "-", "-", "-", "-", "-", "-",
                 ex.Message.Replace("\n", " "));
             return 0;
         }
@@ -237,19 +257,20 @@ internal static class WarpTileSweepTool
 
     private static void Report(
         string label, int tileM, int tileN, PtxTensorCoreEmitter emitter,
-        double deviation, double us, long macs, string? note)
+        string correctnessReference, double deviation, double us, long macs, string? note)
     {
         int accRegisters = tileM * tileN * 8;
         double loadsPerMma = (tileM + tileN) / (double)(tileM * tileN);
 
         Console.WriteLine(
-            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}{9}",
+            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}{10}",
             label,
             tileM + "x" + tileN,
             emitter.AsyncCopy ? "cp.async" : "registers",
             accRegisters.ToString(CultureInfo.InvariantCulture),
             loadsPerMma.ToString("0.00", CultureInfo.InvariantCulture),
             note is null ? emitter.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) : "-",
+            correctnessReference,
             note is null ? deviation.ToString("0.000E+000", CultureInfo.InvariantCulture) : "-",
             us > 0 ? us.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
             (us > 0 && macs > 0)
@@ -322,15 +343,15 @@ internal static class WarpTileSweepTool
                 (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads, macs);
 
             Console.WriteLine(
-                "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
-                label, tileM + "x" + tileN, "ORACLE", "-", "0.00", "-", "(no answer)",
+                "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}",
+                label, tileM + "x" + tileN, "CEILING", "-", "0.00", "-", "-", "(no answer)",
                 us.ToString("0.0", CultureInfo.InvariantCulture) + " us",
                 (2.0 * macs / us / 1e6).ToString("0.0", CultureInfo.InvariantCulture));
         }
         catch (Exception ex)
         {
-            Console.WriteLine("{0,-16} {1,7} {2,10}  oracle failed: {3}",
-                label, tileM + "x" + tileN, "ORACLE", ex.Message.Replace('\n', ' '));
+            Console.WriteLine("{0,-16} {1,7} {2,10}  ceiling failed: {3}",
+                label, tileM + "x" + tileN, "CEILING", ex.Message.Replace('\n', ' '));
         }
         finally
         {
@@ -359,6 +380,14 @@ internal static class WarpTileSweepTool
 
     private static IEnumerable<(string, CodegenKernelSpec, int, int, int)> Shapes()
     {
+        // 256^3 exists so at least ONE shape is checked against the fp64 ORACLE rather than
+        // against another GPU lowering. The oracle branch requires M*N*K <= 64Mi, and every other
+        // shape here is at least 512^3 = 128Mi, so without this the 2x2 tile was assigned
+        // deviation 0 by fiat ("this IS the reference tile") and every larger tile was compared
+        // only against that unverified reference - meaning a defect shared by all staged
+        // lowerings could be timed and reported as verified. 256 is divisible by 128, so every
+        // rung of the warp-tile ladder (including 4x4, which needs M % 128 == 0) can stage it.
+        yield return ("256^3", MatMul("sweep_256", 256, 256, 256), 256, 256, 256);
         yield return ("512^3", MatMul("sweep_512", 512, 512, 512), 512, 512, 512);
         yield return ("1024^3", MatMul("sweep_1024", 1024, 1024, 1024), 1024, 1024, 1024);
         yield return ("2048^3", MatMul("sweep_2048", 2048, 2048, 2048), 2048, 2048, 2048);
