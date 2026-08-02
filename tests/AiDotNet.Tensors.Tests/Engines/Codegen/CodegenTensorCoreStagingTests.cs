@@ -365,10 +365,13 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void BlockThreads_TracksTheLoweringThatWasEmitted()
     {
-        var staged = new PtxTensorCoreEmitter { WarpsPerBlock = 8 };
+        var staged = Tile2x2();
+        staged.WarpsPerBlock = 8;
         staged.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         Assert.True(staged.Staged);
+        Assert.Equal(2, staged.WarpTilesM);
+        Assert.Equal(2, staged.WarpTilesN);
         Assert.Equal(128, staged.BlockThreads);
 
         var naive = new PtxTensorCoreEmitter { EnableStaging = false, WarpsPerBlock = 8 };
