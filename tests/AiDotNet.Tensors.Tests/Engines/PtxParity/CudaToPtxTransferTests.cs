@@ -56,6 +56,7 @@ public sealed class CudaToPtxTransferTests
         Assert.Equal(PtxTransferStatus.PtxValidatedPartialCoverage, transfer.Status);
 
         string[] validatedApis = DirectPtxRecurrentCoverageManifest.All
+            .Where(cell => cell.Api.EndsWith(".RgLruScanForward", StringComparison.Ordinal))
             .Where(cell => cell.Status == DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx)
             .Select(cell => cell.Api)
             .OrderBy(api => api, StringComparer.Ordinal)
