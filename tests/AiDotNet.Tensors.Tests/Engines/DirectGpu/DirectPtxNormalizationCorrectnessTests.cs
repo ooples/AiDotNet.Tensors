@@ -169,23 +169,22 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         Assert.Equal(86, blueprintIds.Count);
         Assert.Equal(81, expected.Count);
 
-        string[] cubins = resources.Where(name =>
-            name.IndexOf(".Artifacts.sm86.", StringComparison.Ordinal) >= 0 &&
-            name.EndsWith(".cubin", StringComparison.Ordinal)).ToArray();
-        Assert.Equal(expected.Count, cubins.Length);
-        foreach (string resource in cubins)
+        // Other direct-PTX families share the same architecture resource tree.
+        // Validate exactly the files named by this manifest instead of assuming
+        // normalization owns every embedded SM86 cubin in the assembly.
+        foreach (KeyValuePair<string, string> artifact in expected)
         {
-            int end = resource.Length - ".cubin".Length;
-            int start = resource.LastIndexOf('.', end - 1) + 1;
-            string sourceKey = resource.Substring(start, end - start);
+            string sourceKey = artifact.Key;
+            string resource = Assert.Single(resources, name =>
+                name.EndsWith(".Artifacts.sm86." + sourceKey + ".cubin",
+                    StringComparison.Ordinal));
             using Stream stream = Assert.IsAssignableFrom<Stream>(
                 assembly.GetManifestResourceStream(resource));
             using var memory = new MemoryStream();
             stream.CopyTo(memory);
             using SHA256 sha = SHA256.Create();
             string actual = PtxCompat.ToHexString(sha.ComputeHash(memory.ToArray())).ToLowerInvariant();
-            Assert.True(expected.TryGetValue(sourceKey, out string? hash), sourceKey);
-            Assert.Equal(hash, actual);
+            Assert.Equal(artifact.Value, actual);
         }
     }
 
