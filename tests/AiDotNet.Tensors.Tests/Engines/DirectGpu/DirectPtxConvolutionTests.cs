@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers.Autotune;
@@ -21,6 +22,17 @@ public sealed class DirectPtxConvolutionTests
         Assert.True(resources.Count(name =>
             name.IndexOf(".Artifacts.sm86.convolution.", StringComparison.Ordinal) >= 0 &&
             name.EndsWith(".cubin", StringComparison.Ordinal)) >= 47);
+    }
+
+    [Fact]
+    public void EmbeddedArtifactArchitecture_AnchorsOnTheSmMarker()
+    {
+        Assert.True(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.Artifacts.sm86.convolution.manifest.tsv",
+            out string architecture));
+        Assert.Equal("sm86", architecture);
+        Assert.False(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.manifest.tsv", out _));
     }
 
     [Fact]
@@ -231,15 +243,61 @@ public sealed class DirectPtxConvolutionTests
     [Fact]
     public void AutotuneEvidence_FailsClosedOnAnIncompletePromotableSearch()
     {
-        string autotune = File.ReadAllText(SourcePath(
-            "tests", "AiDotNet.Tensors.Benchmarks", "KernelAutotuneTool.cs"));
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-evidence-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune.tsv");
+            const string previousArtifact = "previous-complete-artifact";
+            File.WriteAllText(outputPath, previousArtifact);
+            var evidence = new CodegenAutotuneEvidenceGate();
 
-        Assert.Contains("InconclusivePromotableCandidates.Add(candidate.Name)", autotune,
-            StringComparison.Ordinal);
-        Assert.Contains("the selected search is incomplete", autotune,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain("if (File.Exists(outputPath)) File.Delete(outputPath)", autotune,
-            StringComparison.Ordinal);
+            evidence.RecordInconclusivePromotableCandidate("tiled-conv2d:8x8");
+            InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
+                evidence.CommitArtifact(outputPath, "incomplete-replacement"));
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "tiled-conv2d:8x8" },
+                evidence.InconclusivePromotableCandidates);
+            Assert.Contains("the selected search is incomplete", error.Message,
+                StringComparison.Ordinal);
+            Assert.Equal(previousArtifact, File.ReadAllText(outputPath));
+            Assert.Single(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void AutotuneProbe_PublishesDiagnosticArtifactWithInconclusiveCandidate()
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune-probe.tsv");
+            var evidence = new CodegenAutotuneEvidenceGate();
+            evidence.RecordInconclusivePromotableCandidate("tiled-conv2d:8x8");
+
+            evidence.CommitArtifact(
+                outputPath, "diagnostic-probe-artifact", requireCompleteSearch: false);
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "tiled-conv2d:8x8" },
+                evidence.InconclusivePromotableCandidates);
+            Assert.Equal("diagnostic-probe-artifact", File.ReadAllText(outputPath));
+            Assert.Single(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
     }
 
     private static string? Validate(
