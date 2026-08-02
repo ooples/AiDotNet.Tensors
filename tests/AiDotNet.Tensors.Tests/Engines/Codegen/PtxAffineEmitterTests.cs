@@ -12,6 +12,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Codegen;
 
+[Collection("DirectGpuSerial")]
 public class PtxAffineEmitterTests
 {
     private const int N = 2, C = 8, H = 8, W = 8;
