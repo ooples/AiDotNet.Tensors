@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
 /// AiDotNet #1841 regression: the compiled-plan backward for the
-/// <c>TensorPermute + TensorMatMul + TensorBroadcastAdd</c> chain used by every
+/// <c>TensorPermute + TensorMatMul + TensorAdd</c> chain used by every
 /// NBEATS / NHiTS block (paper §3.2 doubly-residual MLP: permute input to
 /// column-major, matmul with weight, broadcast-add bias) produces exploding Adam
 /// updates on the linked Tensors build. The junior dev's PR body reports
@@ -27,7 +27,7 @@ public class PermuteBroadcastAddCompiledBackwardTests
     /// Minimal repro of the NBEATS block forward chain. Batch B=4, input dim
     /// inSize=3, output dim outSize=2 — small enough to reason about but
     /// exercises the exact op sequence:
-    /// <c>x[B,in]  ─Permute[1,0]→  x[in,B]  ─MatMul(W[out,in], x[in,B])→  linear[out,B]  ─BroadcastAdd(linear, biasCol[out,1])→  y[out,B]</c>
+    /// <c>x[B,in]  ─Permute[1,0]→  x[in,B]  ─MatMul(W[out,in], x[in,B])→  linear[out,B]  ─TensorAdd(linear, biasCol[out,1])→  y[out,B]</c>
     /// Then a ReduceSum-to-scalar loss so a single scalar backward has clear
     /// analytic gradients w.r.t. W and bias.
     /// </summary>
@@ -59,7 +59,7 @@ public class PermuteBroadcastAddCompiledBackwardTests
 var x = engine.TensorPermute(input, new[] { 1, 0 });         // [in, B]
             var linear = engine.TensorMatMul(weight, x);                 // [out, B]
             var biasCol = engine.Reshape(bias, new[] { outSize, 1 });    // [out, 1]
-            var y = engine.TensorBroadcastAdd(linear, biasCol);          // [out, B]
+            var y = engine.TensorAdd(linear, biasCol);          // [out, B]
             var loss = engine.ReduceSum(y, null);                        // scalar
             var grads = tape.ComputeGradients(loss, new[] { weight, bias });
             weightGradEager = grads[weight];
@@ -79,7 +79,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });         // [in, B]
                 var x = engine.TensorPermute(inputC, new[] { 1, 0 });
                 var linear = engine.TensorMatMul(weightC, x);
                 var biasCol = engine.Reshape(biasC, new[] { outSize, 1 });
-                var y = engine.TensorBroadcastAdd(linear, biasCol);
+                var y = engine.TensorAdd(linear, biasCol);
                 engine.ReduceSum(y, null);
                 plan = scope.CompileTraining(new[] { weightC, biasC });
             }
@@ -139,7 +139,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });         // [in, B]
 var x = engine.TensorPermute(input, new[] { 1, 0 });
             var linear = engine.TensorMatMul(weight, x);
             var biasCol = engine.Reshape(bias, new[] { outSize, 1 });
-            var y = engine.TensorBroadcastAdd(linear, biasCol);
+            var y = engine.TensorAdd(linear, biasCol);
             var diff = engine.TensorSubtract(y, target);
             var sq = engine.TensorMultiply(diff, diff);
             var loss = engine.ReduceMean(sq, new[] { 0, 1 }, keepDims: false);
@@ -161,7 +161,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });
                 var x = engine.TensorPermute(inputC, new[] { 1, 0 });
                 var linear = engine.TensorMatMul(weightC, x);
                 var biasCol = engine.Reshape(biasC, new[] { outSize, 1 });
-                var y = engine.TensorBroadcastAdd(linear, biasCol);
+                var y = engine.TensorAdd(linear, biasCol);
                 var diff = engine.TensorSubtract(y, targetC);
                 var sq = engine.TensorMultiply(diff, diff);
                 engine.ReduceMean(sq, new[] { 0, 1 }, keepDims: false);
@@ -227,7 +227,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });
             var x = engine.TensorPermute(input, new[] { 1, 0 });
             var linear = engine.TensorMatMul(weight, x);
             var biasCol = engine.Reshape(bias, new[] { outSize, 1 });
-            var y = engine.TensorBroadcastAdd(linear, biasCol);
+            var y = engine.TensorAdd(linear, biasCol);
             var diff = engine.TensorSubtract(y, target);
             var sq = engine.TensorMultiply(diff, diff);
             engine.ReduceMean(sq, new[] { 0, 1 }, keepDims: false);
@@ -277,7 +277,7 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });
 
     /// <summary>
     /// Exact NBEATS doubly-residual stack pattern (paper §3.2): two blocks share
-    /// the same Permute+MatMul+BroadcastAdd forward, block N's output is
+    /// the same Permute+MatMul+TensorAdd forward, block N's output is
     /// SUBTRACTED from the residual fed to block N+1, and per-block forecasts
     /// are SUMMED. The subtract-from-residual + sum-of-forecasts chain is what
     /// the junior dev's NBEATS PR comment blames for the "compiled fused
@@ -324,13 +324,13 @@ var x = engine.TensorPermute(input, new[] { 1, 0 });
             var x = engine.TensorPermute(resIn, new[] { 1, 0 });                    // [L, B]
             var bcLin = engine.TensorMatMul(wBc, x);                                 // [L, B]
             var bcCol = engine.Reshape(bBc, new[] { L, 1 });
-            var bc = engine.TensorBroadcastAdd(bcLin, bcCol);                        // [L, B]
+            var bc = engine.TensorAdd(bcLin, bcCol);                        // [L, B]
             var bcT = engine.TensorPermute(bc, new[] { 1, 0 });                      // [B, L]
             newRes = engine.TensorSubtract(resIn, bcT);                              // residual chain
 
             var fcLin = engine.TensorMatMul(wFc, x);                                 // [H, B]
             var fcCol = engine.Reshape(bFc, new[] { H, 1 });
-            fc = engine.TensorBroadcastAdd(fcLin, fcCol);                            // [H, B]
+            fc = engine.TensorAdd(fcLin, fcCol);                            // [H, B]
             return fc;
         }
 

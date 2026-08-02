@@ -7,6 +7,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>Static and opt-in driver contracts for issue #850.</summary>
+[Collection("DirectGpuSerial")]
 public class DirectPtxComplexMultiplyTests
 {
     [Fact]
@@ -15,11 +16,14 @@ public class DirectPtxComplexMultiplyTests
         string ptx = PtxFusedComplexMultiplyF32Kernel.EmitPtx(8, 6, 262144);
         Assert.Contains("exact-shape pairs=262144 block=256", ptx);
         Assert.Equal(3, Count(ptx, "ld.param.u64"));
-        Assert.Equal(2, Count(ptx, "ld.global.nc.v2.f32"));
-        Assert.Equal(1, Count(ptx, "st.global.v2.f32"));
-        Assert.Equal(2, Count(ptx, "mul.rn.f32"));
-        Assert.Equal(2, Count(ptx, "fma.rn.f32"));
-        Assert.Equal(1, Count(ptx, "neg.f32"));
+        Assert.Equal(4, Count(ptx, "ld.global.cg.v4.f32"));
+        Assert.Equal(2, Count(ptx, "st.global.v4.f32"));
+        Assert.Equal(8, Count(ptx, "mul.rn.f32"));
+        Assert.Equal(8, Count(ptx, "fma.rn.f32"));
+        Assert.Equal(4, Count(ptx, "neg.f32"));
+        Assert.Contains("mul.wide.u32 %rd3, %r2, 16", ptx);
+        Assert.Contains("mad.lo.u32 %r2, %r1, 512, %r0", ptx);
+        Assert.Contains("add.u64 %rd7, %rd3, 4096", ptx);
         Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -29,6 +33,14 @@ public class DirectPtxComplexMultiplyTests
     [Fact]
     public void ComplexMultiplyDomain_IsClosedExactSmAndUnpromoted()
     {
+        Assert.Equal(2, PtxFusedComplexMultiplyF32Kernel.GetPairsPerThread(65_536));
+        Assert.Equal(4, PtxFusedComplexMultiplyF32Kernel.GetPairsPerThread(262_144));
+        Assert.Equal(8, PtxFusedComplexMultiplyF32Kernel.GetPairsPerThread(1_048_576));
+        string large = PtxFusedComplexMultiplyF32Kernel.EmitPtx(8, 6, 1_048_576);
+        Assert.Equal(8, Count(large, "ld.global.cg.v4.f32"));
+        Assert.Equal(4, Count(large, "st.global.v4.f32"));
+        Assert.Contains("mad.lo.u32 %r2, %r1, 1024, %r0", large);
+        Assert.Contains("add.u64 %rd7, %rd3, 12288", large);
         Assert.True(PtxFusedComplexMultiplyF32Kernel.IsSupportedShape(65536));
         Assert.True(PtxFusedComplexMultiplyF32Kernel.IsSupportedShape(262144));
         Assert.True(PtxFusedComplexMultiplyF32Kernel.IsSupportedShape(1048576));
@@ -714,6 +726,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(1, Count(ptx, "fma.rn.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Contains("$MEL_F_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("div.u32 %r3, %r2, 8", ptx);        // frame = gid / nMels
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxApplyMelFilterbankF32Kernel.IsSupportedShape(32, 64, 8));
@@ -1352,6 +1365,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(3, Count(ptx, "ld.param.u64"));
         Assert.Contains("setp.ge.u32 %p0, %r2, 1408", ptx);        // output guard
         Assert.Contains("$OLA_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("setp.ge.u32 %p1, %r3, 8", ptx);           // frame loop bound
         Assert.Contains("mul.lo.u32 %r4, %r3, 128", ptx);          // frameStart = frame*hop
         Assert.Contains("setp.ge.s32 %p3, %r5, 512", ptx);         // localIdx < nFft
@@ -1370,6 +1384,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("exact-shape nFft=512 hop=128 outLen=1408 numFrames=8 block=256 op=window-sum-squares", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
         Assert.Contains("setp.ge.u32 %p1, %r3, 8", ptx);           // derived numFrames
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("fma.rn.f32 %f0, %f1, %f1, %f0", ptx);     // sum += w*w
         Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -1559,6 +1574,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("$BS_ZERO:", ptx);
         Assert.Contains("$BS_FILL_LOOP:", ptx);
         Assert.Contains("$BS_MIRROR_LOOP:", ptx);
+        Assert.Equal(2, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("cos.approx.f32", ptx);
         Assert.Contains("sin.approx.f32", ptx);
         Assert.Equal(1, Count(ptx, "neg.f32"));   // conjugate mirror
@@ -1574,6 +1590,7 @@ public class DirectPtxComplexMultiplyTests
         string ptx = PtxStftMagPhaseF32Kernel.EmitPtx(8, 6, 4, 1408, 512, 128, 8, 257);
         Assert.Contains("op=stft-mag-phase", ptx);
         Assert.Contains("$STFT_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("cos.approx.f32", ptx);
         Assert.Contains("sin.approx.f32", ptx);
         Assert.Contains("sqrt.rn.f32", ptx);
@@ -1591,6 +1608,7 @@ public class DirectPtxComplexMultiplyTests
         string ptx = PtxPhaseVocoderF32Kernel.EmitPtx(8, 6, 4, 8, 257, 12);   // leading=4,nFramesV=8,nFreqV=257,outFrames=12
         Assert.Contains("op=phase-vocoder", ptx);
         Assert.Contains("$PV_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("ld.param.f32 %f0, [rate_val]", ptx);
         Assert.Contains("cvt.rmi.s32.f32", ptx);   // floor(t*rate)
         Assert.Contains("cvt.rni.f32.f32", ptx);   // round(dp/2pi)
@@ -1786,6 +1804,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("div.u32 %r3, %r2, 80", ptx);           // seg = outIdx / melBins
         Assert.Contains("rem.u32 %r4, %r2, 80", ptx);           // m = outIdx % melBins
         Assert.Contains("$MFA_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Equal(1, Count(ptx, "fma.rn.f32"));
         Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -2288,6 +2307,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("min.s32 %r6, %r6, 17", ptx);                // clamp to NUM_PHASE_BINS-1
         Assert.Contains("$PAC_HIST:", ptx);
         Assert.Contains("$PAC_ENT:", ptx);
+        Assert.Equal(3, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("lg2.approx.f32", ptx);
         Assert.Contains("mad.lo.u32 %r13, %r1, 5, 2", ptx);          // b*numGammaBands + gammaIdx
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
@@ -2384,6 +2404,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(2, Count(ptx, "cvt.rzi.s32.f32"));       // binStart and binEnd floors
         Assert.Contains("min.s32 %r6, %r6, 256", ptx);        // clamp to usable
         Assert.Contains("$WB_LOOP:", ptx);
+        Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("lg2.approx.f32", ptx);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxWidebandLogBinPoolF32Kernel.IsSupportedShape(32, 512, 40, 256));
@@ -2472,14 +2493,23 @@ public class DirectPtxComplexMultiplyTests
         using var iB = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
         using var oB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
         iB.Upload<float>(input);
-        kernel.Launch(
-            DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
-        runtime.Synchronize();
         var actual = new float[rows * cols];
-        oB.Download<float>(actual);
-        for (int i = 0; i < actual.Length; i++)
-            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-3 * (1 + Math.Abs(expected[i])));
+        var sentinel = Enumerable.Repeat(float.NaN, actual.Length).ToArray();
+        for (int launch = 0; launch < 16; launch++)
+        {
+            if (launch > 0)
+                oB.Upload<float>(sentinel);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(iB, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(oB, kernel.Blueprint.Tensors[1]));
+            runtime.Synchronize();
+            oB.Download<float>(actual);
+            for (int i = 0; i < actual.Length; i++)
+                Assert.True(
+                    Math.Abs(actual[i] - expected[i]) <= 1e-3 * (1 + Math.Abs(expected[i])),
+                    $"normalize launch {launch} mismatch at {i}: " +
+                    $"expected={expected[i]:R}, actual={actual[i]:R}");
+        }
     }
 
     private static int Count(string text, string value)

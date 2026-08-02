@@ -6,8 +6,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Exact contiguous interleaved-complex FP32 multiplication for issue #850.
-/// Every thread loads one <c>(real,imag)</c> pair from each input, keeps the
-/// four components and both products in registers, and writes one final pair.
+/// Every thread processes a shape-selected number of warp-contiguous 16-byte
+/// chunks, reusing the same arithmetic registers between chunks.
 /// The element count is baked into the module and the launch ABI contains only
 /// three pointers. The initial candidate is disabled and unpromoted.
 /// </summary>
@@ -15,6 +15,7 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
 {
     internal const string EntryPoint = "aidotnet_fused_complex_multiply_f32";
     internal const int BlockThreads = 256;
+    internal const int PairsPerChunk = 2;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -65,7 +66,8 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
         arguments[2] = &outputPointer;
         _module.Launch(
             _function,
-            checked((uint)(NumPairs / BlockThreads)), 1, 1,
+            checked((uint)(NumPairs /
+                (BlockThreads * GetPairsPerThread(NumPairs)))), 1, 1,
             checked((uint)BlockThreads), 1, 1,
             0,
             arguments);
@@ -76,6 +78,8 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
     internal static string EmitPtx(int ccMajor, int ccMinor, int numPairs)
     {
         Validate(numPairs);
+        int pairsPerThread = GetPairsPerThread(numPairs);
+        int chunksPerThread = pairsPerThread / PairsPerChunk;
         var ptx = new StringBuilder(2_048);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -91,31 +95,43 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .b32 %r<3>;");
         ptx.AppendLine("    .reg .b64 %rd<9>;");
-        ptx.AppendLine("    .reg .f32 %f<6>;");
+        ptx.AppendLine("    .reg .f32 %f<12>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [left_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [right_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 8;");
-        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
-        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-                // Inputs are streamed once and never revisited, so they go through the
-        // read-only data cache rather than displacing L1 lines the store path
-        // can use.
-        ptx.AppendLine("    ld.global.nc.v2.f32 {%f0,%f1}, [%rd4];");
-                ptx.AppendLine("    ld.global.nc.v2.f32 {%f2,%f3}, [%rd5];");
-        ptx.AppendLine("    mul.rn.f32 %f4, %f1, %f3;");
-        ptx.AppendLine("    neg.f32 %f4, %f4;");
-        ptx.AppendLine("    fma.rn.f32 %f4, %f0, %f2, %f4;");
-        ptx.AppendLine("    mul.rn.f32 %f5, %f1, %f2;");
-        ptx.AppendLine("    fma.rn.f32 %f5, %f0, %f3, %f5;");
-        ptx.AppendLine("    st.global.v2.f32 [%rd6], {%f4,%f5};");
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads * chunksPerThread}, %r0;");
+        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 16;");
+        AppendTwoPairs(ptx, "%rd3");
+        for (int chunk = 1; chunk < chunksPerThread; chunk++)
+        {
+            ptx.AppendLine($"    add.u64 %rd7, %rd3, {chunk * BlockThreads * 16};");
+            AppendTwoPairs(ptx, "%rd7");
+        }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
+    }
+
+    private static void AppendTwoPairs(StringBuilder ptx, string offsetRegister)
+    {
+        ptx.AppendLine($"    add.u64 %rd4, %rd0, {offsetRegister};");
+        ptx.AppendLine($"    add.u64 %rd5, %rd1, {offsetRegister};");
+        ptx.AppendLine($"    add.u64 %rd6, %rd2, {offsetRegister};");
+        ptx.AppendLine("    ld.global.cg.v4.f32 {%f0,%f1,%f2,%f3}, [%rd4];");
+        ptx.AppendLine("    ld.global.cg.v4.f32 {%f4,%f5,%f6,%f7}, [%rd5];");
+        ptx.AppendLine("    mul.rn.f32 %f8, %f1, %f5;");
+        ptx.AppendLine("    neg.f32 %f8, %f8;");
+        ptx.AppendLine("    fma.rn.f32 %f8, %f0, %f4, %f8;");
+        ptx.AppendLine("    mul.rn.f32 %f9, %f1, %f4;");
+        ptx.AppendLine("    fma.rn.f32 %f9, %f0, %f5, %f9;");
+        ptx.AppendLine("    mul.rn.f32 %f10, %f3, %f7;");
+        ptx.AppendLine("    neg.f32 %f10, %f10;");
+        ptx.AppendLine("    fma.rn.f32 %f10, %f2, %f6, %f10;");
+        ptx.AppendLine("    mul.rn.f32 %f11, %f3, %f6;");
+        ptx.AppendLine("    fma.rn.f32 %f11, %f2, %f7, %f11;");
+        ptx.AppendLine("    st.global.v4.f32 [%rd6], {%f8,%f9,%f10,%f11};");
     }
 
     internal static bool IsSupportedShape(int numPairs) =>
@@ -123,14 +139,22 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
 
     internal static bool IsPromotedShape(int numPairs) => false;
 
+    internal static int GetPairsPerThread(int numPairs) => numPairs switch
+    {
+        65_536 => 2,
+        262_144 => 4,
+        1_048_576 or 4_194_304 => 8,
+        _ => throw new ArgumentOutOfRangeException(nameof(numPairs))
+    };
+
     private static void Validate(int numPairs)
     {
         if (!IsSupportedShape(numPairs))
             throw new ArgumentOutOfRangeException(nameof(numPairs),
                 "The first complex-multiply family supports exact pair counts 65536, 262144, 1048576, and 4194304.");
-        if (numPairs % BlockThreads != 0)
+        if (numPairs % (BlockThreads * GetPairsPerThread(numPairs)) != 0)
             throw new ArgumentOutOfRangeException(nameof(numPairs),
-                "The exact-shape kernel requires a full final block.");
+                "The exact-shape kernel requires a full final shape-selected block.");
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -142,7 +166,7 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
             Operation: "interleaved-complex-multiply-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"pairwise-v2-n{numPairs}",
+            Variant: $"pairwise-v4-{GetPairsPerThread(numPairs)}pairs-warp-contiguous-n{numPairs}",
             Tensors:
             [
                 new("left", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -153,7 +177,7 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 6),
@@ -164,8 +188,8 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
                 ["input-layout"] = "canonical-interleaved-[pair,real-imag]",
                 ["output-layout"] = "canonical-interleaved-[pair,real-imag]",
                 ["arithmetic"] = "two-mul-two-fma-register-resident",
-                ["global-input-reads"] = "one-fp32x2-per-input-per-pair",
-                ["global-output-writes"] = "one-fp32x2-per-pair",
+                ["global-input-reads"] = "shape-selected warp-contiguous fp32x4 chunks per input",
+                ["global-output-writes"] = "shape-selected warp-contiguous fp32x4 chunks",
                 ["shared-intermediate"] = "none",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",

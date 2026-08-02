@@ -118,6 +118,7 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                   // sum
         ptx.AppendLine("    mov.u32 %r7, 0;");                            // f = 0
         ptx.AppendLine("$MEL_F_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd6];");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd7];");
         ptx.AppendLine("    fma.rn.f32 %f0, %f1, %f2, %f0;");             // sum += power*filter

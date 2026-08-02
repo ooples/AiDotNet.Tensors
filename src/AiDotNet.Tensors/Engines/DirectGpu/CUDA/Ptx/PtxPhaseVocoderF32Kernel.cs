@@ -144,6 +144,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");                    // accPhase
         ptx.AppendLine("    mov.u32 %r7, 0;");                             // t
         ptx.AppendLine("$PV_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r7, {outFrames};");
         ptx.AppendLine("    @%p0 bra $PV_RET;");
         ptx.AppendLine("    cvt.rn.f32.u32 %f2, %r7;");                    // tF

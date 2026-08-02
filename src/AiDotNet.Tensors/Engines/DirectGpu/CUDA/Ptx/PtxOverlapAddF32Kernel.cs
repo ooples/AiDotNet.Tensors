@@ -120,6 +120,7 @@ internal sealed class PtxOverlapAddF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                    // sum
         ptx.AppendLine("    mov.u32 %r3, 0;");                             // frame
         ptx.AppendLine("$OLA_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p1, %r3, {numFrames};");
         ptx.AppendLine("    @%p1 bra $OLA_WRITE;");
         ptx.AppendLine($"    mul.lo.u32 %r4, %r3, {hopLength};");         // frameStart

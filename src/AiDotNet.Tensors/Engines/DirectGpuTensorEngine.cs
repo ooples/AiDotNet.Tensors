@@ -7356,6 +7356,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841 golden slice: the direct PTX path owns the complete
+            // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
+            // Every other shape/semantic contract continues through the
+            // established convolution, bias, and activation kernels below.
+            //
+            // Promoted register-blocked specialization first: for the ResNet c64
+            // 1x1 contract it beats cuDNN's best ~1.60x on SM86. It fails closed on
+            // any other contract, falling through to the v1 golden slice and then
+            // the established path.
+            if (typeof(T) == typeof(float) && bias is { } rbBias &&
+                activation == FusedActivationType.ReLU &&
+                kernelH == 1 && kernelW == 1 && strideH == 1 && strideW == 1 &&
+                padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1 &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend rbCuda &&
+                rbCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var rbBiasBuffer = GetWeightBufferPreferResident(
+                    backend, rbBias, PersistentTensorRole.Biases);
+                if (rbCuda.TryDirectPtxRegBlockedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, rbBiasBuffer.Buffer,
+                    outputBuffer.Buffer, batch, inChannels, inHeight, inWidth, outChannels))
+                {
+                    var rbResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(rbResult, outputBuffer.Buffer, backend);
+                    return rbResult;
+                }
+            }
+            if (typeof(T) == typeof(float) && bias is { } directBias &&
+                activation == FusedActivationType.ReLU &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                using var directBiasBuffer = GetWeightBufferPreferResident(
+                    backend, directBias, PersistentTensorRole.Biases);
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, dilationH, dilationW);
+                if (directCuda.TryDirectPtxFusedConv2DBiasRelu(
+                    inputBuffer.Buffer, kernelBuffer.Buffer, directBiasBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+
             // Execute GPU convolution
             backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
@@ -8642,9 +8701,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <c>catch</c> blocks that route selected GPU kernels, including Power, conv / transpose / unfold-fold /
     /// pooling / locally-connected / deformable / attention operations, to their CPU reference RETHROW instead of
     /// silently falling back. Because the per-kernel fallback now lives partly inside the individual backends
-    /// (Metal / Vulkan implement the conv/pool family in their own classes), the flag is a process-wide
-    /// <c>static</c> so those backend <c>catch</c> blocks can honor it too
-    /// (<see cref="ThrowOnGpuKernelFallback"/> is read from <c>DirectGpuTensorEngine</c> by the backends).
+    /// (Metal / Vulkan implement the conv/pool family in their own classes), the accessor is <c>static</c> so
+    /// those backend <c>catch</c> blocks can honor it too. Its backing field remains <c>[ThreadStatic]</c>:
+    /// backends read the current test thread's value through <see cref="ThrowOnGpuKernelFallback"/>, while
+    /// parallel test threads retain their independent defaults.
     /// <para>
     /// <see cref="GpuConvKernelCoverageTests"/> (in the test project) enables it so the GPU-vs-CPU accuracy
     /// gate PROVES the GPU kernel actually ran on-device — a kernel that threw (or a backend that silently
@@ -11612,8 +11672,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
-            int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
-            if (center) outputLength -= nFft;
+            // An explicitly requested length is honoured VERBATIM; the centre-padding trim applies only
+            // to the length this method INFERS. Previously the `-= nFft` ran unconditionally, so
+            // ISTFT(..., center: true, length: 514) with nFft=512 returned TWO samples — the same
+            // defect fixed in CpuEngine.ISTFT earlier in this branch, still live here. Measured by
+            // TimeStretchStageDiffTests.Stage3_Istft_CpuMatchesGpu: cpu=514, gpu=2.
+            int outputLength;
+            if (length.HasValue)
+            {
+                outputLength = length.Value;
+            }
+            else
+            {
+                outputLength = (numFrames - 1) * hopLength + nFft;
+                if (center) outputLength -= nFft;
+            }
             int totalOutput = batch * outputLength;
 
             using var magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
@@ -11667,7 +11740,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             ((IEngine)this).STFT(input, nFft, hopLength, window, center: true,
                 out var magnitude, out var phase);
-            _ = phase;
+            // `phase` is retained (it used to be discarded via `_ = phase`) because
+            // MelSpectrogramBackward needs it to rebuild the complex spectrum when propagating the
+            // gradient back through |STFT|.
+            bool tapeActive = IsTapeActive<T>();
             int numFreqs = magnitude.Shape._dims[^2];
             int numFrames = magnitude.Shape._dims[^1];
             int batch = magnitude.Length / (numFreqs * numFrames);
@@ -11690,8 +11766,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             framesMajorShape[^2] = numFrames;
             framesMajorShape[^1] = nMels;
             Tensor<T> framesMajorResult;
+            // MelSpectrogramBackward needs the PRE-dB mel, element-aligned with the OUTPUT, to
+            // differentiate the log. Snapshot it while melBuffer is still alive, permuted the same
+            // way the result is, and force the deferred download now because melBuffer is disposed at
+            // scope exit. Gated on an active tape so inference pays nothing for it.
+            Tensor<T>? linearMel = null;
             if (powerToDb)
             {
+                if (tapeActive)
+                {
+                    var linearFramesMajor = DeferTensorResult<T>(
+                        backend, melBuffer.Buffer, melLength, (int[])framesMajorShape.Clone());
+                    linearMel = PermuteResidentGpu(backend, linearFramesMajor, swapLastTwo);
+                    _ = linearMel.GetDataArray();
+                }
                 using var dbBuffer = AllocateOutputBuffer(backend, melLength);
                 backend.PowerToDb(melBuffer.Buffer, dbBuffer.Buffer, melLength, 1f, -80f);
                 backend.Synchronize();
@@ -11705,7 +11793,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 melBuffer.RelinquishOwnership();
             }
 
-            return PermuteResidentGpu(backend, framesMajorResult, swapLastTwo);
+            var melResult = PermuteResidentGpu(backend, framesMajorResult, swapLastTwo);
+
+            // Without powerToDb the output IS the linear mel, so no snapshot is needed.
+            if (!powerToDb) linearMel = melResult;
+
+            // Tape registration. This override recorded NOTHING, so a GPU MelSpectrogram produced no
+            // gradient at all while CpuEngine's produced one — mel-based objectives (vocoder / TTS)
+            // silently lost their gradient whenever the GPU path won. Same savedState contract as
+            // CpuEngine.MelSpectrogram.
+            if (tapeActive)
+            {
+                Autodiff.DifferentiableOps.RecordUnary(
+                    "MelSpectrogram", melResult, input,
+                    Autodiff.BackwardFunctions<T>.MelSpectrogramBackward,
+                    new object[]
+                    {
+                        nFft, hopLength, window, phase, input._shape[^1],
+                        magnitude, filterbank, nMels, powerToDb, linearMel!,
+                    });
+            }
+            return melResult;
         }
         catch
         {
@@ -15508,6 +15616,105 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     #region Broadcast Operations
 
     /// <summary>
+    /// Executes an arbitrary NumPy-compatible binary broadcast entirely on the active GPU backend.
+    /// </summary>
+    /// <remarks>
+    /// Every direct backend implements <see cref="IDirectGpuBackend.TileAxis"/> and the four binary
+    /// element-wise primitives. Composing those shared operations gives CUDA, HIP, Metal, OpenCL,
+    /// Vulkan, and WebGPU one rank-generic fallback while the specialized one-kernel paths below
+    /// continue to own the common last-axis cases. This deliberately materializes only the operands
+    /// that need expansion; it never downloads either operand to perform index mapping on the CPU.
+    /// </remarks>
+    private Tensor<T>? TryRunGeneralBroadcastBinary<T>(
+        Tensor<T> a,
+        Tensor<T> b,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> operation)
+    {
+        if (!TryGetBackend(out var backend))
+            return null;
+
+        // GetOrAllocateBuffer and every TileAxis expansion below may allocate synchronously. CUDA
+        // forbids those allocations after cuStreamBeginCapture (CUDA 906), so decline the composed
+        // path before touching either input and let the established caller fallback own the case.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing())
+            return null;
+
+        if (!CanBroadcast(a.Shape._dims, b.Shape._dims))
+            return null;
+
+        int rank = Math.Max(a.Rank, b.Rank);
+        var outputShape = new int[rank];
+        var shapeA = new int[rank];
+        var shapeB = new int[rank];
+        int offsetA = rank - a.Rank;
+        int offsetB = rank - b.Rank;
+
+        for (int axis = 0; axis < rank; axis++)
+        {
+            int dimA = axis < offsetA ? 1 : a.Shape._dims[axis - offsetA];
+            int dimB = axis < offsetB ? 1 : b.Shape._dims[axis - offsetB];
+            shapeA[axis] = dimA;
+            shapeB[axis] = dimB;
+            outputShape[axis] = dimA == 1 ? dimB : dimA;
+        }
+
+        int outputLength = 1;
+        for (int axis = 0; axis < rank; axis++)
+            outputLength = checked(outputLength * outputShape[axis]);
+
+        // No kernel launch or device allocation is needed for an empty broadcast result.
+        if (outputLength == 0)
+            return new Tensor<T>(outputShape);
+
+        using var inputA = GetOrAllocateBuffer(backend, a);
+        using var inputB = GetOrAllocateBuffer(backend, b);
+        var temporaries = new List<IGpuBuffer>();
+
+        try
+        {
+            IGpuBuffer Expand(IGpuBuffer input, int[] currentShape, int currentLength)
+            {
+                IGpuBuffer current = input;
+                for (int axis = 0; axis < rank; axis++)
+                {
+                    if (currentShape[axis] == outputShape[axis])
+                        continue;
+
+                    // CanBroadcast above proves every differing source dimension is one.
+                    int outerSize = 1;
+                    for (int d = 0; d < axis; d++)
+                        outerSize = checked(outerSize * currentShape[d]);
+                    int innerSize = 1;
+                    for (int d = axis + 1; d < rank; d++)
+                        innerSize = checked(innerSize * currentShape[d]);
+
+                    int repeats = outputShape[axis];
+                    int expandedLength = checked(currentLength * repeats);
+                    IGpuBuffer expanded = backend.AllocateBuffer(expandedLength);
+                    temporaries.Add(expanded);
+                    backend.TileAxis(current, expanded, outerSize, 1, innerSize, repeats);
+                    current = expanded;
+                    currentShape[axis] = repeats;
+                    currentLength = expandedLength;
+                }
+                return current;
+            }
+
+            IGpuBuffer expandedA = Expand(inputA.Buffer, shapeA, a.Length);
+            IGpuBuffer expandedB = Expand(inputB.Buffer, shapeB, b.Length);
+            return DispatchDeferredGpuOp<T>(backend, outputLength, outputShape,
+                output => operation(backend, expandedA, expandedB, output, outputLength));
+        }
+        finally
+        {
+            // Keep every expansion alive until the final binary launch has been enqueued on the
+            // backend stream/queue, then release in reverse dependency order.
+            for (int i = temporaries.Count - 1; i >= 0; i--)
+                temporaries[i].Dispose();
+        }
+    }
+
+    /// <summary>
     /// GPU-accelerated TensorBroadcastMultiply operation.
     /// Performs element-wise multiplication with NumPy-style broadcasting.
     /// </summary>
@@ -15617,13 +15824,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Multiply(expandedA, bufferB.Buffer, output, b.Length)));
             }
 
-            // Fallback to CPU for complex broadcast patterns
-            GpuLaunchProbe.OnFallback($"TensorBroadcastMultiply:no-branch a={string.Join("x", a.Shape._dims)} b={string.Join("x", b.Shape._dims)}", null);
+            // Rank-generic path: expand only the stretched axes with backend.TileAxis, then multiply.
+            // TileAxis + Multiply are part of IDirectGpuBackend, so this remains native on all six
+            // direct GPU backends instead of silently downloading complex broadcast shapes to CPU.
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Multiply(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+
+            GpuLaunchProbe.OnFallback($"TensorBroadcastMultiply:incompatible a={string.Join("x", a.Shape._dims)} b={string.Join("x", b.Shape._dims)}", null);
             return base.TensorBroadcastMultiply(a, b);
         }
         catch (Exception exBm)
         {
             GpuLaunchProbe.OnFallback("TensorBroadcastMultiply:threw", exBm);
+            if (ThrowOnGpuKernelFallback) throw;
             return base.TensorBroadcastMultiply(a, b);
         }
     }
@@ -19892,9 +20106,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGrid = GetOrAllocateBuffer(backend, grid);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
-            // Match CpuEngine.GridSample (2-arg): align_corners=True + border/clamp padding.
+            // torchvision defaults, matching the corrected CpuEngine narrow forward:
+            // paddingMode 0 == zeros (the kernels treat 1 as border and anything else as zeros),
+            // alignCorners false. This previously passed border + alignCorners:true, which matched
+            // the old (size-1)/2 CPU mapping; the OpParity oracle scored that ~1e9 ULP off while the
+            // corrected CPU sits at 6-71 ULP. The kernels themselves are already general — both
+            // conventions are runtime branches inside them.
             backend.GridSample(bufIn.Buffer, bufGrid.Buffer, bufOut.Buffer,
-                batch, channels, inH, inW, outH, outW, paddingMode: 1, alignCorners: true);
+                batch, channels, inH, inW, outH, outW, paddingMode: 0, alignCorners: false);
             return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
         }
@@ -20586,6 +20805,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch { }
         }
+
+        try
+        {
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Add(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastAdd:general", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+        }
         return base.TensorBroadcastAdd(a, b);
     }
 
@@ -20638,6 +20869,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch { }
         }
+
+        try
+        {
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Subtract(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastSubtract:general", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+        }
         return base.TensorBroadcastSubtract(a, b);
     }
 
@@ -20689,6 +20932,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Divide(bufA.Buffer, expandedB.Buffer, output, a.Length)));
             }
             catch { }
+        }
+
+        try
+        {
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Divide(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastDivide:general", ex);
+            if (ThrowOnGpuKernelFallback) throw;
         }
         return base.TensorBroadcastDivide(a, b);
     }
@@ -23381,6 +23636,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
+        // The compiled graph must retain StopGradient as a forward dependency.
+        // Bypassing CpuEngine here would eagerly snapshot a lazy input and replay
+        // stale data, so let the base implementation record the no-backward node.
+        if (Compilation.GraphMode.IsActive) return base.StopGradient(tensor);
+
         try
         {
             if (TryGetBackend(out var backend))

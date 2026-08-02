@@ -34,7 +34,8 @@ internal enum CudaFunctionAttribute
     LocalSizeBytes = 3,
     NumRegisters = 4,
     PtxVersion = 5,
-    BinaryVersion = 6
+    BinaryVersion = 6,
+    MaxDynamicSharedSizeBytes = 8
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -62,46 +63,37 @@ internal static class CudaNativeBindings
     }
 #endif
 
-    private static bool _isAvailable;
-    private static bool _availabilityChecked;
+    private static readonly Lazy<bool> Availability = new(CheckAvailability, isThreadSafe: true);
 
     /// <summary>
     /// Gets whether the CUDA driver API is available on this system.
     /// </summary>
-    public static bool IsAvailable
+    public static bool IsAvailable => Availability.Value;
+
+    private static bool CheckAvailability()
     {
-        get
+        try
         {
-            if (!_availabilityChecked)
+            var result = CuBlasNative.cuInit(0);
+            if (result != CudaResult.Success)
             {
-                _availabilityChecked = true;
-                try
-                {
-                    var result = CuBlasNative.cuInit(0);
-                    if (result != CudaResult.Success)
-                    {
-                        _isAvailable = false;
-                    }
-                    else
-                    {
-                        result = CuBlasNative.cuDeviceGetCount(out int count);
-                        _isAvailable = result == CudaResult.Success && count > 0;
-                    }
-                }
-                catch (DllNotFoundException)
-                {
-                    _isAvailable = false;
-                }
-                catch (EntryPointNotFoundException)
-                {
-                    _isAvailable = false;
-                }
-                catch
-                {
-                    _isAvailable = false;
-                }
+                return false;
             }
-            return _isAvailable;
+
+            result = CuBlasNative.cuDeviceGetCount(out int count);
+            return result == CudaResult.Success && count > 0;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -122,6 +114,33 @@ internal static class CudaNativeBindings
         [In] int[] options,
         [In] IntPtr[] optionValues);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkCreate_v2")]
+    internal static extern CudaResult cuLinkCreate(
+        uint numOptions,
+        [In] int[] options,
+        [In] IntPtr[] optionValues,
+        out IntPtr state);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkAddData_v2")]
+    internal static extern CudaResult cuLinkAddData(
+        IntPtr state,
+        int inputType,
+        IntPtr data,
+        UIntPtr size,
+        string name,
+        uint numOptions,
+        IntPtr options,
+        IntPtr optionValues);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkComplete")]
+    internal static extern CudaResult cuLinkComplete(
+        IntPtr state,
+        out IntPtr cubin,
+        out UIntPtr size);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuLinkDestroy")]
+    internal static extern CudaResult cuLinkDestroy(IntPtr state);
+
     [DllImport(CudaLibrary, EntryPoint = "cuModuleUnload")]
     public static extern CudaResult cuModuleUnload(IntPtr module);
 
@@ -131,6 +150,10 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuFuncGetAttribute")]
     public static extern CudaResult cuFuncGetAttribute(
         out int value, CudaFunctionAttribute attribute, IntPtr function);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuFuncSetAttribute")]
+    public static extern CudaResult cuFuncSetAttribute(
+        IntPtr function, CudaFunctionAttribute attribute, int value);
 
     [DllImport(CudaLibrary, EntryPoint = "cuLaunchKernel")]
     public static extern CudaResult cuLaunchKernel(

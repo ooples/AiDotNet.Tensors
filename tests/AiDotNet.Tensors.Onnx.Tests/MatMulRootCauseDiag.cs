@@ -48,7 +48,7 @@ public class MatMulRootCauseDiag
     [SkippableFact]
     public void LocaliseBertFfnBottleneck()
     {
-        // Evidence harness for the TensorBroadcastAdd(x, zeros) root-cause
+        // Evidence harness for the TensorAdd(x, zeros) root-cause
         // investigation. Gated so CI runs fast; set the env var to re-run.
         Skip.IfNot(
             Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_HARNESS") == "1",

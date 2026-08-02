@@ -152,6 +152,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");                    // im
         ptx.AppendLine("    mov.u32 %r10, 0;");                            // i
         ptx.AppendLine("$STFT_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p4, %r10, {nFft};");
         ptx.AppendLine("    @%p4 bra $STFT_AFTER;");
         ptx.AppendLine("    mul.wide.u32 %rd6, %r10, 4;");

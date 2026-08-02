@@ -129,6 +129,7 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");                    // myCount
         ptx.AppendLine("    mov.u32 %r5, 0;");                             // i
         ptx.AppendLine("$PAC_HIST:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r5, {numSamples};");
         ptx.AppendLine("    @%p0 bra $PAC_STORE;");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r5, 4;");
@@ -159,6 +160,7 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f5, 0f00000000;");                    // totalAmp
         ptx.AppendLine("    mov.u32 %r10, 0;");                            // k
         ptx.AppendLine("$PAC_TOTAL:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p1, %r10, {NumPhaseBins};");
         ptx.AppendLine("    @%p1 bra $PAC_AFTER_TOTAL;");
         ptx.AppendLine("    shl.b32 %r11, %r10, 2;");
@@ -179,6 +181,7 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f10, 0f00000000;");                   // entropy
         ptx.AppendLine("    mov.u32 %r10, 0;");
         ptx.AppendLine("$PAC_ENT:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p1, %r10, {NumPhaseBins};");
         ptx.AppendLine("    @%p1 bra $PAC_AFTER_ENT;");
         ptx.AppendLine("    shl.b32 %r11, %r10, 2;");

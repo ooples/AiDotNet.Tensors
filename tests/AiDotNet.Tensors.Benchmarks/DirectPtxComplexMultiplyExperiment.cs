@@ -16,6 +16,9 @@ internal static class DirectPtxComplexMultiplyExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int LaunchesPerDeviceSample = 50;
+    private const int ThroughputOperationsPerGraph = 64;
+    private const double RequiredGain = 1.10;
+    private const double SemanticTolerance = 1.0e-5;
     private static readonly int[] Shapes = [65536, 262144, 1048576, 4194304];
 
     private readonly record struct Distribution(
@@ -37,19 +40,37 @@ internal static class DirectPtxComplexMultiplyExperiment
         int LocalBytes,
         int ActiveBlocks);
 
-    internal static void Run(int independentRuns = 3)
+    private readonly record struct OracleResult(
+        int Run,
+        int NumPairs,
+        string Lane,
+        StableTimer.PairResult Timing,
+        double DirectError,
+        double IncumbentError,
+        DirectPtxKernelAudit Audit);
+
+    internal static void Run(int independentRuns = 3, bool oracleOnly = false)
     {
         if (independentRuns <= 0)
             throw new ArgumentOutOfRangeException(nameof(independentRuns));
         var results = new List<Result>();
+        var oracle = new List<OracleResult>();
+        GpuBenchmarkEnvironment.RequireIdleGpu("complex-multiply-suite-start");
         for (int run = 1; run <= independentRuns; run++)
         {
             GpuBenchmarkEnvironment.PrintSnapshot($"complex-multiply-start-{run}");
-            RunDirect(run, results);
-            RunEstablished(run, results);
+            if (!oracleOnly)
+            {
+                RunDirect(run, results);
+                RunEstablished(run, results);
+            }
+            RunOracle(run, oracle);
             GpuBenchmarkEnvironment.PrintSnapshot($"complex-multiply-end-{run}");
         }
-        Print(results);
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "complex-multiply-suite-end", afterSuite: true);
+        if (!oracleOnly) Print(results);
+        PrintOracle(oracle);
         Console.WriteLine("Production verdict remains HOLD until the companion PyTorch CUDA records and Nsight evidence are joined with these results.");
     }
 
@@ -66,7 +87,9 @@ internal static class DirectPtxComplexMultiplyExperiment
             foreach (int numPairs in Shapes)
             {
                 if (!backend.PrewarmDirectPtxComplexMultiply(numPairs))
-                    continue;
+                    throw new InvalidOperationException(
+                        $"Direct PTX prewarm failed for {numPairs} pairs: " +
+                        (backend.DirectPtxLastError ?? "no diagnostic"));
                 float[] left = Values(numPairs * 2, 1000 + numPairs);
                 float[] right = Values(numPairs * 2, 2000 + numPairs);
                 using var leftBuffer = backend.AllocateBuffer(left);
@@ -145,6 +168,140 @@ internal static class DirectPtxComplexMultiplyExperiment
         {
             DirectPtxFeatureGate.ComplexMultiplyGateOverride = originalGate;
         }
+    }
+
+    private static void RunOracle(int run, List<OracleResult> results)
+    {
+        using var direct = new CudaBackend();
+        using var incumbent = new CudaBackend();
+        if (!direct.IsAvailable || !incumbent.IsAvailable) return;
+
+        bool originalExperiment = DirectPtxFeatureGate.ComplexMultiplyExperimentOverride;
+        bool? originalGate = DirectPtxFeatureGate.ComplexMultiplyGateOverride;
+        try
+        {
+            DirectPtxFeatureGate.ComplexMultiplyExperimentOverride = true;
+            foreach (int numPairs in Shapes)
+            {
+                DirectPtxFeatureGate.ComplexMultiplyGateOverride = true;
+                if (!direct.PrewarmDirectPtxComplexMultiply(numPairs))
+                    throw new InvalidOperationException(
+                        $"Direct PTX oracle prewarm failed for {numPairs} pairs: " +
+                        (direct.DirectPtxLastError ?? "no diagnostic"));
+
+                float[] left = Values(numPairs * 2, 1000 + numPairs);
+                float[] right = Values(numPairs * 2, 2000 + numPairs);
+                using var directLeft = direct.AllocateBuffer(left);
+                using var directRight = direct.AllocateBuffer(right);
+                using var directOutput = direct.AllocateBuffer(numPairs * 2);
+                using var incumbentLeft = incumbent.AllocateBuffer(left);
+                using var incumbentRight = incumbent.AllocateBuffer(right);
+                using var incumbentOutput = incumbent.AllocateBuffer(numPairs * 2);
+
+                void DirectLaunch()
+                {
+                    DirectPtxFeatureGate.ComplexMultiplyGateOverride = true;
+                    direct.ComplexMultiply(
+                        directLeft, directRight, directOutput, numPairs);
+                }
+
+                void IncumbentLaunch()
+                {
+                    DirectPtxFeatureGate.ComplexMultiplyGateOverride = false;
+                    incumbent.ComplexMultiply(
+                        incumbentLeft, incumbentRight, incumbentOutput, numPairs);
+                }
+
+                long directDispatchesBefore =
+                    direct.DirectPtxComplexMultiplyDispatchCount;
+                long incumbentDispatchesBefore =
+                    incumbent.DirectPtxComplexMultiplyDispatchCount;
+                DirectLaunch();
+                direct.Synchronize();
+                IncumbentLaunch();
+                incumbent.Synchronize();
+                var directActual = new float[left.Length];
+                var incumbentActual = new float[left.Length];
+                direct.DownloadBuffer(directOutput, directActual);
+                incumbent.DownloadBuffer(incumbentOutput, incumbentActual);
+                double directError = Validate(directActual, left, right, numPairs);
+                double incumbentError = Validate(incumbentActual, left, right, numPairs);
+                if (!direct.TryGetDirectPtxComplexMultiplyAudit(numPairs, out var audit))
+                    throw new InvalidOperationException(
+                        "The prewarmed direct-PTX module has no audit record.");
+
+                bool correctnessPassed =
+                    IsFinite(directError) && IsFinite(incumbentError) &&
+                    directError <= SemanticTolerance &&
+                    incumbentError <= SemanticTolerance;
+                StableTimer.PairResult timing = default;
+                string lane = "correctness-rejected";
+
+                if (correctnessPassed)
+                {
+                    IntPtr directGraph = IntPtr.Zero;
+                    IntPtr incumbentGraph = IntPtr.Zero;
+                    try
+                    {
+                        directGraph = CaptureRepeatedGraph(
+                            direct, DirectLaunch, ThroughputOperationsPerGraph);
+                        incumbentGraph = CaptureRepeatedGraph(
+                            incumbent, IncumbentLaunch, ThroughputOperationsPerGraph);
+                        if (directGraph != IntPtr.Zero && incumbentGraph != IntPtr.Zero)
+                        {
+                            lane = "repeated-cuda-graph-host-paired";
+                            timing = StableTimer.MeasureCalibratedHostPair(
+                                () => direct.EnqueueCapturedGraph(directGraph),
+                                direct.Synchronize,
+                                () => incumbent.EnqueueCapturedGraph(incumbentGraph),
+                                incumbent.Synchronize,
+                                operationsPerLaunchA: ThroughputOperationsPerGraph,
+                                operationsPerLaunchB: ThroughputOperationsPerGraph,
+                                targetBatchMilliseconds: 20.0);
+                        }
+                        else
+                        {
+                            lane = "public-launch-host-paired-capture-fallback";
+                            timing = StableTimer.MeasureCalibratedHostPair(
+                                DirectLaunch, direct.Synchronize,
+                                IncumbentLaunch, incumbent.Synchronize,
+                                targetBatchMilliseconds: 20.0);
+                        }
+                    }
+                    finally
+                    {
+                        direct.DestroyCapturedGraph(directGraph);
+                        incumbent.DestroyCapturedGraph(incumbentGraph);
+                    }
+                }
+
+                if (direct.DirectPtxComplexMultiplyDispatchCount <=
+                    directDispatchesBefore)
+                    throw new InvalidOperationException(
+                        "The candidate oracle lane did not enter direct PTX.");
+                if (incumbent.DirectPtxComplexMultiplyDispatchCount !=
+                    incumbentDispatchesBefore)
+                    throw new InvalidOperationException(
+                        "The incumbent oracle lane unexpectedly entered direct PTX.");
+
+                results.Add(new OracleResult(
+                    run, numPairs, lane, timing, directError, incumbentError, audit));
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ComplexMultiplyGateOverride = originalGate;
+            DirectPtxFeatureGate.ComplexMultiplyExperimentOverride = originalExperiment;
+        }
+    }
+
+    private static IntPtr CaptureRepeatedGraph(
+        CudaBackend backend, Action launch, int operations)
+    {
+        return backend.CaptureGraph(() =>
+        {
+            for (int i = 0; i < operations; i++) launch();
+        });
     }
 
     private static Result CreateResult(
@@ -304,6 +461,91 @@ internal static class DirectPtxComplexMultiplyExperiment
             }));
         }
     }
+
+    private static void PrintOracle(IReadOnlyList<OracleResult> results)
+    {
+        foreach (OracleResult result in results.OrderBy(r => r.Run)
+                     .ThenBy(r => r.NumPairs))
+        {
+            bool correctnessPassed =
+                IsFinite(result.DirectError) && IsFinite(result.IncumbentError) &&
+                result.DirectError <= SemanticTolerance &&
+                result.IncumbentError <= SemanticTolerance;
+            bool measurable = correctnessPassed && result.Timing.Stable;
+            double incumbentOverDirect = measurable
+                ? 1.0 / result.Timing.Ratio
+                : double.NaN;
+            string measurementStatus = !correctnessPassed
+                ? "correctness-failed"
+                : !result.Timing.Stable
+                    ? "unstable"
+                    : "stable";
+            string verdict = !measurable
+                ? "not-measurable"
+                : incumbentOverDirect >= RequiredGain
+                    ? "win"
+                    : incumbentOverDirect <= 1.0 / RequiredGain
+                        ? "loss"
+                        : "tie";
+
+            Console.WriteLine(
+                $"oracle | {result.Run} | complex-multiply | pairs={result.NumPairs} | " +
+                $"lane={result.Lane} | direct={result.Timing.A.Describe()} | " +
+                $"incumbent={result.Timing.B.Describe()} | " +
+                $"incumbent/direct={(measurable ? incumbentOverDirect.ToString("0.00") + "x" : "-")} | " +
+                $"correctness={measurementStatus} " +
+                $"(direct={result.DirectError:E3}, incumbent={result.IncumbentError:E3}, " +
+                $"tolerance={SemanticTolerance:E1}) | {verdict}");
+            Console.WriteLine("complex_multiply_oracle_json=" +
+                JsonSerializer.Serialize(new
+                {
+                    kind = "direct-ptx-complex-multiply-oracle",
+                    run = result.Run,
+                    operation = "complex-multiply",
+                    pairs = result.NumPairs,
+                    lane = result.Lane,
+                    logical_operations_per_graph = result.Lane.StartsWith(
+                        "repeated-cuda-graph", StringComparison.Ordinal)
+                            ? ThroughputOperationsPerGraph
+                            : 1,
+                    direct_median_us = result.Timing.A.Stable
+                        ? result.Timing.A.Microseconds
+                        : (double?)null,
+                    incumbent_median_us = result.Timing.B.Stable
+                        ? result.Timing.B.Microseconds
+                        : (double?)null,
+                    incumbent_over_direct = measurable
+                        ? incumbentOverDirect
+                        : (double?)null,
+                    direct_relative_spread = FiniteOrNull(
+                        result.Timing.A.RelativeSpread),
+                    incumbent_relative_spread = FiniteOrNull(
+                        result.Timing.B.RelativeSpread),
+                    paired_ratio_relative_spread = FiniteOrNull(
+                        result.Timing.RelativeSpread),
+                    attempts = result.Timing.Samples,
+                    required_gain = RequiredGain,
+                    direct_semantic_error = FiniteOrNull(result.DirectError),
+                    incumbent_semantic_error = FiniteOrNull(result.IncumbentError),
+                    semantic_tolerance = SemanticTolerance,
+                    correctness_passed = correctnessPassed,
+                    measurement_status = measurementStatus,
+                    verdict,
+                    registers_per_thread = result.Audit.Function.RegistersPerThread,
+                    static_shared_bytes = result.Audit.Function.StaticSharedBytes,
+                    local_bytes_per_thread = result.Audit.Function.LocalBytesPerThread,
+                    active_blocks_per_sm = result.Audit.ActiveBlocksPerMultiprocessor,
+                    diagnostic_only = true,
+                    promotion = false
+                }));
+        }
+    }
+
+    private static bool IsFinite(double value) =>
+        !double.IsNaN(value) && !double.IsInfinity(value);
+
+    private static double? FiniteOrNull(double value) =>
+        IsFinite(value) ? value : null;
 
     private static string Dash(int value) => value < 0 ? "-" : value.ToString();
 }

@@ -61,7 +61,7 @@ public class FusedLinearBenchmark
         {
             using var tape = new GradientTape<float>();
             var linear = _engine.TensorMatMul(input, weight);
-            var biased = _engine.TensorBroadcastAdd(linear, bias);
+            var biased = _engine.TensorAdd(linear, bias);
             var activated = _engine.ReLU(biased);
             var loss = _engine.ReduceSum(activated, [0, 1], keepDims: false);
             tape.ComputeGradients(loss, [input, weight, bias]);

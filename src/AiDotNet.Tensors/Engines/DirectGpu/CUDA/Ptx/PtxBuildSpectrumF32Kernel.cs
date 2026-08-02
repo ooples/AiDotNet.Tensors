@@ -152,6 +152,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         ptx.AppendLine("$BS_FILL:");
         ptx.AppendLine("    mov.u32 %r7, 0;");
         ptx.AppendLine("$BS_FILL_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r7, {numFreqs};");
         ptx.AppendLine("    @%p0 bra $BS_MIRROR;");
         ptx.AppendLine($"    mad.lo.u32 %r8, %r7, {numFrames}, %r3;");    // k*numFrames + frame
@@ -175,6 +176,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         ptx.AppendLine("$BS_MIRROR:");
         ptx.AppendLine("    mov.u32 %r9, 1;");
         ptx.AppendLine("$BS_MIRROR_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p0, %r9, {mirrorEnd};");
         ptx.AppendLine("    @%p0 bra $BS_RET;");
         ptx.AppendLine($"    sub.u32 %r10, {nFft}, %r9;");               // dst = nFft - k

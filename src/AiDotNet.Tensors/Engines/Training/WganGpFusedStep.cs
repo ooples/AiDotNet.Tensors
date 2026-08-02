@@ -138,7 +138,7 @@ public sealed class WganGpFusedStep<T> : IDisposable
             if (_plan is null)
             {
                 using var arenaSuspend = TensorArena.Suspend();
-                using var scope = GraphMode.Enable();
+                using var scope = GraphMode.EnableTraining(_cachedParameters);
                 var loss = BuildWganGpLoss(discForward, gradientPenaltyWeight);
                 _plan = scope.CompileTraining(_cachedParameters, loss);
             }
@@ -193,8 +193,8 @@ public sealed class WganGpFusedStep<T> : IDisposable
         // Interpolated x̃ = ε · real + (1 − ε) · fake, broadcasting ε over the
         // sample. epsilon01 has shape [B, 1, ...] matching the sample.
         var interpolated = Engine.TensorAdd(
-            Engine.TensorBroadcastMultiply(epsilon01, real),
-            Engine.TensorBroadcastMultiply(
+            Engine.TensorMultiply(epsilon01, real),
+            Engine.TensorMultiply(
                 Engine.TensorSubtract(OnesLike(epsilon01), epsilon01),
                 fake));
 

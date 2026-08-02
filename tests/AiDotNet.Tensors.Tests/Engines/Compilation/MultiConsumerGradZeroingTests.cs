@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// backward step is specialized (genericBackwardCount == 0), on the assumption
 /// that a specialized delegate always OVERWRITES its gradient buffer (beta=0).
 /// That assumption is false for a MULTI-CONSUMER tensor: the specialized
-/// BroadcastAdd bias-grad delegate ACCUMULATES in place (+=) because a tensor
+/// TensorAdd bias-grad delegate ACCUMULATES in place (+=) because a tensor
 /// consumed by N ops receives the SUM of N gradient contributions. With the
 /// buffer never zeroed, each step's accumulation lands on top of the PRIOR
 /// step's gradient, so the gradient grows without bound — the N-BEATS
@@ -24,8 +24,8 @@ public class MultiConsumerGradZeroingTests
 {
     /// <summary>
     /// A single bias <c>b</c> broadcast-added to TWO distinct inputs, so <c>b</c>
-    /// is multi-consumer and its gradient accumulates from both BroadcastAdd
-    /// backwards. The whole graph (BroadcastAdd + scalar ReduceSum + Add) compiles
+    /// is multi-consumer and its gradient accumulates from both TensorAdd
+    /// backwards. The whole graph (TensorAdd + scalar ReduceSum + Add) compiles
     /// to an all-specialized backward, which is exactly the path that skipped
     /// zeroing. loss = sum(x1 + b) + sum(x2 + b), so d(loss)/db[f] = 2*batch on
     /// EVERY step (input- and b-independent). With the bug the second step reports
@@ -48,8 +48,8 @@ public class MultiConsumerGradZeroingTests
         ICompiledTrainingPlan<double> plan;
         using (var scope = GraphMode.Enable())
         {
-            var h1 = engine.TensorBroadcastAdd(x1, b); // b consumer #1
-            var h2 = engine.TensorBroadcastAdd(x2, b); // b consumer #2 → multi-consumer
+            var h1 = engine.TensorAdd(x1, b); // b consumer #1
+            var h2 = engine.TensorAdd(x2, b); // b consumer #2 → multi-consumer
             var s1 = engine.ReduceSum(h1, null);       // scalar
             var s2 = engine.ReduceSum(h2, null);       // scalar
             engine.TensorAdd(s1, s2);                  // scalar loss
@@ -106,8 +106,8 @@ public class MultiConsumerGradZeroingTests
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.Enable())
             {
-                var h1 = gpu.TensorBroadcastAdd(x1, b);
-                var h2 = gpu.TensorBroadcastAdd(x2, b);
+                var h1 = gpu.TensorAdd(x1, b);
+                var h2 = gpu.TensorAdd(x2, b);
                 var s1 = gpu.ReduceSum(h1, null);
                 var s2 = gpu.ReduceSum(h2, null);
                 gpu.TensorAdd(s1, s2);

@@ -141,6 +141,7 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         ptx.AppendLine("    mov.u32 %r9, 0;");                          // cnt
         ptx.AppendLine("    mov.s32 %r10, %r5;");                       // i = binStart
         ptx.AppendLine("$WB_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine("    setp.ge.s32 %p2, %r10, %r6;");
         ptx.AppendLine("    @%p2 bra $WB_AVG;");
         ptx.AppendLine("    add.s32 %r11, %r8, %r10;");
@@ -186,7 +187,9 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
                     outExtent, outExtent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 20,
+                // The non-unrolled pooling loop uses 24 registers on SM86;
+                // occupancy remains capped by the architectural thread limit.
+                MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),

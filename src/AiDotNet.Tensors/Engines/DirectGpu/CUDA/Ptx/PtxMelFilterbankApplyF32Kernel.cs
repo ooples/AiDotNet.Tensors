@@ -125,6 +125,7 @@ internal sealed class PtxMelFilterbankApplyF32Kernel : IDisposable
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                    // sum
         ptx.AppendLine("    mov.u32 %r7, 0;");                             // i
         ptx.AppendLine("$MFA_LOOP:");
+        ptx.AppendLine("    .pragma \"nounroll\";");
         ptx.AppendLine($"    setp.ge.u32 %p1, %r7, {specBins};");
         ptx.AppendLine("    @%p1 bra $MFA_WRITE;");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r7, 4;");

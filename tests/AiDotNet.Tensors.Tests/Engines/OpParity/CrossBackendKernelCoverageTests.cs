@@ -64,8 +64,10 @@ public sealed class CrossBackendKernelCoverageTests
         "conv_transpose2d_backward_weights",                   // -> conv_transpose2d_backward_kernel
         "gru_accumulate_bias_gradients", "gru_accumulate_weight_gradients_hh",
         "gru_accumulate_weight_gradients_ih",                  // -> gru_accumulate_weight_gradients (fused hh/ih/bias)
-        "lstm_accumulate_bias_gradients", "lstm_accumulate_weight_gradients_hh",
-        "lstm_accumulate_weight_gradients_ih",                 // -> lstm_accumulate_weight_gradients
+        "lstm_backward_dgates", "lstm_backward_dweights",      // OpenCL's race-free BPTT split (a per-batch
+                                                               // reverse-time gate pass + a weight-reduction
+                                                               // pass) -> CUDA lstm_cell_backward (+ its
+                                                               // deterministic split) / HIP lstm_backward_sequence
         "sparse_categorical_cross_entropy_gradient",
         "sparse_categorical_cross_entropy_loss",               // -> categorical_cross_entropy_* (int-label form)
         "weighted_cross_entropy_gradient", "weighted_cross_entropy_loss", // -> categorical_cross_entropy (class weights)

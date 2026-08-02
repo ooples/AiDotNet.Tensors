@@ -34,7 +34,7 @@ internal static class DirectPtxSpectralCoverageManifest
 
     internal static IReadOnlyList<DirectPtxSpectralCoverageCell> All { get; } =
     [
-        Experimental("CudaBackend.ComplexMultiply", "NVRTC complex_multiply", "pairwise complex product", Interleaved, "FP32", "v1 SM86 pairwise-v2 exact-count cells"),
+        Experimental("CudaBackend.ComplexMultiply", "NVRTC complex_multiply", "pairwise complex product", Interleaved, "FP32", "v1 SM86 exact-count cells with shape-selected 2/4/8-pair coarsening and warp-contiguous fp32x4 traffic"),
         Experimental("CudaBackend.ComplexPhase", "NVRTC complex_phase", "split complex phase (interleaved-API alias)", Split, "FP32", "same split-buffer atan2 as SplitComplexPhase (PtxSplitComplexPhaseF32Kernel); minimax atan2 over the exact counts, tolerance-based"),
         Experimental("CudaBackend.ComplexConjugate", "NVRTC complex_conjugate", "complex conjugate", Interleaved, "FP32", "v1 Ampere pairwise-v2 exact-pair cells; neg.f32 sign flip preserves NaN payloads and signed zeros"),
         Experimental("CudaBackend.ComplexMagnitude", "NVRTC complex_magnitude", "complex magnitude", Interleaved, "FP32", "v1 Ampere pairwise-v2 exact-pair cells; unfused mul-mul-add then sqrt.rn to match sqrtf rounding"),
