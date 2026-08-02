@@ -206,6 +206,10 @@ public sealed class DirectPtxRecurrentTests
         });
         Assert.Equal(2, DirectPtxRecurrentCoverageManifest.All.Count(cell =>
             cell.Status == DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx));
+        Assert.Equal(DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx,
+            DirectPtxRecurrentCoverageManifest.Get("CpuEngine.RgLruScanForward").Status);
+        Assert.Equal(DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx,
+            DirectPtxRecurrentCoverageManifest.Get("IDirectGpuBackend.RgLruScanForward").Status);
         Assert.DoesNotContain(DirectPtxRecurrentCoverageManifest.All, cell =>
             cell.Status == DirectPtxRecurrentCoverageStatus.ExperimentalDirectPtx);
     }
