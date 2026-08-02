@@ -4,6 +4,7 @@
 // inherited CpuEngine path since they internally call the already
 // GPU-accelerated STFT).
 
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -28,9 +29,19 @@ public partial class DirectGpuTensorEngine
                 {
                     audio.AmplitudeToDB(inBuf.Buffer, outBuf.Buffer, len,
                         minAmplitude, 0.0f, clipTopDb: false);
+                    // Keeps main's deferred-download result (DeferTensorResult +
+                    // RelinquishOwnership) and adds the tape recording this override was missing.
+                    // Returning without recording made the GPU path silently non-differentiable
+                    // for an op OpRegistry classifies as differentiable — no tape node, so
+                    // gradients were zero with no error anywhere. Recording the deferred tensor is
+                    // safe: RecordUnary stores the reference, and materialization happens on
+                    // access, which is exactly when the backward reads it.
                     var result = DeferTensorResult<T>(
                         backend, outBuf.Buffer, len, (int[])input._shape.Clone());
                     outBuf.RelinquishOwnership();
+                    DifferentiableOps.RecordUnary("AmplitudeToDB", result, input,
+                        BackwardFunctions<T>.AmplitudeToDBBackward,
+                        new object[] { minAmplitude });
                     return result;
                 }
                 catch { outBuf.Dispose(); throw; }
@@ -123,9 +134,13 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     audio.ComputeDeltas(inBuf.Buffer, outBuf.Buffer, leading, timeAxis, winLength);
+                    // main's deferred result + the missing tape recording — see AmplitudeToDB.
                     var result = DeferTensorResult<T>(
                         backend, outBuf.Buffer, input.Length, (int[])input._shape.Clone());
                     outBuf.RelinquishOwnership();
+                    DifferentiableOps.RecordUnary("ComputeDeltas", result, input,
+                        BackwardFunctions<T>.ComputeDeltasBackward,
+                        new object[] { winLength });
                     return result;
                 }
                 catch { outBuf.Dispose(); throw; }
@@ -184,8 +199,12 @@ public partial class DirectGpuTensorEngine
                     audio.Resample(inBuf.Buffer, outBuf.Buffer, leading, inLen, outLen, up, down, halfWidth);
                     var outShape = (int[])waveform._shape.Clone();
                     outShape[waveform.Rank - 1] = outLen;
+                    // main's deferred result + the missing tape recording — see AmplitudeToDB.
                     var result = DeferTensorResult<T>(backend, outBuf.Buffer, outTotal, outShape);
                     outBuf.RelinquishOwnership();
+                    DifferentiableOps.RecordUnary("Resample", result, waveform,
+                        BackwardFunctions<T>.ResampleBackward,
+                        new object[] { origRate, newRate });
                     return result;
                 }
                 catch { outBuf.Dispose(); throw; }

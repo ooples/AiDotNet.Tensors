@@ -47,14 +47,15 @@ internal sealed class PtxFusedConv2DNchwK1Kernel : IDisposable
 
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        _module = runtime.LoadModule(Ptx);
+        _module = runtime.LoadModule(
+            Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.ConvolutionExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
         FunctionInfo = functionInfo;
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal static DirectPtxKernelBlueprint CreateBlueprint(
@@ -81,7 +82,11 @@ internal sealed class PtxFusedConv2DNchwK1Kernel : IDisposable
                     output, output, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 32,
+                // Measured on SM86 (RTX 3080, driver 13.3): the 64-iteration
+                // unrolled channel dot compiles to 40 registers/thread. 128
+                // threads x 40 regs = 5120 regs/block, well within the 4-block
+                // occupancy target (SM86 has 65536 regs/SM).
+                MaxRegistersPerThread: 40,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 4),

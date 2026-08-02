@@ -199,18 +199,50 @@ public class TensorPoolPinningTests
     public void TensorPool_Return_RefusesReshapeView()
     {
         // A Reshape on contiguous storage returns a view sharing the
-        // backing array. Same pooling hazard as the permute view —
-        // the view-safety guard catches both via
-        // GetLiveBackingArrayOrNull, which requires _storageOffset == 0
-        // AND _storage.Length == Length (i.e. owned-not-aliased).
+        // backing array. Full-span views are particularly subtle: their
+        // offset, length, and contiguity are indistinguishable from owned
+        // storage unless the explicit IsView flag is checked.
         TensorPool<float>.Clear();
-        var source = new Tensor<float>(new[] { 24 });
+        var sourceValues = Enumerable.Range(1, 24).Select(i => (float)i).ToArray();
+        var source = new Tensor<float>(sourceValues, new[] { 24 });
+        var sourceSnapshot = source.ToArray();
         var reshapeView = source.Reshape(new[] { 2, 3, 4 });
+        Assert.True(reshapeView.IsView);
 
         TensorPool<float>.Return(reshapeView);
 
-        var rented = TensorPool<float>.Rent(new[] { 24 });
+        var rented = TensorPool<float>.RentZeroed(new[] { 2, 3, 4 });
+        Assert.Equal(sourceSnapshot, source.ToArray());
         Assert.NotSame(reshapeView, rented);
         Assert.NotSame(source, rented);
+    }
+
+    [Fact]
+    public void FullSpanSliceThenReshape_BackwardDoesNotMutateInput()
+    {
+        TensorPool<double>.Clear();
+        var engine = new CpuEngine();
+        var inputValues = new[] { 0.2, -0.4, 0.7, 0.1 };
+        var inputSnapshot = (double[])inputValues.Clone();
+        var input = new Tensor<double>(inputValues, new[] { 1, 1, 4 });
+        var weight = new Tensor<double>(new[] { 8, 4 });
+        var projection = new Tensor<double>(
+            new[] { 0.7, -0.3, 0.2, 0.9, -0.8, 0.4, -0.6, 0.1 },
+            new[] { 1, 8 });
+
+        for (int i = 0; i < weight.Length; i++)
+            weight[i] = -0.11 + i * 0.013;
+
+        using var tape = new GradientTape<double>();
+        var timestep = engine.Reshape(input.Slice(1, 0, 1), new[] { 1, 4 });
+        var output = engine.TensorMatMul(timestep, engine.TensorTranspose(weight));
+        var loss = engine.ReduceSum(
+            engine.TensorMultiply(output, projection),
+            new[] { 0, 1 },
+            keepDims: false);
+
+        tape.ComputeGradients(loss, new[] { weight });
+
+        Assert.Equal(inputSnapshot, input.ToArray());
     }
 }

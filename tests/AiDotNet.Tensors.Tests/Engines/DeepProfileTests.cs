@@ -211,7 +211,7 @@ public class DeepProfileTests
         for (int i = 0; i < iters; i++)
         {
             var mm = _engine.TensorMatMul(input, weights);
-            var added = _engine.TensorBroadcastAdd(mm, bias);
+            var added = _engine.TensorAdd(mm, bias);
             var activated = _engine.ReLU(added);
         }
         sw.Stop();

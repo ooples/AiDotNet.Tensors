@@ -148,7 +148,6 @@ public sealed partial class CudaBackend
     private PtxFusedConv2DNchwK1Kernel CreateAndCacheDirectPtxConvolutionKernelSlow() =>
         _directPtxConvolutionKernels.GetOrAdd(
             1, () => new PtxFusedConv2DNchwK1Kernel(_directPtxRuntime!));
-
     private readonly DirectPtxKernelCache<int, PtxFusedDepthwiseConv2D3x3F32Kernel>
         _directPtxDepthwiseConvKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private long _directPtxDepthwiseConvDispatchCount;

@@ -6,7 +6,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal enum DirectPtxConvolutionCoverageStatus
 {
     BaselineOnly,
+
+    /// <summary>
+    /// A direct-PTX specialization is reachable from the public API through a real dispatch
+    /// hook (e.g. <c>TryDirectPtxFusedConv2DBiasRelu</c>), gated off by default.
+    /// </summary>
     ExperimentalDirectPtx,
+
+    /// <summary>
+    /// An SM86 kernel exists and its content-addressed cubin is released and SASS-audited,
+    /// but NOTHING routes the public API to it yet: the API still takes the baseline path in
+    /// every case. Distinct from <see cref="ExperimentalDirectPtx"/>, which has a dispatch
+    /// hook, and from <see cref="PlannedDirectPtx"/>, for which no kernel exists.
+    /// </summary>
+    KernelReleasedNotRouted,
     PlannedDirectPtx
 }
 

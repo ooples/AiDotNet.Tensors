@@ -1832,6 +1832,7 @@ public sealed partial class CudaBackend
             _directPtxDeformableConv2DGroupedBwdMaskKernels.Dispose();
             _directPtxDeformableConv2DGroupedBwdOffsetKernels.Dispose();
             _directPtxDeformableConv2DGroupedBwdInputKernels.Dispose();
+            _directPtxRegBlockedConvKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }

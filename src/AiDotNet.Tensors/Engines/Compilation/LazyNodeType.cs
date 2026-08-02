@@ -87,5 +87,11 @@ internal enum LazyNodeType : byte
     Reshape,
     Concat,
     Slice,
-    Custom
+    Custom,
+
+    // Appended deliberately AFTER Custom. This enum is a byte with implicit
+    // ordinals, and serialized compiled plans identify ops by that ordinal —
+    // inserting Expand next to the Broadcast* group above would renumber every
+    // member after it and silently misinterpret plans written by an older build.
+    Expand
 }
