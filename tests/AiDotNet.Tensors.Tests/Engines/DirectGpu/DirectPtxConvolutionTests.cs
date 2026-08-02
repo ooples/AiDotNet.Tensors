@@ -11,6 +11,17 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class DirectPtxConvolutionTests
 {
     [Fact]
+    public void EmbeddedArtifactArchitecture_AnchorsOnTheSmMarker()
+    {
+        Assert.True(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.Artifacts.sm86.convolution.manifest.tsv",
+            out string architecture));
+        Assert.Equal("sm86", architecture);
+        Assert.False(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.manifest.tsv", out _));
+    }
+
+    [Fact]
     public void Emitter_IsPointerOnlyShapeSpecializedSm86Ptx()
     {
         string ptx = PtxFusedConv2DNchwK1Kernel.EmitPtx(8, 6);
