@@ -189,11 +189,23 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
             if ($temperatureCelsius -gt 75) {
                 throw "[$Label] GPU temperature $temperatureCelsius C exceeds the 75 C evidence ceiling."
             }
-            # A process that just exited can still own the current utilization
-            # sample. Apply idle/memory admission only before a suite; after a
-            # suite, require no foreign compute and a safe temperature.
             if (-not $AfterSuite -and ($utilization -gt 20 -or $usedMegabytes -gt 2048)) {
                 throw "[$Label] GPU is not benchmark-ready (utilization=$utilization%, memory.used=$usedMegabytes MiB, temperature=$temperatureCelsius C)."
+            }
+            if ($AfterSuite -and $utilization -gt 20) {
+                # Utilization is a trailing NVIDIA sample, so the first snapshot can
+                # still describe the child process that just exited. Allow that sample
+                # a bounded time to age out, but fail closed on sustained activity.
+                for ($attempt = 1; $attempt -lt 6 -and $utilization -gt 20; $attempt++) {
+                    Start-Sleep -Milliseconds 250
+                    $tail = & nvidia-smi '--query-gpu=utilization.gpu' '--format=csv,noheader,nounits' 2>&1
+                    if ($LASTEXITCODE -ne 0 -or -not [int]::TryParse(($tail -join '').Trim(), [ref]$utilization)) {
+                        throw "[$Label] could not sample post-suite GPU utilization: $tail"
+                    }
+                }
+                if ($utilization -gt 20) {
+                    throw "[$Label] GPU utilization remains $utilization% after 6 post-suite quiescence samples, above the 20% evidence ceiling."
+                }
             }
         }
     }

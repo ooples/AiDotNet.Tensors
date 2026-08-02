@@ -155,11 +155,11 @@ public sealed partial class WebGpuBackend
         DispatchNBufferAsync("Audit:IotaPad", WebGpuAuditKernels.IotaPad, "main",
             new IGpuBuffer[] { idx }, new float[] { BitConverter.Int32BitsToSingle(l), BitConverter.Int32BitsToSingle(p), BitConverter.Int32BitsToSingle(numRows), 0f }, __total).GetAwaiter().GetResult();
     }
-    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         int __total = batch*numHeads; if (__total <= 0) return;
         DispatchNBufferAsync("Audit:Rwkv7Forward", WebGpuAuditKernels.Rwkv7Forward, "main",
-            new IGpuBuffer[] { r, k, v, a, b, output, sbuf }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(seqLen), BitConverter.Int32BitsToSingle(modelDim), BitConverter.Int32BitsToSingle(numHeads), BitConverter.Int32BitsToSingle(headDim), 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
+            new IGpuBuffer[] { r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(seqLen), BitConverter.Int32BitsToSingle(modelDim), BitConverter.Int32BitsToSingle(numHeads), BitConverter.Int32BitsToSingle(headDim), 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
     }
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
     {
@@ -209,11 +209,11 @@ public sealed partial class WebGpuBackend
         DispatchNBufferAsync("Audit:StftMagPhase", WebGpuAuditKernels.StftMagPhase, "main",
             new IGpuBuffer[] { padded, window, mag, phase }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(lp), BitConverter.Int32BitsToSingle(nFft), BitConverter.Int32BitsToSingle(hop), BitConverter.Int32BitsToSingle(numFrames), BitConverter.Int32BitsToSingle(numFreqs), 0f, 0f }, __total).GetAwaiter().GetResult();
     }
-    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate)
     {
-        int __total = leading*nFreqV; if (__total <= 0) return;
+        int __total = leading*numFreqs; if (__total <= 0) return;
         DispatchNBufferAsync("Audit:PhaseVocoder", WebGpuAuditKernels.PhaseVocoder, "main",
-            new IGpuBuffer[] { mag, phase, newMag, newPhase }, new float[] { BitConverter.Int32BitsToSingle(leading), BitConverter.Int32BitsToSingle(nFramesV), BitConverter.Int32BitsToSingle(nFreqV), BitConverter.Int32BitsToSingle(outFrames), rate, 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
+            new IGpuBuffer[] { mag, phase, newMag, newPhase }, new float[] { BitConverter.Int32BitsToSingle(leading), BitConverter.Int32BitsToSingle(numFrames), BitConverter.Int32BitsToSingle(numFreqs), BitConverter.Int32BitsToSingle(outFrames), rate, 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
     }
     public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft)
     {

@@ -84,6 +84,217 @@ class Program
                 args.Length > 1 && int.TryParse(args[1], out int softmaxRuns) ? softmaxRuns : 1);
             return;
         }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "normalization", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--resident-spike")
+        {
+            ResidentProgramSpike.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-vector-ab")
+        {
+            KernelConveyorTool.Run("vector-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-coarsen-ab")
+        {
+            KernelConveyorTool.Run("coarsen-ab", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-autotune")
+        {
+            KernelAutotuneTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-splitk")
+        {
+            KernelSplitTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--head-to-head")
+        {
+            HeadToHeadTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-oracle")
+        {
+            KernelOracleTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-oracle-incumbents")
+        {
+            HandWrittenKernelOracleTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-competitor")
+        {
+            KernelCompetitorTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-championship")
+        {
+            KernelChampionshipTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-identity")
+        {
+            KernelIdentityTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-arch-validate")
+        {
+            KernelArchitectureTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--warp-tile-sweep")
+        {
+            WarpTileSweepTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--multiout-check")
+        {
+            MultiOutputCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--algebra-check")
+        {
+            AlgebraCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--gather-check")
+        {
+            GatherScatterCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--tensorcore-check")
+        {
+            TensorCoreCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--frontend-check")
+        {
+            FrontEndCheckTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-limiter")
+        {
+            KernelLimiterTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-predict")
+        {
+            KernelConveyorTool.Run("predict", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-once")
+        {
+            KernelConveyorTool.Run("once", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-dump")
+        {
+            KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-verify")
+        {
+            KernelConveyorTool.Run("verify", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-release")
+        {
+            KernelConveyorTool.Run("release", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-bench")
+        {
+            KernelConveyorTool.Run("bench", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--bench-calibrate")
+        {
+            BenchmarkCalibrationExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--codegen-bakeoff")
+        {
+            CodegenBakeOffExperiment.Run();
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-convolution")
+        {
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxConvolutionExperiment.Run(includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-convolution-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            DirectPtxConvolutionArtifactTool.Run(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-convolution-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            DirectPtxConvolutionArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-convolution-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "convolution");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "convolution", "sass");
+            DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory,
+                "convolution-cubins.tsv", "convolution-sass-audit.tsv", "convolution");
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-external-gpu-baselines")
         {
             DirectPtxExternalBaselines.Run();
@@ -122,6 +333,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
         {
             DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")
+        {
+            DirectPtxProfileTarget.RunConvolution();
             return;
         }
         if (args.Length > 1 && args[0] == "--direct-ptx-verify-ncu")
@@ -1072,6 +1288,10 @@ class Program
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
         Console.WriteLine("  --direct-ptx-softmax [runs]: exact-shape FP32 row-softmax championship matrix");
+        Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
+        Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
+        Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-convolution-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
@@ -1079,7 +1299,16 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
         Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
+        Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
+        Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
+        Console.WriteLine("  --kernel-oracle: generated-family performance vs spec-derived ceilings");
+        Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
+        Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
+        Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
+        Console.WriteLine("  --kernel-identity: print the four-fingerprint autotune identity per catalog kernel");
+        Console.WriteLine("  --kernel-arch-validate: assemble catalog PTX for SM80/86/89/90/100/120");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");

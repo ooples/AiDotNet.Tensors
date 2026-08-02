@@ -2011,10 +2011,17 @@ public interface IDirectGpuBackend : IDisposable
     void IotaPad(IGpuBuffer idx, int l, int p, int numRows);
 
     /// <summary>
-    /// RWKV-7 (WKV7 generalized delta rule) sequence forward, parallel over (batch, head) with a
-    /// per-(b,h) [headDim,headDim] state in the <paramref name="sbuf"/> scratch (size batch*numHeads*headDim^2).
+    /// RWKV-7 "Goose" generalized-delta-rule sequence forward (arXiv:2503.14456, Eq. 17), parallel over
+    /// (batch, head):
+    /// <c>S_t = S_{t-1}(diag(w_t) - kappaHat_t^T(a_t (*) kappaHat_t)) + v_t^T kTilde_t</c>,
+    /// <c>o_t = S_t . r_t</c>, with <c>w = exp(-e^(-1/2) sigmoid(decayLogit))</c> and
+    /// <c>kappaHat = kappa/||kappa||_2</c> per head, both applied internally. <paramref name="iclRate"/>
+    /// is already post-sigmoid.
     /// </summary>
-    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
+    /// <param name="sbuf">Per-(b,h) scratch of size <c>batch*numHeads*(headDim^2 + 3*headDim)</c>: the
+    /// <c>[headDim,headDim]</c> state followed by the kappaHat / w / a gate vectors.</param>
+    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v,
+        IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output,
         IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
     /// <summary>
@@ -2044,8 +2051,18 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>STFT magnitude+phase: per (b,k,frame) DFT bin of the windowed frame. out [b][k*numFrames+frame].</summary>
     void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs);
 
-    /// <summary>Phase vocoder time-axis remap + phase accumulation (one thread per (b,f)).</summary>
-    void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate);
+    /// <summary>
+    /// Phase vocoder over a <c>[leading, numFreqs, numFrames]</c> magnitude/phase pair — the STFT's
+    /// layout, with TIME as the contiguous inner axis. Interpolates along time and accumulates phase
+    /// per frequency bin, writing <c>[leading, numFreqs, outFrames]</c>.
+    /// </summary>
+    /// <remarks>
+    /// The <c>numFrames</c>/<c>numFreqs</c> parameters were previously named nFramesV/nFreqV and
+    /// carried the OPPOSITE meaning: callers passed numFreqs as the "frames" slot to reproduce a CPU
+    /// defect that interpolated across frequency bins. Both the kernels and the callers now use the
+    /// natural meaning.
+    /// </remarks>
+    void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate);
 
     /// <summary>Build the full conj-symmetric spectrum (two CPU passes in order) from mag/phase.</summary>
     void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft);

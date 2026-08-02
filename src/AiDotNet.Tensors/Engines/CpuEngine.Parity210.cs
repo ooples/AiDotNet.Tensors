@@ -677,6 +677,10 @@ public partial class CpuEngine
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn, so the
+        // tape records against the tensors the caller actually holds.
+        var x1Orig = x1;
+        var x2Orig = x2;
         if (!x1.IsContiguous) x1 = x1.Contiguous();
         if (!x2.IsContiguous) x2 = x2.Contiguous();
         var a = x1.AsSpan();
@@ -718,8 +722,19 @@ public partial class CpuEngine
             }
 
         // For 1-D inputs we produced a length-1 result; flatten to scalar.
-        if (rank == 1) return result.Reshape(new int[0]);
-        return result;
+        var final = rank == 1 ? result.Reshape(new int[0]) : result;
+
+        // Tape registration. This op recorded NOTHING, so x1/x2 received no gradient despite
+        // OpRegistry classifying TensorCosineSimilarity as differentiable. Note this uses
+        // CosineSimilarityDimBackward, NOT CosineSimilarityBackward — the latter belongs to
+        // TensorCosineSimilarityLoss, which is a whole-tensor SCALAR loss and would be wrong for
+        // any input carrying more than one similarity slice. Recorded against `final` (the tensor
+        // actually returned) so the tape's output identity matches what the caller receives.
+        DifferentiableOps.RecordBinary(
+            "TensorCosineSimilarity", final, x1Orig, x2Orig,
+            BackwardFunctions<T>.CosineSimilarityDimBackward,
+            savedState: new object[] { dim, eps });
+        return final;
     }
 
     private static T MaxScalar<T>(Interfaces.INumericOperations<T> ops, T a, T b)
@@ -738,6 +753,8 @@ public partial class CpuEngine
         if (n == 0) return new Tensor<T>(new[] { 0 });
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
+        var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
         var src = input.AsSpan();
         int pairs = n * (n - 1) / 2;
@@ -749,6 +766,13 @@ public partial class CpuEngine
             {
                 dst[cursor++] = PNorm(ops, src, i * d, j * d, d, p);
             }
+
+        // Tape registration — this op recorded nothing, so the input received no gradient
+        // despite OpRegistry classifying TensorPDist as differentiable.
+        DifferentiableOps.RecordUnary(
+            "TensorPDist", result, inputOrig,
+            BackwardFunctions<T>.PDistBackward,
+            savedState: new object[] { p });
         return result;
     }
 
@@ -764,6 +788,9 @@ public partial class CpuEngine
             throw new ArgumentException("CDist: feature dim must match");
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var x1Orig = x1;
+        var x2Orig = x2;
         if (!x1.IsContiguous) x1 = x1.Contiguous();
         if (!x2.IsContiguous) x2 = x2.Contiguous();
         var a = x1.AsSpan();
@@ -775,6 +802,13 @@ public partial class CpuEngine
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
                 dst[i * n + j] = PNormCross(ops, a, i * d, b, j * d, d, p);
+
+        // Tape registration — this op recorded nothing, so neither input received a gradient
+        // despite OpRegistry classifying TensorCDist as differentiable.
+        DifferentiableOps.RecordBinary(
+            "TensorCDist", result, x1Orig, x2Orig,
+            BackwardFunctions<T>.CDistBackward,
+            savedState: new object[] { p });
         return result;
     }
 
@@ -1020,6 +1054,12 @@ public partial class CpuEngine
                 idx[k] = 0;
             }
         }
+
+        // Tape registration — recorded nothing, so no input received a gradient despite
+        // OpRegistry classifying TensorCartesianProd as differentiable.
+        DifferentiableOps.RecordIfActive(
+            "TensorCartesianProd", result, tensors,
+            BackwardFunctions<T>.CartesianProdBackward);
         return result;
     }
 
@@ -1778,6 +1818,10 @@ public partial class CpuEngine
             throw new ArgumentException("At least one of min / max must be supplied");
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn. Recording the
+        // reassigned local would tape an internal copy the caller never sees, so a non-contiguous
+        // argument (a transpose or a slice) would receive no gradient at all.
+        var clampTensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Broadcast min / max against the tensor shape using NumPy / PyTorch
@@ -1818,6 +1862,29 @@ public partial class CpuEngine
                 idx[k] = 0;
             }
         }
+
+        // Tape registration. This op previously recorded NOTHING while its
+        // TensorClampMin / TensorClampMax siblings above both record, so
+        // TensorClampTensor silently produced no gradient for the tensor OR for
+        // tensor-valued bounds despite being classified differentiable.
+        //
+        // Gradient routing follows PyTorch's clamp: the output equals exactly one
+        // of {tensor, min, max} per element, so the incoming gradient goes wholly
+        // to whichever operand supplied it. The backward re-derives that choice
+        // with the SAME comparison order used above (min first, then max, so a max
+        // bound below the min bound wins — matching this loop), which is why the
+        // broadcast strides are saved rather than recomputed from shapes.
+        var clampInputs = min is null
+            ? (max is null ? new[] { clampTensorOrig } : new[] { clampTensorOrig, max })
+            : (max is null ? new[] { clampTensorOrig, min } : new[] { clampTensorOrig, min, max });
+        DifferentiableOps.RecordIfActive(
+            "TensorClampTensor", result, clampInputs,
+            BackwardFunctions<T>.ClampTensorBackward,
+            savedState: new object[]
+            {
+                min is not null, max is not null,
+                minStrides!, maxStrides!, tensor._shape,
+            });
         return result;
     }
 
@@ -1848,6 +1915,9 @@ public partial class CpuEngine
             srcDim++;
         }
 
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var selTensorOrig = tensor;
+        var selSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -1865,6 +1935,13 @@ public partial class CpuEngine
                 int srcPos = outer * innerSize + inner;
                 dst[dstPos] = src[srcPos];
             }
+
+        // Tape registration — recorded nothing, so neither the destination nor the scattered
+        // source received a gradient. Surfaced once the sweep could construct valid arguments.
+        DifferentiableOps.RecordBinary(
+            "TensorSelectScatter", result, selTensorOrig, selSourceOrig,
+            BackwardFunctions<T>.SelectScatterBackward,
+            savedState: new object[] { dim, index });
         return result;
     }
 
@@ -1990,6 +2067,9 @@ public partial class CpuEngine
             throw new ArgumentException($"source length {source.Length} must match index length {n}");
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var putIndexTensorOrig = tensor;
+        var putIndexSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -1999,6 +2079,7 @@ public partial class CpuEngine
 
         // Contiguous row-major strides over tensor.Shape.
         var strides = ComputeRowMajorStrides(tensor._shape);
+        var resolvedPositions = new int[n];
         for (int i = 0; i < n; i++)
         {
             int pos = 0;
@@ -2010,8 +2091,18 @@ public partial class CpuEngine
                         $"indices[{k}][{i}]={idx} out of range for axis size {tensor._shape[k]}");
                 pos += idx * strides[k];
             }
+            resolvedPositions[i] = pos;
             dst[pos] = accumulate ? ops.Add(dst[pos], srcData[i]) : srcData[i];
         }
+
+        // Tape registration — this op recorded nothing, so neither the destination nor the scattered
+        // source received a gradient. The RESOLVED flat positions are saved so the backward need not
+        // re-derive strides, and the accumulate flag selects between add (destination keeps its full
+        // gradient) and overwrite (written positions lose it, last write wins).
+        DifferentiableOps.RecordBinary(
+            "TensorIndexPut", result, putIndexTensorOrig, putIndexSourceOrig,
+            BackwardFunctions<T>.IndexPutBackward,
+            savedState: new object[] { resolvedPositions, accumulate });
         return result;
     }
 
@@ -2183,6 +2274,12 @@ public partial class CpuEngine
             rowOffset += r;
             colOffset += c;
         }
+
+        // Tape registration — recorded nothing, so no input matrix received a gradient despite
+        // OpRegistry classifying TensorBlockDiag as differentiable.
+        DifferentiableOps.RecordIfActive(
+            "TensorBlockDiag", result, matrices,
+            BackwardFunctions<T>.BlockDiagBackward);
         return result;
     }
 
@@ -2208,6 +2305,9 @@ public partial class CpuEngine
                     $"source.shape[{k}]={source._shape[k]} must match tensor.shape[{k}]={tensor._shape[k]}");
         }
 
+        // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
+        var sliceTensorOrig = tensor;
+        var sliceSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -2227,6 +2327,12 @@ public partial class CpuEngine
                     int srcPos = outer * length * innerSize + i * innerSize + inner;
                     dst[dstPos] = src[srcPos];
                 }
+
+        // Tape registration — see TensorSelectScatter above.
+        DifferentiableOps.RecordBinary(
+            "TensorSliceScatter", result, sliceTensorOrig, sliceSourceOrig,
+            BackwardFunctions<T>.SliceScatterBackward,
+            savedState: new object[] { dim, start, length });
         return result;
     }
 
@@ -2293,6 +2399,11 @@ public partial class CpuEngine
         }
 
         var ops = MathHelper.GetNumericOperations<T>();
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
+        var scatterTensorOrig = tensor;
+        // The destination already captured its pre-Contiguous ref; the SOURCE needs the same, or a
+        // non-contiguous source operand is taped as an internal copy and receives no gradient.
+        var scatterSourceOrig = source;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!source.IsContiguous) source = source.Contiguous();
 
@@ -2391,6 +2502,14 @@ public partial class CpuEngine
                     dst[i] = ops.Divide(dst[i], ops.FromDouble(counts[i]));
         }
 
+        // Tape registration — this op recorded nothing, so neither the destination nor the scattered
+        // source received a gradient. The index list, mode and includeSelf flag are snapshotted so the
+        // backward can replay the forward's per-slot decisions (which contributor won an AMin/AMax
+        // slot, each slot's Mean divisor, whether the destination value survived) exactly.
+        DifferentiableOps.RecordBinary(
+            "TensorScatterReduce", result, scatterTensorOrig, scatterSourceOrig,
+            BackwardFunctions<T>.ScatterReduceBackward,
+            savedState: new object[] { dim, indices.GetFlattenedData(), (int)mode, includeSelf });
         return result;
     }
 
@@ -3487,7 +3606,16 @@ public partial class CpuEngine
         // Bit-level next-after. We dispatch on typeof(T) so fp32 stays in fp32
         // (avoids the trap where "next after 1.0 toward 2.0" in fp64 rounds
         // straight back to 1.0f when cast through T=float).
-        return ElementwiseBinary(a, b, (av, bv) => NextAfterDispatch(av, bv), "TensorNextAfter");
+        var lazy = TryRecordLazyBinary("TensorNextAfter", a, b,
+            eng => eng.TensorNextAfter(a, b), BackwardFunctions<T>.NextAfterBackward);
+        if (lazy != null) return lazy;
+        var result = ElementwiseBinary(a, b, (av, bv) => NextAfterDispatch(av, bv), "TensorNextAfter");
+        // This op alone among the ElementwiseBinary family returned its result without recording
+        // (its siblings — TensorHypot, TensorLogAddExp, TensorXlogy, … — all wrap the helper with a
+        // RecordBinary call), so it produced no gradient despite being classified differentiable.
+        DifferentiableOps.RecordBinary("TensorNextAfter", result, a, b,
+            BackwardFunctions<T>.NextAfterBackward);
+        return result;
     }
 
     private static T NextAfterDispatch<T>(T av, T bv)
@@ -3544,6 +3672,8 @@ public partial class CpuEngine
         if (indices.Length != source.Length)
             throw new ArgumentException("indices and source must have the same element count");
 
+        // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
+        var putTensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = (Tensor<T>)tensor.Clone();
         var dst = result.AsWritableSpan();
@@ -3558,6 +3688,13 @@ public partial class CpuEngine
                     $"indices[{i}]={pos} out of range for flattened length {total}");
             dst[pos] = src[i];
         }
+
+        // Tape registration — recorded nothing. The index list is snapshotted so the backward can
+        // resolve last-write-wins for duplicate indices without re-reading a mutable tensor.
+        DifferentiableOps.RecordBinary(
+            "TensorPut", result, putTensorOrig, source,
+            BackwardFunctions<T>.PutBackward,
+            savedState: new object[] { indices.GetFlattenedData() });
         return result;
     }
 
