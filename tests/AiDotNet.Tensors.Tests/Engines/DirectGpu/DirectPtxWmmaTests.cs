@@ -366,6 +366,25 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [Fact]
+    public void OnlineAttentionEpsilon_IsLaunchDataRatherThanModuleIdentity()
+    {
+        string defaultPtx = PtxOnlineFusedAttention128x64Kernel.EmitPtx(
+            8, 6, isCausal: true, fuseLayerNormGelu: true,
+            0.125f, 1e-5f, sequenceLength: 128,
+            emitSoftmaxStats: true, warpsPerBlock: 8);
+        string callerSpecificPtx = PtxOnlineFusedAttention128x64Kernel.EmitPtx(
+            8, 6, isCausal: true, fuseLayerNormGelu: true,
+            0.125f, 7.5e-4f, sequenceLength: 128,
+            emitSoftmaxStats: true, warpsPerBlock: 8);
+
+        Assert.Equal(defaultPtx, callerSpecificPtx);
+        Assert.Contains(".param .f32 epsilon", callerSpecificPtx, StringComparison.Ordinal);
+        DirectPtxCubinArtifact artifact = Assert.IsType<DirectPtxCubinArtifact>(
+            DirectPtxCubinArtifactCache.TryResolveEmbedded(callerSpecificPtx, 8, 6));
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, artifact.ImageKind);
+    }
+
     [Theory]
     [MemberData(nameof(OnlineAttentionReleaseCases))]
     public void OnlineAttentionReleaseCase_HasEmbeddedSm86Cubin(
