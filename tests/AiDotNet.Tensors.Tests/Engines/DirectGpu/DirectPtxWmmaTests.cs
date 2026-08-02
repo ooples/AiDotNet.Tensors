@@ -13,28 +13,46 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 public partial class DirectPtxWmmaTests
 {
-    public static TheoryData<int, bool, bool, int> OnlineAttentionReleaseCases => new()
+    public static TheoryData<int, bool, bool, int> OnlineAttentionReleaseCases
     {
-        { 16, false, false, 1 },
-        { 16, true, true, 1 },
-        { 32, false, false, 1 },
-        { 32, true, true, 2 },
-        { 64, false, false, 2 },
-        { 64, true, true, 4 },
-        { 128, false, false, 4 },
-        { 128, false, true, 8 },
-        { 128, true, false, 4 },
-        { 128, true, true, 8 }
-    };
+        get
+        {
+            var data = new TheoryData<int, bool, bool, int>();
+            foreach (DirectPtxOnlineAttentionBasicReleaseCase releaseCase in
+                     DirectPtxOnlineAttentionReleaseMatrix.BasicCases)
+            {
+                data.Add(
+                    releaseCase.Sequence,
+                    releaseCase.Causal,
+                    releaseCase.Epilogue,
+                    releaseCase.Warps);
+            }
 
-    public static TheoryData<int, int, int, int, int, bool, int> OnlineAttentionFamilyReleaseCases => new()
+            return data;
+        }
+    }
+
+    public static TheoryData<int, int, int, int, int, bool, int> OnlineAttentionFamilyReleaseCases
     {
-        { 2, 4, 2, 32, 64, false, 0 },
-        { 2, 8, 1, 32, 64, true, 0 },
-        { 2, 8, 2, 32, 64, true, 32 },
-        { 1, 4, 4, 128, 32, true, 0 },
-        { 1, 4, 2, 128, 64, true, -64 }
-    };
+        get
+        {
+            var data = new TheoryData<int, int, int, int, int, bool, int>();
+            foreach (DirectPtxOnlineAttentionFamilyReleaseCase releaseCase in
+                     DirectPtxOnlineAttentionReleaseMatrix.FamilyCases)
+            {
+                data.Add(
+                    releaseCase.Batch,
+                    releaseCase.QueryHeads,
+                    releaseCase.KeyValueHeads,
+                    releaseCase.QuerySequence,
+                    releaseCase.KeyValueSequence,
+                    releaseCase.Causal,
+                    releaseCase.CausalQueryOffset);
+            }
+
+            return data;
+        }
+    }
 
     [SkippableTheory]
     [InlineData(16, false)]
