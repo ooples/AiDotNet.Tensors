@@ -365,10 +365,13 @@ public class CodegenTensorCoreStagingTests
     [Fact]
     public void BlockThreads_TracksTheLoweringThatWasEmitted()
     {
-        var staged = new PtxTensorCoreEmitter { WarpsPerBlock = 8 };
+        var staged = Tile2x2();
+        staged.WarpsPerBlock = 8;
         staged.Emit(MatMul(512, 512, 512), Sm86Major, Sm86Minor);
 
         Assert.True(staged.Staged);
+        Assert.Equal(2, staged.WarpTilesM);
+        Assert.Equal(2, staged.WarpTilesN);
         Assert.Equal(128, staged.BlockThreads);
 
         var naive = new PtxTensorCoreEmitter { EnableStaging = false, WarpsPerBlock = 8 };
@@ -491,9 +494,13 @@ public class CodegenTensorCoreStagingTests
     /// value outside the measured 2/4 ladder at assignment time.
     /// </summary>
     [Theory]
+    [InlineData(-1)]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(3)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
     [InlineData(8)]
     public void WarpTileExtents_RejectUnsupportedValues(int extent)
     {

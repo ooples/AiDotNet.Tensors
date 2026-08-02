@@ -50,6 +50,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Only operator-isolated, manifested direct-PTX release cubins are
+         executable package resources. Loose legacy files under smXX remain
+         excluded until they pass the same source/hash/resource gates. -->
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.cubin" />
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*-cubins.tsv" />
     <InternalsVisibleTo Include="AiDotNet" />
     <InternalsVisibleTo Include="AiDotNetTests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
