@@ -503,9 +503,19 @@ internal sealed class DirectPtxBuffer : IDisposable
         if (bytes > ByteLength) throw new ArgumentException("Source is larger than the device buffer.", nameof(source));
         using var _ = _runtime.Enter();
         fixed (T* pSource = source)
+        {
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyHtoD(_pointer, (IntPtr)pSource, checked((ulong)bytes)),
                 "cuMemcpyHtoD");
+            // Standalone runtimes launch on a CU_STREAM_NON_BLOCKING stream.
+            // A synchronous pageable-host copy is issued in the null-stream
+            // ordering domain and therefore does not establish an edge to that
+            // stream. Complete the transfer before the caller can enqueue a
+            // kernel, or concurrent contexts can observe an incompletely staged
+            // input and leave apparently random output blocks at zero.
+            DirectPtxRuntime.Check(
+                CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+        }
     }
 
     internal unsafe void Download<T>(Span<T> destination) where T : unmanaged
@@ -513,6 +523,11 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)destination.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Destination is larger than the device buffer.", nameof(destination));
         using var _ = _runtime.Enter();
+        // The null-stream DtoH copy does not wait for work in the runtime's
+        // non-blocking stream. Make Download independently correct even when a
+        // caller omits an explicit Synchronize before reading the result.
+        DirectPtxRuntime.Check(
+            CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(download)");
         fixed (T* pDestination = destination)
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyDtoH((IntPtr)pDestination, _pointer, checked((ulong)bytes)),
