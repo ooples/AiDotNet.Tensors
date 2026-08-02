@@ -76,7 +76,10 @@ internal static class DirectPtxCubinArtifactCache
         lock (Sync)
         {
             DirectPtxCubinArtifact? embedded = TryReadEmbedded(
-                runtime, sourceKey, ComputePtxSha256(ptx));
+                runtime.ComputeCapabilityMajor,
+                runtime.ComputeCapabilityMinor,
+                sourceKey,
+                ComputePtxSha256(ptx));
             if (embedded != null)
                 return embedded;
 
@@ -104,6 +107,20 @@ internal static class DirectPtxCubinArtifactCache
     internal static string ComputePtxSha256(string ptx) =>
         Sha256(Encoding.UTF8.GetBytes(CanonicalizePtx(ptx)));
 
+    internal static DirectPtxCubinArtifact? TryResolveEmbedded(
+        string ptx,
+        int computeCapabilityMajor,
+        int computeCapabilityMinor)
+    {
+        PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
+        ptx = CanonicalizePtx(ptx);
+        return TryReadEmbedded(
+            computeCapabilityMajor,
+            computeCapabilityMinor,
+            ComputeSourceKey(ptx, computeCapabilityMajor, computeCapabilityMinor),
+            ComputePtxSha256(ptx));
+    }
+
     internal static string CanonicalizePtx(string ptx)
     {
         PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
@@ -113,11 +130,14 @@ internal static class DirectPtxCubinArtifactCache
     }
 
     private static DirectPtxCubinArtifact? TryReadEmbedded(
-        DirectPtxRuntime runtime, string sourceKey, string ptxSha256)
+        int computeCapabilityMajor,
+        int computeCapabilityMinor,
+        string sourceKey,
+        string ptxSha256)
     {
         string architecture = "sm" +
-            runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture);
+            computeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
+            computeCapabilityMinor.ToString(CultureInfo.InvariantCulture);
         string sourceIdentity = architecture + "|source|" + sourceKey;
         string ptxIdentity = architecture + "|ptx|" + ptxSha256;
         if (!EmbeddedArtifacts.Value.TryGetValue(sourceIdentity, out EmbeddedArtifact? artifact) &&

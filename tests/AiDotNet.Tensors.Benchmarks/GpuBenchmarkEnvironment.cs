@@ -123,19 +123,23 @@ internal static class GpuBenchmarkEnvironment
                 contribution = Math.Max(0,
                     (sample.TotalProcessorTime - start.TotalProcessorTime).TotalMilliseconds);
             }
-            else
+            else if (sample.StartTimeUtc > sliceStartedUtc)
             {
                 // A newly observed process may have started during this slice. Its
                 // accumulated CPU time is relevant, but never count work older than
                 // the slice or more CPU time than its observed lifetime can contain.
-                DateTime observedStartUtc = sample.StartTimeUtc > sliceStartedUtc
-                    ? sample.StartTimeUtc
-                    : sliceStartedUtc;
                 double observedLifetimeMilliseconds = Math.Max(0,
-                    (sliceEndedUtc - observedStartUtc).TotalMilliseconds);
+                    (sliceEndedUtc - sample.StartTimeUtc).TotalMilliseconds);
                 contribution = Math.Min(
                     sample.TotalProcessorTime.TotalMilliseconds,
                     observedLifetimeMilliseconds * processorCount);
+            }
+            else
+            {
+                // The process predates this slice but had no readable baseline, so an
+                // access race hid it earlier. No delta is available until the next
+                // slice; charging its lifetime here would create a false busy host.
+                continue;
             }
 
             busyMilliseconds += Math.Min(
