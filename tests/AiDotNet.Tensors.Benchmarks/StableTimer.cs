@@ -280,10 +280,10 @@ internal static class StableTimer
     }
 
     /// <summary>
-    /// Host-pairs two launches after calibrating a common batch length. AB/BA
-    /// brackets remove launch-order bias; an odd median-of-brackets rejects an
-    /// isolated desktop preemption while the unchanged outer spread gate decides
-    /// actionability.
+    /// Host-pairs two launches after calibrating independent batch lengths to the
+    /// same wall-clock exposure. AB/BA brackets remove launch-order bias; an odd
+    /// median-of-brackets rejects an isolated desktop preemption while the
+    /// unchanged outer spread gate decides actionability.
     /// </summary>
     internal static PairResult MeasureCalibratedHostPair(
         Action launchA,
@@ -332,8 +332,10 @@ internal static class StableTimer
             calibrationB = Math.Min(calibrationB,
                 TimeHostBatch(launchB, synchronizeB, calibrationLaunches));
         }
-        int iterations = CalibratedIterationsFromMicroseconds(
-            Math.Max(calibrationA, calibrationB), targetBatchMilliseconds);
+        int iterationsA = CalibratedIterationsFromMicroseconds(
+            calibrationA, targetBatchMilliseconds);
+        int iterationsB = CalibratedIterationsFromMicroseconds(
+            calibrationB, targetBatchMilliseconds);
 
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
@@ -347,13 +349,13 @@ internal static class StableTimer
             var bracketRatios = new List<double>(bracketsPerAttempt);
             for (int bracket = 0; bracket < bracketsPerAttempt; bracket++)
             {
-                double aFirst = TimeHostBatch(launchA, synchronizeA, iterations) /
+                double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA) /
                     operationsPerLaunchA;
-                double bSecond = TimeHostBatch(launchB, synchronizeB, iterations) /
+                double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB) /
                     operationsPerLaunchB;
-                double bFirst = TimeHostBatch(launchB, synchronizeB, iterations) /
+                double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB) /
                     operationsPerLaunchB;
-                double aSecond = TimeHostBatch(launchA, synchronizeA, iterations) /
+                double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA) /
                     operationsPerLaunchA;
                 double a = (aFirst + aSecond) * 0.5;
                 double b = (bFirst + bSecond) * 0.5;
