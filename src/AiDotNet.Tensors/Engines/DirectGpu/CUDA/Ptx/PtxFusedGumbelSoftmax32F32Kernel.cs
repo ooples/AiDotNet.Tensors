@@ -132,6 +132,23 @@ internal sealed class PtxFusedGumbelSoftmax32F32Kernel : IDisposable
         ptx.AppendLine("    lg2.approx.f32 %f3, %f2;");
         ptx.AppendLine("    mul.rn.f32 %f3, %f3, 0f3F317218;");
         ptx.AppendLine("    neg.f32 %f3, %f3;");
+        // lg2.approx has a small absolute error, but -ln(u) approaches zero as
+        // u approaches one and the following logarithm amplifies that error.
+        // For the narrow cancellation-prone interval, evaluate
+        // -ln(1-y) = y * (1 + y/2 + ... + y^6/7) with a fixed Horner chain.
+        // At y <= 1/8 the omitted tail is below 8e-9; the common path keeps the
+        // cheaper native approximation.
+        ptx.AppendLine("    setp.gt.f32 %p0, %f2, 0f3F600000;");
+        ptx.AppendLine("    sub.rn.f32 %f13, 0f3F800000, %f2;");
+        ptx.AppendLine("    mov.f32 %f14, 0f3E124925;");
+        ptx.AppendLine("    fma.rn.f32 %f14, %f14, %f13, 0f3E2AAAAB;");
+        ptx.AppendLine("    fma.rn.f32 %f14, %f14, %f13, 0f3E4CCCCD;");
+        ptx.AppendLine("    fma.rn.f32 %f14, %f14, %f13, 0f3E800000;");
+        ptx.AppendLine("    fma.rn.f32 %f14, %f14, %f13, 0f3EAAAAAB;");
+        ptx.AppendLine("    fma.rn.f32 %f14, %f14, %f13, 0f3F000000;");
+        ptx.AppendLine("    fma.rn.f32 %f14, %f14, %f13, 0f3F800000;");
+        ptx.AppendLine("    mul.rn.f32 %f15, %f13, %f14;");
+        ptx.AppendLine("    @%p0 mov.f32 %f3, %f15;");
         ptx.AppendLine("    lg2.approx.f32 %f4, %f3;");
         ptx.AppendLine("    mul.rn.f32 %f4, %f4, 0f3F317218;");
         ptx.AppendLine("    neg.f32 %f4, %f4;");
@@ -150,8 +167,10 @@ internal sealed class PtxFusedGumbelSoftmax32F32Kernel : IDisposable
         ptx.AppendLine("    mov.b32 %r23, %f7;");
         ptx.AppendLine("    shfl.sync.idx.b32 %r24, %r23, 0, 0x1f, 0xffffffff;");
         ptx.AppendLine("    mov.b32 %f8, %r24;");
-        ptx.AppendLine("    rcp.approx.f32 %f8, %f8;");
-        ptx.AppendLine("    mul.rn.f32 %f9, %f12, %f8;");
+        // Keep fast approximate transcendentals, but round the final
+        // normalization division. The reciprocal approximation's error is
+        // amplified at the million-element validation shape.
+        ptx.AppendLine("    div.rn.f32 %f9, %f12, %f8;");
         ptx.AppendLine("    st.global.f32 [%rd7], %f9;");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -199,7 +218,7 @@ internal sealed class PtxFusedGumbelSoftmax32F32Kernel : IDisposable
                 ["rng-abi"] = "philox4x32-10-v1",
                 ["counter"] = "counterOffset+global-element-index; subsequence in high64",
                 ["word-mapping"] = "one Philox counter per element; word0 consumed",
-                ["gumbel"] = "-ln(-ln(clamp(u,2^-32,nextafter(1,0))))",
+                ["gumbel"] = "-ln(-ln(clamp(u,2^-32,nextafter(1,0)))); fixed FP32 log1p series near u=1",
                 ["softmax"] = "warp max then warp sum; approximate PTX transcendental mode",
                 ["global-reads"] = "one scalar logit per lane",
                 ["global-writes"] = "one final scalar probability per lane",

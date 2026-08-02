@@ -50,7 +50,6 @@ public sealed class DirectPtxRngDropoutTests
     [InlineData((int)DirectPtxPhiloxFillKind.Uniform)]
     [InlineData((int)DirectPtxPhiloxFillKind.Normal)]
     [InlineData((int)DirectPtxPhiloxFillKind.BernoulliMask)]
-    [InlineData((int)DirectPtxPhiloxFillKind.DropThresholdMask)]
     public void FillEmitterUsesExactFloat4PhiloxAbiWithoutTailOrLocalStorage(
         int kindValue)
     {
@@ -70,6 +69,22 @@ public sealed class DirectPtxRngDropoutTests
         Assert.DoesNotContain(" bra ", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(".param .u32 size", ptx, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void StatelessDropoutEmitterPreservesSharedPcgIntegerContract()
+    {
+        string ptx = PtxPhiloxFillF32Kernel.EmitPtx(
+            8, 6, DirectPtxPhiloxFillKind.DropThresholdMask, 65_536);
+
+        Assert.Equal(0, Count(ptx, "// Philox4x32-10 round"));
+        Assert.Equal(4, Count(ptx, "mad.lo.u32 %r15, %r14, 747796405, %r4"));
+        Assert.Equal(4, Count(ptx, "mul.lo.u32 %r18, %r17, 277803737"));
+        Assert.Equal(4, Count(ptx, "shr.u32 %r17, %r15, %r16"));
+        Assert.Contains("selp.f32 %f0, 0f00000000, %f8, %p0", ptx,
+            StringComparison.Ordinal);
+        Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
+        Assert.DoesNotContain(" bra ", ptx, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -142,6 +157,25 @@ public sealed class DirectPtxRngDropoutTests
     }
 
     [Fact]
+    public void DropoutBackwardUnrollBalancesSmallShapeOccupancyAndLargeShapeIlp()
+    {
+        string small = PtxDropoutBackwardF32Kernel.EmitPtx(8, 6, 4_096);
+        string large = PtxDropoutBackwardF32Kernel.EmitPtx(8, 6, 1_048_576);
+
+        Assert.Equal(2, PtxDropoutBackwardF32Kernel.GetValuesPerThread(4_096));
+        Assert.Equal(4, PtxDropoutBackwardF32Kernel.GetValuesPerThread(65_536));
+        Assert.Equal(8, PtxDropoutBackwardF32Kernel.GetValuesPerThread(1_048_576));
+        Assert.Contains("values_per_thread=2", small, StringComparison.Ordinal);
+        Assert.Equal(2, Count(small, "ld.global.v2.f32"));
+        Assert.Equal(1, Count(small, "st.global.v2.f32"));
+        Assert.Contains("values_per_thread=8", large, StringComparison.Ordinal);
+        Assert.Contains("mad.lo.u32 %r2, %r1, 512, %r0", large, StringComparison.Ordinal);
+        Assert.Contains("add.u64 %rd7, %rd3, 4096", large, StringComparison.Ordinal);
+        Assert.Equal(4, Count(large, "ld.global.v4.f32"));
+        Assert.Equal(2, Count(large, "st.global.v4.f32"));
+    }
+
+    [Fact]
     public void DropoutBackwardEmitterRejectsEveryUnmeasuredSm()
     {
         Assert.Throws<PlatformNotSupportedException>(() =>
@@ -163,6 +197,11 @@ public sealed class DirectPtxRngDropoutTests
         Assert.Equal(2, Count(ptx, "shfl.sync.idx.b32"));
         Assert.Equal(2, Count(ptx, "lg2.approx.f32"));
         Assert.Equal(1, Count(ptx, "ex2.approx.f32"));
+        Assert.Equal(1, Count(ptx, "div.rn.f32"));
+        Assert.Equal(6, Count(ptx, "fma.rn.f32 %f14"));
+        Assert.Contains("setp.gt.f32 %p0, %f2, 0f3F600000", ptx, StringComparison.Ordinal);
+        Assert.Contains("@%p0 mov.f32 %f3, %f15", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rcp.approx.f32", ptx, StringComparison.Ordinal);
         Assert.Equal(1, Count(ptx, "ld.global.f32"));
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
@@ -200,13 +239,19 @@ public sealed class DirectPtxRngDropoutTests
         Assert.Contains(PtxFusedImportanceSampling64F32Kernel.EntryPoint, ptx, StringComparison.Ordinal);
         Assert.Contains("exact_shape=[1024,64,64]", ptx, StringComparison.Ordinal);
         Assert.Contains("one_warp_per_ray=1", ptx, StringComparison.Ordinal);
-        Assert.Contains("cdf_unrolled=64", ptx, StringComparison.Ordinal);
+        Assert.Contains("cooperative_cdf=64", ptx, StringComparison.Ordinal);
+        Assert.Contains("binary_search_steps=6", ptx, StringComparison.Ordinal);
         Assert.Equal(20, Count(ptx, "// Philox4x32-10 round"));
         Assert.Equal(4, Count(ptx, "ld.global.f32"));
         Assert.Equal(4, Count(ptx, "st.shared.f32"));
+        Assert.Contains("mov.u64 %rd8, t_shared;", ptx, StringComparison.Ordinal);
+        Assert.Contains("mov.u64 %rd9, weights_shared;", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("shared+%rd", ptx, StringComparison.Ordinal);
         Assert.Equal(2, Count(ptx, "st.global.f32"));
         Assert.Equal(1, Count(ptx, "bar.sync 0"));
-        Assert.Equal(128, Count(ptx, "ld.shared.f32 %f11, [weights_shared+"));
+        Assert.Equal(10, Count(ptx, "shfl.sync.up.b32"));
+        Assert.Equal(12, Count(ptx, "ld.shared.f32 %f11, [%rd10]"));
+        Assert.Equal(2, Count(ptx, "div.rn.f32"));
         Assert.DoesNotContain(" bra ", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("num_rays", ptx, StringComparison.OrdinalIgnoreCase);
@@ -420,13 +465,37 @@ public sealed class DirectPtxRngDropoutTests
         var kind = (DirectPtxRreluKind)kindValue;
         string ptx = PtxRreluF32Kernel.EmitPtx(8, 6, kind, 65_536);
 
-        Assert.Equal(expectedLoads, Count(ptx, "ld.global.v4.f32"));
+        Assert.Equal(expectedLoads, Count(ptx, "ld.global.cg.v4.f32"));
         Assert.Equal(expectedStores, Count(ptx, "st.global.v4.f32"));
         Assert.Equal(4, Count(ptx, "setp.ge.f32"));
+        Assert.Equal(1, Count(ptx, "@%p5 ld.global.cg.v4.f32"));
+        Assert.Equal(4, Count(ptx, "@!%p"));
+        Assert.DoesNotContain("selp.f32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(" bra ", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(".param .u32 size", ptx, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SavedNoiseRreluUnrollBalancesSmallShapeOccupancyAndLargeShapeIlp()
+    {
+        string small = PtxRreluF32Kernel.EmitPtx(
+            8, 6, DirectPtxRreluKind.Forward, 4_096);
+        string large = PtxRreluF32Kernel.EmitPtx(
+            8, 6, DirectPtxRreluKind.Backward, 1_048_576);
+
+        Assert.Equal(2, PtxRreluF32Kernel.GetValuesPerThread(4_096));
+        Assert.Equal(4, PtxRreluF32Kernel.GetValuesPerThread(65_536));
+        Assert.Equal(16, PtxRreluF32Kernel.GetValuesPerThread(1_048_576));
+        Assert.Contains("values_per_thread=2", small, StringComparison.Ordinal);
+        Assert.Equal(2, Count(small, "ld.global.cg.v2.f32"));
+        Assert.Equal(1, Count(small, "st.global.v2.f32"));
+        Assert.Contains("values_per_thread=16", large, StringComparison.Ordinal);
+        Assert.Contains("mad.lo.u32 %r2, %r1, 512, %r0", large, StringComparison.Ordinal);
+        Assert.Contains("add.u64 %rd7, %rd4, 6144", large, StringComparison.Ordinal);
+        Assert.Equal(12, Count(large, "ld.global.cg.v4.f32"));
+        Assert.Equal(4, Count(large, "st.global.v4.f32"));
     }
 
     [Fact]

@@ -14,11 +14,17 @@ internal static class DirectPtxRngDropoutExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int DeviceLaunches = 10;
+    private const int ThroughputOperationsPerGraph = 64;
+    private const double RequiredGain = 1.10;
     private const float DropoutRate = 0.1f;
     private const ulong Seed = 0x8490_1234_5678_9ABCul;
 
     private readonly record struct Shape(string Name, int Elements);
     private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
+    private readonly record struct OracleEvidence(
+        StableTimer.PairResult Timing,
+        double DirectError,
+        double IncumbentError);
     private readonly record struct Cell(
         int Run,
         Shape Shape,
@@ -29,7 +35,8 @@ internal static class DirectPtxRngDropoutExperiment
         long ManagedBytes,
         long TemporaryDeviceBytes,
         double MaximumError,
-        DirectPtxKernelAudit? Audit);
+        DirectPtxKernelAudit? Audit,
+        OracleEvidence? PairedEvidence);
     private sealed record PythonCell(
         string Status,
         int Run,
@@ -146,14 +153,36 @@ internal static class DirectPtxRngDropoutExperiment
             throw new InvalidOperationException("The prewarmed PTX module has no audit record.");
         Console.WriteLine($"audit run={run} shape={shape.Name}: {audit.ToJson()}");
 
-        IntPtr graph = backend.CaptureGraph(DirectLaunch);
-        if (graph == IntPtr.Zero)
-            throw new InvalidOperationException("Could not capture the prewarmed PTX dropout route.");
+        IntPtr graph = IntPtr.Zero;
+        IntPtr directThroughputGraph = IntPtr.Zero;
+        IntPtr currentThroughputGraph = IntPtr.Zero;
         try
         {
+            graph = backend.CaptureGraph(DirectLaunch);
+            directThroughputGraph = CaptureRepeatedGraph(
+                backend, DirectLaunch, ThroughputOperationsPerGraph);
+            currentThroughputGraph = CaptureRepeatedGraph(
+                establishedBackend, CurrentLaunch, ThroughputOperationsPerGraph);
+            if (graph == IntPtr.Zero || directThroughputGraph == IntPtr.Zero ||
+                currentThroughputGraph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    "Could not capture the prewarmed dropout comparison graphs.");
+
+            StableTimer.PairResult paired = StableTimer.MeasureCalibratedHostPair(
+                () => backend.EnqueueCapturedGraph(directThroughputGraph),
+                backend.Synchronize,
+                () => establishedBackend.EnqueueCapturedGraph(currentThroughputGraph),
+                establishedBackend.Synchronize,
+                operationsPerLaunchA: ThroughputOperationsPerGraph,
+                operationsPerLaunchB: ThroughputOperationsPerGraph);
             void GraphLaunch() => backend.EnqueueCapturedGraph(graph);
-            yield return Measure(backend, run, shape, "Direct PTX CUDA graph", GraphLaunch,
+            Cell graphCell = Measure(
+                backend, run, shape, "Direct PTX CUDA graph", GraphLaunch,
                 directError, audit, temporaryDeviceBytes: 0);
+            yield return graphCell with
+            {
+                PairedEvidence = new OracleEvidence(paired, directError, currentError)
+            };
             long directDispatchBefore = backend.DirectPtxRngDropoutDispatchCount;
             Cell direct = Measure(backend, run, shape, "Direct PTX fused", DirectLaunch,
                 directError, audit, temporaryDeviceBytes: 0);
@@ -174,7 +203,18 @@ internal static class DirectPtxRngDropoutExperiment
         finally
         {
             backend.DestroyCapturedGraph(graph);
+            backend.DestroyCapturedGraph(directThroughputGraph);
+            establishedBackend.DestroyCapturedGraph(currentThroughputGraph);
         }
+    }
+
+    private static IntPtr CaptureRepeatedGraph(
+        CudaBackend backend, Action launch, int operations)
+    {
+        return backend.CaptureGraph(() =>
+        {
+            for (int i = 0; i < operations; i++) launch();
+        });
     }
 
     private static Cell Measure(
@@ -196,7 +236,7 @@ internal static class DirectPtxRngDropoutExperiment
             (device.Median * 1e-6) / 1e9;
         return new Cell(
             run, shape, method, device, endToEnd, gbps,
-            managedBytes, temporaryDeviceBytes, maximumError, audit);
+            managedBytes, temporaryDeviceBytes, maximumError, audit, null);
     }
 
     private static Distribution MeasureDevice(CudaBackend backend, Action action)
@@ -353,7 +393,70 @@ internal static class DirectPtxRngDropoutExperiment
                 $"{cell.DeviceMeanUs:F3}/{cell.DeviceMedianUs:F3}/{cell.DeviceP95Us:F3}/{cell.DeviceP99Us:F3} | " +
                 $"{cell.EndToEndMeanUs:F3}/{cell.EndToEndMedianUs:F3}/{cell.EndToEndP95Us:F3}/{cell.EndToEndP99Us:F3} | " +
                 $"{cell.GbPerSecond:F2} | n/a | {cell.PeakDeviceBytes} | {cell.MaxError:E3} | pending");
+        foreach (Cell cell in cells.Where(cell => cell.PairedEvidence is not null))
+            PrintPairedEvidence(cell);
     }
+
+    private static void PrintPairedEvidence(Cell cell)
+    {
+        OracleEvidence evidence = cell.PairedEvidence!.Value;
+        StableTimer.PairResult timing = evidence.Timing;
+        double incumbentOverDirect = 1.0 / timing.Ratio;
+        const double semanticTolerance = 1.0e-4;
+        bool correctnessPassed =
+            double.IsFinite(evidence.DirectError) &&
+            double.IsFinite(evidence.IncumbentError) &&
+            evidence.DirectError <= semanticTolerance &&
+            evidence.IncumbentError <= semanticTolerance;
+        string measurementStatus = !correctnessPassed
+            ? "correctness-failed"
+            : !timing.Stable
+                ? "unstable"
+                : "stable";
+        string verdict = !correctnessPassed || !timing.Stable
+            ? "not-measurable"
+            : incumbentOverDirect >= RequiredGain
+                ? "win"
+                : incumbentOverDirect <= 1.0 / RequiredGain
+                    ? "loss"
+                    : "tie";
+        Console.WriteLine(
+            $"oracle | {cell.Run} | {cell.Shape.Name} | " +
+            $"direct={timing.A.Describe()} | incumbent={timing.B.Describe()} | " +
+            $"direct/incumbent={(correctnessPassed ? timing.DescribeRatio() : "-")} | " +
+            $"correctness={measurementStatus} " +
+            $"(direct={evidence.DirectError:E3}, incumbent={evidence.IncumbentError:E3}, " +
+            $"tolerance={semanticTolerance:E1}) | {verdict}");
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            kind = "rng-dropout-kernel-throughput-oracle",
+            run = cell.Run,
+            shape = cell.Shape.Name,
+            lane = "repeated-cuda-graph-host-paired",
+            logical_operations_per_graph = ThroughputOperationsPerGraph,
+            direct_median_us = timing.A.Stable ? timing.A.Microseconds : (double?)null,
+            incumbent_median_us = timing.B.Stable ? timing.B.Microseconds : (double?)null,
+            incumbent_over_direct = correctnessPassed && timing.Stable
+                ? incumbentOverDirect
+                : (double?)null,
+            direct_relative_spread = FiniteOrNull(timing.A.RelativeSpread),
+            incumbent_relative_spread = FiniteOrNull(timing.B.RelativeSpread),
+            paired_ratio_relative_spread = FiniteOrNull(timing.RelativeSpread),
+            attempts = timing.Samples,
+            required_gain = RequiredGain,
+            direct_semantic_error = FiniteOrNull(evidence.DirectError),
+            incumbent_semantic_error = FiniteOrNull(evidence.IncumbentError),
+            semantic_tolerance = semanticTolerance,
+            correctness_passed = correctnessPassed,
+            measurement_status = measurementStatus,
+            verdict,
+            diagnostic_only = true,
+            promotion = false
+        }));
+    }
+
+    private static double? FiniteOrNull(double value) =>
+        double.IsNaN(value) || double.IsInfinity(value) ? null : value;
 
     private static Distribution Summarize(double[] values)
     {

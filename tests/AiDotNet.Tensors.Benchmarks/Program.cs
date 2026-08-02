@@ -84,7 +84,15 @@ class Program
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
             bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
-            DirectPtxRngStochasticExperiment.Run(runs, includeExternal);
+            int familyIndex = Array.IndexOf(args, "--family");
+            string? family = familyIndex >= 0 && familyIndex + 1 < args.Length
+                ? args[familyIndex + 1]
+                : null;
+            int operationIndex = Array.IndexOf(args, "--operation");
+            string? operation = operationIndex >= 0 && operationIndex + 1 < args.Length
+                ? args[operationIndex + 1]
+                : null;
+            DirectPtxRngStochasticExperiment.Run(runs, includeExternal, family, operation);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")

@@ -17,6 +17,8 @@ internal static class DirectPtxRngStochasticExperiment
     private const int Warmups = 30;
     private const int Samples = 101;
     private const int DeviceLaunches = 10;
+    private const int ThroughputOperationsPerGraph = 64;
+    private const double RequiredGain = 1.10;
     private const ulong Seed = 0x8490_1234_5678_9ABCul;
     private const float DropoutRate = 0.1f;
     private const float Keep = 1.0f - DropoutRate;
@@ -24,6 +26,14 @@ internal static class DirectPtxRngStochasticExperiment
 
     private readonly record struct Distribution(
         double Mean, double Median, double P95, double P99);
+
+    private readonly record struct OracleEvidence(
+        StableTimer.PairResult Timing,
+        string Lane,
+        int LogicalOperationsPerLaunch,
+        double DirectSemanticError,
+        double IncumbentSemanticError,
+        double SemanticTolerance);
 
     private readonly record struct Cell(
         int Run,
@@ -36,7 +46,8 @@ internal static class DirectPtxRngStochasticExperiment
         long ManagedBytes,
         long TemporaryDeviceBytes,
         double MaximumSemanticError,
-        DirectPtxKernelAudit? Audit);
+        DirectPtxKernelAudit? Audit,
+        OracleEvidence? PairedEvidence);
     private sealed record PythonCell(
         string Status,
         int Run,
@@ -54,13 +65,21 @@ internal static class DirectPtxRngStochasticExperiment
         string Error);
     private readonly record struct GroupKey(int Run, string Operation, string Shape);
 
-    internal static void Run(int independentRuns = 3, bool includeExternal = true)
+    internal static void Run(
+        int independentRuns = 3,
+        bool includeExternal = true,
+        string? family = null,
+        string? operation = null)
     {
         if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
+        if (family is not null && family is not ("vector" or "row" or "importance" or "bias-dropout"))
+            throw new ArgumentOutOfRangeException(nameof(family),
+                "Family must be vector, row, importance, or bias-dropout.");
         GpuBenchmarkEnvironment.RequireIdleGpu("direct-ptx-rng-stochastic-start");
         Console.WriteLine(
             $"Direct PTX stochastic suite: {independentRuns} clean run(s), {Warmups} warmups + " +
-            $"{Samples} samples/cell; {DeviceLaunches} resident launches/device sample.");
+            $"{Samples} samples/cell; {DeviceLaunches} resident launches/device sample; " +
+            $"family={family ?? "all"}; operation={operation ?? "all"}.");
 
         var cells = new List<Cell>();
         for (int run = 1; run <= independentRuns; run++)
@@ -70,14 +89,22 @@ internal static class DirectPtxRngStochasticExperiment
             using (established)
             {
                 if (run == 1) Console.WriteLine($"GPU: {direct.DeviceName}");
-                RunVectorFamilies(cells, direct, established, run);
-                RunRowFamilies(cells, direct, established, run);
-                RunImportanceFamilies(cells, direct, established, run);
-                RunBiasDropoutFamilies(cells, direct, established, run);
+                if ((family is null or "vector") &&
+                    (operation is null || IsVectorOperation(operation)))
+                    RunVectorFamilies(cells, direct, established, run, operation);
+                if ((family is null or "row") &&
+                    (operation is null || IsRowOperation(operation)))
+                    RunRowFamilies(cells, direct, established, run, operation);
+                if ((family is null or "importance") &&
+                    (operation is null or "importance-sampling"))
+                    RunImportanceFamilies(cells, direct, established, run);
+                if ((family is null or "bias-dropout") &&
+                    (operation is null or "bias-dropout"))
+                    RunBiasDropoutFamilies(cells, direct, established, run);
             }
         }
 
-        IReadOnlyList<PythonCell> python = includeExternal
+        IReadOnlyList<PythonCell> python = includeExternal && family is null && operation is null
             ? RunPython(independentRuns)
             : Array.Empty<PythonCell>();
         Print(cells, python);
@@ -121,22 +148,42 @@ internal static class DirectPtxRngStochasticExperiment
         List<Cell> cells,
         CudaBackend direct,
         CudaBackend established,
-        int run)
+        int run,
+        string? operation)
     {
         foreach (int elements in new[] { 4_096, 65_536, 1_048_576 })
         {
             string shape = $"N={elements}";
-            RunUniform(cells, direct, established, run, shape, elements);
-            RunNormal(cells, direct, established, run, shape, elements, gaussianNoise: false);
-            RunNormal(cells, direct, established, run, shape, elements, gaussianNoise: true);
-            RunDropoutMask(cells, direct, established, run, shape, elements, stateless: false);
-            RunDropoutMask(cells, direct, established, run, shape, elements, stateless: true);
-            RunDropoutForward(cells, direct, established, run, shape, elements);
-            RunDropoutBackward(cells, direct, established, run, shape, elements);
-            RunDdim(cells, direct, established, run, shape, elements);
-            RunRrelu(cells, direct, established, run, shape, elements);
+            if (operation is null or "uniform")
+                RunUniform(cells, direct, established, run, shape, elements);
+            if (operation is null or "normal")
+                RunNormal(cells, direct, established, run, shape, elements, gaussianNoise: false);
+            if (operation is null or "gaussian-noise")
+                RunNormal(cells, direct, established, run, shape, elements, gaussianNoise: true);
+            if (operation is null or "dropout-mask")
+                RunDropoutMask(cells, direct, established, run, shape, elements, stateless: false);
+            if (operation is null or "stateless-dropout-mask")
+                RunDropoutMask(cells, direct, established, run, shape, elements, stateless: true);
+            if (operation is null or "dropout-forward")
+                RunDropoutForward(cells, direct, established, run, shape, elements);
+            if (operation is null or "dropout-backward")
+                RunDropoutBackward(cells, direct, established, run, shape, elements);
+            if (operation is null or "ddim-step")
+                RunDdim(cells, direct, established, run, shape, elements);
+            if (operation is null || operation.StartsWith("rrelu-", StringComparison.Ordinal))
+                RunRrelu(cells, direct, established, run, shape, elements, operation);
         }
     }
+
+    private static bool IsVectorOperation(string operation) =>
+        operation is "uniform" or "normal" or "gaussian-noise" or
+            "dropout-mask" or "stateless-dropout-mask" or "dropout-forward" or
+            "dropout-backward" or "ddim-step" or "rrelu-training" or
+            "rrelu-saved-noise-forward" or "rrelu-backward";
+
+    private static bool IsRowOperation(string operation) =>
+        operation is "gumbel-softmax" or "categorical-one-hot" or
+            "gumbel-softmax-backward";
 
     private static void RunDropoutForward(
         List<Cell> cells,
@@ -192,7 +239,8 @@ internal static class DirectPtxRngStochasticExperiment
         CudaBackend established,
         int run,
         string shape,
-        int elements)
+        int elements,
+        string? operation)
     {
         const float lower = 0.125f;
         const float upper = 1.0f / 3.0f;
@@ -204,100 +252,109 @@ internal static class DirectPtxRngStochasticExperiment
             .Select(index => (index % 193 - 96) / 96.0f).ToArray();
 
         using var directInput = direct.AllocateBuffer(input);
-        using var directNoise = direct.AllocateBuffer(elements);
-        using var directOutput = direct.AllocateBuffer(elements);
         using var establishedInput = established.AllocateBuffer(input);
-        using var establishedNoise = established.AllocateBuffer(elements);
-        using var establishedOutput = established.AllocateBuffer(elements);
-        Require(direct.PrewarmDirectPtxFusedRreluF32(elements), direct,
-            "fused RReLU prewarm");
-        Require(direct.TryGetDirectPtxFusedRreluAudit(
-            elements, out DirectPtxKernelAudit fusedAudit), direct, "fused RReLU audit");
-
-        void DirectFused() => Require(direct.TryFusedPhiloxRRelu(
-            directInput, directNoise, directOutput, elements,
-            lower, upper, Seed), direct, "fused RReLU dispatch");
-        void EstablishedFused()
+        if (operation is null or "rrelu-training")
         {
-            established.GenerateRandomUniform(
-                establishedNoise, elements, lower, upper, Seed);
-            established.RRelu(
-                establishedInput, establishedNoise, establishedOutput, elements);
+            using var directNoise = direct.AllocateBuffer(elements);
+            using var directOutput = direct.AllocateBuffer(elements);
+            using var establishedNoise = established.AllocateBuffer(elements);
+            using var establishedOutput = established.AllocateBuffer(elements);
+            Require(direct.PrewarmDirectPtxFusedRreluF32(elements), direct,
+                "fused RReLU prewarm");
+            Require(direct.TryGetDirectPtxFusedRreluAudit(
+                elements, out DirectPtxKernelAudit audit), direct, "fused RReLU audit");
+
+            void DirectFused() => Require(direct.TryFusedPhiloxRRelu(
+                directInput, directNoise, directOutput, elements,
+                lower, upper, Seed), direct, "fused RReLU dispatch");
+            void EstablishedFused()
+            {
+                established.GenerateRandomUniform(
+                    establishedNoise, elements, lower, upper, Seed);
+                established.RRelu(
+                    establishedInput, establishedNoise, establishedOutput, elements);
+            }
+            DirectFused();
+            EstablishedFused();
+            direct.Synchronize();
+            established.Synchronize();
+            float[] directNoiseHost = direct.DownloadBuffer(directNoise);
+            float[] rreluNoiseOracle = PhiloxUniformOracle(elements, lower, upper);
+            float[] rreluOutputOracle = input.Select((value, index) =>
+                value >= 0f ? value : value * rreluNoiseOracle[index]).ToArray();
+            double directError = Math.Max(
+                MaximumError(directNoiseHost, rreluNoiseOracle),
+                MaximumError(direct.DownloadBuffer(directOutput), rreluOutputOracle));
+            double establishedError = RreluError(
+                established.DownloadBuffer(establishedOutput),
+                established.DownloadBuffer(establishedNoise), input, lower, upper);
+            AddPair(cells, direct, established, run, "rrelu-training", shape,
+                DirectFused, EstablishedFused, usefulBytes: 12L * elements,
+                directError, establishedError, audit, establishedTemporaryBytes: 0);
         }
-        DirectFused();
-        EstablishedFused();
-        direct.Synchronize();
-        established.Synchronize();
-        float[] directNoiseHost = direct.DownloadBuffer(directNoise);
-        float[] rreluNoiseOracle = PhiloxUniformOracle(elements, lower, upper);
-        float[] rreluOutputOracle = input.Select((value, index) =>
-            value >= 0f ? value : value * rreluNoiseOracle[index]).ToArray();
-        double directFusedError = Math.Max(
-            MaximumError(directNoiseHost, rreluNoiseOracle),
-            MaximumError(direct.DownloadBuffer(directOutput), rreluOutputOracle));
-        double establishedFusedError = RreluError(
-            established.DownloadBuffer(establishedOutput),
-            established.DownloadBuffer(establishedNoise), input, lower, upper);
-        AddPair(cells, direct, established, run, "rrelu-training", shape,
-            DirectFused, EstablishedFused, usefulBytes: 12L * elements,
-            directFusedError, establishedFusedError, fusedAudit,
-            establishedTemporaryBytes: 0);
 
-        using var directSavedNoise = direct.AllocateBuffer(savedNoise);
-        using var directSavedOutput = direct.AllocateBuffer(elements);
-        using var establishedSavedNoise = established.AllocateBuffer(savedNoise);
-        using var establishedSavedOutput = established.AllocateBuffer(elements);
-        Require(direct.PrewarmDirectPtxRreluF32(DirectPtxRreluKind.Forward, elements),
-            direct, "saved-noise RReLU forward prewarm");
-        Require(direct.TryGetDirectPtxRreluAudit(
-            DirectPtxRreluKind.Forward, elements, out DirectPtxKernelAudit forwardAudit),
-            direct, "saved-noise RReLU forward audit");
-        void DirectForward() => direct.RRelu(
-            directInput, directSavedNoise, directSavedOutput, elements);
-        void EstablishedForward() => established.RRelu(
-            establishedInput, establishedSavedNoise, establishedSavedOutput, elements);
-        DirectForward();
-        EstablishedForward();
-        direct.Synchronize();
-        established.Synchronize();
-        double directForwardError = RreluError(
-            direct.DownloadBuffer(directSavedOutput), savedNoise, input, lower, upper);
-        double establishedForwardError = RreluError(
-            established.DownloadBuffer(establishedSavedOutput), savedNoise, input, lower, upper);
-        AddPair(cells, direct, established, run, "rrelu-saved-noise-forward", shape,
-            DirectForward, EstablishedForward, usefulBytes: 12L * elements,
-            directForwardError, establishedForwardError, forwardAudit,
-            establishedTemporaryBytes: 0);
+        if (operation is null or "rrelu-saved-noise-forward")
+        {
+            using var directSavedNoise = direct.AllocateBuffer(savedNoise);
+            using var directOutput = direct.AllocateBuffer(elements);
+            using var establishedSavedNoise = established.AllocateBuffer(savedNoise);
+            using var establishedOutput = established.AllocateBuffer(elements);
+            Require(direct.PrewarmDirectPtxRreluF32(DirectPtxRreluKind.Forward, elements),
+                direct, "saved-noise RReLU forward prewarm");
+            Require(direct.TryGetDirectPtxRreluAudit(
+                DirectPtxRreluKind.Forward, elements, out DirectPtxKernelAudit audit),
+                direct, "saved-noise RReLU forward audit");
+            void DirectForward() => direct.RRelu(
+                directInput, directSavedNoise, directOutput, elements);
+            void EstablishedForward() => established.RRelu(
+                establishedInput, establishedSavedNoise, establishedOutput, elements);
+            DirectForward();
+            EstablishedForward();
+            direct.Synchronize();
+            established.Synchronize();
+            double directError = RreluError(
+                direct.DownloadBuffer(directOutput), savedNoise, input, lower, upper);
+            double establishedError = RreluError(
+                established.DownloadBuffer(establishedOutput), savedNoise, input, lower, upper);
+            AddPair(cells, direct, established, run, "rrelu-saved-noise-forward", shape,
+                DirectForward, EstablishedForward, usefulBytes: 12L * elements,
+                directError, establishedError, audit, establishedTemporaryBytes: 0);
+        }
 
-        using var directGradient = direct.AllocateBuffer(gradient);
-        using var directGradientInput = direct.AllocateBuffer(elements);
-        using var establishedGradient = established.AllocateBuffer(gradient);
-        using var establishedGradientInput = established.AllocateBuffer(elements);
-        Require(direct.PrewarmDirectPtxRreluF32(DirectPtxRreluKind.Backward, elements),
-            direct, "saved-noise RReLU backward prewarm");
-        Require(direct.TryGetDirectPtxRreluAudit(
-            DirectPtxRreluKind.Backward, elements, out DirectPtxKernelAudit backwardAudit),
-            direct, "saved-noise RReLU backward audit");
-        void DirectBackward() => direct.RReluBackward(
-            directGradient, directInput, directSavedNoise, directGradientInput, elements);
-        void EstablishedBackward() => established.RReluBackward(
-            establishedGradient, establishedInput, establishedSavedNoise,
-            establishedGradientInput, elements);
-        DirectBackward();
-        EstablishedBackward();
-        direct.Synchronize();
-        established.Synchronize();
-        float[] backwardOracle = new float[elements];
-        for (int index = 0; index < elements; index++)
-            backwardOracle[index] = gradient[index] * (input[index] >= 0f ? 1f : savedNoise[index]);
-        double directBackwardError = MaximumError(
-            direct.DownloadBuffer(directGradientInput), backwardOracle);
-        double establishedBackwardError = MaximumError(
-            established.DownloadBuffer(establishedGradientInput), backwardOracle);
-        AddPair(cells, direct, established, run, "rrelu-backward", shape,
-            DirectBackward, EstablishedBackward, usefulBytes: 16L * elements,
-            directBackwardError, establishedBackwardError, backwardAudit,
-            establishedTemporaryBytes: 0);
+        if (operation is null or "rrelu-backward")
+        {
+            using var directSavedNoise = direct.AllocateBuffer(savedNoise);
+            using var establishedSavedNoise = established.AllocateBuffer(savedNoise);
+            using var directGradient = direct.AllocateBuffer(gradient);
+            using var directGradientInput = direct.AllocateBuffer(elements);
+            using var establishedGradient = established.AllocateBuffer(gradient);
+            using var establishedGradientInput = established.AllocateBuffer(elements);
+            Require(direct.PrewarmDirectPtxRreluF32(DirectPtxRreluKind.Backward, elements),
+                direct, "saved-noise RReLU backward prewarm");
+            Require(direct.TryGetDirectPtxRreluAudit(
+                DirectPtxRreluKind.Backward, elements, out DirectPtxKernelAudit audit),
+                direct, "saved-noise RReLU backward audit");
+            void DirectBackward() => direct.RReluBackward(
+                directGradient, directInput, directSavedNoise, directGradientInput, elements);
+            void EstablishedBackward() => established.RReluBackward(
+                establishedGradient, establishedInput, establishedSavedNoise,
+                establishedGradientInput, elements);
+            DirectBackward();
+            EstablishedBackward();
+            direct.Synchronize();
+            established.Synchronize();
+            float[] oracle = new float[elements];
+            for (int index = 0; index < elements; index++)
+                oracle[index] = gradient[index] *
+                    (input[index] >= 0f ? 1f : savedNoise[index]);
+            double directError = MaximumError(
+                direct.DownloadBuffer(directGradientInput), oracle);
+            double establishedError = MaximumError(
+                established.DownloadBuffer(establishedGradientInput), oracle);
+            AddPair(cells, direct, established, run, "rrelu-backward", shape,
+                DirectBackward, EstablishedBackward, usefulBytes: 16L * elements,
+                directError, establishedError, audit, establishedTemporaryBytes: 0);
+        }
     }
 
     private static void RunUniform(
@@ -409,11 +466,19 @@ internal static class DirectPtxRngStochasticExperiment
         Established();
         direct.Synchronize();
         established.Synchronize();
-        double directError = MaximumError(
-            direct.DownloadBuffer(directOutput),
-            PhiloxMaskOracle(elements, threshold, scale, dropWhenLess: stateless));
-        double establishedError = BinaryScaleViolation(
-            established.DownloadBuffer(establishedOutput), scale);
+        float[] directHost = direct.DownloadBuffer(directOutput);
+        float[] establishedHost = established.DownloadBuffer(establishedOutput);
+        double directError = stateless
+            ? MaximumError(directHost,
+                StatelessDropoutMaskOracle(
+                    elements, threshold, scale, unchecked((uint)Seed)))
+            : MaximumError(directHost,
+                PhiloxMaskOracle(elements, threshold, scale, dropWhenLess: false));
+        double establishedError = stateless
+            ? MaximumError(establishedHost,
+                StatelessDropoutMaskOracle(
+                    elements, threshold, scale, unchecked((uint)Seed)))
+            : BinaryScaleViolation(establishedHost, scale);
         AddPair(cells, direct, established, run,
             stateless ? "stateless-dropout-mask" : "dropout-mask", shape,
             Direct, Established, usefulBytes: 4L * elements,
@@ -502,127 +567,149 @@ internal static class DirectPtxRngStochasticExperiment
     }
 
     private static void RunRowFamilies(
-        List<Cell> cells, CudaBackend direct, CudaBackend established, int run)
+        List<Cell> cells,
+        CudaBackend direct,
+        CudaBackend established,
+        int run,
+        string? operation)
     {
         foreach (int rows in new[] { 128, 2_048, 32_768 })
         {
             int classes = PtxFusedGumbelSoftmax32F32Kernel.InnerSize;
             int elements = checked(rows * classes);
             string shape = $"[{rows},32]";
-            float[] logits = Enumerable.Range(0, elements)
-                .Select(index => (index % classes - 15.5f) / 8.0f).ToArray();
-            using var directLogits = direct.AllocateBuffer(logits);
-            using var directSoft = direct.AllocateBuffer(elements);
-            using var establishedLogits = established.AllocateBuffer(logits);
-            using var establishedSoft = established.AllocateBuffer(elements);
-            Require(direct.PrewarmDirectPtxGumbelSoftmaxF32(rows, classes), direct, "Gumbel prewarm");
-            Require(direct.TryGetDirectPtxGumbelSoftmaxAudit(rows, out DirectPtxKernelAudit gumbelAudit),
-                direct, "Gumbel audit");
-
-            void DirectGumbel() => direct.GumbelSoftmax(
-                directLogits, directSoft, rows, classes, Temperature, Seed);
-            void EstablishedGumbel() => established.GumbelSoftmax(
-                establishedLogits, establishedSoft, rows, classes, Temperature, Seed);
-            DirectGumbel();
-            EstablishedGumbel();
-            direct.Synchronize();
-            established.Synchronize();
-            double directGumbelError = MaximumError(
-                direct.DownloadBuffer(directSoft),
-                GumbelSoftmaxOracle(logits, rows, classes, Temperature));
-            double establishedGumbelError = SimplexViolation(
-                established.DownloadBuffer(establishedSoft), rows, classes);
-            AddPair(cells, direct, established, run, "gumbel-softmax", shape,
-                DirectGumbel, EstablishedGumbel, usefulBytes: 8L * elements,
-                directGumbelError, establishedGumbelError, gumbelAudit,
-                establishedTemporaryBytes: 0);
-
-            float[] probabilities = Enumerable.Repeat(1.0f / classes, elements).ToArray();
-            using var directProbabilities = direct.AllocateBuffer(probabilities);
-            using var directOneHot = direct.AllocateBuffer(elements);
-            using var establishedProbabilities = established.AllocateBuffer(probabilities);
-            using var establishedLogProbabilities = established.AllocateBuffer(elements);
-            using var establishedCategoricalSoft = established.AllocateBuffer(elements);
-            using var establishedSelectedIndices = established.AllocateBuffer(rows);
-            using var establishedOneHot = established.AllocateBuffer(elements);
-            Require(direct.PrewarmDirectPtxCategoricalF32(rows, classes), direct,
-                "categorical prewarm");
-            Require(direct.TryGetDirectPtxCategoricalAudit(rows, out DirectPtxKernelAudit categoricalAudit),
-                direct, "categorical audit");
-            void DirectCategorical()
-            {
-                Require(direct.TryCategoricalSample(
-                    directProbabilities, directOneHot, rows, classes, Seed),
-                    direct, "categorical dispatch");
-            }
-            void EstablishedCategorical()
-            {
-                established.Log(
-                    establishedProbabilities, establishedLogProbabilities, elements);
-                established.GumbelSoftmax(
-                    establishedLogProbabilities, establishedCategoricalSoft,
-                    rows, classes, 1f, Seed);
-                established.ArgMaxAxis(
-                    establishedCategoricalSoft, establishedSelectedIndices, rows, classes);
-                established.OneHotKernel(
-                    establishedSelectedIndices, establishedOneHot, rows, classes);
-            }
-            DirectCategorical();
-            EstablishedCategorical();
-            direct.Synchronize();
-            established.Synchronize();
-            double directCategoricalError = MaximumError(
-                direct.DownloadBuffer(directOneHot),
-                UniformCategoricalOracle(rows, classes));
-            double establishedCategoricalError = OneHotViolation(
-                established.DownloadBuffer(establishedOneHot), rows, classes);
-            AddPair(cells, direct, established, run, "categorical-one-hot", shape,
-                DirectCategorical, EstablishedCategorical, usefulBytes: 8L * elements,
-                directCategoricalError, establishedCategoricalError, categoricalAudit,
-                establishedTemporaryBytes: checked(8L * elements + 4L * rows));
-
-            float[] grad = Enumerable.Range(0, elements)
-                .Select(index => (index % classes - 15.5f) / 16.0f).ToArray();
-            float[] soft = Enumerable.Repeat(1.0f / classes, elements).ToArray();
-            using var directGrad = direct.AllocateBuffer(grad);
-            using var directSoftInput = direct.AllocateBuffer(soft);
-            using var directGradInput = direct.AllocateBuffer(elements);
-            using var establishedGrad = established.AllocateBuffer(grad);
-            using var establishedSoftInput = established.AllocateBuffer(soft);
-            using var establishedTemporary = established.AllocateBuffer(elements);
-            using var establishedGradInput = established.AllocateBuffer(elements);
-            Require(direct.PrewarmDirectPtxGumbelSoftmaxBackwardF32(rows, classes), direct,
-                "Gumbel backward prewarm");
-            Require(direct.TryGetDirectPtxGumbelSoftmaxBackwardAudit(
-                rows, out DirectPtxKernelAudit backwardAudit), direct, "Gumbel backward audit");
-
-            void DirectBackward()
-            {
-                Require(direct.TryGumbelSoftmaxBackward(
-                    directGrad, directSoftInput, directGradInput,
-                    rows, classes, Temperature), direct, "Gumbel backward dispatch");
-            }
-            void EstablishedBackward()
-            {
-                established.SoftmaxBackward(
-                    establishedGrad, establishedSoftInput, establishedTemporary, rows, classes);
-                established.Scale(
-                    establishedTemporary, establishedGradInput, 1.0f / Temperature, elements);
-            }
-            DirectBackward();
-            EstablishedBackward();
-            direct.Synchronize();
-            established.Synchronize();
-            float[] backwardOracle = SoftmaxBackwardOracle(grad, soft, rows, classes, Temperature);
-            double directBackwardError = MaximumError(
-                direct.DownloadBuffer(directGradInput), backwardOracle);
-            double establishedBackwardError = MaximumError(
-                established.DownloadBuffer(establishedGradInput), backwardOracle);
-            AddPair(cells, direct, established, run, "gumbel-softmax-backward", shape,
-                DirectBackward, EstablishedBackward, usefulBytes: 12L * elements,
-                directBackwardError, establishedBackwardError, backwardAudit,
-                establishedTemporaryBytes: 4L * elements);
+            if (operation is null or "gumbel-softmax")
+                RunGumbelSoftmax(cells, direct, established, run, rows, classes, elements, shape);
+            if (operation is null or "categorical-one-hot")
+                RunCategorical(cells, direct, established, run, rows, classes, elements, shape);
+            if (operation is null or "gumbel-softmax-backward")
+                RunGumbelSoftmaxBackward(
+                    cells, direct, established, run, rows, classes, elements, shape);
         }
+    }
+
+    private static void RunGumbelSoftmax(
+        List<Cell> cells, CudaBackend direct, CudaBackend established,
+        int run, int rows, int classes, int elements, string shape)
+    {
+        float[] logits = Enumerable.Range(0, elements)
+            .Select(index => (index % classes - 15.5f) / 8.0f).ToArray();
+        using var directLogits = direct.AllocateBuffer(logits);
+        using var directSoft = direct.AllocateBuffer(elements);
+        using var establishedLogits = established.AllocateBuffer(logits);
+        using var establishedSoft = established.AllocateBuffer(elements);
+        Require(direct.PrewarmDirectPtxGumbelSoftmaxF32(rows, classes), direct, "Gumbel prewarm");
+        Require(direct.TryGetDirectPtxGumbelSoftmaxAudit(rows, out DirectPtxKernelAudit audit),
+            direct, "Gumbel audit");
+
+        void Direct() => direct.GumbelSoftmax(
+            directLogits, directSoft, rows, classes, Temperature, Seed);
+        void Established() => established.GumbelSoftmax(
+            establishedLogits, establishedSoft, rows, classes, Temperature, Seed);
+        Direct();
+        Established();
+        direct.Synchronize();
+        established.Synchronize();
+        double directError = MaximumError(
+            direct.DownloadBuffer(directSoft),
+            GumbelSoftmaxOracle(logits, rows, classes, Temperature));
+        double establishedError = SimplexViolation(
+            established.DownloadBuffer(establishedSoft), rows, classes);
+        AddPair(cells, direct, established, run, "gumbel-softmax", shape,
+            Direct, Established, usefulBytes: 8L * elements,
+            directError, establishedError, audit, establishedTemporaryBytes: 0);
+    }
+
+    private static void RunCategorical(
+        List<Cell> cells, CudaBackend direct, CudaBackend established,
+        int run, int rows, int classes, int elements, string shape)
+    {
+        float[] probabilities = Enumerable.Repeat(1.0f / classes, elements).ToArray();
+        using var directProbabilities = direct.AllocateBuffer(probabilities);
+        using var directOneHot = direct.AllocateBuffer(elements);
+        using var establishedProbabilities = established.AllocateBuffer(probabilities);
+        using var establishedLogProbabilities = established.AllocateBuffer(elements);
+        using var establishedCategoricalSoft = established.AllocateBuffer(elements);
+        using var establishedSelectedIndices = established.AllocateBuffer(rows);
+        using var establishedOneHot = established.AllocateBuffer(elements);
+        Require(direct.PrewarmDirectPtxCategoricalF32(rows, classes), direct,
+            "categorical prewarm");
+        Require(direct.TryGetDirectPtxCategoricalAudit(rows, out DirectPtxKernelAudit audit),
+            direct, "categorical audit");
+        void Direct()
+        {
+            Require(direct.TryCategoricalSample(
+                directProbabilities, directOneHot, rows, classes, Seed),
+                direct, "categorical dispatch");
+        }
+        void Established()
+        {
+            established.Log(establishedProbabilities, establishedLogProbabilities, elements);
+            established.GumbelSoftmax(
+                establishedLogProbabilities, establishedCategoricalSoft,
+                rows, classes, 1f, Seed);
+            established.ArgMaxAxis(
+                establishedCategoricalSoft, establishedSelectedIndices, rows, classes);
+            established.OneHotKernel(
+                establishedSelectedIndices, establishedOneHot, rows, classes);
+        }
+        Direct();
+        Established();
+        direct.Synchronize();
+        established.Synchronize();
+        double directError = MaximumError(
+            direct.DownloadBuffer(directOneHot), UniformCategoricalOracle(rows, classes));
+        double establishedError = OneHotViolation(
+            established.DownloadBuffer(establishedOneHot), rows, classes);
+        AddPair(cells, direct, established, run, "categorical-one-hot", shape,
+            Direct, Established, usefulBytes: 8L * elements,
+            directError, establishedError, audit,
+            establishedTemporaryBytes: checked(8L * elements + 4L * rows));
+    }
+
+    private static void RunGumbelSoftmaxBackward(
+        List<Cell> cells, CudaBackend direct, CudaBackend established,
+        int run, int rows, int classes, int elements, string shape)
+    {
+        float[] grad = Enumerable.Range(0, elements)
+            .Select(index => (index % classes - 15.5f) / 16.0f).ToArray();
+        float[] soft = Enumerable.Repeat(1.0f / classes, elements).ToArray();
+        using var directGrad = direct.AllocateBuffer(grad);
+        using var directSoftInput = direct.AllocateBuffer(soft);
+        using var directGradInput = direct.AllocateBuffer(elements);
+        using var establishedGrad = established.AllocateBuffer(grad);
+        using var establishedSoftInput = established.AllocateBuffer(soft);
+        using var establishedTemporary = established.AllocateBuffer(elements);
+        using var establishedGradInput = established.AllocateBuffer(elements);
+        Require(direct.PrewarmDirectPtxGumbelSoftmaxBackwardF32(rows, classes), direct,
+            "Gumbel backward prewarm");
+        Require(direct.TryGetDirectPtxGumbelSoftmaxBackwardAudit(
+            rows, out DirectPtxKernelAudit audit), direct, "Gumbel backward audit");
+
+        void Direct()
+        {
+            Require(direct.TryGumbelSoftmaxBackward(
+                directGrad, directSoftInput, directGradInput,
+                rows, classes, Temperature), direct, "Gumbel backward dispatch");
+        }
+        void Established()
+        {
+            established.SoftmaxBackward(
+                establishedGrad, establishedSoftInput, establishedTemporary, rows, classes);
+            established.Scale(
+                establishedTemporary, establishedGradInput, 1.0f / Temperature, elements);
+        }
+        Direct();
+        Established();
+        direct.Synchronize();
+        established.Synchronize();
+        float[] oracle = SoftmaxBackwardOracle(grad, soft, rows, classes, Temperature);
+        double directError = MaximumError(direct.DownloadBuffer(directGradInput), oracle);
+        double establishedError = MaximumError(
+            established.DownloadBuffer(establishedGradInput), oracle);
+        AddPair(cells, direct, established, run, "gumbel-softmax-backward", shape,
+            Direct, Established, usefulBytes: 12L * elements,
+            directError, establishedError, audit, establishedTemporaryBytes: 4L * elements);
     }
 
     private static void RunImportanceFamilies(
@@ -660,7 +747,8 @@ internal static class DirectPtxRngStochasticExperiment
             established.Synchronize();
             double directError = MaximumError(
                 direct.DownloadBuffer(directOutput),
-                ImportanceSamplingOracle(tValues, weights, rays, samples));
+                ImportanceSamplingOracle(
+                    tValues, weights, rays, samples, unchecked((uint)Seed)));
             double establishedError = ImportanceRangeViolation(
                 established.DownloadBuffer(establishedOutput), rays, samples);
             AddPair(cells, direct, established, run, "importance-sampling", shape,
@@ -748,14 +836,53 @@ internal static class DirectPtxRngStochasticExperiment
         DirectPtxKernelAudit audit,
         long establishedTemporaryBytes)
     {
-        IntPtr graph = directBackend.CaptureGraph(direct);
-        if (graph == IntPtr.Zero)
-            throw new InvalidOperationException($"Could not capture prewarmed {operation} direct PTX.");
+        IntPtr graph = IntPtr.Zero;
+        IntPtr directThroughputGraph = IntPtr.Zero;
+        IntPtr establishedThroughputGraph = IntPtr.Zero;
         try
         {
-            cells.Add(Measure(directBackend, run, operation, shape,
+            graph = directBackend.CaptureGraph(direct);
+            directThroughputGraph = CaptureRepeatedGraph(
+                directBackend, direct, ThroughputOperationsPerGraph);
+            establishedThroughputGraph = CaptureRepeatedGraph(
+                establishedBackend, established, ThroughputOperationsPerGraph);
+            if (graph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    $"Could not capture the prewarmed {operation} direct graph.");
+
+            OracleEvidence evidence;
+            if (directThroughputGraph != IntPtr.Zero &&
+                establishedThroughputGraph != IntPtr.Zero)
+            {
+                StableTimer.PairResult paired = StableTimer.MeasureCalibratedHostPair(
+                    () => directBackend.EnqueueCapturedGraph(directThroughputGraph),
+                    directBackend.Synchronize,
+                    () => establishedBackend.EnqueueCapturedGraph(establishedThroughputGraph),
+                    establishedBackend.Synchronize,
+                    operationsPerLaunchA: ThroughputOperationsPerGraph,
+                    operationsPerLaunchB: ThroughputOperationsPerGraph);
+                evidence = new OracleEvidence(
+                    paired, "repeated-cuda-graph-host-paired",
+                    ThroughputOperationsPerGraph,
+                    directError, establishedError, SemanticTolerance(operation));
+            }
+            else
+            {
+                Console.WriteLine(
+                    $"oracle-capture-fallback | {run} | {operation} | {shape} | " +
+                    $"direct-graph={directThroughputGraph != IntPtr.Zero} | " +
+                    $"incumbent-graph={establishedThroughputGraph != IntPtr.Zero}");
+                StableTimer.PairResult paired = StableTimer.MeasureCalibratedHostPair(
+                    direct, directBackend.Synchronize,
+                    established, establishedBackend.Synchronize);
+                evidence = new OracleEvidence(
+                    paired, "public-launch-host-paired", 1,
+                    directError, establishedError, SemanticTolerance(operation));
+            }
+            Cell graphCell = Measure(directBackend, run, operation, shape,
                 "Direct PTX CUDA graph", () => directBackend.EnqueueCapturedGraph(graph),
-                usefulBytes, directError, audit, temporaryDeviceBytes: 0));
+                usefulBytes, directError, audit, temporaryDeviceBytes: 0);
+            cells.Add(graphCell with { PairedEvidence = evidence });
             cells.Add(Measure(directBackend, run, operation, shape,
                 "Direct PTX", direct, usefulBytes, directError, audit,
                 temporaryDeviceBytes: 0));
@@ -766,7 +893,18 @@ internal static class DirectPtxRngStochasticExperiment
         finally
         {
             directBackend.DestroyCapturedGraph(graph);
+            directBackend.DestroyCapturedGraph(directThroughputGraph);
+            establishedBackend.DestroyCapturedGraph(establishedThroughputGraph);
         }
+    }
+
+    private static IntPtr CaptureRepeatedGraph(
+        CudaBackend backend, Action launch, int operations)
+    {
+        return backend.CaptureGraph(() =>
+        {
+            for (int i = 0; i < operations; i++) launch();
+        });
     }
 
     private static Cell Measure(
@@ -786,7 +924,7 @@ internal static class DirectPtxRngStochasticExperiment
         long managedBytes = MeasureAllocation(backend, action);
         double gbps = usefulBytes / (device.Median * 1e-6) / 1e9;
         return new Cell(run, operation, shape, method, device, endToEnd,
-            gbps, managedBytes, temporaryDeviceBytes, maximumError, audit);
+            gbps, managedBytes, temporaryDeviceBytes, maximumError, audit, null);
     }
 
     private static Distribution MeasureDevice(CudaBackend backend, Action action)
@@ -976,8 +1114,83 @@ internal static class DirectPtxRngStochasticExperiment
                 Console.WriteLine(
                     $"SKIPPED | {cell.Run} | {cell.Operation} | {cell.Shape} | " +
                     $"{cell.Method} | {cell.Error}");
+            foreach (Cell cell in cells.Where(cell =>
+                         cell.Run == group.Run && cell.Operation == group.Operation &&
+                         cell.Shape == group.Shape && cell.PairedEvidence is not null))
+                PrintPairedEvidence(group, cell.PairedEvidence!.Value);
         }
     }
+
+    private static void PrintPairedEvidence(
+        GroupKey group, OracleEvidence evidence)
+    {
+        StableTimer.PairResult timing = evidence.Timing;
+        double incumbentOverDirect = 1.0 / timing.Ratio;
+        bool correctnessPassed =
+            double.IsFinite(evidence.DirectSemanticError) &&
+            double.IsFinite(evidence.IncumbentSemanticError) &&
+            evidence.DirectSemanticError <= evidence.SemanticTolerance &&
+            evidence.IncumbentSemanticError <= evidence.SemanticTolerance;
+        string measurementStatus = !correctnessPassed
+            ? "correctness-failed"
+            : !timing.Stable
+                ? "unstable"
+                : "stable";
+        string verdict = !correctnessPassed || !timing.Stable
+            ? "not-measurable"
+            : incumbentOverDirect >= RequiredGain
+                ? "win"
+                : incumbentOverDirect <= 1.0 / RequiredGain
+                    ? "loss"
+                    : "tie";
+        Console.WriteLine(
+            $"oracle | {group.Run} | {group.Operation} | {group.Shape} | " +
+            $"direct={timing.A.Describe()} | incumbent={timing.B.Describe()} | " +
+            $"direct/incumbent={(correctnessPassed ? timing.DescribeRatio() : "-")} | " +
+            $"correctness={measurementStatus} " +
+            $"(direct={evidence.DirectSemanticError:E3}, " +
+            $"incumbent={evidence.IncumbentSemanticError:E3}, " +
+            $"tolerance={evidence.SemanticTolerance:E1}) | {verdict}");
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            kind = "rng-kernel-throughput-oracle",
+            run = group.Run,
+            operation = group.Operation,
+            shape = group.Shape,
+            lane = evidence.Lane,
+            logical_operations_per_launch = evidence.LogicalOperationsPerLaunch,
+            direct_median_us = timing.A.Stable ? timing.A.Microseconds : (double?)null,
+            incumbent_median_us = timing.B.Stable ? timing.B.Microseconds : (double?)null,
+            incumbent_over_direct = correctnessPassed && timing.Stable
+                ? incumbentOverDirect
+                : (double?)null,
+            direct_relative_spread = FiniteOrNull(timing.A.RelativeSpread),
+            incumbent_relative_spread = FiniteOrNull(timing.B.RelativeSpread),
+            paired_ratio_relative_spread = FiniteOrNull(timing.RelativeSpread),
+            attempts = timing.Samples,
+            required_gain = RequiredGain,
+            direct_semantic_error = FiniteOrNull(evidence.DirectSemanticError),
+            incumbent_semantic_error = FiniteOrNull(evidence.IncumbentSemanticError),
+            semantic_tolerance = evidence.SemanticTolerance,
+            correctness_passed = correctnessPassed,
+            measurement_status = measurementStatus,
+            verdict,
+            diagnostic_only = true,
+            promotion = false
+        }));
+    }
+
+    private static double? FiniteOrNull(double value) =>
+        double.IsNaN(value) || double.IsInfinity(value) ? null : value;
+
+    private static double SemanticTolerance(string operation) =>
+        operation is "normal" or "gaussian-noise"
+            // The incumbent exposes a statistical distribution rather than
+            // the direct Philox word mapping, so its validation is a finite-
+            // sample moment bound. Every other row has a deterministic or
+            // structural oracle and uses the numerical kernel tolerance.
+            ? 0.10
+            : 1.0e-4;
 
     private static Distribution Summarize(double[] values)
     {
@@ -1115,6 +1328,24 @@ internal static class DirectPtxRngStochasticExperiment
         return result;
     }
 
+    private static float[] StatelessDropoutMaskOracle(
+        int elements,
+        uint threshold,
+        float scale,
+        uint seed)
+    {
+        var result = new float[elements];
+        for (int index = 0; index < elements; index++)
+        {
+            uint state = unchecked((uint)index * 747796405u + seed + 2891336453u);
+            uint word = unchecked(
+                ((state >> (int)((state >> 28) + 4u)) ^ state) * 277803737u);
+            uint sample = (word >> 22) ^ word;
+            result[index] = sample < threshold ? 0.0f : scale;
+        }
+        return result;
+    }
+
     private static uint PhiloxWordForFloat4Index(int index)
     {
         var words = PtxFusedPhiloxDropoutF32Kernel.GenerateUInt4(
@@ -1128,14 +1359,24 @@ internal static class DirectPtxRngStochasticExperiment
         };
     }
 
-    private static double PhiloxUnitForCounter(ulong counter)
+    private static double PhiloxUnitForCounter(ulong counter, ulong seed = Seed)
     {
         uint word = PtxFusedPhiloxDropoutF32Kernel.GenerateUInt4(
-            Seed, 0, counter).X0;
+            seed, 0, counter).X0;
         return Math.Clamp(
             word / 4_294_967_296.0,
             1.0 / 4_294_967_296.0,
             Math.BitDecrement(1.0));
+    }
+
+    private static float PhiloxFloatUnitForCounter(ulong counter)
+    {
+        uint word = PtxFusedPhiloxDropoutF32Kernel.GenerateUInt4(
+            Seed, 0, counter).X0;
+        return Math.Clamp(
+            (float)word * BitConverter.Int32BitsToSingle(unchecked((int)0x2F800000)),
+            BitConverter.Int32BitsToSingle(unchecked((int)0x2F800000)),
+            BitConverter.Int32BitsToSingle(unchecked((int)0x3F7FFFFF)));
     }
 
     private static float[] GumbelSoftmaxOracle(
@@ -1145,26 +1386,38 @@ internal static class DirectPtxRngStochasticExperiment
         float temperature)
     {
         var result = new float[logits.Length];
-        var perturbed = new double[columns];
+        var perturbed = new float[columns];
+        var exponentials = new float[columns];
+        var reduction = new float[columns];
         for (int row = 0; row < rows; row++)
         {
-            double maximum = double.NegativeInfinity;
+            float maximum = float.NegativeInfinity;
             for (int column = 0; column < columns; column++)
             {
                 int index = row * columns + column;
-                double uniform = PhiloxUnitForCounter((ulong)index);
-                double gumbel = -Math.Log(-Math.Log(uniform));
+                // The PTX contract converts the uint word to FP32 before
+                // scaling. Reproducing that rounding here is essential for
+                // extreme Gumbel samples; a double-only oracle silently tests
+                // a different random variate.
+                float uniform = PhiloxFloatUnitForCounter((ulong)index);
+                float gumbel = -MathF.Log(-MathF.Log(uniform));
                 perturbed[column] = (logits[index] + gumbel) / temperature;
                 maximum = Math.Max(maximum, perturbed[column]);
             }
-            double sum = 0;
             for (int column = 0; column < columns; column++)
             {
-                perturbed[column] = Math.Exp(perturbed[column] - maximum);
-                sum += perturbed[column];
+                exponentials[column] = MathF.Exp(perturbed[column] - maximum);
+                reduction[column] = exponentials[column];
             }
+            // Match the fixed 32-lane shuffle tree rather than comparing an
+            // FP32 kernel to a sequential FP64 reduction with a different
+            // association.
+            foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+                for (int lane = 0; lane < columns - offset; lane++)
+                    reduction[lane] += reduction[lane + offset];
+            float sum = reduction[0];
             for (int column = 0; column < columns; column++)
-                result[row * columns + column] = (float)(perturbed[column] / sum);
+                result[row * columns + column] = exponentials[column] / sum;
         }
         return result;
     }
@@ -1186,7 +1439,8 @@ internal static class DirectPtxRngStochasticExperiment
         float[] tValues,
         float[] weights,
         int rows,
-        int samples)
+        int samples,
+        uint seed)
     {
         var result = new float[checked(rows * samples)];
         var cumulative = new double[samples];
@@ -1203,7 +1457,7 @@ internal static class DirectPtxRngStochasticExperiment
                 for (int sample = 0; sample < samples; sample++)
                 {
                     double u = (sample + PhiloxUnitForCounter(
-                        checked((ulong)(rowOffset + sample)))) / samples;
+                        checked((ulong)(rowOffset + sample)), seed)) / samples;
                     result[rowOffset + sample] = (float)(first + u * range);
                 }
                 continue;
@@ -1218,7 +1472,7 @@ internal static class DirectPtxRngStochasticExperiment
             for (int fine = 0; fine < samples; fine++)
             {
                 double u = (fine + PhiloxUnitForCounter(
-                    checked((ulong)(rowOffset + fine)))) / samples;
+                    checked((ulong)(rowOffset + fine)), seed)) / samples;
                 int upper = 0;
                 while (upper < samples - 1 && u > cumulative[upper]) upper++;
                 if (upper == 0)

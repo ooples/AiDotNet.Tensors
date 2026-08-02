@@ -13,9 +13,11 @@ internal enum DirectPtxPhiloxFillKind
 }
 
 /// <summary>
-/// Exact-shape standalone Philox fills shared by uniform initialization,
+/// Exact-shape standalone random fills shared by uniform initialization,
 /// normal/noise generation, Bernoulli sampling, and public mask APIs.
-/// Four adjacent values are produced per thread with no tail branch.
+/// Four adjacent values are produced per thread with no tail branch. The
+/// stateless dropout variant preserves the existing cross-backend PCG integer
+/// contract; the other variants use Philox4x32-10.
 /// </summary>
 internal sealed class PtxPhiloxFillF32Kernel : IDisposable
 {
@@ -99,6 +101,10 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
         Require(output);
         if (threshold == 0 || !PtxCompat.IsFinite(scale) || scale < 0f)
             throw new ArgumentOutOfRangeException(nameof(threshold));
+        if (Kind == DirectPtxPhiloxFillKind.DropThresholdMask &&
+            (subsequence != 0 || counterOffset != 0 || seed > uint.MaxValue))
+            throw new ArgumentOutOfRangeException(nameof(seed),
+                "Stateless dropout requires the public uint seed and zero Philox offsets.");
         IntPtr outputPointer = output.Pointer;
         void** arguments = stackalloc void*[6];
         arguments[0] = &outputPointer;
@@ -183,13 +189,20 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
         ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {ThreadsPerBlock}, %r0;");
         ptx.AppendLine("    shl.b32 %r3, %r2, 2;");
         ptx.AppendLine("    mov.b64 {%r4,%r5}, %rd1;");
-        ptx.AppendLine("    mov.b64 {%r6,%r7}, %rd2;");
-        ptx.AppendLine("    mov.b64 {%r8,%r9}, %rd3;");
-        ptx.AppendLine("    add.cc.u32 %r10, %r8, %r2;");
-        ptx.AppendLine("    addc.u32 %r11, %r9, 0;");
-        ptx.AppendLine("    mov.u32 %r12, %r6;");
-        ptx.AppendLine("    mov.u32 %r13, %r7;");
-        PtxFusedPhiloxDropoutF32Kernel.AppendPhiloxRounds(ptx);
+        if (kind == DirectPtxPhiloxFillKind.DropThresholdMask)
+        {
+            AppendStatelessPcgWords(ptx);
+        }
+        else
+        {
+            ptx.AppendLine("    mov.b64 {%r6,%r7}, %rd2;");
+            ptx.AppendLine("    mov.b64 {%r8,%r9}, %rd3;");
+            ptx.AppendLine("    add.cc.u32 %r10, %r8, %r2;");
+            ptx.AppendLine("    addc.u32 %r11, %r9, 0;");
+            ptx.AppendLine("    mov.u32 %r12, %r6;");
+            ptx.AppendLine("    mov.u32 %r13, %r7;");
+            PtxFusedPhiloxDropoutF32Kernel.AppendPhiloxRounds(ptx);
+        }
 
         switch (kind)
         {
@@ -245,6 +258,23 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
         }
     }
 
+    private static void AppendStatelessPcgWords(StringBuilder ptx)
+    {
+        for (int i = 0; i < ValuesPerThread; i++)
+        {
+            ptx.AppendLine($"    add.u32 %r14, %r3, {i};");
+            ptx.AppendLine("    mad.lo.u32 %r15, %r14, 747796405, %r4;");
+            ptx.AppendLine("    add.u32 %r15, %r15, 2891336453;");
+            ptx.AppendLine("    shr.u32 %r16, %r15, 28;");
+            ptx.AppendLine("    add.u32 %r16, %r16, 4;");
+            ptx.AppendLine("    shr.u32 %r17, %r15, %r16;");
+            ptx.AppendLine("    xor.b32 %r17, %r17, %r15;");
+            ptx.AppendLine("    mul.lo.u32 %r18, %r17, 277803737;");
+            ptx.AppendLine("    shr.u32 %r19, %r18, 22;");
+            ptx.AppendLine($"    xor.b32 %r{10 + i}, %r19, %r18;");
+        }
+    }
+
     private static void AppendNormalOutput(StringBuilder ptx)
     {
         for (int i = 0; i < 4; i++)
@@ -292,8 +322,11 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
         int elementCount)
     {
         var extent = new DirectPtxExtent(elementCount);
+        bool statelessDropout = kind == DirectPtxPhiloxFillKind.DropThresholdMask;
         return new DirectPtxKernelBlueprint(
-            Operation: $"philox-{kind.ToString().ToLowerInvariant()}-f32",
+            Operation: statelessDropout
+                ? "stateless-pcg-drop-threshold-mask-f32"
+                : $"philox-{kind.ToString().ToLowerInvariant()}-f32",
             Version: 1,
             Architecture: architecture,
             Variant: $"exact-n{elementCount}-float4-t{ThreadsPerBlock}",
@@ -309,9 +342,15 @@ internal sealed class PtxPhiloxFillF32Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 8),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["rng-abi"] = "philox4x32-10-v1",
-                ["counter"] = "counterOffset+float4-group; explicit subsequence",
-                ["word-mapping"] = "element i consumes word i%4 of counter floor(i/4)",
+                ["rng-abi"] = statelessDropout
+                    ? "stateless-pcg-integer-v1"
+                    : "philox4x32-10-v1",
+                ["counter"] = statelessDropout
+                    ? "element-index; uint seed; no subsequence or counter offset"
+                    : "counterOffset+float4-group; explicit subsequence",
+                ["word-mapping"] = statelessDropout
+                    ? "sample=pcg(element-index,seed), exactly matching the public CPU/GPU contract"
+                    : "element i consumes word i%4 of counter floor(i/4)",
                 ["distribution"] = kind.ToString(),
                 ["global-reads"] = "none",
                 ["global-writes"] = "one-fp32x4-per-thread",

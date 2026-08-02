@@ -6,9 +6,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Exact 64-coarse/64-fine NeRF importance sampler. One warp owns a ray,
-/// cooperatively stages t-values and non-negative weights once, and produces
-/// two stratified samples per lane. CDF traversal is fully unrolled and
-/// predicated; there are no data-dependent branches or global intermediates.
+/// cooperatively builds the 64-entry CDF once, and produces two stratified
+/// samples per lane with a fixed-depth binary search. There are no
+/// data-dependent branches or global intermediates.
 /// </summary>
 internal sealed class PtxFusedImportanceSampling64F32Kernel : IDisposable
 {
@@ -135,16 +135,31 @@ internal sealed class PtxFusedImportanceSampling64F32Kernel : IDisposable
         ptx.AppendLine("    max.f32 %f3, %f3, 0f00000000;");
         ptx.AppendLine("    mul.wide.u32 %rd12, %r0, 4;");
         ptx.AppendLine("    add.u64 %rd13, %rd12, 128;");
-        ptx.AppendLine("    st.shared.f32 [t_shared+%rd12], %f0;");
-        ptx.AppendLine("    st.shared.f32 [t_shared+%rd13], %f1;");
-        ptx.AppendLine("    st.shared.f32 [weights_shared+%rd12], %f2;");
-        ptx.AppendLine("    st.shared.f32 [weights_shared+%rd13], %f3;");
-        ptx.AppendLine("    bar.sync 0;");
-        ptx.AppendLine("    add.rn.f32 %f4, %f2, %f3;");
-        AppendWarpSum(ptx, "%f4");
-        ptx.AppendLine("    mov.b32 %r23, %f4;");
-        ptx.AppendLine("    shfl.sync.idx.b32 %r24, %r23, 0, 0x1f, 0xffffffff;");
+        // PTX addresses permit register+immediate, but not symbol+register.
+        // Materialize each shared symbol as an address before adding the
+        // lane-owned byte offsets; the old symbol+%rd form failed ptxas.
+        ptx.AppendLine("    mov.u64 %rd8, t_shared;");
+        ptx.AppendLine("    mov.u64 %rd9, weights_shared;");
+        ptx.AppendLine("    add.u64 %rd10, %rd8, %rd12;");
+        ptx.AppendLine("    add.u64 %rd11, %rd8, %rd13;");
+        ptx.AppendLine("    st.shared.f32 [%rd10], %f0;");
+        ptx.AppendLine("    st.shared.f32 [%rd11], %f1;");
+        ptx.AppendLine("    add.u64 %rd10, %rd9, %rd12;");
+        ptx.AppendLine("    add.u64 %rd11, %rd9, %rd13;");
+        AppendWarpInclusiveScan(ptx, "%f2");
+        AppendWarpInclusiveScan(ptx, "%f3");
+        ptx.AppendLine("    mov.b32 %r23, %f2;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r24, %r23, 31, 0x1f, 0xffffffff;");
+        ptx.AppendLine("    mov.b32 %f4, %r24;");
+        ptx.AppendLine("    add.rn.f32 %f3, %f3, %f4;");
+        ptx.AppendLine("    mov.b32 %r23, %f3;");
+        ptx.AppendLine("    shfl.sync.idx.b32 %r24, %r23, 31, 0x1f, 0xffffffff;");
         ptx.AppendLine("    mov.b32 %f5, %r24;");
+        ptx.AppendLine("    add.u64 %rd10, %rd9, %rd12;");
+        ptx.AppendLine("    add.u64 %rd11, %rd9, %rd13;");
+        ptx.AppendLine("    st.shared.f32 [%rd10], %f2;");
+        ptx.AppendLine("    st.shared.f32 [%rd11], %f3;");
+        ptx.AppendLine("    bar.sync 0;");
 
         AppendUniform(ptx, "%r2", "%f6");
         ptx.AppendLine("    cvt.rn.f32.u32 %f7, %r0;");
@@ -161,7 +176,7 @@ internal sealed class PtxFusedImportanceSampling64F32Kernel : IDisposable
 
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
-        ptx.AppendLine($"// exact_shape=[{numRays},64,64]; one_warp_per_ray=1; no_tail_branch=1; cdf_unrolled=64");
+        ptx.AppendLine($"// exact_shape=[{numRays},64,64]; one_warp_per_ray=1; no_tail_branch=1; cooperative_cdf=64; binary_search_steps=6");
         return ptx.ToString();
     }
 
@@ -180,55 +195,60 @@ internal sealed class PtxFusedImportanceSampling64F32Kernel : IDisposable
         ptx.AppendLine($"    min.f32 {output}, {output}, 0f3F7FFFFF;");
     }
 
-    private static void AppendWarpSum(StringBuilder ptx, string value)
+    private static void AppendWarpInclusiveScan(StringBuilder ptx, string value)
     {
-        foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+        foreach (int offset in new[] { 1, 2, 4, 8, 16 })
         {
             ptx.AppendLine($"    mov.b32 %r23, {value};");
-            ptx.AppendLine($"    shfl.sync.down.b32 %r24, %r23, {offset}, 0x1f, 0xffffffff;");
+            ptx.AppendLine($"    shfl.sync.up.b32 %r24, %r23, {offset}, 0, 0xffffffff;");
             ptx.AppendLine("    mov.b32 %f23, %r24;");
-            ptx.AppendLine($"    add.rn.f32 {value}, {value}, %f23;");
+            ptx.AppendLine($"    setp.ge.u32 %p5, %r0, {offset};");
+            ptx.AppendLine($"    @%p5 add.rn.f32 {value}, {value}, %f23;");
         }
     }
 
     private static void AppendCdfSample(StringBuilder ptx, string u, string byteOffset)
     {
-        ptx.AppendLine("    mov.pred %p0, 0;");
-        ptx.AppendLine("    mov.f32 %f8, 0f00000000;");
-        ptx.AppendLine("    mov.f32 %f9, 0f00000000;");
-        ptx.AppendLine("    ld.shared.f32 %f10, [t_shared];");
-        for (int sample = 0; sample < Samples; sample++)
+        // Search the raw prefix sums. Multiplying u by the total once is
+        // algebraically identical to dividing every weight by the total, and
+        // turns the linear 64-bin/division chain into six fixed search steps.
+        ptx.AppendLine($"    mul.rn.f32 %f22, {u}, %f5;");
+        ptx.AppendLine("    mov.u32 %r25, 0;");
+        foreach (int step in new[] { 32, 16, 8, 4, 2, 1 })
         {
-            int offset = sample * sizeof(float);
-            ptx.AppendLine($"    ld.shared.f32 %f11, [weights_shared+{offset}];");
-            ptx.AppendLine("    mov.f32 %f12, %f9;");
-            ptx.AppendLine("    div.rn.f32 %f11, %f11, %f5;");
-            ptx.AppendLine("    add.rn.f32 %f9, %f9, %f11;");
-            ptx.AppendLine(sample == Samples - 1
-                ? "    mov.pred %p1, 1;"
-                : $"    setp.le.f32 %p1, {u}, %f9;");
-            ptx.AppendLine("    not.pred %p2, %p0;");
-            ptx.AppendLine("    and.pred %p2, %p2, %p1;");
-            if (sample == 0)
-            {
-                ptx.AppendLine("    ld.shared.f32 %f17, [t_shared];");
-            }
-            else
-            {
-                int previousOffset = (sample - 1) * sizeof(float);
-                ptx.AppendLine("    sub.rn.f32 %f13, %f9, %f12;");
-                ptx.AppendLine($"    ld.shared.f32 %f14, [t_shared+{previousOffset}];");
-                ptx.AppendLine($"    ld.shared.f32 %f15, [t_shared+{offset}];");
-                ptx.AppendLine($"    sub.rn.f32 %f16, {u}, %f12;");
-                ptx.AppendLine("    div.rn.f32 %f16, %f16, %f13;");
-                ptx.AppendLine("    sub.rn.f32 %f18, %f15, %f14;");
-                ptx.AppendLine("    fma.rn.f32 %f18, %f16, %f18, %f14;");
-                ptx.AppendLine("    setp.gt.f32 %p3, %f13, 0f2EDBE6FF;");
-                ptx.AppendLine("    selp.f32 %f17, %f18, %f14, %p3;");
-            }
-            ptx.AppendLine("    selp.f32 %f10, %f17, %f10, %p2;");
-            ptx.AppendLine("    or.pred %p0, %p0, %p2;");
+            ptx.AppendLine($"    add.u32 %r26, %r25, {step};");
+            ptx.AppendLine("    sub.u32 %r27, %r26, 1;");
+            ptx.AppendLine("    mul.wide.u32 %rd10, %r27, 4;");
+            ptx.AppendLine("    add.u64 %rd10, %rd9, %rd10;");
+            ptx.AppendLine("    ld.shared.f32 %f11, [%rd10];");
+            ptx.AppendLine("    setp.gt.f32 %p1, %f22, %f11;");
+            ptx.AppendLine("    selp.u32 %r25, %r26, %r25, %p1;");
         }
+        ptx.AppendLine("    min.u32 %r25, %r25, 63;");
+        ptx.AppendLine("    ld.shared.f32 %f10, [t_shared];");
+        ptx.AppendLine("    setp.gt.u32 %p2, %r25, 0;");
+        ptx.AppendLine("    sub.u32 %r26, %r25, 1;");
+        ptx.AppendLine("    mul.wide.u32 %rd10, %r26, 4;");
+        ptx.AppendLine("    mul.wide.u32 %rd11, %r25, 4;");
+        ptx.AppendLine("    add.u64 %rd12, %rd9, %rd10;");
+        ptx.AppendLine("    add.u64 %rd13, %rd9, %rd11;");
+        ptx.AppendLine("    mov.f32 %f12, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f13, 0f00000000;");
+        ptx.AppendLine("    @%p2 ld.shared.f32 %f12, [%rd12];");
+        ptx.AppendLine("    @%p2 ld.shared.f32 %f13, [%rd13];");
+        ptx.AppendLine("    add.u64 %rd12, %rd8, %rd10;");
+        ptx.AppendLine("    add.u64 %rd13, %rd8, %rd11;");
+        ptx.AppendLine("    @%p2 ld.shared.f32 %f14, [%rd12];");
+        ptx.AppendLine("    @%p2 ld.shared.f32 %f15, [%rd13];");
+        ptx.AppendLine("    @%p2 mov.f32 %f10, %f14;");
+        ptx.AppendLine("    sub.rn.f32 %f16, %f13, %f12;");
+        ptx.AppendLine("    mul.rn.f32 %f17, %f5, 0f2EDBE6FF;");
+        ptx.AppendLine("    setp.gt.f32 %p3, %f16, %f17;");
+        ptx.AppendLine("    and.pred %p3, %p3, %p2;");
+        ptx.AppendLine("    @%p3 sub.rn.f32 %f18, %f22, %f12;");
+        ptx.AppendLine("    @%p3 div.rn.f32 %f18, %f18, %f16;");
+        ptx.AppendLine("    @%p3 sub.rn.f32 %f19, %f15, %f14;");
+        ptx.AppendLine("    @%p3 fma.rn.f32 %f10, %f18, %f19, %f14;");
         ptx.AppendLine("    ld.shared.f32 %f19, [t_shared];");
         ptx.AppendLine("    ld.shared.f32 %f20, [t_shared+252];");
         ptx.AppendLine("    sub.rn.f32 %f21, %f20, %f19;");

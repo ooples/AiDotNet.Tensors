@@ -12,8 +12,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
 {
     internal const string EntryPoint = "aidotnet_dropout_backward_f32";
-    internal const int ThreadsPerBlock = 128;
-    internal const int ValuesPerThread = 4;
+    internal const int ThreadsPerBlock = 256;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -62,7 +61,7 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
         arguments[0] = &gradOutputPointer;
         arguments[1] = &maskPointer;
         arguments[2] = &gradInputPointer;
-        uint groups = checked((uint)(ElementCount / ValuesPerThread));
+        uint groups = checked((uint)(ElementCount / GetValuesPerThread(ElementCount)));
         _module.Launch(
             _function,
             groups / ThreadsPerBlock, 1, 1,
@@ -74,13 +73,22 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
     internal static bool IsSupportedElementCount(int elementCount) =>
         PtxFusedPhiloxDropoutF32Kernel.IsSupportedElementCount(elementCount);
 
+    internal static int GetValuesPerThread(int elementCount) => elementCount switch
+    {
+        4_096 => 2,
+        65_536 => 4,
+        1_048_576 => 8,
+        _ => throw new ArgumentOutOfRangeException(nameof(elementCount))
+    };
+
     internal static string EmitPtx(int ccMajor, int ccMinor, int elementCount)
     {
         if (!DirectPtxArchitecture.HasExperimentalRngDropout(ccMajor, ccMinor))
             throw new PlatformNotSupportedException(
                 "The experimental dropout-backward emitter targets SM86 only.");
         ValidateElementCount(elementCount);
-        int groups = elementCount / ValuesPerThread;
+        int valuesPerThread = GetValuesPerThread(elementCount);
+        int groups = elementCount / valuesPerThread;
         int blocks = groups / ThreadsPerBlock;
         var ptx = new StringBuilder(2_000);
         ptx.AppendLine(".version 7.1");
@@ -102,11 +110,45 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
         ptx.AppendLine("    ld.param.u64 %rd2, [grad_input_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {ThreadsPerBlock}, %r0;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 16;");
+        int chunksPerThread = valuesPerThread < 4 ? 1 : valuesPerThread / 4;
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {ThreadsPerBlock * chunksPerThread}, %r0;");
+        ptx.AppendLine($"    mul.wide.u32 %rd3, %r2, {(valuesPerThread == 2 ? 8 : 16)};");
+        if (valuesPerThread == 2)
+        {
+            AppendVector2(ptx);
+        }
+        else
+        {
+            for (int chunk = 0; chunk < chunksPerThread; chunk++)
+                AppendVector4(ptx, chunk * ThreadsPerBlock * 16);
+        }
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        ptx.AppendLine($"// exact_elements={elementCount}; values_per_thread={valuesPerThread}; exact_blocks={blocks}; no_tail_branch=1");
+        return ptx.ToString();
+    }
+
+    private static void AppendVector2(StringBuilder ptx)
+    {
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
+        ptx.AppendLine("    ld.global.v2.f32 {%f0,%f1}, [%rd4];");
+        ptx.AppendLine("    ld.global.v2.f32 {%f4,%f5}, [%rd5];");
+        ptx.AppendLine("    mul.rn.f32 %f8, %f0, %f4;");
+        ptx.AppendLine("    mul.rn.f32 %f9, %f1, %f5;");
+        ptx.AppendLine("    st.global.v2.f32 [%rd6], {%f8,%f9};");
+    }
+
+    private static void AppendVector4(StringBuilder ptx, int offset)
+    {
+        if (offset == 0)
+            ptx.AppendLine("    mov.u64 %rd7, %rd3;");
+        else
+            ptx.AppendLine($"    add.u64 %rd7, %rd3, {offset};");
+        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd7;");
+        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd7;");
+        ptx.AppendLine("    add.u64 %rd6, %rd2, %rd7;");
         ptx.AppendLine("    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd4];");
         ptx.AppendLine("    ld.global.v4.f32 {%f4,%f5,%f6,%f7}, [%rd5];");
         ptx.AppendLine("    mul.rn.f32 %f8, %f0, %f4;");
@@ -114,10 +156,6 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
         ptx.AppendLine("    mul.rn.f32 %f10, %f2, %f6;");
         ptx.AppendLine("    mul.rn.f32 %f11, %f3, %f7;");
         ptx.AppendLine("    st.global.v4.f32 [%rd6], {%f8,%f9,%f10,%f11};");
-        ptx.AppendLine("    ret;");
-        ptx.AppendLine("}");
-        ptx.AppendLine($"// exact_elements={elementCount}; exact_blocks={blocks}; no_tail_branch=1");
-        return ptx.ToString();
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -129,7 +167,7 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
             Operation: "dropout-backward-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"exact-n{elementCount}-float4-t{ThreadsPerBlock}",
+            Variant: $"exact-n{elementCount}-float{GetValuesPerThread(elementCount)}-t{ThreadsPerBlock}",
             Tensors:
             [
                 new("grad-output", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -140,10 +178,15 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
+                // The shape-specialized multi-chunk variants stay within 32
+                // registers while a 256-thread block exposes enough warps to
+                // hide memory latency. Six blocks (1,536 resident threads) is
+                // the architectural thread-count ceiling for this launch
+                // geometry on the admitted SM86 device.
+                MaxRegistersPerThread: 32,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 12),
+                MinBlocksPerMultiprocessor: 6),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["mask"] = "saved forward mask already contains inverse-keep scale",

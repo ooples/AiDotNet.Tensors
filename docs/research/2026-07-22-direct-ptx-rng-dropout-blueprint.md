@@ -16,16 +16,16 @@ explicit fail-closed reason.
 |---|---|---|---|
 | Uniform and random initialization | `PtxPhiloxFillF32Kernel.Uniform` | N=4,096 / 65,536 / 1,048,576 | no reads; one float4 output write |
 | Normal and Gaussian noise | `PtxPhiloxFillF32Kernel.Normal` | same N | Philox plus two Box-Muller pairs in registers; one float4 write |
-| Bernoulli/dropout masks | `PtxPhiloxFillF32Kernel.BernoulliMask` and `DropThresholdMask` | same N | predicate and scale remain in registers; one required public-mask write |
+| Bernoulli/dropout masks | `PtxPhiloxFillF32Kernel.BernoulliMask` and `DropThresholdMask` | same N | Philox for the Bernoulli API; the shared stateless PCG integer contract for drop-threshold masks; predicate and scale remain in registers; one required public-mask write |
 | Dropout forward | `PtxFusedPhiloxDropoutF32Kernel` | same N | input read plus required output and saved-mask writes; no random-mask intermediate or second launch |
-| Dropout backward | `PtxDropoutBackwardF32Kernel` | same N | gradient and saved-mask reads plus gradient write |
+| Dropout backward | `PtxDropoutBackwardF32Kernel` | same N | gradient and saved-mask reads plus gradient write; shape-specific 2/4/8-value vectorization uses 256-thread blocks and enough resident warps for memory-latency coverage |
 | Bias + dropout | `PtxFusedBiasPhiloxDropout256F32Kernel` | [16/256/4,096, 256] | bias read, input read, required output and saved-mask writes; no biased-tensor temporary |
-| Gumbel softmax | `PtxFusedGumbelSoftmax32F32Kernel` | [128/2,048/32,768, 32] | Philox Gumbel perturbation and warp max/sum remain in registers; only logits read and probabilities written |
+| Gumbel softmax | `PtxFusedGumbelSoftmax32F32Kernel` | [128/2,048/32,768, 32] | Philox Gumbel perturbation and warp max/sum remain in registers; a cancellation-safe FP32 log series handles `u` near one and the final normalization uses rounded division; only logits read and probabilities written |
 | Gumbel backward | `PtxGumbelSoftmaxBackward32F32Kernel` | same rows x 32 | softmax Jacobian reduction and temperature scale remain in one warp; no reduction temporary |
 | Categorical sampling | `PtxPhiloxCategorical32F32Kernel` | same rows x 32 | warp CDF scan, draw, and one-hot selection remain in registers; no CDF or index intermediate |
-| NeRF importance sampling | `PtxFusedImportanceSampling64F32Kernel` | 64/1,024/16,384 rays x 64 coarse x 64 fine | each coarse t/weight read once into two bank-aligned shared arrays; unrolled CDF traversal writes only final samples |
+| NeRF importance sampling | `PtxFusedImportanceSampling64F32Kernel` | 64/1,024/16,384 rays x 64 coarse x 64 fine | each coarse t/weight is read once; a warp-cooperative prefix scan builds the CDF once per ray and each output uses a six-step binary search; only final samples are written |
 | Training RReLU | `PtxFusedPhiloxRreluF32Kernel` | same vector N | slope generation and negative-side multiply are fused; input read plus required output and backward-visible saved-noise writes |
-| Saved-noise RReLU forward/backward | `PtxRreluF32Kernel` | same vector N | exact float4 ports of both existing NVRTC kernels; no intermediate |
+| Saved-noise RReLU forward/backward | `PtxRreluF32Kernel` | same vector N | exact 2/4/16-value shape variants; all-positive chunks skip the saved-noise read and positive elements skip the multiply; no intermediate |
 | Advertised DDIM step | `PtxFusedDdimStepF32Kernel` | same vector N | two float4 reads and one output write after host-side FP64 coefficient collapse |
 
 The tensor random-uniform/range/normal construction and in-place entry points,
@@ -46,7 +46,7 @@ the direct route even when the feature gate is enabled.
 
 ## Versioned RNG ABI
 
-The first ABI is `philox4x32-10-v1`:
+The primary ABI is `philox4x32-10-v1`:
 
 | Field | Mapping |
 |---|---|
@@ -69,6 +69,13 @@ Counter ownership is scheduling-independent:
 The benchmark CPU oracle uses the same ten-round reference and explicit mapping.
 Seed, subsequence, and counter-offset tests include the published all-zero
 Philox4x32-10 vector. No variable-length rejection loop owns an implicit stream.
+
+`GenerateStatelessDropoutMask` deliberately retains the separate repository-wide
+integer PCG mapping keyed by `(element-index, uint-seed)`. Its direct emitter
+reproduces that mapping bit-for-bit and rejects nonzero Philox
+subsequence/counter offsets rather than silently substituting a different
+random stream. The benchmark compares both direct and incumbent outputs against
+that exact shared oracle.
 
 ## Physical ABI and fail-closed admission
 
@@ -150,7 +157,8 @@ bytes or for violating its per-kernel register/shared/occupancy budget.
 
 Focused non-GPU tests prove:
 
-- ten Philox rounds, counter-domain reproducibility, and the published vector;
+- ten Philox rounds, counter-domain reproducibility, and the published vector,
+  plus bit-exact stateless-PCG instruction and threshold semantics;
 - fixed instruction/dataflow structure for every emitter;
 - exact supported shape buckets and unmeasured-SM rejection;
 - no runtime stride/shape/tail ABI or emitted local-memory declaration;
@@ -172,6 +180,10 @@ dotnet run -c Release -f net10.0 --project tests/AiDotNet.Tensors.Benchmarks -- 
 ```
 
 Use `--no-external` only for harness diagnostics; it is not promotion evidence.
+For focused local diagnosis, `--family vector|row|importance|bias-dropout`
+runs one bounded AiDotNet family and automatically omits cross-process peers;
+`--operation <oracle-operation>` narrows this further. Filtered output is never
+promotion evidence.
 The full run covers every table row and every exact shape with:
 
 - direct PTX launch and direct PTX CUDA-graph replay;
@@ -181,13 +193,30 @@ The full run covers every table row and every exact shape with:
   fullgraph=True)` where supported; unsupported peers are printed as skipped,
   not silently omitted.
 
-Every cell uses 30 warmups, 101 samples, ten resident launches per device-time
-sample, and three independent runs. Output is grouped by operation and shape and
-reports device and synchronized end-to-end mean/median/P95/P99, effective GB/s,
-managed bytes/call, temporary or peak device bytes, maximum oracle/semantic
-error, registers, shared/local bytes, blocks/SM, and complete .NET/PyTorch/CUDA/
-GPU/driver/audit fingerprints. GFLOPS is intentionally not fabricated for RNG
-and probability kernels; GB/s is the meaningful throughput measure.
+The raw diagnostic rows retain 30 warmups, 101 samples, and ten resident
+launches per device-time sample. Promotion-facing AiDotNet comparisons use a
+separate automated oracle: each contender is captured as a 64-operation CUDA
+graph on its own backend, graph replays are host-paired in AB/BA order, an odd
+median of brackets rejects isolated WDDM preemption, and the outer three-
+consecutive-sample 5% spread gate remains the authority. Time is normalized per
+logical public operation. An unstable absolute lane or paired ratio is emitted
+as `not-measurable`, never averaged into a speed claim.
+If either public operation cannot be captured, the oracle explicitly falls back
+to the same calibrated, AB/BA host-paired protocol over public launches; it does
+not omit that operation or compare unlike timing lanes. Correctness is evaluated
+before timing: a non-finite or over-tolerance semantic result is emitted as
+`not-measurable` with `measurement_status=correctness-failed`, and no ratio is
+eligible for a win.
+
+Output is grouped by operation and shape and reports the raw device and
+synchronized end-to-end distributions, the structured paired-oracle verdict,
+effective GB/s, managed bytes/call, temporary or peak device bytes, maximum
+oracle/semantic error, registers, shared/local bytes, blocks/SM, and complete
+.NET/PyTorch/CUDA/GPU/driver/audit fingerprints. GFLOPS is intentionally not
+fabricated for RNG and probability kernels; GB/s is the meaningful throughput
+measure. Cross-process PyTorch rows remain diagnostic until an equally stable
+paired protocol is available; they cannot promote a specialization by
+themselves.
 
 ## Nsight zero-spill proof
 
@@ -213,12 +242,15 @@ alone are not sufficient. No Nsight result has been collected in this change.
 | importance sampling | three ray counts x 64 x 64 | pending | pending | pending | pending | pending | pending | pending | pending |
 | bias-dropout | three row counts x 256 | pending | pending | pending | pending | pending | pending | pending | pending |
 
-No cell may be filled from another machine, a CPU competitor, a partial run, or
-a screening result. Promotion requires at least 1.10x candidate median speedup
-over the strongest eligible peer, candidate P95 no worse than peer P95 +10%,
-zero hot managed allocation, zero avoidable temporary VRAM, operation-specific
-correctness, zero local bytes, and zero executed spill/local evidence. A losing
-or unproven specialization remains disabled and on the established fallback.
+No cell may be filled from another machine, a CPU competitor, a partial run, an
+unstable oracle result, or a screening result. Promotion requires at least
+1.10x stable paired candidate median speedup over the strongest eligible peer,
+candidate P95 no worse than peer P95 +10%, zero hot managed allocation, zero
+avoidable temporary VRAM, operation-specific correctness, zero local bytes,
+and zero executed spill/local evidence. The automated oracle classifies stable
+results below the 1.10x boundary as ties or losses for diagnosis only; it never
+promotes them. A losing or unproven specialization remains disabled and on the
+established fallback.
 
 ## Assembly-line extension order
 

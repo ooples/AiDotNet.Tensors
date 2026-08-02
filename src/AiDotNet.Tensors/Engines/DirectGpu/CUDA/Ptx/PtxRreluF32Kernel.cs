@@ -102,7 +102,7 @@ internal sealed class PtxRreluF32Kernel : IDisposable
 
     private unsafe void Launch(void** arguments)
     {
-        uint groups = checked((uint)(ElementCount / 4));
+        uint groups = checked((uint)(ElementCount / GetValuesPerThread(ElementCount)));
         _module.Launch(
             _function, groups / ThreadsPerBlock, 1, 1,
             ThreadsPerBlock, 1, 1, 0, arguments);
@@ -112,6 +112,14 @@ internal sealed class PtxRreluF32Kernel : IDisposable
 
     internal static bool IsSupportedElementCount(int elementCount) =>
         PtxFusedPhiloxRreluF32Kernel.IsSupportedElementCount(elementCount);
+
+    internal static int GetValuesPerThread(int elementCount) => elementCount switch
+    {
+        4_096 => 2,
+        65_536 => 4,
+        1_048_576 => 16,
+        _ => throw new ArgumentOutOfRangeException(nameof(elementCount))
+    };
 
     internal static string EmitPtx(
         int ccMajor,
@@ -123,6 +131,7 @@ internal sealed class PtxRreluF32Kernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The experimental saved-noise RReLU emitter targets SM86 only.");
         ValidateElementCount(elementCount);
+        int valuesPerThread = GetValuesPerThread(elementCount);
         string entryPoint = kind == DirectPtxRreluKind.Forward
             ? "aidotnet_rrelu_f32"
             : "aidotnet_rrelu_backward_f32";
@@ -148,7 +157,7 @@ internal sealed class PtxRreluF32Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {ThreadsPerBlock}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<4>;");
+        ptx.AppendLine("    .reg .pred %p<8>;");
         ptx.AppendLine("    .reg .b32 %r<4>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
         ptx.AppendLine("    .reg .f32 %f<20>;");
@@ -160,33 +169,73 @@ internal sealed class PtxRreluF32Kernel : IDisposable
         ptx.AppendLine($"    ld.param.u64 %rd{parameter}, [{(kind == DirectPtxRreluKind.Forward ? "output_ptr" : "grad_input_ptr")}];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {ThreadsPerBlock}, %r0;");
-        ptx.AppendLine("    mul.wide.u32 %rd4, %r2, 16;");
+        int chunksPerThread = valuesPerThread < 4 ? 1 : valuesPerThread / 4;
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {ThreadsPerBlock * chunksPerThread}, %r0;");
+        ptx.AppendLine($"    mul.wide.u32 %rd4, %r2, {(valuesPerThread == 2 ? 8 : 16)};");
         int inputPointer = kind == DirectPtxRreluKind.Forward ? 0 : 1;
         int noisePointer = inputPointer + 1;
         int outputPointer = noisePointer + 1;
-        ptx.AppendLine($"    add.u64 %rd8, %rd{inputPointer}, %rd4;");
-        ptx.AppendLine($"    add.u64 %rd9, %rd{noisePointer}, %rd4;");
-        ptx.AppendLine($"    add.u64 %rd10, %rd{outputPointer}, %rd4;");
-        ptx.AppendLine("    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd8];");
-        ptx.AppendLine("    ld.global.v4.f32 {%f4,%f5,%f6,%f7}, [%rd9];");
-        if (kind == DirectPtxRreluKind.Backward)
+        if (valuesPerThread == 2)
         {
-            ptx.AppendLine("    add.u64 %rd11, %rd0, %rd4;");
-            ptx.AppendLine("    ld.global.v4.f32 {%f8,%f9,%f10,%f11}, [%rd11];");
+            AppendVectorChunk(
+                ptx, kind, inputPointer, noisePointer, outputPointer, 0, 2);
         }
-        for (int i = 0; i < 4; i++)
+        else
         {
-            ptx.AppendLine($"    setp.ge.f32 %p{i}, %f{i}, 0f00000000;");
-            ptx.AppendLine($"    selp.f32 %f{12 + i}, 0f3F800000, %f{4 + i}, %p{i};");
-            int value = kind == DirectPtxRreluKind.Forward ? i : 8 + i;
-            ptx.AppendLine($"    mul.rn.f32 %f{16 + i}, %f{value}, %f{12 + i};");
+            for (int chunk = 0; chunk < chunksPerThread; chunk++)
+                AppendVectorChunk(
+                    ptx, kind, inputPointer, noisePointer, outputPointer,
+                    chunk * ThreadsPerBlock * 16, 4);
         }
-        ptx.AppendLine("    st.global.v4.f32 [%rd10], {%f16,%f17,%f18,%f19};");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
-        ptx.AppendLine($"// exact_elements={elementCount}; no_tail_branch=1");
+        ptx.AppendLine($"// exact_elements={elementCount}; values_per_thread={valuesPerThread}; no_tail_branch=1");
         return ptx.ToString();
+    }
+
+    private static void AppendVectorChunk(
+        StringBuilder ptx,
+        DirectPtxRreluKind kind,
+        int inputPointer,
+        int noisePointer,
+        int outputPointer,
+        int offset,
+        int width)
+    {
+        if (offset == 0)
+            ptx.AppendLine("    mov.u64 %rd7, %rd4;");
+        else
+            ptx.AppendLine($"    add.u64 %rd7, %rd4, {offset};");
+        ptx.AppendLine($"    add.u64 %rd8, %rd{inputPointer}, %rd7;");
+        ptx.AppendLine($"    add.u64 %rd9, %rd{noisePointer}, %rd7;");
+        ptx.AppendLine($"    add.u64 %rd10, %rd{outputPointer}, %rd7;");
+        string inputRegisters = width == 2 ? "%f0,%f1" : "%f0,%f1,%f2,%f3";
+        string noiseRegisters = width == 2 ? "%f4,%f5" : "%f4,%f5,%f6,%f7";
+        string resultRegisters = width == 2 ? "%f16,%f17" : "%f16,%f17,%f18,%f19";
+        ptx.AppendLine($"    ld.global.cg.v{width}.f32 {{{inputRegisters}}}, [%rd8];");
+        for (int i = 0; i < width; i++)
+            ptx.AppendLine($"    setp.ge.f32 %p{i}, %f{i}, 0f00000000;");
+        ptx.AppendLine("    and.pred %p4, %p0, %p1;");
+        if (width == 4)
+        {
+            ptx.AppendLine("    and.pred %p4, %p4, %p2;");
+            ptx.AppendLine("    and.pred %p4, %p4, %p3;");
+        }
+        ptx.AppendLine("    not.pred %p5, %p4;");
+        ptx.AppendLine($"    @%p5 ld.global.cg.v{width}.f32 {{{noiseRegisters}}}, [%rd9];");
+        if (kind == DirectPtxRreluKind.Backward)
+        {
+            string gradientRegisters = width == 2 ? "%f8,%f9" : "%f8,%f9,%f10,%f11";
+            ptx.AppendLine("    add.u64 %rd11, %rd0, %rd7;");
+            ptx.AppendLine($"    ld.global.cg.v{width}.f32 {{{gradientRegisters}}}, [%rd11];");
+        }
+        for (int i = 0; i < width; i++)
+        {
+            int value = kind == DirectPtxRreluKind.Forward ? i : 8 + i;
+            ptx.AppendLine($"    mov.f32 %f{16 + i}, %f{value};");
+            ptx.AppendLine($"    @!%p{i} mul.rn.f32 %f{16 + i}, %f{value}, %f{4 + i};");
+        }
+        ptx.AppendLine($"    st.global.v{width}.f32 [%rd10], {{{resultRegisters}}};");
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -212,7 +261,7 @@ internal sealed class PtxRreluF32Kernel : IDisposable
                 : "rrelu-saved-noise-backward-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"exact-n{elementCount}-float4-t{ThreadsPerBlock}",
+            Variant: $"exact-n{elementCount}-float{GetValuesPerThread(elementCount)}-t{ThreadsPerBlock}",
             Tensors: tensors,
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 40,
