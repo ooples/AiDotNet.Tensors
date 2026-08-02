@@ -142,7 +142,7 @@ internal static class DirectPtxRecurrentExperiment
                 MeasureAllocation(backend, DirectLaunch), 0, directError, audit);
             Distribution incumbentTiming = MeasureDevice(backend, CurrentLaunch);
             Print(run, "AiDotNet current NVRTC", incumbentTiming,
-                MeasureAllocation(backend, CurrentLaunch), 0, currentError, null);
+                MeasureAllocation(backend, CurrentLaunch), -1, currentError, null);
             OracleEvidence oracleEvidence = RunPairedOracle(
                 run, backend, GraphLaunch, DirectLaunch, CurrentLaunch,
                 directError, currentError, audit);
@@ -253,7 +253,8 @@ internal static class DirectPtxRecurrentExperiment
             direct_semantic_error = directError,
             incumbent_semantic_error = incumbentError,
             semantic_tolerance = SemanticTolerance,
-            correctness_passed = true,
+            correctness_passed = directError <= SemanticTolerance &&
+                incumbentError <= SemanticTolerance,
             measurement_status = measurementStatus,
             verdict,
             registers_per_thread = audit.Function.RegistersPerThread,
