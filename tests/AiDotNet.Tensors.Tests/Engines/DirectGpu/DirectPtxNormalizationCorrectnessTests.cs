@@ -126,7 +126,9 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         // same operations and more - eighty-six modules against seventy-one - so
         // retargeting here strengthens the check rather than relaxing it.
         string manifestResource = Assert.Single(resources, name =>
-            name.EndsWith(".Artifacts.sm86.normalization-offline-cubins.tsv", StringComparison.Ordinal));
+            name.EndsWith(
+                ".Artifacts.sm86.normalization_offline.normalization-offline-cubins.tsv",
+                StringComparison.Ordinal));
         var expected = new Dictionary<string, string>(StringComparer.Ordinal);
         var blueprintIds = new HashSet<string>(StringComparer.Ordinal);
         int manifestRows = 0;
@@ -176,7 +178,7 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         {
             string sourceKey = artifact.Key;
             string resource = Assert.Single(resources, name =>
-                name.EndsWith(".Artifacts.sm86." + sourceKey + ".cubin",
+                name.EndsWith(".Artifacts.sm86.normalization_offline." + sourceKey + ".cubin",
                     StringComparison.Ordinal));
             using Stream stream = Assert.IsAssignableFrom<Stream>(
                 assembly.GetManifestResourceStream(resource));

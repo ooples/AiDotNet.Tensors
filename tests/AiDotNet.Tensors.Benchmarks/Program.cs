@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the online-attention family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         // GPU-free cubin generation and verification for the normalization-offline family.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-normalization-offline-cubins")
         {

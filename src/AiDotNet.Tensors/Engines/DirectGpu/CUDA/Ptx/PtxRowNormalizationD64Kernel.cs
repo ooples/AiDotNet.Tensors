@@ -121,11 +121,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         _module = runtime.LoadModule(
             Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.NormalizationExperimentOverride);
         _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int blockThreads = IsFusedBackward(operation)
-            ? GetFusedBackwardBlockThreads(operation)
-            : IsParameterGradient(operation)
-                ? ParameterBlockThreads
-                : IsReduction(operation) ? ReductionBlockThreads : RowBlockThreads;
+        int blockThreads = GetBlockThreads(operation);
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
         Blueprint.ResourceBudget.Validate(
             EntryPoint, info, blockThreads, activeBlocks);
@@ -166,11 +162,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         arguments[8] = &pointer7;
         arguments[9] = &pointer8;
 
-        uint blockThreads = IsFusedBackward(Operation)
-            ? (uint)GetFusedBackwardBlockThreads(Operation)
-            : IsParameterGradient(Operation)
-                ? (uint)ParameterBlockThreads
-                : IsReduction(Operation) ? (uint)ReductionBlockThreads : (uint)RowBlockThreads;
+        uint blockThreads = checked((uint)GetBlockThreads(Operation));
         uint grid = IsFusedBackward(Operation)
             ? checked((uint)Math.Min(
                 (Rows + GetFusedBackwardWarpsPerBlock(Operation) - 1) /
@@ -1747,6 +1739,14 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         DirectPtxRowNormalizationOperation operation) =>
         IsFusedBackward(operation) ||
         operation == DirectPtxRowNormalizationOperation.ReduceNormL2Atomic;
+
+    internal static int GetBlockThreads(
+        DirectPtxRowNormalizationOperation operation) =>
+        IsFusedBackward(operation)
+            ? GetFusedBackwardBlockThreads(operation)
+            : IsParameterGradient(operation)
+                ? ParameterBlockThreads
+                : IsReduction(operation) ? ReductionBlockThreads : RowBlockThreads;
 
     private static bool IsReduction(
         DirectPtxRowNormalizationOperation operation) =>

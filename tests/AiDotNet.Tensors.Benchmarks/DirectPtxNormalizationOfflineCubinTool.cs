@@ -45,7 +45,8 @@ internal static class DirectPtxNormalizationOfflineCubinTool
             yield return new DirectPtxModuleSource(
                 $"row-normalization-{op}-v1-r{rows}",
                 PtxRowNormalizationD64Kernel.GetEntryPoint(op),
-                ptx);
+                ptx,
+                PtxRowNormalizationD64Kernel.GetBlockThreads(op));
         }
 
         // Channel normalization is a single module per operation. It has no row
@@ -79,7 +80,8 @@ internal static class DirectPtxNormalizationOfflineCubinTool
                     $"fused-residual-rmsnorm-v1-r{rows}-w{warpsPerBlock}",
                     PtxFusedResidualRmsNormD64Kernel.EntryPoint,
                     PtxFusedResidualRmsNormD64Kernel.EmitPtx(
-                        8, 6, DefaultEpsilon, rows, warpsPerBlock));
+                        8, 6, DefaultEpsilon, rows, warpsPerBlock),
+                    warpsPerBlock * 32);
         }
     }
 
