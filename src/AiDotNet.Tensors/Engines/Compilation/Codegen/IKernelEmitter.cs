@@ -165,6 +165,13 @@ public enum CodegenTarget
     Wgsl,
     /// <summary>GLSL compute (Vulkan).</summary>
     Glsl,
+    /// <summary>
+    /// Direct PTX emitted from the index-map layer, bypassing a source language and
+    /// its compiler. Specialised per shape, which is the property a shipped library
+    /// cannot have: reduction indices fold to compile-time constants and interval
+    /// analysis removes the bounds guards that folding proves unnecessary.
+    /// </summary>
+    DirectPtx,
 }
 
 /// <summary>
