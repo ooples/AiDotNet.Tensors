@@ -165,6 +165,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-championship")
+        {
+            KernelChampionshipTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-identity")
         {
             KernelIdentityTool.Run(args.Skip(1).ToArray());
@@ -1320,6 +1326,7 @@ class Program
         Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
         Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --kernel-identity: print the four-fingerprint autotune identity per catalog kernel");
         Console.WriteLine("  --kernel-arch-validate: assemble catalog PTX for SM80/86/89/90/100/120");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
