@@ -1,0 +1,116 @@
+name: GPU Parity (POCL / CPU-OpenCL)
+
+# Why this lane exists
+# --------------------
+# The CPU-vs-GPU op-parity suites construct a real DirectGpuTensorEngine and compare every op
+# against the trusted CPU oracle. On a GPU-less runner they *skip* — which is why a genuine GPU
+# kernel bug (the LSTM seq-major-vs-batch-major layout defect) shipped in a release: nothing ever
+# executed the kernels in CI. POCL (Portable Computing Language) exposes a CPU OpenCL device, so
+# the DirectGpu OpenCL kernels can actually EXECUTE and be parity-checked on a stock ubuntu runner.
+#   * AIDOTNET_OPENCL_ALLOW_CPU=1  — lets the OpenCL backend bind a CPU device as a fallback when no
+#                                    GPU is present (default off; GPU always preferred).
+#   * AIDOTNET_REQUIRE_GPU_TESTS=1 — turns "no GPU device" from a silent Skip into a hard failure.
+#
+# SHARDED: a single-process run of the full parity surface exhausts POCL partway through (it
+# JIT-compiles every kernel it touches; after ~150 the OpenCL context is lost and later tests fail
+# "no DirectGpu backend available"). So each parity class group runs as its OWN matrix job — a fresh
+# runner + fresh POCL process per shard, so POCL never accumulates across groups. Only the
+# backend-agnostic OpenCL-routed classes are included; the other GPU backends (Cuda/Hip/Metal/
+# Vulkan/WebGpu) and the GPU-feature-specific OpenCL kernels (FlashDecode/PagedAttention/QuantGemm/
+# RopeGqa) are excluded — POCL can't provide those devices/features, so they'd fail "unavailable".
+#
+# STATUS: informational (continue-on-error), NOT required. POCL has also shown intermittent
+# DirectGpu-init failures on hosted runners that are unreproducible without POCL hardware locally.
+# This runs + uploads a per-shard divergence report but never blocks. Promote a shard to required
+# in branch protection only once it is reliably green here. The fully reliable gate remains real GPU
+# hardware (the LSTM parity passes 234/234 on a local AMD RX 5500 XT).
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this lane only reads the repo to check out + build + test.
+permissions:
+  contents: read
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  gpu-parity-pocl:
+    # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each entry runs in its OWN job/runner (fresh POCL) so no single process compiles too many
+        # kernels. The two big classes are single [Theory]s over the op registry (~550 forward, ~430
+        # tape-gradient); AIDOTNET_PARITY_SHARD=k/N partitions each into sub-shards via ParityShard so
+        # each POCL process stays under its per-process kernel-compile ceiling. `name` is the job label.
+        include:
+          - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
+          - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
+          - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
+          - { name: op-forward-1, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "1/6" }
+          - { name: op-forward-2, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "2/6" }
+          - { name: op-forward-3, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "3/6" }
+          - { name: op-forward-4, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "4/6" }
+          - { name: op-forward-5, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "5/6" }
+          - { name: op-forward-6, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "6/6" }
+          - { name: tape-grad-1,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "1/6" }
+          - { name: tape-grad-2,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "2/6" }
+          - { name: tape-grad-3,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "3/6" }
+          - { name: tape-grad-4,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "4/6" }
+          - { name: tape-grad-5,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "5/6" }
+          - { name: tape-grad-6,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "6/6" }
+    name: gpu-parity-pocl (${{ matrix.name }})
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Install POCL (CPU OpenCL device) + ICD loader
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd clinfo
+        echo "=== clinfo: OpenCL platforms/devices ==="
+        clinfo || echo "::warning::clinfo failed — POCL may not be registered."
+
+    - name: Build tests (net10.0)
+      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+
+    - name: Run CPU-vs-GPU parity on POCL (shard ${{ matrix.name }})
+      # Informational only: POCL is not yet reliable as a hard gate on hosted runners (see header).
+      continue-on-error: true
+      env:
+        AIDOTNET_OPENCL_ALLOW_CPU: '1'
+        AIDOTNET_REQUIRE_GPU_TESTS: '1'
+        # Empty for the non-partitioned shards (unset => full set); "k/N" for the op-registry sub-shards.
+        AIDOTNET_PARITY_SHARD: ${{ matrix.shard }}
+        AIDOTNET_OPPARITY_REPORT_DIR: ${{ runner.temp }}/opparity
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "(${{ matrix.filter }})&Category!=Benchmark&Category!=Performance" \
+          --blame-hang --blame-hang-timeout 600s --blame-crash
+
+    - name: Upload parity divergence report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: opparity-pocl-${{ matrix.name }}
+        path: ${{ runner.temp }}/opparity/**
+        if-no-files-found: ignore
