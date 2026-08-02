@@ -234,5 +234,112 @@ public static class CodegenLowering
             CodegenOpKind.StoreOutput, new[] { prev }, dtype, (int[])inputShape.Clone(), 0));
         return graph;
     }
-}
 
+    /// <summary>
+    /// Lowers a 2-D convolution into a graph, optionally with a bias and a ReLU.
+    /// </summary>
+    /// <typeparam name="T">Element type.</typeparam>
+    /// <param name="opKind">
+    /// <see cref="CodegenOpKind.Conv2D"/>, <see cref="CodegenOpKind.DepthwiseConv2D"/> or
+    /// <see cref="CodegenOpKind.ConvTranspose2D"/>.
+    /// </param>
+    /// <param name="inputShape">Input in NCHW order.</param>
+    /// <param name="weightShape">
+    /// <c>[K,C,kh,kw]</c> for a dense convolution, or <c>[C,kh,kw]</c> for a depthwise
+    /// convolution. Transposed convolution accepts either form.
+    /// </param>
+    /// <param name="attributes">Stride and padding.</param>
+    /// <param name="withBias">Adds a per-output-channel bias.</param>
+    /// <param name="withRelu">Adds a ReLU after the bias.</param>
+    /// <remarks>
+    /// The output shape is DERIVED from the geometry rather than taken from the caller,
+    /// so a graph cannot declare an extent its own stride and padding do not produce.
+    /// </remarks>
+    public static CodegenGraph LowerConv2D<T>(
+        CodegenOpKind opKind,
+        int[] inputShape,
+        int[] weightShape,
+        CodegenConvAttributes attributes,
+        bool withBias = false,
+        bool withRelu = false)
+    {
+        if (CodegenOpKinds.Categorize(opKind) != CodegenOpCategory.Convolution)
+            throw new ArgumentException(
+                $"Op {opKind} is not a convolution — cannot lower with LowerConv2D.", nameof(opKind));
+        if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
+        if (weightShape is null) throw new ArgumentNullException(nameof(weightShape));
+        if (attributes is null) throw new ArgumentNullException(nameof(attributes));
+        if (inputShape.Length != 4)
+            throw new ArgumentException("Convolution input must be NCHW.", nameof(inputShape));
+
+        bool transposed = opKind == CodegenOpKind.ConvTranspose2D;
+        bool depthwise = opKind == CodegenOpKind.DepthwiseConv2D ||
+                         (transposed && weightShape.Length == 3);
+        if (weightShape.Length != (depthwise ? 3 : 4))
+            throw new ArgumentException(
+                $"{opKind} expects a rank-{(depthwise ? 3 : 4)} weight tensor.", nameof(weightShape));
+
+        attributes.Validate();
+
+        // Channel agreement, checked HERE rather than left to the translator. LowerConv2D
+        // derives the output shape, so a mismatched weight tensor would produce a graph that
+        // is internally consistent and still wrong -- and the translator would then decline
+        // it with a message about a graph the caller did not write.
+        if (depthwise && weightShape[0] != inputShape[1])
+            throw new ArgumentException(
+                $"A depthwise convolution has one filter per channel, so weights[0] " +
+                $"({weightShape[0]}) must equal the input channels ({inputShape[1]}).",
+                nameof(weightShape));
+        if (!depthwise && weightShape[1] != inputShape[1])
+            throw new ArgumentException(
+                $"Weights are [K,C,kh,kw], so weights[1] ({weightShape[1]}) must equal the " +
+                $"input channels ({inputShape[1]}).",
+                nameof(weightShape));
+
+        int tapH = depthwise ? weightShape[1] : weightShape[2];
+        int tapW = depthwise ? weightShape[2] : weightShape[3];
+        int outChannels = weightShape[0];
+        int outH = transposed
+            ? CodegenConvAttributes.TransposedExtent(inputShape[2], tapH, attributes.StrideHeight, attributes.PadHeight)
+            : CodegenConvAttributes.ForwardExtent(inputShape[2], tapH, attributes.StrideHeight, attributes.PadHeight);
+        int outW = transposed
+            ? CodegenConvAttributes.TransposedExtent(inputShape[3], tapW, attributes.StrideWidth, attributes.PadWidth)
+            : CodegenConvAttributes.ForwardExtent(inputShape[3], tapW, attributes.StrideWidth, attributes.PadWidth);
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                "This stride and padding produce an empty output for the given input and kernel.",
+                nameof(attributes));
+
+        int[] outShape = { inputShape[0], outChannels, outH, outW };
+        var dtype = ResolveElementType<T>();
+        var graph = new CodegenGraph();
+
+        int input = graph.AddNode(new CodegenNode(
+            CodegenOpKind.LoadInput, Array.Empty<int>(), dtype, (int[])inputShape.Clone(), 0));
+        int weights = graph.AddNode(new CodegenNode(
+            CodegenOpKind.LoadInput, Array.Empty<int>(), dtype, (int[])weightShape.Clone(), 1));
+        int value = graph.AddNode(new CodegenNode(
+            opKind, new[] { input, weights }, dtype, (int[])outShape.Clone(), attributes));
+
+        if (withBias)
+        {
+            // Shaped [1,K,1,1], not [K]. Broadcasting is right-aligned, so a bare [K]
+            // would align against the WIDTH axis and mean something else entirely -- a
+            // per-column bias, which is not what a convolution bias is. Spelling the
+            // channel axis out makes the intent unambiguous instead of relying on a
+            // convolution-specific exception to the broadcast rule.
+            int bias = graph.AddNode(new CodegenNode(
+                CodegenOpKind.LoadInput, Array.Empty<int>(), dtype,
+                new[] { 1, outChannels, 1, 1 }, 2));
+            value = graph.AddNode(new CodegenNode(
+                CodegenOpKind.Add, new[] { value, bias }, dtype, (int[])outShape.Clone()));
+        }
+        if (withRelu)
+            value = graph.AddNode(new CodegenNode(
+                CodegenOpKind.ReLU, new[] { value }, dtype, (int[])outShape.Clone()));
+
+        graph.AddNode(new CodegenNode(
+            CodegenOpKind.StoreOutput, new[] { value }, dtype, (int[])outShape.Clone(), 0));
+        return graph;
+    }
+}

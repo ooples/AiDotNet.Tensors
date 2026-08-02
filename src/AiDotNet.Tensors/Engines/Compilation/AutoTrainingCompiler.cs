@@ -25,6 +25,10 @@ internal static class AutoTrainingCompiler
     {
         _state = null;
         ReplayMode = false;
+        // The compile-size override is thread-static too, so leaving it set here would make this
+        // method's "all thread-static state" contract false and let a fixture's gate survive into
+        // whatever runs next on the thread.
+        _testMinForwardElementsOverride = null;
     }
 
     /// <summary>
@@ -85,7 +89,7 @@ internal static class AutoTrainingCompiler
         // SOURCE identities. Activation / loss identities are deliberately NOT
         // included — only sources, which are the long-lived parameter tensors
         // the caller actually wants gradients for.
-        long currentHash = ComputeStructureHash(tape.Entries, tape.EntryCount);
+        if (!TryComputeStructureHash(tape.Entries, tape.EntryCount, sources, out long currentHash)) return null;
         currentHash = IncludeTargetIdentity(currentHash, loss, sources);
         // Match on BOTH the full hash AND exact source reference-equality. The
         // hash alone is collision-prone (XOR of 32-bit GetHashCode values), and
@@ -149,7 +153,7 @@ internal static class AutoTrainingCompiler
             var compiled = tape.CompileBackward(loss, sources);
             // Store the cache key (structure + sources). Matches the lookup
             // computation in TryGetCompiledBackward — both must agree.
-            long hash = ComputeStructureHash(tape.Entries, tape.EntryCount);
+            if (!TryComputeStructureHash(tape.Entries, tape.EntryCount, sources, out long hash)) return;
             hash = IncludeTargetIdentity(hash, loss, sources);
             State.StoreCompiledBackwardWithHash(compiled, hash, sources);
             // Drop the plan's strong reference to the compilation-time loss
@@ -223,10 +227,74 @@ internal static class AutoTrainingCompiler
     /// </remarks>
     internal static long ComputeStructureHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
-        long hash = unchecked((long)0xcbf29ce484222325L);
-        // Include element type so float and double plans don't collide.
+        TryComputeStructureHash(entries, entryCount, sources: null, out long hash);
+        return hash;
+    }
+
+    /// <summary>
+    /// Structure hash, optionally made sensitive to the VALUES of data-derived constants.
+    /// </summary>
+    /// <param name="entries">The tape entries.</param>
+    /// <param name="entryCount">Number of live entries.</param>
+    /// <param name="sources">
+    /// The parameter tensors this plan is built against. Leaves in this set are expected to change
+    /// every step and are deliberately excluded from value hashing; leaves NOT in it are constants
+    /// the compiled plan bakes in, and those must invalidate the plan when they change.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// Hashing operation names and output shapes alone assumes every leaf that is not a parameter
+    /// holds the same value on every replay. A loss that computes a constant FROM ITS INPUT breaks
+    /// that assumption: the op structure and every shape are identical on each step, so the plan is
+    /// reused while the baked-in value goes stale. Nothing detects it, and the failure surfaces far
+    /// from its cause as a wrong or non-finite loss.
+    /// </para>
+    /// <para>
+    /// Observed in a cross-entropy whose ignore_index reduction divided by a supervised-example
+    /// count materialised from the target tensor. Evaluated eagerly the loss was exactly right
+    /// (2.196550 for a uniform 9-class head, 105 gradient tensors, none non-finite, max |grad|
+    /// 0.60); replayed from a compiled plan the identical expression produced NaN on step 1.
+    /// </para>
+    /// <para>
+    /// Small non-parameter leaves are hashed by value. Large ones are refused outright
+    /// (this returns <c>false</c>) rather than assuming they are step-invariant,
+    /// since hashing them on every step would cost more than compiling saves.
+    /// </para>
+    /// <para>
+    /// All inputs are covered, including the <see cref="TapeEntry{T}.InputsOverflow"/> array that
+    /// variadic ops use for inputs 4 and beyond; a constant hiding in an extra slot would otherwise
+    /// bypass the check completely. Each distinct leaf is walked at most once per call, since this
+    /// runs on every <c>ComputeGradients</c> and one constant often feeds many entries.
+    /// </para>
+    /// </remarks>
+    /// <param name="hash">The computed hash. Only meaningful when this returns <c>true</c>.</param>
+    /// <returns>
+    /// <c>false</c> when the tape holds a constant the compiler cannot safely bake in, in which
+    /// case the caller must neither store nor reuse a plan for it. Signalled by the return value
+    /// rather than a sentinel hash, because any sentinel value is one a real hash could take.
+    /// </returns>
+    internal static bool TryComputeStructureHash<T>(
+        TapeEntryArena<T> entries, int entryCount, Tensor<T>[]? sources, out long hash)
+    {
+        hash = unchecked((long)0xcbf29ce484222325L);
+        // Include element type so float and double plans do not collide.
         hash ^= typeof(T).GetHashCode();
         hash *= unchecked((long)0x100000001b3L);
+
+        HashSet<Tensor<T>>? produced = null;
+        HashSet<Tensor<T>>? parameters = null;
+        Dictionary<Tensor<T>, long>? leafValueHashes = null;
+        if (sources is not null)
+        {
+            produced = new HashSet<Tensor<T>>(TensorIdentityComparer<T>.Instance);
+            parameters = new HashSet<Tensor<T>>(TensorIdentityComparer<T>.Instance);
+            leafValueHashes = new Dictionary<Tensor<T>, long>(TensorIdentityComparer<T>.Instance);
+            foreach (var source in sources)
+            {
+                if (source is not null) parameters.Add(source);
+            }
+        }
+
         for (int i = 0; i < entryCount; i++)
         {
             ref var entry = ref entries[i];
@@ -234,7 +302,7 @@ internal static class AutoTrainingCompiler
             hash *= unchecked((long)0x100000001b3L);
             if (entry.Output is not null)
             {
-                // Shape only — NOT identity. Two steps with the same model
+                // Shape only - NOT identity. Two steps with the same model
                 // shape produce the same structure hash.
                 foreach (int dim in entry.Output._shape)
                 {
@@ -242,8 +310,132 @@ internal static class AutoTrainingCompiler
                     hash *= unchecked((long)0x100000001b3L);
                 }
             }
+
+            if (produced is not null && parameters is not null && leafValueHashes is not null)
+            {
+                if (!TryHashLeafValue(entry.Input0, produced, parameters, leafValueHashes, ref hash)
+                    || !TryHashLeafValue(entry.Input1, produced, parameters, leafValueHashes, ref hash)
+                    || !TryHashLeafValue(entry.Input2, produced, parameters, leafValueHashes, ref hash))
+                {
+                    return false;
+                }
+
+                // Variadic ops (Concat, Stack, TensorAddMany) keep inputs 4+ ONLY here, and
+                // TapeEntry treats this array as the authoritative input list when it is set.
+                // Reading Input0-2 alone would let a data-derived constant in an extra slot
+                // escape the hash entirely - precisely the staleness this method exists to catch.
+                var overflow = entry.InputsOverflow;
+                if (overflow is not null)
+                {
+                    for (int j = 0; j < overflow.Length; j++)
+                    {
+                        if (!TryHashLeafValue(overflow[j], produced, parameters, leafValueHashes, ref hash))
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                if (entry.Output is not null) produced.Add(entry.Output);
+            }
         }
-        return hash;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Compares tensors by reference. Leaf tracking must key on identity: two distinct tensors can
+    /// hold equal contents, and a value-based comparer would both mis-group them and cost a full
+    /// element scan per lookup.
+    /// </summary>
+    private sealed class TensorIdentityComparer<TElement> : IEqualityComparer<Tensor<TElement>>
+    {
+        internal static readonly TensorIdentityComparer<TElement> Instance = new();
+
+        public bool Equals(Tensor<TElement>? x, Tensor<TElement>? y) => ReferenceEquals(x, y);
+
+        public int GetHashCode(Tensor<TElement> obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
+    }
+
+    /// <summary>
+    /// Largest non-parameter leaf whose values are folded into the hash. Beyond this, hashing on
+    /// every step would outweigh the benefit of compiling, so the tape is declared uncompilable.
+    /// </summary>
+    private const int MaxHashedConstantElements = 4096;
+
+    /// <summary>
+    /// Folds a leaf constant's values into the hash. Returns false when the leaf is too large to
+    /// hash, meaning the tape must not be compiled.
+    /// </summary>
+    /// <param name="leafValueHashes">
+    /// Per-lookup memo of leaf digests. This runs on every <c>ComputeGradients</c>, and a single
+    /// constant is commonly an input to many entries; without the memo each occurrence re-walks
+    /// every element. The digest depends only on the leaf's contents, so one walk per distinct
+    /// leaf per lookup is sufficient.
+    /// </param>
+    private static bool TryHashLeafValue<T>(
+        Tensor<T>? candidate,
+        HashSet<Tensor<T>> produced,
+        HashSet<Tensor<T>> parameters,
+        Dictionary<Tensor<T>, long> leafValueHashes,
+        ref long hash)
+    {
+        // Only LEAVES matter: anything an earlier entry produced is recomputed on replay.
+        if (candidate is null) return true;
+        if (produced.Contains(candidate)) return true;
+        // Parameters legitimately change every step; the plan binds them by identity.
+        if (parameters.Contains(candidate)) return true;
+
+        if (!leafValueHashes.TryGetValue(candidate, out long valueHash))
+        {
+            if (candidate.Length > MaxHashedConstantElements) return false;
+
+            valueHash = ComputeLeafValueHash(candidate);
+            leafValueHashes[candidate] = valueHash;
+        }
+
+        // Folded at EVERY occurrence, not just the first: the digest is memoised, the position
+        // is not, so a constant moving between inputs still changes the overall hash.
+        hash ^= valueHash;
+        hash *= unchecked((long)0x100000001b3L);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Digest of a leaf's contents, independent of where it appears in the tape.
+    /// </summary>
+    /// <remarks>
+    /// Covers shape as well as values. Flattened values alone do not identify a leaf: a [2,1] and
+    /// a [1,2] constant holding the same numbers broadcast along different axes while leaving the
+    /// op name, the output shape and the value sequence identical, so the plan key would not move
+    /// and a plan compiled for one broadcast would be replayed for the other.
+    /// </remarks>
+    private static long ComputeLeafValueHash<T>(Tensor<T> leaf)
+    {
+        long valueHash = unchecked((long)0xcbf29ce484222325L);
+
+        // Rank first, so [2,2] and [2,2,1] cannot coincide by dimension sequence alone.
+        valueHash ^= leaf._shape.Length;
+        valueHash *= unchecked((long)0x100000001b3L);
+        foreach (int dim in leaf._shape)
+        {
+            valueHash ^= dim;
+            valueHash *= unchecked((long)0x100000001b3L);
+        }
+
+        // EqualityComparer<T>.Default dispatches without boxing for value types; calling
+        // GetHashCode() on the element directly would allocate once per element, which on a
+        // per-step hash of up to MaxHashedConstantElements values is a hot-path regression.
+        var comparer = EqualityComparer<T>.Default;
+        for (int i = 0; i < leaf.Length; i++)
+        {
+            var value = leaf[i];
+            valueHash ^= value is null ? 0 : comparer.GetHashCode(value);
+            valueHash *= unchecked((long)0x100000001b3L);
+        }
+
+        return valueHash;
     }
 
     /// <summary>
@@ -266,7 +458,22 @@ internal static class AutoTrainingCompiler
     /// Null = use the env-or-1M default. Mirrors the established test-hook pattern
     /// (e.g. MixedPrecisionEmit.TestOverrideEnabled).
     /// </summary>
-    internal static long? TestMinForwardElementsOverride { get; set; }
+    /// <remarks>
+    /// Thread-scoped, matching the <see cref="_state"/> and <see cref="ReplayMode"/> it gates.
+    /// As a process-wide static it leaked across xunit collections, which run in parallel: while
+    /// any fixture held the gate at a tiny value, unrelated tests on other threads had their small
+    /// tapes become compile-eligible, so they intermittently exercised the replay path they were
+    /// never written for and failed depending on timing.
+    /// </remarks>
+    [ThreadStatic]
+    private static long? _testMinForwardElementsOverride;
+
+    /// <inheritdoc cref="_testMinForwardElementsOverride"/>
+    internal static long? TestMinForwardElementsOverride
+    {
+        get => _testMinForwardElementsOverride;
+        set => _testMinForwardElementsOverride = value;
+    }
 
     /// <summary>Effective size-gate threshold: the test override when set, else the env-or-1M default.</summary>
     private static long CompiledTrainingMinForwardElements

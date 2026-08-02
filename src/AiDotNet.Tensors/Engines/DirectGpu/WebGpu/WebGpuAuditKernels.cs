@@ -48,19 +48,25 @@ struct P { batch: i32, Lp: i32, nFft: i32, hop: i32, numFrames: i32, numFreqs: i
 @group(0) @binding(1) var<storage, read> phase : array<f32>;
 @group(0) @binding(2) var<storage, read_write> newMag : array<f32>;
 @group(0) @binding(3) var<storage, read_write> newPhase : array<f32>;
-struct P { leading: i32, nFramesV: i32, nFreqV: i32, outFrames: i32, rate: f32 };
+struct P { leading: i32, numFrames: i32, numFreqs: i32, outFrames: i32, rate: f32 };
 @group(0) @binding(4) var<uniform> pc : P;
+// Layout is [numFreqs, numFrames] — TIME contiguous-inner, matching BuildSpectrum below and
+// CpuEngine's vocoder. The old outer-axis reading interpolated across frequency bins.
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let idx = i32(gid.x); if (idx >= pc.leading * pc.nFreqV) { return; }
-  let f = idx % pc.nFreqV; let b = idx / pc.nFreqV; let stride = pc.nFramesV * pc.nFreqV; let outStride = pc.outFrames * pc.nFreqV;
+  let idx = i32(gid.x); if (idx >= pc.leading * pc.numFreqs) { return; }
+  let f = idx % pc.numFreqs; let b = idx / pc.numFreqs;
+  let row = b * pc.numFreqs * pc.numFrames + f * pc.numFrames;
+  let outRow = b * pc.numFreqs * pc.outFrames + f * pc.outFrames;
   var accPhase = 0.0;
   for (var t = 0; t < pc.outFrames; t = t + 1) {
-    let srcT = f32(t) * pc.rate; let t0 = i32(floor(srcT)); let t1 = min(t0 + 1, pc.nFramesV - 1); let frac = srcT - f32(t0);
-    let m0 = mag[b * stride + t0 * pc.nFreqV + f]; let m1 = mag[b * stride + t1 * pc.nFreqV + f];
-    newMag[b * outStride + t * pc.nFreqV + f] = (1.0 - frac) * m0 + frac * m1;
+    let srcT = f32(t) * pc.rate; var t0 = i32(floor(srcT));
+    if (t0 > pc.numFrames - 1) { t0 = pc.numFrames - 1; }
+    let t1 = min(t0 + 1, pc.numFrames - 1); let frac = srcT - f32(t0);
+    let m0 = mag[row + t0]; let m1 = mag[row + t1];
+    newMag[outRow + t] = (1.0 - frac) * m0 + frac * m1;
     var dp = 0.0;
-    if (t0 + 1 < pc.nFramesV) { dp = phase[b * stride + (t0 + 1) * pc.nFreqV + f] - phase[b * stride + t0 * pc.nFreqV + f]; dp = dp - 2.0 * 3.14159265358979 * round(dp / (2.0 * 3.14159265358979)); }
-    accPhase = accPhase + dp; newPhase[b * outStride + t * pc.nFreqV + f] = accPhase;
+    if (t0 + 1 < pc.numFrames) { dp = phase[row + t0 + 1] - phase[row + t0]; dp = dp - 2.0 * 3.14159265358979 * round(dp / (2.0 * 3.14159265358979)); }
+    accPhase = accPhase + dp; newPhase[outRow + t] = accPhase;
   }
 }";
 
@@ -524,7 +530,10 @@ struct P { batch: i32, numFrames: i32, nFft: i32, hop: i32, outputLength: i32, c
   let idx = i32(gid.x); let total = pc.batch * pc.outputLength; if (idx >= total) { return; }
   let outIdx = idx % pc.outputLength; let b = idx / pc.outputLength; var resultAcc = 0.0; var windowAcc = 0.0;
   for (var frame = 0; frame < pc.numFrames; frame = frame + 1) {
-    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = max(0, frame * pc.hop - pc.nFft / 2); }
+    // No max(0, ..) — see CpuEngine.ISTFT: clamping SHIFTS the frames whose centre precedes sample 0
+    // instead of trimming them, wrecking the head and collapsing the window sum to ~1e-8. writeStart is
+    // i32 here (idx is i32(gid.x)), so a negative start is representable and the i >= 0 test trims it.
+    var writeStart = frame * pc.hop; if (pc.center != 0) { writeStart = frame * pc.hop - pc.nFft / 2; }
     let i = outIdx - writeStart;
     if (i >= 0 && i < pc.nFft) {
       let specOff = (b * pc.numFrames + frame) * pc.nFft; var acc = 0.0;
@@ -569,29 +578,44 @@ struct P { rowLen: i32, k: i32, j: i32, numRows: i32, descending: i32 };
   if (doSwap) { values[base + i] = b; values[base + ixj] = a; let t = indices[base + i]; indices[base + i] = indices[base + ixj]; indices[base + ixj] = t; }
 }";
 
+    // RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17). Sbuf holds, per (b,h), the
+    // [d_v, d_k] state followed by the kappaHat / w / a gate vectors.
     public static string Rwkv7Forward => @"
 @group(0) @binding(0) var<storage, read> R : array<f32>;
-@group(0) @binding(1) var<storage, read> K : array<f32>;
-@group(0) @binding(2) var<storage, read> V : array<f32>;
-@group(0) @binding(3) var<storage, read> A : array<f32>;
-@group(0) @binding(4) var<storage, read> B : array<f32>;
-@group(0) @binding(5) var<storage, read_write> outp : array<f32>;
-@group(0) @binding(6) var<storage, read_write> Sbuf : array<f32>;
+@group(0) @binding(1) var<storage, read> KAP : array<f32>;
+@group(0) @binding(2) var<storage, read> KT : array<f32>;
+@group(0) @binding(3) var<storage, read> V : array<f32>;
+@group(0) @binding(4) var<storage, read> D : array<f32>;
+@group(0) @binding(5) var<storage, read> AR : array<f32>;
+@group(0) @binding(6) var<storage, read_write> outp : array<f32>;
+@group(0) @binding(7) var<storage, read_write> Sbuf : array<f32>;
 struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
-@group(0) @binding(7) var<uniform> pc : P;
+@group(0) @binding(8) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let bh = i32(gid.x); if (bh >= pc.batch * pc.numHeads) { return; } let b = bh / pc.numHeads; let h = bh % pc.numHeads; let hOff = h * pc.headDim; let hh = pc.headDim * pc.headDim; let sBase = bh * hh;
+  let bh = i32(gid.x); if (bh >= pc.batch * pc.numHeads) { return; }
+  let b = bh / pc.numHeads; let h = bh % pc.numHeads; let hOff = h * pc.headDim; let hh = pc.headDim * pc.headDim;
+  let sBase = bh * (hh + 3 * pc.headDim); let khB = sBase + hh; let wB = sBase + hh + pc.headDim; let aB = sBase + hh + 2 * pc.headDim;
   for (var i = 0; i < hh; i = i + 1) { Sbuf[sBase + i] = 0.0; }
   for (var t = 0; t < pc.seqLen; t = t + 1) {
     let baseOff = (b * pc.seqLen + t) * pc.modelDim + hOff;
-    for (var di = 0; di < pc.headDim; di = di + 1) {
-      let ga = 1.0 / (1.0 + exp(-A[baseOff + di])); let gbk = (1.0 / (1.0 + exp(-B[baseOff + di]))) * K[baseOff + di]; let srow = di * pc.headDim;
-      for (var vi = 0; vi < pc.headDim; vi = vi + 1) { Sbuf[sBase + srow + vi] = ga * Sbuf[sBase + srow + vi] + gbk * V[baseOff + vi]; }
+    var ss = 1e-12;
+    for (var ki = 0; ki < pc.headDim; ki = ki + 1) { let kp = KAP[baseOff + ki]; ss = ss + kp * kp; }
+    let invN = 1.0 / sqrt(ss);
+    for (var ki = 0; ki < pc.headDim; ki = ki + 1) {
+      Sbuf[khB + ki] = KAP[baseOff + ki] * invN;
+      Sbuf[wB + ki] = exp(-0.60653065971263342 / (1.0 + exp(-D[baseOff + ki])));
+      Sbuf[aB + ki] = AR[baseOff + ki];
     }
-    for (var di = 0; di < pc.headDim; di = di + 1) {
-      let srow = di * pc.headDim; var sk = 0.0;
-      for (var vi = 0; vi < pc.headDim; vi = vi + 1) { sk = sk + Sbuf[sBase + srow + vi] * K[baseOff + vi]; }
-      outp[baseOff + di] = (1.0 / (1.0 + exp(-R[baseOff + di]))) * sk;
+    for (var vi = 0; vi < pc.headDim; vi = vi + 1) {
+      let srow = sBase + vi * pc.headDim; var p = 0.0;
+      for (var ki = 0; ki < pc.headDim; ki = ki + 1) { p = p + Sbuf[srow + ki] * Sbuf[khB + ki]; }
+      let vv = V[baseOff + vi]; var o = 0.0;
+      for (var ki = 0; ki < pc.headDim; ki = ki + 1) {
+        let sv = Sbuf[srow + ki] * Sbuf[wB + ki] - p * Sbuf[aB + ki] * Sbuf[khB + ki] + vv * KT[baseOff + ki];
+        Sbuf[srow + ki] = sv;
+        o = o + sv * R[baseOff + ki];
+      }
+      outp[baseOff + vi] = o;
     }
   }
 }";

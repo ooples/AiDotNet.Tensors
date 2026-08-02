@@ -242,6 +242,14 @@ internal sealed class TensorStorage<T>
         return _data.GetDataArray();
     }
 
+    /// <summary>
+    /// Gets the actual managed backing array and the base offset of this
+    /// storage without materializing a copy.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBackingArraySegment(out T[]? array, out int offset)
+        => _data.TryGetBackingArraySegment(out array, out offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ThrowIfReadOnlyMapped()
     {

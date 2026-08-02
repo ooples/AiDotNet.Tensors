@@ -208,9 +208,9 @@ layout(set=0,binding=8) writeonly buffer CacheGates { float cacheGates[]; };
 layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
 float sigmoid(float x){return 1.0/(1.0+exp(-x));}
 void main(){uint b=gl_GlobalInvocationID.x;if(b>=batch)return;uint gateSize=4u*hiddenSize,cellSize=batch*hiddenSize;
-    for(uint t=0u;t<seqLen;++t){uint hOffset=t*cellSize,nextOffset=(t+1u)*cellSize,gateOffset=(t*batch+b)*gateSize,inputOffset=(t*batch+b)*inputSize;
+    for(uint t=0u;t<seqLen;++t){uint hOffset=t*cellSize,nextOffset=(t+1u)*cellSize,gateOffset=(t*batch+b)*gateSize,inputOffset=(b*seqLen+t)*inputSize;
         for(uint g=0u;g<gateSize;++g){float sum=biasIh[g]+biasHh[g];for(uint k=0u;k<inputSize;++k)sum+=inputData[inputOffset+k]*weightsIh[g*inputSize+k];for(uint k=0u;k<hiddenSize;++k)sum+=allH[hOffset+b*hiddenSize+k]*weightsHh[g*hiddenSize+k];cacheGates[gateOffset+g]=sum;}
-        for(uint i=0u;i<hiddenSize;++i){float ig=sigmoid(cacheGates[gateOffset+i]),fg=sigmoid(cacheGates[gateOffset+hiddenSize+i]),gg=tanh(cacheGates[gateOffset+2u*hiddenSize+i]),og=sigmoid(cacheGates[gateOffset+3u*hiddenSize+i]);uint state=b*hiddenSize+i;float ct=fg*allC[hOffset+state]+ig*gg,ht=og*tanh(ct);allC[nextOffset+state]=ct;allH[nextOffset+state]=ht;outputData[t*cellSize+state]=ht;}
+        for(uint i=0u;i<hiddenSize;++i){float ig=sigmoid(cacheGates[gateOffset+i]),fg=sigmoid(cacheGates[gateOffset+hiddenSize+i]),gg=tanh(cacheGates[gateOffset+2u*hiddenSize+i]),og=sigmoid(cacheGates[gateOffset+3u*hiddenSize+i]);uint state=b*hiddenSize+i;float ct=fg*allC[hOffset+state]+ig*gg,ht=og*tanh(ct);allC[nextOffset+state]=ct;allH[nextOffset+state]=ht;outputData[(b*seqLen+t)*hiddenSize+i]=ht;}
     }
 }";
 
@@ -234,8 +234,8 @@ float sigmoid(float x){return 1.0/(1.0+exp(-x));}
 void main(){if(gl_GlobalInvocationID.x!=0u)return;uint gateSize=4u*hiddenSize,cellSize=batch*hiddenSize;
     for(uint i=0u;i<seqLen*batch*inputSize;++i)gradInput[i]=0.0;for(uint i=0u;i<cellSize;++i){gradHInit[i]=0.0;gradCInit[i]=0.0;nextDh[i]=0.0;}for(uint i=0u;i<gateSize*inputSize;++i)gradWeightsIh[i]=0.0;for(uint i=0u;i<gateSize*hiddenSize;++i)gradWeightsHh[i]=0.0;for(uint i=0u;i<gateSize;++i)gradBias[i]=0.0;
     for(int ti=int(seqLen)-1;ti>=0;--ti){uint t=uint(ti),hOffset=t*cellSize,nextOffset=(t+1u)*cellSize;
-        for(uint b=0u;b<batch;++b){uint stateOffset=b*hiddenSize,gateOffset=(t*batch+b)*gateSize,inputOffset=(t*batch+b)*inputSize;
-            for(uint i=0u;i<hiddenSize;++i)gradHInit[stateOffset+i]+=gradOutput[t*cellSize+stateOffset+i];
+        for(uint b=0u;b<batch;++b){uint stateOffset=b*hiddenSize,gateOffset=(t*batch+b)*gateSize,inputOffset=(b*seqLen+t)*inputSize;
+            for(uint i=0u;i<hiddenSize;++i)gradHInit[stateOffset+i]+=gradOutput[(b*seqLen+t)*hiddenSize+i];
             for(uint i=0u;i<hiddenSize;++i){float ig=sigmoid(cacheGates[gateOffset+i]),fg=sigmoid(cacheGates[gateOffset+hiddenSize+i]),gg=tanh(cacheGates[gateOffset+2u*hiddenSize+i]),og=sigmoid(cacheGates[gateOffset+3u*hiddenSize+i]),ct=allC[nextOffset+stateOffset+i],tanhCt=tanh(ct),localDh=gradHInit[stateOffset+i];gradCInit[stateOffset+i]+=localDh*og*(1.0-tanhCt*tanhCt);float localDc=gradCInit[stateOffset+i],dIg=localDc*gg*ig*(1.0-ig),dFg=localDc*allC[hOffset+stateOffset+i]*fg*(1.0-fg),dGg=localDc*ig*(1.0-gg*gg),dOg=localDh*tanhCt*og*(1.0-og);
                 for(uint gi=0u;gi<4u;++gi){float dg=gi==0u?dIg:(gi==1u?dFg:(gi==2u?dGg:dOg));uint gate=gi*hiddenSize+i;gradBias[gate]+=dg;for(uint k=0u;k<inputSize;++k)gradWeightsIh[gate*inputSize+k]+=dg*inputData[inputOffset+k];for(uint k=0u;k<hiddenSize;++k)gradWeightsHh[gate*hiddenSize+k]+=dg*allH[hOffset+stateOffset+k];}
                 for(uint k=0u;k<inputSize;++k)for(uint gi=0u;gi<4u;++gi){float dg=gi==0u?dIg:(gi==1u?dFg:(gi==2u?dGg:dOg));gradInput[inputOffset+k]+=dg*weightsIh[(gi*hiddenSize+i)*inputSize+k];}gradCInit[stateOffset+i]*=fg;
