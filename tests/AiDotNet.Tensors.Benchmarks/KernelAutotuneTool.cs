@@ -45,11 +45,14 @@ internal static class KernelAutotuneTool
 
     private sealed class TuneState : IDisposable
     {
-        internal TuneState(StableTimer.Result baseline)
+        internal TuneState(
+            StableTimer.Result baseline,
+            CodegenAutotuneEvidenceGate evidence)
         {
             HasStableTiming = baseline.Stable;
             BestUs = baseline.Stable ? baseline.Microseconds : double.MaxValue;
             BestModelledUs = BestUs;
+            Evidence = evidence;
         }
 
         internal bool HasStableTiming { get; set; }
@@ -57,7 +60,7 @@ internal static class KernelAutotuneTool
         internal double BestUs { get; set; }
         internal double BestModelledUs { get; set; }
         internal double BestGain { get; set; } = 1.0;
-        internal List<string> InconclusivePromotableCandidates { get; } = new();
+        internal CodegenAutotuneEvidenceGate Evidence { get; }
         internal CandidateProgram? BestProgram { get; private set; }
 
         internal void Adopt(CandidateProgram candidate)
@@ -243,14 +246,14 @@ internal static class KernelAutotuneTool
         DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
         var rows = LoadUnselectedCurrentRows(outputPath, runtime, entries);
         int improved = 0;
-        var failures = new List<string>();
+        var evidence = new CodegenAutotuneEvidenceGate();
         try
         {
             foreach (var entry in entries)
             {
                 try
                 {
-                    TuneResult? result = TuneOne(runtime, entry, candidateSelector);
+                    TuneResult? result = TuneOne(runtime, entry, candidateSelector, evidence);
                     if (result is null || !double.IsFinite(result.BestUs) ||
                         result.BestUs == double.MaxValue ||
                         !double.IsFinite(result.ModelledUs) || result.ModelledUs == double.MaxValue)
@@ -283,19 +286,13 @@ internal static class KernelAutotuneTool
                 catch (Exception ex)
                 {
                     Console.WriteLine(entry.Name.PadRight(30) + "  ERROR " + ex.Message.Split('\n')[0]);
-                    failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
+                    evidence.RecordFailure(entry.Name + ": " + ex.Message.Split('\n')[0]);
                 }
             }
         }
         finally { DirectPtxFeatureGate.ConvolutionExperimentOverride = prior; }
 
         GpuBenchmarkEnvironment.RequireNoForeignCompute("autotune-end", afterSuite: true);
-        if (failures.Count != 0)
-            throw new InvalidOperationException(
-                failures.Count.ToString(CultureInfo.InvariantCulture) +
-                " selected kernel(s) failed autotuning; no winner artifact written. " +
-                string.Join("; ", failures));
-
         var text = new StringBuilder();
         text.AppendLine("# autotune winners, " + CodegenMeasurementProtocol.Tag + ": " +
                         CodegenMeasurementProtocol.Description);
@@ -303,10 +300,13 @@ internal static class KernelAutotuneTool
             "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope");
         foreach (CodegenCatalogEntry entry in CodegenKernelCatalog.All)
             if (rows.TryGetValue(entry.Name, out string? row)) text.AppendLine(row);
-        string temporaryOutput = outputPath + ".tmp-" +
-            Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
-        File.WriteAllText(temporaryOutput, text.ToString());
-        File.Move(temporaryOutput, outputPath, overwrite: true);
+        bool requireCompleteSearch = string.Equals(searchScope, "full", StringComparison.Ordinal);
+        if (!requireCompleteSearch && evidence.InconclusivePromotableCandidates.Count != 0)
+            Console.WriteLine("inconclusive promotable candidate(s): " +
+                string.Join(", ", evidence.InconclusivePromotableCandidates) +
+                "; probe result is diagnostic only");
+        evidence.CommitArtifact(
+            outputPath, text.ToString(), requireCompleteSearch);
 
         Console.WriteLine();
         double noiseFloorPercent =
@@ -414,7 +414,8 @@ internal static class KernelAutotuneTool
     }
 
     private static TuneResult? TuneOne(
-        DirectPtxRuntime runtime, CodegenCatalogEntry entry, string? candidateSelector)
+        DirectPtxRuntime runtime, CodegenCatalogEntry entry, string? candidateSelector,
+        CodegenAutotuneEvidenceGate evidence)
     {
         CodegenKernelSpec spec = entry.Bench;
         long workUnits = WorkUnits(spec);
@@ -431,7 +432,7 @@ internal static class KernelAutotuneTool
                               "; trying independently gated paired windows");
         }
 
-        using var state = new TuneState(baseline);
+        using var state = new TuneState(baseline, evidence);
 
         for (int i = 1; i < Candidates.Length; i++)
         {
@@ -693,11 +694,6 @@ internal static class KernelAutotuneTool
                               "no winner recorded");
             return null;
         }
-        if (state.InconclusivePromotableCandidates.Count != 0)
-            throw new InvalidOperationException(
-                "promotable candidate timing did not stabilize: " +
-                string.Join(", ", state.InconclusivePromotableCandidates) +
-                "; the selected search is incomplete");
         return new TuneResult(
             state.BestName, state.BestUs, state.BestModelledUs, state.BestGain);
     }
@@ -750,7 +746,7 @@ internal static class KernelAutotuneTool
                                   "0.0", CultureInfo.InvariantCulture) + "%); rejected");
             ReportPhases(runtime, candidate);
             if (candidate.Promotable)
-                state.InconclusivePromotableCandidates.Add(candidate.Name);
+                state.Evidence.RecordInconclusivePromotableCandidate(candidate.Name);
             return;
         }
 
