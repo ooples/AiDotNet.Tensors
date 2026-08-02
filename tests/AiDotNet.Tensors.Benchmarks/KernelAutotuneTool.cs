@@ -300,7 +300,13 @@ internal static class KernelAutotuneTool
             "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope");
         foreach (CodegenCatalogEntry entry in CodegenKernelCatalog.All)
             if (rows.TryGetValue(entry.Name, out string? row)) text.AppendLine(row);
-        evidence.CommitArtifact(outputPath, text.ToString());
+        bool requireCompleteSearch = string.Equals(searchScope, "full", StringComparison.Ordinal);
+        if (!requireCompleteSearch && evidence.InconclusivePromotableCandidates.Count != 0)
+            Console.WriteLine("inconclusive promotable candidate(s): " +
+                string.Join(", ", evidence.InconclusivePromotableCandidates) +
+                "; probe result is diagnostic only");
+        evidence.CommitArtifact(
+            outputPath, text.ToString(), requireCompleteSearch);
 
         Console.WriteLine();
         double noiseFloorPercent =

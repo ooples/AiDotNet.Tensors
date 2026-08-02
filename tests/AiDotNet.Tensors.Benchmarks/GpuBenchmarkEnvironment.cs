@@ -68,8 +68,8 @@ internal static class GpuBenchmarkEnvironment
 
     private static void RequireHostQuiescence(string label)
     {
-        Dictionary<int, ForeignProcessCpuSample> before = ReadForeignProcessCpuTimes();
         var interval = Stopwatch.StartNew();
+        Dictionary<int, ForeignProcessCpuSample> before = ReadForeignProcessCpuTimes();
         DateTime sliceStartedUtc = DateTime.UtcNow;
         double busyMilliseconds = 0;
         do
@@ -91,6 +91,9 @@ internal static class GpuBenchmarkEnvironment
 
         double capacityMilliseconds = interval.Elapsed.TotalMilliseconds *
             Math.Max(1, Environment.ProcessorCount);
+        if (capacityMilliseconds <= 0)
+            throw new InvalidOperationException(
+                $"[{label}] Host quiescence sampling produced no measurable interval.");
         int utilizationPercent = (int)Math.Round(
             busyMilliseconds / capacityMilliseconds * 100.0,
             MidpointRounding.AwayFromZero);
@@ -155,14 +158,19 @@ internal static class GpuBenchmarkEnvironment
                         times[process.Id] = new ForeignProcessCpuSample(
                             process.TotalProcessorTime, process.StartTime.ToUniversalTime());
                 }
-                catch (Exception)
+                catch (InvalidOperationException)
                 {
-                    // A process can exit or become inaccessible between enumeration
-                    // and sampling. The short rolling slices ensure a process seen
-                    // before it exits still contributes to an earlier interval.
+                    // The process exited between enumeration and property access.
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    // The process became inaccessible between enumeration and sampling.
                 }
             }
         }
+        if (times.Count == 0)
+            throw new InvalidOperationException(
+                "Host quiescence sampling observed no accessible foreign processes.");
         return times;
     }
 

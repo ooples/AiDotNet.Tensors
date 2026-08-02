@@ -12,6 +12,17 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class DirectPtxConvolutionTests
 {
     [Fact]
+    public void EmbeddedArtifactArchitecture_AnchorsOnTheSmMarker()
+    {
+        Assert.True(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.Artifacts.sm86.convolution.manifest.tsv",
+            out string architecture));
+        Assert.Equal("sm86", architecture);
+        Assert.False(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.manifest.tsv", out _));
+    }
+
+    [Fact]
     public void Emitter_IsPointerOnlyShapeSpecializedSm86Ptx()
     {
         string ptx = PtxFusedConv2DNchwK1Kernel.EmitPtx(8, 6);
@@ -204,6 +215,34 @@ public sealed class DirectPtxConvolutionTests
             Assert.Contains("the selected search is incomplete", error.Message,
                 StringComparison.Ordinal);
             Assert.Equal(previousArtifact, File.ReadAllText(outputPath));
+            Assert.Single(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void AutotuneProbe_PublishesDiagnosticArtifactWithInconclusiveCandidate()
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune-probe.tsv");
+            var evidence = new CodegenAutotuneEvidenceGate();
+            evidence.RecordInconclusivePromotableCandidate("tiled-conv2d:8x8");
+
+            evidence.CommitArtifact(
+                outputPath, "diagnostic-probe-artifact", requireCompleteSearch: false);
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "tiled-conv2d:8x8" },
+                evidence.InconclusivePromotableCandidates);
+            Assert.Equal("diagnostic-probe-artifact", File.ReadAllText(outputPath));
             Assert.Single(Directory.GetFiles(temporaryDirectory));
         }
         finally

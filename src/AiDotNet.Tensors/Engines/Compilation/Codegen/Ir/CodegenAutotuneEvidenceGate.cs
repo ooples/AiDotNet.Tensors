@@ -8,8 +8,9 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
 /// <summary>
 /// Owns the completeness decision and atomic publication boundary for one
-/// measured autotune search. An incomplete search may report diagnostics, but
-/// it must never replace the last complete winner artifact.
+/// measured autotune search. An incomplete full search may report diagnostics,
+/// but it must never replace the last complete winner artifact. A probe can
+/// publish an explicitly diagnostic artifact without claiming completeness.
 /// </summary>
 internal sealed class CodegenAutotuneEvidenceGate
 {
@@ -36,10 +37,15 @@ internal sealed class CodegenAutotuneEvidenceGate
             _failures.Add(failure);
     }
 
-    internal void CommitArtifact(string outputPath, string contents)
+    internal void CommitArtifact(
+        string outputPath,
+        string contents,
+        bool requireCompleteSearch = true)
     {
-        if (!IsComplete)
-            throw new InvalidOperationException(DescribeIncompleteSearch());
+        if (_failures.Count != 0 ||
+            (requireCompleteSearch && _inconclusivePromotableCandidates.Count != 0))
+            throw new InvalidOperationException(
+                DescribeIncompleteSearch(requireCompleteSearch));
 
         string? directory = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrEmpty(directory))
@@ -74,14 +80,14 @@ internal sealed class CodegenAutotuneEvidenceGate
         }
     }
 
-    private string DescribeIncompleteSearch()
+    private string DescribeIncompleteSearch(bool requireCompleteSearch)
     {
         var reasons = new List<string>();
         if (_failures.Count != 0)
             reasons.Add(
                 _failures.Count.ToString(CultureInfo.InvariantCulture) +
                 " selected kernel(s) failed autotuning: " + string.Join("; ", _failures));
-        if (_inconclusivePromotableCandidates.Count != 0)
+        if (requireCompleteSearch && _inconclusivePromotableCandidates.Count != 0)
             reasons.Add(
                 "promotable candidate timing did not stabilize: " +
                 string.Join(", ", _inconclusivePromotableCandidates) +

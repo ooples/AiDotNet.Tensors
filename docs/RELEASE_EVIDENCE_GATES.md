@@ -138,9 +138,10 @@ The p9 run explains all eight non-wins:
 > it can support a current promotion decision.
 
 The p9 diagnoses above were used as search directions, not as permanent explanations.
-Under p13, a full measured candidate search selected nine different schedules and a fresh
-consolidated process produced 13/13 stable wins. Before competitor timing, the same selected
-dispatch passed all 13 generated fp64 interpretations. The device was an RTX 3080 locked at
+Under p13, a full measured candidate search selected nine schedules other than the modelled
+affine baseline, and a fresh consolidated process produced 13/13 stable wins. Before competitor
+timing, the same selected dispatch passed all 13 generated fp64 interpretations. The device was
+an RTX 3080 locked at
 1770 MHz; the competitor was PyTorch 2.12.1+cu130/cuDNN 9.2, `allow_tf32=False`, with both
 sides replayed through CUDA graphs.
 
