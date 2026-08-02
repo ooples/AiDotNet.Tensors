@@ -25,11 +25,13 @@ internal static class DirectPtxOfflineCubinTool
             yield return new DirectPtxModuleSource(
                 $"cast-f32-to-f16-v1-n{size}",
                 PtxFusedCastF32ToF16Kernel.EntryPoint,
-                PtxFusedCastF32ToF16Kernel.EmitPtx(8, 6, size));
+                PtxFusedCastF32ToF16Kernel.EmitPtx(8, 6, size),
+                PtxFusedCastF32ToF16Kernel.DefaultBlockThreads);
             yield return new DirectPtxModuleSource(
                 $"cast-f16-to-f32-v1-n{size}",
                 PtxFusedCastF16ToF32Kernel.EntryPoint,
-                PtxFusedCastF16ToF32Kernel.EmitPtx(8, 6, size));
+                PtxFusedCastF16ToF32Kernel.EmitPtx(8, 6, size),
+                PtxFusedCastF16ToF32Kernel.DefaultBlockThreads);
         }
 
         foreach (int rows in new[] { 512, 1024, 2048, 4096 })
@@ -38,7 +40,8 @@ internal static class DirectPtxOfflineCubinTool
             yield return new DirectPtxModuleSource(
                 $"transpose2d-f32-v1-r{rows}-c{columns}",
                 PtxFusedTranspose2DF32Kernel.EntryPoint,
-                PtxFusedTranspose2DF32Kernel.EmitPtx(8, 6, rows, columns));
+                PtxFusedTranspose2DF32Kernel.EmitPtx(8, 6, rows, columns),
+                PtxFusedTranspose2DF32Kernel.BlockThreads);
         }
     }
 

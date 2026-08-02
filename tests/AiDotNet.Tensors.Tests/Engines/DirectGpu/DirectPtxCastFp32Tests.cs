@@ -74,6 +74,31 @@ public class DirectPtxCastFp32Tests
     }
 
     [Fact]
+    public void LayoutOfflinePackage_CoversEveryReleaseModule()
+    {
+        foreach (int size in new[] { 65_536, 262_144, 1_048_576, 4_194_304 })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedCastF32ToF16Kernel.EmitPtx(8, 6, size), 8, 6));
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedCastF16ToF32Kernel.EmitPtx(8, 6, size), 8, 6));
+        }
+
+        foreach (int rows in new[] { 512, 1024, 2048, 4096 })
+        foreach (int columns in new[] { 512, 1024, 2048, 4096 })
+        {
+            Assert.NotNull(DirectPtxCubinArtifactCache.TryResolveEmbedded(
+                PtxFusedTranspose2DF32Kernel.EmitPtx(8, 6, rows, columns), 8, 6));
+        }
+
+        Assert.Contains(
+            typeof(PtxFusedCastF16ToF32Kernel).Assembly.GetManifestResourceNames(),
+            name => name.EndsWith(
+                ".sm86.layout.layout-cubins.tsv",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void WideningCastArchitectureGate_FailsClosedOutsideSm86()
     {
         Assert.True(DirectPtxArchitecture.HasValidatedCastFp32(8, 6));
