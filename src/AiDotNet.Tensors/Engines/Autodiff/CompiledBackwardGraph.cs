@@ -47,6 +47,13 @@ public sealed class CompiledBackwardGraph<T>
     /// </summary>
     private readonly TapeEntryArena<T> _entries;
 
+    /// <summary>
+    /// Number of entries owned by this compiled plan at construction time. The
+    /// shared arena can later grow during higher-order recording; those newer
+    /// entries own separate pins and must not be released by this plan.
+    /// </summary>
+    private readonly int _entryCount;
+
     private readonly IEngine _engine;
 
     /// <summary>
@@ -75,6 +82,7 @@ public sealed class CompiledBackwardGraph<T>
         // 2. The tape's arena is not Reset() until tape.Dispose() which is after Execute()
         // 3. For persistent tapes, the arena is not cleared between ComputeGradients calls
         _entries = entries;
+        _entryCount = entries.Count;
         _loss = loss;
         _sources = sources;
         _engine = engine;
@@ -225,6 +233,17 @@ public sealed class CompiledBackwardGraph<T>
             // finally block performs. GradientTapeLeakTests catches this.
             BackwardInputBuffers<T>.Clear();
 
+            // Pin acquisition is per recorded entry, while this plan executes only
+            // loss-reachable entries. Release the full construction-time range so
+            // eliminated/dead entries are balanced too. The entry-owned bit makes
+            // persistent replay and overlapping cleanup routes exactly-once.
+            int releaseCount = Math.Min(_entryCount, _entries.Count);
+            for (int i = 0; i < releaseCount; i++)
+            {
+                ref var entry = ref _entries[i];
+                DifferentiableOps.UnpinSavedStateTensors<T>(ref entry);
+            }
+
             // Persistent-tape parity with the GradientTape.ComputeGradientsViaGraphCore
             // cleanup: clear .GradFn AND .Grad on forward intermediates so they don't
             // get pinned across iterations. CompiledBackwardGraph walks the tape via
@@ -294,7 +313,6 @@ public sealed class CompiledBackwardGraph<T>
                         inp._pinnedByTape = false;
                     }
                 }
-
                 // .GradFn / .Grad cleanup on this entry's output (every output is an
                 // intermediate — graph leaves never appear as outputs in the entries
                 // array). Inputs are NOT cleared because they may be graph leaves
