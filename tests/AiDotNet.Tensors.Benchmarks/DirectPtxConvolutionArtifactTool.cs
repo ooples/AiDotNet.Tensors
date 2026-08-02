@@ -35,6 +35,8 @@ internal static class DirectPtxConvolutionArtifactTool
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "Convolution cubins can currently be released only for the experimental GA102/SM86 device.");
+        using IDisposable freshCompileScope =
+            DirectPtxCubinArtifactCache.EnterFreshCompileScope();
 
         var exported = new HashSet<string>(StringComparer.Ordinal);
         var manifest = new List<string>

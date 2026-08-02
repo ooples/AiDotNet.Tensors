@@ -79,7 +79,12 @@ internal static class DirectPtxCubinArtifactCache
         lock (Sync)
         {
             if (_freshCompileScopeDepth != 0)
-                return Compile(runtime, ptx, sourceKey, cachePath: null);
+            {
+                DirectPtxCubinArtifact fresh = Compile(
+                    runtime, ptx, sourceKey, GetCachePath(runtime, sourceKey));
+                TryWriteDisk(fresh, runtime);
+                return fresh;
+            }
             DirectPtxCubinArtifact? embedded = TryReadEmbedded(
                 runtime.ComputeCapabilityMajor,
                 runtime.ComputeCapabilityMinor,
