@@ -11,10 +11,13 @@ internal static class GpuBenchmarkEnvironment
     private const int PostSuiteUtilizationDelayMilliseconds = 250;
     private const int DeviceMemoryCeilingMegabytes = 2048;
     private const int DeviceTemperatureCeilingCelsius = 75;
+    private const int HostUtilizationCeilingPercent = 20;
+    private const int HostUtilizationSampleMilliseconds = 750;
 
     internal static void RequireIdleGpu(string label)
     {
         RequireNoForeignCompute(label);
+        RequireHostQuiescence(label);
 
         string status = RunNvidiaSmi(
             "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
@@ -56,7 +59,59 @@ internal static class GpuBenchmarkEnvironment
                 $"{DeviceTemperatureCeilingCelsius} C evidence ceiling.");
 
         if (afterSuite)
+        {
             RequirePostSuiteDeviceQuiescence(label);
+            RequireHostQuiescence(label);
+        }
+    }
+
+    private static void RequireHostQuiescence(string label)
+    {
+        Dictionary<int, TimeSpan> before = ReadForeignProcessCpuTimes();
+        var interval = Stopwatch.StartNew();
+        System.Threading.Thread.Sleep(HostUtilizationSampleMilliseconds);
+        Dictionary<int, TimeSpan> after = ReadForeignProcessCpuTimes();
+        interval.Stop();
+
+        double busyMilliseconds = 0;
+        foreach (KeyValuePair<int, TimeSpan> sample in after)
+        {
+            if (before.TryGetValue(sample.Key, out TimeSpan start) && sample.Value > start)
+                busyMilliseconds += (sample.Value - start).TotalMilliseconds;
+        }
+
+        double capacityMilliseconds = interval.Elapsed.TotalMilliseconds *
+            Math.Max(1, Environment.ProcessorCount);
+        int utilizationPercent = (int)Math.Round(
+            busyMilliseconds / capacityMilliseconds * 100.0,
+            MidpointRounding.AwayFromZero);
+        if (utilizationPercent > HostUtilizationCeilingPercent)
+            throw new InvalidOperationException(
+                $"[{label}] Host is not benchmark-ready (foreign CPU utilization=" +
+                $"{utilizationPercent}%, ceiling={HostUtilizationCeilingPercent}%).");
+    }
+
+    private static Dictionary<int, TimeSpan> ReadForeignProcessCpuTimes()
+    {
+        var times = new Dictionary<int, TimeSpan>();
+        int currentProcessId = Environment.ProcessId;
+        foreach (Process process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.Id != 0 && process.Id != currentProcessId)
+                        times[process.Id] = process.TotalProcessorTime;
+                }
+                catch (Exception)
+                {
+                    // A process can exit or become inaccessible between enumeration
+                    // and sampling. Other surviving processes still form the gate.
+                }
+            }
+        }
+        return times;
     }
 
     private static void RequirePostSuiteDeviceQuiescence(string label)
