@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// for the v1 golden slice and the shared-memory tiled GEMM. Skips cleanly when
 /// no CUDA device is present.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class DirectPtxConvolutionGpuExecutionTests
 {
     private const float Tolerance = 2e-4f;
