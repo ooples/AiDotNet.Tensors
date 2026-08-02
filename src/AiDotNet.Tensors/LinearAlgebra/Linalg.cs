@@ -251,7 +251,7 @@ public static class Linalg
         return SvdWrapper.LowRank(input, rank, q);
     }
 
-    private static (Tensor<float> U, Tensor<float> S, Tensor<float> Vh) TruncateSvd4x4(
+    internal static (Tensor<float> U, Tensor<float> S, Tensor<float> Vh) TruncateSvd4x4(
         Tensor<float> fullU, Tensor<float> fullS, Tensor<float> fullVh, int k)
     {
         int rank = fullU.Rank;
