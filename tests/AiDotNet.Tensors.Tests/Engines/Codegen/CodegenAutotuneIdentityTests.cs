@@ -19,6 +19,35 @@ public sealed class CodegenAutotuneCacheCollection
 public class CodegenAutotuneIdentityTests
 {
     [Fact]
+    public void Cache_DefaultPathHonorsEnvironmentAndFallsBack()
+    {
+        const string variable = "AIDOTNET_CODEGEN_AUTOTUNE_CACHE";
+        string? previous = Environment.GetEnvironmentVariable(variable);
+        string configured = Path.Combine(
+            Path.GetTempPath(), "configured-codegen-autotune.tsv");
+
+        try
+        {
+            Environment.SetEnvironmentVariable(variable, configured);
+            Assert.Equal(configured, CodegenAutotuneCache.ResolveDefaultCachePath());
+
+            Environment.SetEnvironmentVariable(variable, null);
+            Assert.Equal(
+                Path.Combine("artifacts", "autotune.tsv"),
+                CodegenAutotuneCache.ResolveDefaultCachePath());
+
+            Environment.SetEnvironmentVariable(variable, "   ");
+            Assert.Equal(
+                Path.Combine("artifacts", "autotune.tsv"),
+                CodegenAutotuneCache.ResolveDefaultCachePath());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, previous);
+        }
+    }
+
+    [Fact]
     public void ChunkedSplitFactors_AreOrderedAndShared()
     {
         Assert.Equal(new[] { 2, 4, 7, 14 }, CodegenAutotuneIdentity.ChunkedSplitFactors);
