@@ -102,7 +102,7 @@ jobs:
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
           --verify-direct-ptx-layout-cubins
           "$RUNNER_TEMP/cuda-nvcc/bin/ptxas"
-          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86/layout"
 
       # The disassembly is the machine-code evidence the promotion gate asks
       # for, and it needs no device: LDL/STL in the SASS means a spill reached
@@ -112,7 +112,7 @@ jobs:
           dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll
           --audit-direct-ptx-layout-sass
           "$RUNNER_TEMP/cuda-nvdisasm/bin/nvdisasm"
-          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86"
+          "src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/sm86/layout"
           "artifacts/direct-ptx/layout/sass"
 
       # Always upload: when verify or the SASS audit fails, the generated
