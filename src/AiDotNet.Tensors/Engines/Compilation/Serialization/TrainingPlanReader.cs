@@ -180,7 +180,7 @@ internal static class TrainingPlanReader
         for (int i = 0; i < tensorTable.Length; i++)
             liveTensors[i] = tensorTable[i];
 
-        using (var scope = GraphMode.Enable())
+        using (var scope = GraphMode.EnableTraining(callerParameters))
         {
             for (int i = 0; i < rawOps.Length; i++)
             {
