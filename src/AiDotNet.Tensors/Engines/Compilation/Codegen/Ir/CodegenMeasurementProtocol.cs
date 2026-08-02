@@ -70,6 +70,12 @@
 //              first. The tuner now retains only the incumbent, directly interleaves it with
 //              each nominally faster challenger, and samples toward a tighter spread target
 //              before applying the same noise-floor and measured-uncertainty requirements.
+//   v13 -> v14 complete-search and host-quiescence admission. An unstable promotable candidate
+//              was treated as a loss, so a noisy full search could publish the modelled fallback
+//              even when the unmeasured specialization was several times faster. Full searches
+//              now fail when any applicable promotable candidate does not stabilize, preserve
+//              the last identity-valid artifact on failure, and reject material foreign host
+//              CPU load before and after GPU evidence collection.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -93,7 +99,7 @@ public static class CodegenMeasurementProtocol
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 13;
+    public const int Version = 14;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -104,7 +110,8 @@ public static class CodegenMeasurementProtocol
         "true-fp32 CUDA-graph replay on both lanes; exact PTX-set autotune and dispatch-bound evidence; " +
         "exact competitor geometry; multi-strategy cuDNN plan search; " +
         "phase-scoped counter profiles; recoverable per-operation stability windows; " +
-        "direct adaptive finalist replay for autotune winner arbitration";
+        "direct adaptive finalist replay for autotune winner arbitration; " +
+        "complete stable promotable searches on a host-quiescent machine";
 
     /// <summary>
     /// Minimum paired ratio required for a directly replayed challenger to displace

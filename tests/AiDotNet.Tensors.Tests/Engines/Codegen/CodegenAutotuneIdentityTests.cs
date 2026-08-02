@@ -122,10 +122,14 @@ public class CodegenAutotuneIdentityTests
                 identity.SpecFingerprint, identity.EmitterFingerprint, "full");
             string probeRow = row.Replace("depthwise\t", "probe\t");
             probeRow = probeRow.Substring(0, probeRow.Length - "full".Length) + "probe";
+            string staleProtocolRow = row
+                .Replace("depthwise\t", "stale-protocol\t")
+                .Replace("\t" + CodegenMeasurementProtocol.Tag + "\t", "\tp13\t");
             File.WriteAllText(path,
                 "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope\n" +
                 "legacy\tno-tile\t10.0\t20.0\t2.0\t" + CodegenMeasurementProtocol.Tag + "\n" +
                 probeRow + "\n" +
+                staleProtocolRow + "\n" +
                 row + "\n");
             File.WriteAllText(secondPath,
                 "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope\n" +
@@ -139,6 +143,7 @@ public class CodegenAutotuneIdentityTests
                 "depthwise", identity with { Target = "sm90" }));
             Assert.Null(CodegenAutotuneCache.WinnerFor("legacy", identity));
             Assert.Null(CodegenAutotuneCache.WinnerFor("probe", identity));
+            Assert.Null(CodegenAutotuneCache.WinnerFor("stale-protocol", identity));
 
             // Assigning another path must invalidate automatically; requiring callers to
             // remember Invalidate made tests and tools silently serve the previous file.
