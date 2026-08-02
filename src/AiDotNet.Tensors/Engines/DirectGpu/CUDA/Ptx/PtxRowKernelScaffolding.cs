@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -8,7 +9,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 ///
 /// Caller preconditions (the emitted code reads these registers):
 /// <c>%r0 = %tid.x</c>, <c>%rd5</c> is the base address of the <c>red</c> shared array
-/// (<see cref="SharedBytes"/> bytes), and <c>%rd10 = &amp;red[tid]</c>, computed as
+/// (<see cref="SharedBytes"/> bytes for the default 256-thread geometry), and
+/// <c>%rd10 = &amp;red[tid]</c>, computed as
 /// <c>%rd5 + tid * 4</c>.
 ///
 /// The emitted code clobbers <c>%f10</c>, <c>%f11</c>, <c>%r10</c>, <c>%r11</c>,
@@ -25,9 +27,18 @@ internal static class PtxRowReduce
     internal const int SharedBytes = WarpCount * sizeof(float);
     internal const string Strategy = "warp-shuffle-plus-warp-leader-shared";
 
-    internal static void Emit(StringBuilder ptx, string operation, string accumulator)
+    internal static int SharedBytesFor(int blockThreads)
+    {
+        ValidateBlockThreads(blockThreads);
+        return blockThreads / 32 * sizeof(float);
+    }
+
+    internal static void Emit(
+        StringBuilder ptx, string operation, string accumulator,
+        int blockThreads = PtxRowShape.BlockThreads)
     {
         PtxCompat.ThrowIfNull(ptx, nameof(ptx));
+        ValidateBlockThreads(blockThreads);
         if (operation != "max.f32" && operation != "add.rn.f32")
             throw new ArgumentOutOfRangeException(nameof(operation), operation,
                 "Only the audited max and add row reductions are supported.");
@@ -51,13 +62,20 @@ internal static class PtxRowReduce
         ptx.AppendLine(operation == "max.f32"
             ? "    mov.f32 %f10, 0fFF800000;"
             : "    mov.f32 %f10, 0f00000000;");
-        ptx.AppendLine("    setp.lt.u32 %p3, %r0, 8;");
+        ptx.AppendLine($"    setp.lt.u32 %p3, %r0, {blockThreads / 32};");
         ptx.AppendLine("    @%p3 ld.shared.f32 %f10, [%rd10];");
         ptx.AppendLine("    setp.lt.u32 %p3, %r0, 32;");
         EmitWarpShuffle(ptx, operation, predicate: "@%p3 ");
         ptx.AppendLine("    setp.eq.u32 %p3, %r0, 0;");
         ptx.AppendLine("    @%p3 st.shared.f32 [%rd5], %f10;");
         ptx.AppendLine("    bar.sync 0;");
+    }
+
+    private static void ValidateBlockThreads(int blockThreads)
+    {
+        if (blockThreads is < 32 or > 1024 || blockThreads % 32 != 0)
+            throw new ArgumentOutOfRangeException(nameof(blockThreads),
+                "Row reduction thread count must be a warp-aligned value from 32 through 1024.");
     }
 
     private static void EmitWarpShuffle(StringBuilder ptx, string operation, string predicate)
@@ -111,22 +129,32 @@ internal static class PtxElementwiseShape
 
     internal static bool IsPromoted(int count) => false;
 
-    internal static int VectorGridBlocks(int count, int blockThreads = BlockThreads)
+    internal static int VectorGridBlocks(
+        int count, int blockThreads = BlockThreads, int vectorWidth = VectorWidth)
     {
         Validate(count, "Vectorized elementwise launch");
-        if (blockThreads <= 0)
-            throw new ArgumentOutOfRangeException(nameof(blockThreads));
-        int elementsPerBlock = checked(blockThreads * VectorWidth);
+        ValidateVectorGeometry(blockThreads, vectorWidth);
+        int elementsPerBlock = checked(blockThreads * vectorWidth);
         return checked((count + elementsPerBlock - 1) / elementsPerBlock);
     }
 
-    internal static bool RequiresBoundsGuard(int count, int blockThreads = BlockThreads)
+    internal static bool RequiresBoundsGuard(
+        int count, int blockThreads = BlockThreads, int vectorWidth = VectorWidth)
     {
         Validate(count, "Vectorized elementwise launch");
-        if (blockThreads <= 0)
-            throw new ArgumentOutOfRangeException(nameof(blockThreads));
-        int vectorCount = count / VectorWidth;
+        ValidateVectorGeometry(blockThreads, vectorWidth);
+        int vectorCount = count / vectorWidth;
         return vectorCount % blockThreads != 0;
+    }
+
+    internal static void ValidateVectorGeometry(int blockThreads, int vectorWidth)
+    {
+        if (blockThreads is not (128 or 256 or 512))
+            throw new ArgumentOutOfRangeException(nameof(blockThreads),
+                "Elementwise variants support 128, 256, or 512 threads.");
+        if (vectorWidth is not (4 or 8 or 16))
+            throw new ArgumentOutOfRangeException(nameof(vectorWidth),
+                "Elementwise variants support 4, 8, or 16 elements per thread.");
     }
 
     internal static void Validate(int count, string operation)
@@ -136,6 +164,43 @@ internal static class PtxElementwiseShape
                 nameof(count),
                 $"{operation} supports a positive element count that is a multiple of " +
                 $"{BlockThreads} up to {MaxCount}.");
+    }
+}
+
+internal readonly record struct PtxElementwiseVariant(
+    int BlockThreads,
+    int VectorWidth,
+    string LoadModifier,
+    string StoreModifier)
+{
+    internal static readonly PtxElementwiseVariant MaskedFillDefault = new(256, 8, "nc", "cg");
+    internal static readonly PtxElementwiseVariant MaskedFillBackwardDefault = new(256, 8, "nc", "wt");
+
+    internal static IEnumerable<PtxElementwiseVariant> SearchSpace(bool backward)
+    {
+        string defaultStore = backward ? "wt" : "cg";
+        foreach (int threads in new[] { 128, 256, 512 })
+        foreach (int width in new[] { 4, 8, 16 })
+            yield return new PtxElementwiseVariant(threads, width, "nc", defaultStore);
+
+        foreach (string load in new[] { "nc", "ca" })
+        foreach (string store in new[] { "cg", "wt", "cs", "wb" })
+            if (load != "nc" || store != defaultStore)
+                yield return new PtxElementwiseVariant(256, 8, load, store);
+    }
+
+    internal string Name => $"t{BlockThreads}-v{VectorWidth}-{LoadModifier}-{StoreModifier}";
+
+    internal void Validate(int count)
+    {
+        PtxElementwiseShape.ValidateVectorGeometry(BlockThreads, VectorWidth);
+        if (count % VectorWidth != 0)
+            throw new ArgumentOutOfRangeException(nameof(VectorWidth),
+                "Element count must be divisible by the elementwise vector width.");
+        if (LoadModifier is not ("nc" or "ca"))
+            throw new ArgumentOutOfRangeException(nameof(LoadModifier));
+        if (StoreModifier is not ("cg" or "wt" or "cs" or "wb"))
+            throw new ArgumentOutOfRangeException(nameof(StoreModifier));
     }
 }
 

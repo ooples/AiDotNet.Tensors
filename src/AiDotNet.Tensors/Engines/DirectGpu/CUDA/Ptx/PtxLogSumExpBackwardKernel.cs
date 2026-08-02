@@ -9,11 +9,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// axis (issue #840), where <c>lse</c> is the caller-provided [M] forward log-partition and
 /// <c>dY</c> is its [M] upstream gradient. One block owns one row and reuses those forward
 /// statistics directly, matching the incumbent CUDA contract while avoiding a redundant max
-/// and exp-sum reduction. Uses <c>ex2.approx.f32</c>, so a promoted specialization carries
-/// ~1e-3 approximation error (disclosed on the release gate).
+/// and exp-sum reduction. The baked row extent removes the scalar loop; the default transaction
+/// width is derived from the row extent, while the oracle can measure alternate launch widths.
+/// Uses <c>ex2.approx.f32</c>, so a
+/// promoted specialization carries ~1e-3 approximation error (disclosed on the release gate).
 ///
-/// One block per row (grid = M), 256 threads, no shared memory. Supported N are multiples of
-/// 256 so each thread strides the row exactly.
+/// One block per row (grid = M), 256 or 512 threads, no shared memory. Supported N are
+/// multiples of 256 so each thread owns an exact scalar, float2, or float4 pack.
 /// </summary>
 internal sealed class PtxLogSumExpBackwardKernel : IDisposable
 {
@@ -22,6 +24,7 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
+    private readonly int _blockThreads;
 
     internal int M { get; }
     internal int N { get; }
@@ -30,6 +33,12 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
     internal DirectPtxKernelAudit Audit { get; }
 
     internal PtxLogSumExpBackwardKernel(DirectPtxRuntime runtime, int m, int n)
+        : this(runtime, m, n, PtxLogSumExpBackwardVariant.ForShape(n))
+    {
+    }
+
+    internal PtxLogSumExpBackwardKernel(
+        DirectPtxRuntime runtime, int m, int n, PtxLogSumExpBackwardVariant variant)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedSoftmax(
@@ -37,19 +46,21 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The checked-in log-sum-exp-backward specialization is measured only on GA10x/SM86.");
         PtxRowShape.Validate(m, n, "Log-sum-exp backward");
+        variant.Validate(n);
         M = m;
         N = n;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, n);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, n);
+        _blockThreads = variant.BlockThreads;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, n, variant);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, n, variant);
         var loaded = DirectPtxResourceInitialization.Complete(
             runtime.LoadModule(Ptx),
             module =>
             {
                 IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
-                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, _blockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, _blockThreads, activeBlocks);
                 DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
-                    Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks,
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info, _blockThreads, activeBlocks,
                     module.JitInfoLog);
                 return (Function: function, Audit: audit);
             });
@@ -78,15 +89,22 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         arguments[1] = &logSumExpPointer;
         arguments[2] = &gradPointer;
         arguments[3] = &outputPointer;
-        _module.Launch(_function, (uint)M, 1, 1, BlockThreads, 1, 1, 0, arguments);
+        _module.Launch(_function, (uint)M, 1, 1, (uint)_blockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int m, int n)
+        => EmitPtx(ccMajor, ccMinor, m, n, PtxLogSumExpBackwardVariant.ForShape(n));
+
+    internal static string EmitPtx(
+        int ccMajor, int ccMinor, int m, int n, PtxLogSumExpBackwardVariant variant)
     {
         PtxRowShape.Validate(m, n, "Log-sum-exp backward");
+        variant.Validate(n);
         int rowBytes = checked(n * sizeof(float));
+        int blockThreads = variant.BlockThreads;
+        int elementsPerThread = n / blockThreads;
         const string Log2e = "0f3FB8AA3B";
 
         var ptx = new StringBuilder(5_000);
@@ -101,12 +119,11 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         ptx.AppendLine("    .param .u64 grad_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<2>;");
-        ptx.AppendLine("    .reg .b32 %r<8>;");
-        ptx.AppendLine("    .reg .b64 %rd<16>;");
-        ptx.AppendLine("    .reg .f32 %f<8>;");
+        ptx.AppendLine("    .reg .b32 %r<2>;");
+        ptx.AppendLine("    .reg .b64 %rd<5>;");
+        ptx.AppendLine("    .reg .f32 %f<9>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [lse_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [grad_ptr];");
@@ -114,44 +131,61 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
         ptx.AppendLine($"    mul.wide.u32 %rd4, %r1, {rowBytes};");
-        ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");               // &input[m,0]
-        ptx.AppendLine("    add.u64 %rd6, %rd3, %rd4;");               // &output[m,0]
-        ptx.AppendLine("    mul.wide.u32 %rd7, %r1, 4;");
-        ptx.AppendLine("    add.u64 %rd8, %rd1, %rd7;");               // &lse[m]
-        ptx.AppendLine("    add.u64 %rd9, %rd2, %rd7;");               // &grad[m]
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd8];");           // lse[m]
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd9];");           // dY[m]
-        ptx.AppendLine("    mov.u32 %r2, %r0;");
-        ptx.AppendLine("OUT_LOOP:");
-        ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {n};");
-        ptx.AppendLine("    @%p0 bra.uni OUT_DONE;");
-        ptx.AppendLine("    mul.wide.u32 %rd10, %r2, 4;");
-        ptx.AppendLine("    add.u64 %rd11, %rd5, %rd10;");
-        ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd11];");
-        ptx.AppendLine("    sub.rn.f32 %f2, %f2, %f0;");
-        ptx.AppendLine($"    mul.rn.f32 %f2, %f2, {Log2e};");
-        ptx.AppendLine("    ex2.approx.f32 %f2, %f2;");
-        ptx.AppendLine("    mul.rn.f32 %f2, %f2, %f1;");
-        ptx.AppendLine("    add.u64 %rd12, %rd6, %rd10;");
-        ptx.AppendLine("    st.global.f32 [%rd12], %f2;");
-        ptx.AppendLine($"    add.u32 %r2, %r2, {BlockThreads};");
-        ptx.AppendLine("    bra.uni OUT_LOOP;");
-        ptx.AppendLine("OUT_DONE:");
+        ptx.AppendLine("    add.u64 %rd0, %rd0, %rd4;");               // &input[m,0]
+        ptx.AppendLine("    add.u64 %rd3, %rd3, %rd4;");               // &output[m,0]
+        ptx.AppendLine("    mul.wide.u32 %rd4, %r1, 4;");
+        ptx.AppendLine("    add.u64 %rd1, %rd1, %rd4;");               // &lse[m]
+        ptx.AppendLine("    add.u64 %rd2, %rd2, %rd4;");               // &grad[m]
+        ptx.AppendLine($"    ld.global.{variant.LoadModifier}.f32 %f0, [%rd1];"); // lse[m]
+        ptx.AppendLine($"    ld.global.{variant.LoadModifier}.f32 %f1, [%rd2];"); // dY[m]
+        int vectorWidth = variant.VectorWidth;
+        int vectorBytes = vectorWidth * sizeof(float);
+        ptx.AppendLine($"    mul.wide.u32 %rd4, %r0, {vectorBytes};");
+        ptx.AppendLine("    add.u64 %rd0, %rd0, %rd4;");
+        ptx.AppendLine("    add.u64 %rd3, %rd3, %rd4;");
+        for (int group = 0; group < elementsPerThread; group += vectorWidth)
+        {
+            if (vectorWidth == 4)
+                ptx.AppendLine($"    ld.global.{variant.LoadModifier}.v4.f32 {{%f2,%f3,%f4,%f5}}, [%rd0];");
+            else if (vectorWidth == 2)
+                ptx.AppendLine($"    ld.global.{variant.LoadModifier}.v2.f32 {{%f2,%f3}}, [%rd0];");
+            else
+                ptx.AppendLine($"    ld.global.{variant.LoadModifier}.f32 %f2, [%rd0];");
+            for (int lane = 2; lane < 2 + vectorWidth; lane++)
+            {
+                ptx.AppendLine($"    sub.rn.f32 %f{lane}, %f{lane}, %f0;");
+                ptx.AppendLine($"    mul.rn.f32 %f{lane}, %f{lane}, {Log2e};");
+                ptx.AppendLine($"    ex2.approx.f32 %f{lane}, %f{lane};");
+                ptx.AppendLine($"    mul.rn.f32 %f{lane}, %f{lane}, %f1;");
+            }
+            if (vectorWidth == 4)
+                ptx.AppendLine($"    st.global.{variant.StoreModifier}.v4.f32 [%rd3], {{%f2,%f3,%f4,%f5}};");
+            else if (vectorWidth == 2)
+                ptx.AppendLine($"    st.global.{variant.StoreModifier}.v2.f32 [%rd3], {{%f2,%f3}};");
+            else
+                ptx.AppendLine($"    st.global.{variant.StoreModifier}.f32 [%rd3], %f2;");
+            if (group + vectorWidth < elementsPerThread)
+            {
+                ptx.AppendLine($"    add.u64 %rd0, %rd0, {blockThreads * vectorBytes};");
+                ptx.AppendLine($"    add.u64 %rd3, %rd3, {blockThreads * vectorBytes};");
+            }
+        }
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
-        DirectPtxArchitectureFamily architecture, int m, int n)
+        DirectPtxArchitectureFamily architecture, int m, int n,
+        PtxLogSumExpBackwardVariant variant)
     {
         var matrix = new DirectPtxExtent(m, n);
         var vector = new DirectPtxExtent(m);
         return new DirectPtxKernelBlueprint(
             Operation: "logsumexp-backward-row",
-            Version: 2,
+            Version: 3,
             Architecture: architecture,
-            Variant: $"fp32-m{m}-n{n}",
+            Variant: $"fp32-m{m}-n{n}-{variant.Name}",
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
@@ -164,15 +198,23 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
                     matrix, matrix, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                // The measured SM86 search family reports at most 30 registers; the default
+                // 256-thread geometry remains below that envelope.
+                MaxRegistersPerThread: 30,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+                MinBlocksPerMultiprocessor: 1536 / variant.BlockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "dX[m,n] = exp(x[m,n] - lse[m]) * dY[m]",
                 ["axis"] = "last",
                 ["broadcast"] = "per-row-scalar-upstream-gradient",
+                ["block-threads"] = variant.BlockThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["vector-width"] = variant.VectorWidth.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["cache-policy"] = $"ld.{variant.LoadModifier}/st.{variant.StoreModifier}",
+                ["exponential"] = "ex2.approx.f32",
+                ["loop-shape"] = "baked-row-extent-fully-unrolled",
+                ["register-lifetime"] = "pointer-chained-between-unrolled-groups",
                 ["forward-statistics"] = "caller-provided-logsumexp-vector",
                 ["reduction"] = "none-forward-logsumexp-reused",
                 ["global-intermediates"] = "caller-provided-lse-input",
@@ -184,4 +226,57 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
     internal static bool IsSupportedShape(int m, int n) => PtxRowShape.IsSupported(m, n);
 
     internal static bool IsPromotedShape(int m, int n) => PtxRowShape.IsPromoted(m, n);
+
+}
+
+internal readonly record struct PtxLogSumExpBackwardVariant(
+    int BlockThreads,
+    int VectorWidth,
+    string LoadModifier,
+    string StoreModifier)
+{
+    internal static readonly PtxLogSumExpBackwardVariant Default = new(256, 4, "nc", "wb");
+
+    internal static PtxLogSumExpBackwardVariant ForShape(int n) => n == 1024
+        ? new PtxLogSumExpBackwardVariant(256, 4, "ca", "cg")
+        : Default with { VectorWidth = Math.Min(4, n / PtxRowShape.BlockThreads) };
+
+    internal static IEnumerable<PtxLogSumExpBackwardVariant> SearchSpace(int n)
+    {
+        if (!PtxRowShape.IsSupported(64, n))
+            throw new ArgumentOutOfRangeException(nameof(n),
+                "Log-sum-exp-backward variant search requires a supported row extent.");
+        foreach (int threads in new[] { 128, 256, 512 })
+        {
+            if (threads > n || n % threads != 0) continue;
+            int elementsPerThread = n / threads;
+            foreach (int width in new[] { 1, 2, 4 })
+                if (elementsPerThread >= width && elementsPerThread % width == 0)
+                    yield return new PtxLogSumExpBackwardVariant(threads, width, "nc", "wb");
+        }
+
+        PtxLogSumExpBackwardVariant defaultVariant = ForShape(n);
+        foreach (string load in new[] { "nc", "ca" })
+        foreach (string store in new[] { "wb", "cg", "wt", "cs" })
+            if (load != "nc" || store != "wb")
+                yield return defaultVariant with { LoadModifier = load, StoreModifier = store };
+    }
+
+    internal string Name => $"t{BlockThreads}-v{VectorWidth}-{LoadModifier}-{StoreModifier}-ex2";
+
+    internal void Validate(int n)
+    {
+        if (BlockThreads is not (128 or 256 or 512) || BlockThreads > n || n % BlockThreads != 0)
+            throw new ArgumentOutOfRangeException(nameof(BlockThreads),
+                "Log-sum-exp-backward variants require 128, 256, or 512 threads that divide N.");
+        int elementsPerThread = n / BlockThreads;
+        if (VectorWidth is not (1 or 2 or 4) || VectorWidth > elementsPerThread ||
+            elementsPerThread % VectorWidth != 0)
+            throw new ArgumentOutOfRangeException(nameof(VectorWidth),
+                "Transaction width must be 1, 2, or 4 and divide the per-thread row extent.");
+        if (LoadModifier is not ("nc" or "ca"))
+            throw new ArgumentOutOfRangeException(nameof(LoadModifier));
+        if (StoreModifier is not ("wb" or "cg" or "wt" or "cs"))
+            throw new ArgumentOutOfRangeException(nameof(StoreModifier));
+    }
 }

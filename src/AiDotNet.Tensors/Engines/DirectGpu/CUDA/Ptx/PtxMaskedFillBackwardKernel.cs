@@ -21,6 +21,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
+    private readonly PtxElementwiseVariant _variant;
 
     internal int Count { get; }
     internal string Ptx { get; }
@@ -28,6 +29,12 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
     internal DirectPtxKernelAudit Audit { get; }
 
     internal PtxMaskedFillBackwardKernel(DirectPtxRuntime runtime, int count)
+        : this(runtime, count, PtxElementwiseVariant.MaskedFillBackwardDefault)
+    {
+    }
+
+    internal PtxMaskedFillBackwardKernel(
+        DirectPtxRuntime runtime, int count, PtxElementwiseVariant variant)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedSoftmax(
@@ -35,18 +42,20 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The checked-in masked-fill-backward specialization is measured only on GA10x/SM86.");
         PtxElementwiseShape.Validate(count, "Masked-fill backward");
+        variant.Validate(count);
         Count = count;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, count);
-        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, count);
+        _variant = variant;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, count, variant);
+        Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, count, variant);
         var loaded = DirectPtxResourceInitialization.Complete(
             runtime.LoadModule(Ptx),
             module =>
             {
                 IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
-                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, variant.BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, variant.BlockThreads, activeBlocks);
                 DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
-                    Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks,
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info, variant.BlockThreads, activeBlocks,
                     module.JitInfoLog);
                 return (Function: function, Audit: audit);
             });
@@ -69,15 +78,23 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         arguments[0] = &gradPointer;
         arguments[1] = &maskPointer;
         arguments[2] = &outputPointer;
-        _module.Launch(_function, (uint)PtxElementwiseShape.VectorGridBlocks(Count),
-            1, 1, BlockThreads, 1, 1, 0, arguments);
+        _module.Launch(_function, (uint)PtxElementwiseShape.VectorGridBlocks(
+                Count, _variant.BlockThreads, _variant.VectorWidth),
+            1, 1, (uint)_variant.BlockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int count)
+        => EmitPtx(ccMajor, ccMinor, count, PtxElementwiseVariant.MaskedFillBackwardDefault);
+
+    internal static string EmitPtx(
+        int ccMajor, int ccMinor, int count, PtxElementwiseVariant variant)
     {
         PtxElementwiseShape.Validate(count, "Masked-fill backward");
+        variant.Validate(count);
+        int packCount = variant.VectorWidth / 4;
+        int packStrideBytes = checked(count * sizeof(float) / packCount);
         var ptx = new StringBuilder(4_000);
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
@@ -89,7 +106,7 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         ptx.AppendLine("    .param .u64 mask_ptr,");
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
-        ptx.AppendLine($".maxntid {BlockThreads}, 1, 1");
+        ptx.AppendLine($".maxntid {variant.BlockThreads}, 1, 1");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<4>;");
         ptx.AppendLine("    .reg .b32 %r<8>;");
@@ -100,21 +117,27 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         ptx.AppendLine("    ld.param.u64 %rd2, [output_ptr];");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {BlockThreads}, %r0;");    // two striped float4 packs
-        if (PtxElementwiseShape.RequiresBoundsGuard(count, BlockThreads))
+        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {variant.BlockThreads}, %r0;");
+        if (PtxElementwiseShape.RequiresBoundsGuard(
+                count, variant.BlockThreads, variant.VectorWidth))
         {
-            ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {count / PtxElementwiseShape.VectorWidth};");
+            ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {count / variant.VectorWidth};");
             ptx.AppendLine("    @%p0 bra.uni MASKED_FILL_BACKWARD_DONE;");
         }
         ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 16;");
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6");
-        ptx.AppendLine($"    add.u64 %rd4, %rd4, {count * 2};");
-        ptx.AppendLine($"    add.u64 %rd5, %rd5, {count * 2};");
-        ptx.AppendLine($"    add.u64 %rd6, %rd6, {count * 2};");
-        EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6");
+        for (int pack = 0; pack < packCount; pack++)
+        {
+            EmitFloat4Slice(ptx, "%rd4", "%rd5", "%rd6", variant);
+            if (pack + 1 < packCount)
+            {
+                ptx.AppendLine($"    add.u64 %rd4, %rd4, {packStrideBytes};");
+                ptx.AppendLine($"    add.u64 %rd5, %rd5, {packStrideBytes};");
+                ptx.AppendLine($"    add.u64 %rd6, %rd6, {packStrideBytes};");
+            }
+        }
         ptx.AppendLine("MASKED_FILL_BACKWARD_DONE:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
@@ -122,10 +145,11 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
     }
 
     private static void EmitFloat4Slice(
-        StringBuilder ptx, string gradAddress, string maskAddress, string outputAddress)
+        StringBuilder ptx, string gradAddress, string maskAddress, string outputAddress,
+        PtxElementwiseVariant variant)
     {
-        ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f0,%f1,%f2,%f3}}, [{gradAddress}];");
-        ptx.AppendLine($"    ld.global.nc.v4.f32 {{%f4,%f5,%f6,%f7}}, [{maskAddress}];");
+        ptx.AppendLine($"    ld.global.{variant.LoadModifier}.v4.f32 {{%f0,%f1,%f2,%f3}}, [{gradAddress}];");
+        ptx.AppendLine($"    ld.global.{variant.LoadModifier}.v4.f32 {{%f4,%f5,%f6,%f7}}, [{maskAddress}];");
         ptx.AppendLine("    setp.neu.f32 %p0, %f4, 0f00000000;");
         ptx.AppendLine("    setp.neu.f32 %p1, %f5, 0f00000000;");
         ptx.AppendLine("    setp.neu.f32 %p2, %f6, 0f00000000;");
@@ -134,17 +158,18 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
         ptx.AppendLine("    selp.f32 %f10, 0f00000000, %f1, %p1;");
         ptx.AppendLine("    selp.f32 %f11, 0f00000000, %f2, %p2;");
         ptx.AppendLine("    selp.f32 %f12, 0f00000000, %f3, %p3;");
-        ptx.AppendLine($"    st.global.wt.v4.f32 [{outputAddress}], {{%f9,%f10,%f11,%f12}};");
+        ptx.AppendLine($"    st.global.{variant.StoreModifier}.v4.f32 [{outputAddress}], {{%f9,%f10,%f11,%f12}};");
     }
 
-    private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture, int count)
+    private static DirectPtxKernelBlueprint CreateBlueprint(
+        DirectPtxArchitectureFamily architecture, int count, PtxElementwiseVariant variant)
     {
         var extent = new DirectPtxExtent(count);
         return new DirectPtxKernelBlueprint(
             Operation: "masked-fill-backward",
             Version: 3,
             Architecture: architecture,
-            Variant: $"fp32-count{count}",
+            Variant: $"fp32-count{count}-{variant.Name}",
             Tensors:
             [
                 new("grad", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -155,15 +180,17 @@ internal sealed class PtxMaskedFillBackwardKernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 28,
+                MaxRegistersPerThread: variant.VectorWidth == 16 ? 40 : 28,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+                MinBlocksPerMultiprocessor: 1536 / variant.BlockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "gradInput[i] = mask[i] != 0 ? 0 : gradOutput[i]",
                 ["role"] = "masked-fill-gradient-gating",
-                ["vector-width"] = "8 (two striped, aligned float4 transactions)",
+                ["vector-width"] = variant.VectorWidth.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["block-threads"] = variant.BlockThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["cache-policy"] = $"ld.{variant.LoadModifier}/st.{variant.StoreModifier}",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none"

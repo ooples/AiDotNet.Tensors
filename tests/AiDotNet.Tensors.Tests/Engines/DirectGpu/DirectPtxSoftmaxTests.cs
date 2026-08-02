@@ -183,6 +183,9 @@ public class DirectPtxSoftmaxTests
         Assert.Equal(PtxRowShape.BlockThreads, PtxElementwiseShape.BlockThreads);
         Assert.Equal(PtxRowShape.BlockThreads / 32, PtxRowReduce.WarpCount);
         Assert.Equal(32, PtxRowReduce.SharedBytes);
+        Assert.Equal(16, PtxRowReduce.SharedBytesFor(128));
+        Assert.Equal(64, PtxRowReduce.SharedBytesFor(512));
+        Assert.Throws<ArgumentOutOfRangeException>(() => PtxRowReduce.SharedBytesFor(100));
         Assert.Equal(8, PtxElementwiseShape.VectorWidth);
         Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(256));
         Assert.Equal(1, PtxElementwiseShape.VectorGridBlocks(1280));
@@ -199,6 +202,40 @@ public class DirectPtxSoftmaxTests
         Assert.False(PtxElementwiseShape.IsPromoted(1024));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxElementwiseShape.Validate(257, "Test elementwise operation"));
+    }
+
+    [Fact]
+    public void SoftmaxAutotuneVariants_AreUniqueAndValidForEverySupportedRowExtent()
+    {
+        foreach (int n in new[] { 256, 512, 1024, 2048, 4096 })
+        {
+            PtxSoftmaxVariant softmaxDefault = PtxSoftmaxVariant.ForShape(n);
+            PtxLogSumExpBackwardVariant backwardDefault =
+                PtxLogSumExpBackwardVariant.ForShape(n);
+            softmaxDefault.Validate(n);
+            backwardDefault.Validate(n);
+
+            PtxSoftmaxVariant[] softmax = PtxSoftmaxVariant.SearchSpace(n).ToArray();
+            PtxLogSumExpBackwardVariant[] backward =
+                PtxLogSumExpBackwardVariant.SearchSpace(n).ToArray();
+            Assert.NotEmpty(softmax);
+            Assert.NotEmpty(backward);
+            Assert.Equal(softmax.Length,
+                softmax.Select(candidate => candidate.Name).Distinct().Count());
+            Assert.Equal(backward.Length,
+                backward.Select(candidate => candidate.Name).Distinct().Count());
+            Assert.All(softmax, candidate => candidate.Validate(n));
+            Assert.All(backward, candidate => candidate.Validate(n));
+        }
+
+        PtxElementwiseVariant[] forward = PtxElementwiseVariant.SearchSpace(false).ToArray();
+        PtxElementwiseVariant[] backwardMask = PtxElementwiseVariant.SearchSpace(true).ToArray();
+        Assert.Equal(forward.Length,
+            forward.Select(candidate => candidate.Name).Distinct().Count());
+        Assert.Equal(backwardMask.Length,
+            backwardMask.Select(candidate => candidate.Name).Distinct().Count());
+        Assert.All(forward, candidate => candidate.Validate(PtxElementwiseShape.MaxCount));
+        Assert.All(backwardMask, candidate => candidate.Validate(PtxElementwiseShape.MaxCount));
     }
 
     [Fact]
@@ -349,6 +386,37 @@ public class DirectPtxSoftmaxTests
         Assert.False(PtxMaskedFillBackwardKernel.IsPromotedCount(16384));
     }
 
+    [Fact]
+    public void MaskedSoftmaxEmitter_FusesSelectionAndStableReductionWithoutIntermediate()
+    {
+        string ptx = PtxMaskedSoftmaxKernel.EmitPtx(8, 6, 64, 1024);
+        Assert.Contains(PtxMaskedSoftmaxKernel.EntryPoint, ptx);
+        Assert.Contains(".maxntid 64, 1, 1", ptx);
+        Assert.Contains(".shared .align 16 .b8 red[16]", ptx);
+        Assert.Equal(8, Count(ptx, "ld.global.nc.v4.f32"));           // four input + four mask
+        Assert.Equal(16, Count(ptx, "selp.f32"));
+        Assert.Equal(16, Count(ptx, "ex2.approx.f32"));
+        Assert.Equal(4, Count(ptx, "st.global.v4.f32"));              // final output only
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMaskedSoftmaxKernel.IsSupportedShape(64, 1024));
+        Assert.False(PtxMaskedSoftmaxKernel.IsSupportedShape(64, 512));
+        Assert.False(PtxMaskedSoftmaxKernel.IsPromotedShape(64, 1024));
+    }
+
+    [Fact]
+    public void MaskedSoftmaxBackwardEmitter_FusesJacobianAndGradientGate()
+    {
+        string ptx = PtxMaskedSoftmaxBackwardKernel.EmitPtx(8, 6, 64, 1024);
+        Assert.Contains(PtxMaskedSoftmaxBackwardKernel.EntryPoint, ptx);
+        Assert.Contains("MASKED_SOFTMAX_BWD_LOAD_LOOP:", ptx);
+        Assert.Contains("fma.rn.f32 %f0, %f2, %f1, %f0", ptx);
+        Assert.Contains("selp.f32 %f1, 0f00000000, %f1, %p1", ptx);
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));              // S + dY, then dY + mask
+        Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+        Assert.True(PtxMaskedSoftmaxBackwardKernel.IsSupportedShape(64, 1024));
+        Assert.False(PtxMaskedSoftmaxBackwardKernel.IsPromotedShape(64, 1024));
+    }
+
     [SkippableTheory]
     [InlineData(64, 256)]
     [InlineData(128, 512)]
@@ -402,16 +470,110 @@ public class DirectPtxSoftmaxTests
         AssertVectorClose(actualBwd, expBwd, 0f, $"masked-fill-backward {m}x{n}");
     }
 
+    [SkippableFact]
+    public void DriverOnlyMaskedSoftmax_MatchesComposedOracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedSoftmax(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in masked-softmax candidate is measured on GA10x/SM86.");
+        const int m = 64;
+        const int n = 1024;
+        const float fill = -10_000f;
+        var random = RandomHelper.CreateSeededRandom(20265264);
+        float[] inputHost = Values(random, m * n, 2.0f);
+        var maskHost = new float[m * n];
+        for (int i = 0; i < maskHost.Length; i++)
+            maskHost[i] = random.NextDouble() < 0.3 ? 1f : 0f;
+
+        var expected = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            int start = row * n;
+            double max = double.NegativeInfinity;
+            for (int column = 0; column < n; column++)
+            {
+                double selected = maskHost[start + column] != 0f
+                    ? fill : inputHost[start + column];
+                max = Math.Max(max, selected);
+            }
+            double sum = 0;
+            for (int column = 0; column < n; column++)
+            {
+                double selected = maskHost[start + column] != 0f
+                    ? fill : inputHost[start + column];
+                sum += Math.Exp(selected - max);
+            }
+            for (int column = 0; column < n; column++)
+            {
+                double selected = maskHost[start + column] != 0f
+                    ? fill : inputHost[start + column];
+                expected[start + column] = (float)(Math.Exp(selected - max) / sum);
+            }
+        }
+
+        using var kernel = new PtxMaskedSoftmaxKernel(runtime, m, n, fill);
+        using var backward = new PtxMaskedSoftmaxBackwardKernel(runtime, m, n);
+        Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+        Assert.Equal(0, backward.Audit.Function.LocalBytesPerThread);
+        Assert.Equal("masked-fill-plus-softmax-no-global-intermediate",
+            kernel.Blueprint.Semantics["fusion"]);
+        using var input = runtime.AllocateBytes((nuint)(inputHost.Length * sizeof(float)));
+        using var mask = runtime.AllocateBytes((nuint)(maskHost.Length * sizeof(float)));
+        using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+        float[] gradientHost = Values(random, m * n, 1.0f);
+        var expectedBackward = new float[m * n];
+        for (int row = 0; row < m; row++)
+        {
+            int start = row * n;
+            double dot = 0;
+            for (int column = 0; column < n; column++)
+                dot += gradientHost[start + column] * expected[start + column];
+            for (int column = 0; column < n; column++)
+                expectedBackward[start + column] = maskHost[start + column] != 0f
+                    ? 0f
+                    : expected[start + column] * (gradientHost[start + column] - (float)dot);
+        }
+        using var gradient = runtime.AllocateBytes((nuint)(gradientHost.Length * sizeof(float)));
+        using var backwardOutput = runtime.AllocateBytes(
+            (nuint)(expectedBackward.Length * sizeof(float)));
+        input.Upload<float>(inputHost);
+        mask.Upload<float>(maskHost);
+        gradient.Upload<float>(gradientHost);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(mask, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        AssertVectorClose(actual, expected, 2e-3f, "masked-softmax 64x1024");
+
+        backward.Launch(
+            DirectPtxTensorView.CreateOwned(output, backward.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(gradient, backward.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(mask, backward.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(backwardOutput, backward.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        var actualBackward = new float[expectedBackward.Length];
+        backwardOutput.Download<float>(actualBackward);
+        AssertVectorClose(actualBackward, expectedBackward, 2e-3f,
+            "masked-softmax-backward 64x1024");
+    }
+
     [Fact]
     public void LogSumExpBackwardEmitter_ReusesSuppliedLogPartition()
     {
-        string ptx = PtxLogSumExpBackwardKernel.EmitPtx(8, 6, 64, 512);
+        string ptx = PtxLogSumExpBackwardKernel.EmitPtx(8, 6, 64, 1024);
         Assert.Contains(PtxLogSumExpBackwardKernel.EntryPoint, ptx);
-        Assert.Contains("OUT_LOOP:", ptx);
-        Assert.Equal(1, Count(ptx, "ex2.approx.f32"));                 // one elementwise broadcast pass
+        Assert.DoesNotContain("OUT_LOOP:", ptx);                       // baked extent, no runtime loop
+        Assert.Equal(4, Count(ptx, "ex2.approx.f32"));                 // one float4 per lane
+        Assert.Equal(1, Count(ptx, "ld.global.ca.v4.f32"));
+        Assert.Equal(1, Count(ptx, "st.global.cg.v4.f32"));
         Assert.Contains("ld.param.u64 %rd1, [lse_ptr]", ptx);
-        Assert.Contains("ld.global.nc.f32 %f0, [%rd8]", ptx);           // supplied lse[m]
-        Assert.Contains("ld.global.nc.f32 %f1, [%rd9]", ptx);           // per-row dY[m]
+        Assert.Contains("ld.global.ca.f32 %f0, [%rd1]", ptx);           // supplied lse[m]
+        Assert.Contains("ld.global.ca.f32 %f1, [%rd2]", ptx);           // per-row dY[m]
         Assert.Contains("sub.rn.f32 %f2, %f2, %f0", ptx);               // x - supplied lse
         Assert.DoesNotContain("LOAD_LOOP:", ptx);
         Assert.DoesNotContain("SUM_LOOP:", ptx);
@@ -419,6 +581,11 @@ public class DirectPtxSoftmaxTests
         Assert.DoesNotContain("bar.sync", ptx);
         Assert.DoesNotContain(".shared", ptx);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+
+        string narrow = PtxLogSumExpBackwardKernel.EmitPtx(8, 6, 64, 512);
+        Assert.DoesNotContain("OUT_LOOP:", narrow);
+        Assert.Equal(1, Count(narrow, "ld.global.nc.v2.f32"));         // one float2 per lane
+        Assert.Equal(1, Count(narrow, "st.global.wb.v2.f32"));
         Assert.True(PtxLogSumExpBackwardKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxLogSumExpBackwardKernel.IsPromotedShape(128, 2048));
     }
@@ -656,21 +823,53 @@ public class DirectPtxSoftmaxTests
     }
 
     [Fact]
-    public void SoftmaxEmitter_IsSinglePassStableRowReduction()
+    public void SoftmaxEmitter_DoubleBuffersReductionScratchWithoutProtectionBarriers()
     {
         string ptx = PtxSoftmaxKernel.EmitPtx(8, 6, 64, 512);
         Assert.Contains(PtxSoftmaxKernel.EntryPoint, ptx);
         Assert.DoesNotContain("row_sh", ptx);                          // L1 + final-output staging
-        Assert.Contains(".shared .align 16 .b8 red[32]", ptx);
+        Assert.Contains(".shared .align 16 .b8 red[64]", ptx);         // max and sum do not alias
         Assert.DoesNotContain("_LOOP:", ptx);                          // baked N is fully unrolled
         Assert.Contains("max.f32 %f10", ptx);                          // warp-hierarchical max
         Assert.Equal(2, Count(ptx, "ex2.approx.f32"));                 // once per 256-column slice
-        Assert.Contains("ld.global.ca.f32", ptx);                      // repeated row pass stays cacheable
+        Assert.Equal(4, Count(ptx, "ld.global.nc.f32"));               // immutable input max + exp
+        Assert.Equal(2, Count(ptx, "ld.global.ca.f32"));               // staged output stays cacheable
         Assert.Equal(4, Count(ptx, "st.global.f32"));                  // stage + normalize each slice
+        Assert.Contains("add.u64 %rd5, %rd5, 32", ptx);               // switch to sum scratch
+        Assert.Contains("add.u64 %rd10, %rd5, %rd13", ptx);
         Assert.Contains("rcp.approx.f32", ptx);                        // 1/sumExp
-        // Two reductions, each: two-level warp reduction + post-load barrier.
-        Assert.Equal(6, Count(ptx, "bar.sync 0"));
+        Assert.Equal(4, Count(ptx, "bar.sync 0"));                     // two barriers per reduction
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
+
+        string vector = PtxSoftmaxKernel.EmitPtx(8, 6, 64, 1024);
+        Assert.Contains(".maxntid 64, 1, 1", vector);
+        Assert.Contains(".shared .align 16 .b8 red[16]", vector);
+        Assert.Equal(4, Count(vector, "ld.global.nc.v4.f32"));         // one read, four packs/lane
+        Assert.Equal(0, Count(vector, "ld.global.ca.v4.f32"));         // no staged output reload
+        Assert.Equal(4, Count(vector, "st.global.v4.f32"));            // normalized output only
+        Assert.Equal(16, Count(vector, "ex2.approx.f32"));
+        Assert.DoesNotContain("ld.global.ca.f32 %f1", vector);
+
+        string registerStaged = PtxSoftmaxKernel.EmitPtx(8, 6, 64, 1024,
+            new PtxSoftmaxVariant(256, true, true, false, true));
+        Assert.Equal(1, Count(registerStaged, "ld.global.nc.v4.f32")); // input remains live
+        Assert.Equal(1, Count(registerStaged, "st.global.v4.f32"));   // normalized output only
+        Assert.Equal(4, Count(registerStaged, "ex2.approx.f32"));
+        Assert.DoesNotContain("ld.global.ca.v4.f32", registerStaged);
+
+        string twoPackRegisterStaged = PtxSoftmaxKernel.EmitPtx(8, 6, 64, 1024,
+            new PtxSoftmaxVariant(128, true, true, false, true));
+        Assert.Equal(2, Count(twoPackRegisterStaged, "ld.global.nc.v4.f32"));
+        Assert.Equal(2, Count(twoPackRegisterStaged, "st.global.v4.f32"));
+        Assert.Equal(8, Count(twoPackRegisterStaged, "ex2.approx.f32"));
+        Assert.Contains("{%f12,%f13,%f14,%f15}", twoPackRegisterStaged);
+
+        string fourPackRegisterStaged = PtxSoftmaxKernel.EmitPtx(8, 6, 64, 1024,
+            new PtxSoftmaxVariant(64, true, true, false, true));
+        Assert.Equal(4, Count(fourPackRegisterStaged, "ld.global.nc.v4.f32"));
+        Assert.Equal(4, Count(fourPackRegisterStaged, "st.global.v4.f32"));
+        Assert.Equal(16, Count(fourPackRegisterStaged, "ex2.approx.f32"));
+        Assert.Contains("{%f20,%f21,%f22,%f23}", fourPackRegisterStaged);
         Assert.True(PtxSoftmaxKernel.IsSupportedShape(128, 2048));
         Assert.False(PtxSoftmaxKernel.IsSupportedShape(63, 2048));
         Assert.False(PtxSoftmaxKernel.IsPromotedShape(128, 2048));
