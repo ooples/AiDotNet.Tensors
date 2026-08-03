@@ -33,7 +33,8 @@ internal static class DirectPtxAttentionOfflineCubinTool
                   int keyValueSequence, bool causal, int causalQueryOffset, bool epilogue) in
                  DirectPtxOnlineAttentionReleaseMatrix.FamilyCases)
         {
-            int warps = System.Math.Min(8, querySequence / 16);
+            int warps = System.Math.Min(
+                8, querySequence / PtxOnlineFusedAttention128x64Kernel.QueryTileRows);
             yield return new DirectPtxModuleSource(
                 $"online-attention-d64-v3-family-b{batch}-hq{queryHeads}-hkv{keyValueHeads}" +
                 $"-sq{querySequence}-skv{keyValueSequence}-c{Bool(causal)}-o{causalQueryOffset}" +
