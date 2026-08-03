@@ -17,8 +17,10 @@ internal static class GpuBenchmarkEnvironment
 
     internal static void RequireIdleGpu(string label)
     {
-        RequireNoForeignCompute(label);
-        RequireHostQuiescence(label);
+        int? trustedOrchestratorId = ReadTrustedOrchestratorId();
+        RequireNoForeignCompute(
+            label, afterSuite: false, trustedOrchestratorId: trustedOrchestratorId);
+        RequireHostQuiescence(label, trustedOrchestratorId);
 
         string status = RunNvidiaSmi(
             "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
@@ -38,15 +40,14 @@ internal static class GpuBenchmarkEnvironment
     }
 
     internal static void RequireNoForeignCompute(string label, bool afterSuite = false)
+        => RequireNoForeignCompute(label, afterSuite, ReadTrustedOrchestratorId());
+
+    private static void RequireNoForeignCompute(
+        string label, bool afterSuite, int? trustedOrchestratorId)
     {
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
-        int? trustedOrchestrator = int.TryParse(
-            Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
-            out int orchestratorId) && orchestratorId > 0
-                ? orchestratorId
-                : null;
         string[] conflicts = FindComputeWorkloadConflicts(
-            processMonitor, Environment.ProcessId, trustedOrchestrator, afterSuite);
+            processMonitor, Environment.ProcessId, trustedOrchestratorId, afterSuite);
         if (conflicts.Length != 0)
             throw new InvalidOperationException(
                 $"[{label}] Foreign GPU workload detected; clean benchmark refused: {string.Join("; ", conflicts)}");
@@ -62,14 +63,21 @@ internal static class GpuBenchmarkEnvironment
         if (afterSuite)
         {
             RequirePostSuiteDeviceQuiescence(label);
-            RequireHostQuiescence(label);
+            RequireHostQuiescence(label, trustedOrchestratorId);
         }
     }
 
-    private static void RequireHostQuiescence(string label)
+    private static int? ReadTrustedOrchestratorId() => int.TryParse(
+        Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
+        out int orchestratorId) && orchestratorId > 0
+            ? orchestratorId
+            : null;
+
+    private static void RequireHostQuiescence(string label, int? trustedOrchestratorId)
     {
         var interval = Stopwatch.StartNew();
-        Dictionary<int, ForeignProcessCpuSample> before = ReadForeignProcessCpuTimes();
+        Dictionary<int, ForeignProcessCpuSample> before =
+            ReadForeignProcessCpuTimes(trustedOrchestratorId);
         var contributorMilliseconds = new Dictionary<int, double>();
         var contributorNames = new Dictionary<int, string>();
         DateTime sliceStartedUtc = DateTime.UtcNow;
@@ -82,7 +90,8 @@ internal static class GpuBenchmarkEnvironment
                 HostUtilizationSampleSliceMilliseconds, remainingMilliseconds));
 
             DateTime sliceEndedUtc = DateTime.UtcNow;
-            Dictionary<int, ForeignProcessCpuSample> after = ReadForeignProcessCpuTimes();
+            Dictionary<int, ForeignProcessCpuSample> after =
+                ReadForeignProcessCpuTimes(trustedOrchestratorId);
             busyMilliseconds += MeasureForeignCpuMilliseconds(
                 before, after, sliceStartedUtc, sliceEndedUtc,
                 contributorMilliseconds, contributorNames);
@@ -161,6 +170,14 @@ internal static class GpuBenchmarkEnvironment
 
             double boundedContribution = Math.Min(
                 contribution, sliceMilliseconds * processorCount);
+            // The competitor parent spends a little CPU supervising its child
+            // lanes. Exclude that expected bookkeeping, but count it normally
+            // once it exceeds the same material-work threshold used by the
+            // GPU-process admission gate.
+            if (sample.IsTrustedOrchestrator && boundedContribution <=
+                sliceMilliseconds * processorCount *
+                MixedComputeConflictThresholdPercent / 100.0)
+                continue;
             busyMilliseconds += boundedContribution;
             contributorMilliseconds.TryGetValue(entry.Key, out double accumulated);
             contributorMilliseconds[entry.Key] = accumulated + boundedContribution;
@@ -169,7 +186,8 @@ internal static class GpuBenchmarkEnvironment
         return busyMilliseconds;
     }
 
-    private static Dictionary<int, ForeignProcessCpuSample> ReadForeignProcessCpuTimes()
+    private static Dictionary<int, ForeignProcessCpuSample> ReadForeignProcessCpuTimes(
+        int? trustedOrchestratorId)
     {
         var times = new Dictionary<int, ForeignProcessCpuSample>();
         int currentProcessId = Environment.ProcessId;
@@ -182,7 +200,9 @@ internal static class GpuBenchmarkEnvironment
                     if (process.Id != 0 && process.Id != currentProcessId)
                         times[process.Id] = new ForeignProcessCpuSample(
                             process.TotalProcessorTime, process.StartTime.ToUniversalTime(),
-                            process.ProcessName);
+                            process.ProcessName,
+                            trustedOrchestratorId is > 0 &&
+                            process.Id == trustedOrchestratorId);
                 }
                 catch (InvalidOperationException)
                 {
@@ -203,7 +223,8 @@ internal static class GpuBenchmarkEnvironment
     private readonly record struct ForeignProcessCpuSample(
         TimeSpan TotalProcessorTime,
         DateTime StartTimeUtc,
-        string ProcessName);
+        string ProcessName,
+        bool IsTrustedOrchestrator);
 
     private static void RequirePostSuiteDeviceQuiescence(string label)
     {
