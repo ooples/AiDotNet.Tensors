@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Benchmarks;
@@ -159,6 +160,12 @@ internal static class StableTimer
 
         int iterationsA = CalibrateDeviceIterations(runtime, launchA, workUnitsA);
         int iterationsB = CalibrateDeviceIterations(runtime, launchB, workUnitsB);
+        double calibrationA = runtime.MeasureKernelMilliseconds(
+            launchA, 0, iterationsA) * 1000.0;
+        double calibrationB = runtime.MeasureKernelMilliseconds(
+            launchB, 0, iterationsB) * 1000.0;
+        (iterationsA, iterationsB) = CalibrateBracketPairIterations(
+            iterationsA, calibrationA, iterationsB, calibrationB);
         Trace($"device pair iterations A={iterationsA} B={iterationsB}");
 
         var samplesA = new List<double>(3);
@@ -281,6 +288,14 @@ internal static class StableTimer
         int iterationsA = CalibrateHostIterations(launchA, synchronizeA, workUnitsA);
         int iterationsB = CalibrateHostIterations(launchB, synchronizeB, workUnitsB);
         Trace($"host pair iterations A={iterationsA} B={iterationsB}");
+
+        // Host-timed comparisons have the same exposure problem as CUDA-event pairs. Keep
+        // the timing methods identical within a comparison, discard one calibration batch
+        // per lane, and normalize the accepted samples per launch as before.
+        double calibrationA = TimeHostBatch(launchA, synchronizeA, iterationsA);
+        double calibrationB = TimeHostBatch(launchB, synchronizeB, iterationsB);
+        (iterationsA, iterationsB) = CalibrateBracketPairIterations(
+            iterationsA, calibrationA, iterationsB, calibrationB);
 
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
@@ -410,6 +425,29 @@ internal static class StableTimer
         }
         return iterations;
     }
+
+    /// <summary>
+    /// Applies p15 equal-duration calibration to the total exposure of one robust sample.
+    /// Each lane appears twice in each of five A/B/B/A brackets, so calibrating an individual
+    /// timed call to the protocol's 100 ms floor would accidentally turn one sample into
+    /// roughly a second per lane. Calibrate the ten-call lane total, then map it back to the
+    /// per-bracket iteration count while preserving the existing count as a floor.
+    /// </summary>
+    private static (int A, int B) CalibrateBracketPairIterations(
+        int iterationsA, double microsecondsA,
+        int iterationsB, double microsecondsB)
+    {
+        const int LaneBatchesPerSample = BracketReplicates * 2;
+        (int totalA, int totalB) = CodegenMeasurementProtocol.CalibratePairIterations(
+            checked(iterationsA * LaneBatchesPerSample), microsecondsA,
+            checked(iterationsB * LaneBatchesPerSample), microsecondsB);
+        return (
+            Math.Max(iterationsA, DivideRoundUp(totalA, LaneBatchesPerSample)),
+            Math.Max(iterationsB, DivideRoundUp(totalB, LaneBatchesPerSample)));
+    }
+
+    private static int DivideRoundUp(int value, int divisor) =>
+        checked((value + divisor - 1) / divisor);
 
     private static bool CountsAreClose(int left, int right) =>
         Math.Abs((long)left - right) <= Math.Max(1L, left / 10L);
