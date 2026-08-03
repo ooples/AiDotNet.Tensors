@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // A version stamp for how a number was measured.
 //
-// The measurement protocol changed twelve times during this project, and each change
+// The measurement protocol changed fourteen times during this project, and each change
 // silently invalidated every number recorded before it:
 //
 //   v1 -> v2  the estimator. median(A)/median(B) let clock drift during a run leak into
@@ -76,6 +76,12 @@
 //              now fail when any applicable promotable candidate does not stabilize, preserve
 //              the last identity-valid artifact on failure, and reject material foreign host
 //              CPU load before and after GPU evidence collection.
+//   v14 -> v15 equal-duration paired batches. Pair timing assigned iterations from operator
+//              work alone, so a specialization running four times faster than its baseline
+//              received one quarter of the device-time exposure and could fail the unchanged
+//              5% gate under ordinary WDDM preemption. Each pair now discards a calibration
+//              batch and lengthens the under-exposed lane toward the same bounded duration;
+//              the work-based iteration count remains a floor.
 //
 // Nothing marked the old numbers as stale, so they sat in documents and commit messages
 // next to fresh ones looking equally authoritative. A number without its protocol is not
@@ -89,6 +95,10 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 /// <summary>Identifies how a performance number was obtained.</summary>
 public static class CodegenMeasurementProtocol
 {
+    private const double MinimumPairBatchMicroseconds = 100_000.0;
+    private const double MaximumPairBatchMicroseconds = 250_000.0;
+    private const int MaximumPairIterations = 20_000;
+
     /// <summary>Smallest measured gain distinguishable from the harness noise floor.</summary>
     public const double AutotuneGainNoiseFloor = 1.0105;
 
@@ -99,7 +109,7 @@ public static class CodegenMeasurementProtocol
     /// Current protocol version. Increment whenever a change makes new numbers
     /// incomparable with old ones, and add a line to the history in this file.
     /// </summary>
-    public const int Version = 14;
+    public const int Version = 15;
 
     /// <summary>Short tag for manifests and tables, e.g. <c>p5</c>.</summary>
     public static string Tag => "p" + Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -110,6 +120,7 @@ public static class CodegenMeasurementProtocol
         "true-fp32 CUDA-graph replay on both lanes; exact PTX-set autotune and dispatch-bound evidence; " +
         "exact competitor geometry; multi-strategy cuDNN plan search; " +
         "phase-scoped counter profiles; recoverable per-operation stability windows; " +
+        "calibrated equal-duration paired batches; " +
         "direct adaptive finalist replay for autotune winner arbitration; " +
         "complete stable promotable searches on a host-quiescent machine";
 
@@ -126,6 +137,48 @@ public static class CodegenMeasurementProtocol
             AutotuneGainNoiseFloor,
             1.0 + relativeSpread);
     }
+
+    /// <summary>
+    /// Lengthens the under-exposed lane toward the same timed-batch duration. The original
+    /// work-size choice remains a floor, so calibration can never make an existing sample
+    /// shorter. Bounds keep a pathological or very small kernel from making the search
+    /// unbounded; within those bounds both lanes receive the same timed exposure.
+    /// </summary>
+    internal static (int A, int B) CalibratePairIterations(
+        int iterationsA, double microsecondsA,
+        int iterationsB, double microsecondsB)
+    {
+        if (iterationsA <= 0) throw new ArgumentOutOfRangeException(nameof(iterationsA));
+        if (iterationsB <= 0) throw new ArgumentOutOfRangeException(nameof(iterationsB));
+        if (!IsFinitePositive(microsecondsA) || !IsFinitePositive(microsecondsB))
+            return (iterationsA, iterationsB);
+
+        double observedBatchMicroseconds = Math.Max(
+            microsecondsA * iterationsA,
+            microsecondsB * iterationsB);
+        double targetBatchMicroseconds = Math.Min(
+            MaximumPairBatchMicroseconds,
+            Math.Max(MinimumPairBatchMicroseconds, observedBatchMicroseconds));
+
+        return (
+            IterationsForTarget(iterationsA, microsecondsA, targetBatchMicroseconds),
+            IterationsForTarget(iterationsB, microsecondsB, targetBatchMicroseconds));
+    }
+
+    private static int IterationsForTarget(
+        int floor, double microsecondsPerLaunch, double targetBatchMicroseconds)
+    {
+        double desired = Math.Ceiling(targetBatchMicroseconds / microsecondsPerLaunch);
+        // MaximumPairIterations caps calibration growth, never an iteration floor supplied
+        // by the caller. Keeping that distinction makes the no-shortening contract true even
+        // if a future timing lane starts with a batch larger than today's 2,000-launch cap.
+        if (floor >= MaximumPairIterations) return floor;
+        if (desired >= MaximumPairIterations) return MaximumPairIterations;
+        return Math.Max(floor, (int)desired);
+    }
+
+    private static bool IsFinitePositive(double value) =>
+        value > 0 && !double.IsNaN(value) && !double.IsInfinity(value);
 
     /// <summary>
     /// Human-readable stamp to put beside a number.
