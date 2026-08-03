@@ -200,6 +200,9 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamSynchronize")]
     public static extern CudaResult cuStreamSynchronize(IntPtr stream);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
+    public static extern CudaResult cuCtxSynchronize();
+
     [DllImport(CudaLibrary, EntryPoint = "cuStreamQuery")]
     public static extern CudaResult cuStreamQuery(IntPtr stream);
 
