@@ -48,17 +48,17 @@ internal static class DirectPtxAttentionOfflineCubinTool
         }
     }
 
-    internal static int Generate(string[] args) => args.Length < 3
+    internal static int Generate(string[] args) => args.Length < 2
         ? Usage("--generate-direct-ptx-attention-offline-cubins <ptxas-path> <output-directory>")
-        : DirectPtxCubinToolCore.Generate(Family, EnumerateModules(), args[1], args[2]);
+        : DirectPtxCubinToolCore.Generate(Family, EnumerateModules(), args[0], args[1]);
 
-    internal static int Verify(string[] args) => args.Length < 3
+    internal static int Verify(string[] args) => args.Length < 2
         ? Usage("--verify-direct-ptx-attention-offline-cubins <ptxas-path> <artifact-directory>")
-        : DirectPtxCubinToolCore.Verify(Family, EnumerateModules(), args[1], args[2]);
+        : DirectPtxCubinToolCore.Verify(Family, EnumerateModules(), args[0], args[1]);
 
-    internal static int AuditSass(string[] args) => args.Length < 4
+    internal static int AuditSass(string[] args) => args.Length < 3
         ? Usage("--audit-direct-ptx-attention-offline-sass <nvdisasm-path> <artifact-directory> <output-directory>")
-        : DirectPtxCubinToolCore.AuditSass(Family, args[1], args[2], args[3]);
+        : DirectPtxCubinToolCore.AuditSass(Family, args[0], args[1], args[2]);
 
     private static int Bool(bool value) => value ? 1 : 0;
 
