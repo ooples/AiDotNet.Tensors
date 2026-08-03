@@ -70,6 +70,8 @@ internal static class GpuBenchmarkEnvironment
     {
         var interval = Stopwatch.StartNew();
         Dictionary<int, ForeignProcessCpuSample> before = ReadForeignProcessCpuTimes();
+        var contributorMilliseconds = new Dictionary<int, double>();
+        var contributorNames = new Dictionary<int, string>();
         DateTime sliceStartedUtc = DateTime.UtcNow;
         double busyMilliseconds = 0;
         do
@@ -82,7 +84,8 @@ internal static class GpuBenchmarkEnvironment
             DateTime sliceEndedUtc = DateTime.UtcNow;
             Dictionary<int, ForeignProcessCpuSample> after = ReadForeignProcessCpuTimes();
             busyMilliseconds += MeasureForeignCpuMilliseconds(
-                before, after, sliceStartedUtc, sliceEndedUtc);
+                before, after, sliceStartedUtc, sliceEndedUtc,
+                contributorMilliseconds, contributorNames);
             before = after;
             sliceStartedUtc = sliceEndedUtc;
         }
@@ -98,16 +101,30 @@ internal static class GpuBenchmarkEnvironment
             busyMilliseconds / capacityMilliseconds * 100.0,
             MidpointRounding.AwayFromZero);
         if (utilizationPercent > HostUtilizationCeilingPercent)
+        {
+            string topContributors = string.Join(", ", contributorMilliseconds
+                .OrderByDescending(entry => entry.Value)
+                .Take(5)
+                .Select(entry =>
+                    (contributorNames.TryGetValue(entry.Key, out string? name)
+                        ? name
+                        : "unknown") + "[" + entry.Key + "]=" +
+                    (entry.Value / capacityMilliseconds * 100.0).ToString("0.0",
+                        System.Globalization.CultureInfo.InvariantCulture) + "%"));
             throw new InvalidOperationException(
                 $"[{label}] Host is not benchmark-ready (foreign CPU utilization=" +
-                $"{utilizationPercent}%, ceiling={HostUtilizationCeilingPercent}%).");
+                $"{utilizationPercent}%, ceiling={HostUtilizationCeilingPercent}%; " +
+                $"top contributors: {topContributors}).");
+        }
     }
 
     private static double MeasureForeignCpuMilliseconds(
         IReadOnlyDictionary<int, ForeignProcessCpuSample> before,
         IReadOnlyDictionary<int, ForeignProcessCpuSample> after,
         DateTime sliceStartedUtc,
-        DateTime sliceEndedUtc)
+        DateTime sliceEndedUtc,
+        IDictionary<int, double> contributorMilliseconds,
+        IDictionary<int, string> contributorNames)
     {
         int processorCount = Math.Max(1, Environment.ProcessorCount);
         double sliceMilliseconds = Math.Max(0,
@@ -142,8 +159,12 @@ internal static class GpuBenchmarkEnvironment
                 continue;
             }
 
-            busyMilliseconds += Math.Min(
+            double boundedContribution = Math.Min(
                 contribution, sliceMilliseconds * processorCount);
+            busyMilliseconds += boundedContribution;
+            contributorMilliseconds.TryGetValue(entry.Key, out double accumulated);
+            contributorMilliseconds[entry.Key] = accumulated + boundedContribution;
+            contributorNames[entry.Key] = sample.ProcessName;
         }
         return busyMilliseconds;
     }
@@ -160,7 +181,8 @@ internal static class GpuBenchmarkEnvironment
                 {
                     if (process.Id != 0 && process.Id != currentProcessId)
                         times[process.Id] = new ForeignProcessCpuSample(
-                            process.TotalProcessorTime, process.StartTime.ToUniversalTime());
+                            process.TotalProcessorTime, process.StartTime.ToUniversalTime(),
+                            process.ProcessName);
                 }
                 catch (InvalidOperationException)
                 {
@@ -180,7 +202,8 @@ internal static class GpuBenchmarkEnvironment
 
     private readonly record struct ForeignProcessCpuSample(
         TimeSpan TotalProcessorTime,
-        DateTime StartTimeUtc);
+        DateTime StartTimeUtc,
+        string ProcessName);
 
     private static void RequirePostSuiteDeviceQuiescence(string label)
     {
