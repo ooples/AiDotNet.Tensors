@@ -11,9 +11,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 
 #define PI 3.14159265358979323846f
 
-// Bit reversal permutation for in-place FFT
+// Bit reversal permutation, OUT OF PLACE. `src` and `dst` must be distinct
+// allocations: each thread reads src[reversed] and writes dst[idx].
 extern ""C"" __global__ __launch_bounds__(256) void bit_reverse_permutation(
-    float* real, float* imag, int n, int log2n)
+    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int n, int log2n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -25,14 +26,9 @@ extern ""C"" __global__ __launch_bounds__(256) void bit_reverse_permutation(
         temp >>= 1;
     }
 
-    if (reversed > idx) {
-        float tempReal = real[idx];
-        float tempImag = imag[idx];
-        real[idx] = real[reversed];
-        imag[idx] = imag[reversed];
-        real[reversed] = tempReal;
-        imag[reversed] = tempImag;
-    }
+    // Out of place: each thread writes one destination; src and dst must be distinct allocations.
+    dstReal[idx] = srcReal[reversed];
+    dstImag[idx] = srcImag[reversed];
 }
 
 // Butterfly operation for Cooley-Tukey FFT
@@ -230,11 +226,11 @@ extern ""C"" __global__ __launch_bounds__(256) void apply_window(
     output[idx] = input[idx] * window[idx];
 }
 
-// 2D FFT row-wise bit-reversal (permute each row of length `width` in place).
-// Required before the DIT row butterflies — without it FFT2D transforms
-// un-permuted data and returns garbage.
+// 2D FFT row-wise bit-reversal (permute each row of length `width`, OUT OF PLACE
+// into `dst`; `src` and `dst` must be distinct). Required before the DIT row
+// butterflies — without it FFT2D transforms un-permuted data and returns garbage.
 extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
-    float* real, float* imag, int height, int width, int log2width)
+    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int height, int width, int log2width)
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -244,21 +240,17 @@ extern ""C"" __global__ __launch_bounds__(256) void fft_rows_bit_reverse(
     int temp = idx;
     for (int i = 0; i < log2width; i++) { reversed = (reversed << 1) | (temp & 1); temp >>= 1; }
 
-    if (reversed > idx) {
-        int base = row * width;
-        float tr = real[base + idx];
-        float ti = imag[base + idx];
-        real[base + idx] = real[base + reversed];
-        imag[base + idx] = imag[base + reversed];
-        real[base + reversed] = tr;
-        imag[base + reversed] = ti;
-    }
+    // Out of place: see bit_reverse_permutation above.
+    int base = row * width;
+    dstReal[base + idx] = srcReal[base + reversed];
+    dstImag[base + idx] = srcImag[base + reversed];
 }
 
 // 2D FFT column-wise bit-reversal (permute each column of length `height`,
-// stride `width`, in place). Required before the DIT column butterflies.
+// stride `width`, OUT OF PLACE into `dst`; `src` and `dst` must be distinct).
+// Required before the DIT column butterflies.
 extern ""C"" __global__ __launch_bounds__(256) void fft_cols_bit_reverse(
-    float* real, float* imag, int height, int width, int log2height)
+    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int height, int width, int log2height)
 {
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;   // position within the column
@@ -268,16 +260,11 @@ extern ""C"" __global__ __launch_bounds__(256) void fft_cols_bit_reverse(
     int temp = idx;
     for (int i = 0; i < log2height; i++) { reversed = (reversed << 1) | (temp & 1); temp >>= 1; }
 
-    if (reversed > idx) {
-        int a = idx * width + col;
-        int b = reversed * width + col;
-        float tr = real[a];
-        float ti = imag[a];
-        real[a] = real[b];
-        imag[a] = imag[b];
-        real[b] = tr;
-        imag[b] = ti;
-    }
+    // Out of place: see bit_reverse_permutation above.
+    int a = idx * width + col;
+    int b = reversed * width + col;
+    dstReal[a] = srcReal[b];
+    dstImag[a] = srcImag[b];
 }
 
 // 2D FFT row-wise butterfly
@@ -366,7 +353,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scale_inverse(float* real, f
 
 // Batched FFT bit reversal
 extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
-    float* real, float* imag, int batch, int n, int log2n)
+    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int batch, int n, int log2n)
 {
     int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -379,15 +366,10 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
         temp >>= 1;
     }
 
-    if (reversed > idx) {
-        int baseOffset = b * n;
-        float tempReal = real[baseOffset + idx];
-        float tempImag = imag[baseOffset + idx];
-        real[baseOffset + idx] = real[baseOffset + reversed];
-        imag[baseOffset + idx] = imag[baseOffset + reversed];
-        real[baseOffset + reversed] = tempReal;
-        imag[baseOffset + reversed] = tempImag;
-    }
+    // Out of place: see bit_reverse_permutation above.
+    int baseOffset = b * n;
+    dstReal[baseOffset + idx] = srcReal[baseOffset + reversed];
+    dstImag[baseOffset + idx] = srcImag[baseOffset + reversed];
 }
 
 // Batched FFT butterfly
