@@ -129,9 +129,9 @@ The p9 run explains all eight non-wins:
 
 ## p13 closure: every non-win converted
 
-> Historical evidence only under the current p14 protocol. p14 adds complete stable
-> promotable-search and host-quiescence admission, so this table must be reproduced before
-> it can support a current promotion decision.
+> Historical p13 evidence; not current under p15. p15 adds calibrated equal-duration paired
+> batches while retaining p14's complete stable promotable-search and host-quiescence admission,
+> so this table must be reproduced before it can support a current promotion decision.
 
 The p9 diagnoses above were used as search directions, not as permanent explanations.
 Under p13, a full measured candidate search selected nine schedules other than the modelled
