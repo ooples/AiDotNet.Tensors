@@ -251,14 +251,16 @@ internal static class DirectPtxCubinToolCore
         return violations == 0 ? 0 : 1;
     }
 
-    /// <summary>First capture of <paramref name="pattern"/> as an int, or 0.</summary>
-    private static int ParseBytes(string text, string pattern)
-    {
-        Match m = Regex.Match(text, pattern);
-        return m.Success ? int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
-    }
+    /// <summary>
+    /// Sum of every capture of <paramref name="pattern"/>, or 0. Ptxas reports
+    /// one figure per entry point, so any local-memory use must fail the module.
+    /// </summary>
+    private static int ParseBytes(string text, string pattern) =>
+        Regex.Matches(text, pattern)
+            .Cast<Match>()
+            .Sum(match => int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
 
-    /// <summary>What ptxas reported about one compiled entry point.</summary>
+    /// <summary>The worst resource footprint ptxas reported for a module.</summary>
     private readonly record struct ResourceUsage(int Registers, int SharedBytes);
 
     /// <summary>
@@ -271,10 +273,12 @@ internal static class DirectPtxCubinToolCore
     {
         int registers = 0;
         int shared = 0;
-        Match r = Regex.Match(diagnostics, @"Used (\d+) registers");
-        if (r.Success) registers = int.Parse(r.Groups[1].Value, CultureInfo.InvariantCulture);
-        Match sm = Regex.Match(diagnostics, @"(\d+) bytes smem");
-        if (sm.Success) shared = int.Parse(sm.Groups[1].Value, CultureInfo.InvariantCulture);
+        foreach (Match match in Regex.Matches(diagnostics, @"Used (\d+) registers"))
+            registers = Math.Max(
+                registers, int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
+        foreach (Match match in Regex.Matches(diagnostics, @"(\d+) bytes smem"))
+            shared = Math.Max(
+                shared, int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
         return new ResourceUsage(registers, shared);
     }
 
