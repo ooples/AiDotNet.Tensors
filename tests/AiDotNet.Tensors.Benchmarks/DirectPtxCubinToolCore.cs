@@ -323,15 +323,29 @@ internal static class DirectPtxCubinToolCore
     private static Dictionary<string, string> ReadManifest(IEnumerable<string> lines)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        int idIndex = -1;
+        int cubinIndex = -1;
         foreach (string line in lines)
         {
             if (line.Length == 0 ||
-                line.StartsWith("#", StringComparison.Ordinal) ||
-                line.StartsWith("blueprint-id", StringComparison.Ordinal))
+                line.StartsWith("#", StringComparison.Ordinal))
                 continue;
             string[] parts = line.Split('\t');
-            if (parts.Length >= 4) map[parts[0]] = parts[3];
+            if (idIndex < 0)
+            {
+                idIndex = Array.IndexOf(parts, "blueprint-id");
+                cubinIndex = Array.IndexOf(parts, "cubin-sha256");
+                if (idIndex < 0 || cubinIndex < 0)
+                    throw new InvalidDataException(
+                        "Manifest header lacks blueprint-id or cubin-sha256.");
+                continue;
+            }
+
+            if (parts.Length > Math.Max(idIndex, cubinIndex))
+                map[parts[idIndex]] = parts[cubinIndex];
         }
+        if (idIndex < 0)
+            throw new InvalidDataException("Manifest header was not found.");
         return map;
     }
 
