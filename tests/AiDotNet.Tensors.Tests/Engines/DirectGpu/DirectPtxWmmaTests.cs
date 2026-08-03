@@ -434,7 +434,9 @@ public class DirectPtxWmmaTests
             emitSoftmaxStats: true, warpsPerBlock);
         Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
-        Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, 255);
+        Assert.InRange(
+            kernel.FunctionInfo.RegistersPerThread,
+            1, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
 
         using var qDevice = runtime.AllocateBytes(kernel.QBytes);
         using var kDevice = runtime.AllocateBytes(kernel.KBytes);
