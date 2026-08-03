@@ -45,6 +45,15 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The checked-in FP32 row-softmax specialization is measured and promoted
+    /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
+    /// tuning domains and must supply and benchmark their own specialization
+    /// rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedRowSoftmax(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The fused-linear + GELU decode specializations are measured and promoted
     /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
     /// tuning domains and must supply and benchmark their own specialization

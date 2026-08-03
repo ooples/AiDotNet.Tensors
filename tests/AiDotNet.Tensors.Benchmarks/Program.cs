@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the online-attention family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -76,6 +95,12 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
+        {
+            DirectPtxSoftmaxExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int softmaxRuns) ? softmaxRuns : 1);
             return;
         }
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
@@ -142,6 +167,12 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-competitor")
         {
             KernelCompetitorTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-championship")
+        {
+            KernelChampionshipTool.Run(args.Skip(1).ToArray());
             return;
         }
 
@@ -1275,6 +1306,7 @@ class Program
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-softmax [runs]: exact-shape FP32 row-softmax championship matrix");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
         Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");
@@ -1293,6 +1325,7 @@ class Program
         Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
         Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --kernel-identity: print the four-fingerprint autotune identity per catalog kernel");
         Console.WriteLine("  --kernel-arch-validate: assemble catalog PTX for SM80/86/89/90/100/120");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
