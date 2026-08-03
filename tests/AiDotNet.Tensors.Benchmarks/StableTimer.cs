@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
 
@@ -161,8 +162,19 @@ internal static class StableTimer
 
         int iterationsA = IterationsFor(workUnitsA);
         int iterationsB = IterationsFor(workUnitsB);
-        int warmupA = Math.Max(3, iterationsA / 10);
-        int warmupB = Math.Max(3, iterationsB / 10);
+
+        // Calibrate with the ordinary work-size batch, then lengthen whichever lane receives
+        // less device-time. Equal launch counts under-expose a fast specialization: in the
+        // transposed-convolution search the 98 us baseline received about 196 ms per sample,
+        // while its 23 us candidate received only 46 ms and repeatedly failed the same 5%
+        // gate. The calibration batch is deliberately discarded rather than becoming a
+        // favourable extra sample.
+        double calibrationA = runtime.MeasureKernelMilliseconds(
+            launchA, Math.Max(3, iterationsA / 10), iterationsA) * 1000.0;
+        double calibrationB = runtime.MeasureKernelMilliseconds(
+            launchB, Math.Max(3, iterationsB / 10), iterationsB) * 1000.0;
+        (iterationsA, iterationsB) = CodegenMeasurementProtocol.CalibratePairIterations(
+            iterationsA, calibrationA, iterationsB, calibrationB);
 
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
@@ -173,9 +185,9 @@ internal static class StableTimer
         {
             attempts++;
             double a = runtime.MeasureKernelMilliseconds(
-                launchA, attempt == 0 ? warmupA : 0, iterationsA) * 1000.0;
+                launchA, 0, iterationsA) * 1000.0;
             double b = runtime.MeasureKernelMilliseconds(
-                launchB, attempt == 0 ? warmupB : 0, iterationsB) * 1000.0;
+                launchB, 0, iterationsB) * 1000.0;
             AddToConsecutiveWindow(samplesA, a);
             AddToConsecutiveWindow(samplesB, b);
             AddToConsecutiveWindow(ratios, a / b);
@@ -381,6 +393,14 @@ internal static class StableTimer
 
         Warm(launchA, synchronizeA, iterationsA);
         Warm(launchB, synchronizeB, iterationsB);
+
+        // Host-timed comparisons have the same exposure problem as CUDA-event pairs. Keep
+        // the timing methods identical within a comparison, discard one calibration batch
+        // per lane, and normalize the accepted samples per launch as before.
+        double calibrationA = TimeHostBatch(launchA, synchronizeA, iterationsA);
+        double calibrationB = TimeHostBatch(launchB, synchronizeB, iterationsB);
+        (iterationsA, iterationsB) = CodegenMeasurementProtocol.CalibratePairIterations(
+            iterationsA, calibrationA, iterationsB, calibrationB);
 
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
