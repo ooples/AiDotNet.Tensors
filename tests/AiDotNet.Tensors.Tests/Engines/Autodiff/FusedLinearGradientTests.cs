@@ -67,7 +67,7 @@ public class FusedLinearGradientTests : IDisposable
         using (var tape = new GradientTape<double>())
         {
             var linear = _engine.TensorMatMul(input, weight);
-            var biased = _engine.TensorBroadcastAdd(linear, bias);
+            var biased = _engine.TensorAdd(linear, bias);
             var loss = _engine.ReduceSum(biased, new[] { 0, 1 }, keepDims: false);
             unfusedGrads = tape.ComputeGradients(loss, new[] { input, weight, bias });
         }
@@ -168,7 +168,7 @@ public class FusedLinearGradientTests : IDisposable
         using (var tape = new GradientTape<float>())
         {
             var linear = _engine.TensorMatMul(input, weight);
-            var biased = _engine.TensorBroadcastAdd(linear, bias);
+            var biased = _engine.TensorAdd(linear, bias);
             unfusedOutput = activationOp(_engine, biased);
             var loss = _engine.ReduceSum(unfusedOutput, [0, 1], keepDims: false);
             unfusedGrads = tape.ComputeGradients(loss, [input, weight, bias]);
