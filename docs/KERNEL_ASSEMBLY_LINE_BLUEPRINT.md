@@ -384,3 +384,26 @@ Section 6 stands, with these amendments:
 * **Phase 3 measures end-to-end chain time**, not only kernel-only time (11.3).
 * **Determinism (11.6) and arch parameterisation (11.7)** are cross-cutting and must
   be designed into the spec algebra now, not retrofitted.
+
+## 12. The closed optimization loop
+
+The assembly line now exposes the complete schedule loop as one fail-closed command:
+
+```text
+--kernel-championship [kernel-or-all]
+    full candidate search
+ -> generated fp64 proof
+ -> strongest stable PyTorch/cuDNN plan search
+ -> PASS only when every selected ratio is >= 1.10x
+ -> otherwise Nsight counters + catalog-oracle diagnosis, then FAIL
+```
+
+This is the reusable foundation behind the historical p13 13/13 catalog result. Under p15,
+an unstable applicable promotable candidate makes the search incomplete instead of silently
+electing the modelled fallback, material foreign host CPU load refuses the suite, and paired
+lanes are calibrated toward equal-duration batches so a faster candidate does not receive
+less exposure to device scheduling noise. An ignored or stale
+autotune cache can no longer make the championship command benchmark the modelled fallback,
+and a partial competitor table cannot be mistaken for a complete pass. The cache path is
+propagated to every fresh child process, while the existing device, target, semantic-spec,
+candidate-PTX-set, dispatch, and protocol identities still invalidate stale evidence.

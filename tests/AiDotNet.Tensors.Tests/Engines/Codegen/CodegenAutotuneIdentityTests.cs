@@ -19,6 +19,35 @@ public sealed class CodegenAutotuneCacheCollection
 public class CodegenAutotuneIdentityTests
 {
     [Fact]
+    public void Cache_DefaultPathHonorsEnvironmentAndFallsBack()
+    {
+        const string variable = "AIDOTNET_CODEGEN_AUTOTUNE_CACHE";
+        string? previous = Environment.GetEnvironmentVariable(variable);
+        string configured = Path.Combine(
+            Path.GetTempPath(), "configured-codegen-autotune.tsv");
+
+        try
+        {
+            Environment.SetEnvironmentVariable(variable, configured);
+            Assert.Equal(configured, CodegenAutotuneCache.ResolveDefaultCachePath());
+
+            Environment.SetEnvironmentVariable(variable, null);
+            Assert.Equal(
+                Path.Combine("artifacts", "autotune.tsv"),
+                CodegenAutotuneCache.ResolveDefaultCachePath());
+
+            Environment.SetEnvironmentVariable(variable, "   ");
+            Assert.Equal(
+                Path.Combine("artifacts", "autotune.tsv"),
+                CodegenAutotuneCache.ResolveDefaultCachePath());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, previous);
+        }
+    }
+
+    [Fact]
     public void ChunkedSplitFactors_AreOrderedAndShared()
     {
         Assert.Equal(new[] { 2, 4, 7, 14 }, CodegenAutotuneIdentity.ChunkedSplitFactors);
@@ -40,6 +69,37 @@ public class CodegenAutotuneIdentityTests
             CodegenMeasurementProtocol.RequiredDirectCandidateGain(-0.01));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             CodegenMeasurementProtocol.RequiredDirectCandidateGain(double.NaN));
+    }
+
+    [Fact]
+    public void Protocol_PairedBatchCalibrationEqualizesExposureWithoutShortening()
+    {
+        // The real parity-transpose shape: preserve the 196 ms baseline batch and
+        // lengthen the 23 us candidate from 46 ms to the same exposure window.
+        Assert.Equal(
+            (A: 2_000, B: 8_522),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                2_000, 98.0, 2_000, 23.0));
+
+        // Very short pairs receive the 100 ms floor, while iteration growth is bounded.
+        Assert.Equal(
+            (A: 10_000, B: 10_000),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                100, 10.0, 100, 10.0));
+        Assert.Equal(
+            (A: 20_000, B: 20_000),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                2_000, 0.1, 2_000, 0.1));
+
+        // A long existing batch is never shortened, even when the bounded target is lower.
+        Assert.Equal(
+            (A: 5, B: 250),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                5, 100_000.0, 5, 1_000.0));
+        Assert.Equal(
+            (A: 50_000, B: 50_000),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                50_000, 1.0, 50_000, 1.0));
     }
 
     [Fact]
@@ -93,10 +153,14 @@ public class CodegenAutotuneIdentityTests
                 identity.SpecFingerprint, identity.EmitterFingerprint, "full");
             string probeRow = row.Replace("depthwise\t", "probe\t");
             probeRow = probeRow.Substring(0, probeRow.Length - "full".Length) + "probe";
+            string staleProtocolRow = row
+                .Replace("depthwise\t", "stale-protocol\t")
+                .Replace("\t" + CodegenMeasurementProtocol.Tag + "\t", "\tp13\t");
             File.WriteAllText(path,
                 "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope\n" +
                 "legacy\tno-tile\t10.0\t20.0\t2.0\t" + CodegenMeasurementProtocol.Tag + "\n" +
                 probeRow + "\n" +
+                staleProtocolRow + "\n" +
                 row + "\n");
             File.WriteAllText(secondPath,
                 "kernel\twinner\tbest_us\tmodelled_us\tgain\tprotocol\tdevice\ttarget\tspec\temitter\tscope\n" +
@@ -110,6 +174,7 @@ public class CodegenAutotuneIdentityTests
                 "depthwise", identity with { Target = "sm90" }));
             Assert.Null(CodegenAutotuneCache.WinnerFor("legacy", identity));
             Assert.Null(CodegenAutotuneCache.WinnerFor("probe", identity));
+            Assert.Null(CodegenAutotuneCache.WinnerFor("stale-protocol", identity));
 
             // Assigning another path must invalidate automatically; requiring callers to
             // remember Invalidate made tests and tools silently serve the previous file.

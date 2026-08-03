@@ -12,6 +12,47 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 public class DirectPtxWmmaTests
 {
+    public static TheoryData<int, bool, bool, int> OnlineAttentionReleaseCases
+    {
+        get
+        {
+            var data = new TheoryData<int, bool, bool, int>();
+            foreach (DirectPtxOnlineAttentionBasicReleaseCase releaseCase in
+                     DirectPtxOnlineAttentionReleaseMatrix.BasicCases)
+            {
+                data.Add(
+                    releaseCase.Sequence,
+                    releaseCase.Causal,
+                    releaseCase.Epilogue,
+                    releaseCase.Warps);
+            }
+
+            return data;
+        }
+    }
+
+    public static TheoryData<int, int, int, int, int, bool, int> OnlineAttentionFamilyReleaseCases
+    {
+        get
+        {
+            var data = new TheoryData<int, int, int, int, int, bool, int>();
+            foreach (DirectPtxOnlineAttentionFamilyReleaseCase releaseCase in
+                     DirectPtxOnlineAttentionReleaseMatrix.FamilyCases)
+            {
+                data.Add(
+                    releaseCase.Batch,
+                    releaseCase.QueryHeads,
+                    releaseCase.KeyValueHeads,
+                    releaseCase.QuerySequence,
+                    releaseCase.KeyValueSequence,
+                    releaseCase.Causal,
+                    releaseCase.CausalQueryOffset);
+            }
+
+            return data;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(16, false)]
     [InlineData(16, true)]
@@ -342,17 +383,41 @@ public class DirectPtxWmmaTests
         }
     }
 
+    [Fact]
+    public void OnlineAttentionEpsilon_IsLaunchDataRatherThanModuleIdentity()
+    {
+        string defaultPtx = PtxOnlineFusedAttention128x64Kernel.EmitPtx(
+            8, 6, isCausal: true, fuseLayerNormGelu: true,
+            0.125f, 1e-5f, sequenceLength: 128,
+            emitSoftmaxStats: true, warpsPerBlock: 8);
+        string callerSpecificPtx = PtxOnlineFusedAttention128x64Kernel.EmitPtx(
+            8, 6, isCausal: true, fuseLayerNormGelu: true,
+            0.125f, 7.5e-4f, sequenceLength: 128,
+            emitSoftmaxStats: true, warpsPerBlock: 8);
+
+        Assert.Equal(defaultPtx, callerSpecificPtx);
+        Assert.Contains(".param .f32 epsilon", callerSpecificPtx, StringComparison.Ordinal);
+        DirectPtxCubinArtifact artifact = Assert.IsType<DirectPtxCubinArtifact>(
+            DirectPtxCubinArtifactCache.TryResolveEmbedded(callerSpecificPtx, 8, 6));
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, artifact.ImageKind);
+    }
+
+    [Theory]
+    [MemberData(nameof(OnlineAttentionReleaseCases))]
+    public void OnlineAttentionReleaseCase_HasEmbeddedSm86Cubin(
+        int sequence, bool isCausal, bool fuseLayerNormGelu, int warpsPerBlock)
+    {
+        string ptx = PtxOnlineFusedAttention128x64Kernel.EmitPtx(
+            8, 6, isCausal, fuseLayerNormGelu, 0.125f, 1e-5f, sequence,
+            emitSoftmaxStats: true, warpsPerBlock);
+
+        DirectPtxCubinArtifact artifact = Assert.IsType<DirectPtxCubinArtifact>(
+            DirectPtxCubinArtifactCache.TryResolveEmbedded(ptx, 8, 6));
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, artifact.ImageKind);
+    }
+
     [SkippableTheory]
-    [InlineData(16, false, false, 1)]
-    [InlineData(16, true, true, 1)]
-    [InlineData(32, false, false, 1)]
-    [InlineData(32, true, true, 2)]
-    [InlineData(64, false, false, 2)]
-    [InlineData(64, true, true, 4)]
-    [InlineData(128, false, false, 4)]
-    [InlineData(128, false, true, 8)]
-    [InlineData(128, true, false, 4)]
-    [InlineData(128, true, true, 8)]
+    [MemberData(nameof(OnlineAttentionReleaseCases))]
     public void DriverOnlyOnlineAttention_MatchesOracleAndHasZeroLocalBytes(
         int sequence, bool isCausal, bool fuseLayerNormGelu, int warpsPerBlock)
     {
@@ -366,6 +431,7 @@ public class DirectPtxWmmaTests
         using var kernel = new PtxOnlineFusedAttention128x64Kernel(
             runtime, 1, isCausal, fuseLayerNormGelu, 0.125f, 1e-5f, sequence,
             emitSoftmaxStats: true, warpsPerBlock);
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
         Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, 255);
 
@@ -406,12 +472,25 @@ public class DirectPtxWmmaTests
             $"Online PTX max abs error {maxError:G9}.");
     }
 
+    [Theory]
+    [MemberData(nameof(OnlineAttentionFamilyReleaseCases))]
+    public void OnlineAttentionFamilyReleaseCase_HasEmbeddedSm86Cubin(
+        int batch, int queryHeads, int keyValueHeads,
+        int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset)
+    {
+        _ = batch;
+        string ptx = PtxOnlineFusedAttention128x64Kernel.EmitFamilyPtx(
+            8, 6, queryHeads, keyValueHeads, isCausal, fuseLayerNormGelu: false,
+            0.125f, 1e-5f, querySequence, keyValueSequence,
+            emitSoftmaxStats: true, causalQueryOffset: causalQueryOffset);
+
+        DirectPtxCubinArtifact artifact = Assert.IsType<DirectPtxCubinArtifact>(
+            DirectPtxCubinArtifactCache.TryResolveEmbedded(ptx, 8, 6));
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, artifact.ImageKind);
+    }
+
     [SkippableTheory]
-    [InlineData(2, 4, 2, 32, 64, false, 0)]
-    [InlineData(2, 8, 1, 32, 64, true, 0)]
-    [InlineData(2, 8, 2, 32, 64, true, 32)]
-    [InlineData(1, 4, 4, 128, 32, true, 0)]
-    [InlineData(1, 4, 2, 128, 64, true, -64)]
+    [MemberData(nameof(OnlineAttentionFamilyReleaseCases))]
     public void DriverOnlyOnlineAttentionFamily_MatchesRectangularGqaOracleAndHasZeroLocalBytes(
         int batch, int queryHeads, int keyValueHeads,
         int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset)
@@ -426,6 +505,7 @@ public class DirectPtxWmmaTests
             runtime, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
             isCausal, false, 0.125f, 1e-5f, emitSoftmaxStats: true,
             causalQueryOffset: causalQueryOffset);
+        Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
         Assert.Equal((long)batch * queryHeads * querySequence * dimension * sizeof(float),
             (long)kernel.OutputBytes);

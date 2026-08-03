@@ -18,6 +18,7 @@ internal static class DirectPtxFeatureGate
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
+    internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
@@ -34,6 +35,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
@@ -52,6 +54,28 @@ internal static class DirectPtxFeatureGate
     internal static bool NormalizationExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
     internal static bool ConvolutionExperimentOverride { get; set; }
+
+    [ThreadStatic]
+    private static bool s_complexMultiplyExperimentOverride;
+    [ThreadStatic]
+    private static bool? s_complexMultiplyGateOverride;
+
+    /// <summary>Thread-local benchmark access to unpromoted complex-multiply cells.</summary>
+    internal static bool ComplexMultiplyExperimentOverride
+    {
+        get => s_complexMultiplyExperimentOverride;
+        set => s_complexMultiplyExperimentOverride = value;
+    }
+
+    /// <summary>
+    /// Thread-local benchmark/test selection of the candidate or established
+    /// route. Null restores process-start feature configuration.
+    /// </summary>
+    internal static bool? ComplexMultiplyGateOverride
+    {
+        get => s_complexMultiplyGateOverride;
+        set => s_complexMultiplyGateOverride = value;
+    }
 
     internal static bool IsEnabled => IsAttentionEnabled;
 
@@ -75,6 +99,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashAttentionBackwardEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashAttentionBackwardEnabled);
+
+    internal static bool IsComplexMultiplyEnabled => ComplexMultiplyGateOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentComplexMultiplyEnabled);
 
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);

@@ -4408,6 +4408,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (gpuEvent is not CudaEvent cudaEvent)
             throw new ArgumentException("Event must be a CudaEvent", nameof(gpuEvent));
+        if (!ReferenceEquals(cudaEvent.Backend, this))
+            throw new ArgumentException(
+                "Event must belong to this CUDA backend.", nameof(gpuEvent));
+        if (stream is not CudaStream cudaStream || !ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
 
         cudaEvent.Record(stream);
     }
@@ -4417,6 +4423,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (stream is not CudaStream cudaStream)
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+        if (!ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
+        if (gpuEvent is not CudaEvent cudaEvent || !ReferenceEquals(cudaEvent.Backend, this))
+            throw new ArgumentException(
+                "Event must belong to this CUDA backend.", nameof(gpuEvent));
 
         cudaStream.WaitEvent(gpuEvent);
     }
@@ -4426,6 +4438,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (stream is not CudaStream cudaStream)
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+        if (!ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
 
         return new CudaSyncPoint(this, cudaStream);
     }
@@ -4740,6 +4755,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (gpuEvent is not CudaEvent cudaEvent)
             throw new ArgumentException("Event must be a CudaEvent", nameof(gpuEvent));
+        if (!ReferenceEquals(cudaEvent.Backend, this))
+            throw new ArgumentException(
+                "Event must belong to this CUDA backend.", nameof(gpuEvent));
 
         return cudaEvent.Query();
     }
@@ -4751,6 +4769,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException("Start event must be a CudaEvent", nameof(start));
         if (end is not CudaEvent cudaEnd)
             throw new ArgumentException("End event must be a CudaEvent", nameof(end));
+        if (!ReferenceEquals(cudaStart.Backend, this) ||
+            !ReferenceEquals(cudaEnd.Backend, this))
+            throw new ArgumentException(
+                "Both events must belong to this CUDA backend.");
 
         return cudaEnd.GetElapsedTime(cudaStart);
     }
@@ -14665,6 +14687,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
     {
         if (numPairs <= 0) return;
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxComplexMultiply(a, b, output, numPairs))
+            return;
+#endif
         if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
