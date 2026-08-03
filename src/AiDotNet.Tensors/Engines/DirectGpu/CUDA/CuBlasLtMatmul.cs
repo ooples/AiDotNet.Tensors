@@ -68,7 +68,8 @@ public sealed class CuBlasLtMatmul : IDisposable
         IntPtr workspace = default, ulong workspaceSizeInBytes = 0,
         IntPtr stream = default,
         CublasDataType dtype = CublasDataType.Float32,
-        CublasComputeType computeType = CublasComputeType.Float32)
+        CublasComputeType computeType = CublasComputeType.Float32,
+        CublasDataType? outputDtype = null)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuBlasLtMatmul));
 
@@ -97,8 +98,9 @@ public sealed class CuBlasLtMatmul : IDisposable
             // the choice to them rather than silently reinterpreting.
             Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(out aDesc, dtype, (ulong)m, (ulong)k, transA ? k : m), "A layout");
             Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(out bDesc, dtype, (ulong)k, (ulong)n, transB ? n : k), "B layout");
-            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(out cDesc, dtype, (ulong)m, (ulong)n, m), "C layout");
-            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(out dDesc, dtype, (ulong)m, (ulong)n, m), "D layout");
+            CublasDataType resultType = outputDtype ?? dtype;
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(out cDesc, resultType, (ulong)m, (ulong)n, m), "C layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(out dDesc, resultType, (ulong)m, (ulong)n, m), "D layout");
 
             Check(CuBlasLtNative.cublasLtMatmul(
                 _handle, opDesc,

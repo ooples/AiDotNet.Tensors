@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the online-attention family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -76,6 +95,54 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-dense-linear-full")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includePython = !args.Contains("--no-python", StringComparer.Ordinal);
+            bool tuneFp16TensorCore = args.Contains(
+                "--autotune-fp16-m16", StringComparer.Ordinal);
+            string? onlyOperation = args.FirstOrDefault(
+                argument => argument.StartsWith("--only=", StringComparison.Ordinal))?[7..];
+            DirectPtxDenseLinearFullExperiment.Run(
+                runs, includePython, onlyOperation, tuneFp16TensorCore);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-dense-linear-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
+            DirectPtxDenseLinearArtifactTool.Export(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-dense-linear-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
+            DirectPtxDenseLinearArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-dense-linear-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "dense-linear", "sass");
+            DirectPtxDenseLinearSassAuditTool.Run(
+                args[1], artifactDirectory, evidenceDirectory);
             return;
         }
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
@@ -142,6 +209,12 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-competitor")
         {
             KernelCompetitorTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-championship")
+        {
+            KernelChampionshipTool.Run(args.Skip(1).ToArray());
             return;
         }
 
@@ -296,6 +369,16 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
         {
             DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
+        {
+            DirectPtxProfileTarget.RunFusedLinear();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-dense-linear")
+        {
+            DirectPtxProfileTarget.RunDenseLinear();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
@@ -1269,6 +1352,11 @@ class Program
         Console.WriteLine("  --direct-ptx-fused-attention: Fused PTX QK+softmax+PV championship cell");
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
+        Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
+        Console.WriteLine("  --direct-ptx-dense-linear-full [runs] [--no-python] [--only=operation] [--autotune-fp16-m16]: complete #836 resident NVIDIA matrix");
+        Console.WriteLine("  --export-direct-ptx-dense-linear-cubins [dir]: link and export exact SM86 cubins");
+        Console.WriteLine("  --verify-direct-ptx-dense-linear-cubins [dir]: reject stale/missing dense-linear artifacts");
+        Console.WriteLine("  --audit-direct-ptx-dense-linear-sass <nvdisasm> [cubins] [evidence]: reject final-SASS LDL/STL");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
@@ -1282,6 +1370,8 @@ class Program
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
+        Console.WriteLine("  --direct-ptx-profile-dense-linear: exact-cubin Nsight target for all issue-836 entries");
         Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
@@ -1293,6 +1383,7 @@ class Program
         Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
         Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --kernel-identity: print the four-fingerprint autotune identity per catalog kernel");
         Console.WriteLine("  --kernel-arch-validate: assemble catalog PTX for SM80/86/89/90/100/120");
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");

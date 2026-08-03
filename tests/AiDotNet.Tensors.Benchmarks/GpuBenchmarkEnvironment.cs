@@ -11,10 +11,14 @@ internal static class GpuBenchmarkEnvironment
     private const int PostSuiteUtilizationDelayMilliseconds = 250;
     private const int DeviceMemoryCeilingMegabytes = 2048;
     private const int DeviceTemperatureCeilingCelsius = 75;
+    private const int HostUtilizationCeilingPercent = 20;
+    private const int HostUtilizationSampleMilliseconds = 750;
+    private const int HostUtilizationSampleSliceMilliseconds = 100;
 
     internal static void RequireIdleGpu(string label)
     {
         RequireNoForeignCompute(label);
+        RequireHostQuiescence(label);
 
         string status = RunNvidiaSmi(
             "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
@@ -33,8 +37,12 @@ internal static class GpuBenchmarkEnvironment
         }
     }
 
-    internal static void RequireNoForeignCompute(string label, bool afterSuite = false)
+    internal static void RequireNoForeignCompute(
+        string label,
+        bool afterSuite = false,
+        bool ignoreMixedWddmProcesses = false)
     {
+        RequireNoForeignPython(label);
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
         int? trustedOrchestrator = int.TryParse(
             Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
@@ -42,7 +50,8 @@ internal static class GpuBenchmarkEnvironment
                 ? orchestratorId
                 : null;
         string[] conflicts = FindComputeWorkloadConflicts(
-            processMonitor, Environment.ProcessId, trustedOrchestrator, afterSuite);
+            processMonitor, Environment.ProcessId, trustedOrchestrator,
+            afterSuite || ignoreMixedWddmProcesses);
         if (conflicts.Length != 0)
             throw new InvalidOperationException(
                 $"[{label}] Foreign GPU workload detected; clean benchmark refused: {string.Join("; ", conflicts)}");
@@ -56,8 +65,184 @@ internal static class GpuBenchmarkEnvironment
                 $"{DeviceTemperatureCeilingCelsius} C evidence ceiling.");
 
         if (afterSuite)
+        {
             RequirePostSuiteDeviceQuiescence(label);
+            RequireHostQuiescence(label);
+        }
     }
+
+    private static void RequireNoForeignPython(string label)
+    {
+        var conflicts = new List<string>();
+        foreach (Process process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.Id == Environment.ProcessId)
+                        continue;
+                    string name = process.ProcessName;
+                    if (string.Equals(name, "python", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "python3", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "pythonw", StringComparison.OrdinalIgnoreCase))
+                        conflicts.Add($"pid={process.Id} {name}");
+                }
+                catch (InvalidOperationException)
+                {
+                    // The process exited between enumeration and inspection.
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    // An inaccessible system process cannot be a normal Python
+                    // benchmark process; the NVIDIA process gate remains active.
+                }
+            }
+        }
+        if (conflicts.Count != 0)
+            throw new InvalidOperationException(
+                $"[{label}] OS-level Python workload detected before CUDA registration; " +
+                $"clean benchmark refused: {string.Join("; ", conflicts)}");
+    }
+
+    private static void RequireHostQuiescence(string label)
+    {
+        var interval = Stopwatch.StartNew();
+        Dictionary<int, ForeignProcessCpuSample> before = ReadForeignProcessCpuTimes();
+        var contributorMilliseconds = new Dictionary<int, double>();
+        var contributorNames = new Dictionary<int, string>();
+        DateTime sliceStartedUtc = DateTime.UtcNow;
+        double busyMilliseconds = 0;
+        do
+        {
+            int remainingMilliseconds = Math.Max(1,
+                HostUtilizationSampleMilliseconds - (int)interval.Elapsed.TotalMilliseconds);
+            System.Threading.Thread.Sleep(Math.Min(
+                HostUtilizationSampleSliceMilliseconds, remainingMilliseconds));
+
+            DateTime sliceEndedUtc = DateTime.UtcNow;
+            Dictionary<int, ForeignProcessCpuSample> after = ReadForeignProcessCpuTimes();
+            busyMilliseconds += MeasureForeignCpuMilliseconds(
+                before, after, sliceStartedUtc, sliceEndedUtc,
+                contributorMilliseconds, contributorNames);
+            before = after;
+            sliceStartedUtc = sliceEndedUtc;
+        }
+        while (interval.Elapsed.TotalMilliseconds < HostUtilizationSampleMilliseconds);
+        interval.Stop();
+
+        double capacityMilliseconds = interval.Elapsed.TotalMilliseconds *
+            Math.Max(1, Environment.ProcessorCount);
+        if (capacityMilliseconds <= 0)
+            throw new InvalidOperationException(
+                $"[{label}] Host quiescence sampling produced no measurable interval.");
+        int utilizationPercent = (int)Math.Round(
+            busyMilliseconds / capacityMilliseconds * 100.0,
+            MidpointRounding.AwayFromZero);
+        if (utilizationPercent > HostUtilizationCeilingPercent)
+        {
+            string topContributors = string.Join(", ", contributorMilliseconds
+                .OrderByDescending(entry => entry.Value)
+                .Take(5)
+                .Select(entry =>
+                    (contributorNames.TryGetValue(entry.Key, out string? name)
+                        ? name
+                        : "unknown") + "[" + entry.Key + "]=" +
+                    (entry.Value / capacityMilliseconds * 100.0).ToString("0.0",
+                        System.Globalization.CultureInfo.InvariantCulture) + "%"));
+            throw new InvalidOperationException(
+                $"[{label}] Host is not benchmark-ready (foreign CPU utilization=" +
+                $"{utilizationPercent}%, ceiling={HostUtilizationCeilingPercent}%; " +
+                $"top contributors: {topContributors}).");
+        }
+    }
+
+    private static double MeasureForeignCpuMilliseconds(
+        IReadOnlyDictionary<int, ForeignProcessCpuSample> before,
+        IReadOnlyDictionary<int, ForeignProcessCpuSample> after,
+        DateTime sliceStartedUtc,
+        DateTime sliceEndedUtc,
+        IDictionary<int, double> contributorMilliseconds,
+        IDictionary<int, string> contributorNames)
+    {
+        int processorCount = Math.Max(1, Environment.ProcessorCount);
+        double sliceMilliseconds = Math.Max(0,
+            (sliceEndedUtc - sliceStartedUtc).TotalMilliseconds);
+        double busyMilliseconds = 0;
+        foreach (KeyValuePair<int, ForeignProcessCpuSample> entry in after)
+        {
+            ForeignProcessCpuSample sample = entry.Value;
+            double contribution;
+            if (before.TryGetValue(entry.Key, out ForeignProcessCpuSample start) &&
+                start.StartTimeUtc == sample.StartTimeUtc)
+            {
+                contribution = Math.Max(0,
+                    (sample.TotalProcessorTime - start.TotalProcessorTime).TotalMilliseconds);
+            }
+            else if (sample.StartTimeUtc > sliceStartedUtc)
+            {
+                // A newly observed process may have started during this slice. Its
+                // accumulated CPU time is relevant, but never count work older than
+                // the slice or more CPU time than its observed lifetime can contain.
+                double observedLifetimeMilliseconds = Math.Max(0,
+                    (sliceEndedUtc - sample.StartTimeUtc).TotalMilliseconds);
+                contribution = Math.Min(
+                    sample.TotalProcessorTime.TotalMilliseconds,
+                    observedLifetimeMilliseconds * processorCount);
+            }
+            else
+            {
+                // The process predates this slice but had no readable baseline, so an
+                // access race hid it earlier. No delta is available until the next
+                // slice; charging its lifetime here would create a false busy host.
+                continue;
+            }
+
+            double boundedContribution = Math.Min(
+                contribution, sliceMilliseconds * processorCount);
+            busyMilliseconds += boundedContribution;
+            contributorMilliseconds.TryGetValue(entry.Key, out double accumulated);
+            contributorMilliseconds[entry.Key] = accumulated + boundedContribution;
+            contributorNames[entry.Key] = sample.ProcessName;
+        }
+        return busyMilliseconds;
+    }
+
+    private static Dictionary<int, ForeignProcessCpuSample> ReadForeignProcessCpuTimes()
+    {
+        var times = new Dictionary<int, ForeignProcessCpuSample>();
+        int currentProcessId = Environment.ProcessId;
+        foreach (Process process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.Id != 0 && process.Id != currentProcessId)
+                        times[process.Id] = new ForeignProcessCpuSample(
+                            process.TotalProcessorTime, process.StartTime.ToUniversalTime(),
+                            process.ProcessName);
+                }
+                catch (InvalidOperationException)
+                {
+                    // The process exited between enumeration and property access.
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    // The process became inaccessible between enumeration and sampling.
+                }
+            }
+        }
+        if (times.Count == 0)
+            throw new InvalidOperationException(
+                "Host quiescence sampling observed no accessible foreign processes.");
+        return times;
+    }
+
+    private readonly record struct ForeignProcessCpuSample(
+        TimeSpan TotalProcessorTime,
+        DateTime StartTimeUtc,
+        string ProcessName);
 
     private static void RequirePostSuiteDeviceQuiescence(string label)
     {

@@ -2,6 +2,7 @@
 
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -49,6 +50,12 @@ public sealed partial class CudaBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
 
+        if (TryDirectPtxFp16Gemm(
+            aFp16, bFp16, cFp16, m, n, k,
+            outputType: DirectPtxGemmOutputType.Float16,
+            halfAccumulate: true))
+            return;
+
         using var _ = PushContext();
         // alpha=1, beta=0 as FP16 bit patterns.
         // 1.0 in IEEE 754 binary16 = 0x3C00. 0.0 = 0x0000.
@@ -87,6 +94,9 @@ public sealed partial class CudaBackend
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
+
+        if (TryDirectPtxFp16Gemm(aFp16, bFp16, cFp32, m, n, k))
+            return;
 
         using var _ = PushContext();
         // GemmEx needs alpha/beta as POINTERS to scalars in the
@@ -128,6 +138,11 @@ public sealed partial class CudaBackend
         if (Ahalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {Ahalf.SizeInBytes} < {(long)M * K * 2}.");
         if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
         if (Chalf.SizeInBytes < (long)M * N * 2) throw new ArgumentException($"C half buffer too small: {Chalf.SizeInBytes} < {(long)M * N * 2}.");
+
+        if (alpha == 1f && beta == 0f && TryDirectPtxFp16Gemm(
+            Ahalf, Bhalf, Chalf, M, N, K,
+            outputType: DirectPtxGemmOutputType.Float16))
+            return;
 
         using var _ = PushContext();
         float aVal = alpha, bVal = beta;
@@ -197,6 +212,11 @@ public sealed partial class CudaBackend
         if (bHalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {bHalf.SizeInBytes} < {(long)K * N * 2}.");
         if (gradAOut.SizeInBytes < (long)M * K * outElemBytes) throw new ArgumentException($"gradA buffer too small: {gradAOut.SizeInBytes} < {(long)M * K * outElemBytes}.");
         if (gradBOut.SizeInBytes < (long)K * N * outElemBytes) throw new ArgumentException($"gradB buffer too small: {gradBOut.SizeInBytes} < {(long)K * N * outElemBytes}.");
+
+        if (TryDirectPtxFp16Backward(
+            gradCHalf, aHalf, bHalf, gradAOut, gradBOut,
+            M, N, K, gradOutHalf))
+            return;
 
         using var _ = PushContext();
         float alphaF = 1.0f, betaF = 0.0f;

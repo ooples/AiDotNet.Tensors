@@ -65,6 +65,11 @@ missing or duplicate assignment.
 The machine-readable manifest is authoritative; this compact table is its
 human-readable summary.
 
+The same assembly-line contract now also governs issue #836 dense-linear work.
+Its executable inventory and evidence live in
+`DirectPtxDenseLinearCoverageManifest` and
+`2026-07-21-direct-ptx-dense-linear-blueprint.md`.
+
 ## Apples-to-apples contracts
 
 Two lanes are reported separately.

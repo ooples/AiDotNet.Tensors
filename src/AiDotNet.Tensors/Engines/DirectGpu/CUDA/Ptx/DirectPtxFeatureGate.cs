@@ -19,6 +19,7 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
     internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
@@ -35,6 +36,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
@@ -42,8 +44,19 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
-    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
-    internal static bool FusedLinearExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool _fusedLinearExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to measured cells that have not passed promotion.
+    /// The override is thread-local so parallel test/benchmark activity cannot
+    /// transiently admit an experimental route in another caller.
+    /// </summary>
+    internal static bool FusedLinearExperimentOverride
+    {
+        get => _fusedLinearExperimentOverride;
+        set => _fusedLinearExperimentOverride = value;
+    }
     /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
     internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
@@ -79,6 +92,8 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    internal static bool IsFusedLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentFusedLinearEnabled);
     internal static bool IsConvolutionEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
 
@@ -111,6 +126,8 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense row-major [batch, row, feature].</summary>
+    RowMajor3D,
     /// <summary>Dense canonical [batch, channel, spatial] (NCHW-flattened).</summary>
     Nchw,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
