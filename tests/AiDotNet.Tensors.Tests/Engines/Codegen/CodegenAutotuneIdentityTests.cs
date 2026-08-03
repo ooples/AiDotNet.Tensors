@@ -72,6 +72,37 @@ public class CodegenAutotuneIdentityTests
     }
 
     [Fact]
+    public void Protocol_PairedBatchCalibrationEqualizesExposureWithoutShortening()
+    {
+        // The real parity-transpose shape: preserve the 196 ms baseline batch and
+        // lengthen the 23 us candidate from 46 ms to the same exposure window.
+        Assert.Equal(
+            (A: 2_000, B: 8_522),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                2_000, 98.0, 2_000, 23.0));
+
+        // Very short pairs receive the 100 ms floor, while iteration growth is bounded.
+        Assert.Equal(
+            (A: 10_000, B: 10_000),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                100, 10.0, 100, 10.0));
+        Assert.Equal(
+            (A: 20_000, B: 20_000),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                2_000, 0.1, 2_000, 0.1));
+
+        // A long existing batch is never shortened, even when the bounded target is lower.
+        Assert.Equal(
+            (A: 5, B: 250),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                5, 100_000.0, 5, 1_000.0));
+        Assert.Equal(
+            (A: 50_000, B: 50_000),
+            CodegenMeasurementProtocol.CalibratePairIterations(
+                50_000, 1.0, 50_000, 1.0));
+    }
+
+    [Fact]
     public async Task Identity_IsMemoizedForTheSameInputs_AndIsolatedBySpecAndDevice()
     {
         var first = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(1, 32, 16, 16);
