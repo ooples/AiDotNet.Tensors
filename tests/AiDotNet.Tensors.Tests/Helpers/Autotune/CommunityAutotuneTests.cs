@@ -94,21 +94,29 @@ public sealed class CommunityAutotuneTests : IDisposable
     public void GoodCommunityConfig_WinsOnRemeasure_IsUsed_AndPublished()
     {
         var exchange = new InMemoryGpuTuningExchange();
-        // A community peer reports tile-32 is great on this model.
-        exchange.Seed(Community("tile-32", 32, 1500.0));
+        // tile-11 is absent from Local(), so selecting it proves the community
+        // fetch-and-merge path actually participated in the sweep.
+        exchange.Seed(Community("tile-11", 11, 1500.0));
+        bool communityWasBenchmarked = false;
 
-        // On THIS device the sweep confirms tile-32 really is fastest.
+        // On THIS device the sweep confirms tile-11 really is fastest.
         AutotuneResolution r = CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
-            c => c.Variant == "tile-32" ? 1400.0 : 500.0,
+            c =>
+            {
+                if (c.Variant == "tile-11") communityWasBenchmarked = true;
+                return c.Variant == "tile-11" ? 1400.0 : 500.0;
+            },
             isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(r.Measured);
+        Assert.True(exchange.FetchCount > 0);
+        Assert.True(communityWasBenchmarked);
         Assert.True(ConvTileAutotune.TryGetTile(r, out int tile));
-        Assert.Equal(32, tile);              // community config re-measured and selected
+        Assert.Equal(11, tile);              // community config re-measured and selected
         Assert.Single(exchange.Published);   // our own measurement corroborates it
-        Assert.Equal("tile-32", exchange.Published[0].Variant);
+        Assert.Equal("tile-11", exchange.Published[0].Variant);
         Assert.Equal(Card.ModelKey, exchange.Published[0].ModelKey);
     }
 
@@ -118,16 +126,25 @@ public sealed class CommunityAutotuneTests : IDisposable
         var exchange = new InMemoryGpuTuningExchange();
         // A malicious/over-reported config claims a huge number but cannot launch here.
         exchange.Seed(Community("tile-999", 999, 999999.0));
+        bool poisonedWasBenchmarked = false;
 
         AutotuneResolution r = CommunityAutotune.Resolve(
             exchange, Category, Kernel, Card, Shape(), Local(),
-            c => c.Variant == "tile-999"
-                ? throw new InvalidOperationException("shared-mem over budget")
-                : (c.Variant == "tile-16" ? 800.0 : 400.0),
+            c =>
+            {
+                if (c.Variant == "tile-999")
+                {
+                    poisonedWasBenchmarked = true;
+                    throw new InvalidOperationException("shared-mem over budget");
+                }
+                return c.Variant == "tile-16" ? 800.0 : 400.0;
+            },
             isCommunityCandidateAllowed: AllowAnyCandidate,
             autotuneEnabled: true);
 
         Assert.True(r.Measured);
+        Assert.True(exchange.FetchCount > 0);
+        Assert.True(poisonedWasBenchmarked);
         Assert.True(ConvTileAutotune.TryGetTile(r, out int tile));
         Assert.Equal(16, tile); // poison lost; a real local candidate won
     }
