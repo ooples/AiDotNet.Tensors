@@ -170,6 +170,7 @@ internal static class WarpTileSweepTool
             // checked against the 2x2 tile's own output instead, which is the tile the
             // verified rows already cover, so a tile that disagrees with it is wrong.
             double deviation;
+            bool agrees;
             var got = new float[outCount];
             outBuffer.Download<float>(got);
 
@@ -180,21 +181,27 @@ internal static class WarpTileSweepTool
                 : tileM == 2 && tileN == 2 ? "root@256" : "tile2x2";
             if (usesFp64Reference)
             {
-                double[] want = spec.Interpret(wide);
-                deviation = 0;
-                for (long e = 0; e < outCount; e++)
-                    deviation = Math.Max(deviation, Math.Abs(got[e] - want[e]));
+                double[] interpreted = spec.Interpret(wide);
+                var want = new float[interpreted.Length];
+                for (int e = 0; e < interpreted.Length; e++)
+                    want[e] = (float)interpreted[e];
+                agrees = CodegenOutputAgreement.Agrees(
+                    got, want, 1e-3, out deviation, out _, out _, out _);
             }
             else if (tileM == 2 && tileN == 2)
             {
-                deviation = 0;   // this IS the reference tile; the verified shapes cover it
+                // This is the reference tile. A self-comparison still rejects NaN/Inf
+                // before the result can become the anchor for other candidates.
+                agrees = CodegenOutputAgreement.Agrees(
+                    got, got, 1e-3, out deviation, out _, out _, out _);
             }
             else
             {
-                deviation = CompareAgainstReference(runtime, spec, major, minor, pointers, got, outCount);
+                agrees = CompareAgainstReference(
+                    runtime, spec, major, minor, pointers, got, outCount, out deviation);
             }
 
-            if (deviation > 1e-3)
+            if (!agrees)
             {
                 Report(label, tileM, tileN, emitter, correctnessReference, deviation, 0, 0, "WRONG");
                 return 0;
@@ -221,9 +228,9 @@ internal static class WarpTileSweepTool
     }
 
     /// <summary>Compares a large shape against the 2x2 tile's output on the same inputs.</summary>
-    private static double CompareAgainstReference(
+    private static bool CompareAgainstReference(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        IntPtr[] pointers, float[] got, long outCount)
+        IntPtr[] pointers, float[] got, long outCount, out double deviation)
     {
         var reference = new PtxTensorCoreEmitter { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
         PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _);
@@ -244,10 +251,8 @@ internal static class WarpTileSweepTool
 
             var want = new float[outCount];
             refBuffer.Download<float>(want);
-
-            double worst = 0;
-            for (long e = 0; e < outCount; e++) worst = Math.Max(worst, Math.Abs(got[e] - want[e]));
-            return worst;
+            return CodegenOutputAgreement.Agrees(
+                got, want, 1e-3, out deviation, out _, out _, out _);
         }
         finally
         {
