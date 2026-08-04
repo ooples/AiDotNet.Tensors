@@ -172,10 +172,11 @@ internal static class GpuBenchmarkEnvironment
                 contribution, sliceMilliseconds * processorCount);
             // The competitor parent spends a little CPU supervising its child
             // lanes. Exclude that expected bookkeeping, but count it normally
-            // once it exceeds the same material-work threshold used by the
-            // GPU-process admission gate.
+            // once it exceeds the threshold. The allowance is a share of one
+            // core, not of the whole machine: supervising child lanes does not
+            // scale with the host's core count.
             if (sample.IsTrustedOrchestrator && boundedContribution <=
-                sliceMilliseconds * processorCount *
+                sliceMilliseconds *
                 MixedComputeConflictThresholdPercent / 100.0)
                 continue;
             busyMilliseconds += boundedContribution;
