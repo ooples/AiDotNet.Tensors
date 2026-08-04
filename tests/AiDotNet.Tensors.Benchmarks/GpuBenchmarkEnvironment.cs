@@ -76,7 +76,7 @@ internal static class GpuBenchmarkEnvironment
     private static void RequireHostQuiescence(string label, int? trustedOrchestratorId)
     {
         var interval = Stopwatch.StartNew();
-        Dictionary<int, ForeignProcessCpuSample> before =
+        ForeignProcessCpuSnapshot before =
             ReadForeignProcessCpuTimes(trustedOrchestratorId);
         var contributorMilliseconds = new Dictionary<int, double>();
         var contributorNames = new Dictionary<int, string>();
@@ -90,7 +90,7 @@ internal static class GpuBenchmarkEnvironment
                 HostUtilizationSampleSliceMilliseconds, remainingMilliseconds));
 
             DateTime sliceEndedUtc = DateTime.UtcNow;
-            Dictionary<int, ForeignProcessCpuSample> after =
+            ForeignProcessCpuSnapshot after =
                 ReadForeignProcessCpuTimes(trustedOrchestratorId);
             busyMilliseconds += MeasureForeignCpuMilliseconds(
                 before, after, sliceStartedUtc, sliceEndedUtc,
@@ -128,22 +128,33 @@ internal static class GpuBenchmarkEnvironment
     }
 
     private static double MeasureForeignCpuMilliseconds(
-        IReadOnlyDictionary<int, ForeignProcessCpuSample> before,
-        IReadOnlyDictionary<int, ForeignProcessCpuSample> after,
+        ForeignProcessCpuSnapshot before,
+        ForeignProcessCpuSnapshot after,
         DateTime sliceStartedUtc,
         DateTime sliceEndedUtc,
         IDictionary<int, double> contributorMilliseconds,
         IDictionary<int, string> contributorNames)
     {
+        int[] inaccessibleProcessIds = before.InaccessibleProcessIds
+            .Concat(after.InaccessibleProcessIds)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToArray();
+        if (inaccessibleProcessIds.Length != 0)
+            throw new InvalidOperationException(
+                "Host quiescence sampling is incomplete; CPU time was inaccessible for " +
+                inaccessibleProcessIds.Length + " foreign process(es): " +
+                string.Join(", ", inaccessibleProcessIds) + ".");
+
         int processorCount = Math.Max(1, Environment.ProcessorCount);
         double sliceMilliseconds = Math.Max(0,
             (sliceEndedUtc - sliceStartedUtc).TotalMilliseconds);
         double busyMilliseconds = 0;
-        foreach (KeyValuePair<int, ForeignProcessCpuSample> entry in after)
+        foreach (KeyValuePair<int, ForeignProcessCpuSample> entry in after.Samples)
         {
             ForeignProcessCpuSample sample = entry.Value;
             double contribution;
-            if (before.TryGetValue(entry.Key, out ForeignProcessCpuSample start) &&
+            if (before.Samples.TryGetValue(entry.Key, out ForeignProcessCpuSample start) &&
                 start.StartTimeUtc == sample.StartTimeUtc)
             {
                 contribution = Math.Max(0,
@@ -187,23 +198,26 @@ internal static class GpuBenchmarkEnvironment
         return busyMilliseconds;
     }
 
-    private static Dictionary<int, ForeignProcessCpuSample> ReadForeignProcessCpuTimes(
+    private static ForeignProcessCpuSnapshot ReadForeignProcessCpuTimes(
         int? trustedOrchestratorId)
     {
         var times = new Dictionary<int, ForeignProcessCpuSample>();
+        var inaccessibleProcessIds = new HashSet<int>();
         int currentProcessId = Environment.ProcessId;
         foreach (Process process in Process.GetProcesses())
         {
             using (process)
             {
+                int processId = -1;
                 try
                 {
-                    if (process.Id != 0 && process.Id != currentProcessId)
-                        times[process.Id] = new ForeignProcessCpuSample(
+                    processId = process.Id;
+                    if (processId != 0 && processId != currentProcessId)
+                        times[processId] = new ForeignProcessCpuSample(
                             process.TotalProcessorTime, process.StartTime.ToUniversalTime(),
                             process.ProcessName,
                             trustedOrchestratorId is > 0 &&
-                            process.Id == trustedOrchestratorId);
+                            processId == trustedOrchestratorId);
                 }
                 catch (InvalidOperationException)
                 {
@@ -211,15 +225,21 @@ internal static class GpuBenchmarkEnvironment
                 }
                 catch (System.ComponentModel.Win32Exception)
                 {
-                    // The process became inaccessible between enumeration and sampling.
+                    // Access failure is not evidence of zero CPU. Preserve it so the
+                    // before/after measurement can reject incomplete host coverage.
+                    inaccessibleProcessIds.Add(processId);
                 }
             }
         }
-        if (times.Count == 0)
+        if (times.Count == 0 && inaccessibleProcessIds.Count == 0)
             throw new InvalidOperationException(
                 "Host quiescence sampling observed no accessible foreign processes.");
-        return times;
+        return new ForeignProcessCpuSnapshot(times, inaccessibleProcessIds);
     }
+
+    private readonly record struct ForeignProcessCpuSnapshot(
+        IReadOnlyDictionary<int, ForeignProcessCpuSample> Samples,
+        IReadOnlySet<int> InaccessibleProcessIds);
 
     private readonly record struct ForeignProcessCpuSample(
         TimeSpan TotalProcessorTime,
