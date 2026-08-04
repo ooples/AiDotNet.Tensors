@@ -120,6 +120,9 @@ public static class CommunityAutotune
         int maxCommunity)
     {
         if (local is null) throw new ArgumentNullException(nameof(local));
+        if (local.Count == 0)
+            throw new ArgumentException(
+                "At least one local candidate is required.", nameof(local));
         if (isCommunityCandidateAllowed is null)
             throw new ArgumentNullException(nameof(isCommunityCandidateAllowed));
 

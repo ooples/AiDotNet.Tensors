@@ -283,6 +283,19 @@ public sealed class CommunityAutotuneTests : IDisposable
     }
 
     [Fact]
+    public void MergeCommunityCandidates_RejectsEmptyLocalSet()
+    {
+        ArgumentException error = Assert.Throws<ArgumentException>(() =>
+            CommunityAutotune.MergeCommunityCandidates(
+                Array.Empty<AutotuneCandidate>(),
+                Array.Empty<GpuTuningProfile>(),
+                AllowAnyCandidate,
+                maxCommunity: 2));
+
+        Assert.Equal("local", error.ParamName);
+    }
+
+    [Fact]
     public void CacheHit_SkipsFetchAndPublish()
     {
         var exchange = new InMemoryGpuTuningExchange();
