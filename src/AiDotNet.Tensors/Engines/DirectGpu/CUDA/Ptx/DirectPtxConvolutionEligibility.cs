@@ -89,8 +89,10 @@ internal static class DirectPtxConvolutionEligibility
         nuint rightBytes = (nuint)right.SizeInBytes;
         nuint leftEnd = leftStart + leftBytes;
         nuint rightEnd = rightStart + rightBytes;
-        // Malformed pointer ranges (unsigned wraparound, where end < start) must
-        // reject rather than escape the fail-closed admission boundary.
+        // Malformed pointer ranges must reject rather than escape the fail-closed
+        // admission boundary. Unsigned addition wraps, so an end below its start
+        // is exactly an overflowed (invalid) range. This avoids nuint.MaxValue,
+        // which is unavailable pre-net5.
         if (leftEnd < leftStart || rightEnd < rightStart)
             return true;
         return leftStart < rightEnd && rightStart < leftEnd;

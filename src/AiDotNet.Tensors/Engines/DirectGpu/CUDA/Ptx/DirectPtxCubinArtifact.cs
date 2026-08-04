@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -61,8 +62,8 @@ internal static class DirectPtxCubinArtifactCache
     private const int LogBytes = 16 * 1024;
     private const string CacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_PATH";
     private static readonly object Sync = new();
-    private static readonly Lazy<IReadOnlyDictionary<string, string>> EmbeddedHashes =
-        new(ReadEmbeddedHashes);
+    private static readonly Lazy<IReadOnlyDictionary<string, EmbeddedArtifact>> EmbeddedArtifacts =
+        new(ReadEmbeddedArtifacts);
 
     internal static DirectPtxCubinArtifact Resolve(DirectPtxRuntime runtime, string ptx)
     {
@@ -74,7 +75,11 @@ internal static class DirectPtxCubinArtifactCache
 
         lock (Sync)
         {
-            DirectPtxCubinArtifact? embedded = TryReadEmbedded(runtime, sourceKey);
+            DirectPtxCubinArtifact? embedded = TryReadEmbedded(
+                runtime.ComputeCapabilityMajor,
+                runtime.ComputeCapabilityMinor,
+                sourceKey,
+                ComputePtxSha256(ptx));
             if (embedded != null)
                 return embedded;
 
@@ -102,6 +107,20 @@ internal static class DirectPtxCubinArtifactCache
     internal static string ComputePtxSha256(string ptx) =>
         Sha256(Encoding.UTF8.GetBytes(CanonicalizePtx(ptx)));
 
+    internal static DirectPtxCubinArtifact? TryResolveEmbedded(
+        string ptx,
+        int computeCapabilityMajor,
+        int computeCapabilityMinor)
+    {
+        PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
+        ptx = CanonicalizePtx(ptx);
+        return TryReadEmbedded(
+            computeCapabilityMajor,
+            computeCapabilityMinor,
+            ComputeSourceKey(ptx, computeCapabilityMajor, computeCapabilityMinor),
+            ComputePtxSha256(ptx));
+    }
+
     internal static string CanonicalizePtx(string ptx)
     {
         PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
@@ -111,78 +130,161 @@ internal static class DirectPtxCubinArtifactCache
     }
 
     private static DirectPtxCubinArtifact? TryReadEmbedded(
-        DirectPtxRuntime runtime, string sourceKey)
+        int computeCapabilityMajor,
+        int computeCapabilityMinor,
+        string sourceKey,
+        string ptxSha256)
     {
-        string suffix = ".Artifacts.sm" +
-            runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + "." +
-            sourceKey + ".cubin";
-        Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
-        string? resourceName = null;
-        foreach (string candidate in assembly.GetManifestResourceNames())
-        {
-            if (candidate.EndsWith(suffix, StringComparison.Ordinal))
-            {
-                resourceName = candidate;
-                break;
-            }
-        }
-        if (resourceName == null)
+        string architecture = "sm" +
+            computeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
+            computeCapabilityMinor.ToString(CultureInfo.InvariantCulture);
+        string sourceIdentity = architecture + "|source|" + sourceKey;
+        string ptxIdentity = architecture + "|ptx|" + ptxSha256;
+        if (!EmbeddedArtifacts.Value.TryGetValue(sourceIdentity, out EmbeddedArtifact? artifact) &&
+            !EmbeddedArtifacts.Value.TryGetValue(ptxIdentity, out artifact))
             return null;
 
-        using Stream? stream = assembly.GetManifestResourceStream(resourceName);
+        Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
+        using Stream? stream = assembly.GetManifestResourceStream(artifact.ResourceName);
         if (stream == null)
             throw new InvalidDataException(
-                "The embedded direct-PTX cubin resource could not be opened: " + resourceName);
+                "The embedded direct-PTX cubin resource could not be opened: " + artifact.ResourceName);
         using var memory = new MemoryStream();
         stream.CopyTo(memory);
         byte[] image = memory.ToArray();
-        ValidateCubin(image, "embedded resource " + resourceName);
+        ValidateCubin(image, "embedded resource " + artifact.ResourceName);
         string cubinHash = Sha256(image);
-        string manifestKey = "sm" +
-            runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
-            runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture) + "|" + sourceKey;
-        if (!EmbeddedHashes.Value.TryGetValue(manifestKey, out string? expectedHash) ||
-            !string.Equals(expectedHash, cubinHash, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(artifact.CubinSha256, cubinHash, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException(
-                "Embedded direct-PTX cubin failed its release-manifest hash: " + resourceName);
+                "Embedded direct-PTX cubin failed its release-manifest hash: " + artifact.ResourceName);
         return new DirectPtxCubinArtifact(
             image, sourceKey, cubinHash, DirectPtxModuleImageKind.EmbeddedCubin,
-            resourceName, "precompiled package cubin");
+            artifact.ResourceName, "precompiled package cubin");
     }
 
-    private static IReadOnlyDictionary<string, string> ReadEmbeddedHashes()
+    private static IReadOnlyDictionary<string, EmbeddedArtifact> ReadEmbeddedArtifacts()
     {
-        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        var result = new Dictionary<string, EmbeddedArtifact>(StringComparer.Ordinal);
         Assembly assembly = typeof(DirectPtxCubinArtifactCache).Assembly;
-        foreach (string resourceName in assembly.GetManifestResourceNames())
+        string[] orderedResourceNames = assembly.GetManifestResourceNames()
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        foreach (string resourceName in orderedResourceNames)
         {
-            const string suffix = ".normalization-cubins.tsv";
-            if (!resourceName.EndsWith(suffix, StringComparison.Ordinal))
+            if (!resourceName.EndsWith(".tsv", StringComparison.Ordinal) ||
+                !TryParseEmbeddedArtifactArchitecture(resourceName, out string architecture))
                 continue;
-            string marker = ".Artifacts.sm";
-            int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
-            int suffixIndex = resourceName.Length - suffix.Length;
-            if (markerIndex < 0 || suffixIndex <= markerIndex + marker.Length)
-                continue;
-            string architecture = "sm" + resourceName.Substring(
-                markerIndex + marker.Length, suffixIndex - markerIndex - marker.Length);
+
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
             if (stream == null)
-                continue;
+                throw new InvalidDataException(
+                    "The embedded direct-PTX manifest could not be opened: " + resourceName);
             using var reader = new StreamReader(stream, Encoding.UTF8, true, 1024, leaveOpen: false);
+            string[]? header = null;
+            int ptxIndex = -1;
+            int sourceIndex = -1;
+            int cubinIndex = -1;
+            int fileIndex = -1;
             string? line;
             while ((line = reader.ReadLine()) != null)
             {
-                if (line.Length == 0 || line[0] == '#' || line.StartsWith("blueprint-id", StringComparison.Ordinal))
+                if (line.Length == 0 || line[0] == '#')
                     continue;
+                if (header == null)
+                {
+                    header = line.Split('\t');
+                    ptxIndex = Array.IndexOf(header, "ptx-sha256");
+                    sourceIndex = Array.IndexOf(header, "source-key");
+                    cubinIndex = Array.IndexOf(header, "cubin-sha256");
+                    fileIndex = Array.IndexOf(header, "file");
+                    // Artifact directories can also contain non-manifest TSV
+                    // evidence. Only a table with the release-manifest identity
+                    // columns participates in executable resolution.
+                    if (ptxIndex < 0 || cubinIndex < 0 || fileIndex < 0)
+                        break;
+                    continue;
+                }
+
                 string[] columns = line.Split('\t');
-                if (columns.Length >= 4)
-                    result[architecture + "|" + columns[2]] = columns[3];
+                if (columns.Length <= Math.Max(fileIndex, Math.Max(ptxIndex, cubinIndex)))
+                    throw new InvalidDataException(
+                        "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
+
+                string? cubinResource = FindEmbeddedCubinResource(
+                    orderedResourceNames, architecture, columns[fileIndex]);
+                if (cubinResource == null)
+                    throw new InvalidDataException(
+                        "Embedded direct-PTX manifest references a missing cubin: " +
+                        resourceName + " -> " + columns[fileIndex]);
+                var artifact = new EmbeddedArtifact(columns[cubinIndex], cubinResource);
+                AddEmbeddedArtifact(result, architecture + "|ptx|" + columns[ptxIndex], artifact);
+                if (sourceIndex >= 0 && sourceIndex < columns.Length &&
+                    !string.IsNullOrWhiteSpace(columns[sourceIndex]))
+                    AddEmbeddedArtifact(
+                        result, architecture + "|source|" + columns[sourceIndex], artifact);
             }
         }
         return result;
     }
+
+    internal static bool TryParseEmbeddedArtifactArchitecture(
+        string resourceName,
+        out string architecture)
+    {
+        const string marker = ".Artifacts.sm";
+        int markerIndex = resourceName.IndexOf(marker, StringComparison.Ordinal);
+        if (markerIndex < 0)
+        {
+            architecture = string.Empty;
+            return false;
+        }
+
+        int architectureStart = markerIndex + ".Artifacts.".Length;
+        int architectureEnd = resourceName.IndexOf('.', architectureStart);
+        if (architectureEnd <= architectureStart)
+        {
+            architecture = string.Empty;
+            return false;
+        }
+
+        architecture = resourceName.Substring(
+            architectureStart, architectureEnd - architectureStart);
+        return true;
+    }
+
+    private static string? FindEmbeddedCubinResource(
+        IReadOnlyList<string> orderedResourceNames,
+        string architecture,
+        string fileName)
+    {
+        string architectureMarker = ".Artifacts." + architecture + ".";
+        string suffix = "." + fileName;
+        foreach (string candidate in orderedResourceNames)
+        {
+            if (candidate.IndexOf(architectureMarker, StringComparison.Ordinal) >= 0 &&
+                candidate.EndsWith(suffix, StringComparison.Ordinal))
+                return candidate;
+        }
+        return null;
+    }
+
+    private static void AddEmbeddedArtifact(
+        IDictionary<string, EmbeddedArtifact> artifacts,
+        string identity,
+        EmbeddedArtifact artifact)
+    {
+        if (artifacts.TryGetValue(identity, out EmbeddedArtifact? existing))
+        {
+            if (!string.Equals(existing.CubinSha256, artifact.CubinSha256,
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException(
+                    "Embedded direct-PTX manifests disagree for identity " + identity + ".");
+            return;
+        }
+        artifacts.Add(identity, artifact);
+    }
+
+    private sealed record EmbeddedArtifact(string CubinSha256, string ResourceName);
 
     private static DirectPtxCubinArtifact? TryReadDisk(string? path, string sourceKey)
     {

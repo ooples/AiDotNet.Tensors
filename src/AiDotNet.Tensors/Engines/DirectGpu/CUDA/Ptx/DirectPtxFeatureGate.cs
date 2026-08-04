@@ -132,7 +132,9 @@ internal enum DirectPtxPhysicalLayout
     /// <summary>Block table plus packed pages for decode attention.</summary>
     PagedKv,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
-    Oihw
+    Oihw,
+    /// <summary>Dense input/output/spatial transposed-convolution weights [input, output, height, width].</summary>
+    Iohw
 }
 
 /// <summary>

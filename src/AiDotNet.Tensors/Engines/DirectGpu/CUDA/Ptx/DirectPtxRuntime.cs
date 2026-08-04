@@ -25,6 +25,8 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal int ComputeCapabilityMajor { get; }
     internal int ComputeCapabilityMinor { get; }
     internal int MaxThreadsPerMultiprocessor { get; }
+    internal int MaxRegistersPerMultiprocessor { get; }
+    internal int MaxRegistersPerBlock { get; }
     internal DirectPtxArchitectureFamily ArchitectureFamily { get; }
     internal string DeviceUuid { get; }
     internal int DriverVersion { get; }
@@ -50,6 +52,10 @@ internal sealed class DirectPtxRuntime : IDisposable
             out int maxThreadsPerMultiprocessor,
             (int)CudaDeviceAttribute.MaxThreadsPerMultiprocessor, device),
             "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
+        int maxRegistersPerMultiprocessor = QueryRegisterCapacity(
+            device, CudaDeviceAttribute.MaxRegistersPerMultiprocessor);
+        int maxRegistersPerBlock = QueryRegisterCapacity(
+            device, CudaDeviceAttribute.MaxRegistersPerBlock);
 
         Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
         Check(CudaNativeBindings.cuStreamCreate(out _stream, 1), "cuStreamCreate(non-blocking)");
@@ -70,6 +76,8 @@ internal sealed class DirectPtxRuntime : IDisposable
         ComputeCapabilityMajor = major;
         ComputeCapabilityMinor = minor;
         MaxThreadsPerMultiprocessor = maxThreadsPerMultiprocessor;
+        MaxRegistersPerMultiprocessor = maxRegistersPerMultiprocessor;
+        MaxRegistersPerBlock = maxRegistersPerBlock;
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
@@ -105,16 +113,35 @@ internal sealed class DirectPtxRuntime : IDisposable
             out int maxThreadsPerMultiprocessor,
             (int)CudaDeviceAttribute.MaxThreadsPerMultiprocessor, device),
             "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
+        int maxRegistersPerMultiprocessor = QueryRegisterCapacity(
+            device, CudaDeviceAttribute.MaxRegistersPerMultiprocessor);
+        int maxRegistersPerBlock = QueryRegisterCapacity(
+            device, CudaDeviceAttribute.MaxRegistersPerBlock);
 
         DeviceOrdinal = device;
         DeviceName = name.ToString();
         ComputeCapabilityMajor = major;
         ComputeCapabilityMinor = minor;
         MaxThreadsPerMultiprocessor = maxThreadsPerMultiprocessor;
+        MaxRegistersPerMultiprocessor = maxRegistersPerMultiprocessor;
+        MaxRegistersPerBlock = maxRegistersPerBlock;
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
         DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+    }
+
+    // Device register-file capacity drives the per-thread register ceiling in
+    // DirectPtxResourceBudget.Validate so it scales with the hardware instead of
+    // a hardcoded literal. Treated as advisory: a driver that cannot report the
+    // attribute yields 0, and the validator then falls back to the kernel's
+    // explicit design cap plus the driver's own occupancy calculator.
+    private static int QueryRegisterCapacity(int device, CudaDeviceAttribute attribute)
+    {
+        if (CuBlasNative.cuDeviceGetAttribute(out int value, (int)attribute, device)
+                != CudaResult.Success)
+            return 0;
+        return value > 0 ? value : 0;
     }
 
     private static unsafe string QueryDeviceUuid(int device)
@@ -476,9 +503,19 @@ internal sealed class DirectPtxBuffer : IDisposable
         if (bytes > ByteLength) throw new ArgumentException("Source is larger than the device buffer.", nameof(source));
         using var _ = _runtime.Enter();
         fixed (T* pSource = source)
+        {
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyHtoD(_pointer, (IntPtr)pSource, checked((ulong)bytes)),
                 "cuMemcpyHtoD");
+            // Standalone runtimes launch on a CU_STREAM_NON_BLOCKING stream.
+            // A synchronous pageable-host copy is issued in the null-stream
+            // ordering domain and therefore does not establish an edge to that
+            // stream. Complete the transfer before the caller can enqueue a
+            // kernel, or concurrent contexts can observe an incompletely staged
+            // input and leave apparently random output blocks at zero.
+            DirectPtxRuntime.Check(
+                CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+        }
     }
 
     internal unsafe void Download<T>(Span<T> destination) where T : unmanaged
@@ -486,6 +523,11 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)destination.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Destination is larger than the device buffer.", nameof(destination));
         using var _ = _runtime.Enter();
+        // The null-stream DtoH copy does not wait for work in the runtime's
+        // non-blocking stream. Make Download independently correct even when a
+        // caller omits an explicit Synchronize before reading the result.
+        DirectPtxRuntime.Check(
+            CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(download)");
         fixed (T* pDestination = destination)
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyDtoH((IntPtr)pDestination, _pointer, checked((ulong)bytes)),
@@ -547,7 +589,11 @@ internal sealed class DirectPtxModule : IDisposable
         DirectPtxRuntime.Check(
             CudaNativeBindings.cuModuleGetFunction(out IntPtr function, _module, name),
             $"cuModuleGetFunction({name})");
-        info = DirectPtxFunctionInfo.Query(function);
+        info = DirectPtxFunctionInfo.Query(function) with
+        {
+            MaxRegistersPerMultiprocessor = _runtime.MaxRegistersPerMultiprocessor,
+            MaxRegistersPerBlock = _runtime.MaxRegistersPerBlock
+        };
         if (info.LocalBytesPerThread != 0)
             throw new InvalidOperationException(
                 $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
@@ -629,7 +675,13 @@ internal readonly record struct DirectPtxFunctionInfo(
     int LocalBytesPerThread,
     int RegistersPerThread,
     int PtxVersion,
-    int BinaryVersion)
+    int BinaryVersion,
+    // Device register-file capacity carried alongside the per-function JIT
+    // attributes so the resource budget can derive an occupancy-scaled register
+    // ceiling for this exact GPU. Populated by DirectPtxModule.GetFunction from
+    // the runtime; 0 when the driver cannot report it.
+    int MaxRegistersPerMultiprocessor = 0,
+    int MaxRegistersPerBlock = 0)
 {
     internal static DirectPtxFunctionInfo Query(IntPtr function)
     {
