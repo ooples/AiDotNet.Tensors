@@ -273,6 +273,8 @@ public sealed class CommunityAutotuneTests : IDisposable
         // Local candidates preserved and first (candidates[0] stays the local default).
         Assert.Equal("tile-16", merged[0].Variant);
         Assert.Equal(local.Count + 2, merged.Count);           // exactly 2 community adds
+        Assert.Equal("tile-11", merged[local.Count].Variant);
+        Assert.Equal("tile-7", merged[local.Count + 1].Variant);
         var variants = merged.Select(c => c.Variant).ToList();
         Assert.Contains("tile-11", variants);                  // best-reported new one included
         Assert.Contains("tile-7", variants);
