@@ -65,7 +65,7 @@ public static class CommunityAutotune
         IReadOnlyList<AutotuneCandidate> candidates = localCandidates;
         KernelChoice? cached = useCommunity ? AutotuneCache.Lookup(kernelId, shape) : null;
         if (useCommunity &&
-            (cached is null || !ContainsVariant(localCandidates, cached.Variant)))
+            (cached is null || !ContainsChoice(localCandidates, cached)))
         {
             // Fetch on a genuine cache miss, and also to rehydrate a cached
             // community-only variant that is absent from the local candidate set.
@@ -96,12 +96,11 @@ public static class CommunityAutotune
         return resolution;
     }
 
-    private static bool ContainsVariant(
-        IReadOnlyList<AutotuneCandidate> candidates, string variant)
+    private static bool ContainsChoice(
+        IReadOnlyList<AutotuneCandidate> candidates, KernelChoice cached)
     {
-        if (string.IsNullOrEmpty(variant)) return false;
         for (int i = 0; i < candidates.Count; i++)
-            if (string.Equals(candidates[i].Variant, variant, StringComparison.Ordinal))
+            if (GpuFirstRunAutotuner.MatchesCachedChoice(candidates[i], cached))
                 return true;
         return false;
     }

@@ -159,7 +159,8 @@ public static class GpuFirstRunAutotuner
         // 2. Cache hit — but only honor a variant that is still on offer, so a
         //    renamed/removed candidate re-tunes instead of launching a stale id.
         KernelChoice? cached = AutotuneCache.Lookup(kernelId, shape);
-        if (cached is { } hit && TryFindByVariant(candidates, hit.Variant, out AutotuneCandidate cachedCandidate))
+        if (cached is { } hit &&
+            TryFindCachedChoice(candidates, hit, out AutotuneCandidate cachedCandidate))
             return new AutotuneResolution(
                 cachedCandidate.Variant, cachedCandidate.Parameters,
                 hit.MeasuredGflops, fromCache: true, measured: false);
@@ -225,22 +226,36 @@ public static class GpuFirstRunAutotuner
             best.Variant, best.Parameters, bestGflops, fromCache: false, measured: true);
     }
 
-    private static bool TryFindByVariant(
-        IReadOnlyList<AutotuneCandidate> candidates, string variant, out AutotuneCandidate match)
+    private static bool TryFindCachedChoice(
+        IReadOnlyList<AutotuneCandidate> candidates,
+        KernelChoice cached,
+        out AutotuneCandidate match)
     {
-        if (!string.IsNullOrEmpty(variant))
+        for (int i = 0; i < candidates.Count; i++)
         {
-            for (int i = 0; i < candidates.Count; i++)
+            if (MatchesCachedChoice(candidates[i], cached))
             {
-                if (string.Equals(candidates[i].Variant, variant, StringComparison.Ordinal))
-                {
-                    match = candidates[i];
-                    return true;
-                }
+                match = candidates[i];
+                return true;
             }
         }
         match = default;
         return false;
+    }
+
+    internal static bool MatchesCachedChoice(
+        AutotuneCandidate candidate, KernelChoice cached)
+    {
+        if (!string.Equals(candidate.Variant, cached.Variant, StringComparison.Ordinal) ||
+            cached.Parameters is null ||
+            candidate.Parameters.Count != cached.Parameters.Count)
+            return false;
+
+        foreach (KeyValuePair<string, string> parameter in candidate.Parameters)
+            if (!cached.Parameters.TryGetValue(parameter.Key, out string? cachedValue) ||
+                !string.Equals(parameter.Value, cachedValue, StringComparison.Ordinal))
+                return false;
+        return true;
     }
 
     private static Dictionary<string, string> ToStringDictionary(

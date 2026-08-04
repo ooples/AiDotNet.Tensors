@@ -252,6 +252,38 @@ public sealed class GpuFirstRunAutotunerTests : IDisposable
     }
 
     [Fact]
+    public void Resolve_CachedVariantWithStaleParameters_Retunes()
+    {
+        KernelId id = GpuFirstRunAutotuner.GpuKernelId(
+            "conv2d", "stale-parameters", "gpu-stale-parameters-sm86");
+        var shape = new ShapeProfile(32, 64, 64, 3136);
+        AutotuneCache.Store(id, shape, new KernelChoice
+        {
+            Variant = "tile-16",
+            Parameters = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["Tile"] = "999"
+            },
+            MeasuredGflops = 1234.0
+        });
+
+        int benchmarkCalls = 0;
+        AutotuneResolution resolution = GpuFirstRunAutotuner.Resolve(
+            id, shape, Tiles(16, 32),
+            candidate =>
+            {
+                benchmarkCalls++;
+                return candidate.Variant == "tile-16" ? 800.0 : 400.0;
+            },
+            autotuneEnabled: true);
+
+        Assert.Equal(2, benchmarkCalls);
+        Assert.False(resolution.FromCache);
+        Assert.True(resolution.Measured);
+        Assert.Equal("16", resolution.Parameters["Tile"]);
+    }
+
+    [Fact]
     public void Resolve_SingleCandidate_UsesItWithoutMeasuring()
     {
         KernelId id = GpuFirstRunAutotuner.GpuKernelId("conv2d", "single", "gpu-single-sm86");

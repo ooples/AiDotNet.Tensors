@@ -15,6 +15,7 @@ internal sealed class InMemoryGpuTuningExchange : IGpuTuningExchange
 {
     private readonly List<GpuTuningProfile> _rows = new();
     public bool IsEnabled { get; set; } = true;
+    public bool ReturnEmptyFetch { get; set; }
     public int FetchCount { get; private set; }
     public List<GpuTuningProfile> Published { get; } = new();
 
@@ -24,6 +25,7 @@ internal sealed class InMemoryGpuTuningExchange : IGpuTuningExchange
         string modelKey, string category, string kernelName, string shapeKey)
     {
         FetchCount++;
+        if (ReturnEmptyFetch) return Array.Empty<GpuTuningProfile>();
         return _rows.Where(r =>
                 r.ModelKey == modelKey && r.Category == category &&
                 r.KernelName == kernelName && r.ShapeKey == shapeKey)
@@ -347,6 +349,38 @@ public sealed class CommunityAutotuneTests : IDisposable
         Assert.Equal("tile-11", second.Variant);
         Assert.Equal(fetchesAfterFirst + 1, exchange.FetchCount);
         Assert.Equal(publishedAfterFirst, exchange.Published.Count);
+    }
+
+    [Fact]
+    public void CachedCommunityOnlyWinner_EmptyFetchFallsBackToLocalSweep()
+    {
+        var exchange = new InMemoryGpuTuningExchange();
+        exchange.Seed(Community("tile-11", 11, 1500.0));
+        AutotuneResolution first = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(), Local(),
+            candidate => candidate.Variant == "tile-11" ? 1400.0 : 500.0,
+            isCommunityCandidateAllowed: AllowAnyCandidate,
+            autotuneEnabled: true);
+        Assert.Equal("tile-11", first.Variant);
+
+        int fetchesAfterFirst = exchange.FetchCount;
+        exchange.ReturnEmptyFetch = true;
+        bool localWasBenchmarked = false;
+        AutotuneResolution second = CommunityAutotune.Resolve(
+            exchange, Category, Kernel, Card, Shape(), Local(),
+            candidate =>
+            {
+                localWasBenchmarked = true;
+                return candidate.Variant == "tile-16" ? 800.0 : 400.0;
+            },
+            isCommunityCandidateAllowed: AllowAnyCandidate,
+            autotuneEnabled: true);
+
+        Assert.Equal(fetchesAfterFirst + 1, exchange.FetchCount);
+        Assert.True(localWasBenchmarked);
+        Assert.False(second.FromCache);
+        Assert.True(second.Measured);
+        Assert.Equal("tile-16", second.Variant);
     }
 
     [Fact]
