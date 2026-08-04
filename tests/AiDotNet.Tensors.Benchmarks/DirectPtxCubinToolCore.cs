@@ -166,13 +166,22 @@ internal static class DirectPtxCubinToolCore
         Dictionary<string, string> expected = ReadManifest(File.ReadAllLines(manifestPath));
 
         string temporary = Path.Combine(
-            Path.GetTempPath(), "direct-ptx-verify-" + family);
-        if (Directory.Exists(temporary)) Directory.Delete(temporary, recursive: true);
-        int generated = Generate(family, modules, ptxas, temporary);
-        if (generated != 0) return generated;
+            Path.GetTempPath(),
+            "direct-ptx-verify-" + family + "-" + Guid.NewGuid().ToString("N"));
+        Dictionary<string, string> actual;
+        try
+        {
+            int generated = Generate(family, modules, ptxas, temporary);
+            if (generated != 0) return generated;
 
-        Dictionary<string, string> actual = ReadManifest(
-            File.ReadAllLines(Path.Combine(temporary, ManifestName(family))));
+            actual = ReadManifest(
+                File.ReadAllLines(Path.Combine(temporary, ManifestName(family))));
+        }
+        finally
+        {
+            if (Directory.Exists(temporary))
+                Directory.Delete(temporary, recursive: true);
+        }
 
         int mismatches = 0;
         foreach (KeyValuePair<string, string> pair in actual)
