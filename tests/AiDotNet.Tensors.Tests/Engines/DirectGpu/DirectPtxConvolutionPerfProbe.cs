@@ -152,7 +152,8 @@ public sealed class DirectPtxConvolutionPerfProbe
         output.Download<float>(actual);
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(float.IsFinite(actual[i]) && Math.Abs(expected[i] - actual[i]) <= 2e-4f,
+            Assert.True(!float.IsNaN(actual[i]) && !float.IsInfinity(actual[i]) &&
+                Math.Abs(expected[i] - actual[i]) <= 2e-4f,
                 $"{candidate} mismatch at {i}: expected {expected[i]}, actual {actual[i]}");
     }
 
