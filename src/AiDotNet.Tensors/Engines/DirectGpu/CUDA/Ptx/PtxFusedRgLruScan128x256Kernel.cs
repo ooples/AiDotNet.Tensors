@@ -50,7 +50,7 @@ internal sealed class PtxFusedRgLruScan128x256Kernel : IDisposable
             Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
             Audit = DirectPtxKernelAudit.Create(
                 Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-                BlockThreads, activeBlocks, module.JitInfoLog);
+                BlockThreads, activeBlocks, module);
         }
         catch
         {

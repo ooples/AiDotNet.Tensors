@@ -338,7 +338,8 @@ internal static class StreamingStrategy
     }
 
     /// <summary>
-    /// Serial microkernel dispatch: AVX-512 → AVX2 → Neon → scalar.
+    /// Serial microkernel dispatch: AVX-512 → AVX2 → Neon → BCL <see cref="System.Numerics.Vector{T}"/>
+    /// (FP64) → scalar.
     /// </summary>
     private static void RunSerial<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
@@ -369,6 +370,19 @@ internal static class StreamingStrategy
             if (NeonStreaming.IsSupported)
             {
                 NeonStreaming.RunFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, transA,
+                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, double>(c), ldc,
+                    m, n, k);
+                return;
+            }
+            // BCL Vector<T> tier. Reached on TFMs without System.Runtime.Intrinsics (net471,
+            // where the AVX/Neon IsSupported above are compile-time false) and on any host whose
+            // intrinsic sets are unavailable. Bit-identical to ScalarStreaming.RunFp64, and it
+            // internally defers to it for transB / sub-lane n.
+            if (PortableSimdStreaming.IsSupported)
+            {
+                PortableSimdStreaming.RunFp64(
                     MemoryMarshal.Cast<T, double>(a), lda, transA,
                     MemoryMarshal.Cast<T, double>(b), ldb, transB,
                     MemoryMarshal.Cast<T, double>(c), ldc,

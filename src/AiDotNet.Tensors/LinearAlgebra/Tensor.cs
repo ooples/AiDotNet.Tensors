@@ -79,6 +79,38 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
     }
 
+    private Tensor(int[] dimensions, Action<TensorBase<T>>? initializer, bool deferred)
+        : base(dimensions, initializer, deferred)
+    {
+    }
+
+    /// <summary>
+    /// Creates a tensor that knows its shape but has not allocated storage. The buffer is created,
+    /// and <paramref name="initializer"/> applied, the first time the tensor's values are touched.
+    /// </summary>
+    /// <param name="dimensions">Logical shape. <c>Length</c>, <c>Rank</c> and <c>Shape</c> are exact immediately.</param>
+    /// <param name="initializer">
+    /// Fill applied once, when storage is first created — a weight's He/Xavier fill, for example.
+    /// Null leaves the buffer zeroed. Deferring the fill as well as the allocation is the point:
+    /// running it eagerly would touch the buffer and allocate anyway.
+    /// </param>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> this is a tensor that costs nothing until you use it. You can
+    /// ask how big it is, what shape it is, and how many values it holds, and none of that
+    /// allocates any memory. The memory appears the moment you read or write an actual value.</para>
+    /// <para>
+    /// Useful when you need a model's size before you need its weights: counting parameters,
+    /// sizing a checkpoint, or planning a memory budget. Because the count comes from the same
+    /// construction that later allocates, it cannot disagree with what you eventually get.
+    /// </para>
+    /// </remarks>
+    public static Tensor<T> CreateDeferred(int[] dimensions, Action<Tensor<T>>? initializer = null)
+    {
+        Action<TensorBase<T>>? adapted =
+            initializer is null ? null : t => initializer((Tensor<T>)t);
+        return new Tensor<T>(dimensions, adapted, deferred: true);
+    }
+
     /// <summary>
     /// Creates a new tensor with the specified dimensions and pre-populated data.
     /// </summary>
@@ -474,6 +506,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void CopyTo(Span<T> destination)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         if (destination.Length < Length)
         {
             throw new ArgumentException(
@@ -775,6 +808,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 "Call .Contiguous() first to materialize a copy if needed.");
         // The fast path returns the LIVE backing vector (aliases storage); privatize first so a
         // caller mutating the returned vector can't corrupt a COW peer. No-op for normal tensors.
+        EnsureMaterialized();
         EnsureOwnedForWrite();
         if (_data.Length == _shape[0])
             return _data;
@@ -1301,6 +1335,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Support both 2D and 3D tensors
         // For 2D: [batch, features] + [features] -> broadcasts vector across batch
         // For 3D: [batch, seq, features] + [features] -> broadcasts vector across batch and seq
+        EnsureMaterialized();
         if (this.Rank == 2)
         {
             if (this._shape[1] != vector.Length)
@@ -1372,6 +1407,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int index, Tensor<T> slice)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
+        slice.EnsureMaterialized();
         if (index < 0 || index >= Shape[0])
         {
             throw new ArgumentOutOfRangeException(nameof(index));
@@ -1408,6 +1445,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for dot product.");
 
+        EnsureMaterialized();
+        other.EnsureMaterialized();
         // Use vectorized Dot product for SIMD acceleration (10-15x faster with AVX2)
         return _numOps.Dot(_data.AsSpan(), other._data.AsSpan());
     }
@@ -1424,6 +1463,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void Fill(T value)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         EnsureOwnedForWrite();
         _numOps.Fill(_data.AsWritableSpan(), value);
         IncrementVersion();
@@ -1710,6 +1750,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
+        EnsureMaterialized();
+        other.EnsureMaterialized();
         _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
     }
 
@@ -1731,6 +1773,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Sum(int[]? axes = null)
     {
+        EnsureMaterialized();
         if (axes == null || axes.Length == 0)
         {
             // Sum all elements using vectorized Sum operation for SIMD acceleration (5-15x faster with AVX2)
@@ -1865,6 +1908,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Vector<T> GetSlice(int start, int length)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         if (start < 0 || start >= _data.Length)
             throw new ArgumentOutOfRangeException(nameof(start), "Start index must be within bounds of the tensor data.");
         if (length < 0 || start + length > _data.Length)
@@ -1899,6 +1943,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public (T maxVal, int maxIndex) Max()
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         // Use vectorized Max to find the value quickly (5-15x faster with AVX2)
         T maxVal = _numOps.Max(_data.AsSpan());
 
@@ -2079,6 +2124,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void DivideInPlace(T scalar)
     {
+        EnsureMaterialized();
         _numOps.DivideScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
     }
 
@@ -2895,6 +2941,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T Mean()
     {
+        EnsureMaterialized();
         // Use vectorized Sum for SIMD acceleration (8-12x speedup with AVX2)
         T sum = _numOps.Sum(_data.AsSpan());
 
@@ -3106,6 +3153,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetRow(int rowIndex)
     {
+        EnsureMaterialized();
         if (rowIndex < 0 || rowIndex >= Shape[0])
         {
             throw new ArgumentOutOfRangeException(nameof(rowIndex), "Row index is out of range.");
@@ -3415,6 +3463,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Tensor<T> ElementwiseMultiply(Tensor<T> a, Tensor<T> b)
     {
+        a.EnsureMaterialized();
+        b.EnsureMaterialized();
         // TensorValidator.ValidateShape(a, b._shape);
 
         Tensor<T> result = new Tensor<T>(a._shape);
@@ -3824,6 +3874,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for addition.");
 
+        EnsureMaterialized();
+        other.EnsureMaterialized();
         _numOps.Add(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
     }
 
@@ -4317,6 +4369,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int start, Vector<T> slice)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         for (int i = 0; i < slice.Length; i++)
         {
             _data[start + i] = slice[i];
@@ -4346,6 +4399,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int dimension, int index, Tensor<T> slice)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
+        slice.EnsureMaterialized();
         if (dimension < 0 || dimension >= Rank)
             throw new ArgumentOutOfRangeException(nameof(dimension), "Dimension is out of range.");
 
@@ -4483,6 +4538,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <summary>Legacy SumOverAxis implementation for internal use.</summary>
     internal Tensor<T> SumOverAxisDirect(int axis)
     {
+        EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
@@ -4516,6 +4572,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> MaxOverAxis(int axis)
     {
+        EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
@@ -4557,6 +4614,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     internal Tensor<T> MeanOverAxisDirect(int axis)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
