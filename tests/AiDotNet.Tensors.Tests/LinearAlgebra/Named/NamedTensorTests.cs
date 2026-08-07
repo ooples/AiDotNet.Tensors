@@ -129,6 +129,54 @@ public class NamedTensorTests
     }
 
     [Fact]
+    public void Add_BroadcastsSingletonAxisFromLeftOperand()
+    {
+        var a = new Tensor<float>(new[] { 1, 3 });
+        a[0, 0] = 1; a[0, 1] = 2; a[0, 2] = 3;
+        var aN = new NamedTensor<float>(a, "batch", "features");
+
+        var b = new Tensor<float>(new[] { 4, 3 });
+        for (int batch = 0; batch < 4; batch++)
+            for (int feature = 0; feature < 3; feature++)
+                b[batch, feature] = batch * 10 + feature;
+        var bN = new NamedTensor<float>(b, "batch", "features");
+
+        var result = NamedOps.Add(aN, bN);
+
+        Assert.Equal(new[] { 4, 3 }, result.Shape);
+        Assert.Equal(new string?[] { "batch", "features" }, result.Names);
+        Assert.Equal(1f, result.Tensor[0, 0]);
+        Assert.Equal(13f, result.Tensor[1, 1]);
+        Assert.Equal(25f, result.Tensor[2, 2]);
+        Assert.Equal(31f, result.Tensor[3, 0]);
+    }
+
+    [Fact]
+    public void AddAndMultiply_PreserveNamesAndValuesForStridedLeftOperand()
+    {
+        var storage = new Tensor<float>(new[] { 2, 3 });
+        storage[0, 0] = 1; storage[0, 1] = 2; storage[0, 2] = 3;
+        storage[1, 0] = 4; storage[1, 1] = 5; storage[1, 2] = 6;
+        Tensor<float> strided = storage.Transpose(new[] { 1, 0 });
+        Assert.False(strided.IsContiguous);
+        var named = new NamedTensor<float>(strided, "features", "batch");
+
+        var perFeature = new Tensor<float>(new[] { 3 });
+        perFeature[0] = 10; perFeature[1] = 20; perFeature[2] = 30;
+        var namedPerFeature = new NamedTensor<float>(perFeature, "features");
+
+        NamedTensor<float> added = NamedOps.Add(named, namedPerFeature);
+        NamedTensor<float> multiplied = NamedOps.Multiply(named, namedPerFeature);
+
+        Assert.Equal(new string?[] { "features", "batch" }, added.Names);
+        Assert.Equal(new string?[] { "features", "batch" }, multiplied.Names);
+        Assert.Equal(new[] { 3, 2 }, added.Shape);
+        Assert.Equal(new[] { 3, 2 }, multiplied.Shape);
+        Assert.Equal(new float[] { 11, 14, 22, 25, 33, 36 }, added.Tensor.AsSpan().ToArray());
+        Assert.Equal(new float[] { 10, 40, 40, 100, 90, 180 }, multiplied.Tensor.AsSpan().ToArray());
+    }
+
+    [Fact]
     public void Sum_ReducesByName()
     {
         var t = new Tensor<float>(new[] { 2, 3 });

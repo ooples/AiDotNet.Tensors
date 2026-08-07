@@ -86,10 +86,9 @@ internal static class StableTimer
     /// negligible -- a 1.05x result should still not be called a win.
     /// </remarks>
     internal const double StableSpread = 0.05;
+
     private const double TargetDeviceBatchMicroseconds = 250_000.0;
     private const int MaxDeviceIterations = 50_000;
-    private const double TargetHostBatchMicroseconds = 250_000.0;
-    private const int MaxHostIterations = 50_000;
 
     /// <summary>
     /// Times <paramref name="launch"/>, repeating until the spread converges or attempts run out.
@@ -197,6 +196,45 @@ internal static class StableTimer
     }
 
     /// <summary>
+    /// Times a launch that does NOT go through the direct-PTX runtime, using the same
+    /// convergence protocol.
+    /// </summary>
+    /// <remarks>
+    /// The backend owns its own context and stream, so its kernels cannot be bracketed by
+    /// events recorded on the direct-PTX stream. Host timing over a batch is the honest
+    /// alternative, and the stability gate matters MORE here rather than less: host timing
+    /// includes launch cost, so an unstable result is the expected outcome for a short kernel
+    /// and must be reported as one rather than averaged into a confident number.
+    ///
+    /// Both sides of a head-to-head must use the same method, or the comparison measures the
+    /// methods.
+    /// </remarks>
+    internal static Result MeasureHost(
+        Action launch, Action synchronize, long workUnits, int maxAttempts = 15)
+    {
+        if (launch is null) throw new ArgumentNullException(nameof(launch));
+        if (synchronize is null) throw new ArgumentNullException(nameof(synchronize));
+
+        int iterations = IterationsFor(workUnits);
+
+        Warm(launch, synchronize, iterations);
+
+        var samples = new List<double>(3);
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            AddToConsecutiveWindow(
+                samples, TimeHostBatch(launch, synchronize, iterations));
+
+            if (samples.Count >= 3 && SpreadOf(samples) <= StableSpread) break;
+        }
+
+        double spread = SpreadOf(samples);
+        return new Result(
+            Median(samples), spread, samples.Count,
+            samples.Count >= 3 && spread <= StableSpread);
+    }
+
+    /// <summary>
     /// Device-times two launches as adjacent A/B batches when both use the caller's stream.
     /// </summary>
     /// <remarks>
@@ -297,46 +335,6 @@ internal static class StableTimer
     }
 
     /// <summary>
-    /// Times a launch that does NOT go through the direct-PTX runtime, using the same
-    /// convergence protocol.
-    /// </summary>
-    /// <remarks>
-    /// The backend owns its own context and stream, so its kernels cannot be bracketed by
-    /// events recorded on the direct-PTX stream. Host timing over a batch is the honest
-    /// alternative, and the stability gate matters MORE here rather than less: host timing
-    /// includes launch cost, so an unstable result is the expected outcome for a short kernel
-    /// and must be reported as one rather than averaged into a confident number.
-    ///
-    /// Both sides of a head-to-head must use the same method, or the comparison measures the
-    /// methods.
-    /// </remarks>
-    internal static Result MeasureHost(
-        Action launch, Action synchronize, long workUnits, int maxAttempts = 15)
-    {
-        if (launch is null) throw new ArgumentNullException(nameof(launch));
-        if (synchronize is null) throw new ArgumentNullException(nameof(synchronize));
-
-        int iterations = IterationsFor(workUnits);
-
-        Warm(launch, synchronize, iterations);
-        iterations = CalibrateHostIterations(launch, synchronize, iterations);
-
-        var samples = new List<double>(3);
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
-        {
-            AddToConsecutiveWindow(
-                samples, TimeHostBatch(launch, synchronize, iterations));
-
-            if (samples.Count >= 3 && SpreadOf(samples) <= StableSpread) break;
-        }
-
-        double spread = SpreadOf(samples);
-        return new Result(
-            Median(samples), spread, samples.Count,
-            samples.Count >= 3 && spread <= StableSpread);
-    }
-
-    /// <summary>
     /// Host-times two operations as adjacent A/B batches and summarizes the ratios formed
     /// inside each sample.
     /// </summary>
@@ -363,8 +361,6 @@ internal static class StableTimer
 
         Warm(launchA, synchronizeA, iterationsA);
         Warm(launchB, synchronizeB, iterationsB);
-        iterationsA = CalibrateHostIterations(launchA, synchronizeA, iterationsA);
-        iterationsB = CalibrateHostIterations(launchB, synchronizeB, iterationsB);
 
         // Host-timed comparisons have the same exposure problem as CUDA-event pairs. Keep
         // the timing methods identical within a comparison, discard one calibration batch
@@ -437,26 +433,6 @@ internal static class StableTimer
         synchronize();
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds * 1000.0 / iterations;
-    }
-
-    /// <summary>
-    /// Corrects the work-unit estimate for kernels whose nominal arithmetic count is a poor
-    /// predictor of wall time (especially cached or memory-bound kernels under WDDM).
-    /// </summary>
-    /// <remarks>
-    /// The stability threshold is intentionally not relaxed. Instead, a throwaway calibrated
-    /// batch makes subsequent host-timed samples long enough that an ordinary scheduling event
-    /// cannot dominate the evidence. Calibration can only increase the caller's conservative
-    /// starting count and is capped to keep tiny kernels bounded.
-    /// </remarks>
-    private static int CalibrateHostIterations(
-        Action launch, Action synchronize, int startingIterations)
-    {
-        double microsecondsPerLaunch = TimeHostBatch(launch, synchronize, startingIterations);
-        if (!double.IsFinite(microsecondsPerLaunch) || microsecondsPerLaunch <= 0)
-            return startingIterations;
-        double desired = Math.Ceiling(TargetHostBatchMicroseconds / microsecondsPerLaunch);
-        return (int)Math.Clamp(desired, startingIterations, MaxHostIterations);
     }
 
     /// <summary>
