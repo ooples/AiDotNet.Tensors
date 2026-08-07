@@ -45,6 +45,14 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The checked-in softmax-family specializations (issue #840) are measured and
+    /// promoted only on GA10x/SM86. Other architectures fail closed to the established
+    /// backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedSoftmax(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The fused-linear + GELU decode specializations are measured and promoted
     /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
     /// tuning domains and must supply and benchmark their own specialization

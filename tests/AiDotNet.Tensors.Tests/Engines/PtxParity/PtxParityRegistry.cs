@@ -47,6 +47,57 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxSoftmaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.Softmax / SoftmaxRows",
+            "Backend_Softmax_ThreeWayParityAndAudit runs the incumbent CUDA route and direct PTX on " +
+            "identical inputs, proves the selected path with the dispatch counter, and checks both against " +
+            "the same double-precision softmax oracle."),
+        new PtxParitySpec("PtxLogSoftmaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.LogSoftmax",
+            "Backend_SoftmaxVariants_ThreeWayParity compares incumbent CUDA and direct PTX independently " +
+            "against the same double-precision log-sum-exp interpretation."),
+        new PtxParitySpec("PtxTaylorSoftmaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.TaylorSoftmax",
+            "Backend_SoftmaxVariants_ThreeWayParity compares both GPU routes against the identical " +
+            "1+x+x^2/2 double-precision normalization oracle."),
+        new PtxParitySpec("PtxSparsemaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.Sparsemax",
+            "Backend_SoftmaxVariants_ThreeWayParity compares both GPU routes against the sorted closed-form " +
+            "simplex projection and verifies non-negativity, exact zeros, and row sums."),
+        new PtxParitySpec("PtxSoftmaxBackwardKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.SoftmaxBackward",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity checks incumbent CUDA and direct PTX " +
+            "against the same double-precision Jacobian-vector product."),
+        new PtxParitySpec("PtxLogSumExpKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.LogSumExpAxis",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity checks both GPU routes against a " +
+            "stable double-precision log-sum-exp oracle."),
+        new PtxParitySpec("PtxLogSumExpBackwardKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.LogSumExpBackward",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity supplies the same CPU-derived log " +
+            "partition to both routes, compares both against the derivative oracle, and separately verifies " +
+            "that direct PTX consumes a deliberately changed supplied partition."),
+        new PtxParitySpec("PtxMaskedFillKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.MaskedFillKernel",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity compares incumbent CUDA and direct PTX " +
+            "bit-for-bit against the elementwise mask/select contract."),
+        new PtxParitySpec("PtxMaskedFillBackwardKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.MaskedFillBackward",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity compares incumbent CUDA and direct PTX " +
+            "bit-for-bit against the masked-gradient contract."),
+        new PtxParitySpec("PtxMaskedSoftmaxKernel", PtxParityStatus.Deferred,
+            "driver-only fused masked-fill + softmax candidate",
+            "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX result against the stable " +
+            "double-precision composed oracle. The candidate has no CudaBackend/public dispatch route, so it " +
+            "cannot yet run the required incumbent-vs-direct-PTX-vs-CPU parity test and remains unpromoted. " +
+            "Wire a backend route and its incumbent composed path before converting this entry to ThreeWayParity."),
+        new PtxParitySpec("PtxMaskedSoftmaxBackwardKernel", PtxParityStatus.Deferred,
+            "driver-only fused masked-softmax backward candidate",
+            "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX gradient against the same " +
+            "double-precision Jacobian-vector-product oracle with the gradient mask applied. The candidate has " +
+            "no CudaBackend/public dispatch route, so it cannot yet run the required three-way parity test and " +
+            "remains unpromoted. Wire that route and incumbent composition before promoting it."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +
