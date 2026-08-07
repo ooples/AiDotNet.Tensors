@@ -69,39 +69,61 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, scale);
-        _module = runtime.LoadModule(Ptx);
-        _rowDeltaFunction = _module.GetFunction(
-            RowDeltaEntryPoint, out DirectPtxFunctionInfo rowDeltaInfo);
-        _gradQueryFunction = _module.GetFunction(
-            GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
-        _gradKeyValueFunction = _module.GetFunction(
-            GradKeyValueEntryPoint, out DirectPtxFunctionInfo gradKeyValueInfo);
-        GradQueryFunctionInfo = gradQueryInfo;
-        GradKeyValueFunctionInfo = gradKeyValueInfo;
-        RowDeltaFunctionInfo = rowDeltaInfo;
-
-        int blockThreads = WarpsPerBlock * 32;
-        int gradQueryBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _gradQueryFunction, blockThreads);
-        int rowDeltaBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _rowDeltaFunction, blockThreads);
-        int gradKeyValueBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _gradKeyValueFunction, blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            RowDeltaEntryPoint, rowDeltaInfo, blockThreads, rowDeltaBlocks);
-        Blueprint.ResourceBudget.Validate(
-            GradQueryEntryPoint, gradQueryInfo, blockThreads, gradQueryBlocks);
-        Blueprint.ResourceBudget.Validate(
-            GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
-        GradQueryAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
-            blockThreads, gradQueryBlocks, _module.JitInfoLog);
-        GradKeyValueAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
-            blockThreads, gradKeyValueBlocks, _module.JitInfoLog);
-        RowDeltaAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, rowDeltaInfo,
-            blockThreads, rowDeltaBlocks, _module.JitInfoLog);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr rowDeltaFunction = module.GetFunction(
+                    RowDeltaEntryPoint, out DirectPtxFunctionInfo rowDeltaInfo);
+                IntPtr gradQueryFunction = module.GetFunction(
+                    GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
+                IntPtr gradKeyValueFunction = module.GetFunction(
+                    GradKeyValueEntryPoint, out DirectPtxFunctionInfo gradKeyValueInfo);
+                int blockThreads = WarpsPerBlock * 32;
+                int gradQueryBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    gradQueryFunction, blockThreads);
+                int rowDeltaBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    rowDeltaFunction, blockThreads);
+                int gradKeyValueBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    gradKeyValueFunction, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    RowDeltaEntryPoint, rowDeltaInfo, blockThreads, rowDeltaBlocks);
+                Blueprint.ResourceBudget.Validate(
+                    GradQueryEntryPoint, gradQueryInfo, blockThreads, gradQueryBlocks);
+                Blueprint.ResourceBudget.Validate(
+                    GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
+                var gradQueryAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
+                    blockThreads, gradQueryBlocks, module);
+                var gradKeyValueAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
+                    blockThreads, gradKeyValueBlocks, module);
+                var rowDeltaAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, rowDeltaInfo,
+                    blockThreads, rowDeltaBlocks, module);
+                return new
+                {
+                    RowDeltaFunction = rowDeltaFunction,
+                    GradQueryFunction = gradQueryFunction,
+                    GradKeyValueFunction = gradKeyValueFunction,
+                    RowDeltaInfo = rowDeltaInfo,
+                    GradQueryInfo = gradQueryInfo,
+                    GradKeyValueInfo = gradKeyValueInfo,
+                    RowDeltaAudit = rowDeltaAudit,
+                    GradQueryAudit = gradQueryAudit,
+                    GradKeyValueAudit = gradKeyValueAudit
+                };
+            });
+        _module = loaded.Resource;
+        _rowDeltaFunction = loaded.Value.RowDeltaFunction;
+        _gradQueryFunction = loaded.Value.GradQueryFunction;
+        _gradKeyValueFunction = loaded.Value.GradKeyValueFunction;
+        RowDeltaFunctionInfo = loaded.Value.RowDeltaInfo;
+        GradQueryFunctionInfo = loaded.Value.GradQueryInfo;
+        GradKeyValueFunctionInfo = loaded.Value.GradKeyValueInfo;
+        RowDeltaAudit = loaded.Value.RowDeltaAudit;
+        GradQueryAudit = loaded.Value.GradQueryAudit;
+        GradKeyValueAudit = loaded.Value.GradKeyValueAudit;
     }
 
     internal unsafe void Launch(
@@ -114,14 +136,14 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView gradKey,
         DirectPtxTensorView gradValue)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(query, Blueprint.Tensors[1], nameof(query));
-        Require(key, Blueprint.Tensors[2], nameof(key));
-        Require(value, Blueprint.Tensors[3], nameof(value));
-        Require(probabilities, Blueprint.Tensors[4], nameof(probabilities));
-        Require(gradQuery, Blueprint.Tensors[5], nameof(gradQuery));
-        Require(gradKey, Blueprint.Tensors[6], nameof(gradKey));
-        Require(gradValue, Blueprint.Tensors[7], nameof(gradValue));
+        DirectPtxAbi.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[1], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[2], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[3], nameof(value));
+        DirectPtxAbi.Require(probabilities, Blueprint.Tensors[4], nameof(probabilities));
+        DirectPtxAbi.Require(gradQuery, Blueprint.Tensors[5], nameof(gradQuery));
+        DirectPtxAbi.Require(gradKey, Blueprint.Tensors[6], nameof(gradKey));
+        DirectPtxAbi.Require(gradValue, Blueprint.Tensors[7], nameof(gradValue));
         RejectOutputAliasing(
             gradOutput, query, key, value, probabilities, gradQuery, gradKey, gradValue);
 
@@ -168,17 +190,6 @@ internal sealed class PtxFusedAttentionBackwardD64Kernel : IDisposable
 
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     private static void RejectOutputAliasing(
         DirectPtxTensorView gradOutput,

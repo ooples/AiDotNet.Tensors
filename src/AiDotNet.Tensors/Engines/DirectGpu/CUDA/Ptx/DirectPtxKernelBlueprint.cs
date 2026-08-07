@@ -86,6 +86,14 @@ internal static class DirectPtxArchitecture
     /// </summary>
     internal static bool HasExperimentalConvolution(int major, int minor) =>
         (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The checked-in specialized-scientific/hypercomplex/quantum specializations (issue
+    /// #854) are measured and promoted only on GA10x/SM86. Other architectures fail closed
+    /// to the established backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedScientific(int major, int minor) =>
+        (major, minor) == (8, 6);
 }
 
 internal enum DirectPtxExtentMode
@@ -190,7 +198,7 @@ internal readonly record struct DirectPtxTensorContract
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
     internal int ElementBytes => PhysicalType switch
     {
-        DirectPtxPhysicalType.Int8 => 1,
+        DirectPtxPhysicalType.Int8 or DirectPtxPhysicalType.UInt8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
@@ -283,21 +291,6 @@ internal sealed record DirectPtxKernelAudit(
     string CubinSourceKey = "",
     string? CubinPath = null)
 {
-    internal static DirectPtxKernelAudit Create(
-        DirectPtxKernelBlueprint blueprint,
-        string deviceFingerprint,
-        string ptx,
-        DirectPtxFunctionInfo function,
-        int blockThreads,
-        int activeBlocksPerMultiprocessor,
-        string jitInfoLog)
-    {
-        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
-        return new DirectPtxKernelAudit(
-            blueprint.Id, deviceFingerprint, hash, function, blockThreads,
-            activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
-    }
-
     internal static DirectPtxKernelAudit Create(
         DirectPtxKernelBlueprint blueprint,
         string deviceFingerprint,
