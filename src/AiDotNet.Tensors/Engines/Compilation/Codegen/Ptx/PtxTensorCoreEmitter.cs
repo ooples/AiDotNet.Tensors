@@ -262,8 +262,23 @@ public sealed partial class PtxTensorCoreEmitter
         return true;
     }
 
-    /// <summary>Threads a block launches: one warp per output tile, <see cref="WarpsPerBlock"/> per block.</summary>
-    public int BlockThreads => WarpsPerBlock * 32;
+    /// <summary>
+    /// Threads a block launches for the lowering actually emitted: <see cref="WarpsPerBlock"/>
+    /// warps for the naive path, or the fixed <see cref="StagedWarps"/> when the last
+    /// <see cref="Emit"/> produced the staged kernel.
+    /// </summary>
+    /// <remarks>
+    /// MUST track the emitted lowering, exactly as <see cref="BlockCount"/> does. EmitStaged
+    /// always launches <see cref="StagedWarps"/> (4) warps and derives each warp's row/column
+    /// from <c>%r4 &gt;&gt; 1</c> / <c>%r4 &amp; 1</c>, an addressing scheme that is only valid for
+    /// exactly four warps. <see cref="WarpsPerBlock"/> is public and settable and only
+    /// COINCIDENTALLY defaults to 4, so a caller that tunes it while staging is enabled (also the
+    /// default) would otherwise get a thread count that disagrees with the staged geometry.
+    /// Launching that way is not merely wrong-but-safe: warps past index 3 compute
+    /// warpAOffset/warpBOffset beyond the shared slab (e.g. %r5 * 1024 reaching 2048+ into a
+    /// 2048-byte slab), an out-of-bounds shared-memory access on real hardware.
+    /// </remarks>
+    public int BlockThreads => Staged ? StageThreads : WarpsPerBlock * 32;
 
     /// <summary>
     /// Picks the warp tile for a plan: the measured winner for that shape, else the fallback

@@ -2,6 +2,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
@@ -10,6 +11,31 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 public sealed class DirectPtxConvolutionTests
 {
+    [Fact]
+    public void EmbeddedArtifactArchitecture_AnchorsOnTheSmMarker()
+    {
+        Assert.True(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.Artifacts.sm86.convolution.manifest.tsv",
+            out string architecture));
+        Assert.Equal("sm86", architecture);
+        Assert.False(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
+            "AiDotNet.Decoy.Artifacts.metadata.manifest.tsv", out _));
+    }
+
+    [Theory]
+    [InlineData("", "cubin", "kernel.cubin")]
+    [InlineData("ptx", " ", "kernel.cubin")]
+    [InlineData("ptx", "cubin", "\t")]
+    public void EmbeddedManifestRow_RejectsBlankRequiredValues(
+        string ptxHash, string cubinHash, string file)
+    {
+        string[] columns = { ptxHash, cubinHash, file };
+
+        Assert.Throws<InvalidDataException>(() =>
+            DirectPtxCubinArtifactCache.ValidateEmbeddedManifestRow(
+                columns, 0, 1, 2, "manifest.tsv", string.Join("\t", columns)));
+    }
+
     [Fact]
     public void Emitter_IsPointerOnlyShapeSpecializedSm86Ptx()
     {
@@ -177,6 +203,96 @@ public sealed class DirectPtxConvolutionTests
         Assert.Contains(PtxFusedConv2DNchwK1Kernel.EntryPoint, ncu, StringComparison.Ordinal);
         Assert.Contains("smsp__sass_inst_executed_op_local_ld.sum", ncu,
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AutotuneEvidence_FailsClosedOnAnIncompletePromotableSearch()
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-evidence-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune.tsv");
+            const string previousArtifact = "previous-complete-artifact";
+            File.WriteAllText(outputPath, previousArtifact);
+            var evidence = new CodegenAutotuneEvidenceGate();
+
+            evidence.RecordInconclusivePromotableCandidate("tiled-conv2d:8x8");
+            InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
+                evidence.CommitArtifact(outputPath, "incomplete-replacement"));
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "tiled-conv2d:8x8" },
+                evidence.InconclusivePromotableCandidates);
+            Assert.Contains("the selected search is incomplete", error.Message,
+                StringComparison.Ordinal);
+            Assert.Equal(previousArtifact, File.ReadAllText(outputPath));
+            Assert.Single(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void AutotuneProbe_PublishesDiagnosticArtifactWithInconclusiveCandidate()
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune-probe.tsv");
+            var evidence = new CodegenAutotuneEvidenceGate();
+            evidence.RecordInconclusivePromotableCandidate("tiled-conv2d:8x8");
+
+            evidence.CommitArtifact(
+                outputPath, "diagnostic-probe-artifact", requireCompleteSearch: false);
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "tiled-conv2d:8x8" },
+                evidence.InconclusivePromotableCandidates);
+            Assert.Equal("diagnostic-probe-artifact", File.ReadAllText(outputPath));
+            Assert.Single(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void AutotuneEvidence_FailureBlocksEvenADiagnosticProbeArtifact()
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "aidotnet-autotune-failure-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        try
+        {
+            string outputPath = Path.Combine(temporaryDirectory, "autotune-probe.tsv");
+            var evidence = new CodegenAutotuneEvidenceGate();
+            evidence.RecordFailure("conv2d_3x3: module load failed");
+
+            InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
+                evidence.CommitArtifact(
+                    outputPath, "diagnostic-probe-artifact", requireCompleteSearch: false));
+
+            Assert.False(evidence.IsComplete);
+            Assert.Equal(
+                new[] { "conv2d_3x3: module load failed" }, evidence.Failures);
+            Assert.Contains("failed autotuning", error.Message, StringComparison.Ordinal);
+            Assert.Contains("the previous artifact was preserved", error.Message,
+                StringComparison.Ordinal);
+            Assert.Empty(Directory.GetFiles(temporaryDirectory));
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
     }
 
     private static string? Validate(
