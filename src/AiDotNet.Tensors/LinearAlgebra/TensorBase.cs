@@ -1485,6 +1485,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
         _deferredInitializer = initializer;
+        _storageDeferred = true;
+        // Lifetime is a mutable placement hint for the pool; set here for diagnostics
+        // only. It is NOT the materialization discriminator — the immutable
+        // _storageDeferred flag is, so a caller flipping Lifetime to Default/Streaming
+        // cannot strand this tensor on empty, never-materialized storage.
         Lifetime = WeightLifetime.Deferred;
     }
 
@@ -1502,11 +1507,34 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     private volatile bool _deferredReady;
 
     /// <summary>
+    /// Immutable discriminator: true iff this tensor was constructed with deferred storage.
+    /// Set once in the deferred constructor and never cleared, so it cannot be defeated by a
+    /// caller mutating the public <see cref="Lifetime"/> hint. Materialization gates on this,
+    /// not on <c>Lifetime</c>.
+    /// </summary>
+    private readonly bool _storageDeferred;
+
+    /// <summary>
+    /// True only while the outermost deferred initializer is running. The fill writes through
+    /// this tensor's own indexer, which re-enters <see cref="MaterializeDeferredStorage"/> on the
+    /// same (lock-holding) thread; that nested call returns without publishing readiness, so a
+    /// half-filled buffer is never observable as ready. Guarded by <see cref="_deferredLock"/>.
+    /// </summary>
+    private bool _deferredInProgress;
+
+    /// <summary>
+    /// Captured failure from a deferred initializer. Once set, every subsequent value access
+    /// rethrows it rather than rerunning a partial fill or marking the buffer ready.
+    /// Guarded by <see cref="_deferredLock"/>.
+    /// </summary>
+    private Exception? _deferredFailure;
+
+    /// <summary>
     /// True while this tensor knows its shape but owns no storage. Reading <c>Length</c>,
     /// <c>Shape</c> or <c>Rank</c> keeps it that way; touching values does not.
     /// </summary>
     public bool IsStorageDeferred
-        => Lifetime == WeightLifetime.Deferred && !_deferredReady;
+        => _storageDeferred && !_deferredReady;
 
     /// <summary>
     /// Allocates deferred storage and applies the pending initializer, exactly once.
@@ -1518,6 +1546,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             // Re-check inside the lock: another thread may have finished while we waited.
             if (_deferredReady) return;
 
+            // Re-entrant call from inside the initializer (same thread — the lock is reentrant).
+            // Storage is installed below before the fill runs; the outermost call owns publishing
+            // readiness, so return without touching _deferredReady. Without this guard the nested
+            // call would mark the tensor ready while the outer fill is only partway done, letting
+            // another thread read a half-initialized buffer.
+            if (_deferredInProgress) return;
+
+            // A previous initializer attempt threw. Do not rerun a partial fill or silently mark
+            // the buffer ready — surface the original failure on every subsequent access.
+            if (_deferredFailure is not null)
+                throw new InvalidOperationException(
+                    "Deferred tensor storage initialization failed on an earlier access; " +
+                    "the buffer is only partially initialized.", _deferredFailure);
+
             if (_data.Length != Length)
             {
                 var fresh = new Vector<T>(Length);
@@ -1527,15 +1569,34 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 old.Release();
             }
 
-            // Cleared BEFORE running: the initializer fills through this tensor's own indexer, so
-            // it re-enters here on the same thread. The lock is reentrant, storage is already
-            // installed, and the pending fill is null, so the nested call is a no-op.
+            // Cleared BEFORE running so the re-entrant nested call (the initializer writes through
+            // this tensor's indexer) sees no pending fill; _deferredInProgress makes that nested
+            // call a clean no-op that does not publish readiness.
             var init = _deferredInitializer;
             _deferredInitializer = null;
-            init?.Invoke(this);
 
-            // Published last, and only from inside the lock, so no other thread observes the
-            // tensor as ready until the fill has completed.
+            if (init is not null)
+            {
+                _deferredInProgress = true;
+                try
+                {
+                    init.Invoke(this);
+                }
+                catch (Exception ex)
+                {
+                    // Cache and rethrow: the buffer is only partially filled, so it must never
+                    // become observable as ready, and later accesses must see this failure.
+                    _deferredFailure = ex;
+                    throw;
+                }
+                finally
+                {
+                    _deferredInProgress = false;
+                }
+            }
+
+            // Published last, only from inside the lock and only after the outermost initializer
+            // completed successfully, so no other thread observes the tensor as ready early.
             _deferredReady = true;
         }
     }
@@ -1967,10 +2028,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             node.Realize(node.RecordingEngine);
 
         // Deferred storage: shape was known at construction, the buffer was not created. Gated on
-        // the same cheap Lifetime field the streaming branch below uses, so a normal tensor pays
-        // one predictable branch. This runs FIRST because a deferred weight may also be streaming-
-        // tagged, and it has to exist before the pool can page it.
-        if (Lifetime == WeightLifetime.Deferred && !_deferredReady)
+        // the immutable _storageDeferred flag (NOT the mutable Lifetime hint, which a caller can
+        // flip), so a normal tensor pays one predictable branch. This runs FIRST because a deferred
+        // weight may also be streaming-tagged, and it has to exist before the pool can page it.
+        if (_storageDeferred && !_deferredReady)
             MaterializeDeferredStorage();
 
         // Transparent weight-streaming page-in. Gated on the cheap Lifetime
@@ -3087,6 +3148,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     {
         get
         {
+            // Deferred storage must be allocated (and its initializer run) before we hand out a
+            // writable view; EnsureOwnedForWrite alone does not materialize a plain deferred tensor.
+            EnsureMaterialized();
             EnsureOwnedForWrite();
             // Route through _storage so a read-only mmap alias throws rather than faulting on write
             // (transparent for normal tensors — _storage wraps the same Vector as _data).

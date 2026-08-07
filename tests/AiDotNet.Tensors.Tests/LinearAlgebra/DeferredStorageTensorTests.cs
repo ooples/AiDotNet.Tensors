@@ -149,4 +149,93 @@ public class DeferredStorageTensorTests
         Assert.Equal(100_000_000, huge.Length);
         Assert.True(huge.IsStorageDeferred);
     }
+
+    [Fact]
+    public void Mutating_Lifetime_does_not_strand_deferred_storage()
+    {
+        // Regression: materialization must key off an immutable flag, NOT the mutable Lifetime hint
+        // (which has a public setter). A caller flipping Lifetime away from Deferred before first
+        // access must not leave the tensor stranded on its empty, never-materialized buffer.
+        var t = Tensor<float>.CreateDeferred([3], w => { for (int i = 0; i < w.Length; i++) w[i] = 5f; });
+
+        t.Lifetime = WeightLifetime.Default;
+
+        Assert.Equal(5f, t[0]);
+        Assert.Equal(5f, t[2]);
+    }
+
+    [Fact]
+    public void CopyTo_materializes_and_copies_initialized_values()
+    {
+        var t = Tensor<float>.CreateDeferred([4], w => { for (int i = 0; i < w.Length; i++) w[i] = i + 1f; });
+
+        var dst = new float[4];
+        t.CopyTo(dst);
+
+        Assert.Equal([1f, 2f, 3f, 4f], dst);
+    }
+
+    [Fact]
+    public void AsVector_materializes_before_exposing_the_backing_vector()
+    {
+        var t = Tensor<float>.CreateDeferred([3], w => { for (int i = 0; i < w.Length; i++) w[i] = 8f; });
+
+        var v = t.AsVector();
+
+        Assert.Equal(3, v.Length);
+        for (int i = 0; i < 3; i++) Assert.Equal(8f, v[i]);
+    }
+
+    [Fact]
+    public void Fill_materializes_before_it_overwrites_the_buffer()
+    {
+        // Without materialization Fill would write into the empty buffer and a later read would
+        // allocate a fresh zeroed one, silently discarding the fill.
+        var t = Tensor<float>.CreateDeferred([4], w => { for (int i = 0; i < w.Length; i++) w[i] = 1f; });
+
+        t.Fill(9f);
+
+        Assert.False(t.IsStorageDeferred);
+        Assert.All(Enumerable.Range(0, 4).Select(i => t[i]), value => Assert.Equal(9f, value));
+    }
+
+    [Fact]
+    public void Reductions_over_a_deferred_tensor_see_initialized_values()
+    {
+        var t = Tensor<float>.CreateDeferred([4], w => { for (int i = 0; i < w.Length; i++) w[i] = i + 1f; });
+
+        Assert.Equal(10f, t.Sum()[0]);   // 1 + 2 + 3 + 4
+        Assert.Equal(2.5f, t.Mean());    // 10 / 4
+        Assert.Equal(4f, t.Max().maxVal);
+    }
+
+    [Fact]
+    public void DotProduct_materializes_both_operands()
+    {
+        var a = Tensor<float>.CreateDeferred([3], w => { for (int i = 0; i < w.Length; i++) w[i] = i + 1f; });
+        var b = Tensor<float>.CreateDeferred([3], w => { for (int i = 0; i < w.Length; i++) w[i] = 2f; });
+
+        Assert.Equal(12f, a.DotProduct(b));  // (1 + 2 + 3) * 2
+    }
+
+    [Fact]
+    public void A_failing_initializer_is_cached_and_resurfaced_on_every_access()
+    {
+        int runs = 0;
+        var t = Tensor<float>.CreateDeferred([3], _ =>
+        {
+            runs++;
+            throw new InvalidOperationException("boom");
+        });
+
+        var first = Assert.ThrowsAny<Exception>(() => _ = t[0]);
+        var second = Assert.ThrowsAny<Exception>(() => _ = t[1]);
+
+        // The failure is cached and re-surfaced; the initializer is NOT re-run, and the tensor is
+        // never silently published as ready over a half-initialized buffer.
+        Assert.Equal(1, runs);
+        Assert.True(t.IsStorageDeferred);
+        Assert.Contains("boom", (first.InnerException ?? first).Message);
+        Assert.Contains("boom", (second.InnerException ?? second).Message);
+    }
 }
