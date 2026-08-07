@@ -1,11 +1,38 @@
 # Path to wins: every kernel, every competitor
 
+## Current status: p15 revalidation required
+
+The historical p4 and p9 investigation below is preserved, including predictions that
+hardware falsified. The completed p13 loop used those limiter findings to search the shared
+contraction, tiled-Conv2D, Winograd, cooperative-reduction, split-K, and parity families. A
+consolidated run on the RTX 3080 produced **13 stable wins, zero ties, zero losses,
+and zero refused rows** against PyTorch 2.12.1/cuDNN 9.2 with true FP32 CUDA-graph replay.
+All 13 selected programs first passed the generated fp64 oracle.
+
+Protocol p15 invalidates that result for current promotion. p14 made incomplete promotable
+searches fail closed, but paired candidates still received equal launch counts even when one
+ran several times faster, giving the faster lane materially less device-time exposure. p15
+discards a calibration batch and lengthens the under-exposed lane toward the same bounded
+duration while preserving the 5% gate. It also retains p14's complete-search and host-load
+admission. The p13 table remains historical evidence, but no current catalog closure is
+claimed until a clean p15 championship reproduces 13/13.
+
+`--kernel-championship` now performs that complete loop for any catalog selector: exhaustive
+measured autotune, fp64 verification, competitor measurement, then Nsight + catalog-oracle
+diagnosis if any result remains below 1.10x. It checks the expected row count and fails the
+process when even one stable non-win remains.
+
 One table per kernel, three measured columns, and a named lever with a prediction that can
 be wrong. Nothing here is a plan on its own — each row says what is saturated, what the
 next change is, and what result would falsify it.
 
 All numbers: protocol p4, RTX 3080 locked at 1770 MHz, true fp32 (`allow_tf32=False`),
 competitor in its CUDA-graph lane, best of 3.
+
+These p4 results are historical. Protocol p14 introduced the requirements that every
+applicable promotable candidate stabilize, that incomplete searches preserve the last
+identity-valid artifact, and that evidence under material foreign host CPU load be refused.
+Current p15 adds calibrated paired timing while retaining those p14 admission requirements.
 
 ## The board
 

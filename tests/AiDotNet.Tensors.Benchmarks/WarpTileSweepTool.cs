@@ -57,15 +57,15 @@ internal static class WarpTileSweepTool
         Console.WriteLine("device sm_{0}{1}", major, minor);
         Console.WriteLine();
         Console.WriteLine(
-            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
-            "shape", "tile", "staging", "acc reg", "ld/mma", "shared B", "max abs dev", "us", "TFLOP/s");
+            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}",
+            "shape", "tile", "staging", "acc reg", "ld/mma", "shared B", "reference",
+            "max abs dev", "us", "TFLOP/s");
 
         // A single tile can be selected so a profiler can attribute counters to it: the sweep
         // otherwise launches the 2x2 reference between candidates, and every launch of the
         // same kernel name looks alike to ncu.
         string? only = args.Length > 0 && args[0].Contains('x') ? args[0] : null;
         string? shapeOnly = args.Length > 1 ? args[1] : null;
-
         foreach (var (label, spec, m, n, k) in Shapes())
         {
             if (shapeOnly is not null && !label.StartsWith(shapeOnly, StringComparison.Ordinal)) continue;
@@ -81,7 +81,7 @@ internal static class WarpTileSweepTool
                     if (us > 0 && baseline == 0) baseline = us;
                 }
 
-                // THE ORACLE: the same tile and the same mma instructions with the fragment
+                // THE CEILING: the same tile and the same mma instructions with the fragment
                 // loads hoisted out of the K loop. It computes the wrong answer on purpose --
                 // it exists to bound what this instruction mix can reach with memory traffic
                 // removed, so progress is measured against a ceiling rather than against a
@@ -94,7 +94,8 @@ internal static class WarpTileSweepTool
 
     private static double Measure(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        int tileM, int tileN, bool async, int m, int n, int k, string label, ref double baseline)
+        int tileM, int tileN, bool async, int m, int n, int k, string label,
+        ref double baseline)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -106,13 +107,13 @@ internal static class WarpTileSweepTool
 
             if (!PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out string why))
             {
-                Report(label, tileM, tileN, emitter, 0, 0, 0, "not a wmma shape: " + why);
+                Report(label, tileM, tileN, emitter, "-", 0, 0, 0, "not a wmma shape: " + why);
                 return 0;
             }
 
             if (!emitter.CanStage(plan!, out string stageWhy))
             {
-                Report(label, tileM, tileN, emitter, 0, 0, 0, stageWhy);
+                Report(label, tileM, tileN, emitter, "-", 0, 0, 0, stageWhy);
                 return 0;
             }
 
@@ -129,7 +130,9 @@ internal static class WarpTileSweepTool
                 var bits = new ushort[count];
                 for (long e = 0; e < count; e++)
                 {
-                    double v = ((((e * 37 + i * 11) % 65) - 32) / 8.0);
+                    double v = i == 0
+                        ? (((e * 37) % 65) - 32) / 8.0
+                        : ReductionFactor((int)(e / n)) * ColumnFactor((int)(e % n));
                     var half = (Half)(float)v;
                     bits[e] = BitConverter.HalfToUInt16Bits(half);
                     values[e] = (float)half;
@@ -152,45 +155,32 @@ internal static class WarpTileSweepTool
             DirectPtxLaunchHelper.Launch(module, fn, pointers, blocks, threads);
             runtime.Synchronize();
 
-            // CORRECTNESS FIRST. Verified against the fp64 interpretation where the shape is
-            // small enough for the oracle -- it is O(M*N*K) on the CPU. Larger shapes are
-            // checked against the 2x2 tile's own output instead, which is the tile the
-            // verified rows already cover, so a tile that disagrees with it is wrong.
+            // CORRECTNESS FIRST. Every row is checked against an independent fp64 CPU oracle.
+            // The dense right operand is constructed as reductionFactor[k] * columnFactor[n],
+            // with exactly representable fp16 factors. This preserves representative dense
+            // GPU work while reducing the oracle from O(M*N*K) to O(M*K + M*N).
             double deviation;
             var got = new float[outCount];
             outBuffer.Download<float>(got);
+            float[] want = RankOneMatMulReference(wide[0], m, n, k);
+            bool agrees = CodegenOutputAgreement.Agrees(
+                got, want, 1e-3, out deviation, out _, out _, out _);
 
-            if ((long)m * n * k <= 64L * 1024 * 1024)
+            if (!agrees)
             {
-                double[] want = spec.Interpret(wide);
-                deviation = 0;
-                for (long e = 0; e < outCount; e++)
-                    deviation = Math.Max(deviation, Math.Abs(got[e] - want[e]));
-            }
-            else if (tileM == 2 && tileN == 2)
-            {
-                deviation = 0;   // this IS the reference tile; the verified shapes cover it
-            }
-            else
-            {
-                deviation = CompareAgainstReference(runtime, spec, major, minor, pointers, got, outCount);
-            }
-
-            if (deviation > 1e-3)
-            {
-                Report(label, tileM, tileN, emitter, deviation, 0, 0, "WRONG");
+                Report(label, tileM, tileN, emitter, "fp64", deviation, 0, 0, "WRONG");
                 return 0;
             }
 
             long macs = (long)m * n * k;
             double us = TimeIt(runtime, module, fn, pointers, blocks, threads, macs);
-            Report(label, tileM, tileN, emitter, deviation, us, macs, null);
+            Report(label, tileM, tileN, emitter, "fp64", deviation, us, macs, null);
             return us;
         }
         catch (Exception ex)
         {
-            Console.WriteLine("{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}  {9}",
-                label, tileM + "x" + tileN, "-", "-", "-", "-", "-", "-", "-",
+            Console.WriteLine("{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}  {10}",
+                label, tileM + "x" + tileN, "-", "-", "-", "-", "-", "-", "-", "-",
                 ex.Message.Replace("\n", " "));
             return 0;
         }
@@ -200,56 +190,60 @@ internal static class WarpTileSweepTool
         }
     }
 
-    /// <summary>Compares a large shape against the 2x2 tile's output on the same inputs.</summary>
-    private static double CompareAgainstReference(
-        DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
-        IntPtr[] pointers, float[] got, long outCount)
+    private static float[] RankOneMatMulReference(double[] left, int m, int n, int k)
     {
-        var reference = new PtxTensorCoreEmitter { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
-        PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _);
-
-        string ptx = reference.Emit(spec, major, minor);
-        using var module = runtime.LoadModule(ptx);
-        IntPtr fn = module.GetFunction(spec.Name, out _);
-
-        var refBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
-        try
+        var rowSums = new double[m];
+        for (int row = 0; row < m; row++)
         {
-            var refPointers = (IntPtr[])pointers.Clone();
-            refPointers[2] = refBuffer.Pointer;
-
-            DirectPtxLaunchHelper.Launch(module, fn, refPointers,
-                (uint)reference.BlockCount(plan!), (uint)reference.BlockThreads);
-            runtime.Synchronize();
-
-            var want = new float[outCount];
-            refBuffer.Download<float>(want);
-
-            double worst = 0;
-            for (long e = 0; e < outCount; e++) worst = Math.Max(worst, Math.Abs(got[e] - want[e]));
-            return worst;
+            double sum = 0;
+            long rowOffset = (long)row * k;
+            for (int reduction = 0; reduction < k; reduction++)
+                sum += left[rowOffset + reduction] * ReductionFactor(reduction);
+            rowSums[row] = sum;
         }
-        finally
+
+        var result = new float[(long)m * n];
+        for (int row = 0; row < m; row++)
         {
-            refBuffer.Dispose();
+            long rowOffset = (long)row * n;
+            for (int column = 0; column < n; column++)
+                result[rowOffset + column] = (float)(rowSums[row] * ColumnFactor(column));
         }
+        return result;
+    }
+
+    private static double ReductionFactor(int reduction) => (reduction % 6) switch
+    {
+        0 => 0.5,
+        1 => 1.0,
+        2 => 2.0,
+        3 => -0.5,
+        4 => -1.0,
+        _ => -2.0,
+    };
+
+    private static double ColumnFactor(int column)
+    {
+        double magnitude = ((column * 29) % 63 + 1) / 16.0;
+        return (column & 1) == 0 ? magnitude : -magnitude;
     }
 
     private static void Report(
         string label, int tileM, int tileN, PtxTensorCoreEmitter emitter,
-        double deviation, double us, long macs, string? note)
+        string correctnessReference, double deviation, double us, long macs, string? note)
     {
         int accRegisters = tileM * tileN * 8;
         double loadsPerMma = (tileM + tileN) / (double)(tileM * tileN);
 
         Console.WriteLine(
-            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}{9}",
+            "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}{10}",
             label,
             tileM + "x" + tileN,
             emitter.AsyncCopy ? "cp.async" : "registers",
             accRegisters.ToString(CultureInfo.InvariantCulture),
             loadsPerMma.ToString("0.00", CultureInfo.InvariantCulture),
             note is null ? emitter.SharedMemoryBytes.ToString(CultureInfo.InvariantCulture) : "-",
+            correctnessReference,
             note is null ? deviation.ToString("0.000E+000", CultureInfo.InvariantCulture) : "-",
             us > 0 ? us.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
             (us > 0 && macs > 0)
@@ -322,15 +316,15 @@ internal static class WarpTileSweepTool
                 (uint)emitter.BlockCount(plan), (uint)emitter.BlockThreads, macs);
 
             Console.WriteLine(
-                "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,12} {7,10} {8,9}",
-                label, tileM + "x" + tileN, "ORACLE", "-", "0.00", "-", "(no answer)",
+                "{0,-16} {1,7} {2,10} {3,7} {4,7} {5,9} {6,9} {7,12} {8,10} {9,9}",
+                label, tileM + "x" + tileN, "CEILING", "-", "0.00", "-", "-", "(no answer)",
                 us.ToString("0.0", CultureInfo.InvariantCulture) + " us",
                 (2.0 * macs / us / 1e6).ToString("0.0", CultureInfo.InvariantCulture));
         }
         catch (Exception ex)
         {
-            Console.WriteLine("{0,-16} {1,7} {2,10}  oracle failed: {3}",
-                label, tileM + "x" + tileN, "ORACLE", ex.Message.Replace('\n', ' '));
+            Console.WriteLine("{0,-16} {1,7} {2,10}  ceiling failed: {3}",
+                label, tileM + "x" + tileN, "CEILING", ex.Message.Replace('\n', ' '));
         }
         finally
         {
@@ -359,6 +353,9 @@ internal static class WarpTileSweepTool
 
     private static IEnumerable<(string, CodegenKernelSpec, int, int, int)> Shapes()
     {
+        // 256 is divisible by 128, so every rung of the warp-tile ladder (including 4x4,
+        // which needs M % 128 == 0) can stage it.
+        yield return ("256^3", MatMul("sweep_256", 256, 256, 256), 256, 256, 256);
         yield return ("512^3", MatMul("sweep_512", 512, 512, 512), 512, 512, 512);
         yield return ("1024^3", MatMul("sweep_1024", 1024, 1024, 1024), 1024, 1024, 1024);
         yield return ("2048^3", MatMul("sweep_2048", 2048, 2048, 2048), 2048, 2048, 2048);
