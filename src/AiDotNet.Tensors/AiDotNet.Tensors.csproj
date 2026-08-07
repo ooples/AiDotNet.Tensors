@@ -50,9 +50,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Direct-PTX release cubins are packaged only from operator-isolated
-         architecture/family directories. Legacy files directly under smXX are
-         intentionally excluded unless they are moved beside a current manifest. -->
+    <!-- Only operator-isolated, manifested direct-PTX release cubins are
+         executable package resources. Loose legacy files under smXX remain
+         excluded until they pass the same source/hash/resource gates. -->
     <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.cubin" />
     <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*-cubins.tsv" />
     <InternalsVisibleTo Include="AiDotNet" />
