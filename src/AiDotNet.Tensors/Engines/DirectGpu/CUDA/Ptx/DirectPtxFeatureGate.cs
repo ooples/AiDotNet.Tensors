@@ -87,6 +87,14 @@ internal static class DirectPtxFeatureGate
     /// validation before a shape is performance-promoted. Off in production.
     /// </summary>
     internal static bool SoftmaxExperimentOverride { get; set; }
+    /// <summary>Specialized-scientific (issue #854) rollout gate; disabled by default.</summary>
+    internal static bool IsScientificEnabled => TestOverride ?? EnvironmentMasterEnabled;
+
+    /// <summary>
+    /// Opt-in switch that lets fail-closed scientific specializations dispatch for GPU
+    /// validation before a shape is performance-promoted. Off in production.
+    /// </summary>
+    internal static bool ScientificExperimentOverride { get; set; }
 
     internal static bool IsConvolutionEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
@@ -111,7 +119,8 @@ internal enum DirectPtxPhysicalType
     Float16,
     BFloat16,
     Float32,
-    Int32
+    Int32,
+    UInt8
 }
 
 internal enum DirectPtxPhysicalLayout

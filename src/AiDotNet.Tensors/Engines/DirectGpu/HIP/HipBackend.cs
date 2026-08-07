@@ -10643,8 +10643,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but input buffer has {input.Size}.");
         if (numPairs > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
-        if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: complex_magnitude");
+        if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: complex_magnitude_interleaved");
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         {
             IntPtr _p0 = input.Handle, _p1 = output.Handle;

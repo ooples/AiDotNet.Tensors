@@ -63,7 +63,7 @@ internal sealed class PtxSoftmaxKernel : IDisposable
                 Blueprint.ResourceBudget.Validate(EntryPoint, info, _blockThreads, activeBlocks);
                 DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
                     Blueprint, runtime.DeviceFingerprint, Ptx, info, _blockThreads, activeBlocks,
-                    module.JitInfoLog);
+                    module);
                 return (Function: function, Audit: audit);
             });
         _module = loaded.Resource;

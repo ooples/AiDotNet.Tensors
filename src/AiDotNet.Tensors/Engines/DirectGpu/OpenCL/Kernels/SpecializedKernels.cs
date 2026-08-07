@@ -645,7 +645,7 @@ __kernel void complex_conjugate(
     output[idx+1] = -input[idx+1];
 }
 
-__kernel void complex_magnitude(
+__kernel void complex_magnitude_interleaved(
     __global const float* input, __global float* output, int numPairs)
 {
     int i = get_global_id(0);
@@ -683,7 +683,7 @@ __kernel void complex_magnitude(
             // Complex tensor ops
             "complex_multiply",
             "complex_conjugate",
-            "complex_magnitude"
+            "complex_magnitude_interleaved"
         ];
     }
 }
