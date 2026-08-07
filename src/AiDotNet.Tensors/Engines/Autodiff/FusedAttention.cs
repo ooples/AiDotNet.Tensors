@@ -400,9 +400,9 @@ public static class FusedAttention<T>
 
     private static Tensor<T> AddBroadcastBias(IEngine engine, Tensor<T> scores, Tensor<T> bias)
     {
-        // Engine TensorBroadcastAdd handles the broadcast rules —
+        // Engine TensorAdd handles the broadcast rules —
         // bias can be [B, H, Sq, Sk], [H, Sq, Sk], [1, 1, Sq, Sk], etc.
-        return engine.TensorBroadcastAdd(scores, bias);
+        return engine.TensorAdd(scores, bias);
     }
 
     private static Tensor<T> BuildCausalBias(IEngine engine, int sq, int sk, int queryOffset = 0)
@@ -741,7 +741,7 @@ public static class FusedAttention<T>
 
     /// <summary>Scaled scores for one key tile: <c>scale · (Q @ Kt^T)</c> as [BH, Sq, bk], plus
     /// the additive attention bias sliced to the tile's key columns when present. The bias slice
-    /// preserves the bias's broadcast shape (last axis Sk → [j0, j0+bk)); TensorBroadcastAdd then
+    /// preserves the bias's broadcast shape (last axis Sk → [j0, j0+bk)); TensorAdd then
     /// applies the same broadcast rules as the full-matrix path's AddBroadcastBias.</summary>
     private static Tensor<T> ScoresTileWithBias(
         IEngine engine, Tensor<T> qf, Tensor<T> kt, T scaleT, Tensor<T>? bias,
@@ -758,7 +758,7 @@ public static class FusedAttention<T>
         len[br - 1] = bk;
         var biasTile = engine.TensorSlice(bias, start, len);                 // [.., Sq, bk] (broadcastable)
         var s4 = engine.Reshape(s, new[] { B, H, Sq, bk });
-        s4 = engine.TensorBroadcastAdd(s4, biasTile);
+        s4 = engine.TensorAdd(s4, biasTile);
         return engine.Reshape(s4, new[] { B * H, Sq, bk });
     }
 

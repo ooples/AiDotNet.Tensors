@@ -11351,13 +11351,25 @@ KERNEL VARIANTS (A/B testing):
 
             int log2n = (int)MathHelper.Log2(n);
 
-            // Bit-reversal permutation
+            // Bit-reversal permutation, out of place through scratch. Input and output may be the
+            // same buffer here (the copies above are conditional), so the permutation reads the
+            // output — which already holds the input — and lands in scratch before being copied
+            // back. See batched_bit_reverse for why the in-place swap this replaces was unsafe.
+            using var permScratchReal = AllocateBuffer(n);
+            using var permScratchImag = AllocateBuffer(n);
+            var permSrcR = ((DirectOpenClGpuBuffer)permScratchReal).Buffer;
+            var permSrcI = ((DirectOpenClGpuBuffer)permScratchImag).Buffer;
+
             var bitRevKernel = _kernelCache["bit_reverse_permutation"];
             bitRevKernel.SetArg(0, outReal.Handle);
             bitRevKernel.SetArg(1, outImag.Handle);
-            bitRevKernel.SetArg(2, n);
-            bitRevKernel.SetArg(3, log2n);
+            bitRevKernel.SetArg(2, permSrcR.Handle);
+            bitRevKernel.SetArg(3, permSrcI.Handle);
+            bitRevKernel.SetArg(4, n);
+            bitRevKernel.SetArg(5, log2n);
             bitRevKernel.Execute1D(n, Math.Min(256, n));
+            CopyBuffer(permScratchReal, outputReal, n);
+            CopyBuffer(permScratchImag, outputImag, n);
 
             // FFT butterfly stages
             var butterflyKernel = _kernelCache["fft_butterfly"];
@@ -11447,6 +11459,7 @@ KERNEL VARIANTS (A/B testing):
             }
         }
 
+
         /// <inheritdoc/>
         public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
         {
@@ -11457,10 +11470,8 @@ KERNEL VARIANTS (A/B testing):
             var outReal = ((DirectOpenClGpuBuffer)outputReal).Buffer;
             var outImag = ((DirectOpenClGpuBuffer)outputImag).Buffer;
 
-            // Copy input to output for in-place FFT
-            CopyBuffer(inputReal, outputReal, batch * n);
-            CopyBuffer(inputImag, outputImag, batch * n);
-
+            // No input copy: batched_bit_reverse reads the input and writes the permuted result
+            // straight into the output, so the permutation IS the copy.
             int log2n = (int)MathHelper.Log2(n);
 
             // Batched bit-reversal. NOTE: batched_bit_reverse / batched_fft_butterfly index via a
@@ -11471,11 +11482,13 @@ KERNEL VARIANTS (A/B testing):
             // FFT path that N-D IFFT / wideband / mel-spectrogram all route through).
             int bitRevItems = batch * n;
             var bitRevKernel = _kernelCache["batched_bit_reverse"];
-            bitRevKernel.SetArg(0, outReal.Handle);
-            bitRevKernel.SetArg(1, outImag.Handle);
-            bitRevKernel.SetArg(2, batch);
-            bitRevKernel.SetArg(3, n);
-            bitRevKernel.SetArg(4, log2n);
+            bitRevKernel.SetArg(0, inReal.Handle);
+            bitRevKernel.SetArg(1, inImag.Handle);
+            bitRevKernel.SetArg(2, outReal.Handle);
+            bitRevKernel.SetArg(3, outImag.Handle);
+            bitRevKernel.SetArg(4, batch);
+            bitRevKernel.SetArg(5, n);
+            bitRevKernel.SetArg(6, log2n);
             bitRevKernel.Execute1D(bitRevItems, Math.Min(256, bitRevItems));
 
             // Batched FFT butterfly stages (batch * (n/2) butterfly pairs per stage)
@@ -11523,13 +11536,26 @@ KERNEL VARIANTS (A/B testing):
             // get_global_id(0) only spanned one row/col's worth and every row/col but the first was
             // left untransformed — the root cause of the whole GPU 2D/ND-FFT divergence family (#775).
             int rowsTotal = width * height;
+
+            // Both bit-reversals below run out of place through scratch and are copied back, for
+            // the reason recorded on batched_bit_reverse: the in-place swap they used to perform
+            // lost the second half of each exchange, leaving one slot of every pair unwritten.
+            using var brScratchReal = AllocateBuffer(rowsTotal);
+            using var brScratchImag = AllocateBuffer(rowsTotal);
+            var brR = ((DirectOpenClGpuBuffer)brScratchReal).Buffer;
+            var brI = ((DirectOpenClGpuBuffer)brScratchImag).Buffer;
+
             var bitRevRowsKernel = _kernelCache["bit_reverse_rows"];
             bitRevRowsKernel.SetArg(0, outReal.Handle);
             bitRevRowsKernel.SetArg(1, outImag.Handle);
-            bitRevRowsKernel.SetArg(2, height);
-            bitRevRowsKernel.SetArg(3, width);
-            bitRevRowsKernel.SetArg(4, log2Width);
+            bitRevRowsKernel.SetArg(2, brR.Handle);
+            bitRevRowsKernel.SetArg(3, brI.Handle);
+            bitRevRowsKernel.SetArg(4, height);
+            bitRevRowsKernel.SetArg(5, width);
+            bitRevRowsKernel.SetArg(6, log2Width);
             bitRevRowsKernel.Execute1D(rowsTotal, Math.Min(256, rowsTotal));
+            CopyBuffer(brScratchReal, outputReal, rowsTotal);
+            CopyBuffer(brScratchImag, outputImag, rowsTotal);
 
             // Row-wise FFT (one butterfly pair per work item: (width/2) pairs per row × height rows)
             int rowButterflyItems = (width / 2) * height;
@@ -11549,10 +11575,14 @@ KERNEL VARIANTS (A/B testing):
             var bitRevColsKernel = _kernelCache["bit_reverse_cols"];
             bitRevColsKernel.SetArg(0, outReal.Handle);
             bitRevColsKernel.SetArg(1, outImag.Handle);
-            bitRevColsKernel.SetArg(2, height);
-            bitRevColsKernel.SetArg(3, width);
-            bitRevColsKernel.SetArg(4, log2Height);
+            bitRevColsKernel.SetArg(2, brR.Handle);
+            bitRevColsKernel.SetArg(3, brI.Handle);
+            bitRevColsKernel.SetArg(4, height);
+            bitRevColsKernel.SetArg(5, width);
+            bitRevColsKernel.SetArg(6, log2Height);
             bitRevColsKernel.Execute1D(rowsTotal, Math.Min(256, rowsTotal));
+            CopyBuffer(brScratchReal, outputReal, rowsTotal);
+            CopyBuffer(brScratchImag, outputImag, rowsTotal);
 
             // Column-wise FFT ((height/2) pairs per col × width cols)
             int colButterflyItems = (height / 2) * width;

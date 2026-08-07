@@ -52,7 +52,13 @@ public sealed class OpParityCoverageTests
         Assert.NotEmpty(covered);
         // Coverage floor: keep this at/above the current count so coverage can only grow. Raise it
         // as the registry expands; a drop means an op silently lost its spec.
-        const int coverageFloor = 536;
+        //
+        // Lowered 536 -> 532 when TensorBroadcastAdd/Subtract/Multiply/Divide were removed from
+        // IEngine. The plain ops broadcast implicitly, so those four are no longer distinct ops to
+        // cover; the broadcast SHAPES they exercised are still covered, by the bcast-row and
+        // bcast-col cases on TensorAdd and friends. This is four ops leaving the surface, not four
+        // ops losing their spec.
+        const int coverageFloor = 532;
         Assert.True(covered.Count >= coverageFloor,
             $"Parity op coverage dropped to {covered.Count} distinct IEngine ops (floor {coverageFloor}). " +
             $"An op likely lost its registry spec.");

@@ -22,6 +22,20 @@ public sealed class DirectPtxConvolutionTests
             "AiDotNet.Decoy.Artifacts.metadata.manifest.tsv", out _));
     }
 
+    [Theory]
+    [InlineData("", "cubin", "kernel.cubin")]
+    [InlineData("ptx", " ", "kernel.cubin")]
+    [InlineData("ptx", "cubin", "\t")]
+    public void EmbeddedManifestRow_RejectsBlankRequiredValues(
+        string ptxHash, string cubinHash, string file)
+    {
+        string[] columns = { ptxHash, cubinHash, file };
+
+        Assert.Throws<InvalidDataException>(() =>
+            DirectPtxCubinArtifactCache.ValidateEmbeddedManifestRow(
+                columns, 0, 1, 2, "manifest.tsv", string.Join("\t", columns)));
+    }
+
     [Fact]
     public void Emitter_IsPointerOnlyShapeSpecializedSm86Ptx()
     {

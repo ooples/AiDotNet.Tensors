@@ -468,20 +468,38 @@ namespace AiDotNet.Tensors.Tests.Engines
 
             // Eager: MatMul + broadcast bias add + ReLU (3 separate ops)
             var mm = engine.TensorMatMul(input, weights);
-            var biased = engine.TensorBroadcastAdd(mm, bias1D);
+            var biased = engine.TensorAdd(mm, bias1D);
             var eagerResult = engine.ReLU(biased);
 
-            // Lazy: should fuse into FusedLinearReLU via CpuFusionPass
+            // Compile an isolated recording and inspect the optimized operation sequence. Keep
+            // this separate from the execution recording below because compilation mutates lazy
+            // node metadata and output-buffer bindings.
+            using (var inspectionScope = GraphMode.Enable())
+            {
+                var inspectionMm = engine.TensorMatMul(input, weights);
+                var inspectionBiased = engine.TensorAdd(inspectionMm, bias1D);
+                _ = engine.ReLU(inspectionBiased);
+
+                Assert.Equal(3, inspectionScope.NodeCount);
+                var compiledOperations = new LazyGraphCompiler().Compile(inspectionScope.Nodes);
+                ILazyNode fused = Assert.Single(compiledOperations);
+                Assert.Equal(LazyNodeType.FusedLinearReLU, fused.OpType);
+
+                // This scope exists only to inspect the compiler output; do not execute a second
+                // copy of the graph when the scope is disposed.
+                inspectionScope.MarkCompiled();
+            }
+
+            // Lazy execution: the same pattern should produce the eager result.
             Tensor<float> lazyResult;
             using (var scope = GraphMode.Enable())
             {
                 var lazyMm = engine.TensorMatMul(input, weights);
-                var lazyBiased = engine.TensorBroadcastAdd(lazyMm, bias1D);
+                var lazyBiased = engine.TensorAdd(lazyMm, bias1D);
                 lazyResult = engine.ReLU(lazyBiased);
 
-                // NodeCount reflects recorded lazy nodes (always 3 here: MatMul, Add, ReLU).
-                // Fusion happens at compile time, not during recording, so NodeCount won't
-                // decrease. Instead, verify the compiled result matches the eager output.
+                // NodeCount reflects recorded lazy nodes (always 3 here: MatMul, Add, ReLU), while
+                // the compiler assertion above proves CpuFusionPass reduced them to one operation.
                 Assert.Equal(3, scope.NodeCount);
                 scope.Realize();
             }
