@@ -132,6 +132,11 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
+        new PtxParitySpec("PtxFusedRgLruScan128x256Kernel", PtxParityStatus.ThreeWayParity,
+            "RG-LRU scan forward [1,128,256] (#846) — CudaBackend.RgLruScanForward",
+            "DirectPtxRecurrentTests.DriverRgLru_MatchesDoubleOracleAndRoutesDirectPtxRepeatedly " +
+            "runs the exact SM86 direct route and incumbent NVRTC kernel against an independent fp64 " +
+            "full-sequence recurrence oracle at 2e-5, and proves direct route entry over repeated launches."),
 
         // Issue #854 specialized-scientific / ANN / hypercomplex / hyperbolic / quantum / Instant-NGP
         // kernels. Each has a GPU-gated DriverOnly CPU-fp64-oracle parity test, an emitter structure

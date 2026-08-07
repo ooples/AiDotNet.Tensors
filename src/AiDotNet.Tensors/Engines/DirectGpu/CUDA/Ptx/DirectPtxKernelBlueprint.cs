@@ -45,6 +45,13 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The issue-#846 recurrent specialization is validated only on exact
+    /// GA102/SM86. Other architectures remain separate tuning domains.
+    /// </summary>
+    internal static bool HasValidatedRgLruScan(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The checked-in softmax-family specializations (issue #840) are measured and
     /// promoted only on GA10x/SM86. Other architectures fail closed to the established
     /// backend rather than inheriting Ampere's tuning.

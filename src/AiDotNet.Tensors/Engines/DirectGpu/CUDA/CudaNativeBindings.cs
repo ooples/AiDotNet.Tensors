@@ -63,46 +63,37 @@ internal static class CudaNativeBindings
     }
 #endif
 
-    private static bool _isAvailable;
-    private static bool _availabilityChecked;
+    private static readonly Lazy<bool> Availability = new(CheckAvailability, isThreadSafe: true);
 
     /// <summary>
     /// Gets whether the CUDA driver API is available on this system.
     /// </summary>
-    public static bool IsAvailable
+    public static bool IsAvailable => Availability.Value;
+
+    private static bool CheckAvailability()
     {
-        get
+        try
         {
-            if (!_availabilityChecked)
+            var result = CuBlasNative.cuInit(0);
+            if (result != CudaResult.Success)
             {
-                _availabilityChecked = true;
-                try
-                {
-                    var result = CuBlasNative.cuInit(0);
-                    if (result != CudaResult.Success)
-                    {
-                        _isAvailable = false;
-                    }
-                    else
-                    {
-                        result = CuBlasNative.cuDeviceGetCount(out int count);
-                        _isAvailable = result == CudaResult.Success && count > 0;
-                    }
-                }
-                catch (DllNotFoundException)
-                {
-                    _isAvailable = false;
-                }
-                catch (EntryPointNotFoundException)
-                {
-                    _isAvailable = false;
-                }
-                catch
-                {
-                    _isAvailable = false;
-                }
+                return false;
             }
-            return _isAvailable;
+
+            result = CuBlasNative.cuDeviceGetCount(out int count);
+            return result == CudaResult.Success && count > 0;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch
+        {
+            return false;
         }
     }
 

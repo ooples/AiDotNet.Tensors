@@ -19,6 +19,7 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string RecurrentStateEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RECURRENT_STATE";
     internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
@@ -35,6 +36,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentRecurrentStateEnabled = ReadEnabled(RecurrentStateEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
@@ -79,6 +81,8 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    internal static bool IsRecurrentStateEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentRecurrentStateEnabled);
     /// <summary>Softmax-family (issue #840) rollout gate; disabled by default.</summary>
     internal static bool IsSoftmaxEnabled => TestOverride ?? EnvironmentMasterEnabled;
 
@@ -149,6 +153,8 @@ internal enum DirectPtxPhysicalLayout
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>
     PagedKv,
+    /// <summary>Dense row-major [batch, sequence, feature].</summary>
+    BatchSequenceFeature,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
     Oihw
 }

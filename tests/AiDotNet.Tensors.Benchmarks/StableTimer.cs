@@ -394,6 +394,116 @@ internal static class StableTimer
         return Pair(samplesA, samplesB, ratios);
     }
 
+    /// <summary>
+    /// Host-pairs two launches after calibrating independent batch lengths to the
+    /// same wall-clock exposure. AB/BA brackets remove launch-order bias; an odd
+    /// median-of-brackets rejects an isolated desktop preemption while the
+    /// unchanged outer spread gate decides actionability.
+    /// </summary>
+    internal static PairResult MeasureCalibratedHostPair(
+        Action launchA,
+        Action synchronizeA,
+        Action launchB,
+        Action synchronizeB,
+        int operationsPerLaunchA = 1,
+        int operationsPerLaunchB = 1,
+        int warmups = 3,
+        int maxAttempts = 15,
+        double targetBatchMilliseconds = 5.0,
+        int bracketsPerAttempt = 5)
+    {
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (synchronizeA is null) throw new ArgumentNullException(nameof(synchronizeA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (synchronizeB is null) throw new ArgumentNullException(nameof(synchronizeB));
+        if (operationsPerLaunchA <= 0)
+            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchA));
+        if (operationsPerLaunchB <= 0)
+            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchB));
+        if (warmups < 0) throw new ArgumentOutOfRangeException(nameof(warmups));
+        if (maxAttempts < 3) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+        if (!(targetBatchMilliseconds > 0) ||
+            double.IsInfinity(targetBatchMilliseconds))
+            throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
+        if (bracketsPerAttempt <= 0 || (bracketsPerAttempt & 1) == 0)
+            throw new ArgumentOutOfRangeException(nameof(bracketsPerAttempt),
+                "Use a positive odd bracket count so its median is an observed sample.");
+
+        for (int i = 0; i < warmups; i++)
+        {
+            launchA();
+            synchronizeA();
+            launchB();
+            synchronizeB();
+        }
+
+        const int calibrationLaunches = 3;
+        double calibrationA = double.PositiveInfinity;
+        double calibrationB = double.PositiveInfinity;
+        for (int i = 0; i < 3; i++)
+        {
+            calibrationA = Math.Min(calibrationA,
+                TimeHostBatch(launchA, synchronizeA, calibrationLaunches));
+            calibrationB = Math.Min(calibrationB,
+                TimeHostBatch(launchB, synchronizeB, calibrationLaunches));
+        }
+        int iterationsA = CalibratedIterationsFromMicroseconds(
+            calibrationA, targetBatchMilliseconds);
+        int iterationsB = CalibratedIterationsFromMicroseconds(
+            calibrationB, targetBatchMilliseconds);
+
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
+        int attempts = 0;
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            attempts++;
+            var bracketA = new List<double>(bracketsPerAttempt);
+            var bracketB = new List<double>(bracketsPerAttempt);
+            var bracketRatios = new List<double>(bracketsPerAttempt);
+            for (int bracket = 0; bracket < bracketsPerAttempt; bracket++)
+            {
+                double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA) /
+                    operationsPerLaunchA;
+                double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB) /
+                    operationsPerLaunchB;
+                double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB) /
+                    operationsPerLaunchB;
+                double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA) /
+                    operationsPerLaunchA;
+                double a = (aFirst + aSecond) * 0.5;
+                double b = (bFirst + bSecond) * 0.5;
+                bracketA.Add(a);
+                bracketB.Add(b);
+                bracketRatios.Add(a / b);
+            }
+            AddToConsecutiveWindow(samplesA, Median(bracketA));
+            AddToConsecutiveWindow(samplesB, Median(bracketB));
+            AddToConsecutiveWindow(ratios, Median(bracketRatios));
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios);
+    }
+
+    private static int CalibratedIterationsFromMicroseconds(
+        double microsecondsPerLaunch,
+        double targetBatchMilliseconds)
+    {
+        if (!(microsecondsPerLaunch > 0) || double.IsInfinity(microsecondsPerLaunch))
+            return 4_096;
+        return (int)Math.Clamp(
+            Math.Ceiling(targetBatchMilliseconds * 1_000.0 / microsecondsPerLaunch),
+            1, 4_096);
+    }
+
     private static PairResult Pair(
         List<double> samplesA, List<double> samplesB, List<double> ratios)
     {
