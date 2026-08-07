@@ -160,15 +160,25 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             emitSoftmaxStats,
             selectedWarps,
             causalQueryOffset);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int blockThreads = selectedWarps * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    EntryPoint, out DirectPtxFunctionInfo functionInfo);
+                int blockThreads = selectedWarps * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    EntryPoint, functionInfo, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, FunctionInfo: functionInfo, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(

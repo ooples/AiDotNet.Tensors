@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -437,6 +438,7 @@ public class DirectPtxWmmaTests
         Assert.InRange(
             kernel.FunctionInfo.RegistersPerThread,
             1, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
+        Assert.Equal(144, kernel.Blueprint.ResourceBudget.MeasuredRegistersPerThread);
 
         using var qDevice = runtime.AllocateBytes(kernel.QBytes);
         using var kDevice = runtime.AllocateBytes(kernel.KBytes);
@@ -769,6 +771,34 @@ public class DirectPtxWmmaTests
     }
 
     [Theory]
+    [InlineData(14, 16)]
+    [InlineData(22, 24)]
+    [InlineData(26, 32)]
+    [InlineData(34, 40)]
+    [InlineData(40, 40)]
+    public void MeasuredResourceBudget_StaysWithinCurrentRegisterAllocationBucket(
+        int measuredRegisters, int expectedMaximum)
+    {
+        DirectPtxResourceBudget budget = DirectPtxResourceBudget.FromDriverMeasurement(
+            measuredRegisters, maxStaticSharedBytes: 0,
+            maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1);
+
+        Assert.Equal(measuredRegisters, budget.MeasuredRegistersPerThread);
+        Assert.Equal(expectedMaximum, budget.MaxRegistersPerThread);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void MeasuredResourceBudget_RejectsNonPositiveMeasurement(int measuredRegisters)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegisters, maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1));
+    }
+
+    [Theory]
     [InlineData(8, 0, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 6, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 9, (int)DirectPtxArchitectureFamily.Ada)]
@@ -782,6 +812,47 @@ public class DirectPtxWmmaTests
         Assert.Equal(expected, DirectPtxArchitecture.Classify(major, minor));
         Assert.Equal(major == 8 && minor == 6,
             DirectPtxArchitecture.HasValidatedOnlineAttention(major, minor));
+    }
+
+    [Fact]
+    public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
+    {
+        var resource = new TrackingDisposable();
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackingDisposable, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_CleanupFailureDoesNotMaskPrimaryFailure()
+    {
+        var resource = new TrackingDisposable { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackingDisposable, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_TransfersSuccessfulResourceOwnership()
+    {
+        var resource = new TrackingDisposable();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
     }
 
     [Fact]
@@ -849,6 +920,42 @@ public class DirectPtxWmmaTests
         Assert.Equal(new[] { 4, 2 }, DirectPtxAttentionAutotuner.Candidates(64));
         Assert.Equal(new[] { 8, 4 }, DirectPtxAttentionAutotuner.Candidates(128));
         Assert.Throws<ArgumentOutOfRangeException>(() => DirectPtxAttentionAutotuner.Candidates(96));
+    }
+
+    [Fact]
+    public void AttentionAutotuner_CandidatesRoundTripOnlySupportedWarpCounts()
+    {
+        IReadOnlyList<AutotuneCandidate> candidates =
+            DirectPtxAttentionAutotuner.CandidateConfigurations(64);
+
+        Assert.Collection(candidates,
+            candidate =>
+            {
+                Assert.True(DirectPtxAttentionAutotuner.TryGetWarps(candidate, 64, out int warps));
+                Assert.Equal(4, warps);
+                Assert.Equal("4", candidate.Parameters["WarpsPerBlock"]);
+            },
+            candidate =>
+            {
+                Assert.True(DirectPtxAttentionAutotuner.TryGetWarps(candidate, 64, out int warps));
+                Assert.Equal(2, warps);
+            });
+
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(
+            new AutotuneCandidate("query-warps-999"), 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(default(AutotuneCandidate), 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(candidates[0], 17, out _));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void AttentionAutotuner_MalformedCacheVariantIsCacheMiss(string variant)
+    {
+        var cached = new KernelChoice { Variant = variant };
+
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(cached, 64, out int warps));
+        Assert.Equal(0, warps);
     }
 
     [Fact]
@@ -3234,7 +3341,13 @@ public class DirectPtxWmmaTests
     private sealed class TrackingDisposable : IDisposable
     {
         internal bool IsDisposed { get; private set; }
-        public void Dispose() => IsDisposed = true;
+        internal bool ThrowOnDispose { get; set; }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
     }
 }
 #endif
