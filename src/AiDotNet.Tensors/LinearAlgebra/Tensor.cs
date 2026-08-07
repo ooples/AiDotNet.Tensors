@@ -79,6 +79,38 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
     }
 
+    private Tensor(int[] dimensions, Action<TensorBase<T>>? initializer, bool deferred)
+        : base(dimensions, initializer, deferred)
+    {
+    }
+
+    /// <summary>
+    /// Creates a tensor that knows its shape but has not allocated storage. The buffer is created,
+    /// and <paramref name="initializer"/> applied, the first time the tensor's values are touched.
+    /// </summary>
+    /// <param name="dimensions">Logical shape. <c>Length</c>, <c>Rank</c> and <c>Shape</c> are exact immediately.</param>
+    /// <param name="initializer">
+    /// Fill applied once, when storage is first created — a weight's He/Xavier fill, for example.
+    /// Null leaves the buffer zeroed. Deferring the fill as well as the allocation is the point:
+    /// running it eagerly would touch the buffer and allocate anyway.
+    /// </param>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> this is a tensor that costs nothing until you use it. You can
+    /// ask how big it is, what shape it is, and how many values it holds, and none of that
+    /// allocates any memory. The memory appears the moment you read or write an actual value.</para>
+    /// <para>
+    /// Useful when you need a model's size before you need its weights: counting parameters,
+    /// sizing a checkpoint, or planning a memory budget. Because the count comes from the same
+    /// construction that later allocates, it cannot disagree with what you eventually get.
+    /// </para>
+    /// </remarks>
+    public static Tensor<T> CreateDeferred(int[] dimensions, Action<Tensor<T>>? initializer = null)
+    {
+        Action<TensorBase<T>>? adapted =
+            initializer is null ? null : t => initializer((Tensor<T>)t);
+        return new Tensor<T>(dimensions, adapted, deferred: true);
+    }
+
     /// <summary>
     /// Creates a new tensor with the specified dimensions and pre-populated data.
     /// </summary>
