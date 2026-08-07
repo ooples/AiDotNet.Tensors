@@ -120,10 +120,27 @@ public class PortableSimdStreamingTests
         // The kernel documents that it must NOT skip aval == 0. An `if (aval == 0) continue`
         // early-out is a tempting optimisation that changes results here: 0 * Infinity is NaN,
         // and skipping would leave C's original value instead.
-        const int m = 1, n = 4, k = 2;
+        // WIDE ENOUGH TO REACH THE VECTOR BODY. RunFp64 hands off to ScalarStreaming when
+        // n < Vector<double>.Count, so a hard-coded n = 4 tested only the scalar path on any
+        // runtime with 8 lanes -- AVX-512 -- and this test's whole subject is what the VECTOR
+        // loop does with 0 * Infinity. It would have passed there while asserting nothing about
+        // the code it names. Sized from the runtime instead, so it reaches the vector body at
+        // 2, 4 or 8 lanes.
+        const int m = 1, k = 2;
+        int n = Math.Max(4, System.Numerics.Vector<double>.Count);
         var a = new double[] { 0.0, 1.0 };
-        var b = new double[] { double.PositiveInfinity, double.PositiveInfinity, double.PositiveInfinity, double.PositiveInfinity,
-                               1.0, 1.0, 1.0, 1.0 };
+        var b = new double[n * k];
+        for (int j = 0; j < n; j++)
+        {
+            b[j] = double.PositiveInfinity;   // k-row 0, multiplied by aval 0.0
+            b[n + j] = 1.0;                   // k-row 1, multiplied by aval 1.0
+        }
+
+        // The property this sizing exists for, asserted rather than assumed: if a future
+        // edit hard-codes n again, this fails here instead of silently testing the scalar
+        // path on a wide machine and reporting green.
+        Assert.True(n >= System.Numerics.Vector<double>.Count,
+            $"n={n} must reach the vector body (lanes={System.Numerics.Vector<double>.Count})");
 
         var cScalar = new double[n];
         var cVector = new double[n];
@@ -142,11 +159,27 @@ public class PortableSimdStreamingTests
     {
         // -0.0 + -0.0 stays -0.0, while any accidental re-zeroing of the accumulator would give
         // +0.0. Bit comparison is what makes this observable.
-        const int m = 1, n = 4, k = 1;
+        // Sized from the runtime for the same reason as the test above: at n = 4 on an 8-lane
+        // runtime this never entered the vector body, so the signed-zero claim was only ever
+        // checked against the scalar path it is supposed to be compared WITH.
+        const int m = 1, k = 1;
+        int n = Math.Max(4, System.Numerics.Vector<double>.Count);
         var a = new double[] { -1.0 };
-        var b = new double[] { 0.0, 0.0, 0.0, 0.0 };
-        var cScalar = new double[] { -0.0, -0.0, -0.0, -0.0 };
-        var cVector = new double[] { -0.0, -0.0, -0.0, -0.0 };
+        var b = new double[n];
+        var cScalar = new double[n];
+        var cVector = new double[n];
+        for (int j = 0; j < n; j++)
+        {
+            b[j] = 0.0;
+            cScalar[j] = -0.0;
+            cVector[j] = -0.0;
+        }
+
+        // The property this sizing exists for, asserted rather than assumed: if a future
+        // edit hard-codes n again, this fails here instead of silently testing the scalar
+        // path on a wide machine and reporting green.
+        Assert.True(n >= System.Numerics.Vector<double>.Count,
+            $"n={n} must reach the vector body (lanes={System.Numerics.Vector<double>.Count})");
 
         ScalarStreaming.RunFp64(a, k, false, b, n, false, cScalar, n, m, n, k);
         PortableSimdStreaming.RunFp64(a, k, false, b, n, false, cVector, n, m, n, k);
