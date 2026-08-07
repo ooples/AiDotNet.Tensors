@@ -213,10 +213,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal void Synchronize()
     {
         using var _ = Enter();
-        if (_stream != IntPtr.Zero)
-            Check(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
-        else
-            Check(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
+        Check(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
     }
 
     internal DirectPtxGraph CaptureGraph(Action launch)
@@ -475,10 +472,22 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)source.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Source is larger than the device buffer.", nameof(source));
         using var _ = _runtime.Enter();
+        // Do not let a host write race earlier work on this runtime's stream.
+        // A stream-local barrier preserves ordering without stalling unrelated
+        // streams or other contexts on the device.
+        _runtime.Synchronize();
         fixed (T* pSource = source)
+        {
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyHtoD(_pointer, (IntPtr)pSource, checked((ulong)bytes)),
                 "cuMemcpyHtoD");
+            // The synchronous pageable-host copy stages through the default
+            // stream. Complete that stream before a caller can enqueue new work
+            // on the runtime's CU_STREAM_NON_BLOCKING stream.
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero),
+                "cuStreamSynchronize(upload staging)");
+        }
     }
 
     internal unsafe void Download<T>(Span<T> destination) where T : unmanaged
@@ -486,6 +495,9 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)destination.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Destination is larger than the device buffer.", nameof(destination));
         using var _ = _runtime.Enter();
+        // Make Download independently correct when the caller omits an explicit
+        // barrier, while waiting only for the stream that produces this buffer.
+        _runtime.Synchronize();
         fixed (T* pDestination = destination)
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyDtoH((IntPtr)pDestination, _pointer, checked((ulong)bytes)),

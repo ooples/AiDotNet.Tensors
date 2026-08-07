@@ -44,8 +44,13 @@ internal static class TensorCoreCheckTool
         Console.WriteLine();
         Console.WriteLine(
             "{0,-40} {1,9} {2,12} {3,7} {4,8} {5,10} {6,10} {7,8} {8,9} {9,8}",
-            "kernel", "elements", "max rel dev", "result", "lowering", "double", "single",
-            "dbl gain", "TFLOP/s", "scalar");
+            // "primary" is whatever lowering the emitter actually SELECTED for this shape - it is
+            // not necessarily double-buffered, since EmitStaged falls back to single buffering when
+            // CanDoubleBuffer is false, and non-stageable shapes lower naive. The "lowering" column
+            // reports which one ran, and "db gain" is only populated when the primary really was
+            // double-buffered, so the ratio always compares double against single.
+            "kernel", "elements", "max rel dev", "result", "lowering", "primary", "single",
+            "db gain", "TFLOP/s", "scalar");
 
         int passed = 0, failed = 0;
         foreach (var (label, spec, verify) in Cases())
@@ -172,10 +177,13 @@ internal static class TensorCoreCheckTool
                 outCount.ToString("N0", CultureInfo.InvariantCulture),
                 verify ? deviation.ToString("0.000E+000", CultureInfo.InvariantCulture) : "timing",
                 ok ? (verify ? "PASS" : "-") : "FAIL",
-                emitter.Staged ? "staged" : "naive",
+                emitter.Staged ? (emitter.DoubleBuffered ? "staged+db" : "staged+sb") : "naive",
                 wmmaUs > 0 ? wmmaUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
                 singleUs > 0 ? singleUs.ToString("0.0", CultureInfo.InvariantCulture) + " us" : "-",
-                (wmmaUs > 0 && singleUs > 0)
+                // Only a real double-vs-single ratio when the primary WAS double-buffered.
+                // Otherwise both sides are single-buffered (or the primary is naive) and the
+                // quotient would read as a double-buffering gain that was never measured.
+                (wmmaUs > 0 && singleUs > 0 && emitter.DoubleBuffered)
                     ? (singleUs / wmmaUs).ToString("0.000", CultureInfo.InvariantCulture) + "x"
                     : "-",
                 wmmaUs > 0

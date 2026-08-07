@@ -1519,7 +1519,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // A failed sync here is almost always a STICKY context error (the very CUDA-700 this
                 // allocator guards against), NOT out-of-memory — throw with its real name so the OOM
                 // diagnostic below isn't misleading. Trim is best-effort: warn but still attempt the retry.
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
                 var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
                 if (trimStatus != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
@@ -1638,7 +1638,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // As in the sync-path reclamation: a failed sync is a real (often sticky) error, so throw
             // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
             // Trim is best-effort.
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
                 var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);

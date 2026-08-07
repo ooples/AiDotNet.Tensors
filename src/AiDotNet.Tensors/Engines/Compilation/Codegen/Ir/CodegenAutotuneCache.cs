@@ -16,6 +16,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
@@ -26,7 +27,7 @@ public static class CodegenAutotuneCache
         CodegenMeasurementProtocol.AutotuneGainNoiseFloor;
     private static readonly object Sync = new();
     private static Dictionary<CacheKey, string>? _winners;
-    private static string _cachePath = Path.Combine("artifacts", "autotune.tsv");
+    private static string _cachePath = ResolveDefaultCachePath();
 
     private readonly record struct CacheKey(
         string Kernel,
@@ -101,6 +102,18 @@ public static class CodegenAutotuneCache
         {
             return map;
         }
+        catch (ArgumentException)
+        {
+            return map;
+        }
+        catch (NotSupportedException)
+        {
+            return map;
+        }
+        catch (SecurityException)
+        {
+            return map;
+        }
 
         foreach (string line in lines)
         {
@@ -127,5 +140,14 @@ public static class CodegenAutotuneCache
             map[key] = cells[1];
         }
         return map;
+    }
+
+    internal static string ResolveDefaultCachePath()
+    {
+        string? configured =
+            Environment.GetEnvironmentVariable("AIDOTNET_CODEGEN_AUTOTUNE_CACHE");
+        return string.IsNullOrWhiteSpace(configured)
+            ? Path.Combine("artifacts", "autotune.tsv")
+            : configured;
     }
 }
