@@ -45,6 +45,15 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The first stochastic specialization is deliberately limited to the
+    /// exact SM for which its launch/resource contract was authored. It stays
+    /// behind an experimental gate until correctness, performance, and Nsight
+    /// evidence promote it.
+    /// </summary>
+    internal static bool HasExperimentalRngDropout(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The issue-#846 recurrent specialization is validated only on exact
     /// GA102/SM86. Other architectures remain separate tuning domains.
     /// </summary>

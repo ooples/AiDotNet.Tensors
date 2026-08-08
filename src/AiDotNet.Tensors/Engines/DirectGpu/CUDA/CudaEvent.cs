@@ -56,6 +56,7 @@ public sealed class CudaEvent : IGpuEvent
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         _enableTiming = enableTiming;
+        _backend.EnsureContextCurrent();
 
         CudaStream? cudaStream = null;
         if (stream is not null)
