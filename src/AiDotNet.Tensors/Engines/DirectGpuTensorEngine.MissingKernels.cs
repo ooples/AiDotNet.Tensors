@@ -8020,7 +8020,7 @@ public partial class DirectGpuTensorEngine
 
             // Linear transform: [V,ic] @ [ic,oc] = [V,oc], then broadcast-add bias[oc] over vertices.
             var dw = e.TensorMatMul(diffused, e.TensorTranspose(weights));
-            return e.TensorBroadcastAdd(dw, biases);
+            return e.TensorAdd(dw, biases);
         }
         catch { return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
     }

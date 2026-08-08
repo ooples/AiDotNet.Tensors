@@ -57,7 +57,7 @@ internal sealed class PtxFusedPairwiseBoxIouF32Kernel : IDisposable
                     EntryPoint, info, BlockThreads, activeBlocks);
                 DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
                     Blueprint, runtime.DeviceFingerprint, Ptx, info,
-                    BlockThreads, activeBlocks, module.JitInfoLog);
+                    BlockThreads, activeBlocks, module);
                 return (Function: function, FunctionInfo: info, Audit: audit);
             });
         _module = loaded.Resource;

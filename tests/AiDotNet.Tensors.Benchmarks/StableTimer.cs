@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
-using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -40,10 +39,7 @@ internal static class StableTimer
     /// <param name="RelativeSpread">
     /// (max - min) / median across samples. The headline uncertainty.
     /// </param>
-    /// <param name="Samples">
-    /// Number of timing attempts performed, not the size of the retained three-sample
-    /// convergence window.
-    /// </param>
+    /// <param name="Samples">How many samples were taken.</param>
     /// <param name="Stable">Whether the spread came within tolerance.</param>
     internal readonly record struct Result(
         double Microseconds, double RelativeSpread, int Samples, bool Stable)
@@ -67,13 +63,9 @@ internal static class StableTimer
     /// <param name="B">Second timed operation.</param>
     /// <param name="Ratio">Median of A/B for each paired sample.</param>
     /// <param name="RelativeSpread">Spread of the paired ratios.</param>
-    /// <param name="Samples">
-    /// Number of paired timing attempts performed, not the size of the retained
-    /// three-sample convergence window.
-    /// </param>
+    /// <param name="Samples">Number of paired samples.</param>
     internal readonly record struct PairResult(
-        Result A, Result B, double Ratio, double RelativeSpread, int Samples,
-        int IterationsA, int IterationsB)
+        Result A, Result B, double Ratio, double RelativeSpread, int Samples)
     {
         /// <summary>
         /// A comparison is actionable only when both timings and their paired ratio
@@ -95,6 +87,9 @@ internal static class StableTimer
     /// </remarks>
     internal const double StableSpread = 0.05;
 
+    private const double TargetDeviceBatchMicroseconds = 250_000.0;
+    private const int MaxDeviceIterations = 50_000;
+
     /// <summary>
     /// Times <paramref name="launch"/>, repeating until the spread converges or attempts run out.
     /// </summary>
@@ -105,7 +100,7 @@ internal static class StableTimer
     /// is wrong at both ends: too few for a 20 us kernel to escape launch noise, and minutes
     /// of wall clock for a 100 ms one.
     /// </param>
-    /// <param name="maxAttempts">Timing attempts to make before giving up on convergence.</param>
+    /// <param name="maxAttempts">Samples to take before giving up on convergence.</param>
     internal static Result Measure(
         DirectPtxRuntime runtime, Action launch, long workUnits, int maxAttempts = 15)
     {
@@ -116,11 +111,9 @@ internal static class StableTimer
         int warmup = Math.Max(3, iterations / 10);
 
         var samples = new List<double>(3);
-        int attempts = 0;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            attempts++;
             // Warm up on the FIRST attempt only. Later attempts follow immediately, so the
             // clocks and caches are already where the measurement wants them; re-warming would
             // just spend time re-reaching the same state.
@@ -138,7 +131,7 @@ internal static class StableTimer
 
         double spread = SpreadOf(samples);
         return new Result(
-            Median(samples), spread, attempts,
+            Median(samples), spread, samples.Count,
             samples.Count >= 3 && spread <= StableSpread);
     }
 
@@ -179,11 +172,9 @@ internal static class StableTimer
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
         var ratios = new List<double>(3);
-        int attempts = 0;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            attempts++;
             double a = runtime.MeasureKernelMilliseconds(
                 launchA, 0, iterationsA) * 1000.0;
             double b = runtime.MeasureKernelMilliseconds(
@@ -201,128 +192,7 @@ internal static class StableTimer
             }
         }
 
-        return Pair(samplesA, samplesB, ratios, attempts, iterationsA, iterationsB);
-    }
-
-    /// <summary>
-    /// Event-times two launches on the same async backend as adjacent AB/BA
-    /// batches. A short calibration chooses enough launches for roughly 50 ms of
-    /// device work, avoiding both launch-noise-sized regions and pathological fixed
-    /// batches for serial kernels such as NMS.
-    /// </summary>
-    internal static PairResult MeasureDevicePair(
-        IAsyncGpuBackend backend,
-        Action launchA,
-        Action launchB,
-        int warmups = 5,
-        int maxAttempts = 15,
-        double targetBatchMilliseconds = 50.0,
-        int operationsPerLaunchA = 1,
-        int operationsPerLaunchB = 1,
-        int bracketsPerAttempt = 1)
-    {
-        if (backend is null) throw new ArgumentNullException(nameof(backend));
-        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
-        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
-        if (!backend.SupportsEvents)
-            throw new NotSupportedException("Device-paired timing requires GPU events.");
-        if (warmups < 0) throw new ArgumentOutOfRangeException(nameof(warmups));
-        if (maxAttempts < 3) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
-        if (!(targetBatchMilliseconds > 0) ||
-            double.IsInfinity(targetBatchMilliseconds))
-            throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
-        if (operationsPerLaunchA <= 0)
-            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchA));
-        if (operationsPerLaunchB <= 0)
-            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchB));
-        if (bracketsPerAttempt <= 0 || (bracketsPerAttempt & 1) == 0)
-            throw new ArgumentOutOfRangeException(nameof(bracketsPerAttempt),
-                "Use a positive odd bracket count so its median is an observed sample.");
-
-        for (int i = 0; i < warmups; i++)
-        {
-            launchA();
-            launchB();
-        }
-
-        using IGpuEvent start = backend.CreateEvent(enableTiming: true);
-        using IGpuEvent end = backend.CreateEvent(enableTiming: true);
-        // Five launches make the calibration usable even for kernels close to
-        // the event timer's resolution. The final batches are independently
-        // normalized, so asymmetric kernel costs remain a fair comparison.
-        const int calibrationLaunches = 5;
-        double calibrationA = double.PositiveInfinity;
-        double calibrationB = double.PositiveInfinity;
-        for (int i = 0; i < 3; i++)
-        {
-            calibrationA = Math.Min(calibrationA, TimeDeviceBatch(
-                backend, start, end, launchA, calibrationLaunches));
-            calibrationB = Math.Min(calibrationB, TimeDeviceBatch(
-                backend, start, end, launchB, calibrationLaunches));
-        }
-        // Equal launch counts make interference exposure symmetric and keep the
-        // ratio independent of calibration error. Size the common batch from
-        // the slower side so a serial loss cannot make one sample unbounded.
-        int iterationsA = CalibratedIterations(
-            Math.Max(calibrationA, calibrationB), targetBatchMilliseconds);
-        int iterationsB = iterationsA;
-
-        using IGpuEvent startA = backend.CreateEvent(enableTiming: true);
-        using IGpuEvent endA = backend.CreateEvent(enableTiming: true);
-        using IGpuEvent startB = backend.CreateEvent(enableTiming: true);
-        using IGpuEvent endB = backend.CreateEvent(enableTiming: true);
-        var samplesA = new List<double>(3);
-        var samplesB = new List<double>(3);
-        var ratios = new List<double>(3);
-        int attempts = 0;
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
-        {
-            attempts++;
-            var bracketA = new List<double>(bracketsPerAttempt);
-            var bracketB = new List<double>(bracketsPerAttempt);
-            var bracketRatios = new List<double>(bracketsPerAttempt);
-            for (int bracket = 0; bracket < bracketsPerAttempt; bracket++)
-            {
-                // AB then BA inside every bracket removes first/second-order bias
-                // without pretending it is kernel speed. Median-of-brackets can
-                // reject an isolated WDDM preemption; the outer consecutive-window
-                // gate still requires three independently agreeing samples.
-                EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
-                EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
-                endB.Synchronize();
-                double aFirst = backend.GetEventElapsedTime(startA, endA);
-                double bSecond = backend.GetEventElapsedTime(startB, endB);
-
-                EnqueueDeviceBatch(backend, startB, endB, launchB, iterationsB);
-                EnqueueDeviceBatch(backend, startA, endA, launchA, iterationsA);
-                endA.Synchronize();
-                double bFirst = backend.GetEventElapsedTime(startB, endB);
-                double aSecond = backend.GetEventElapsedTime(startA, endA);
-
-                double a = (aFirst + aSecond) * 500.0 /
-                    (iterationsA * (double)operationsPerLaunchA);
-                double b = (bFirst + bSecond) * 500.0 /
-                    (iterationsB * (double)operationsPerLaunchB);
-                bracketA.Add(a);
-                bracketB.Add(b);
-                bracketRatios.Add(a / b);
-            }
-            AddToConsecutiveWindow(samplesA, Median(bracketA));
-            AddToConsecutiveWindow(samplesB, Median(bracketB));
-            AddToConsecutiveWindow(ratios, Median(bracketRatios));
-            if (samplesA.Count >= 3 &&
-                SpreadOf(samplesA) <= StableSpread &&
-                SpreadOf(samplesB) <= StableSpread &&
-                SpreadOf(ratios) <= StableSpread)
-            {
-                break;
-            }
-        }
-
-        return Pair(
-            samplesA, samplesB, ratios, attempts,
-            checked(iterationsA * operationsPerLaunchA),
-            checked(iterationsB * operationsPerLaunchB));
+        return Pair(samplesA, samplesB, ratios);
     }
 
     /// <summary>
@@ -350,10 +220,8 @@ internal static class StableTimer
         Warm(launch, synchronize, iterations);
 
         var samples = new List<double>(3);
-        int attempts = 0;
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            attempts++;
             AddToConsecutiveWindow(
                 samples, TimeHostBatch(launch, synchronize, iterations));
 
@@ -362,8 +230,108 @@ internal static class StableTimer
 
         double spread = SpreadOf(samples);
         return new Result(
-            Median(samples), spread, attempts,
+            Median(samples), spread, samples.Count,
             samples.Count >= 3 && spread <= StableSpread);
+    }
+
+    /// <summary>
+    /// Device-times two launches as adjacent A/B batches when both use the caller's stream.
+    /// </summary>
+    /// <remarks>
+    /// Public-backend head-to-heads cannot reach the backend's private
+    /// <see cref="DirectPtxRuntime"/>, but they can still use one timing contract when both
+    /// routes share a context and stream. The supplied timer must return microseconds per
+    /// launch for an event-bracketed batch. Keeping convergence here preserves the same
+    /// consecutive-window and five-percent gates used by <see cref="MeasurePair"/>.
+    /// </remarks>
+    internal static PairResult MeasureDevicePair(
+        Action launchA, Action launchB,
+        long workUnitsA, long workUnitsB,
+        Action synchronize,
+        Func<Action, int, double> measureMicroseconds,
+        int maxAttempts = 15)
+    {
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (synchronize is null) throw new ArgumentNullException(nameof(synchronize));
+        if (measureMicroseconds is null)
+            throw new ArgumentNullException(nameof(measureMicroseconds));
+
+        int iterationsA = IterationsFor(workUnitsA);
+        int iterationsB = IterationsFor(workUnitsB);
+        bool traceSamples = string.Equals(
+            Environment.GetEnvironmentVariable("AIDOTNET_STABLE_TIMER_TRACE"),
+            "1", StringComparison.Ordinal);
+        Warm(launchA, synchronize, iterationsA);
+        Warm(launchB, synchronize, iterationsB);
+        iterationsA = CalibrateDeviceIterations(
+            launchA, iterationsA, measureMicroseconds);
+        iterationsB = CalibrateDeviceIterations(
+            launchB, iterationsB, measureMicroseconds);
+
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            // A symmetric ABBA window cancels first-order clock and thermal drift. A plain AB
+            // pair consistently attributed the direction of a 10-20% WDDM swing to whichever
+            // kernel happened to run second, even with event-bracketed 250 ms batches.
+            double aFirst = measureMicroseconds(launchA, iterationsA);
+            double bFirst = measureMicroseconds(launchB, iterationsB);
+            double bSecond = measureMicroseconds(launchB, iterationsB);
+            double aSecond = measureMicroseconds(launchA, iterationsA);
+            double a = (aFirst + aSecond) * 0.5;
+            double b = (bFirst + bSecond) * 0.5;
+            if (traceSamples)
+                Console.WriteLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "  stable-timer sample {0}: A {1:F3} us, B {2:F3} us, ratio {3:F4}x",
+                    attempt + 1, a, b, a / b));
+            AddToConsecutiveWindow(samplesA, a);
+            AddToConsecutiveWindow(samplesB, b);
+            AddToConsecutiveWindow(ratios, a / b);
+
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios);
+    }
+
+    /// <summary>
+    /// Corrects a work-unit estimate with bounded event-timed probes of the actual kernel.
+    /// </summary>
+    /// <remarks>
+    /// Scientific kernels can have the same nominal arithmetic count and radically different
+    /// occupancy or cache behavior. A proxy-derived count as low as five launches made a
+    /// 14-microsecond kernel a 70-microsecond sample, which is too short for the stability gate
+    /// to distinguish kernel behavior from ordinary device scheduling. Calibration only grows
+    /// the conservative starting count and remains capped. A second probe corrects a cold first
+    /// estimate that would otherwise leave the calibrated batch well short of its target.
+    /// </remarks>
+    private static int CalibrateDeviceIterations(
+        Action launch, int startingIterations,
+        Func<Action, int, double> measureMicroseconds)
+    {
+        int iterations = startingIterations;
+        for (int probe = 0; probe < 2; probe++)
+        {
+            double microsecondsPerLaunch = measureMicroseconds(launch, iterations);
+            if (!double.IsFinite(microsecondsPerLaunch) || microsecondsPerLaunch <= 0)
+                break;
+            int desired = (int)Math.Clamp(
+                Math.Ceiling(TargetDeviceBatchMicroseconds / microsecondsPerLaunch),
+                iterations, MaxDeviceIterations);
+            if (desired == iterations) break;
+            iterations = desired;
+        }
+        return iterations;
     }
 
     /// <summary>
@@ -405,11 +373,9 @@ internal static class StableTimer
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
         var ratios = new List<double>(3);
-        int attempts = 0;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            attempts++;
             double a = TimeHostBatch(launchA, synchronizeA, iterationsA);
             double b = TimeHostBatch(launchB, synchronizeB, iterationsB);
             AddToConsecutiveWindow(samplesA, a);
@@ -425,23 +391,131 @@ internal static class StableTimer
             }
         }
 
-        return Pair(samplesA, samplesB, ratios, attempts, iterationsA, iterationsB);
+        return Pair(samplesA, samplesB, ratios);
+    }
+
+    /// <summary>
+    /// Host-pairs two launches after calibrating independent batch lengths to the
+    /// same wall-clock exposure. AB/BA brackets remove launch-order bias; an odd
+    /// median-of-brackets rejects an isolated desktop preemption while the
+    /// unchanged outer spread gate decides actionability.
+    /// </summary>
+    internal static PairResult MeasureCalibratedHostPair(
+        Action launchA,
+        Action synchronizeA,
+        Action launchB,
+        Action synchronizeB,
+        int operationsPerLaunchA = 1,
+        int operationsPerLaunchB = 1,
+        int warmups = 3,
+        int maxAttempts = 15,
+        double targetBatchMilliseconds = 5.0,
+        int bracketsPerAttempt = 5)
+    {
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (synchronizeA is null) throw new ArgumentNullException(nameof(synchronizeA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (synchronizeB is null) throw new ArgumentNullException(nameof(synchronizeB));
+        if (operationsPerLaunchA <= 0)
+            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchA));
+        if (operationsPerLaunchB <= 0)
+            throw new ArgumentOutOfRangeException(nameof(operationsPerLaunchB));
+        if (warmups < 0) throw new ArgumentOutOfRangeException(nameof(warmups));
+        if (maxAttempts < 3) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+        if (!(targetBatchMilliseconds > 0) ||
+            double.IsInfinity(targetBatchMilliseconds))
+            throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
+        if (bracketsPerAttempt <= 0 || (bracketsPerAttempt & 1) == 0)
+            throw new ArgumentOutOfRangeException(nameof(bracketsPerAttempt),
+                "Use a positive odd bracket count so its median is an observed sample.");
+
+        for (int i = 0; i < warmups; i++)
+        {
+            launchA();
+            synchronizeA();
+            launchB();
+            synchronizeB();
+        }
+
+        const int calibrationLaunches = 3;
+        double calibrationA = double.PositiveInfinity;
+        double calibrationB = double.PositiveInfinity;
+        for (int i = 0; i < 3; i++)
+        {
+            calibrationA = Math.Min(calibrationA,
+                TimeHostBatch(launchA, synchronizeA, calibrationLaunches));
+            calibrationB = Math.Min(calibrationB,
+                TimeHostBatch(launchB, synchronizeB, calibrationLaunches));
+        }
+        int iterationsA = CalibratedIterationsFromMicroseconds(
+            calibrationA, targetBatchMilliseconds);
+        int iterationsB = CalibratedIterationsFromMicroseconds(
+            calibrationB, targetBatchMilliseconds);
+
+        var samplesA = new List<double>(3);
+        var samplesB = new List<double>(3);
+        var ratios = new List<double>(3);
+        int attempts = 0;
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            attempts++;
+            var bracketA = new List<double>(bracketsPerAttempt);
+            var bracketB = new List<double>(bracketsPerAttempt);
+            var bracketRatios = new List<double>(bracketsPerAttempt);
+            for (int bracket = 0; bracket < bracketsPerAttempt; bracket++)
+            {
+                double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA) /
+                    operationsPerLaunchA;
+                double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB) /
+                    operationsPerLaunchB;
+                double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB) /
+                    operationsPerLaunchB;
+                double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA) /
+                    operationsPerLaunchA;
+                double a = (aFirst + aSecond) * 0.5;
+                double b = (bFirst + bSecond) * 0.5;
+                bracketA.Add(a);
+                bracketB.Add(b);
+                bracketRatios.Add(a / b);
+            }
+            AddToConsecutiveWindow(samplesA, Median(bracketA));
+            AddToConsecutiveWindow(samplesB, Median(bracketB));
+            AddToConsecutiveWindow(ratios, Median(bracketRatios));
+            if (samplesA.Count >= 3 &&
+                SpreadOf(samplesA) <= StableSpread &&
+                SpreadOf(samplesB) <= StableSpread &&
+                SpreadOf(ratios) <= StableSpread)
+            {
+                break;
+            }
+        }
+
+        return Pair(samplesA, samplesB, ratios);
+    }
+
+    private static int CalibratedIterationsFromMicroseconds(
+        double microsecondsPerLaunch,
+        double targetBatchMilliseconds)
+    {
+        if (!(microsecondsPerLaunch > 0) || double.IsInfinity(microsecondsPerLaunch))
+            return 4_096;
+        return (int)Math.Clamp(
+            Math.Ceiling(targetBatchMilliseconds * 1_000.0 / microsecondsPerLaunch),
+            1, 4_096);
     }
 
     private static PairResult Pair(
-        List<double> samplesA, List<double> samplesB, List<double> ratios,
-        int attempts, int iterationsA, int iterationsB)
+        List<double> samplesA, List<double> samplesB, List<double> ratios)
     {
         double spreadA = SpreadOf(samplesA);
         double spreadB = SpreadOf(samplesB);
         double ratioSpread = SpreadOf(ratios);
         return new PairResult(
-            new Result(Median(samplesA), spreadA, attempts,
+            new Result(Median(samplesA), spreadA, samplesA.Count,
                 samplesA.Count >= 3 && spreadA <= StableSpread),
-            new Result(Median(samplesB), spreadB, attempts,
+            new Result(Median(samplesB), spreadB, samplesB.Count,
                 samplesB.Count >= 3 && spreadB <= StableSpread),
-            Median(ratios), ratioSpread, attempts,
-            iterationsA, iterationsB);
+            Median(ratios), ratioSpread, ratios.Count);
     }
 
     /// <summary>
@@ -469,44 +543,6 @@ internal static class StableTimer
         synchronize();
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds * 1000.0 / iterations;
-    }
-
-    private static double TimeDeviceBatch(
-        IAsyncGpuBackend backend,
-        IGpuEvent start,
-        IGpuEvent end,
-        Action launch,
-        int iterations)
-    {
-        backend.RecordEvent(start, backend.DefaultStream);
-        for (int i = 0; i < iterations; i++) launch();
-        backend.RecordEvent(end, backend.DefaultStream);
-        end.Synchronize();
-        return backend.GetEventElapsedTime(start, end) / iterations;
-    }
-
-    private static void EnqueueDeviceBatch(
-        IAsyncGpuBackend backend,
-        IGpuEvent start,
-        IGpuEvent end,
-        Action launch,
-        int iterations)
-    {
-        backend.RecordEvent(start, backend.DefaultStream);
-        for (int i = 0; i < iterations; i++) launch();
-        backend.RecordEvent(end, backend.DefaultStream);
-    }
-
-    private static int CalibratedIterations(
-        double millisecondsPerLaunch,
-        double targetBatchMilliseconds)
-    {
-        if (!(millisecondsPerLaunch > 0) ||
-            double.IsInfinity(millisecondsPerLaunch))
-            return 4_096;
-        return (int)Math.Clamp(
-            Math.Ceiling(targetBatchMilliseconds / millisecondsPerLaunch),
-            1, 4_096);
     }
 
     /// <summary>

@@ -183,31 +183,39 @@ internal static class DirectPtxVisionFamilyExperiment
             if (directThroughputGraph == IntPtr.Zero || currentThroughputGraph == IntPtr.Zero)
                 throw new InvalidOperationException(
                     $"Throughput graph capture failed after prewarm for {spec.Operation}.");
+            // Event-timed per-op probe used by the paired ABBA comparator. Mirrors
+            // the device-pair timing contract adopted across the direct-PTX
+            // head-to-head harnesses: microseconds per single launch.
+            using IGpuEvent pairStart = backend.CreateEvent(enableTiming: true);
+            using IGpuEvent pairStop = backend.CreateEvent(enableTiming: true);
+            double MeasureMicroseconds(Action launch, int iterations)
+            {
+                backend.RecordEvent(pairStart, backend.DefaultStream);
+                for (int i = 0; i < iterations; i++) launch();
+                backend.RecordEvent(pairStop, backend.DefaultStream);
+                pairStop.Synchronize();
+                return backend.GetEventElapsedTime(pairStart, pairStop) * 1_000.0 / iterations;
+            }
             // Measure the host-gap-free diagnostic first. Raw single-launch and
             // single-graph replay lanes can spend seconds waiting for a clean WDDM
             // window; they must not contaminate the kernel-level diagnosis that
             // tells the autotuner which implementation actually needs work.
             StableTimer.PairResult throughputComparison = StableTimer.MeasureDevicePair(
-                backend,
                 () => backend.EnqueueCapturedGraph(directThroughputGraph),
                 () => backend.EnqueueCapturedGraph(currentThroughputGraph),
-                // Keep each ABBA bracket below the desktop compositor cadence.
-                // The 64-node graphs provide timer resolution without forcing
-                // every bracket to overlap a WDDM display preemption.
-                targetBatchMilliseconds: 0.5,
-                operationsPerLaunchA: ThroughputOperationsPerGraph,
-                operationsPerLaunchB: ThroughputOperationsPerGraph,
-                bracketsPerAttempt: 21);
+                ThroughputOperationsPerGraph, ThroughputOperationsPerGraph,
+                backend.Synchronize, MeasureMicroseconds);
             PrintComparison(run, spec, pairedSpec is not null,
                 "kernel-throughput", throughputComparison);
             StableTimer.PairResult launchComparison = StableTimer.MeasureDevicePair(
-                backend, cell.LaunchDirect, cell.LaunchCurrent);
+                cell.LaunchDirect, cell.LaunchCurrent,
+                1, 1, backend.Synchronize, MeasureMicroseconds);
             PrintComparison(run, spec, pairedSpec is not null,
                 "launch", launchComparison);
             StableTimer.PairResult graphComparison = StableTimer.MeasureDevicePair(
-                backend,
                 () => backend.EnqueueCapturedGraph(directGraph),
-                () => backend.EnqueueCapturedGraph(currentGraph));
+                () => backend.EnqueueCapturedGraph(currentGraph),
+                1, 1, backend.Synchronize, MeasureMicroseconds);
             PrintComparison(run, spec, pairedSpec is not null,
                 "cuda-graph", graphComparison);
 
@@ -277,8 +285,6 @@ internal static class DirectPtxVisionFamilyExperiment
             required_gain = requiredGain,
             promotion_gain = promotionGain,
             samples = timing.Samples,
-            direct_launches_per_sample = timing.IterationsA,
-            incumbent_launches_per_sample = timing.IterationsB,
             protocol = CodegenMeasurementProtocol.Tag
         }));
     }

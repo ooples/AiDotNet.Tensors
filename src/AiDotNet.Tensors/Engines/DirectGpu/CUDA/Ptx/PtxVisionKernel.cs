@@ -95,7 +95,7 @@ internal sealed class PtxVisionKernel : IDisposable
                     EntryPoint, info, blockThreads, activeBlocks);
                 DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
                     Blueprint, runtime.DeviceFingerprint, Definition.Ptx, info,
-                    blockThreads, activeBlocks, module.JitInfoLog);
+                    blockThreads, activeBlocks, module);
                 return (Function: function, FunctionInfo: info, Audit: audit);
             });
         _module = loaded.Resource;

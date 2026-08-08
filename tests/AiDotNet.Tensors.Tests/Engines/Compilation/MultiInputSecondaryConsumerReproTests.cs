@@ -98,7 +98,7 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
         {
             var xb = engine.TensorMatMul(x, wx);                  // [2,5]
             var scale = engine.TensorMatMul(t, wt);              // [1,5]
-            var o = engine.TensorBroadcastMultiply(xb, scale);   // adaLN scale
+            var o = engine.TensorMultiply(xb, scale);   // adaLN scale
             var arr = new float[o.Length]; o.AsSpan().CopyTo(arr); return arr;
         }
 
@@ -106,7 +106,7 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
         try
         {
             var plan = cache.GetOrCompileInference(new[] { x0, t0 }, () =>
-                engine.TensorBroadcastMultiply(engine.TensorMatMul(x0, wx), engine.TensorMatMul(t0, wt)));
+                engine.TensorMultiply(engine.TensorMatMul(x0, wx), engine.TensorMatMul(t0, wt)));
             AssertReplayMatches(plan, () => Tensor<float>.CreateRandom(new[] { 2, 4 }),
                 () => Tensor<float>.CreateRandom(new[] { 1, 3 }), Eager, "broadcast-modulation");
         }

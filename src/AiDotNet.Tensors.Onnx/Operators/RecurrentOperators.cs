@@ -155,8 +155,8 @@ internal static class RecurrentOperators
                     var cPre = GatePreActivation(ctx, xt, hPrev, wcT, rcT, gateBs.Item4, gateBs.Item8);
 
                     // Peepholes: P_i * c_{t-1} to i, P_f * c_{t-1} to f.
-                    if (pI is not null) iPre = ctx.Engine.TensorAdd(iPre, ctx.Engine.TensorBroadcastMultiply(cPrev, pI));
-                    if (pF is not null) fPre = ctx.Engine.TensorAdd(fPre, ctx.Engine.TensorBroadcastMultiply(cPrev, pF));
+                    if (pI is not null) iPre = ctx.Engine.TensorAdd(iPre, ctx.Engine.TensorMultiply(cPrev, pI));
+                    if (pF is not null) fPre = ctx.Engine.TensorAdd(fPre, ctx.Engine.TensorMultiply(cPrev, pF));
 
                     var it = ctx.Engine.Sigmoid(iPre);
                     var ftGate = inputForget != 0 ? OneMinus(ctx, it) : ctx.Engine.Sigmoid(fPre);
@@ -168,7 +168,7 @@ internal static class RecurrentOperators
                     var cNext = ctx.Engine.TensorAdd(cForget, cNew);
 
                     // P_o * c_t to o after cell update (ONNX peephole order).
-                    if (pO is not null) oPre = ctx.Engine.TensorAdd(oPre, ctx.Engine.TensorBroadcastMultiply(cNext, pO));
+                    if (pO is not null) oPre = ctx.Engine.TensorAdd(oPre, ctx.Engine.TensorMultiply(cNext, pO));
                     var ot = ctx.Engine.Sigmoid(oPre);
 
                     // Clip: clamp cell state to [-clip, clip].
@@ -507,7 +507,7 @@ internal static class RecurrentOperators
         OnnxTranslationContext<T> ctx, Tensor<T> a, Tensor<T> bT, Tensor<T>? bias) where T : unmanaged
     {
         var mm = ctx.Engine.TensorMatMul(a, bT);
-        return bias is null ? mm : ctx.Engine.TensorBroadcastAdd(mm, bias);
+        return bias is null ? mm : ctx.Engine.TensorAdd(mm, bias);
     }
 
     private static Tensor<T> OneMinus<T>(OnnxTranslationContext<T> ctx, Tensor<T> t) where T : unmanaged
@@ -601,12 +601,12 @@ internal static class RecurrentOperators
             maskSpan[b] = t < seqLens[b] ? one : zero;
         // blended = mask * active + (1 - mask) * fallback, broadcasting mask
         // along the H axis.
-        var maskedActive = ctx.Engine.TensorBroadcastMultiply(active, maskT);
+        var maskedActive = ctx.Engine.TensorMultiply(active, maskT);
         var onesMinusMask = new Tensor<T>(new[] { batch, 1 });
         var omm = onesMinusMask.AsWritableSpan();
         for (int b = 0; b < batch; b++)
             omm[b] = t < seqLens[b] ? zero : one;
-        var maskedFallback = ctx.Engine.TensorBroadcastMultiply(fallback, onesMinusMask);
+        var maskedFallback = ctx.Engine.TensorMultiply(fallback, onesMinusMask);
         return ctx.Engine.TensorAdd(maskedActive, maskedFallback);
     }
 

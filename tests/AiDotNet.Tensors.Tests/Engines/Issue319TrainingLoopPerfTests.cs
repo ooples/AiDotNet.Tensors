@@ -47,6 +47,26 @@ public class Issue319TrainingLoopPerfTests
         AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
     }
 
+    [Fact]
+    public void TensorAdd_BroadcastBiasGradientReducesTheSequenceAxis()
+    {
+        const int Rows = 3;
+        const int Columns = 4;
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { Rows, Columns });
+        var bias = new Tensor<float>(new[] { Columns });
+
+        using var tape = new GradientTape<float>();
+        var result = engine.TensorAdd(input, bias);
+        var loss = engine.ReduceSum(result, axes: null, keepDims: false);
+        var gradients = tape.ComputeGradients(loss, new[] { bias });
+
+        Assert.True(gradients.TryGetValue(bias, out Tensor<float> biasGradient));
+        Assert.Equal(new[] { Columns }, biasGradient._shape);
+        for (int col = 0; col < Columns; col++)
+            Assert.Equal((float)Rows, biasGradient[col]);
+    }
+
     /// <summary>
     /// Times one full training iteration on a 4-layer MLP at ViT-Base
     /// hidden dimensions: each layer is matmul + bias-add + GELU +
@@ -293,7 +313,7 @@ public class Issue319TrainingLoopPerfTests
             for (int l = 0; l < weights.Length; l++)
             {
                 var z = engine.TensorMatMul(current, weights[l]);
-                var z2 = engine.TensorBroadcastAdd(z, biases[l]);
+                var z2 = engine.TensorAdd(z, biases[l]);
                 var a = engine.GELU(z2);
                 current = engine.LayerNorm(a, gammas[l], betas[l], 1e-5, out _, out _);
             }
@@ -303,6 +323,7 @@ public class Issue319TrainingLoopPerfTests
 
             sw.Restart();
             var grads = tape.ComputeGradients(loss, sources);
+            AssertBroadcastBiasGradients(biases, grads);
             sw.Stop();
             bwd = sw.Elapsed.TotalMilliseconds;
 
@@ -345,12 +366,13 @@ public class Issue319TrainingLoopPerfTests
         for (int l = 0; l < weights.Length; l++)
         {
             var z = engine.TensorMatMul(current, weights[l]);
-            var z2 = engine.TensorBroadcastAdd(z, biases[l]);
+            var z2 = engine.TensorAdd(z, biases[l]);
             var a = engine.GELU(z2);
             current = engine.LayerNorm(a, gammas[l], betas[l], 1e-5, out _, out _);
         }
         var loss = engine.ReduceSum(current, axes: null, keepDims: false);
         var grads = tape.ComputeGradients(loss, sources);
+        AssertBroadcastBiasGradients(biases, grads);
         const float lr = 1e-4f;
         foreach (var src in sources)
         {
@@ -363,6 +385,24 @@ public class Issue319TrainingLoopPerfTests
             {
                 var update = engine.TensorMultiplyScalar(g, lr);
                 engine.TensorSubtractInPlace(src, update);
+            }
+        }
+    }
+
+    private static void AssertBroadcastBiasGradients(
+        Tensor<float>[] biases,
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> gradients)
+    {
+        foreach (Tensor<float> bias in biases)
+        {
+            Assert.True(gradients.TryGetValue(bias, out Tensor<float> gradient),
+                "TensorAdd detached a broadcast bias from the training graph.");
+            Assert.Equal(bias._shape, gradient._shape);
+            for (int i = 0; i < gradient.Length; i++)
+            {
+                float value = gradient[i];
+                Assert.False(float.IsNaN(value) || float.IsInfinity(value),
+                    $"Broadcast bias gradient is non-finite at {i}: {value}.");
             }
         }
     }

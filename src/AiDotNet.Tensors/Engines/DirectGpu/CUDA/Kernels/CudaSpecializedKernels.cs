@@ -665,7 +665,7 @@ extern ""C"" __global__ __launch_bounds__(256) void complex_conjugate(
     output[idx+1] = -input[idx+1];
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void complex_magnitude(
+extern ""C"" __global__ __launch_bounds__(256) void complex_magnitude_interleaved(
     const float* input, float* output, int numPairs)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -703,7 +703,7 @@ extern ""C"" __global__ __launch_bounds__(256) void complex_magnitude(
             // Complex tensor ops
             "complex_multiply",
             "complex_conjugate",
-            "complex_magnitude"
+            "complex_magnitude_interleaved"
         };
     }
 }
