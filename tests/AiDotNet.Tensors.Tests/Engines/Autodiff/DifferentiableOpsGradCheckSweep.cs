@@ -796,12 +796,37 @@ public class DifferentiableOpsGradCheckSweep
         _out.WriteLine("");
         foreach (var s in skipped.OrderBy(x => x)) _out.WriteLine("skip  " + s);
 
-        if (mismatches.Count > 0 || noGradient.Count > 0)
+        // A SKIP is an op the harness could not drive at all, so its gradient is simply UNVERIFIED.
+        // That is materially different from a pass, and it is invisible in a green build unless it
+        // is asserted on: this suite went from 114 skips to 0 by adding per-op argument tables, and
+        // without a ratchet the next op whose parameters the synthesizer cannot handle would slip
+        // back in silently and CI would stay green while coverage rotted.
+        //
+        // Measured 0 skips on BOTH target frameworks (net10.0 and net471, 251 ops verified on each),
+        // so 0 is the honest floor rather than a number chosen to make the assertion pass.
+        //
+        // An op that genuinely cannot be gradient-checked has a supported escape hatch — add it to
+        // the Exempt table above with the reason, which keeps it visible as a deliberate exclusion
+        // instead of an accident. So the ratchet does not block legitimate work; it forces a new op
+        // to be either COVERED or DOCUMENTED, never silently unchecked.
+        if (mismatches.Count > 0 || noGradient.Count > 0 || skipped.Count > 0)
         {
+            var problems = new List<string>();
+            if (mismatches.Count > 0)
+                problems.Add($"{mismatches.Count} op(s) disagree with finite differences");
+            if (noGradient.Count > 0)
+                problems.Add($"{noGradient.Count} record no gradient despite being classified differentiable");
+            if (skipped.Count > 0)
+                problems.Add($"{skipped.Count} could not be driven by the harness at all, leaving their " +
+                             "gradients unverified (add a per-op entry to the argument table so the op can be " +
+                             "invoked, or add it to the Exempt table with a documented reason)");
+
             Assert.Fail(
-                $"{mismatches.Count} op(s) disagree with finite differences and {noGradient.Count} record no " +
-                "gradient despite being classified differentiable.\n" +
-                string.Join("\n", mismatches.Concat(noGradient).Take(40)));
+                string.Join("; ", problems) + ".\n" +
+                string.Join("\n", mismatches
+                    .Concat(noGradient)
+                    .Concat(skipped.OrderBy(x => x).Select(s => "SKIPPED " + s))
+                    .Take(40)));
         }
     }
 

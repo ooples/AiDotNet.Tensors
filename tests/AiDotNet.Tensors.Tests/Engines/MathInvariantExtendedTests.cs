@@ -60,15 +60,15 @@ public class MathInvariantExtendedTests
     [Fact] public void MulInto_ZeroResult() { var a = R([64], 1); var z = C(0f, 64); var dest = new Tensor<float>(new float[64], [64]); E.TensorMultiplyInto(dest, a, z); AZ(dest); }
 
     // ================================================================
-    // TensorBroadcastSubtract (2)
+    // TensorSubtract (2)
     // ================================================================
-    [Fact] public void BroadcastSubtract_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastSubtract(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
-    [Fact] public void BroadcastSubtract_SameAsManualExpand() { var a = R([1, 8], 1); var b = R([1, 8], 2); float[] aRow = a.GetDataArray(); float[] bRow = b.GetDataArray(); float[] aExp = Enumerable.Concat(Enumerable.Concat(aRow, aRow), Enumerable.Concat(aRow, aRow)).ToArray(); float[] bExp = Enumerable.Concat(Enumerable.Concat(bRow, bRow), Enumerable.Concat(bRow, bRow)).ToArray(); var result = E.TensorBroadcastSubtract(new Tensor<float>(aExp, [4, 8]), new Tensor<float>(bExp, [4, 8])); var broadcast = E.TensorBroadcastSubtract(new Tensor<float>(aExp, [4, 8]), b); AE(result, broadcast, 1e-3f); }
+    [Fact] public void BroadcastSubtract_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorSubtract(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
+    [Fact] public void BroadcastSubtract_SameAsManualExpand() { var a = R([1, 8], 1); var b = R([1, 8], 2); float[] aRow = a.GetDataArray(); float[] bRow = b.GetDataArray(); float[] aExp = Enumerable.Concat(Enumerable.Concat(aRow, aRow), Enumerable.Concat(aRow, aRow)).ToArray(); float[] bExp = Enumerable.Concat(Enumerable.Concat(bRow, bRow), Enumerable.Concat(bRow, bRow)).ToArray(); var result = E.TensorSubtract(new Tensor<float>(aExp, [4, 8]), new Tensor<float>(bExp, [4, 8])); var broadcast = E.TensorSubtract(new Tensor<float>(aExp, [4, 8]), b); AE(result, broadcast, 1e-3f); }
 
     // ================================================================
     // TensorBroadcastAddInPlace (2)
     // ================================================================
-    [Fact] public void BroadcastAddInPlace_MatchesBroadcastAdd() { var a = R([4, 8], 1); var b = R([1, 8], 2); var expected = E.TensorBroadcastAdd(a, b); var aCopy = new Tensor<float>(a.ToArray(), a._shape); E.TensorBroadcastAddInPlace(aCopy, b); AE(aCopy, expected, 1e-3f); }
+    [Fact] public void BroadcastAddInPlace_MatchesBroadcastAdd() { var a = R([4, 8], 1); var b = R([1, 8], 2); var expected = E.TensorAdd(a, b); var aCopy = new Tensor<float>(a.ToArray(), a._shape); E.TensorBroadcastAddInPlace(aCopy, b); AE(aCopy, expected, 1e-3f); }
     [Fact] public void BroadcastAddInPlace_AddZero_Unchanged() { var a = R([4, 8], 1); var z = C(0f, [1, 8]); var aCopy = new Tensor<float>(a.ToArray(), a._shape); E.TensorBroadcastAddInPlace(aCopy, z); AE(aCopy, a); }
 
     // ================================================================
@@ -667,7 +667,7 @@ public class MathInvariantExtendedTests
         // a: [2, 3, 4, 5], b: [1, 1, 1, 5] -> broadcast multiply
         var a = R([2, 3, 4, 5], 202);
         var b = R([1, 1, 1, 5], 203);
-        var result = E.TensorBroadcastMultiply(a, b);
+        var result = E.TensorMultiply(a, b);
         Assert.Equal(new[] { 2, 3, 4, 5 }, result.Shape.ToArray());
         // Verify values: each element a[i] should be multiplied by b[i % 5]
         var ad = a.GetDataArray(); var bd = b.GetDataArray(); var rd = result.GetDataArray();
@@ -681,7 +681,7 @@ public class MathInvariantExtendedTests
         // Broadcast across multiple axes simultaneously: [4, 3, 5] * [4, 1, 5]
         var a = R([4, 3, 5], 204);
         var b = R([4, 1, 5], 205);
-        var result = E.TensorBroadcastMultiply(a, b);
+        var result = E.TensorMultiply(a, b);
         Assert.Equal(new[] { 4, 3, 5 }, result.Shape.ToArray());
         var ad = a.GetDataArray(); var bd = b.GetDataArray(); var rd = result.GetDataArray();
         for (int i = 0; i < 4; i++)

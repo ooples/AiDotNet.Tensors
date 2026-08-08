@@ -3,7 +3,7 @@
 //
 // WHY THIS EXISTS. CudaBackend.BroadcastMultiplyLastAxis asked the kernel cache for
 // "broadcast_multiply_last_axis", a name defined NOWHERE. Every call threw kernel-not-found and
-// DirectGpuTensorEngine.TensorBroadcastMultiply swallowed it in a bare catch, returning a correct CPU
+// DirectGpuTensorEngine.TensorMultiply swallowed it in a bare catch, returning a correct CPU
 // result while doing zero GPU work. It survived because:
 //   - the hollow-override probe only counts the THROWING kernel-cache indexer, and this site used
 //     TryGetValue, so no KernelMiss was ever recorded; and

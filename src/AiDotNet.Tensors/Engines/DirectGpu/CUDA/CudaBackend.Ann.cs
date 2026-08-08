@@ -26,6 +26,7 @@ public sealed partial class CudaBackend : IAnnBackend
         long totalLong = (long)numQueries * numDatabase;
         if (totalLong > int.MaxValue)
             throw new OverflowException($"ANN distance matrix total {totalLong} exceeds Int32.MaxValue.");
+        if (TryDirectPtxAnnComputeDistances(queries, database, distances, numQueries, numDatabase, dim, metric)) return;
         var kernel = ResolveAnnKernel("ann_compute_distances");
         using var _ = PushContext();
         int total = (int)totalLong;
@@ -42,6 +43,7 @@ public sealed partial class CudaBackend : IAnnBackend
         int numVectors, int numCentroids, int dim, AnnMetric metric)
     {
         if (numVectors <= 0 || numCentroids <= 0) return;
+        if (TryDirectPtxAnnIvfAssign(vectors, centroids, assignments, numVectors, numCentroids, dim, metric)) return;
         var kernel = ResolveAnnKernel("ann_ivf_assign");
         using var _ = PushContext();
         uint grid = (uint)((numVectors + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -60,6 +62,7 @@ public sealed partial class CudaBackend : IAnnBackend
         long totalLong = (long)numQueries * m * ksub;
         if (totalLong > int.MaxValue)
             throw new OverflowException($"ANN PQ table total {totalLong} exceeds Int32.MaxValue.");
+        if (TryDirectPtxAnnPqDistanceTables(queries, codebooks, tables, numQueries, m, ksub, dsub, metric)) return;
         var kernel = ResolveAnnKernel("ann_pq_distance_tables");
         using var _ = PushContext();
         int total = (int)totalLong;
@@ -79,6 +82,7 @@ public sealed partial class CudaBackend : IAnnBackend
         long totalLong = (long)numQueries * numCodes;
         if (totalLong > int.MaxValue)
             throw new OverflowException($"ANN PQ ADC total {totalLong} exceeds Int32.MaxValue.");
+        if (TryDirectPtxAnnPqAdcScan(codes, tables, distances, numQueries, numCodes, m, ksub)) return;
         var kernel = ResolveAnnKernel("ann_pq_adc_scan");
         using var _ = PushContext();
         int total = (int)totalLong;

@@ -74,19 +74,26 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             isPaged, queryHeads, keyValueHeads, sequenceLength,
             blockSize, poolBlocks, scale, WarpsPerBlock);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(
-            isPaged ? PagedEntryPoint : DenseEntryPoint,
-            out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int blockThreads = WarpsPerBlock * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            isPaged ? PagedEntryPoint : DenseEntryPoint,
-            functionInfo, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+        string entryPoint = isPaged ? PagedEntryPoint : DenseEntryPoint;
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    entryPoint, out DirectPtxFunctionInfo functionInfo);
+                int blockThreads = WarpsPerBlock * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    entryPoint, functionInfo, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, FunctionInfo: functionInfo, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void LaunchDense(
@@ -96,10 +103,10 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         DirectPtxTensorView output)
     {
         if (IsPaged) throw new InvalidOperationException("A paged decode module requires a block table.");
-        Require(query, Blueprint.Tensors[0], nameof(query));
-        Require(key, Blueprint.Tensors[1], nameof(key));
-        Require(value, Blueprint.Tensors[2], nameof(value));
-        Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[1], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[2], nameof(value));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[3], nameof(output));
         RejectAliases(query, key, value, output);
 
         IntPtr q = query.Pointer, k = key.Pointer, v = value.Pointer, o = output.Pointer;
@@ -116,11 +123,11 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
         DirectPtxTensorView output)
     {
         if (!IsPaged) throw new InvalidOperationException("A dense decode module has no block table ABI.");
-        Require(query, Blueprint.Tensors[0], nameof(query));
-        Require(key, Blueprint.Tensors[1], nameof(key));
-        Require(value, Blueprint.Tensors[2], nameof(value));
-        Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
-        Require(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[1], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[2], nameof(value));
+        DirectPtxAbi.Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[4], nameof(output));
         RejectAliases(query, key, value, output);
 
         IntPtr q = query.Pointer, k = key.Pointer, v = value.Pointer;
@@ -146,17 +153,6 @@ internal sealed class PtxFusedDecodeAttentionD64Kernel : IDisposable
             throw new ArgumentException("Decode output may not alias Q, K, or V.", nameof(output));
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     public void Dispose() => _module.Dispose();
 

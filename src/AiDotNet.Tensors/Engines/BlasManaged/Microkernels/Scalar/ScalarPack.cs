@@ -49,15 +49,26 @@ internal static class ScalarPack
         for (int stripe = 0; stripe < numStripes; stripe++)
         {
             int packedOff = stripe * kc * mr;
-            for (int k = 0; k < kc; k++)
+            int baseRow = stripe * mr;
+
+            if (transA)
             {
-                for (int row = 0; row < mr; row++)
+                // A is [K, M], so consecutive logical ROWS are adjacent in memory — and the vpanel wants
+                // them adjacent too. The whole inner row loop is therefore a CONTIGUOUS block move, which
+                // CopyTo performs with the platform's vectorized memmove instead of mr scalar loads and
+                // stores. Bit-exact by construction: packing moves values and never arithmetic on them.
+                for (int k = 0; k < kc; k++)
+                    a.Slice((k * lda) + baseRow, mr).CopyTo(packed.Slice(packedOff + (k * mr), mr));
+            }
+            else
+            {
+                // A is [M, K]: consecutive logical rows are lda apart, so this is a strided gather and
+                // cannot become a block move. Left scalar deliberately — a register transpose would help
+                // here and is a separate, riskier change.
+                for (int k = 0; k < kc; k++)
                 {
-                    int logicalRow = stripe * mr + row;
-                    T value = transA
-                        ? a[k * lda + logicalRow]            // A stored [K, M], read M-stride
-                        : a[logicalRow * lda + k];           // A stored [M, K], read K-stride
-                    packed[packedOff + k * mr + row] = value;
+                    for (int row = 0; row < mr; row++)
+                        packed[packedOff + (k * mr) + row] = a[((baseRow + row) * lda) + k];
                 }
             }
         }
@@ -106,15 +117,24 @@ internal static class ScalarPack
         for (int stripe = 0; stripe < numFullStripes; stripe++)
         {
             int packedOff = stripe * kc * nr;
-            for (int k = 0; k < kc; k++)
+            int baseCol = stripe * nr;
+
+            if (!transB)
             {
-                for (int col = 0; col < nr; col++)
+                // B is [K, N], so a stripe's nr columns are ADJACENT in memory and the packed stripe wants
+                // them adjacent as well. This is the common case (untransposed B) and the entire inner
+                // column loop collapses to a contiguous block move, which CopyTo does with a vectorized
+                // memmove. Bit-exact: packing only moves values.
+                for (int k = 0; k < kc; k++)
+                    b.Slice((k * ldb) + baseCol, nr).CopyTo(packed.Slice(packedOff + (k * nr), nr));
+            }
+            else
+            {
+                // B is [N, K]: a stripe's columns are ldb apart, a strided gather. Left scalar.
+                for (int k = 0; k < kc; k++)
                 {
-                    int logicalCol = stripe * nr + col;
-                    T value = transB
-                        ? b[logicalCol * ldb + k]            // B stored [N, K], read K-stride
-                        : b[k * ldb + logicalCol];           // B stored [K, N], read N-stride
-                    packed[packedOff + k * nr + col] = value;
+                    for (int col = 0; col < nr; col++)
+                        packed[packedOff + (k * nr) + col] = b[((baseCol + col) * ldb) + k];
                 }
             }
         }
@@ -127,19 +147,25 @@ internal static class ScalarPack
             int tailStripe = numFullStripes;
             int tailPackedOff = tailStripe * kc * nr;
             int tailBaseCol = tailStripe * nr;
+
             for (int k = 0; k < kc; k++)
             {
-                for (int col = 0; col < nr; col++)
+                var destination = packed.Slice(tailPackedOff + (k * nr), nr);
+
+                if (!transB)
                 {
-                    int logicalCol = tailBaseCol + col;
-                    T value = default;
-                    if (col < tailCols)
-                    {
-                        value = transB
-                            ? b[logicalCol * ldb + k]
-                            : b[k * ldb + logicalCol];
-                    }
-                    packed[tailPackedOff + k * nr + col] = value;
+                    // Contiguous for the real columns, then the padding lanes are CLEARED rather than left
+                    // as whatever the buffer held. That zero-fill is load bearing, not tidiness: the packed
+                    // layout is always nr wide so a tail kernel reads all nr lanes, and pooled buffers are
+                    // not zeroed on rent — stale values in the padding would be multiplied into C.
+                    b.Slice((k * ldb) + tailBaseCol, tailCols).CopyTo(destination);
+                    destination.Slice(tailCols).Clear();
+                }
+                else
+                {
+                    for (int col = 0; col < tailCols; col++)
+                        destination[col] = b[((tailBaseCol + col) * ldb) + k];
+                    destination.Slice(tailCols).Clear();
                 }
             }
         }
