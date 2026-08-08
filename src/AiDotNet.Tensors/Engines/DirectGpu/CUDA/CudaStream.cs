@@ -16,6 +16,8 @@ public sealed class CudaStream : IGpuStream
     /// <inheritdoc/>
     public IntPtr Handle => _handle;
 
+    internal CudaBackend Backend => _backend;
+
     /// <inheritdoc/>
     public GpuStreamType StreamType { get; }
 
@@ -57,6 +59,7 @@ public sealed class CudaStream : IGpuStream
         Priority = priority;
         IsDefault = false;
         _ownsHandle = true;
+        _backend.EnsureContextCurrent();
 
         IntPtr streamHandle;
         CudaResult result;
@@ -101,6 +104,7 @@ public sealed class CudaStream : IGpuStream
     {
         ThrowIfDisposed();
 
+        _backend.EnsureContextCurrent();
         var result = CudaNativeBindings.cuStreamSynchronize(_handle);
         CuBlasNative.CheckCudaResult(result, "cuStreamSynchronize");
     }
@@ -121,7 +125,11 @@ public sealed class CudaStream : IGpuStream
         {
             throw new ArgumentException("Event must be a CudaEvent", nameof(gpuEvent));
         }
+        if (!ReferenceEquals(cudaEvent.Backend, _backend))
+            throw new ArgumentException(
+                "Stream and event must belong to the same CUDA backend.", nameof(gpuEvent));
 
+        _backend.EnsureContextCurrent();
         var result = CudaNativeBindings.cuStreamWaitEvent(_handle, cudaEvent.Handle, 0);
         CuBlasNative.CheckCudaResult(result, "cuStreamWaitEvent");
     }
@@ -134,6 +142,7 @@ public sealed class CudaStream : IGpuStream
     {
         ThrowIfDisposed();
 
+        _backend.EnsureContextCurrent();
         var result = CudaNativeBindings.cuStreamQuery(_handle);
 
         if (result == CudaResult.Success)
@@ -150,7 +159,7 @@ public sealed class CudaStream : IGpuStream
         return false;
     }
 
-    private void ThrowIfDisposed()
+    internal void ThrowIfDisposed()
     {
         if (_disposed)
         {
@@ -172,6 +181,7 @@ public sealed class CudaStream : IGpuStream
         {
             try
             {
+                _backend.EnsureContextCurrent();
                 CudaNativeBindings.cuStreamDestroy(_handle);
             }
             catch

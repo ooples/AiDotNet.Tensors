@@ -27,6 +27,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
             "parity210_i0","parity210_i1","parity210_i0e","parity210_i1e",
             "parity210_is_finite","parity210_is_nan","parity210_is_inf","parity210_nan_to_num",
             "parity210_cosine_similarity_last","parity210_cdist_l2",
+            "cosine_similarity","pairwise_distance_squared",
             "parity210_clamp_min_max",
         };
 
@@ -780,6 +781,42 @@ kernel void parity210_cdist_l2(
         acc += v * v;
     }
     out[gid] = sqrt(acc);
+}
+
+kernel void cosine_similarity(
+    device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& batch_size [[buffer(3)]], constant int& dim [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= batch_size) return;
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    int base_ = (int)gid * dim;
+    for (int k = 0; k < dim; ++k) {
+        float av = a[base_ + k], bv = b[base_ + k];
+        dot += av * bv;
+        na += av * av;
+        nb += bv * bv;
+    }
+    out[gid] = dot / (sqrt(na) * sqrt(nb) + 1.0e-8f);
+}
+
+kernel void pairwise_distance_squared(
+    device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& m [[buffer(3)]], constant int& n [[buffer(4)]],
+    constant int& dim [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= m * n) return;
+    int row = (int)gid / n;
+    int col = (int)gid % n;
+    float acc = 0.0f;
+    for (int k = 0; k < dim; ++k) {
+        float diff = a[row * dim + k] - b[col * dim + k];
+        acc += diff * diff;
+    }
+    out[gid] = acc;
 }
 
 // ==========================================================================

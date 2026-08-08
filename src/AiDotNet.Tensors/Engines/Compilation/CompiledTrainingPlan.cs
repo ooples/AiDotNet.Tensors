@@ -6095,7 +6095,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // TensorBroadcastAdd forward: route compiled-plan replay through
+        // Legacy TensorBroadcastAdd forward: route compiled-plan replay through
         // a copy-into-output + TensorBroadcastAddInPlace pair instead of the
         // generic "allocate fresh result + memcpy into plan output" closure.
         // Used in every SD UNet ResBlock for the time-embedding conditioning
@@ -6137,7 +6137,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 a.AsSpan().CopyTo(o.AsWritableSpan());
                 if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, b);
-                else { var r = eng.TensorBroadcastAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
+                else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
             };
         }
 
@@ -6888,8 +6888,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // engine fallback is the generic TensorMatMul which routes through SimdGemm.Dgemm.
         if (typeof(T) == typeof(double)
             && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
-            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
-            && BlasProvider.IsAvailable)
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
+            // Same reasoning as the float specialization below: TryGemmEx has a double overload
+            // that routes managed when no native library is present, so gating on native only
+            // forced this onto the allocating generic path.
         {
             var inputAd = step.Inputs[0];
             var inputBd = step.Inputs[1];
@@ -6957,7 +6959,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && step.OutputBuffer.IsContiguous
-            && BlasProvider.IsAvailable
+            // Deliberately NOT gated on BlasProvider.IsAvailable. TryGemmEx serves this contract
+            // from the managed SIMD kernel when no native library is present, and it writes dA/dB
+            // straight into the plan's pre-allocated gradient buffers. Requiring native here meant
+            // that on a BLAS-less host every matmul backward fell to the generic dictionary path,
+            // which rents fresh gradients and transposes every step — measured at 136 KB per
+            // compiled step, enough to force a Gen0 collection every ~100 steps and cost a 20-50 ms
+            // pause. If TryGemmEx still declines for a given shape the lambda below keeps its
+            // existing engine fallback, so this can only widen the allocation-free path.
             && typeof(T) == typeof(float))
         {
             var inputA = step.Inputs[0];

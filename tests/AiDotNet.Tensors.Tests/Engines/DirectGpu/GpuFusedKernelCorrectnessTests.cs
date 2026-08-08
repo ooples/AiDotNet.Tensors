@@ -436,13 +436,13 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
     }
 
     [SkippableFact]
-    public void TensorBroadcastMultiply_GpuMatchesCpu()
+    public void TensorMultiply_BroadcastShapes_GpuMatchesCpu()
     {
         SkipIfNoGpu();
         var a = RandomTensor(new[] { 4, 8 }, 101);
         var b = RandomTensor(new[] { 1, 8 }, 102);
-        var cpuResult = _cpu.TensorBroadcastMultiply(a, b);
-        var gpuResult = _gpu!.TensorBroadcastMultiply(a, b);
+        var cpuResult = _cpu.TensorMultiply(a, b);
+        var gpuResult = _gpu!.TensorMultiply(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -559,13 +559,13 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
     }
 
     [SkippableFact]
-    public void TensorBroadcastAdd_GpuMatchesCpu()
+    public void TensorAdd_BroadcastShapes_GpuMatchesCpu()
     {
         SkipIfNoGpu();
         var a = RandomTensor(new[] { 8, 16 }, 112);
         var b = RandomTensor(new[] { 1, 16 }, 113);
-        var cpuResult = _cpu.TensorBroadcastAdd(a, b);
-        var gpuResult = _gpu!.TensorBroadcastAdd(a, b);
+        var cpuResult = _cpu.TensorAdd(a, b);
+        var gpuResult = _gpu!.TensorAdd(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 

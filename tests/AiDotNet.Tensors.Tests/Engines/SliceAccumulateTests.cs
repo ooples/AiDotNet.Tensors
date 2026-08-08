@@ -73,7 +73,7 @@ public class SliceAccumulateTests
 
         // Slice and broadcast multiply
         var slice = tensor.GetSliceAlongDimension(1, 1); // [batch, dim], non-contiguous
-        var result = _engine.TensorBroadcastMultiply(slice, weight);
+        var result = _engine.TensorMultiply(slice, weight);
 
         // Verify
         for (int b = 0; b < batch; b++)

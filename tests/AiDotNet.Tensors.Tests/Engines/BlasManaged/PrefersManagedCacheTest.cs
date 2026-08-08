@@ -129,10 +129,24 @@ public class PrefersManagedCacheTest
 
             bool ok = BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N);
 
-            // With autotune off (and non-deterministic), cache must NOT be touched.
+            // With autotune off (and non-deterministic), cache must NOT be touched. This is what
+            // the test is actually about, and it is unchanged.
             Assert.Equal(0, PrefersManagedCache.Count);
-            // ok matches native availability (same as pre-F3 behavior).
-            Assert.Equal(BlasProvider.IsAvailable, ok);
+
+            // TryGemmEx now always serves a GEMM: natively when a library is present, from the
+            // managed kernel when it is not. This assertion previously read
+            // `Assert.Equal(BlasProvider.IsAvailable, ok)` — i.e. "no native library means this call
+            // FAILS" — and that contract was expensive. Every caller reads false as "no GEMM
+            // available" and takes a fallback, and those fallbacks allocate: the compiled training
+            // plan's specialized MatMul backward writes dA/dB directly into pre-allocated gradient
+            // buffers through this call, and on a host without native BLAS it was dropping to the
+            // generic dictionary backward at 136 KB of garbage per step, forcing a Gen0 collection
+            // every ~100 steps at a 20-50 ms pause each.
+            //
+            // Routing to managed here does not disturb what this test guards — the autotune cache is
+            // still bypassed, asserted above — it only replaces "give up" with "use the kernel we
+            // already have".
+            Assert.True(ok, "TryGemmEx should serve every float GEMM, managed when no native library exists.");
         }
         finally
         {

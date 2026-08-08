@@ -45,6 +45,21 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The issue-#846 recurrent specialization is validated only on exact
+    /// GA102/SM86. Other architectures remain separate tuning domains.
+    /// </summary>
+    internal static bool HasValidatedRgLruScan(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The checked-in softmax-family specializations (issue #840) are measured and
+    /// promoted only on GA10x/SM86. Other architectures fail closed to the established
+    /// backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedSoftmax(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The fused-linear + GELU decode specializations are measured and promoted
     /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
     /// tuning domains and must supply and benchmark their own specialization
@@ -95,6 +110,14 @@ internal static class DirectPtxArchitecture
     /// attached; other SMs must use the established backend.
     /// </summary>
     internal static bool HasExperimentalConvolution(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The checked-in specialized-scientific/hypercomplex/quantum specializations (issue
+    /// #854) are measured and promoted only on GA10x/SM86. Other architectures fail closed
+    /// to the established backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedScientific(int major, int minor) =>
         (major, minor) == (8, 6);
 }
 
@@ -200,7 +223,7 @@ internal readonly record struct DirectPtxTensorContract
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
     internal int ElementBytes => PhysicalType switch
     {
-        DirectPtxPhysicalType.Int8 => 1,
+        DirectPtxPhysicalType.Int8 or DirectPtxPhysicalType.UInt8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
@@ -212,8 +235,35 @@ internal readonly record struct DirectPtxResourceBudget(
     int MaxRegistersPerThread,
     int MaxStaticSharedBytes,
     int MaxLocalBytesPerThread,
-    int MinBlocksPerMultiprocessor)
+    int MinBlocksPerMultiprocessor,
+    int MeasuredRegistersPerThread = 0)
 {
+    // NVIDIA allocates registers in 256-register warp quanta. For a full
+    // 32-thread warp, one occupancy bucket is therefore eight registers per
+    // thread. Keep measured baselines inside their current bucket: harmless
+    // driver/JIT variation within the bucket passes, while a change that can
+    // affect occupancy still trips the release gate.
+    private const int RegistersPerThreadAllocationQuantum = 256 / 32;
+
+    internal static DirectPtxResourceBudget FromDriverMeasurement(
+        int measuredRegistersPerThread,
+        int maxStaticSharedBytes,
+        int maxLocalBytesPerThread,
+        int minBlocksPerMultiprocessor)
+    {
+        if (measuredRegistersPerThread <= 0)
+            throw new ArgumentOutOfRangeException(nameof(measuredRegistersPerThread));
+        int maxRegistersPerThread = checked(
+            ((measuredRegistersPerThread + RegistersPerThreadAllocationQuantum - 1) /
+             RegistersPerThreadAllocationQuantum) * RegistersPerThreadAllocationQuantum);
+        return new DirectPtxResourceBudget(
+            maxRegistersPerThread,
+            maxStaticSharedBytes,
+            maxLocalBytesPerThread,
+            minBlocksPerMultiprocessor,
+            measuredRegistersPerThread);
+    }
+
     internal void Validate(
         string kernelName,
         DirectPtxFunctionInfo info,
@@ -266,21 +316,6 @@ internal sealed record DirectPtxKernelAudit(
     string CubinSourceKey = "",
     string? CubinPath = null)
 {
-    internal static DirectPtxKernelAudit Create(
-        DirectPtxKernelBlueprint blueprint,
-        string deviceFingerprint,
-        string ptx,
-        DirectPtxFunctionInfo function,
-        int blockThreads,
-        int activeBlocksPerMultiprocessor,
-        string jitInfoLog)
-    {
-        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
-        return new DirectPtxKernelAudit(
-            blueprint.Id, deviceFingerprint, hash, function, blockThreads,
-            activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
-    }
-
     internal static DirectPtxKernelAudit Create(
         DirectPtxKernelBlueprint blueprint,
         string deviceFingerprint,
