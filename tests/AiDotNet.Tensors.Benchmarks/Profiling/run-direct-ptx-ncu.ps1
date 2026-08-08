@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rglru', 'convolution')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'vision-box-iou', 'rglru', 'convolution')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -27,6 +27,7 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'vision-box-iou' { '--direct-ptx-profile-vision-box-iou' }
     'rglru' { '--direct-ptx-profile-rglru' }
     'convolution' { '--direct-ptx-profile-convolution' }
 }
@@ -38,6 +39,7 @@ $kernel = switch ($Target) {
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
+    'vision-box-iou' { 'regex:aidotnet_(fused_pairwise_box_iou_f32|vision_.*)' }
     'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
     'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
 }
@@ -49,6 +51,7 @@ $expectedLaunches = switch ($Target) {
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
+    'vision-box-iou' { 31 }
     'rglru' { 1 }
     'convolution' { 1 }
 }

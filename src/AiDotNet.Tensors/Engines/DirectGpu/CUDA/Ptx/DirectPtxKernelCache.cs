@@ -25,7 +25,9 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
 
         internal TKey Key { get; }
         internal TKernel Kernel { get; }
-        internal bool IsPinned { get; set; }
+        internal bool IsPermanentlyPinned { get; set; }
+        internal int CapturePinCount { get; set; }
+        internal bool IsPinned => IsPermanentlyPinned || CapturePinCount != 0;
     }
 
     internal DirectPtxKernelCache(int capacity)
@@ -61,17 +63,37 @@ internal sealed class DirectPtxKernelCache<TKey, TKernel> : IDisposable
     }
 
     /// <summary>
-    /// Prevents eviction of a loaded module whose function is retained by a
-    /// CUDA graph. Pins are intentionally released only when the owning cache
-    /// is disposed: graph handles can outlive the call site that captured them,
-    /// and unloading their module would invalidate the retained function.
+    /// Permanently prevents eviction of a loaded module whose lifetime cannot
+    /// be observed by the cache. Captures owned by <c>CudaBackend.CaptureGraph</c>
+    /// use the reference-counted capture-pin methods below instead.
     /// </summary>
     internal bool Pin(TKey key)
     {
         if (!_entries.TryGetValue(key, out LinkedListNode<Entry>? node))
             return false;
-        node.Value.IsPinned = true;
+        node.Value.IsPermanentlyPinned = true;
         return true;
+    }
+
+    /// <summary>
+    /// Acquires a graph-lifetime pin. Unlike <see cref="Pin"/>, this pin can be
+    /// released when the graph-exec that retains the module is destroyed.
+    /// </summary>
+    internal bool AcquireCapturePin(TKey key)
+    {
+        if (!_entries.TryGetValue(key, out LinkedListNode<Entry>? node))
+            return false;
+        node.Value.CapturePinCount = checked(node.Value.CapturePinCount + 1);
+        return true;
+    }
+
+    internal void ReleaseCapturePin(TKey key)
+    {
+        if (!_entries.TryGetValue(key, out LinkedListNode<Entry>? node) ||
+            node.Value.CapturePinCount == 0)
+            throw new InvalidOperationException(
+                "The direct-PTX capture pin is not owned by this cache entry.");
+        node.Value.CapturePinCount--;
     }
 
     internal TKernel GetOrAdd(TKey key, Func<TKernel> factory)
