@@ -112,13 +112,13 @@ public class FusedAdvancedGraphFusionTests
             0f, 0f, -0.05f, 0f, 0f,
         }, new[] { 8, 5 });
 
-        var eager = engine.ReLU(engine.TensorBroadcastAdd(engine.TensorMatMul(input, weight), bias));
+        var eager = engine.ReLU(engine.TensorAdd(engine.TensorMatMul(input, weight), bias));
 
         ICompiledPlan<float> plan;
         using (var scope = GraphMode.Enable())
         {
             var matmul = engine.TensorMatMul(input, weight);
-            var biased = engine.TensorBroadcastAdd(matmul, bias);
+            var biased = engine.TensorAdd(matmul, bias);
             var output = engine.ReLU(biased);
             plan = scope.CompileInference<float>(output);
         }

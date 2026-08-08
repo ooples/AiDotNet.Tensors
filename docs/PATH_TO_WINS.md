@@ -29,6 +29,11 @@ next change is, and what result would falsify it.
 All numbers: protocol p4, RTX 3080 locked at 1770 MHz, true fp32 (`allow_tf32=False`),
 competitor in its CUDA-graph lane, best of 3.
 
+These p4 results are historical. Protocol p14 introduced the requirements that every
+applicable promotable candidate stabilize, that incomplete searches preserve the last
+identity-valid artifact, and that evidence under material foreign host CPU load be refused.
+Current p15 adds calibrated paired timing while retaining those p14 admission requirements.
+
 ## The board
 
 | kernel | vs cuDNN | limiter | ld/MAC | staged | verdict |

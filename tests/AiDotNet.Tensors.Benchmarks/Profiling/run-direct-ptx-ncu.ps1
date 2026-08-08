@@ -1,5 +1,6 @@
 param(
     [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'global-avgpool', 'convolution')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rglru', 'convolution')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -28,6 +29,7 @@ $switch = switch ($Target) {
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'global-avgpool' { '--direct-ptx-profile-global-avgpool' }
+    'rglru' { '--direct-ptx-profile-rglru' }
     'convolution' { '--direct-ptx-profile-convolution' }
 }
 $kernel = switch ($Target) {
@@ -39,6 +41,7 @@ $kernel = switch ($Target) {
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'global-avgpool' { 'regex:aidotnet_fused_global_avgpool_f32' }
+    'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
     'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
 }
 $expectedLaunches = switch ($Target) {
@@ -50,6 +53,7 @@ $expectedLaunches = switch ($Target) {
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'global-avgpool' { 4 }
+    'rglru' { 1 }
     'convolution' { 1 }
 }
 $metricNames = @(

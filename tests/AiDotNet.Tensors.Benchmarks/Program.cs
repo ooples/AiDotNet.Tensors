@@ -13,41 +13,22 @@ class Program
 
     static void Main(string[] args)
     {
-        // GPU-free cubin generation and verification for the pooling family.
-        if (args.Length > 0 && args[0] == "--generate-direct-ptx-pooling-cubins")
-        {
-            Environment.ExitCode = DirectPtxPoolingCubinTool.Generate(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--verify-direct-ptx-pooling-cubins")
-        {
-            Environment.ExitCode = DirectPtxPoolingCubinTool.Verify(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--audit-direct-ptx-pooling-sass")
-        {
-            Environment.ExitCode = DirectPtxPoolingCubinTool.AuditSass(args);
-            return;
-        }
-
         // GPU-free cubin generation and verification for the online-attention family.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args.Skip(1).ToArray());
             return;
         }
 
         if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args.Skip(1).ToArray());
             return;
         }
 
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args.Skip(1).ToArray());
             return;
         }
 
@@ -1330,6 +1311,9 @@ class Program
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
+        Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
         Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");

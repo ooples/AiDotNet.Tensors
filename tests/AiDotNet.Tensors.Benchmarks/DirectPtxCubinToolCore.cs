@@ -166,13 +166,22 @@ internal static class DirectPtxCubinToolCore
         Dictionary<string, string> expected = ReadManifest(File.ReadAllLines(manifestPath));
 
         string temporary = Path.Combine(
-            Path.GetTempPath(), "direct-ptx-verify-" + family);
-        if (Directory.Exists(temporary)) Directory.Delete(temporary, recursive: true);
-        int generated = Generate(family, modules, ptxas, temporary);
-        if (generated != 0) return generated;
+            Path.GetTempPath(),
+            "direct-ptx-verify-" + family + "-" + Guid.NewGuid().ToString("N"));
+        Dictionary<string, string> actual;
+        try
+        {
+            int generated = Generate(family, modules, ptxas, temporary);
+            if (generated != 0) return generated;
 
-        Dictionary<string, string> actual = ReadManifest(
-            File.ReadAllLines(Path.Combine(temporary, ManifestName(family))));
+            actual = ReadManifest(
+                File.ReadAllLines(Path.Combine(temporary, ManifestName(family))));
+        }
+        finally
+        {
+            if (Directory.Exists(temporary))
+                Directory.Delete(temporary, recursive: true);
+        }
 
         int mismatches = 0;
         foreach (KeyValuePair<string, string> pair in actual)
@@ -251,14 +260,16 @@ internal static class DirectPtxCubinToolCore
         return violations == 0 ? 0 : 1;
     }
 
-    /// <summary>First capture of <paramref name="pattern"/> as an int, or 0.</summary>
-    private static int ParseBytes(string text, string pattern)
-    {
-        Match m = Regex.Match(text, pattern);
-        return m.Success ? int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
-    }
+    /// <summary>
+    /// Sum of every capture of <paramref name="pattern"/>, or 0. Ptxas reports
+    /// one figure per entry point, so any local-memory use must fail the module.
+    /// </summary>
+    private static int ParseBytes(string text, string pattern) =>
+        Regex.Matches(text, pattern)
+            .Cast<Match>()
+            .Sum(match => int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
 
-    /// <summary>What ptxas reported about one compiled entry point.</summary>
+    /// <summary>The worst resource footprint ptxas reported for a module.</summary>
     private readonly record struct ResourceUsage(int Registers, int SharedBytes);
 
     /// <summary>
@@ -271,10 +282,12 @@ internal static class DirectPtxCubinToolCore
     {
         int registers = 0;
         int shared = 0;
-        Match r = Regex.Match(diagnostics, @"Used (\d+) registers");
-        if (r.Success) registers = int.Parse(r.Groups[1].Value, CultureInfo.InvariantCulture);
-        Match sm = Regex.Match(diagnostics, @"(\d+) bytes smem");
-        if (sm.Success) shared = int.Parse(sm.Groups[1].Value, CultureInfo.InvariantCulture);
+        foreach (Match match in Regex.Matches(diagnostics, @"Used (\d+) registers"))
+            registers = Math.Max(
+                registers, int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
+        foreach (Match match in Regex.Matches(diagnostics, @"(\d+) bytes smem"))
+            shared = Math.Max(
+                shared, int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
         return new ResourceUsage(registers, shared);
     }
 
@@ -319,15 +332,29 @@ internal static class DirectPtxCubinToolCore
     private static Dictionary<string, string> ReadManifest(IEnumerable<string> lines)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        int idIndex = -1;
+        int cubinIndex = -1;
         foreach (string line in lines)
         {
             if (line.Length == 0 ||
-                line.StartsWith("#", StringComparison.Ordinal) ||
-                line.StartsWith("blueprint-id", StringComparison.Ordinal))
+                line.StartsWith("#", StringComparison.Ordinal))
                 continue;
             string[] parts = line.Split('\t');
-            if (parts.Length >= 4) map[parts[0]] = parts[3];
+            if (idIndex < 0)
+            {
+                idIndex = Array.IndexOf(parts, "blueprint-id");
+                cubinIndex = Array.IndexOf(parts, "cubin-sha256");
+                if (idIndex < 0 || cubinIndex < 0)
+                    throw new InvalidDataException(
+                        "Manifest header lacks blueprint-id or cubin-sha256.");
+                continue;
+            }
+
+            if (parts.Length > Math.Max(idIndex, cubinIndex))
+                map[parts[idIndex]] = parts[cubinIndex];
         }
+        if (idIndex < 0)
+            throw new InvalidDataException("Manifest header was not found.");
         return map;
     }
 

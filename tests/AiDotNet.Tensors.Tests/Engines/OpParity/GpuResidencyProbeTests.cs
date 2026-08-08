@@ -53,7 +53,7 @@ public sealed class GpuResidencyProbeTests
     // error was naming LaunchKernelWithSharedMem instead of LaunchSoftmaxKernel.
     //
     // Historical worklist before the final launcher-instrumentation pass (5):
-    // NativeNormalizeRows[4,8], TensorBroadcastMultiply[4,64],
+    // NativeNormalizeRows[4,8], TensorMultiply[4,64],
     // TensorSoftmaxRows[4,64], Upsample[1,2,4,4;2x2], UpsampleBackward[1,2,8,8->1,2,4,4].
     // TensorSoftmaxRows did NOT clear with the softmax launcher fix, so it takes a different path.
     // Next step is the same one that worked here: find the launcher each op actually reaches and check

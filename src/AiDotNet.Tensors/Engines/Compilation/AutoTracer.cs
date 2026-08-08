@@ -42,7 +42,7 @@ internal static class AutoTracer
     /// <summary>
     /// Fast inlinable check that callers should use BEFORE constructing
     /// the replay-delegate closure. The closure (e.g.
-    /// <c>eng =&gt; eng.TensorBroadcastAdd(ca, cb)</c>) is allocated
+    /// <c>eng =&gt; eng.TensorAdd(ca, cb)</c>) is allocated
     /// at the call site BEFORE <see cref="RecordOp{T}"/> can early-
     /// return, so checking <see cref="Enabled"/> inside RecordOp does
     /// nothing for closure-allocation cost. Issue #319 hot path:
