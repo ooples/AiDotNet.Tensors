@@ -3,7 +3,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// <summary>
 /// Fused CUDA kernels for gated linear units (GLU, GeGLU, ReGLU, SwiGLU)
 /// and activation derivatives (ReLU', Sigmoid', Tanh').
-/// All gated activations split the input in half and apply gate * activation(value).
+/// All gated activations split the input in half and apply value * activation(gate).
 /// Single-pass fused kernels: one read of input, one write of output.
 /// </summary>
 public static class CudaGatedActivationKernels

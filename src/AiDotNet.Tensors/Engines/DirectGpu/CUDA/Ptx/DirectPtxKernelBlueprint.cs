@@ -87,6 +87,16 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The fused gated-GLU (GeGLU / SwiGLU forward and backward) pointwise
+    /// specializations are measured and promoted only on GA10x/SM86. Other
+    /// Ampere variants (SM80, SM87) are independent tuning domains and must
+    /// supply and benchmark their own specialization rather than silently
+    /// inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedGatedGlu(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The quantized (W8A8) decode-linear specialization is measured only on
     /// GA102/SM86, matching the other fused-linear predicates. Admitting the
     /// whole Ampere family would run PTX that was never validated on SM80/SM87.
