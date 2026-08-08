@@ -384,9 +384,47 @@ public sealed partial class VulkanBackend
     public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => GlslBinaryOp(VulkanGlslKernels.BatchDotProductGlsl, a, b, o, bs, 2 * sizeof(uint));
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => GlslBinaryOp(VulkanGlslKernels.OuterProduct, a, b, o, M * N, 2 * sizeof(uint));
     public void BatchOuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int M, int N) => GlslBinaryOp(VulkanGlslKernels.BatchOuterProductGlsl, a, b, o, bs * M * N, 3 * sizeof(uint));
-    public void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => GlslBinaryOp(VulkanGlslKernels.CosineSimilarity, a, b, o, bs, 2 * sizeof(uint));
-    public void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N, int dim) => GlslBinaryOp(VulkanGlslKernels.PairwiseDistanceGlsl, a, b, o, M * N, 3 * sizeof(uint));
-    public void PairwiseDistanceSquared(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N, int dim) => GlslBinaryOp(VulkanGlslKernels.PairwiseDistanceSquaredGlsl, a, b, o, M * N, 3 * sizeof(uint));
+    public void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim)
+    {
+        var dispatch = CreateCosineSimilarityDispatch(bs, dim);
+        if (dispatch.WorkItems <= 0) return;
+        GlslBinaryOp(
+            VulkanGlslKernels.CosineSimilarity, a, b, o,
+            dispatch.WorkItems, dispatch.PushConstants, 2 * sizeof(uint));
+    }
+
+    public void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N, int dim)
+        => DispatchPairwiseDistance(VulkanGlslKernels.PairwiseDistanceGlsl, a, b, o, M, N, dim);
+
+    public void PairwiseDistanceSquared(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N, int dim)
+        => DispatchPairwiseDistance(VulkanGlslKernels.PairwiseDistanceSquaredGlsl, a, b, o, M, N, dim);
+
+    private void DispatchPairwiseDistance(
+        string glsl, IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int m, int n, int dim)
+    {
+        var dispatch = CreatePairwiseDistanceDispatch(m, n, dim);
+        if (dispatch.WorkItems <= 0) return;
+        GlslBinaryOp(
+            glsl, a, b, o,
+            dispatch.WorkItems, dispatch.PushConstants, 3 * sizeof(uint));
+    }
+
+    internal static (int WorkItems, uint[] PushConstants) CreateCosineSimilarityDispatch(
+        int batchSize, int dim)
+        => batchSize <= 0
+            ? (0, Array.Empty<uint>())
+            : (batchSize, [(uint)batchSize, (uint)dim]);
+
+    internal static (int WorkItems, uint[] PushConstants) CreatePairwiseDistanceDispatch(
+        int m, int n, int dim)
+    {
+        long workItems = (long)m * n;
+        if (workItems <= 0) return (0, Array.Empty<uint>());
+        if (workItems > int.MaxValue)
+            throw new OverflowException(
+                $"Pairwise-distance work-item count {workItems} exceeds Int32.MaxValue.");
+        return ((int)workItems, [(uint)m, (uint)n, (uint)dim]);
+    }
 
     #endregion
 

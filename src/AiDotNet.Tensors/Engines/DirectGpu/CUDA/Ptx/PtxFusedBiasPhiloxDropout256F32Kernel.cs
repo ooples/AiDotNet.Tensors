@@ -42,7 +42,7 @@ internal sealed class PtxFusedBiasPhiloxDropout256F32Kernel : IDisposable
         Blueprint.ResourceBudget.Validate(EntryPoint, info, ThreadsPerBlock, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            ThreadsPerBlock, activeBlocks, _module.JitInfoLog);
+            ThreadsPerBlock, activeBlocks, _module);
     }
 
     internal unsafe void Launch(

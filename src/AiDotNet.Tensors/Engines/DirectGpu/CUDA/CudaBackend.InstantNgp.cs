@@ -18,6 +18,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(numPoints * featuresPerLevel);
         if (total <= 0) return;
+        if (TryDirectPtxInstantNgpHashEncode(positions, hashTable, output, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
         var kernel = ResolveInstantNgpKernel("instant_ngp_hash_encode_level");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -37,6 +38,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(tableSize * featuresPerLevel);
         if (total <= 0) return;
+        if (TryDirectPtxInstantNgpHashEncodeBackward(positions, outputGradient, tableGradient, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
         var kernel = ResolveInstantNgpKernel("instant_ngp_hash_encode_level_backward");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -157,6 +159,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(numVertices * numVertices);
         if (total <= 0) return;
+        if (TryDirectPtxUniformMeshLaplacian(faces, output, numFaces, numVertices)) return;
         var kernel = ResolveInstantNgpKernel("resident_uniform_mesh_laplacian");
         using var _ = PushContext();
         IntPtr f = faces.Handle, o = output.Handle;

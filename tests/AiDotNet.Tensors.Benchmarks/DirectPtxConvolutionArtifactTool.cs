@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -13,8 +14,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// linker for the #841 fused Conv2D+bias+ReLU specialization. The file is
 /// embedded into AiDotNet.Tensors and is also the input to nvdisasm/Nsight
 /// release auditing. Mirrors <see cref="DirectPtxNormalizationArtifactTool"/>;
-/// the convolution family currently promotes exactly one exact specialization,
-/// so the inventory is a single content-addressed cubin.
+/// the convolution family and its production autotune candidates.
 /// </summary>
 internal static class DirectPtxConvolutionArtifactTool
 {
@@ -49,6 +49,13 @@ internal static class DirectPtxConvolutionArtifactTool
 
         using (var kernel = new PtxFusedConv2DNchwK1Kernel(runtime))
             Export(kernel.Audit, outputDirectory, exported, manifest);
+
+        foreach (int tile in ConvTileAutotune.DefaultTileEdges)
+        {
+            var shape = ExactAutotuneShape(tile);
+            using var tiled = new PtxConv2DNchwK1TiledKernel(runtime, shape);
+            Export(tiled.Audit, outputDirectory, exported, manifest);
+        }
 
         // The promoted register-blocked ResNet c64 1x1 specialization (beats cuDNN 1.60x).
         using (var reg = new PtxConv2DNchwK1RegBlockedKernel(runtime, RegBlockedC64))
@@ -371,6 +378,13 @@ internal static class DirectPtxConvolutionArtifactTool
     private static readonly Conv2DRegBlockShape RegBlockedC64 =
         new(32, 64, 64, 3136, 64, 64, 16, 4, 4);
 
+    private static Conv2DTiledShape ExactAutotuneShape(int tile) =>
+        new(PtxFusedConv2DNchwK1Kernel.Batch,
+            PtxFusedConv2DNchwK1Kernel.OutputChannels,
+            PtxFusedConv2DNchwK1Kernel.InputChannels,
+            PtxFusedConv2DNchwK1Kernel.SpatialElements,
+            tile);
+
     // #841 coverage specialization shapes.
     // RULE: these MUST equal the shapes the fp64-oracle tests verify. Releasing a
     // cubin for an unverified shape means the audited artifact is not the artifact
@@ -411,6 +425,17 @@ internal static class DirectPtxConvolutionArtifactTool
             PtxFusedConv2DNchwK1Kernel.CreateBlueprint(DirectPtxArchitectureFamily.Ampere).Id,
             DirectPtxCubinArtifactCache.ComputePtxSha256(ptx),
             DirectPtxCubinArtifactCache.ComputeSourceKey(ptx, 8, 6)));
+
+        foreach (int tile in ConvTileAutotune.DefaultTileEdges)
+        {
+            Conv2DTiledShape shape = ExactAutotuneShape(tile);
+            string tiledPtx = PtxConv2DNchwK1TiledKernel.EmitPtx(8, 6, shape);
+            expected.Add(new ExpectedArtifact(
+                PtxConv2DNchwK1TiledKernel.CreateBlueprint(
+                    DirectPtxArchitectureFamily.Ampere, shape).Id,
+                DirectPtxCubinArtifactCache.ComputePtxSha256(tiledPtx),
+                DirectPtxCubinArtifactCache.ComputeSourceKey(tiledPtx, 8, 6)));
+        }
 
         string regPtx = PtxConv2DNchwK1RegBlockedKernel.EmitPtx(8, 6, RegBlockedC64);
         expected.Add(new ExpectedArtifact(
