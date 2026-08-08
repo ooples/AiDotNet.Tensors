@@ -47,14 +47,22 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             heads, cacheCapacity, position);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int blockThreads = WarpsPerBlock * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int blockThreads = WarpsPerBlock * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -67,14 +75,14 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
         DirectPtxTensorView keyCache,
         DirectPtxTensorView valueCache)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(packedWeights, Blueprint.Tensors[1], nameof(packedWeights));
-        Require(bias, Blueprint.Tensors[2], nameof(bias));
-        Require(cosine, Blueprint.Tensors[3], nameof(cosine));
-        Require(sine, Blueprint.Tensors[4], nameof(sine));
-        Require(query, Blueprint.Tensors[5], nameof(query));
-        Require(keyCache, Blueprint.Tensors[6], nameof(keyCache));
-        Require(valueCache, Blueprint.Tensors[7], nameof(valueCache));
+        DirectPtxAbi.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.Require(packedWeights, Blueprint.Tensors[1], nameof(packedWeights));
+        DirectPtxAbi.Require(bias, Blueprint.Tensors[2], nameof(bias));
+        DirectPtxAbi.Require(cosine, Blueprint.Tensors[3], nameof(cosine));
+        DirectPtxAbi.Require(sine, Blueprint.Tensors[4], nameof(sine));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[5], nameof(query));
+        DirectPtxAbi.Require(keyCache, Blueprint.Tensors[6], nameof(keyCache));
+        DirectPtxAbi.Require(valueCache, Blueprint.Tensors[7], nameof(valueCache));
         RejectOutputAliasing(input, packedWeights, bias, cosine, sine, query, keyCache, valueCache);
 
         IntPtr inputPointer = input.Pointer;
@@ -103,17 +111,6 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     private static void RejectOutputAliasing(
         DirectPtxTensorView input,

@@ -204,7 +204,7 @@ public class GradientTapeExtendedTests
         var b = new Tensor<float>(new float[] { 10, 20, 30 }, new[] { 1, 3 });
 
         using var tape = new GradientTape<float>();
-        var z = _engine.TensorBroadcastAdd(a, b);
+        var z = _engine.TensorAdd(a, b);
         var grads = tape.ComputeGradients(z, new[] { a, b });
 
         // dz/da = ones (same shape as a: [2, 3])

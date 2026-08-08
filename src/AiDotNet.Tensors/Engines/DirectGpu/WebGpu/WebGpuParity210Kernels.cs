@@ -33,6 +33,7 @@ public static class WebGpuParity210Kernels
         "parity210_i0","parity210_i1","parity210_i0e","parity210_i1e",
         "parity210_is_finite","parity210_is_nan","parity210_is_inf","parity210_nan_to_num",
         "parity210_cosine_similarity_last","parity210_cdist_l2",
+        "cosine_similarity","pairwise_distance_squared",
         "parity210_clamp_min_max",
     };
 
@@ -808,6 +809,49 @@ struct P { n: i32, m: i32, d: i32 };
         acc = acc + v * v;
     }
     o[gid] = sqrt(acc);
+}
+";
+
+    public static string CosineSimilarity => @"
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read> b : array<f32>;
+@group(0) @binding(2) var<storage, read_write> o : array<f32>;
+struct P { batch_size: i32, dim: i32 };
+@group(0) @binding(3) var<uniform> p : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let row = i32(id.x);
+    if (row >= p.batch_size) { return; }
+    var dotv : f32 = 0.0;
+    var na : f32 = 0.0;
+    var nb : f32 = 0.0;
+    let base_ = row * p.dim;
+    for (var k : i32 = 0; k < p.dim; k = k + 1) {
+        let av = a[base_ + k]; let bv = b[base_ + k];
+        dotv = dotv + av * bv;
+        na = na + av * av;
+        nb = nb + bv * bv;
+    }
+    o[row] = dotv / (sqrt(na) * sqrt(nb) + 1.0e-8);
+}
+";
+
+    public static string CdistL2Squared => @"
+@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(1) var<storage, read> b : array<f32>;
+@group(0) @binding(2) var<storage, read_write> o : array<f32>;
+struct P { m: i32, n: i32, dim: i32 };
+@group(0) @binding(3) var<uniform> p : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    if (gid >= p.m * p.n) { return; }
+    let row = gid / p.n;
+    let col = gid % p.n;
+    var acc : f32 = 0.0;
+    for (var k : i32 = 0; k < p.dim; k = k + 1) {
+        let diff = a[row * p.dim + k] - b[col * p.dim + k];
+        acc = acc + diff * diff;
+    }
+    o[gid] = acc;
 }
 ";
 

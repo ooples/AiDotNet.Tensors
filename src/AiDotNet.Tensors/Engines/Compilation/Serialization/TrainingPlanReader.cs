@@ -219,7 +219,8 @@ internal static class TrainingPlanReader
                         $"which is out of range [0, {liveTensors.Length}). The plan file is corrupt.");
                 }
 
-                var output = OpReplay.ReplayThroughEngine(engine, op.OpType, op.OpName, inputs, op.SavedState);
+                var output = OpReplay.ReplayThroughEngine(
+                    engine, op.OpType, op.OpName, inputs, op.SavedState, tensorTable[op.OutputId]._shape);
                 if (output is null)
                 {
                     // ReplayThroughEngine returned null because this runtime

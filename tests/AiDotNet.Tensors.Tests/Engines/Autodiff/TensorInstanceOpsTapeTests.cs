@@ -41,7 +41,7 @@ public class TensorInstanceOpsTapeTests
         var b = new Tensor<float>(new float[] { 10, 20, 30 }, [1, 3]);
 
         using var tape = new GradientTape<float>();
-        var result = _engine.TensorBroadcastAdd(a, b);
+        var result = _engine.TensorAdd(a, b);
         var loss = _engine.TensorMeanDiff(result);
 
         Assert.True(tape.EntryCount > 0, "BroadcastAdd via engine should record on tape");
@@ -119,7 +119,7 @@ public class TensorInstanceOpsTapeTests
         var b = new Tensor<float>(new float[] { 10, 20, 30 }, [1, 3]);
 
         using var tape = new GradientTape<float>();
-        var result = _engine.TensorBroadcastSubtract(a, b);
+        var result = _engine.TensorSubtract(a, b);
         var loss = _engine.TensorMeanDiff(result);
 
         Assert.True(tape.EntryCount > 0, "BroadcastSubtract via engine should record on tape");
@@ -134,7 +134,7 @@ public class TensorInstanceOpsTapeTests
         var b = new Tensor<float>(new float[] { 2, 3, 4 }, [1, 3]);
 
         using var tape = new GradientTape<float>();
-        var result = _engine.TensorBroadcastMultiply(a, b);
+        var result = _engine.TensorMultiply(a, b);
         var loss = _engine.TensorMeanDiff(result);
 
         Assert.True(tape.EntryCount > 0, "BroadcastMultiply via engine should record on tape");

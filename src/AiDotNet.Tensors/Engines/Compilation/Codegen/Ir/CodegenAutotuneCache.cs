@@ -16,6 +16,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
@@ -98,6 +99,18 @@ public static class CodegenAutotuneCache
             return map;
         }
         catch (UnauthorizedAccessException)
+        {
+            return map;
+        }
+        catch (ArgumentException)
+        {
+            return map;
+        }
+        catch (NotSupportedException)
+        {
+            return map;
+        }
+        catch (SecurityException)
         {
             return map;
         }

@@ -28,7 +28,7 @@ public static class FusedOperations<T>
         // Add bias if present
         if (bias is not null)
         {
-            output = engine.TensorBroadcastAdd(output, bias);
+            output = engine.TensorAdd(output, bias);
         }
 
         // Record as a single fused op (instead of separate MatMul + Add)
@@ -75,7 +75,7 @@ public static class FusedOperations<T>
         // Forward
         var preActivation = engine.TensorMatMul(input, weight);
         if (bias is not null)
-            preActivation = engine.TensorBroadcastAdd(preActivation, bias);
+            preActivation = engine.TensorAdd(preActivation, bias);
         var output = engine.ReLU(preActivation);
 
         // Record fused op

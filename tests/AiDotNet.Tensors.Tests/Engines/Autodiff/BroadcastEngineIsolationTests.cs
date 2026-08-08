@@ -12,7 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Found via the gradcheck sweep. <c>TensorBroadcastSubtract&lt;double&gt;</c> produced an analytical
+/// Found via the gradcheck sweep. <c>TensorSubtract&lt;double&gt;</c> produced an analytical
 /// gradient of exactly 1 (correct — d(a-b)/da is unambiguously 1) against central finite differences
 /// of 1.0133. The gradient was right and the FORWARD was wrong: for <c>a[0]-b[0]</c> the engine
 /// returned <c>-0.2453465461730957</c> where the exact double result is <c>-0.24534654647360865</c> —
@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// any error above rounding is a precision defect.
 /// </para>
 /// <para>
-/// Root cause: <c>CpuEngine.TensorBroadcastSubtract</c>'s generic fallback calls
+/// Root cause: <c>CpuEngine.TensorSubtract</c>'s generic fallback calls
 /// <c>Tensor&lt;T&gt;.BroadcastSubtract</c>, whose equal-shape shortcut delegated to
 /// <c>Subtract(other)</c> → <c>AiDotNetEngine.Current.TensorSubtract</c>. On this GPU-auto-detect host
 /// <c>AiDotNetEngine.Current</c> is <c>DirectGpuTensorEngine</c>, which computes elementwise
@@ -108,12 +108,12 @@ public class BroadcastEngineIsolationTests : IDisposable
     }
 
     [Fact]
-    public void TensorBroadcastSubtract_Double_KeepsDoublePrecision()
+    public void TensorSubtract_Double_KeepsDoublePrecision()
     {
         var (a, b) = Operands(6, seed: 1234);
         _out.WriteLine($"AiDotNetEngine.Current = {AiDotNetEngine.Current.GetType().Name}, op engine = {_engine.GetType().Name}");
 
-        var r = _engine.TensorBroadcastSubtract(a, b);
+        var r = _engine.TensorSubtract(a, b);
 
         double worst = 0;
         for (int i = 0; i < r.Length; i++)
@@ -127,15 +127,15 @@ public class BroadcastEngineIsolationTests : IDisposable
         Assert.True(worst < 1e-15,
             $"TensorBroadcastSubtract<double> worst relative error {worst:E3} — subtraction is exact in " +
             "floating point, so any error above rounding means the double path computed at float precision.");
-        AssertGlobalEngineUntouched(nameof(CpuEngine.TensorBroadcastSubtract));
+        AssertGlobalEngineUntouched(nameof(CpuEngine.TensorSubtract));
     }
 
     [Fact]
-    public void TensorBroadcastAdd_Double_KeepsDoublePrecision()
+    public void TensorAdd_Double_KeepsDoublePrecision()
     {
         var (a, b) = Operands(6, seed: 4321);
 
-        var r = _engine.TensorBroadcastAdd(a, b);
+        var r = _engine.TensorAdd(a, b);
 
         double worst = 0;
         for (int i = 0; i < r.Length; i++)
@@ -149,7 +149,7 @@ public class BroadcastEngineIsolationTests : IDisposable
         Assert.True(worst < 1e-15,
             $"TensorBroadcastAdd<double> worst relative error {worst:E3} — addition of same-magnitude " +
             "doubles is correctly rounded, so error above 1 ULP means the double path computed at float precision.");
-        AssertGlobalEngineUntouched(nameof(CpuEngine.TensorBroadcastAdd));
+        AssertGlobalEngineUntouched(nameof(CpuEngine.TensorAdd));
     }
 
     /// <summary>
@@ -165,9 +165,9 @@ public class BroadcastEngineIsolationTests : IDisposable
     {
         var (a, b) = Operands(n, seed: 909 + n);
 
-        var subBroadcast = _engine.TensorBroadcastSubtract(a, b);
+        var subBroadcast = _engine.TensorSubtract(a, b);
         var subDirect = _engine.TensorSubtract(a, b);
-        var addBroadcast = _engine.TensorBroadcastAdd(a, b);
+        var addBroadcast = _engine.TensorAdd(a, b);
         var addDirect = _engine.TensorAdd(a, b);
 
         for (int i = 0; i < n; i++)
@@ -189,8 +189,8 @@ public class BroadcastEngineIsolationTests : IDisposable
         var row = new Tensor<double>([3]);
         for (int i = 0; i < 3; i++) row[i] = 0.37 + i * 0.13;
 
-        var diff = _engine.TensorBroadcastSubtract(a, row);
-        var sum = _engine.TensorBroadcastAdd(a, row);
+        var diff = _engine.TensorSubtract(a, row);
+        var sum = _engine.TensorAdd(a, row);
 
         Assert.Equal(new[] { 2, 3 }, diff.Shape.ToArray());
         Assert.Equal(new[] { 2, 3 }, sum.Shape.ToArray());

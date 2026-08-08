@@ -1,16 +1,29 @@
 #if NET5_0_OR_GREATER
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 public sealed class DirectPtxConvolutionTests
 {
+    [Fact]
+    public void ProductionConvolutionArtifacts_AreEmbeddedWithManifest()
+    {
+        string[] resources = typeof(DirectPtxRuntime).Assembly.GetManifestResourceNames();
+        Assert.Contains(resources, name =>
+            name.EndsWith(".Artifacts.sm86.convolution.convolution-cubins.tsv", StringComparison.Ordinal));
+        Assert.True(resources.Count(name =>
+            name.IndexOf(".Artifacts.sm86.convolution.", StringComparison.Ordinal) >= 0 &&
+            name.EndsWith(".cubin", StringComparison.Ordinal)) >= 47);
+    }
+
     [Fact]
     public void EmbeddedArtifactArchitecture_AnchorsOnTheSmMarker()
     {
@@ -20,6 +33,20 @@ public sealed class DirectPtxConvolutionTests
         Assert.Equal("sm86", architecture);
         Assert.False(DirectPtxCubinArtifactCache.TryParseEmbeddedArtifactArchitecture(
             "AiDotNet.Decoy.Artifacts.metadata.manifest.tsv", out _));
+    }
+
+    [Theory]
+    [InlineData("", "cubin", "kernel.cubin")]
+    [InlineData("ptx", " ", "kernel.cubin")]
+    [InlineData("ptx", "cubin", "\t")]
+    public void EmbeddedManifestRow_RejectsBlankRequiredValues(
+        string ptxHash, string cubinHash, string file)
+    {
+        string[] columns = { ptxHash, cubinHash, file };
+
+        Assert.Throws<InvalidDataException>(() =>
+            DirectPtxCubinArtifactCache.ValidateEmbeddedManifestRow(
+                columns, 0, 1, 2, "manifest.tsv", string.Join("\t", columns)));
     }
 
     [Fact]
@@ -144,6 +171,41 @@ public sealed class DirectPtxConvolutionTests
     }
 
     [Fact]
+    public void Autotuner_PreservesDirectFallback_AndRejectsUnofferedVariants()
+    {
+        IReadOnlyList<AutotuneCandidate> candidates =
+            DirectPtxConvolutionAutotuner.CandidateConfigurations(
+                outputChannels: 64, inputChannels: 64, spatial: 256);
+
+        Assert.Equal(
+            new[] { "unrolled-direct", "tile-16", "tile-32", "tile-8", "tile-4" },
+            candidates.Select(candidate => candidate.Variant));
+        Assert.True(DirectPtxConvolutionAutotuner.TryGetVariant(
+            candidates[0], 64, 64, 256, out DirectPtxConvolutionVariant direct));
+        Assert.False(direct.IsTiled);
+        Assert.True(DirectPtxConvolutionAutotuner.TryGetVariant(
+            candidates[1], 64, 64, 256, out DirectPtxConvolutionVariant tiled));
+        Assert.True(tiled.IsTiled);
+        Assert.Equal(16, tiled.Tile);
+
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new AutotuneCandidate("tile-64"), 64, 64, 256, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new AutotuneCandidate("tile-7"), 64, 64, 256, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new AutotuneCandidate("tile-32"), 64, 64, 48, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new AutotuneCandidate("unknown"), 64, 64, 256, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            candidates[0], 0, 64, 256, out _));
+
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            new KernelChoice { Variant = " " }, 64, 64, 256, out _));
+        Assert.False(DirectPtxConvolutionAutotuner.TryGetVariant(
+            default(KernelChoice), 64, 64, 256, out _));
+    }
+
+    [Fact]
     public void PublicRouteAndCaptureLifetime_AreWiredBeforeEstablishedFallback()
     {
         string engine = File.ReadAllText(SourcePath(
@@ -156,11 +218,12 @@ public sealed class DirectPtxConvolutionTests
             "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA",
             "CudaBackend.DirectPtx.Convolution.cs"));
         Assert.Contains("must be prewarmed before CUDA graph capture", backend, StringComparison.Ordinal);
-        Assert.Contains("_directPtxConvolutionKernels.Pin(key)", backend, StringComparison.Ordinal);
+        Assert.Contains("PinDirectPtxConvolutionKernel(selected)", backend, StringComparison.Ordinal);
         string owner = File.ReadAllText(SourcePath(
             "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA",
             "CudaBackend.DirectPtx.cs"));
         Assert.Contains("_directPtxConvolutionKernels.Dispose()", owner, StringComparison.Ordinal);
+        Assert.Contains("_directPtxTiledConvolutionKernels.Dispose()", owner, StringComparison.Ordinal);
     }
 
     [Fact]

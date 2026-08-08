@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string MseLossEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MSE_LOSS";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string RecurrentStateEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RECURRENT_STATE";
     internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
     internal const string CacheCapacityEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CACHE_CAPACITY";
@@ -37,6 +38,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentMseLossEnabled = ReadEnabled(MseLossEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentRecurrentStateEnabled = ReadEnabled(RecurrentStateEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
@@ -86,6 +88,25 @@ internal static class DirectPtxFeatureGate
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
 
+    internal static bool IsRecurrentStateEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentRecurrentStateEnabled);
+    /// <summary>Softmax-family (issue #840) rollout gate; disabled by default.</summary>
+    internal static bool IsSoftmaxEnabled => TestOverride ?? EnvironmentMasterEnabled;
+
+    /// <summary>
+    /// Opt-in switch that lets fail-closed softmax-family specializations dispatch for GPU
+    /// validation before a shape is performance-promoted. Off in production.
+    /// </summary>
+    internal static bool SoftmaxExperimentOverride { get; set; }
+    /// <summary>Specialized-scientific (issue #854) rollout gate; disabled by default.</summary>
+    internal static bool IsScientificEnabled => TestOverride ?? EnvironmentMasterEnabled;
+
+    /// <summary>
+    /// Opt-in switch that lets fail-closed scientific specializations dispatch for GPU
+    /// validation before a shape is performance-promoted. Off in production.
+    /// </summary>
+    internal static bool ScientificExperimentOverride { get; set; }
+
     internal static bool IsConvolutionEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentConvolutionEnabled);
 
@@ -109,7 +130,8 @@ internal enum DirectPtxPhysicalType
     Float16,
     BFloat16,
     Float32,
-    Int32
+    Int32,
+    UInt8
 }
 
 internal enum DirectPtxPhysicalLayout
@@ -138,6 +160,8 @@ internal enum DirectPtxPhysicalLayout
     Vector,
     /// <summary>Block table plus packed pages for decode attention.</summary>
     PagedKv,
+    /// <summary>Dense row-major [batch, sequence, feature].</summary>
+    BatchSequenceFeature,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
     Oihw
 }

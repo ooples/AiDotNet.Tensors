@@ -83,10 +83,10 @@ public class MultiMatMulFusedAdamParamUpdateTests
         {
             // Layer 1: hidden = input @ W1 + b1   (bias broadcast over batch)
             var z1 = engine.TensorMatMul(input, W1);
-            var h1 = engine.TensorBroadcastAdd(z1, b1);
+            var h1 = engine.TensorAdd(z1, b1);
             // Layer 2: logits = h1 @ W2 + b2
             var z2 = engine.TensorMatMul(h1, W2);
-            var logits = engine.TensorBroadcastAdd(z2, b2);
+            var logits = engine.TensorAdd(z2, b2);
             // Loss = sum(logits) — gradient flow check; not a real loss but
             // produces non-zero dL/dY everywhere, which is all the backward
             // chain needs to test parameter updates.
@@ -140,7 +140,7 @@ public class MultiMatMulFusedAdamParamUpdateTests
     /// the exact code path AiDotNet's <c>DenseLayer.Forward</c> takes when
     /// it routes through the fused-linear kernel. Same shapes as the
     /// two-MatMul-chain test; the only difference is the op selection.
-    /// If MatMul+BroadcastAdd works but FusedLinear stacking doesn't, the
+    /// If MatMul+TensorAdd works but FusedLinear stacking doesn't, the
     /// bug is in <c>FusedLinearWithActivationBackward</c>'s graph plumbing.
     /// </summary>
     [Fact]
@@ -608,7 +608,7 @@ public class MultiMatMulFusedAdamParamUpdateTests
     /// Plus a Multiply downstream (which the trace showed at FWDSTEP 13,14
     /// after LayerNorm — residual or scale). Try inserting an Add between
     /// FusedLinear and LayerNorm — the residual connection — that uses
-    /// TensorBroadcastAdd or TensorAdd, since the Transformer's residual
+    /// TensorAdd, since the Transformer's residual
     /// path goes: MHA_out + input → LayerNorm.
     /// </summary>
     [Fact]
@@ -1025,9 +1025,9 @@ public class MultiMatMulFusedAdamParamUpdateTests
         ICompiledTrainingPlan<float> plan;
         using (var scope = GraphMode.Enable())
         {
-            var h1 = engine.TensorBroadcastAdd(engine.TensorMatMul(input, W1), b1);
-            var h2 = engine.TensorBroadcastAdd(engine.TensorMatMul(h1, W2), b2);
-            var logits = engine.TensorBroadcastAdd(engine.TensorMatMul(h2, W3), b3);
+            var h1 = engine.TensorAdd(engine.TensorMatMul(input, W1), b1);
+            var h2 = engine.TensorAdd(engine.TensorMatMul(h1, W2), b2);
+            var logits = engine.TensorAdd(engine.TensorMatMul(h2, W3), b3);
             engine.ReduceSum(logits, null);
             plan = scope.CompileTraining(new[] { W1, b1, W2, b2, W3, b3 });
         }
