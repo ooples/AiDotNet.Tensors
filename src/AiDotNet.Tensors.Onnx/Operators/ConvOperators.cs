@@ -431,7 +431,7 @@ internal static class ConvOperators
                 biasShape[0] = 1; biasShape[1] = bias._shape[0];
                 for (int i = 2; i < input.Rank; i++) biasShape[i] = 1;
                 var reshaped = ctx.Engine.Reshape(bias, biasShape);
-                result = ctx.Engine.TensorBroadcastAdd(result, reshaped);
+                result = ctx.Engine.TensorAdd(result, reshaped);
             }
             ctx.PutTensor(node.Output[0], result);
         }
@@ -599,7 +599,7 @@ internal static class ConvOperators
                 biasShape[0] = 1; biasShape[1] = bias._shape[0];
                 for (int i = 2; i < input.Rank; i++) biasShape[i] = 1;
                 var reshaped = ctx.Engine.Reshape(bias, biasShape);
-                result = ctx.Engine.TensorBroadcastAdd(result, reshaped);
+                result = ctx.Engine.TensorAdd(result, reshaped);
             }
             ctx.PutTensor(node.Output[0], result);
         }

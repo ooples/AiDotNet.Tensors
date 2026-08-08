@@ -79,6 +79,38 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
     }
 
+    private Tensor(int[] dimensions, Action<TensorBase<T>>? initializer, bool deferred)
+        : base(dimensions, initializer, deferred)
+    {
+    }
+
+    /// <summary>
+    /// Creates a tensor that knows its shape but has not allocated storage. The buffer is created,
+    /// and <paramref name="initializer"/> applied, the first time the tensor's values are touched.
+    /// </summary>
+    /// <param name="dimensions">Logical shape. <c>Length</c>, <c>Rank</c> and <c>Shape</c> are exact immediately.</param>
+    /// <param name="initializer">
+    /// Fill applied once, when storage is first created — a weight's He/Xavier fill, for example.
+    /// Null leaves the buffer zeroed. Deferring the fill as well as the allocation is the point:
+    /// running it eagerly would touch the buffer and allocate anyway.
+    /// </param>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> this is a tensor that costs nothing until you use it. You can
+    /// ask how big it is, what shape it is, and how many values it holds, and none of that
+    /// allocates any memory. The memory appears the moment you read or write an actual value.</para>
+    /// <para>
+    /// Useful when you need a model's size before you need its weights: counting parameters,
+    /// sizing a checkpoint, or planning a memory budget. Because the count comes from the same
+    /// construction that later allocates, it cannot disagree with what you eventually get.
+    /// </para>
+    /// </remarks>
+    public static Tensor<T> CreateDeferred(int[] dimensions, Action<Tensor<T>>? initializer = null)
+    {
+        Action<TensorBase<T>>? adapted =
+            initializer is null ? null : t => initializer((Tensor<T>)t);
+        return new Tensor<T>(dimensions, adapted, deferred: true);
+    }
+
     /// <summary>
     /// Creates a new tensor with the specified dimensions and pre-populated data.
     /// </summary>
@@ -474,6 +506,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void CopyTo(Span<T> destination)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         if (destination.Length < Length)
         {
             throw new ArgumentException(
@@ -560,6 +593,106 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         return FinalizeReshapeLikeView(
             CreateStorageView(newShape, newStrides, _storageOffset),
             "ExpandDims");
+    }
+
+    /// <summary>
+    /// Returns a zero-copy view of this tensor stretched to <paramref name="targetShape"/>.
+    /// </summary>
+    /// <param name="targetShape">The shape to stretch to. Must be broadcast-compatible with this tensor's.</param>
+    /// <returns>
+    /// A stride-0 view sharing this tensor's storage, or <c>this</c> when the shapes already match.
+    /// </returns>
+    /// <exception cref="ArgumentException">
+    /// Thrown when a dimension is neither equal to the target nor 1, or when the target has lower rank.
+    /// </exception>
+    /// <remarks>
+    /// <para>
+    /// This is the mechanism behind broadcasting, and it copies nothing. An axis being stretched gets
+    /// a stride of <b>0</b>, so every position along it reads the same stored element — a <c>[4,1]</c>
+    /// column viewed as <c>[4,3]</c> is still four numbers in memory. This is what NumPy's
+    /// <c>broadcast_to</c> and PyTorch's <c>expand</c> do, and it is why broadcasting a bias across a
+    /// batch costs no memory.
+    /// </para>
+    /// <para>
+    /// The returned view reports <c>IsContiguous == false</c>, so <see cref="TensorBase{T}.AsSpan"/>
+    /// throws on it rather than handing back a span that is shorter than the logical length. That is
+    /// deliberate: a silently-misread expanded view would produce plausible numbers from the wrong
+    /// memory. Kernels that cannot walk strides should call <see cref="Contiguous"/>, which
+    /// materializes the stretch honestly and visibly.
+    /// </para>
+    /// <para><b>For Beginners:</b> "Stretching" here never duplicates data. Picture one row of numbers
+    /// and a set of instructions saying "pretend this row repeats 10 times". Reading row 7 quietly
+    /// re-reads the only row there is. That is a stride of zero — move forward zero steps when the
+    /// index advances.</para>
+    /// </remarks>
+    public Tensor<T> ExpandTo(int[] targetShape)
+    {
+        ThrowIfSparse();
+        if (targetShape == null) throw new ArgumentNullException(nameof(targetShape));
+
+        // The overwhelmingly common case in an element-wise op is that no stretch is needed. Return
+        // the receiver untouched so the shape-equal hot path allocates neither view nor descriptors.
+        if (ShapeEquals(_shape, targetShape)) return this;
+
+        int targetRank = targetShape.Length;
+        if (targetRank < Rank)
+            throw new ArgumentException(
+                $"Cannot expand a rank-{Rank} tensor [{string.Join(",", _shape)}] to the lower-rank " +
+                $"shape [{string.Join(",", targetShape)}].", nameof(targetShape));
+
+        // Right-align: NumPy pads the SMALLER shape with leading 1s, so this tensor's axis j
+        // corresponds to target axis j + offset.
+        int offset = targetRank - Rank;
+        var newStrides = new int[targetRank];
+
+        for (int i = 0; i < targetRank; i++)
+        {
+            int target = targetShape[i];
+            if (target < 0)
+                throw new ArgumentException(
+                    $"Target shape [{string.Join(",", targetShape)}] has a negative extent at axis {i}.",
+                    nameof(targetShape));
+
+            int j = i - offset;
+            if (j < 0)
+            {
+                // A padded leading axis: this tensor has no such dimension, so every position along
+                // it reads the same underlying data.
+                newStrides[i] = 0;
+                continue;
+            }
+
+            int mine = _shape[j];
+            if (mine == target)
+            {
+                newStrides[i] = _strides[j];
+            }
+            else if (mine == 1)
+            {
+                newStrides[i] = 0;
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Cannot expand [{string.Join(",", _shape)}] to [{string.Join(",", targetShape)}]: " +
+                    $"axis {i} is {mine} and cannot stretch to {target}. Only axes of extent 1 stretch — " +
+                    "this usually means an operand is transposed or an axis is off by one.",
+                    nameof(targetShape));
+            }
+        }
+
+        var shapeCopy = (int[])targetShape.Clone();
+        var view = CreateStorageView(shapeCopy, newStrides, _storageOffset);
+
+        if (!IsDifferentiableRecordingActive) return view;
+
+        var originalShape = (int[])_shape.Clone();
+        return FinalizeDifferentiableView(
+            view,
+            Engines.Compilation.LazyNodeType.Expand,
+            "Expand",
+            Engines.Autodiff.BackwardFunctions<T>.ExpandBackward,
+            new object[] { originalShape });
     }
 
     /// <summary>
@@ -675,6 +808,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 "Call .Contiguous() first to materialize a copy if needed.");
         // The fast path returns the LIVE backing vector (aliases storage); privatize first so a
         // caller mutating the returned vector can't corrupt a COW peer. No-op for normal tensors.
+        EnsureMaterialized();
         EnsureOwnedForWrite();
         if (_data.Length == _shape[0])
             return _data;
@@ -1201,6 +1335,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Support both 2D and 3D tensors
         // For 2D: [batch, features] + [features] -> broadcasts vector across batch
         // For 3D: [batch, seq, features] + [features] -> broadcasts vector across batch and seq
+        EnsureMaterialized();
         if (this.Rank == 2)
         {
             if (this._shape[1] != vector.Length)
@@ -1272,6 +1407,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int index, Tensor<T> slice)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
+        slice.EnsureMaterialized();
         if (index < 0 || index >= Shape[0])
         {
             throw new ArgumentOutOfRangeException(nameof(index));
@@ -1308,6 +1445,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for dot product.");
 
+        EnsureMaterialized();
+        other.EnsureMaterialized();
         // Use vectorized Dot product for SIMD acceleration (10-15x faster with AVX2)
         return _numOps.Dot(_data.AsSpan(), other._data.AsSpan());
     }
@@ -1324,6 +1463,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void Fill(T value)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         EnsureOwnedForWrite();
         _numOps.Fill(_data.AsWritableSpan(), value);
         IncrementVersion();
@@ -1610,6 +1750,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
+        EnsureMaterialized();
+        other.EnsureMaterialized();
         _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
     }
 
@@ -1631,6 +1773,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Sum(int[]? axes = null)
     {
+        EnsureMaterialized();
         if (axes == null || axes.Length == 0)
         {
             // Sum all elements using vectorized Sum operation for SIMD acceleration (5-15x faster with AVX2)
@@ -1765,6 +1908,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Vector<T> GetSlice(int start, int length)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         if (start < 0 || start >= _data.Length)
             throw new ArgumentOutOfRangeException(nameof(start), "Start index must be within bounds of the tensor data.");
         if (length < 0 || start + length > _data.Length)
@@ -1799,6 +1943,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public (T maxVal, int maxIndex) Max()
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         // Use vectorized Max to find the value quickly (5-15x faster with AVX2)
         T maxVal = _numOps.Max(_data.AsSpan());
 
@@ -1979,6 +2124,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void DivideInPlace(T scalar)
     {
+        EnsureMaterialized();
         _numOps.DivideScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
     }
 
@@ -2393,7 +2539,50 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </para>
     /// </summary>
     /// <summary>Element-wise binary operation kind for the broadcast fast path.</summary>
-    private enum BroadcastOp { Add, Subtract, Multiply }
+    internal enum BroadcastOp { Add, Subtract, Multiply, Divide }
+
+    /// <summary>
+    /// Writes <c>a op b</c> into <paramref name="result"/> using the coalescing SIMD kernel,
+    /// consuming non-contiguous operands where they lie.
+    /// </summary>
+    /// <remarks>
+    /// The engine's element-wise ops call this for their strided path. Walking operands element by
+    /// element through <c>LogicalToStorageIndex</c> instead costs roughly 7x on a Conv+BN shape,
+    /// which implicit broadcasting turned from a rare case into the common one.
+    /// </remarks>
+    internal static void ElementwiseInto(Tensor<T> a, Tensor<T> b, Tensor<T> result, BroadcastOp op)
+    {
+        ValidateBroadcastOperandShape(a._shape, result._shape, nameof(a));
+        ValidateBroadcastOperandShape(b._shape, result._shape, nameof(b));
+        BroadcastElementwise(a, b, result, result._shape, op);
+    }
+
+    private static void ValidateBroadcastOperandShape(
+        int[] operandShape, int[] resultShape, string operandName)
+    {
+        if (operandShape.Length > resultShape.Length)
+        {
+            throw new ArgumentException(
+                $"Tensor with shape [{string.Join(", ", operandShape)}] cannot be broadcast to " +
+                $"result shape [{string.Join(", ", resultShape)}]: operand rank exceeds result rank.",
+                operandName);
+        }
+
+        int offset = resultShape.Length - operandShape.Length;
+        for (int i = 0; i < operandShape.Length; i++)
+        {
+            int operandDim = operandShape[i];
+            int resultDim = resultShape[offset + i];
+            if (operandDim != 1 && operandDim != resultDim)
+            {
+                throw new ArgumentException(
+                    $"Tensor with shape [{string.Join(", ", operandShape)}] cannot be broadcast to " +
+                    $"result shape [{string.Join(", ", resultShape)}]: dimension {offset + i} has " +
+                    $"sizes {operandDim} and {resultDim} (operand must equal result or be 1).",
+                    operandName);
+            }
+        }
+    }
 
     private static void BroadcastElementwise(
         Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)
@@ -2404,44 +2593,45 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int aOff = maxRank - aRank;
         int bOff = maxRank - bRank;
 
-        // Materialize both operands as zero-offset contiguous buffers so we
-        // can index by flat offset. A contiguous VIEW can still have a
-        // non-zero _storageOffset (e.g. a slice of a larger tensor with row-
-        // major layout); reading _data.AsSpan() from index 0 would then
-        // return garbage from before the view's start. Force offset==0 via
-        // Contiguous() in that case, and slice the resulting span by
-        // (offset, logical length) to also handle ArrayPool-backed buffers
-        // that over-allocate past Length.
-        var aContig = (a.IsContiguous && a._storageOffset == 0) ? a : a.Contiguous();
-        var bContig = (b.IsContiguous && b._storageOffset == 0) ? b : b.Contiguous();
-        var aSpan = aContig._data.AsSpan().Slice(aContig._storageOffset, aContig.Length);
-        var bSpan = bContig._data.AsSpan().Slice(bContig._storageOffset, bContig.Length);
+        // Operands are addressed by explicit per-axis stride, so a non-contiguous view — a
+        // transpose, a slice, or the stride-0 view ExpandTo returns — is consumed exactly where it
+        // lies. Materializing here instead would turn every stretched operand into a full-size
+        // temporary, which is precisely the cost broadcasting exists to avoid.
+        //
+        // Sparse is the one layout this walk cannot address, so it still densifies. Everything else
+        // is handled by starting each operand's index at its own _storageOffset (rather than
+        // forcing offset 0) and indexing the FULL backing span, since an arbitrary stride pattern
+        // is not confined to the [offset, offset + Length) window a contiguous slice would occupy.
+        var aSrc = a is SparseTensor<T> sparseA ? sparseA.ToDense() : a;
+        var bSrc = b is SparseTensor<T> sparseB ? sparseB.ToDense() : b;
+        aSrc.EnsureMaterialized();
+        bSrc.EnsureMaterialized();
+        ReadOnlySpan<T> aSpan = aSrc._data.AsSpan();
+        ReadOnlySpan<T> bSpan = bSrc._data.AsSpan();
         var rSpan = result._data.AsWritableSpan();
+        int aOrigin = aSrc._storageOffset;
+        int bOrigin = bSrc._storageOffset;
 
         int total = result.Length;
         if (total == 0) return;
-        if (maxRank == 0) { rSpan[0] = ApplyScalar(op, aSpan[0], bSpan[0]); return; }
+        if (maxRank == 0) { rSpan[0] = ApplyScalar(op, aSpan[aOrigin], bSpan[bOrigin]); return; }
 
-        // Broadcast stride per axis: operand's row-major stride if its dim
-        // matches the broadcast dim, or 0 if the dim is 1 (broadcast axis).
-        // Preceding-axes (the extra leading 1s we implicitly added) have
-        // stride 0 as well.
+        // Broadcast stride per axis: the operand's OWN stride for that axis, or 0 where the axis is
+        // stretched (extent 1) or padded in by right-alignment.
+        //
+        // Reading the stored stride rather than re-deriving a row-major one is the whole point. A
+        // derived stride describes the layout the operand WOULD have if it were freshly allocated;
+        // for a transposed or sliced view that is not the layout it actually has, so the walk would
+        // read the right memory in the wrong order and return numbers that look entirely reasonable.
         Span<int> aBroadStride = stackalloc int[maxRank];
         Span<int> bBroadStride = stackalloc int[maxRank];
-        int aRowStride = 1;
-        for (int i = aRank - 1; i >= 0; i--)
+        for (int i = 0; i < maxRank; i++)
         {
-            aBroadStride[aOff + i] = a._shape[i] == 1 ? 0 : aRowStride;
-            aRowStride *= a._shape[i];
+            int j = i - aOff;
+            aBroadStride[i] = (j < 0 || aSrc._shape[j] == 1) ? 0 : aSrc._strides[j];
+            int k = i - bOff;
+            bBroadStride[i] = (k < 0 || bSrc._shape[k] == 1) ? 0 : bSrc._strides[k];
         }
-        for (int i = 0; i < aOff; i++) aBroadStride[i] = 0;
-        int bRowStride = 1;
-        for (int i = bRank - 1; i >= 0; i--)
-        {
-            bBroadStride[bOff + i] = b._shape[i] == 1 ? 0 : bRowStride;
-            bRowStride *= b._shape[i];
-        }
-        for (int i = 0; i < bOff; i++) bBroadStride[i] = 0;
 
         // Coalesce trailing dims into one vectorizable inner block. The
         // innermost result dim has result-stride 1; extend the block leftward
@@ -2457,8 +2647,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int outerRank = maxRank - 1;
         for (int d = maxRank - 2; d >= 0; d--)
         {
-            int expectedA = aStride == 0 ? 0 : innerLen;
-            int expectedB = bStride == 0 ? 0 : innerLen;
+            // A dim continues the inner block only if stepping it advances by exactly one whole
+            // block at the operand's own per-element stride. With a derived row-major stride that
+            // is always innerLen; with a real stride it scales by it.
+            int expectedA = aStride == 0 ? 0 : aStride * innerLen;
+            int expectedB = bStride == 0 ? 0 : bStride * innerLen;
             if (aBroadStride[d] == expectedA && bBroadStride[d] == expectedB)
             {
                 innerLen *= broadcastShape[d];
@@ -2480,7 +2673,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 coord[d] = remaining % broadcastShape[d];
                 remaining /= broadcastShape[d];
             }
-            int aBase = 0, bBase = 0;
+            int aBase = aOrigin, bBase = bOrigin;
             for (int d = 0; d < outerRank; d++)
             {
                 aBase += coord[d] * aBroadStride[d];
@@ -2498,8 +2691,29 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             BroadcastOp.Add => _numOps.Add(x, y),
             BroadcastOp.Subtract => _numOps.Subtract(x, y),
             BroadcastOp.Multiply => _numOps.Multiply(x, y),
+            BroadcastOp.Divide => _numOps.Divide(x, y),
             _ => _numOps.Multiply(x, y),
         };
+
+    private static void ValidateInnerBounds(
+        int resultLength, int rBase,
+        int aLength, int aBase, int aStride,
+        int bLength, int bBase, int bStride,
+        int len)
+    {
+        static bool Fits(int spanLength, int start, int stride, int count)
+        {
+            long end = (long)start + (long)(count - 1) * stride;
+            return start >= 0 && start < spanLength && end >= 0 && end < spanLength;
+        }
+
+        if (!Fits(resultLength, rBase, 1, len))
+            throw new ArgumentOutOfRangeException(nameof(rBase), "Inner result block exceeds its span.");
+        if (!Fits(aLength, aBase, aStride, len))
+            throw new ArgumentOutOfRangeException(nameof(aBase), "Inner left-operand block exceeds its span.");
+        if (!Fits(bLength, bBase, bStride, len))
+            throw new ArgumentOutOfRangeException(nameof(bBase), "Inner right-operand block exceeds its span.");
+    }
 
 #if NET6_0_OR_GREATER
     // Reinterprets a Span<T> as Span<TTo> after a runtime typeof(T)==typeof(TTo)
@@ -2526,6 +2740,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Span<T> r, int rBase, ReadOnlySpan<T> a, int aBase, int aStride,
         ReadOnlySpan<T> b, int bBase, int bStride, int len)
     {
+        if (len <= 0) return;
+        ValidateInnerBounds(r.Length, rBase, a.Length, aBase, aStride,
+            b.Length, bBase, bStride, len);
+
 #if NET6_0_OR_GREATER
         // Tensor<T> is not struct-constrained, so MemoryMarshal.Cast<T,float>
         // is illegal here. After the runtime typeof check T IS float/double, so
@@ -2550,97 +2768,129 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // net471 (and non-float/double T): tight scalar+enum loop. Still avoids
         // the per-element Func<T,T,T> delegate and benefits from the collapsed
         // inner block (coordinate math runs per-block, not per-element).
+        //
+        // The multiply by stride is what makes an already-strided operand — a transpose or a slice
+        // arriving unmaterialized — read correctly. Treating stride as merely zero-or-not would
+        // walk it one element at a time in storage order and return plausible, wrong numbers.
         for (int i = 0; i < len; i++)
-            r[rBase + i] = ApplyScalar(op,
-                a[aBase + (aStride == 0 ? 0 : i)], b[bBase + (bStride == 0 ? 0 : i)]);
+            r[rBase + i] = ApplyScalar(op, a[aBase + i * aStride], b[bBase + i * bStride]);
     }
 
 #if NET6_0_OR_GREATER
-    private static void ApplyInnerFloat(BroadcastOp op,
+    /// <remarks>
+    /// Pointer-based rather than span-based. The span form cost two bounds-checked <c>Slice</c>
+    /// calls and a <c>CopyTo</c> per vector, which measured 5.2 ms against a 1.8 ms contiguous add
+    /// of the same size — a gap that only mattered once implicit broadcasting made this the path
+    /// every stretched operand takes.
+    /// </remarks>
+    private static unsafe void ApplyInnerFloat(BroadcastOp op,
         Span<float> r, int rBase, ReadOnlySpan<float> a, int aBase, int aStride,
         ReadOnlySpan<float> b, int bBase, int bStride, int len)
     {
         int w = System.Numerics.Vector<float>.Count;
         int i = 0;
+        fixed (float* rp = r, ap = a, bp = b)
+        {
+            float* pr = rp + rBase, pa = ap + aBase, pb = bp + bBase;
         if (aStride == 1 && bStride == 1)
         {
             for (; i + w <= len; i += w)
             {
-                var va = new System.Numerics.Vector<float>(a.Slice(aBase + i, w));
-                var vb = new System.Numerics.Vector<float>(b.Slice(bBase + i, w));
-                VecFloat(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+                var va = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(pa + i);
+                var vb = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(pb + i);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(pr + i, VecFloat(op, va, vb));
             }
-            for (; i < len; i++) r[rBase + i] = ScalarFloat(op, a[aBase + i], b[bBase + i]);
+            for (; i < len; i++) pr[i] = ScalarFloat(op, pa[i], pb[i]);
         }
         else if (aStride == 1 && bStride == 0)
         {
-            float bs = b[bBase];
+            float bs = *pb;
             var vb = new System.Numerics.Vector<float>(bs);
             for (; i + w <= len; i += w)
             {
-                var va = new System.Numerics.Vector<float>(a.Slice(aBase + i, w));
-                VecFloat(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+                var va = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(pa + i);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(pr + i, VecFloat(op, va, vb));
             }
-            for (; i < len; i++) r[rBase + i] = ScalarFloat(op, a[aBase + i], bs);
+            for (; i < len; i++) pr[i] = ScalarFloat(op, pa[i], bs);
         }
         else if (aStride == 0 && bStride == 1)
         {
-            float as0 = a[aBase];
+            float as0 = *pa;
             var va = new System.Numerics.Vector<float>(as0);
             for (; i + w <= len; i += w)
             {
-                var vb = new System.Numerics.Vector<float>(b.Slice(bBase + i, w));
-                VecFloat(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+                var vb = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(pb + i);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(pr + i, VecFloat(op, va, vb));
             }
-            for (; i < len; i++) r[rBase + i] = ScalarFloat(op, as0, b[bBase + i]);
+            for (; i < len; i++) pr[i] = ScalarFloat(op, as0, pb[i]);
+        }
+        else if (aStride == 0 && bStride == 0)
+        {
+            new Span<float>(pr, len).Fill(ScalarFloat(op, *pa, *pb));
         }
         else
         {
-            r.Slice(rBase, len).Fill(ScalarFloat(op, a[aBase], b[bBase]));
+            // Both operands strided by something other than 0 or 1 — a transposed or sliced view
+            // consumed where it lies rather than materialized. Scalar on purpose: vectorizing this
+            // needs gather, and the branches above already cover every layout that broadcasting
+            // itself produces, so this runs only for genuinely non-unit-stride inputs.
+            for (; i < len; i++)
+                pr[i] = ScalarFloat(op, pa[i * aStride], pb[i * bStride]);
+        }
         }
     }
 
-    private static void ApplyInnerDouble(BroadcastOp op,
+    private static unsafe void ApplyInnerDouble(BroadcastOp op,
         Span<double> r, int rBase, ReadOnlySpan<double> a, int aBase, int aStride,
         ReadOnlySpan<double> b, int bBase, int bStride, int len)
     {
         int w = System.Numerics.Vector<double>.Count;
         int i = 0;
+        fixed (double* rp = r, ap = a, bp = b)
+        {
+            double* pr = rp + rBase, pa = ap + aBase, pb = bp + bBase;
         if (aStride == 1 && bStride == 1)
         {
             for (; i + w <= len; i += w)
             {
-                var va = new System.Numerics.Vector<double>(a.Slice(aBase + i, w));
-                var vb = new System.Numerics.Vector<double>(b.Slice(bBase + i, w));
-                VecDouble(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+                var va = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<double>>(pa + i);
+                var vb = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<double>>(pb + i);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(pr + i, VecDouble(op, va, vb));
             }
-            for (; i < len; i++) r[rBase + i] = ScalarDouble(op, a[aBase + i], b[bBase + i]);
+            for (; i < len; i++) pr[i] = ScalarDouble(op, pa[i], pb[i]);
         }
         else if (aStride == 1 && bStride == 0)
         {
-            double bs = b[bBase];
+            double bs = *pb;
             var vb = new System.Numerics.Vector<double>(bs);
             for (; i + w <= len; i += w)
             {
-                var va = new System.Numerics.Vector<double>(a.Slice(aBase + i, w));
-                VecDouble(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+                var va = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<double>>(pa + i);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(pr + i, VecDouble(op, va, vb));
             }
-            for (; i < len; i++) r[rBase + i] = ScalarDouble(op, a[aBase + i], bs);
+            for (; i < len; i++) pr[i] = ScalarDouble(op, pa[i], bs);
         }
         else if (aStride == 0 && bStride == 1)
         {
-            double as0 = a[aBase];
+            double as0 = *pa;
             var va = new System.Numerics.Vector<double>(as0);
             for (; i + w <= len; i += w)
             {
-                var vb = new System.Numerics.Vector<double>(b.Slice(bBase + i, w));
-                VecDouble(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+                var vb = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<double>>(pb + i);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(pr + i, VecDouble(op, va, vb));
             }
-            for (; i < len; i++) r[rBase + i] = ScalarDouble(op, as0, b[bBase + i]);
+            for (; i < len; i++) pr[i] = ScalarDouble(op, as0, pb[i]);
+        }
+        else if (aStride == 0 && bStride == 0)
+        {
+            new Span<double>(pr, len).Fill(ScalarDouble(op, *pa, *pb));
         }
         else
         {
-            r.Slice(rBase, len).Fill(ScalarDouble(op, a[aBase], b[bBase]));
+            // See ApplyInnerFloat: general strided walk for operands consumed unmaterialized.
+            for (; i < len; i++)
+                pr[i] = ScalarDouble(op, pa[i * aStride], pb[i * bStride]);
+        }
         }
     }
 
@@ -2651,6 +2901,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             BroadcastOp.Add => x + y,
             BroadcastOp.Subtract => x - y,
             BroadcastOp.Multiply => x * y,
+            BroadcastOp.Divide => x / y,
             _ => x * y,
         };
 
@@ -2661,14 +2912,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             BroadcastOp.Add => x + y,
             BroadcastOp.Subtract => x - y,
             BroadcastOp.Multiply => x * y,
+            BroadcastOp.Divide => x / y,
             _ => x * y,
         };
 
     private static float ScalarFloat(BroadcastOp op, float x, float y)
-        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, _ => x * y };
+        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, BroadcastOp.Divide => x / y, _ => x * y };
 
     private static double ScalarDouble(BroadcastOp op, double x, double y)
-        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, _ => x * y };
+        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, BroadcastOp.Divide => x / y, _ => x * y };
 #endif
 
     /// <summary>
@@ -2689,6 +2941,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T Mean()
     {
+        EnsureMaterialized();
         // Use vectorized Sum for SIMD acceleration (8-12x speedup with AVX2)
         T sum = _numOps.Sum(_data.AsSpan());
 
@@ -2900,6 +3153,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetRow(int rowIndex)
     {
+        EnsureMaterialized();
         if (rowIndex < 0 || rowIndex >= Shape[0])
         {
             throw new ArgumentOutOfRangeException(nameof(rowIndex), "Row index is out of range.");
@@ -3209,6 +3463,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Tensor<T> ElementwiseMultiply(Tensor<T> a, Tensor<T> b)
     {
+        a.EnsureMaterialized();
+        b.EnsureMaterialized();
         // TensorValidator.ValidateShape(a, b._shape);
 
         Tensor<T> result = new Tensor<T>(a._shape);
@@ -3618,6 +3874,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for addition.");
 
+        EnsureMaterialized();
+        other.EnsureMaterialized();
         _numOps.Add(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
     }
 
@@ -3651,7 +3909,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // engine — regardless of which engine the caller actually invoked. On a
         // GPU-auto-detect host AiDotNetEngine.Current is DirectGpuTensorEngine,
         // which computes elementwise arithmetic in single precision on consumer
-        // GPUs. So CpuEngine.TensorBroadcastAdd — whose generic fallback calls
+        // GPUs. So CpuEngine.TensorAdd — whose generic fallback calls
         // this method — silently returned ~8 significant digits in a
         // Tensor<double> even though the caller held an explicit CpuEngine.
         // Delegating also recorded a spurious second "TensorAdd" tape entry for
@@ -3743,7 +4001,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // delegating to Subtract(other), which would dispatch to the process-GLOBAL
         // AiDotNetEngine.Current and compute in single precision on a GPU host.
         // See BroadcastAdd for the full rationale — this was the defect behind
-        // TensorBroadcastSubtract<double> returning float-precision differences.
+        // TensorSubtract<double> returning float-precision differences.
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = TensorAllocator.Rent<T>(broadcastShape);
         BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Subtract);
@@ -4111,6 +4369,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int start, Vector<T> slice)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         for (int i = 0; i < slice.Length; i++)
         {
             _data[start + i] = slice[i];
@@ -4140,6 +4399,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int dimension, int index, Tensor<T> slice)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
+        slice.EnsureMaterialized();
         if (dimension < 0 || dimension >= Rank)
             throw new ArgumentOutOfRangeException(nameof(dimension), "Dimension is out of range.");
 
@@ -4277,6 +4538,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <summary>Legacy SumOverAxis implementation for internal use.</summary>
     internal Tensor<T> SumOverAxisDirect(int axis)
     {
+        EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
@@ -4310,6 +4572,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> MaxOverAxis(int axis)
     {
+        EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
@@ -4351,6 +4614,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     internal Tensor<T> MeanOverAxisDirect(int axis)
     {
         ThrowIfSparse();
+        EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 

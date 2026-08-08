@@ -56,7 +56,7 @@ public class BroadcastChannelRepeatTests
     {
         var a = MakeRandom([n, c, h, w], seed: 17);
         var b = MakeRandom([1, c, 1, 1], seed: 42);
-        var fast = _engine.TensorBroadcastAdd(a, b);
+        var fast = _engine.TensorAdd(a, b);
         var slow = RefBroadcast(a, b, (x, y) => x + y);
         AssertEqual(slow, fast);
     }
@@ -69,7 +69,7 @@ public class BroadcastChannelRepeatTests
     {
         var a = MakeRandom([n, c, h, w], seed: 23);
         var b = MakeRandom([1, c, 1, 1], seed: 7);
-        var fast = _engine.TensorBroadcastMultiply(a, b);
+        var fast = _engine.TensorMultiply(a, b);
         var slow = RefBroadcast(a, b, (x, y) => x * y);
         AssertEqual(slow, fast);
     }
@@ -81,7 +81,7 @@ public class BroadcastChannelRepeatTests
     {
         var a = MakeRandom([n, c, h, w], seed: 11);
         var b = MakeRandom([1, c, 1, 1], seed: 13);
-        var fast = _engine.TensorBroadcastSubtract(a, b);
+        var fast = _engine.TensorSubtract(a, b);
         var slow = RefBroadcast(a, b, (x, y) => x - y);
         AssertEqual(slow, fast);
     }
@@ -96,7 +96,7 @@ public class BroadcastChannelRepeatTests
         var b = new Tensor<double>([1, c, 1, 1]);
         var rng = new Random(33);
         for (int i = 0; i < b.Length; i++) b.AsWritableSpan()[i] = 0.1 + rng.NextDouble();
-        var fast = _engine.TensorBroadcastDivide(a, b);
+        var fast = _engine.TensorDivide(a, b);
         var slow = RefBroadcast(a, b, (x, y) => x / y);
         AssertEqual(slow, fast);
     }
@@ -107,7 +107,7 @@ public class BroadcastChannelRepeatTests
         // Conv1D NCL shape — verifies rank != 4 still hits the path.
         var a = MakeRandom([2, 8, 17], seed: 41);
         var b = MakeRandom([1, 8, 1], seed: 43);
-        var fast = _engine.TensorBroadcastAdd(a, b);
+        var fast = _engine.TensorAdd(a, b);
         var slow = RefBroadcast(a, b, (x, y) => x + y);
         AssertEqual(slow, fast);
     }
@@ -122,7 +122,7 @@ public class BroadcastChannelRepeatTests
         var b = new Tensor<float>([1, c, 1, 1]);
         for (int i = 0; i < a.Length; i++) a.AsWritableSpan()[i] = (float)(rng.NextDouble() * 2 - 1);
         for (int i = 0; i < b.Length; i++) b.AsWritableSpan()[i] = (float)(rng.NextDouble() * 2 - 1);
-        var fast = _engine.TensorBroadcastAdd(a, b);
+        var fast = _engine.TensorAdd(a, b);
         // Reference: just walk
         var slow = new Tensor<float>([n, c, h, w]);
         int spatial = h * w;

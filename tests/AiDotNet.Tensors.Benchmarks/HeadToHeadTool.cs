@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// from a head-to-head.
 /// </para>
 /// <para>
-/// Both sides go through <see cref="StableTimer.MeasureHostPair"/> as adjacent batches, so a
+/// Both sides go through <see cref="StableTimer.MeasureHostPair"/> as adjacent A/B/B/A batches, so a
 /// ratio is only printed when both measurements AND the within-sample ratio converged. A
 /// promotion decision taken on numbers that move 50% between runs is a coin flip wearing a
 /// table.

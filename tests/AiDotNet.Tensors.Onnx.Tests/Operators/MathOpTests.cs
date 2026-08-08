@@ -1,3 +1,6 @@
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Onnx.Operators;
 using AiDotNet.Tensors.Onnx.Protos;
 using Xunit;
 using static AiDotNet.Tensors.Onnx.Tests.OnnxTestHelpers;
@@ -53,6 +56,17 @@ public class MathOpTests
         var ort = OnnxRuntimeReference.RunSingleOutput(bytes, ("X", new[] { 9 }, x));
         var ours = ImportAndExecute(bytes, ("X", x));
         AssertClose(ort, ours);
+    }
+
+    [Fact]
+    public void Erf_ScalarPreservesRank()
+    {
+        var input = new Tensor<float>(new[] { 0.5f }, Array.Empty<int>());
+
+        var result = MathOperators.ComposeErf(new CpuEngine(), input);
+
+        Assert.Equal(0, result.Rank);
+        Assert.InRange(result[Array.Empty<int>()], 0.5204f, 0.5206f);
     }
 
     [SkippableFact]

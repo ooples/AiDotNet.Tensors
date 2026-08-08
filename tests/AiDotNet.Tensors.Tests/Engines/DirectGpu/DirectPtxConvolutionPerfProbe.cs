@@ -2,6 +2,7 @@
 using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -21,6 +22,140 @@ public sealed class DirectPtxConvolutionPerfProbe
 
     private const int Warmups = 30;
     private const int Samples = 101;
+
+    [Fact]
+    public void Measure_ProductionAutotuner_ExactShape()
+    {
+        if (!DirectPtxRuntime.IsAvailable) { _out.WriteLine("no CUDA device"); return; }
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+        { _out.WriteLine("no SM86 specialization"); return; }
+
+        string variable = "AIDOTNET_AUTOTUNE_CACHE_PATH";
+        string? priorCache = Environment.GetEnvironmentVariable(variable);
+        string cache = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "aidotnet-conv-production-" + Guid.NewGuid().ToString("N"));
+        bool priorJit = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        Environment.SetEnvironmentVariable(variable, cache);
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            using var input = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.InputBytes);
+            using var weights = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.WeightBytes);
+            using var bias = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.BiasBytes);
+            using var output = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.OutputBytes);
+            var hostInput = new float[PtxFusedConv2DNchwK1Kernel.InputBytes / sizeof(float)];
+            var hostWeights = new float[PtxFusedConv2DNchwK1Kernel.WeightBytes / sizeof(float)];
+            var hostBias = new float[PtxFusedConv2DNchwK1Kernel.BiasBytes / sizeof(float)];
+            for (int i = 0; i < hostInput.Length; i++)
+                hostInput[i] = ((i % 7) - 3) * 0.1f;
+            for (int i = 0; i < hostWeights.Length; i++)
+                hostWeights[i] = ((i % 5) - 2) * 0.05f;
+            for (int i = 0; i < hostBias.Length; i++)
+                hostBias[i] = ((i % 3) - 1) * 0.1f;
+            input.Upload<float>(hostInput);
+            weights.Upload<float>(hostWeights);
+            bias.Upload<float>(hostBias);
+            float[] expected = ReferenceConv1x1(hostInput, hostWeights, hostBias);
+            long operations = 2L * PtxFusedConv2DNchwK1Kernel.OutputElements *
+                PtxFusedConv2DNchwK1Kernel.InputChannels;
+
+            double Benchmark(DirectPtxConvolutionVariant candidate)
+            {
+                if (!candidate.IsTiled)
+                {
+                    using var kernel = new PtxFusedConv2DNchwK1Kernel(runtime);
+                    void LaunchDirect() => kernel.Launch(
+                        DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+                    AssertCandidateMatchesReference(
+                        "unrolled-direct", runtime, output, LaunchDirect, expected);
+                    return MeasureStableCandidate(
+                        "unrolled-direct", runtime, LaunchDirect, operations);
+                }
+
+                var shape = new Conv2DTiledShape(
+                    PtxFusedConv2DNchwK1Kernel.Batch,
+                    PtxFusedConv2DNchwK1Kernel.OutputChannels,
+                    PtxFusedConv2DNchwK1Kernel.InputChannels,
+                    PtxFusedConv2DNchwK1Kernel.SpatialElements,
+                    candidate.Tile);
+                using var tiled = new PtxConv2DNchwK1TiledKernel(runtime, shape);
+                void LaunchTiled() => tiled.Launch(
+                    DirectPtxTensorView.CreateOwned(input, tiled.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(weights, tiled.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(bias, tiled.Blueprint.Tensors[2]),
+                    DirectPtxTensorView.CreateOwned(output, tiled.Blueprint.Tensors[3]));
+                AssertCandidateMatchesReference(
+                    $"tile-{candidate.Tile}", runtime, output, LaunchTiled, expected);
+                return MeasureStableCandidate(
+                    $"tile-{candidate.Tile}", runtime, LaunchTiled, operations);
+            }
+
+            DirectPtxConvolutionVariant selected = DirectPtxConvolutionAutotuner.Resolve(
+                runtime,
+                PtxFusedConv2DNchwK1Kernel.Batch,
+                PtxFusedConv2DNchwK1Kernel.OutputChannels,
+                PtxFusedConv2DNchwK1Kernel.InputChannels,
+                PtxFusedConv2DNchwK1Kernel.SpatialElements,
+                Benchmark,
+                autotuneEnabled: true,
+                exchange: NullGpuTuningExchange.Instance);
+            _out.WriteLine(selected.IsTiled
+                ? $"selected=tile-{selected.Tile}"
+                : "selected=unrolled-direct");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = priorJit;
+            Environment.SetEnvironmentVariable(variable, priorCache);
+            try { if (System.IO.Directory.Exists(cache)) System.IO.Directory.Delete(cache, true); }
+            catch { /* best effort */ }
+        }
+    }
+
+    private static float[] ReferenceConv1x1(
+        float[] input, float[] weights, float[] bias)
+    {
+        int batch = PtxFusedConv2DNchwK1Kernel.Batch;
+        int outputChannels = PtxFusedConv2DNchwK1Kernel.OutputChannels;
+        int inputChannels = PtxFusedConv2DNchwK1Kernel.InputChannels;
+        int spatial = PtxFusedConv2DNchwK1Kernel.SpatialElements;
+        var output = new float[PtxFusedConv2DNchwK1Kernel.OutputElements];
+        for (int n = 0; n < batch; n++)
+            for (int oc = 0; oc < outputChannels; oc++)
+                for (int p = 0; p < spatial; p++)
+                {
+                    double sum = bias[oc];
+                    for (int ic = 0; ic < inputChannels; ic++)
+                        sum += (double)input[(n * inputChannels + ic) * spatial + p] *
+                               weights[oc * inputChannels + ic];
+                    output[(n * outputChannels + oc) * spatial + p] =
+                        (float)Math.Max(sum, 0.0);
+                }
+        return output;
+    }
+
+    private static void AssertCandidateMatchesReference(
+        string candidate,
+        DirectPtxRuntime runtime,
+        DirectPtxBuffer output,
+        Action launch,
+        float[] expected)
+    {
+        launch();
+        runtime.Synchronize();
+        var actual = new float[expected.Length];
+        output.Download<float>(actual);
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(!float.IsNaN(actual[i]) && !float.IsInfinity(actual[i]) &&
+                Math.Abs(expected[i] - actual[i]) <= 2e-4f,
+                $"{candidate} mismatch at {i}: expected {expected[i]}, actual {actual[i]}");
+    }
 
     [Fact]
     public void Measure_V1_And_Tiled_ResNetC64()
@@ -643,6 +778,46 @@ public sealed class DirectPtxConvolutionPerfProbe
 
         _out.WriteLine($"{label}: median={median:F1}us p95={p95:F1}us {gflops:F0} GFLOP/s | " +
             $"amortized={amortUs:F1}us {amortGflops:F0} GFLOP/s ({flops / 1e6:F0} MFLOP)");
+    }
+
+    private double MeasureStableCandidate(
+        string label, DirectPtxRuntime runtime, Action launch, long operations)
+    {
+        try
+        {
+            float[]? acceptedSamples = null;
+            int acceptedLaunches = 0;
+            double gflops = GpuAutotuneMeasurement.AdaptiveStableGflops(
+                launchesPerSample =>
+                {
+                    acceptedLaunches = launchesPerSample;
+                    acceptedSamples = runtime.MeasureKernelSamples(
+                        launch, warmup: 3, samples: 20, launchesPerSample);
+                    var attempt = (float[])acceptedSamples.Clone();
+                    Array.Sort(attempt);
+                    (double attemptMedian, double attemptP95) =
+                        GpuAutotuneMeasurement.SortedDistributionStatistics(attempt);
+                    _out.WriteLine(
+                        $"{label} group={launchesPerSample}: " +
+                        $"median={attemptMedian * 1000.0:F2}us " +
+                        $"p95={attemptP95 * 1000.0:F2}us ratio={attemptP95 / attemptMedian:F4}");
+                    return acceptedSamples;
+                },
+                operations);
+            double median = GpuAutotuneMeasurement.StableMedianMilliseconds(acceptedSamples!);
+            var sorted = (float[])acceptedSamples!.Clone();
+            Array.Sort(sorted);
+            double p95 = GpuAutotuneMeasurement.SortedDistributionStatistics(sorted).P95;
+            _out.WriteLine(
+                $"{label}: median={median * 1000.0:F2}us p95={p95 * 1000.0:F2}us " +
+                $"ratio={p95 / median:F4} {gflops:F1} GFLOP/s group={acceptedLaunches}");
+            return gflops;
+        }
+        catch (InvalidOperationException ex)
+        {
+            _out.WriteLine($"{label}: UNSTABLE ({ex.Message})");
+            throw;
+        }
     }
 }
 #endif

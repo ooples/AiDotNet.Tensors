@@ -909,6 +909,42 @@ public class VulkanBackendTests : IDisposable
 
     #endregion
 
+    #region Scientific Distance Tests
+
+    [SkippableFact]
+    public void ScientificDistances_UseCompleteShapePushConstants()
+    {
+        SkipIfNoVulkan();
+        Skip.If(!_backend!.IsGlslCompilerAvailable,
+            "Vulkan GLSL compiler not available on this system");
+
+        using (var a = _backend.AllocateBuffer(new float[] { 1, 0, 0, 1, 1, 1 }))
+        using (var b = _backend.AllocateBuffer(new float[] { 1, 0, 1, 0, 1, -1 }))
+        using (var output = _backend.AllocateBuffer(3))
+        {
+            _backend.CosineSimilarity(a, b, output, 3, 2);
+            float[] actual = _backend.DownloadBuffer(output);
+            Assert.Equal(1f, actual[0], 5);
+            Assert.Equal(0f, actual[1], 5);
+            Assert.Equal(0f, actual[2], 5);
+        }
+
+        using var left = _backend.AllocateBuffer(new float[] { 0, 0, 1, 0 });
+        using var right = _backend.AllocateBuffer(new float[] { 0, 0, 0, 2, 2, 0 });
+        using var distances = _backend.AllocateBuffer(6);
+        _backend.PairwiseDistance(left, right, distances, 2, 3, 2);
+        float[] l2 = _backend.DownloadBuffer(distances);
+        float[] expectedL2 = { 0, 2, 2, 1, MathF.Sqrt(5), 1 };
+        for (int i = 0; i < expectedL2.Length; i++)
+            Assert.Equal(expectedL2[i], l2[i], 4);
+
+        _backend.PairwiseDistanceSquared(left, right, distances, 2, 3, 2);
+        float[] squared = _backend.DownloadBuffer(distances);
+        Assert.Equal(new float[] { 0, 4, 4, 1, 5, 1 }, squared);
+    }
+
+    #endregion
+
     #region Edge Case Tests
 
     [SkippableFact]
@@ -977,4 +1013,3 @@ public class VulkanBackendTests : IDisposable
 
     #endregion
 }
-
