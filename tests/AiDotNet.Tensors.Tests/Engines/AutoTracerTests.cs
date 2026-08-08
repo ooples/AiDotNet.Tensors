@@ -495,12 +495,12 @@ public class AutoTracerTests
     }
 
     [Fact]
-    public void TensorBroadcastAdd_EagerMatchesRepeated()
+    public void TensorAdd_EagerMatchesRepeated()
     {
         var a = Rand(new[] { 10, 100 }, 83);
         var b = Rand(new[] { 1, 100 }, 84);
         var results = new Tensor<float>[5];
-        for (int i = 0; i < 5; i++) results[i] = E.TensorBroadcastAdd(a, b);
+        for (int i = 0; i < 5; i++) results[i] = E.TensorAdd(a, b);
         for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"BroadcastAdd iter {i}");
     }
 

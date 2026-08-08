@@ -56,15 +56,25 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         WarpsPerBlock = warpsPerBlock;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, rows, warpsPerBlock);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, epsilon, rows, warpsPerBlock);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int blockThreads = warpsPerBlock * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    EntryPoint, out DirectPtxFunctionInfo functionInfo);
+                int blockThreads = warpsPerBlock * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    EntryPoint, functionInfo, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, FunctionInfo: functionInfo, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -116,11 +126,11 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         DirectPtxTensorView output,
         DirectPtxTensorView rms)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(residual, Blueprint.Tensors[1], nameof(residual));
-        Require(gamma, Blueprint.Tensors[2], nameof(gamma));
-        Require(output, Blueprint.Tensors[3], nameof(output));
-        Require(rms, Blueprint.Tensors[4], nameof(rms));
+        DirectPtxAbi.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbi.Require(residual, Blueprint.Tensors[1], nameof(residual));
+        DirectPtxAbi.Require(gamma, Blueprint.Tensors[2], nameof(gamma));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbi.Require(rms, Blueprint.Tensors[4], nameof(rms));
         if (output.Pointer == input.Pointer || output.Pointer == residual.Pointer)
             throw new ArgumentException("The fused output must not alias either input.", nameof(output));
 
@@ -142,17 +152,6 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
             (uint)(WarpsPerBlock * 32), 1, 1, 0, arguments);
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     public void Dispose() => _module.Dispose();
 

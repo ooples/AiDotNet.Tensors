@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -1311,45 +1312,27 @@ public sealed partial class CudaBackend
         float scale,
         float epsilon)
     {
-        bool persisted = DirectPtxAttentionAutotuner.TryLoad(
+        int selectedWarps = DirectPtxAttentionAutotuner.Resolve(
             _directPtxRuntime!, plan.Batch, plan.QueryHeads, plan.KeyValueHeads,
             plan.QuerySequence, plan.KeyValueSequence, plan.IsCausal, plan.CausalQueryOffset,
-            plan.FuseLayerNormGelu, plan.EmitSoftmaxStats, scale, epsilon, out int selectedWarps);
-        int[] candidates = DirectPtxAttentionAutotuner.Candidates(plan.QuerySequence);
-        if (!persisted) selectedWarps = candidates[0];
-
-        if (!persisted && DirectPtxFeatureGate.IsAutotuneEnabled && candidates.Length > 1)
-        {
-            double bestMilliseconds = double.PositiveInfinity;
-            int bestWarps = selectedWarps;
-            lock (GpuDispatchLock)
+            plan.FuseLayerNormGelu, plan.EmitSoftmaxStats, scale, epsilon,
+            candidate =>
             {
-                foreach (int candidate in candidates)
-                {
-                    PtxOnlineFusedAttention128x64Kernel candidateKernel = GetOrCreateAttentionKernel(
-                        plan, candidate, scale, epsilon);
-                    float milliseconds = _directPtxRuntime!.MeasureKernelMilliseconds(
-                        () => LaunchAttentionKernel(
-                            candidateKernel, queryHalf, keyHalf, valueHalf,
-                            gammaFloat, betaFloat, outputFloat, softmaxStatsFloat),
-                        warmup: 3, iterations: 12);
-                    if (milliseconds < bestMilliseconds)
+                PtxOnlineFusedAttention128x64Kernel candidateKernel = GetOrCreateAttentionKernel(
+                    plan, candidate, scale, epsilon);
+                double median = GpuAutotuneMeasurement.AdaptiveStableMedianMilliseconds(
+                    launchesPerSample =>
                     {
-                        bestMilliseconds = milliseconds;
-                        bestWarps = candidate;
-                    }
-                }
-            }
-            selectedWarps = bestWarps;
-            PtxOnlineFusedAttention128x64Kernel winner = GetOrCreateAttentionKernel(
-                plan, selectedWarps, scale, epsilon);
-            DirectPtxAttentionAutotuner.Store(
-                _directPtxRuntime!, plan.Batch, plan.QueryHeads, plan.KeyValueHeads,
-                plan.QuerySequence, plan.KeyValueSequence, plan.IsCausal, plan.CausalQueryOffset,
-                plan.FuseLayerNormGelu, plan.EmitSoftmaxStats, scale, epsilon,
-                selectedWarps, bestMilliseconds,
-                winner.AttentionTflops((float)bestMilliseconds));
-        }
+                        lock (GpuDispatchLock)
+                            return _directPtxRuntime!.MeasureKernelSamples(
+                                () => LaunchAttentionKernel(
+                                    candidateKernel, queryHalf, keyHalf, valueHalf,
+                                    gammaFloat, betaFloat, outputFloat, softmaxStatsFloat),
+                                warmup: 3, samples: 20, launchesPerSample);
+                    });
+                return candidateKernel.AttentionTflops((float)median) * 1000.0;
+            },
+            DirectPtxFeatureGate.IsAutotuneEnabled);
         _directPtxAttentionPlans.Set(plan, selectedWarps);
         return selectedWarps;
     }
@@ -2298,7 +2281,8 @@ public sealed partial class CudaBackend
                     PtxCompat.SingleToInt32Bits(scale), PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxAttentionPlans.TryGetValue(plan, out int warps))
                 {
-                    if (!DirectPtxAttentionAutotuner.TryLoad(
+                    if (!DirectPtxFeatureGate.IsAutotuneEnabled ||
+                        !DirectPtxAttentionAutotuner.TryLoad(
                         _directPtxRuntime, batch, queryHeads, keyValueHeads,
                         querySequence, keyValueSequence, isCausal, causalQueryOffset,
                         fuseLayerNormGelu, emitSoftmaxStats, scale, epsilon, out warps))
@@ -3599,7 +3583,9 @@ public sealed partial class CudaBackend
             _directPtxQuantizedLinearKernels.Dispose();
             _directPtxNormalizationWorkspace?.Dispose();
             _directPtxNormalizationWorkspace = null;
+            _directPtxRgLruKernels.Dispose();
             _directPtxConvolutionKernels.Dispose();
+            _directPtxTiledConvolutionKernels.Dispose();
             _directPtxRegBlockedConvKernels.Dispose();
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;

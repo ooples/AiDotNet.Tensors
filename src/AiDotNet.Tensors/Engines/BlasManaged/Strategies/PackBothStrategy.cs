@@ -1425,6 +1425,19 @@ internal static class PackBothStrategy
                         ldc, kc);
                     return;
                 }
+                // Portable BCL Vector<T> tier, below the platform intrinsics and above the scalar
+                // reference. It is bit-identical to ScalarFp64_4x4 by construction (j-axis vectorization,
+                // no horizontal reduction — see PortableFp64_4x4), so it is safe to prefer wherever the
+                // BCL reports four hardware lanes. On net471 this is the only SIMD tier available.
+                if (PortableFp64_4x4.IsSupported)
+                {
+                    PortableFp64_4x4.Run(
+                        MemoryMarshal.Cast<T, double>(packedA),
+                        MemoryMarshal.Cast<T, double>(packedB),
+                        MemoryMarshal.Cast<T, double>(c),
+                        ldc, kc);
+                    return;
+                }
                 ScalarFp64_4x4.Run(
                     MemoryMarshal.Cast<T, double>(packedA),
                     MemoryMarshal.Cast<T, double>(packedB),

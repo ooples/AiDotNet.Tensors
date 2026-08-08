@@ -38,7 +38,7 @@ public class AsyncChainTests : IDisposable
         var plan = cache.GetOrCompileInference(input, () =>
         {
             var h = engine.TensorMatMul(input, w);
-            h = engine.TensorBroadcastAdd(h, b);
+            h = engine.TensorAdd(h, b);
             return engine.ReLU(h);
         });
         return (cache, plan);
@@ -51,7 +51,7 @@ public class AsyncChainTests : IDisposable
         var plan = cache.GetOrCompileInference(input, () =>
         {
             var o = engine.TensorMatMul(input, w);
-            return engine.TensorBroadcastAdd(o, b);
+            return engine.TensorAdd(o, b);
         });
         return (cache, plan);
     }
