@@ -45,6 +45,21 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The checked-in embedding-gather specialization is measured only on
+    /// GA102/SM86. Admitting the whole Ampere family would run PTX that was
+    /// never validated on SM80/SM87, so this pins the exact pair.
+    /// </summary>
+    internal static bool HasValidatedGather(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The index-select specialization is measured only on GA102/SM86. It is a
+    /// separate predicate from the gather one because the two ops have
+    /// different index dtypes and are promoted independently.
+    /// </summary>
+    internal static bool HasValidatedIndexSelect(int major, int minor) =>
+        (major, minor) == (8, 6);
+
     /// The issue-#846 recurrent specialization is validated only on exact
     /// GA102/SM86. Other architectures remain separate tuning domains.
     /// </summary>
