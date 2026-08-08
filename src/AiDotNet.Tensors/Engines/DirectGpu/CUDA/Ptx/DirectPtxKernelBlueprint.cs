@@ -45,6 +45,21 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The first global-average-pool candidate is emitted only for the exact
+    /// GA102/SM86 validation domain. Other Ampere devices are separate tuning
+    /// and admission domains and must not inherit this specialization.
+    /// </summary>
+    internal static bool HasValidatedGlobalAvgPool(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The warp-per-plane global max-pool specialization is measured only on
+    /// GA102/SM86, matching its average-pool sibling.
+    /// </summary>
+    internal static bool HasValidatedGlobalMaxPool(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The issue-#846 recurrent specialization is validated only on exact
     /// GA102/SM86. Other architectures remain separate tuning domains.
     /// </summary>
