@@ -97,6 +97,12 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mse-loss")
+        {
+            DirectPtxMseLossExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int mseRuns) ? mseRuns : 1);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
         {
             if (args.Length < 2)
