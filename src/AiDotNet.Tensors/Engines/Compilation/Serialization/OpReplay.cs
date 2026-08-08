@@ -23,7 +23,8 @@ internal static class OpReplay
         OpType opType,
         string opName,
         Tensor<T>[] inputs,
-        object[]? savedState)
+        object[]? savedState,
+        int[]? outputShape = null)
     {
         return opType switch
         {
@@ -47,6 +48,9 @@ internal static class OpReplay
             OpType.Sin           => engine.TensorSin(inputs[0]),
             OpType.Cos           => engine.TensorCos(inputs[0]),
 
+            // ── Metadata views ─────────────────────────────────────────
+            OpType.Expand        => ReplayExpand(inputs, outputShape),
+
             // ── Parameterless binary ────────────────────────────────
             OpType.TensorAdd      => engine.TensorAdd(inputs[0], inputs[1]),
             OpType.TensorSubtract => engine.TensorSubtract(inputs[0], inputs[1]),
@@ -56,9 +60,9 @@ internal static class OpReplay
             OpType.TensorMatMul   => engine.TensorMatMul(inputs[0], inputs[1]),
 
             // ── Broadcast binary ────────────────────────────────────
-            OpType.TensorBroadcastAdd      => engine.TensorBroadcastAdd(inputs[0], inputs[1]),
-            OpType.TensorBroadcastSubtract => engine.TensorBroadcastSubtract(inputs[0], inputs[1]),
-            OpType.TensorBroadcastMultiply => engine.TensorBroadcastMultiply(inputs[0], inputs[1]),
+            OpType.TensorBroadcastAdd      => engine.TensorAdd(inputs[0], inputs[1]),
+            OpType.TensorBroadcastSubtract => engine.TensorSubtract(inputs[0], inputs[1]),
+            OpType.TensorBroadcastMultiply => engine.TensorMultiply(inputs[0], inputs[1]),
 
             // ── Batch MatMul ────────────────────────────────────────
             OpType.BatchMatMul => engine.TensorBatchMatMul(inputs[0], inputs[1]),
@@ -133,6 +137,17 @@ internal static class OpReplay
         return engine.LeakyReLU(input, alpha);
     }
 
+    private static Tensor<T> ReplayExpand<T>(Tensor<T>[] inputs, int[]? outputShape)
+    {
+        if (inputs.Length != 1)
+            throw new InvalidDataException(
+                $"Expand replay requires exactly 1 input, got {inputs.Length}.");
+        if (outputShape is null)
+            throw new InvalidDataException(
+                "Expand replay requires the serialized output shape.");
+        return inputs[0].ExpandTo(outputShape);
+    }
+
     private static Tensor<T> ReplayMean<T>(IEngine engine, Tensor<T> input, object[]? savedState)
     {
         // Parallels RebuildMean: null-axes maps to a scalar TensorMean, wrapped
@@ -155,6 +170,6 @@ internal static class OpReplay
     {
         // Decomposes to MatMul + optional BroadcastAdd. Mirror of RebuildFusedLinear.
         var r = engine.TensorMatMul(inputs[0], inputs[1]);
-        return inputs.Length > 2 ? engine.TensorBroadcastAdd(r, inputs[2]) : r;
+        return inputs.Length > 2 ? engine.TensorAdd(r, inputs[2]) : r;
     }
 }

@@ -378,7 +378,15 @@ internal static class PackAOnlyStrategy
             // Scalar fallback (no matching SIMD kernel — e.g. net471 / no-AVX2). See the FP32
             // branch above: the fixed 4×4 kernel is only correct for a 4×4 tile, so any other
             // mr×nr routes to the general kernel that honors the actual tile dimensions.
-            if (mr == 4 && nr == 4)
+            if (mr == 4 && nr == 4 && PortableFp64_4x4.IsSupported)
+                // Portable BCL Vector<T> tier — bit-identical to ScalarFp64_4x4.RunStridedB by
+                // construction (j-axis vectorization, no horizontal reduction). This is the only SIMD tier
+                // available on net471, where every branch above declines.
+                PortableFp64_4x4.RunStridedB(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(b), ldb,
+                    MemoryMarshal.Cast<T, double>(c), ldc, kc);
+            else if (mr == 4 && nr == 4)
                 ScalarFp64_4x4.RunStridedB(
                     MemoryMarshal.Cast<T, double>(packedA),
                     MemoryMarshal.Cast<T, double>(b), ldb,

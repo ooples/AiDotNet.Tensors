@@ -160,15 +160,25 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             emitSoftmaxStats,
             selectedWarps,
             causalQueryOffset);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int blockThreads = selectedWarps * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    EntryPoint, out DirectPtxFunctionInfo functionInfo);
+                int blockThreads = selectedWarps * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    EntryPoint, functionInfo, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, FunctionInfo: functionInfo, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -211,11 +221,11 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
                 new("softmax-stats", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
                     stats, stats, 16, DirectPtxTensorAccess.Write)
             ],
-            ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 96,
-                MaxStaticSharedBytes: 32 * 1024,
-                MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1),
+            ResourceBudget: DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegistersPerThread: 144,
+                maxStaticSharedBytes: 32 * 1024,
+                maxLocalBytesPerThread: 0,
+                minBlocksPerMultiprocessor: 1),
             Semantics: new System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["input"] = "fp16",

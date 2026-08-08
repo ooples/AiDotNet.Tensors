@@ -20,12 +20,12 @@ public static class NamedOps
     /// <summary>Element-wise add — broadcasts by name. <paramref name="b"/>'s
     /// names must be a subset of <paramref name="a"/>'s; missing names
     /// are inserted as size-1 broadcast axes. Routes through
-    /// <c>TensorBroadcastAdd</c> so size-1 broadcast dims expand
+    /// <c>TensorAdd</c> so size-1 broadcast dims expand
     /// without an explicit tile copy.</summary>
     public static NamedTensor<T> Add<T>(NamedTensor<T> a, NamedTensor<T> b)
     {
-        var (aligned, namesOut) = AlignForBroadcast(a, b);
-        var result = Engine.TensorBroadcastAdd(a.Tensor, aligned);
+        var (aligned, namesOut) = AlignForBroadcast(a, b, allowLeftSingleton: true);
+        var result = Engine.TensorAdd(a.Tensor, aligned);
         return new NamedTensor<T>(result, namesOut);
     }
 
@@ -33,7 +33,7 @@ public static class NamedOps
     /// <see cref="Add{T}"/>.</summary>
     public static NamedTensor<T> Multiply<T>(NamedTensor<T> a, NamedTensor<T> b)
     {
-        var (aligned, namesOut) = AlignForBroadcast(a, b);
+        var (aligned, namesOut) = AlignForBroadcast(a, b, allowLeftSingleton: false);
         // Multiply broadcasts on the same shape rules as add; expand
         // the broadcast axis into a copy first so TensorMultiply
         // (shape-strict) sees matching dims.
@@ -54,7 +54,7 @@ public static class NamedOps
         }
         // Copy source into a target-shape tensor, broadcasting any size-1
         // axes. Cheap fallback for the multiply path; ops that already
-        // broadcast natively (Add via TensorBroadcastAdd) skip this.
+        // broadcast natively (Add via TensorAdd) skip this.
         var result = new Tensor<T>(targetShape);
         var srcStrides = ComputeStrides(source._shape);
         var dstSpan = result.AsWritableSpan();
@@ -112,12 +112,14 @@ public static class NamedOps
 
     /// <summary>
     /// Aligns <paramref name="b"/> to <paramref name="a"/>'s name layout
-    /// for broadcasting. The aligned tensor has the same shape as
-    /// <paramref name="a"/> with size-1 axes wherever <paramref name="b"/>
-    /// lacked the corresponding name. Returns the aligned dense tensor
-    /// + the result's names array (same as <c>a.Names</c>).
+    /// for broadcasting. Matching axes retain <paramref name="b"/>'s compatible
+    /// size; names absent from <paramref name="b"/> become size-1 axes. Returns
+    /// the aligned dense tensor + the result's names array (same as <c>a.Names</c>).
     /// </summary>
-    private static (Tensor<T> aligned, string?[] names) AlignForBroadcast<T>(NamedTensor<T> a, NamedTensor<T> b)
+    private static (Tensor<T> aligned, string?[] names) AlignForBroadcast<T>(
+        NamedTensor<T> a,
+        NamedTensor<T> b,
+        bool allowLeftSingleton)
     {
         var alignedShape = new int[a.Rank];
         for (int i = 0; i < a.Rank; i++) alignedShape[i] = 1;
@@ -131,10 +133,15 @@ public static class NamedOps
             int bIdx = Array.IndexOf(b.Names, n);
             if (bIdx >= 0)
             {
-                if (b.Tensor._shape[bIdx] != a.Tensor._shape[aIdx] && b.Tensor._shape[bIdx] != 1)
+                int aDim = a.Tensor._shape[aIdx];
+                int bDim = b.Tensor._shape[bIdx];
+                if (aDim != bDim && aDim != 1 && bDim != 1)
                     throw new InvalidOperationException(
-                        $"Broadcast mismatch on axis '{n}': a={a.Tensor._shape[aIdx]} vs b={b.Tensor._shape[bIdx]}.");
-                alignedShape[aIdx] = b.Tensor._shape[bIdx];
+                        $"Broadcast mismatch on axis '{n}': a={aDim} vs b={bDim}.");
+                if (!allowLeftSingleton && aDim == 1 && bDim != 1)
+                    throw new InvalidOperationException(
+                        $"Broadcast mismatch on axis '{n}': a={aDim} vs b={bDim}.");
+                alignedShape[aIdx] = bDim;
                 bDimToA[bIdx] = aIdx;
             }
         }
