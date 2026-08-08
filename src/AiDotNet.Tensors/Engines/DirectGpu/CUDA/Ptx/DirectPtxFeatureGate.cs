@@ -19,6 +19,7 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string ReductionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_REDUCTION";
     internal const string RecurrentStateEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RECURRENT_STATE";
     internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
@@ -36,6 +37,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentReductionEnabled = ReadEnabled(ReductionEnvironmentVariable);
     private static readonly bool EnvironmentRecurrentStateEnabled = ReadEnabled(RecurrentStateEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
@@ -44,6 +46,10 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    /// <summary>Benchmark-only access to reduction cells that have not passed promotion.</summary>
+    internal static bool ReductionExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mean/max/min/sum-of-squares row cells that have not passed promotion.</summary>
+    internal static bool RowReduceOpExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
     internal static bool FusedLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
@@ -65,6 +71,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
+
+    internal static bool IsReductionEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentReductionEnabled);
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);
