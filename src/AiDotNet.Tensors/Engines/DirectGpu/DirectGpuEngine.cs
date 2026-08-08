@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Helpers;
@@ -793,6 +794,16 @@ public sealed class DirectGpuEngine : IDisposable
             {
                 return fusedResult;
             }
+
+            if (TryExecuteFusedResidualBatchNormRelu(
+                fusionResult.Pattern.Operations,
+                input,
+                additionalBuffers,
+                dimensions,
+                out fusedResult))
+            {
+                return fusedResult;
+            }
         }
 
         System.Diagnostics.Debug.WriteLine(
@@ -859,6 +870,67 @@ public sealed class DirectGpuEngine : IDisposable
             outputFeatures,
             activation);
         return result != null;
+    }
+
+    private bool TryExecuteFusedResidualBatchNormRelu<T>(
+        IReadOnlyList<FusableOperation> operations,
+        T[] input,
+        IReadOnlyDictionary<string, T[]>? additionalBuffers,
+        IReadOnlyDictionary<string, int>? dimensions,
+        out T[]? result)
+    {
+        result = null;
+        if (_backend is not CudaBackend cuda || operations == null || operations.Count != 3)
+            return false;
+        if (operations[0].OperationType != GpuOperationType.Residual ||
+            operations[1].OperationType != GpuOperationType.BatchNorm ||
+            operations[2].OperationType != GpuOperationType.ReLU)
+            return false;
+        for (int i = 0; i < operations.Count; i++)
+        {
+            if (!string.IsNullOrEmpty(operations[i].Metadata))
+                return false;
+        }
+
+        if (!TryGetBuffer(additionalBuffers, out T[] residual, "residual", "skip") ||
+            !TryGetBuffer(additionalBuffers, out T[] gamma, "gamma", "scale") ||
+            !TryGetBuffer(additionalBuffers, out T[] beta, "beta", "bias") ||
+            !TryGetBuffer(additionalBuffers, out T[] runningMean, "runningMean", "mean") ||
+            !TryGetBuffer(additionalBuffers, out T[] runningVariance, "runningVariance", "runningVar", "variance") ||
+            !TryGetDimension(dimensions, out int batch, "batch", "batchSize") ||
+            !TryGetDimension(dimensions, out int channels, "channels", "channelCount") ||
+            !TryGetDimension(dimensions, out int spatialSize, "spatialSize", "spatial"))
+            return false;
+
+        long elementCount = (long)batch * channels * spatialSize;
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0 ||
+            elementCount > int.MaxValue || input.Length != (int)elementCount ||
+            residual.Length != (int)elementCount || gamma.Length != channels ||
+            beta.Length != channels || runningMean.Length != channels ||
+            runningVariance.Length != channels)
+            return false;
+
+        float epsilon = 1e-5f;
+        if (dimensions != null && TryGetDimension(dimensions, out int epsilonBits, "epsilonBits"))
+            epsilon = PtxCompat.Int32BitsToSingle(epsilonBits);
+        if (!(epsilon > 0f) || float.IsNaN(epsilon) || float.IsInfinity(epsilon))
+            return false;
+
+        using var inputBuffer = cuda.AllocateBuffer(ToFloatArray(input));
+        using var residualBuffer = cuda.AllocateBuffer(ToFloatArray(residual));
+        using var outputBuffer = cuda.AllocateBuffer((int)elementCount);
+        using var gammaBuffer = cuda.AllocateBuffer(ToFloatArray(gamma));
+        using var betaBuffer = cuda.AllocateBuffer(ToFloatArray(beta));
+        using var meanBuffer = cuda.AllocateBuffer(ToFloatArray(runningMean));
+        using var varianceBuffer = cuda.AllocateBuffer(ToFloatArray(runningVariance));
+        if (!cuda.TryResidualBatchNormRelu(
+                inputBuffer, residualBuffer, outputBuffer,
+                gammaBuffer, betaBuffer, meanBuffer, varianceBuffer,
+                batch, channels, spatialSize, epsilon))
+            return false;
+
+        result = FromFloatArray<T>(cuda.DownloadBuffer(outputBuffer));
+        return true;
     }
 
     /// <summary>
@@ -966,7 +1038,7 @@ public sealed class DirectGpuEngine : IDisposable
                 // Add more operation types as needed
                 default:
                     System.Diagnostics.Debug.WriteLine($"Unsupported operation type for sequential execution: {op.OperationType}");
-                    break;
+                    return null;
             }
         }
 
@@ -1250,6 +1322,4 @@ public sealed class DirectGpuEngine : IDisposable
         _disposed = true;
     }
 }
-
-
 
