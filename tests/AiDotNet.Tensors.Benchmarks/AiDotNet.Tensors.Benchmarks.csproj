@@ -32,6 +32,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
+    <Compile Include="..\Shared\RgLruFp64Oracle.cs" Link="Shared\RgLruFp64Oracle.cs" />
   </ItemGroup>
 
   <!-- #294: Python baseline scripts must be on the build output side

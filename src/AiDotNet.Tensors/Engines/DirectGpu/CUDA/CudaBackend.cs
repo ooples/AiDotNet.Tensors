@@ -1519,7 +1519,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // A failed sync here is almost always a STICKY context error (the very CUDA-700 this
                 // allocator guards against), NOT out-of-memory — throw with its real name so the OOM
                 // diagnostic below isn't misleading. Trim is best-effort: warn but still attempt the retry.
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
                 var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
                 if (trimStatus != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
@@ -1638,7 +1638,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // As in the sync-path reclamation: a failed sync is a real (often sticky) error, so throw
             // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
             // Trim is best-effort.
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
                 var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
@@ -3306,6 +3306,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxSoftmax(A, B, batchSize, features)) return;
         LaunchSoftmaxKernel(A, B, batchSize, features);
     }
 
@@ -3356,6 +3358,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
+        if (TryDirectPtxCapsulePredictions(input, weights, output, batchSize, inputCapsules, inputDim, outputCapsules, outputDim)) return;
+
         if (!_kernelCache.TryGetValue("capsule_predictions", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_predictions");
 
@@ -3385,6 +3389,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
     {
+        if (TryDirectPtxCapsuleTransform(input, weights, output, batchSize, inputCapsules, inputDim, numCapsules, capsuleDim)) return;
+
         if (!_kernelCache.TryGetValue("capsule_transform", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_transform");
 
@@ -3414,6 +3420,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
+        if (TryDirectPtxCapsuleWeightedSum(coupling, predictions, output, batchSize, inputCapsules, outputCapsules, capsuleDim)) return;
+
         if (!_kernelCache.TryGetValue("capsule_weighted_sum", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_weighted_sum");
 
@@ -3441,6 +3449,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
+        if (TryDirectPtxCapsuleAgreement(predictions, output, agreement, batchSize, inputCapsules, outputCapsules, capsuleDim)) return;
+
         if (!_kernelCache.TryGetValue("capsule_agreement", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: capsule_agreement");
 
@@ -4408,6 +4418,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (gpuEvent is not CudaEvent cudaEvent)
             throw new ArgumentException("Event must be a CudaEvent", nameof(gpuEvent));
+        if (!ReferenceEquals(cudaEvent.Backend, this))
+            throw new ArgumentException(
+                "Event must belong to this CUDA backend.", nameof(gpuEvent));
+        if (stream is not CudaStream cudaStream || !ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
 
         cudaEvent.Record(stream);
     }
@@ -4417,6 +4433,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (stream is not CudaStream cudaStream)
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+        if (!ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
+        if (gpuEvent is not CudaEvent cudaEvent || !ReferenceEquals(cudaEvent.Backend, this))
+            throw new ArgumentException(
+                "Event must belong to this CUDA backend.", nameof(gpuEvent));
 
         cudaStream.WaitEvent(gpuEvent);
     }
@@ -4426,6 +4448,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (stream is not CudaStream cudaStream)
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+        if (!ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
 
         return new CudaSyncPoint(this, cudaStream);
     }
@@ -4740,6 +4765,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (gpuEvent is not CudaEvent cudaEvent)
             throw new ArgumentException("Event must be a CudaEvent", nameof(gpuEvent));
+        if (!ReferenceEquals(cudaEvent.Backend, this))
+            throw new ArgumentException(
+                "Event must belong to this CUDA backend.", nameof(gpuEvent));
 
         return cudaEvent.Query();
     }
@@ -4751,6 +4779,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException("Start event must be a CudaEvent", nameof(start));
         if (end is not CudaEvent cudaEnd)
             throw new ArgumentException("End event must be a CudaEvent", nameof(end));
+        if (!ReferenceEquals(cudaStart.Backend, this) ||
+            !ReferenceEquals(cudaEnd.Backend, this))
+            throw new ArgumentException(
+                "Both events must belong to this CUDA backend.");
 
         return cudaEnd.GetElapsedTime(cudaStart);
     }
@@ -9068,6 +9100,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
+        // Fail-closed direct-PTX fast path (issue #840): dX = S*(dY - sum(dY*S)); S=output, dY=gradOutput.
+        if (TryDirectPtxSoftmaxBackward(output, gradOutput, gradInput, batchSize, features)) return;
         if (!_kernelCache.TryGetValue("softmax_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax_backward");
 
@@ -9529,6 +9563,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
     {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxMaskedFillBackward(gradOutput, mask, gradInput, size)) return;
         if (!_kernelCache.TryGetValue("masked_fill_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: masked_fill_backward");
         using var _ = PushContext();
@@ -9569,6 +9605,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
+        // Fail-closed direct-PTX fast path (issue #840): dX = exp(input-lse) * gradOutput[m].
+        if (TryDirectPtxLogSumExpBackward(input, lse, gradOutput, gradInput, outerSize, reduceSize)) return;
         if (!_kernelCache.TryGetValue("logsumexp_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: logsumexp_backward");
         using var _ = PushContext();
@@ -11952,7 +11990,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         // The registered kernel is "broadcast_mul_last". This looked up "broadcast_multiply_last_axis",
         // which is never defined or registered anywhere, so EVERY call threw kernel-not-found and
-        // DirectGpuTensorEngine.TensorBroadcastMultiply swallowed it in its bare catch -> silent CPU
+        // DirectGpuTensorEngine.TensorMultiply swallowed it in its bare catch -> silent CPU
         // result. The hollow-override check missed it because that only counts the THROWING kernel-cache
         // indexer; this used TryGetValue, so no miss was ever recorded. Note the asymmetry that hid it:
         // broadcast_multiply_FIRST_axis does exist, so only the last-axis lookup was dangling.
@@ -13584,16 +13622,27 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
-        // Bit-reversal permutation
+        // Bit-reversal permutation, out of place through scratch. Input and output may be the same
+        // buffer here (the copies above are conditional on the handles differing), so this reads
+        // the output -- which already holds the input -- and copies back. See the kernel comment
+        // for why the in-place swap it replaces was unsafe.
+        using var permScratchReal = AllocateBuffer(n);
+        using var permScratchImag = AllocateBuffer(n);
+        IntPtr permRealPtr = permScratchReal.Handle;
+        IntPtr permImagPtr = permScratchImag.Handle;
         if (_kernelCache.TryGetValue("bit_reverse_permutation", out var bitRevKernel))
         {
             uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args = stackalloc void*[4];
+            void** args = stackalloc void*[6];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
-            args[2] = &n;
-            args[3] = &log2n;
+            args[2] = &permRealPtr;
+            args[3] = &permImagPtr;
+            args[4] = &n;
+            args[5] = &log2n;
             LaunchKernel(bitRevKernel, grid, (uint)DefaultBlockSize, args);
+            CudaCopyBuffer(permScratchReal, outputReal, n);
+            CudaCopyBuffer(permScratchImag, outputImag, n);
         }
 
         // FFT butterfly stages
@@ -13643,7 +13692,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             // Copy input to tempReal, zero tempImag
             CudaCopyBuffer(input, tempReal, n);
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(tempImag.Handle, 0, (ulong)n), "cuMemsetD32");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(tempImag.Handle, 0, (ulong)n * sizeof(float), _stream),
+                "cuMemsetD8Async (RFFT imaginary)");
+            GpuLaunchProbe.OnLaunch();
 
             // Perform full complex FFT
             FFT(tempReal, tempImag, tempReal, tempImag, n, false);
@@ -13731,16 +13783,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
-        // Batched bit-reversal
+        // Batched bit-reversal, out of place through scratch. See the kernel comment: the in-place
+        // swap this replaces lost the second half of every exchange.
+        using var brScratchReal = AllocateBuffer(batch * n);
+        using var brScratchImag = AllocateBuffer(batch * n);
+        IntPtr brRealPtr = brScratchReal.Handle;
+        IntPtr brImagPtr = brScratchImag.Handle;
         if (_kernelCache.TryGetValue("batched_bit_reverse", out var bitRevKernel))
         {
-            void** args = stackalloc void*[5];
+            void** args = stackalloc void*[7];
             args[0] = &outRealPtr;
             args[1] = &outImagPtr;
-            args[2] = &batch;
-            args[3] = &n;
-            args[4] = &log2n;
+            args[2] = &brRealPtr;
+            args[3] = &brImagPtr;
+            args[4] = &batch;
+            args[5] = &n;
+            args[6] = &log2n;
             LaunchKernel2D(bitRevKernel, (uint)((n + 15) / 16), (uint)batch, 1, 16, 1, args);
+            CudaCopyBuffer(brScratchReal, outputReal, batch * n);
+            CudaCopyBuffer(brScratchImag, outputImag, batch * n);
         }
 
         // Batched FFT butterfly stages
@@ -13793,16 +13854,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outImagPtr = outputImag.Handle;
         int inv = inverse ? 1 : 0;
 
+        // Both bit-reversals below run out of place through scratch and copy back. The in-place
+        // swap they used to perform lost the second half of every exchange -- see the kernel
+        // comment. The column pass cannot absorb a copy the way a leading permutation could: it
+        // runs after the row butterflies, so its source is the output buffer itself.
+        using var brScratchReal = AllocateBuffer(height * width);
+        using var brScratchImag = AllocateBuffer(height * width);
+        IntPtr brRealPtr = brScratchReal.Handle;
+        IntPtr brImagPtr = brScratchImag.Handle;
+
         // Row-wise bit-reversal (prerequisite for the DIT row butterflies)
         if (_kernelCache.TryGetValue("fft_rows_bit_reverse", out var rowBitRev))
         {
-            void** brArgs = stackalloc void*[5];
+            void** brArgs = stackalloc void*[7];
             brArgs[0] = &outRealPtr;
             brArgs[1] = &outImagPtr;
-            brArgs[2] = &height;
-            brArgs[3] = &width;
-            brArgs[4] = &log2Width;
+            brArgs[2] = &brRealPtr;
+            brArgs[3] = &brImagPtr;
+            brArgs[4] = &height;
+            brArgs[5] = &width;
+            brArgs[6] = &log2Width;
             LaunchKernel2D(rowBitRev, (uint)((width + 15) / 16), (uint)((height + 15) / 16), 1, 16, 16, brArgs);
+            CudaCopyBuffer(brScratchReal, outputReal, height * width);
+            CudaCopyBuffer(brScratchImag, outputImag, height * width);
         }
 
         // Row-wise FFT (process each row as a separate FFT)
@@ -13826,13 +13900,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Column-wise bit-reversal (prerequisite for the DIT column butterflies)
         if (_kernelCache.TryGetValue("fft_cols_bit_reverse", out var colBitRev))
         {
-            void** brArgs = stackalloc void*[5];
+            void** brArgs = stackalloc void*[7];
             brArgs[0] = &outRealPtr;
             brArgs[1] = &outImagPtr;
-            brArgs[2] = &height;
-            brArgs[3] = &width;
-            brArgs[4] = &log2Height;
+            brArgs[2] = &brRealPtr;
+            brArgs[3] = &brImagPtr;
+            brArgs[4] = &height;
+            brArgs[5] = &width;
+            brArgs[6] = &log2Height;
             LaunchKernel2D(colBitRev, (uint)((height + 15) / 16), (uint)((width + 15) / 16), 1, 16, 16, brArgs);
+            CudaCopyBuffer(brScratchReal, outputReal, height * width);
+            CudaCopyBuffer(brScratchImag, outputImag, height * width);
         }
 
         // Column-wise FFT
@@ -13937,6 +14015,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
 
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexMagnitude(real, imag, magnitude, n)) return;
         if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_magnitude");
 
@@ -13958,6 +14038,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
 
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexPhase(real, imag, phase, n)) return;
         if (!_kernelCache.TryGetValue("complex_phase", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_phase");
 
@@ -14067,8 +14149,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         ulong byteSize = (ulong)size * sizeof(float);
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(dst.Handle, src.Handle, byteSize),
-            "cuMemcpyDtoD");
+            CudaNativeBindings.cuMemcpyDtoDAsync(dst.Handle, src.Handle, byteSize, _stream),
+            "cuMemcpyDtoDAsync (FFT)");
+        GpuLaunchProbe.OnLaunch();
     }
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
@@ -14185,6 +14268,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
+        if (TryDirectPtxRbfForward(input, centers, epsilons, output, batchSize, numCenters, inputDim)) return;
+
         if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rbf_forward");
 
@@ -14268,6 +14353,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxPoincareProject(input, output, batchSize, dim, curvature, epsilon)) return;
         if (!_kernelCache.TryGetValue("poincare_project", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: poincare_project");
 
@@ -14288,6 +14375,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxMobiusAdd(x, y, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("mobius_add", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: mobius_add");
 
@@ -14309,6 +14398,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxPoincareExpMap(basePoint, tangentVec, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("poincare_exp_map", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: poincare_exp_map");
 
@@ -14330,6 +14421,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxPoincareDistance(x, y, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("poincare_distance", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: poincare_distance");
 
@@ -14460,6 +14553,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxOctonionMultiply(a, b, output, count)) return;
         if (!_kernelCache.TryGetValue("octonion_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: octonion_multiply");
 
@@ -14479,6 +14574,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxOctonionAdd(a, b, output, count)) return;
         if (!_kernelCache.TryGetValue("octonion_add", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: octonion_add");
 
@@ -14631,6 +14728,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (numPairs <= 0) return;
         if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexMultiply(a, b, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_multiply");
         using var _ = PushContext();
@@ -14646,6 +14745,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (numPairs <= 0) return;
         if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
+        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        if (TryDirectPtxComplexConjugate(input, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_conjugate");
         using var _ = PushContext();
@@ -14663,8 +14764,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but input buffer has {input.Size}.");
         if (numPairs > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
-        if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_magnitude");
+        if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: complex_magnitude_interleaved");
         using var _ = PushContext();
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pI = input.Handle, pO = output.Handle;
@@ -14876,6 +14977,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void SoftmaxRows(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
         if (rows <= 0 || cols <= 0) return;
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxSoftmax(input, output, rows, cols)) return;
         if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax_rows");
         using var _ = PushContext();
@@ -15297,6 +15400,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
     {
+        if (TryDirectPtxQuantumMeasurement(realPart, imagPart, probabilities, batchSize, stateSize)) return;
+
         if (!_kernelCache.TryGetValue("quantum_measurement", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: quantum_measurement");
 
@@ -15324,6 +15429,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Validate state size is power of two for shared-memory reduction
         ValidateQuantumStateSize(stateSize, nameof(stateSize));
 
+        if (TryDirectPtxNormalizeProbabilities(probabilities, batchSize, stateSize)) return;
+
         using var _ = PushContext();
         // One block per batch element
         uint grid = (uint)batchSize;
@@ -15341,6 +15448,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void ComplexMatVec(IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
+        if (TryDirectPtxComplexMatVec(matReal, matImag, vecReal, vecImag, outReal, outImag, batchSize, dim)) return;
+
         if (!_kernelCache.TryGetValue("complex_matvec", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_matvec");
 
@@ -15377,6 +15486,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(numQubits), numQubits,
                 "Number of qubits must be between 1 and 30 to avoid integer overflow.");
 
+        if (TryDirectPtxQuantumRotation(stateReal, stateImag, outReal, outImag, angles, numQubits, batchSize)) return;
+
         using var _ = PushContext();
         int dim = 1 << numQubits;
         // dim is guaranteed to be power of two since it's 2^numQubits
@@ -15405,6 +15516,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // Validate state size is power of two for shared-memory reduction
         ValidateQuantumStateSize(stateSize, nameof(stateSize));
+
+        if (TryDirectPtxMeasurementForward(input, output, batchSize, stateSize)) return;
 
         using var _ = PushContext();
         // One block per batch element, uses shared memory for reduction
@@ -15563,6 +15676,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (batch <= 0 || seqLen <= 0 || recDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
+        if (TryDirectPtxRgLruScanForward(
+            value, recGate, inpGate, decay, output, batch, seqLen, recDim))
+            return;
+        LaunchLegacyRgLruScanForward(value, recGate, inpGate, decay, output, batch, seqLen, recDim);
+    }
+
+    /// <summary>Resident current-CUDA comparison lane for the issue-#846 harness.</summary>
+    internal unsafe void LaunchLegacyRgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+    {
         if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rglru_scan_forward");
 
@@ -16499,7 +16623,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void StdAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("std_axis", input, output, outerSize, reduceSize);
     public void ProductAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("product_axis", input, output, outerSize, reduceSize);
     public void NormAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("norm_axis", input, output, outerSize, reduceSize);
-    public void LogSumExpAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("logsumexp_axis", input, output, outerSize, reduceSize);
+    public void LogSumExpAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxLogSumExp(input, output, outerSize, reduceSize)) return;
+        LaunchFusedAxis("logsumexp_axis", input, output, outerSize, reduceSize);
+    }
     public void CumSumAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("cumsum_axis", input, output, outerSize, innerSize);
     public void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size) => LaunchFusedScalar("scalar_minus_tensor", input, output, scalar, size);
     public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
@@ -16902,6 +17031,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MaskedFillKernel(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, float fillValue, int size)
     {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxMaskedFill(input, mask, output, size, fillValue)) return;
         if (!_kernelCache.TryGetValue("masked_fill_kernel", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: masked_fill_kernel");
         using var _ = PushContext();
@@ -16963,7 +17094,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     // --- Softmax Variants + Distance ---
-    public void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("log_softmax", input, output, outerSize, innerSize);
+    public void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxLogSoftmax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("log_softmax", input, output, outerSize, innerSize);
+    }
 
     public unsafe void GumbelSoftmax(IGpuBuffer logits, IGpuBuffer output, int outerSize, int innerSize, float temperature, ulong seed)
     {
@@ -16976,9 +17112,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
-    public void Sparsemax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("sparsemax", input, output, outerSize, innerSize);
-    public void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("taylor_softmax", input, output, outerSize, innerSize);
-    public void SphericalSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("spherical_softmax", input, output, outerSize, innerSize);
+    public void Sparsemax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxSparsemax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("sparsemax", input, output, outerSize, innerSize);
+    }
+
+    public void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
+        if (TryDirectPtxTaylorSoftmax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("taylor_softmax", input, output, outerSize, innerSize);
+    }
+
+    public void SphericalSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        if (TryDirectPtxSphericalSoftmax(input, output, outerSize, innerSize)) return;
+        LaunchFusedAxis("spherical_softmax", input, output, outerSize, innerSize);
+    }
 
     public unsafe void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
     {
@@ -17017,6 +17169,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
     {
+        if (TryDirectPtxCosineSimilarity(a, b, output, batchSize, dim)) return;
+
         if (!_kernelCache.TryGetValue("cosine_similarity", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: cosine_similarity");
         using var _ = PushContext();
@@ -17028,6 +17182,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim)
     {
+        if (TryDirectPtxPairwiseDistance(a, b, output, M, N, dim, squared: false)) return;
+
         if (!_kernelCache.TryGetValue("pairwise_distance", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: pairwise_distance");
         using var _ = PushContext();
@@ -17040,6 +17196,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PairwiseDistanceSquared(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim)
     {
+        if (TryDirectPtxPairwiseDistance(a, b, output, M, N, dim, squared: true)) return;
+
         if (!_kernelCache.TryGetValue("pairwise_distance_squared", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: pairwise_distance_squared");
         using var _ = PushContext();
