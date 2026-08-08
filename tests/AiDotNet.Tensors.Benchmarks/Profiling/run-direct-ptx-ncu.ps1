@@ -1,4 +1,5 @@
 param(
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'convolution')]
     [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rglru', 'convolution')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
@@ -27,6 +28,10 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'fused-linear' { '--direct-ptx-profile-fused-linear' }
+    'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
+    'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
+    'w8a8-linear' { '--direct-ptx-profile-w8a8-linear' }
     'rglru' { '--direct-ptx-profile-rglru' }
     'convolution' { '--direct-ptx-profile-convolution' }
 }
@@ -38,6 +43,10 @@ $kernel = switch ($Target) {
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
+    'fused-linear' { 'regex:aidotnet_fused_linear_gelu_m1' }
+    'mixed-linear' { 'regex:aidotnet_fused_linear_gelu_fp16_m1' }
+    'mixed-linear-m16' { 'regex:aidotnet_fused_linear_gelu_fp16_m16' }
+    'w8a8-linear' { 'regex:aidotnet_fused_linear_gelu_w8a8_m1' }
     'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
     'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
 }
@@ -49,6 +58,10 @@ $expectedLaunches = switch ($Target) {
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
+    'fused-linear' { 10 }
+    'mixed-linear' { 10 }
+    'mixed-linear-m16' { 10 }
+    'w8a8-linear' { 10 }
     'rglru' { 1 }
     'convolution' { 1 }
 }
