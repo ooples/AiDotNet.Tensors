@@ -229,10 +229,10 @@ internal static class DirectPtxVisionFamilyExperiment
                 establishedRouteError, directOracleError, model, audit, pairedAudit);
             MeasureAndPrint(backend, run, spec, pairedSpec is not null,
                 "AiDotNet NVRTC", cell.LaunchCurrent,
-                currentOracleError ?? 0, 0, currentOracleError, model, null);
+                currentOracleError, 0, currentOracleError, model, null);
             MeasureAndPrint(backend, run, spec, pairedSpec is not null,
                 "AiDotNet NVRTC CUDA graph",
-                () => backend.EnqueueCapturedGraph(currentGraph), currentOracleError ?? 0,
+                () => backend.EnqueueCapturedGraph(currentGraph), currentOracleError,
                 0, currentOracleError, model, null);
         }
         finally
@@ -296,7 +296,7 @@ internal static class DirectPtxVisionFamilyExperiment
         bool paired,
         string method,
         Action launch,
-        double error,
+        double? error,
         double establishedRouteError,
         double? highPrecisionOracleError,
         WorkModel model,
@@ -452,6 +452,12 @@ internal static class DirectPtxVisionFamilyExperiment
             // Areas in this matrix reach O(10^2); 2e-6 is below one fp32 ULP.
             // Direct PTX and the incumbent are bit-identical for this cell.
             DirectPtxVisionOperation.BoxArea => 2e-5,
+            // IoU-family backward cells: the loss gradients w.r.t. box coordinates
+            // chain divisions by the union/enclosing areas, so per-coordinate values
+            // span from near zero up to O(1) across this matrix. fp32 accumulation
+            // diverges from the fp64 oracle by more than the 2e-6 default here. An
+            // absolute bound is deliberate -- a relative bound would explode on the
+            // coordinates whose gradient is ~0.
             DirectPtxVisionOperation.IoULossBackward or
             DirectPtxVisionOperation.GIoULossBackward or
             DirectPtxVisionOperation.DIoULossBackward or
@@ -670,8 +676,9 @@ internal static class DirectPtxVisionFamilyExperiment
                 for (int i = 0; i < length; i++) data[i] = i % 23 == 0 ? 1f : 0f;
                 return data;
             }
-            if (contract.Access == DirectPtxTensorAccess.Read ||
-                contract.Access == DirectPtxTensorAccess.ReadWrite)
+            // Flag-enum test: fill any tensor that carries the Read bit, so an added
+            // access flag cannot silently leave a readable input zero-filled.
+            if ((contract.Access & DirectPtxTensorAccess.Read) != 0)
             {
                 for (int i = 0; i < length; i++)
                     data[i] = ((i * 17 + argument * 13) % 101 - 50) / 50f;

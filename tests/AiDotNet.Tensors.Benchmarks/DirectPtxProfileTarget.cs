@@ -323,10 +323,24 @@ internal static class DirectPtxProfileTarget
                 {
                     DirectPtxTensorContract contract = kernel.Blueprint.Tensors[i];
                     buffers[i] = runtime.AllocateBytes(contract.RequiredBytes);
-                    if (contract.PhysicalType == DirectPtxPhysicalType.Int32)
-                        buffers[i].Upload<int>(new int[checked((int)(contract.RequiredBytes / 4))]);
-                    else
-                        buffers[i].Upload<float>(new float[checked((int)(contract.RequiredBytes / 4))]);
+                    // Derive the element count from the contract's own element size
+                    // instead of assuming 4 bytes, and fail closed for any physical
+                    // type this profiling upload does not model.
+                    int elementCount = checked((int)(
+                        contract.RequiredBytes / (nuint)contract.ElementBytes));
+                    switch (contract.PhysicalType)
+                    {
+                        case DirectPtxPhysicalType.Float32:
+                            buffers[i].Upload<float>(new float[elementCount]);
+                            break;
+                        case DirectPtxPhysicalType.Int32:
+                            buffers[i].Upload<int>(new int[elementCount]);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                "Vision profiling upload does not handle physical type " +
+                                contract.PhysicalType + ".");
+                    }
                     views[i] = DirectPtxTensorView.CreateOwned(buffers[i], contract);
                 }
                 kernel.Launch(
@@ -348,6 +362,11 @@ internal static class DirectPtxProfileTarget
             "ncu-vision-box-iou-end", afterSuite: true);
     }
 
+    // The number of specs yielded here, plus the 4 fused BoxIoU shapes launched by
+    // RunVisionBoxIou above, must equal $expectedLaunches for the 'vision-box-iou'
+    // target in tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1
+    // (currently 31). Adding or removing a spec here without updating that constant
+    // makes the Nsight verification fail with an opaque row-count error.
     private static IEnumerable<DirectPtxVisionSpec> VisionProfileSpecs()
     {
         yield return new(DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256);

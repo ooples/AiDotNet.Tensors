@@ -93,17 +93,22 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                     DirectPtxLastError = $"vision-{spec.Operation}-null-buffer";
                     return false;
                 }
-                if (capturing && !PinDirectPtxKernelForCapture(
-                        _directPtxVisionKernels, spec))
-                    throw new InvalidOperationException(
-                        $"Could not pin direct-PTX vision module {spec.Operation} for CUDA graph capture.");
+                // Build and validate every view before pinning. A failed Create or
+                // Validate throws before the pin is taken, so the catch below cannot
+                // leave a permanent capture-cache slot occupied (mirrors
+                // TryDirectPtxMeshgrid2DPair).
                 DirectPtxTensorView av = DirectPtxTensorView.Create(a, kernel.Blueprint.Tensors[0]);
                 DirectPtxTensorView bv = count > 1 ? DirectPtxTensorView.Create(b!, kernel.Blueprint.Tensors[1]) : default;
                 DirectPtxTensorView cv = count > 2 ? DirectPtxTensorView.Create(c!, kernel.Blueprint.Tensors[2]) : default;
                 DirectPtxTensorView dv = count > 3 ? DirectPtxTensorView.Create(d!, kernel.Blueprint.Tensors[3]) : default;
                 DirectPtxTensorView ev = count > 4 ? DirectPtxTensorView.Create(e!, kernel.Blueprint.Tensors[4]) : default;
                 DirectPtxTensorView fv = count > 5 ? DirectPtxTensorView.Create(f!, kernel.Blueprint.Tensors[5]) : default;
-                lock (GpuDispatchLock) kernel.Launch(av, bv, cv, dv, ev, fv);
+                kernel.Validate(av, bv, cv, dv, ev, fv);
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxVisionKernels, spec))
+                    throw new InvalidOperationException(
+                        $"Could not pin direct-PTX vision module {spec.Operation} for CUDA graph capture.");
+                lock (GpuDispatchLock) kernel.LaunchUnchecked(av, bv, cv, dv, ev, fv);
             }
             System.Threading.Interlocked.Increment(
                 ref _directPtxVisionDispatchCounts[(int)spec.Operation]);

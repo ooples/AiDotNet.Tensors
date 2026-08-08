@@ -47,7 +47,7 @@ public sealed partial class CudaBackend : IRoiBackend
         if (TryDirectPtxVisionRoi(
                 DirectPtxVisionOperation.RoiPool, input, boxes, output,
                 N, C, H, W, K, outH, outW, C, spatialScale,
-                0, false)) return;
+                samplingRatio: 0, aligned: false)) return;
         var kernel = ResolveRoiKernel("roi_pool");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -95,7 +95,7 @@ public sealed partial class CudaBackend : IRoiBackend
         if (TryDirectPtxVisionRoi(
                 DirectPtxVisionOperation.PsRoiPool, input, boxes, output,
                 N, C, H, W, K, outH, outW, outputChannels, spatialScale,
-                0, false)) return;
+                samplingRatio: 0, aligned: false)) return;
         var kernel = ResolveRoiKernel("ps_roi_pool");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

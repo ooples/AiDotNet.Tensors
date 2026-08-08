@@ -109,7 +109,16 @@ public sealed partial class CudaBackend
             _activeDirectPtxCapturePins = null;
             if (pins.Count == 0) return;
             _directPtxGraphPins ??= new Dictionary<IntPtr, DirectPtxCapturePinSet>();
-            _directPtxGraphPins.Add(graphExec, pins);
+            // The driver can recycle a CUgraphExec address after cuGraphExecDestroy,
+            // so a stale entry can still be present. Release it before assigning, the
+            // same way ReplaceDirectPtxGraphPins does, instead of letting Dictionary.Add
+            // throw and leak the freshly instantiated graphExec on the caller.
+            if (_directPtxGraphPins.TryGetValue(graphExec, out DirectPtxCapturePinSet? stalePins))
+            {
+                _directPtxGraphPins.Remove(graphExec);
+                stalePins.Release();
+            }
+            _directPtxGraphPins[graphExec] = pins;
         }
     }
 
@@ -314,15 +323,19 @@ public sealed partial class CudaBackend
                 }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 PtxFusedPairwiseBoxIouF32Kernel kernel = GetOrCreateVisionBoxIouKernel(key);
+                // Build (and thereby ABI/extent-validate) the views before pinning.
+                // DirectPtxTensorView.Create throws on a mismatch; doing it after the
+                // pin would leave a permanent capture-cache slot occupied when the
+                // catch below swallows the throw.
+                DirectPtxTensorView boxesAView = DirectPtxTensorView.Create(boxesA, kernel.Blueprint.Tensors[0]);
+                DirectPtxTensorView boxesBView = DirectPtxTensorView.Create(boxesB, kernel.Blueprint.Tensors[1]);
+                DirectPtxTensorView outputView = DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]);
                 if (capturing && !PinDirectPtxKernelForCapture(
                         _directPtxVisionBoxIouKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX pairwise BoxIoU module for CUDA graph capture.");
                 lock (GpuDispatchLock)
-                    kernel.Launch(
-                        DirectPtxTensorView.Create(boxesA, kernel.Blueprint.Tensors[0]),
-                        DirectPtxTensorView.Create(boxesB, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+                    kernel.Launch(boxesAView, boxesBView, outputView);
             }
             System.Threading.Interlocked.Increment(ref _directPtxVisionBoxIouDispatchCount);
             DirectPtxLastError = null;

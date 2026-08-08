@@ -12,10 +12,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import platform
 import statistics
-import subprocess
 import time
 from dataclasses import asdict, dataclass
 from typing import Callable
@@ -29,28 +27,7 @@ SAMPLES = 101
 LAUNCHES = 25
 
 
-def require_no_foreign_compute(label: str) -> None:
-    monitor = subprocess.run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
-                             check=True, capture_output=True, text=True, timeout=5)
-    conflicts: list[str] = []
-    for line in monitor.stdout.splitlines():
-        cells = line.split()
-        if not cells or cells[0].startswith("#") or len(cells) < 9:
-            continue
-        try:
-            pid = int(cells[1])
-        except ValueError:
-            continue
-        try:
-            sm = int(cells[3])
-        except ValueError:
-            sm = 0
-        process_type = cells[2].upper()
-        if pid != os.getpid() and (process_type == "C" or
-                                   ("C" in process_type and sm > 5)):
-            conflicts.append(f"pid={pid} {cells[-1]} type={process_type} sm={sm}%")
-    if conflicts:
-        raise RuntimeError(f"[{label}] foreign GPU workload: " + "; ".join(conflicts))
+from direct_ptx_gpu_admission import require_no_foreign_compute
 
 
 @dataclass(frozen=True)
@@ -110,7 +87,10 @@ def maximum_error(actual: object, reference: object) -> float:
         if actual_tensor.shape != reference_tensor.shape:
             return math.inf
         if actual_tensor.numel():
-            error = max(error, (actual_tensor - reference_tensor).abs().max().item())
+            worst = (actual_tensor - reference_tensor).abs().max().item()
+            if not math.isfinite(worst):
+                return math.inf
+            error = max(error, worst)
     return error
 
 

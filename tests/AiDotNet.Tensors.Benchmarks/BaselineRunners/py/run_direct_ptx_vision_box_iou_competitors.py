@@ -4,10 +4,8 @@
 import argparse
 import json
 import math
-import os
 import platform
 import statistics
-import subprocess
 import time
 
 import torch
@@ -21,28 +19,7 @@ SHAPES = (("n256-m256", 256, 256), ("n1024-m256", 1024, 256),
           ("n1024-m1024", 1024, 1024), ("n4096-m256", 4096, 256))
 
 
-def require_no_foreign_compute(label):
-    monitor = subprocess.run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
-                             check=True, capture_output=True, text=True, timeout=5)
-    conflicts = []
-    for line in monitor.stdout.splitlines():
-        cells = line.split()
-        if not cells or cells[0].startswith("#") or len(cells) < 9:
-            continue
-        try:
-            pid = int(cells[1])
-        except ValueError:
-            continue
-        try:
-            sm = int(cells[3])
-        except ValueError:
-            sm = 0
-        process_type = cells[2].upper()
-        if pid != os.getpid() and (process_type == "C" or
-                                   ("C" in process_type and sm > 5)):
-            conflicts.append(f"pid={pid} {cells[-1]} type={process_type} sm={sm}%")
-    if conflicts:
-        raise RuntimeError(f"[{label}] foreign GPU workload: " + "; ".join(conflicts))
+from direct_ptx_gpu_admission import require_no_foreign_compute
 
 
 def box_iou_torch(a, b):
@@ -108,9 +85,11 @@ def run_cell(run, shape_name, n, m, method, fn, reference):
     torch.cuda.reset_peak_memory_stats()
     actual = fn()
     torch.cuda.synchronize()
+    # Read the peak from the single measured launch, before the timing loops
+    # run thousands more launches and inflate the per-call temporary figure.
+    peak = max(0, torch.cuda.max_memory_allocated() - baseline)
     device = measure_device(fn)
     e2e = measure_e2e(fn)
-    peak = max(0, torch.cuda.max_memory_allocated() - baseline)
     error = (actual - reference).abs().max().item()
     cells = n * m
     print(json.dumps({

@@ -1096,10 +1096,16 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
 
             var a = Rand(209, size);
             var b = Rand(210, size);
+            // DirectPtxVisionDispatchCount is cumulative, so assert on the delta this
+            // control call adds rather than the running total, which prior operations
+            // could already have driven past the threshold.
+            long beforeDirect = backend.DirectPtxVisionDispatchCount(
+                DirectPtxVisionOperation.Meshgrid2D);
             Tensor<float>[] direct = _gpu.TensorMeshgrid([a, b], "ij");
             long afterDirect = backend.DirectPtxVisionDispatchCount(
                 DirectPtxVisionOperation.Meshgrid2D);
-            Assert.True(afterDirect >= 2, "The control call did not exercise paired Direct PTX dispatch.");
+            Assert.True(afterDirect - beforeDirect >= 2,
+                "The control call did not exercise paired Direct PTX dispatch.");
 
             using var tape = new GradientTape<float>();
             tape.BindEngineIfUnset(_gpu);

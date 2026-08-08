@@ -81,8 +81,11 @@ public sealed partial class CudaBackend
 
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
         if (rc != CudaResult.Success || graph == IntPtr.Zero)
+        {
             AbortDirectPtxCapturePinTracking(directPtxPins);
-        if (rc != CudaResult.Success || graph == IntPtr.Zero) { GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)"); return IntPtr.Zero; }
+            GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)");
+            return IntPtr.Zero;
+        }
 
         // Diagnostic: how many kernel/memory nodes did the capture actually record? A near-empty graph means
         // the forward's ops were short-circuited (e.g. served from the activation cache) during capture, so
@@ -208,6 +211,12 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>Frees a captured graph-exec handle. Safe to call with <see cref="IntPtr.Zero"/>.</summary>
+    /// <remarks>
+    /// This synchronizes the owning stream and validates both driver calls through
+    /// <c>CheckCudaResult</c>, so it can throw. Callers that invoke it from a
+    /// <c>finally</c> block should note that a throw here replaces the primary
+    /// exception, and guard the call when that must be preserved.
+    /// </remarks>
     public void DestroyCapturedGraph(IntPtr graphExec)
     {
         if (graphExec == IntPtr.Zero) return;
