@@ -22,10 +22,10 @@ A row stamped with an older protocol is treated exactly like a missing one, beca
 number measured under a superseded protocol is not comparable — verified by stamping a
 row `p3` and watching it read MISSING.
 
-Protocol p14 also makes completeness an admission requirement: every applicable,
-numerically-correct promotable candidate must produce a stable paired timing window, and
-material foreign host CPU load refuses the suite. An incomplete run preserves the last
-identity-valid artifact rather than replacing it with a modelled fallback.
+The current protocol, p15, retains the completeness admission requirement introduced by
+p14: every applicable, numerically-correct promotable candidate must produce a stable paired
+timing window, and material foreign host CPU load refuses the suite. An incomplete run
+preserves the last identity-valid artifact rather than replacing it with a modelled fallback.
 
 ## The limiter gate, measured
 

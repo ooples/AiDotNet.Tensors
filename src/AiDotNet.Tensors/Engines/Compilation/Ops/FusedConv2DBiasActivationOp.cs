@@ -107,7 +107,7 @@ internal sealed class FusedConv2DBiasActivationOp<T> : ICompiledOp<T>
         var activation = Activation;
 
         // Reshape bias to [1, Cout, 1, 1] for broadcasting over [N, C, H, W].
-        // CpuEngine.FusedConv2D calls TensorBroadcastAdd(convResult, bias)
+        // CpuEngine.FusedConv2D calls TensorAdd(convResult, bias)
         // which follows NumPy broadcasting rules — a raw [Cout] shape can't
         // broadcast against [N, Cout, H, W] (trailing dims don't align).
         // Only reshape if bias is 1D; if already 4D (e.g., from a fusion pass
@@ -283,7 +283,7 @@ internal sealed class FusedConv2DBiasActivationOp<T> : ICompiledOp<T>
             var reshapedBias = bias.Rank == 1
                 ? bias.Reshape(new[] { 1, bias._shape[0], 1, 1 })
                 : bias;
-            preActivation = engine.TensorBroadcastAdd(preActivation, reshapedBias);
+            preActivation = engine.TensorAdd(preActivation, reshapedBias);
         }
         return engine.SwishBackward(gradOutput, preActivation);
     }

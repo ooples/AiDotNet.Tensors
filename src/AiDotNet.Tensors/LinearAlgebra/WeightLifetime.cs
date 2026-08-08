@@ -49,6 +49,29 @@ public enum WeightLifetime
     /// </para>
     /// </summary>
     GpuPinned = 4,
+
+    /// <summary>
+    /// Weight whose SHAPE is known but whose storage has not been allocated yet. The buffer is
+    /// created — and the tensor's initializer run — the first time its values are actually read or
+    /// written, through the same <c>EnsureMaterialized</c> gate that rehydrates a paged-out
+    /// <see cref="Streaming"/> weight.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This separates a tensor's shape from its storage. <c>Length</c>, <c>Shape</c> and
+    /// <c>Rank</c> are exact and free on a deferred tensor, so a caller can size a checkpoint,
+    /// plan a streaming budget, or report a model's parameter count before a single byte is
+    /// allocated — and the answer comes from the same construction path that later allocates, so
+    /// it cannot drift the way a hand-written formula does.
+    /// </para>
+    /// <para>
+    /// PyTorch offers the same capability as <c>torch.device('meta')</c>, but only as an explicit,
+    /// manual mode the caller has to opt into and then convert back out of; asking an
+    /// uninitialized lazy parameter for its <c>numel()</c> raises instead. Here it is automatic:
+    /// a deferred weight behaves exactly like an allocated one the moment anybody touches it.
+    /// </para>
+    /// </remarks>
+    Deferred = 5,
 }
 
 /// <summary>

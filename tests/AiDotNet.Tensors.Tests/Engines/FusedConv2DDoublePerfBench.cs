@@ -73,10 +73,10 @@ public class FusedConv2DDoublePerfBench
         for (int i = 0; i < iterations; i++)
         {
             var rOut = _engine.Conv2D(reduceIn, reduceKernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
-            _ = _engine.TensorBroadcastAdd(rOut, _engine.Reshape(reduceBias, new[] { 1, reduceOutC, 1, 1 }));
+            _ = _engine.TensorAdd(rOut, _engine.Reshape(reduceBias, new[] { 1, reduceOutC, 1, 1 }));
 
             var eOut = _engine.Conv2D(expandIn, expandKernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
-            _ = _engine.TensorBroadcastAdd(eOut, _engine.Reshape(expandBias, new[] { 1, expandOutC, 1, 1 }));
+            _ = _engine.TensorAdd(eOut, _engine.Reshape(expandBias, new[] { 1, expandOutC, 1, 1 }));
         }
         refSw.Stop();
 

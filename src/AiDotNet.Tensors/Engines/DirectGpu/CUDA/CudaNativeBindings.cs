@@ -63,46 +63,37 @@ internal static class CudaNativeBindings
     }
 #endif
 
-    private static bool _isAvailable;
-    private static bool _availabilityChecked;
+    private static readonly Lazy<bool> Availability = new(CheckAvailability, isThreadSafe: true);
 
     /// <summary>
     /// Gets whether the CUDA driver API is available on this system.
     /// </summary>
-    public static bool IsAvailable
+    public static bool IsAvailable => Availability.Value;
+
+    private static bool CheckAvailability()
     {
-        get
+        try
         {
-            if (!_availabilityChecked)
+            var result = CuBlasNative.cuInit(0);
+            if (result != CudaResult.Success)
             {
-                _availabilityChecked = true;
-                try
-                {
-                    var result = CuBlasNative.cuInit(0);
-                    if (result != CudaResult.Success)
-                    {
-                        _isAvailable = false;
-                    }
-                    else
-                    {
-                        result = CuBlasNative.cuDeviceGetCount(out int count);
-                        _isAvailable = result == CudaResult.Success && count > 0;
-                    }
-                }
-                catch (DllNotFoundException)
-                {
-                    _isAvailable = false;
-                }
-                catch (EntryPointNotFoundException)
-                {
-                    _isAvailable = false;
-                }
-                catch
-                {
-                    _isAvailable = false;
-                }
+                return false;
             }
-            return _isAvailable;
+
+            result = CuBlasNative.cuDeviceGetCount(out int count);
+            return result == CudaResult.Success && count > 0;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -194,11 +185,17 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamCreate")]
     public static extern CudaResult cuStreamCreate(out IntPtr stream, uint flags);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuStreamGetFlags")]
+    public static extern CudaResult cuStreamGetFlags(IntPtr stream, out uint flags);
+
     [DllImport(CudaLibrary, EntryPoint = "cuStreamDestroy_v2")]
     public static extern CudaResult cuStreamDestroy(IntPtr stream);
 
     [DllImport(CudaLibrary, EntryPoint = "cuStreamSynchronize")]
     public static extern CudaResult cuStreamSynchronize(IntPtr stream);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
+    public static extern CudaResult cuCtxSynchronize();
 
     [DllImport(CudaLibrary, EntryPoint = "cuStreamQuery")]
     public static extern CudaResult cuStreamQuery(IntPtr stream);

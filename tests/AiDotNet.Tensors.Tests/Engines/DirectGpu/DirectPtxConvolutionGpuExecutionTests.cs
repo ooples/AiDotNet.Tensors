@@ -1,5 +1,6 @@
 #if NET5_0_OR_GREATER
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
@@ -55,6 +56,122 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
         finally
         {
             DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(4)]
+    [InlineData(8)]
+    [InlineData(16)]
+    [InlineData(32)]
+    public void Tiled_AutotuneCandidateForExactProductionShape_MatchesCpuReference(int tile)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+
+        const int n = PtxFusedConv2DNchwK1Kernel.Batch;
+        const int k = PtxFusedConv2DNchwK1Kernel.OutputChannels;
+        const int c = PtxFusedConv2DNchwK1Kernel.InputChannels;
+        const int hw = PtxFusedConv2DNchwK1Kernel.SpatialElements;
+        var shape = new Conv2DTiledShape(n, k, c, hw, tile);
+        var input = new float[n * c * hw];
+        var weights = new float[k * c];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        float[] expected = ReferenceConv1x1(input, weights, bias, n, k, c, hw);
+
+        using var runtime = new DirectPtxRuntime();
+        Skip.IfNot(DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "Requires the validated SM86 convolution specialization.");
+
+        const string cacheVariable = "AIDOTNET_DIRECT_PTX_CACHE_PATH";
+        string? priorCache = Environment.GetEnvironmentVariable(cacheVariable);
+        string cache = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "aidotnet-conv-embedded-" + Guid.NewGuid().ToString("N"));
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        Environment.SetEnvironmentVariable(cacheVariable, cache);
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = false;
+        try
+        {
+            AssertClose(expected, LaunchTiled(runtime, shape, input, weights, bias, out DirectPtxKernelAudit audit));
+            Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, audit.ImageKind);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+            Environment.SetEnvironmentVariable(cacheVariable, priorCache);
+            try { if (System.IO.Directory.Exists(cache)) System.IO.Directory.Delete(cache, true); }
+            catch { /* best effort */ }
+        }
+    }
+
+    [SkippableFact]
+    public void CudaBackend_FirstDispatchAutotunesAndLaunchesSelectedExactKernel()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+
+        const int n = PtxFusedConv2DNchwK1Kernel.Batch;
+        const int k = PtxFusedConv2DNchwK1Kernel.OutputChannels;
+        const int c = PtxFusedConv2DNchwK1Kernel.InputChannels;
+        const int hw = PtxFusedConv2DNchwK1Kernel.SpatialElements;
+        var input = new float[n * c * hw];
+        var weights = new float[k * c];
+        var bias = new float[k];
+        for (int i = 0; i < input.Length; i++) input[i] = DeterministicInput(i);
+        for (int i = 0; i < weights.Length; i++) weights[i] = DeterministicWeight(i);
+        for (int i = 0; i < bias.Length; i++) bias[i] = DeterministicBias(i);
+        float[] expected = ReferenceConv1x1(input, weights, bias, n, k, c, hw);
+
+        const string cacheVariable = "AIDOTNET_AUTOTUNE_CACHE_PATH";
+        string? priorCache = Environment.GetEnvironmentVariable(cacheVariable);
+        string cache = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "aidotnet-conv-dispatch-" + Guid.NewGuid().ToString("N"));
+        bool? priorGate = DirectPtxFeatureGate.TestOverride;
+        const string directPtxCacheVariable = "AIDOTNET_DIRECT_PTX_CACHE_PATH";
+        string? priorDirectPtxCache = Environment.GetEnvironmentVariable(directPtxCacheVariable);
+        string directPtxCache = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "aidotnet-conv-cubin-" + Guid.NewGuid().ToString("N"));
+        bool priorJit = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        Environment.SetEnvironmentVariable(cacheVariable, cache);
+        Environment.SetEnvironmentVariable(directPtxCacheVariable, directPtxCache);
+        DirectPtxFeatureGate.TestOverride = true;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = false;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.IsDirectPtxConvolutionEnabled,
+                "Requires a validated Ampere CUDA backend with convolution enabled.");
+            using var dInput = backend.AllocateBuffer(input);
+            using var dWeights = backend.AllocateBuffer(weights);
+            using var dBias = backend.AllocateBuffer(bias);
+            using var dOutput = backend.AllocateBuffer(expected.Length);
+
+            Assert.True(backend.TryDirectPtxFusedConv2DBiasRelu(
+                dInput, dWeights, dBias, dOutput, PtxFusedConv2DNchwK1Kernel.Shape),
+                backend.DirectPtxLastError);
+            backend.Synchronize();
+            AssertClose(expected, backend.DownloadBuffer(dOutput));
+            Assert.True(backend.TryGetDirectPtxConvolutionAudit(out DirectPtxKernelAudit audit));
+            Assert.Contains("conv2d-bias-relu", audit.BlueprintId, StringComparison.Ordinal);
+            Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, audit.ImageKind);
+
+            Assert.True(backend.TryDirectPtxFusedConv2DBiasRelu(
+                dInput, dWeights, dBias, dOutput, PtxFusedConv2DNchwK1Kernel.Shape),
+                backend.DirectPtxLastError);
+            Assert.Equal(2, backend.DirectPtxConvolutionDispatchCount);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = priorGate;
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = priorJit;
+            Environment.SetEnvironmentVariable(cacheVariable, priorCache);
+            Environment.SetEnvironmentVariable(directPtxCacheVariable, priorDirectPtxCache);
+            try { if (System.IO.Directory.Exists(cache)) System.IO.Directory.Delete(cache, true); }
+            catch { /* best effort */ }
+            try { if (System.IO.Directory.Exists(directPtxCache)) System.IO.Directory.Delete(directPtxCache, true); }
+            catch { /* best effort */ }
         }
     }
 
@@ -3472,8 +3589,15 @@ public sealed class DirectPtxConvolutionGpuExecutionTests
     private static float[] LaunchTiled(
         DirectPtxRuntime runtime, Conv2DTiledShape shape,
         float[] input, float[] weights, float[] bias)
+        => LaunchTiled(runtime, shape, input, weights, bias, out _);
+
+    private static float[] LaunchTiled(
+        DirectPtxRuntime runtime, Conv2DTiledShape shape,
+        float[] input, float[] weights, float[] bias,
+        out DirectPtxKernelAudit audit)
     {
         using var kernel = new PtxConv2DNchwK1TiledKernel(runtime, shape);
+        audit = kernel.Audit;
         using var dInput = runtime.AllocateBytes((nuint)shape.InputBytes);
         using var dWeights = runtime.AllocateBytes((nuint)shape.WeightBytes);
         using var dBias = runtime.AllocateBytes((nuint)shape.BiasBytes);

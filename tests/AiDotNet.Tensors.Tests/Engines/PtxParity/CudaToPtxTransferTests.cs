@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -47,24 +48,50 @@ public sealed class CudaToPtxTransferTests
             "Transfer ledger has duplicate CUDA-kernel entries: " + string.Join(", ", dupes));
     }
 
+    [Fact]
+    public void RgLruLedgerPreservesValidatedPartialCoverage()
+    {
+        CudaToPtxEntry transfer = Assert.Single(CudaToPtxTransferLedger.Entries,
+            entry => entry.CudaKernel == "rglru_scan_forward");
+        Assert.Equal(PtxTransferStatus.PtxValidatedPartialCoverage, transfer.Status);
+
+        string[] validatedApis = DirectPtxRecurrentCoverageManifest.All
+            .Where(cell => cell.Api.EndsWith(".RgLruScanForward", StringComparison.Ordinal))
+            .Where(cell => cell.Status == DirectPtxRecurrentCoverageStatus.ValidatedDirectPtx)
+            .Select(cell => cell.Api)
+            .OrderBy(api => api, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(new[]
+        {
+            "CpuEngine.RgLruScanForward",
+            "IDirectGpuBackend.RgLruScanForward"
+        }, validatedApis);
+    }
+
     /// <summary>Prints the transfer scoreboard: how many CUDA kernels are replaced, in progress, remaining.</summary>
     [Fact]
     public void TransferProgress_IsReported()
     {
         int total = CudaKernelCensus.KernelNames.Count;
         int replaced = CudaToPtxTransferLedger.Replaced.Count();
+        int validatedPartial = CudaToPtxTransferLedger.ValidatedPartial.Count();
         int inProgress = CudaToPtxTransferLedger.InProgress.Count();
         int notPlanned = CudaToPtxTransferLedger.NotPlanned.Count();
         int remaining = total - replaced - notPlanned;
 
         _out.WriteLine($"CUDA kernels total:            {total}");
         _out.WriteLine($"  replaced by promoted PTX:    {replaced}");
+        _out.WriteLine($"  validated partial PTX coverage: {validatedPartial}");
         _out.WriteLine($"  PTX in progress (not promoted): {inProgress}");
         _out.WriteLine($"  not planned (infra/gap/reassigned): {notPlanned}");
         _out.WriteLine($"  remaining before full delete:  {remaining}");
         _out.WriteLine("");
         _out.WriteLine("In-progress ports:");
         foreach (var e in CudaToPtxTransferLedger.InProgress.OrderBy(e => e.CudaKernel, StringComparer.Ordinal))
+            _out.WriteLine($"  {e.CudaKernel} -> {e.PtxKernel}: {e.Note}");
+        _out.WriteLine("");
+        _out.WriteLine("Validated partial-coverage ports:");
+        foreach (var e in CudaToPtxTransferLedger.ValidatedPartial.OrderBy(e => e.CudaKernel, StringComparer.Ordinal))
             _out.WriteLine($"  {e.CudaKernel} -> {e.PtxKernel}: {e.Note}");
 
         // Always informational — never fails; it is the human-readable scoreboard.

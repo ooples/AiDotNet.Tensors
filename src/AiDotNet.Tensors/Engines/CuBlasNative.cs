@@ -302,12 +302,6 @@ public static class CuBlasNative
     public static extern CudaResult cuCtxPopCurrent(out IntPtr context);
 
     /// <summary>
-    /// Synchronizes the current context.
-    /// </summary>
-    [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
-    public static extern CudaResult cuCtxSynchronize();
-
-    /// <summary>
     /// Allocates device memory.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemAlloc_v2")]
@@ -997,7 +991,7 @@ public sealed class CudaBlasContext : IDisposable
     public void Synchronize()
     {
         ThrowIfDisposed();
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize");
     }
 
     private void ThrowIfDisposed()

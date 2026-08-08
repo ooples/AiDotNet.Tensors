@@ -2057,27 +2057,6 @@ public interface IEngine
     /// </remarks>
     Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b);
 
-    /// <summary>
-    /// Adds two tensors with broadcasting support, following NumPy/PyTorch broadcasting rules.
-    /// </summary>
-    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="a">The first tensor.</param>
-    /// <param name="b">The second tensor. Can have different shape if broadcastable.</param>
-    /// <returns>A new tensor containing the element-wise sum with broadcasting.</returns>
-    /// <exception cref="ArgumentException">Thrown when shapes are not broadcastable.</exception>
-    /// <remarks>
-    /// <para><b>US-GPU-014: Tensor Element-Wise Operations with Broadcasting</b></para>
-    /// <para>
-    /// Broadcasting allows tensors of different shapes to be added together by automatically
-    /// expanding dimensions of size 1 to match the other tensor. This is essential for operations
-    /// like adding per-channel bias in convolutional layers.
-    /// </para>
-    /// <para>
-    /// For example, adding shapes [batch, channels, H, W] + [1, channels, 1, 1] broadcasts
-    /// the bias across batch and spatial dimensions.
-    /// </para>
-    /// </remarks>
-    Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b);
 
     #region In-Place and Into Operations (Zero-Allocation)
 
@@ -2246,57 +2225,8 @@ public interface IEngine
 
     #endregion
 
-    /// <summary>
-    /// Subtracts two tensors element-wise with NumPy-style broadcasting.
-    /// </summary>
-    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="a">The first tensor.</param>
-    /// <param name="b">The second tensor to subtract (will be broadcast to match a if needed).</param>
-    /// <returns>A new tensor containing the element-wise difference with broadcasting.</returns>
-    /// <remarks>
-    /// <para>
-    /// Broadcasting allows tensors of different shapes to be subtracted by automatically
-    /// expanding the smaller tensor. This is commonly used in operations like normalizing
-    /// by subtracting a mean: [batch, features] - [1, features] broadcasts the mean across the batch.
-    /// </para>
-    /// <para>
-    /// For example, subtracting shapes [batch, channels, H, W] - [1, channels, 1, 1] broadcasts
-    /// the bias subtraction across batch and spatial dimensions.
-    /// </para>
-    /// </remarks>
-    Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b);
 
-    /// <summary>
-    /// Divides two tensors element-wise with NumPy-style broadcasting.
-    /// </summary>
-    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="a">The dividend tensor.</param>
-    /// <param name="b">The divisor tensor (will be broadcast to match a if needed).</param>
-    /// <returns>A new tensor containing the element-wise quotient with broadcasting.</returns>
-    /// <remarks>
-    /// <para>
-    /// Broadcasting allows tensors of different shapes to be divided by automatically
-    /// expanding the smaller tensor. This is commonly used in normalization operations
-    /// like dividing by a sum: [batch, features] / [batch, 1] broadcasts the divisor across features.
-    /// </para>
-    /// </remarks>
-    Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b);
 
-    /// <summary>
-    /// Multiplies two tensors element-wise with NumPy-style broadcasting.
-    /// </summary>
-    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="a">The first tensor.</param>
-    /// <param name="b">The second tensor (will be broadcast to match a if needed).</param>
-    /// <returns>A new tensor containing the element-wise product with broadcasting.</returns>
-    /// <remarks>
-    /// <para>
-    /// Broadcasting allows tensors of different shapes to be multiplied together by automatically
-    /// expanding the smaller tensor. For example, [B,H,W,C] * [B,1,1,C] broadcasts the [B,1,1,C]
-    /// tensor across the spatial dimensions.
-    /// </para>
-    /// </remarks>
-    Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b);
 
     /// <summary>
     /// Adds multiple tensors element-wise in a single optimized operation.
