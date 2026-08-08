@@ -82,7 +82,7 @@ public class StreamThroughputBenchmark
         _planA = _cacheA.GetOrCompileInference(_aiInputs[0], () =>
         {
             var h = _engine.TensorMatMul(_aiInputs[0], _aiW1);
-            h = _engine.TensorBroadcastAdd(h, _aiB1);
+            h = _engine.TensorAdd(h, _aiB1);
             return _engine.ReLU(h);
         });
 
@@ -90,7 +90,7 @@ public class StreamThroughputBenchmark
         _planB = _cacheB.GetOrCompileInference(_aiHiddenSeed, () =>
         {
             var o = _engine.TensorMatMul(_aiHiddenSeed, _aiW2);
-            return _engine.TensorBroadcastAdd(o, _aiB2);
+            return _engine.TensorAdd(o, _aiB2);
         });
 
         // Plan pool for the pipelined benchmark. Each pair gets its
@@ -107,14 +107,14 @@ public class StreamThroughputBenchmark
             var a = _poolCachesA[s].GetOrCompileInference(inSeed, () =>
             {
                 var h = _engine.TensorMatMul(inSeed, _aiW1);
-                h = _engine.TensorBroadcastAdd(h, _aiB1);
+                h = _engine.TensorAdd(h, _aiB1);
                 return _engine.ReLU(h);
             });
             _poolCachesB[s] = new CompiledModelCache<float>();
             var b = _poolCachesB[s].GetOrCompileInference(hidSeed, () =>
             {
                 var o = _engine.TensorMatMul(hidSeed, _aiW2);
-                return _engine.TensorBroadcastAdd(o, _aiB2);
+                return _engine.TensorAdd(o, _aiB2);
             });
             _planPool[s] = (a, b);
 

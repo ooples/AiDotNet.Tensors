@@ -65,27 +65,36 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             batch, heads, querySequence, keyValueSequence, scale, isCausal,
             biasBatchStride);
-        _module = runtime.LoadModule(Ptx);
-        _gradQueryFunction = _module.GetFunction(
-            GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
-        _gradKeyValueFunction = _module.GetFunction(
-            GradKeyValueEntryPoint, out DirectPtxFunctionInfo gradKeyValueInfo);
-
-        int blockThreads = WarpsPerBlock * 32;
-        int gradQueryBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _gradQueryFunction, blockThreads);
-        int gradKeyValueBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _gradKeyValueFunction, blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            GradQueryEntryPoint, gradQueryInfo, blockThreads, gradQueryBlocks);
-        Blueprint.ResourceBudget.Validate(
-            GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
-        GradQueryAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
-            blockThreads, gradQueryBlocks, _module.JitInfoLog);
-        GradKeyValueAudit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
-            blockThreads, gradKeyValueBlocks, _module.JitInfoLog);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr gradQueryFunction = module.GetFunction(
+                    GradQueryEntryPoint, out DirectPtxFunctionInfo gradQueryInfo);
+                IntPtr gradKeyValueFunction = module.GetFunction(
+                    GradKeyValueEntryPoint, out DirectPtxFunctionInfo gradKeyValueInfo);
+                int blockThreads = WarpsPerBlock * 32;
+                int gradQueryBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    gradQueryFunction, blockThreads);
+                int gradKeyValueBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    gradKeyValueFunction, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    GradQueryEntryPoint, gradQueryInfo, blockThreads, gradQueryBlocks);
+                Blueprint.ResourceBudget.Validate(
+                    GradKeyValueEntryPoint, gradKeyValueInfo, blockThreads, gradKeyValueBlocks);
+                var gradQueryAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, gradQueryInfo,
+                    blockThreads, gradQueryBlocks, module);
+                var gradKeyValueAudit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, gradKeyValueInfo,
+                    blockThreads, gradKeyValueBlocks, module);
+                return (gradQueryFunction, gradKeyValueFunction, gradQueryAudit, gradKeyValueAudit);
+            });
+        _module = loaded.Resource;
+        _gradQueryFunction = loaded.Value.gradQueryFunction;
+        _gradKeyValueFunction = loaded.Value.gradKeyValueFunction;
+        GradQueryAudit = loaded.Value.gradQueryAudit;
+        GradKeyValueAudit = loaded.Value.gradKeyValueAudit;
     }
 
     internal unsafe void Launch(
@@ -100,21 +109,21 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
         DirectPtxTensorView gradValue,
         DirectPtxTensorView? attentionBias = null)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(query, Blueprint.Tensors[1], nameof(query));
-        Require(key, Blueprint.Tensors[2], nameof(key));
-        Require(value, Blueprint.Tensors[3], nameof(value));
-        Require(output, Blueprint.Tensors[4], nameof(output));
-        Require(softmaxStats, Blueprint.Tensors[5], nameof(softmaxStats));
-        Require(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
-        Require(gradKey, Blueprint.Tensors[7], nameof(gradKey));
-        Require(gradValue, Blueprint.Tensors[8], nameof(gradValue));
+        DirectPtxAbi.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[1], nameof(query));
+        DirectPtxAbi.Require(key, Blueprint.Tensors[2], nameof(key));
+        DirectPtxAbi.Require(value, Blueprint.Tensors[3], nameof(value));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.Require(softmaxStats, Blueprint.Tensors[5], nameof(softmaxStats));
+        DirectPtxAbi.Require(gradQuery, Blueprint.Tensors[6], nameof(gradQuery));
+        DirectPtxAbi.Require(gradKey, Blueprint.Tensors[7], nameof(gradKey));
+        DirectPtxAbi.Require(gradValue, Blueprint.Tensors[8], nameof(gradValue));
         if (HasAttentionBias != attentionBias.HasValue)
             throw new ArgumentException(
                 "The attention-bias view must match the baked FlashAttention-backward specialization.",
                 nameof(attentionBias));
         if (attentionBias is DirectPtxTensorView bias)
-            Require(bias, Blueprint.Tensors[9], nameof(attentionBias));
+            DirectPtxAbi.Require(bias, Blueprint.Tensors[9], nameof(attentionBias));
         RejectOutputAliasing(
             gradOutput, query, key, value, output, softmaxStats,
             gradQuery, gradKey, gradValue, attentionBias);
@@ -161,17 +170,6 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
             (uint)(WarpsPerBlock * 32), 1, 1, 0, gradQueryArguments);
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     private static void RejectOutputAliasing(
         DirectPtxTensorView gradOutput,

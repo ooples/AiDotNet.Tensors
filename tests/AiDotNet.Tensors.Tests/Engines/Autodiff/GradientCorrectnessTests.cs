@@ -754,7 +754,7 @@ public class GradientCorrectnessTests : IDisposable
     {
         var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
         var bias = new Tensor<float>(new float[] { 0.5f, 1.5f }, [2]);
-        VerifyGradient(inp => _engine.TensorBroadcastAdd(inp, bias), x, "BroadcastAdd");
+        VerifyGradient(inp => _engine.TensorAdd(inp, bias), x, "BroadcastAdd");
     }
 
     [Fact]
@@ -844,7 +844,7 @@ public class GradientCorrectnessTests : IDisposable
         // 2x3 tensor broadcast multiplied by 1x3 scale
         var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
         var scale = new Tensor<float>(new float[] { 0.5f, 1.0f, 2.0f }, [1, 3]);
-        VerifyGradient(inp => _engine.TensorBroadcastMultiply(inp, scale), x, "BroadcastMultiply");
+        VerifyGradient(inp => _engine.TensorMultiply(inp, scale), x, "BroadcastMultiply");
     }
 
     [Fact]
@@ -873,7 +873,7 @@ public class GradientCorrectnessTests : IDisposable
     {
         var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
         var bias = new Tensor<float>(new float[] { 0.1f, 0.2f, 0.3f }, [1, 3]);
-        VerifyGradient(inp => _engine.TensorBroadcastSubtract(inp, bias), x, "BroadcastSubtract");
+        VerifyGradient(inp => _engine.TensorSubtract(inp, bias), x, "BroadcastSubtract");
     }
 
     [Fact]

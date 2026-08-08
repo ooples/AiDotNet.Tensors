@@ -45,6 +45,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
+    <Compile Include="..\Shared\RgLruFp64Oracle.cs" Link="Shared\RgLruFp64Oracle.cs" />
   </ItemGroup>
 
   <!-- CLI is net10.0-only; test only references it on the matching TFM. -->

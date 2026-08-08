@@ -172,7 +172,7 @@ internal static class MathOperators
             // safe same-shape path. Negative-base warnings apply; exporters
             // that need that edge case must emit same-shape operands.
             var logBase = ctx.Engine.TensorLog(baseT);
-            var product = ctx.Engine.TensorBroadcastMultiply(logBase, expT);
+            var product = ctx.Engine.TensorMultiply(logBase, expT);
             ctx.PutTensor(node.Output[0], ctx.Engine.TensorExp(product));
         }
     }
@@ -220,23 +220,24 @@ internal static class MathOperators
         const double P = 0.3275911;
         const double A1 = 0.254829592, A2 = -0.284496736, A3 = 1.421413741;
         const double A4 = -1.453152027, A5 = 1.061405429;
+        int[] coefficientShape = x.Rank == 0 ? Array.Empty<int>() : new[] { 1 };
         var absX = engine.TensorAbs(x);
-        var pAbsX = engine.TensorBroadcastMultiply(absX, MakeScalar(P, new[] { 1 }));
-        var onePlusPAbsX = engine.TensorBroadcastAdd(pAbsX, MakeScalar(1.0, new[] { 1 }));
+        var pAbsX = engine.TensorMultiply(absX, MakeScalar(P, coefficientShape));
+        var onePlusPAbsX = engine.TensorAdd(pAbsX, MakeScalar(1.0, coefficientShape));
         var ones = MakeScalar(1.0, x._shape);
         var t = engine.TensorDivide(ones, onePlusPAbsX);
-        var poly = engine.TensorBroadcastAdd(
-            engine.TensorBroadcastMultiply(t, MakeScalar(A5, new[] { 1 })),
-            MakeScalar(A4, new[] { 1 }));
-        poly = engine.TensorBroadcastAdd(engine.TensorMultiply(poly, t), MakeScalar(A3, new[] { 1 }));
-        poly = engine.TensorBroadcastAdd(engine.TensorMultiply(poly, t), MakeScalar(A2, new[] { 1 }));
-        poly = engine.TensorBroadcastAdd(engine.TensorMultiply(poly, t), MakeScalar(A1, new[] { 1 }));
+        var poly = engine.TensorAdd(
+            engine.TensorMultiply(t, MakeScalar(A5, coefficientShape)),
+            MakeScalar(A4, coefficientShape));
+        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A3, coefficientShape));
+        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A2, coefficientShape));
+        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A1, coefficientShape));
         poly = engine.TensorMultiply(poly, t);
         var negXsq = engine.TensorNegate(engine.TensorMultiply(x, x));
         var expNegXsq = engine.TensorExp(negXsq);
         var polyExp = engine.TensorMultiply(poly, expNegXsq);
         var erfMag = engine.TensorSubtract(ones, polyExp);
-        var epsAbsX = engine.TensorBroadcastAdd(absX, MakeScalar(1e-30, new[] { 1 }));
+        var epsAbsX = engine.TensorAdd(absX, MakeScalar(1e-30, coefficientShape));
         var sign = engine.TensorDivide(x, epsAbsX);
         return engine.TensorMultiply(sign, erfMag);
     }
@@ -345,7 +346,7 @@ internal static class MathOperators
 
     /// <summary>
     /// Pairwise Min/Max helper that pre-broadcasts mismatched operands via
-    /// <c>TensorBroadcastAdd</c> with a zero-filled target-shape tensor —
+    /// <c>TensorAdd</c> with a zero-filled target-shape tensor —
     /// the engine's <c>TensorMin</c>/<c>TensorMax</c> require same-shape
     /// inputs. ONNX/NumPy broadcast rules (right-align, each axis either
     /// matches or is 1) are handled by the underlying broadcast kernel.
@@ -357,7 +358,7 @@ internal static class MathOperators
             var targetShape = ComputeBroadcastShape(a._shape, b._shape);
             // TensorBroadcastTo handles identity / leading-1s / general
             // broadcast with the correct fast paths; replaces the old
-            // TensorBroadcastAdd(x, zeros(target)) idiom that skipped
+            // TensorAdd(x, zeros(target)) idiom that skipped
             // those fast paths and forced a full element-wise add.
             a = ctx.Engine.TensorBroadcastTo(a, targetShape);
             b = ctx.Engine.TensorBroadcastTo(b, targetShape);
@@ -518,16 +519,12 @@ internal static class MathOperators
 
         private static Tensor<T> MultiplyMaybeBroadcast(OnnxTranslationContext<T> ctx, Tensor<T> a, Tensor<T> b)
         {
-            return ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorMultiply(a, b)
-                : ctx.Engine.TensorBroadcastMultiply(a, b);
+            return ctx.Engine.TensorMultiply(a, b);
         }
 
         private static Tensor<T> AddMaybeBroadcast(OnnxTranslationContext<T> ctx, Tensor<T> a, Tensor<T> b)
         {
-            return ShapesEqual(a._shape, b._shape)
-                ? ctx.Engine.TensorAdd(a, b)
-                : ctx.Engine.TensorBroadcastAdd(a, b);
+            return ctx.Engine.TensorAdd(a, b);
         }
     }
 
@@ -575,7 +572,7 @@ internal static class MathOperators
         {
             var diff = ShapesEqual(a._shape, b._shape)
                 ? engine.TensorSubtract(a, b)
-                : engine.TensorBroadcastSubtract(a, b);
+                : engine.TensorSubtract(a, b);
             var result = new Tensor<T>(outShape);
             var ops = MathHelper.GetNumericOperations<T>();
             var srcSpan = diff.AsSpan();
@@ -591,7 +588,7 @@ internal static class MathOperators
     /// <summary>
     /// ONNX Expand — broadcast `input` to `shape` (second input, int64 vector).
     /// Shape is often rank-bumping: [1,1,3] → [2,1,3] → broadcasts axis 0 from
-    /// 1 to 2. Uses <c>TensorBroadcastAdd</c> with a zero tensor of the target
+    /// 1 to 2. Uses <c>TensorAdd</c> with a zero tensor of the target
     /// shape — same idiom as the output-wrap in <c>OnnxImporter</c>.
     /// </summary>
     internal sealed class Expand<T> : IOnnxOpTranslator<T> where T : unmanaged
@@ -612,7 +609,7 @@ internal static class MathOperators
                 return;
             }
             var zero = new Tensor<T>(targetShape);
-            ctx.PutTensor(node.Output[0], ctx.Engine.TensorBroadcastAdd(input, zero));
+            ctx.PutTensor(node.Output[0], ctx.Engine.TensorAdd(input, zero));
         }
     }
 

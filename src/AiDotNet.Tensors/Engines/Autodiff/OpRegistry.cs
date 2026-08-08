@@ -114,13 +114,13 @@ internal static class OpRegistry
         // Parity-210 indexing family (forward only in v1).
         // TensorBroadcastTo deliberately omitted here — it's classified under
         // "composed from recorded sub-ops" below because our implementation
-        // dispatches through Reshape or TensorBroadcastAdd (both record
+        // dispatches through Reshape or TensorAdd (both record
         // their own autograd steps), so it gets backward for free.
         "TensorIndexAdd", "TensorIndexFill", "TensorIndexCopy", "TensorIndexPut",
         "TensorGatherPacked", "TensorScatterPacked",
         "TensorMaskedScatter", "TensorScatterReduce",
         // TensorBroadcastTo belongs to the Delegator set below (composed
-        // from Reshape / TensorBroadcastAdd which record themselves) —
+        // from Reshape / TensorAdd which record themselves) —
         // listing it here too tripped the duplicate-check in
         // TapeCompletenessTests.OpRegistry_HasNoDuplicates.
         "TensorExpandAs", "TensorBroadcastTensors",
@@ -445,7 +445,7 @@ internal static class OpRegistry
         "TensorConv2D",      // -> Conv2D (records)
 
         // Composed from recorded sub-ops (backward through constituents)
-        "TensorBroadcastTo", // -> Reshape or TensorBroadcastAdd (both record)
+        "TensorBroadcastTo", // -> Reshape or TensorAdd (both record)
         "TensorLogSumExp",   // ReduceMax + BroadcastSubtract + TensorExp + ReduceSum + TensorLog + TensorAdd
         "TensorNorm",        // TensorMultiply + ReduceSum + TensorSqrt
         "TensorNormalize",   // TensorNorm + TensorDivide
@@ -458,7 +458,7 @@ internal static class OpRegistry
         "GlobalAvgPool2D",   // reshape + ReduceMean
         "GlobalMaxPool2D",   // reshape + ReduceMax
         "TensorLerp",        // TensorAdd + TensorSubtract + TensorMultiplyScalar
-        "FusedLinear",       // TensorMatMul + TensorBroadcastAdd (both record)
+        "FusedLinear",       // TensorMatMul + TensorAdd (both record)
         "TensorEinsum",      // TensorMatMul / BatchMatMul / Split (record)
         "OctonionAddTensor",  // TensorAdd (records)
         "GeGLU",             // composed with GELU + Tanh

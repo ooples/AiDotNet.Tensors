@@ -13,7 +13,8 @@ internal readonly record struct DirectPtxOnlineAttentionFamilyReleaseCase(
     int QuerySequence,
     int KeyValueSequence,
     bool Causal,
-    int CausalQueryOffset);
+    int CausalQueryOffset,
+    bool Epilogue);
 
 /// <summary>
 /// Canonical, ordered SM86 online-attention release matrix shared by offline
@@ -37,10 +38,11 @@ internal static class DirectPtxOnlineAttentionReleaseMatrix
 
     internal static readonly DirectPtxOnlineAttentionFamilyReleaseCase[] FamilyCases =
     [
-        new(2, 4, 2, 32, 64, false, 0),
-        new(2, 8, 1, 32, 64, true, 0),
-        new(2, 8, 2, 32, 64, true, 32),
-        new(1, 4, 4, 128, 32, true, 0),
-        new(1, 4, 2, 128, 64, true, -64)
+        new(2, 4, 2, 32, 64, false, 0, false),
+        new(2, 8, 1, 32, 64, true, 0, false),
+        new(2, 8, 2, 32, 64, true, 32, false),
+        new(1, 4, 4, 128, 32, true, 0, false),
+        new(1, 4, 2, 128, 64, true, -64, false),
+        new(2, 4, 2, 32, 64, false, 0, true)
     ];
 }

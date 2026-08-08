@@ -159,7 +159,7 @@ public class FusedAdvancedBenchmarks
     public Tensor<float> AiDotNet_SparseLinear_DecomposedDense()
     {
         var linear = _engine.TensorMatMul(_sparseInput, _sparseDenseWeight);
-        var biased = _engine.TensorBroadcastAdd(linear, _sparseBias);
+        var biased = _engine.TensorAdd(linear, _sparseBias);
         return _engine.ReLU(biased);
     }
 
