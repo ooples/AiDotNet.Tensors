@@ -662,8 +662,16 @@ public sealed class GradientTape<T> : IDisposable
                         }
                     }
 
-                    step.Backward(gradOutput, step.Inputs, step.Output,
-                        step.SavedState ?? Array.Empty<object>(), engine, grads);
+                    DifferentiableOps.BeginBackwardStep(grads);
+                    try
+                    {
+                        step.Backward(gradOutput, step.Inputs, step.Output,
+                            step.SavedState ?? Array.Empty<object>(), engine, grads);
+                    }
+                    finally
+                    {
+                        DifferentiableOps.EndBackwardStep<T>();
+                    }
 
                     // Release this node-output's gradient now that its backward has
                     // consumed it. In the reverse topo walk every consumer of this
@@ -1125,7 +1133,15 @@ public sealed class GradientTape<T> : IDisposable
                 // Invoke the backward function. Phase A (#338) timing
                 // wrapper records per-op ticks when AIDOTNET_BWD_TIMING=1.
                 long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+                DifferentiableOps.BeginBackwardStep(grads);
+                try
+                {
+                    entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+                }
+                finally
+                {
+                    DifferentiableOps.EndBackwardStep<T>();
+                }
                 if (BackwardTiming.Enabled)
                     BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
 

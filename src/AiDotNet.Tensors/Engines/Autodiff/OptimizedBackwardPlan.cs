@@ -142,30 +142,38 @@ internal sealed class OptimizedBackwardPlan<T>
 
                 entry.ValidateInputVersions();
 
-                // Try optimized path for MatMul operations
-                if (TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
+                DifferentiableOps.BeginBackwardStep(grads);
+                try
                 {
+                    // Try optimized path for MatMul operations
+                    if (TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
+                    {
+                        FreeDeadActivation(entry.Output);
+                        continue;
+                    }
+
+                    // Default path: use the original backward function.
+                    // Phase A (#338) timing wrapper records per-op ticks when
+                    // AIDOTNET_BWD_TIMING=1.
+                    //
+                    // Issue #433 phase-2: GetInputsArrayInto with thread-local
+                    // scratch buffers eliminates the per-entry array allocation
+                    // GetInputsArray() previously paid. Buffers acquired once
+                    // before the loop, reused across all entries; same buffers
+                    // CompiledBackwardGraph.Execute uses.
+                    var inputsArray = entry.GetInputsArrayInto(_inputsBuf1!, _inputsBuf2!, _inputsBuf3!);
+                    long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                    entry.Backward(gradOutput, inputsArray, entry.Output,
+                        entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+                    if (BackwardTiming.Enabled)
+                        BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
+
                     FreeDeadActivation(entry.Output);
-                    continue;
                 }
-
-                // Default path: use the original backward function.
-                // Phase A (#338) timing wrapper records per-op ticks when
-                // AIDOTNET_BWD_TIMING=1.
-                //
-                // Issue #433 phase-2: GetInputsArrayInto with thread-local
-                // scratch buffers eliminates the per-entry array allocation
-                // GetInputsArray() previously paid. Buffers acquired once
-                // before the loop, reused across all entries; same buffers
-                // CompiledBackwardGraph.Execute uses.
-                var inputsArray = entry.GetInputsArrayInto(_inputsBuf1!, _inputsBuf2!, _inputsBuf3!);
-                long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                entry.Backward(gradOutput, inputsArray, entry.Output,
-                    entry.SavedState ?? Array.Empty<object>(), _engine, grads);
-                if (BackwardTiming.Enabled)
-                    BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
-
-                FreeDeadActivation(entry.Output);
+                finally
+                {
+                    DifferentiableOps.EndBackwardStep<T>();
+                }
             }
         }
         finally
