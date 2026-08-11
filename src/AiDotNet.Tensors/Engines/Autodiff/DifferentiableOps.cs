@@ -196,6 +196,28 @@ internal static class DifferentiableOps
         return GradientTape<T>.Current is not null && !NoGradScope<T>.IsSuppressed;
     }
 
+    // Engine view methods delegate their storage work to Tensor.Reshape/Transpose and then
+    // register an operation-specific backward edge themselves. Suppress the Tensor-level
+    // fallback only for that narrow call so a view is recorded exactly once. Direct Tensor
+    // view APIs remain fully differentiable and replayable.
+    [ThreadStatic]
+    private static int s_tensorViewRecordingSuppressionDepth;
+
+    internal static bool IsTensorViewRecordingSuppressed
+        => s_tensorViewRecordingSuppressionDepth > 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static TensorViewRecordingSuppression SuppressTensorViewRecording()
+    {
+        s_tensorViewRecordingSuppressionDepth++;
+        return new TensorViewRecordingSuppression();
+    }
+
+    internal readonly struct TensorViewRecordingSuppression : IDisposable
+    {
+        public void Dispose() => s_tensorViewRecordingSuppressionDepth--;
+    }
+
     /// <summary>
     /// Records a variadic operation (4+ inputs) to the current gradient tape if one is active.
     /// The caller must provide the pre-allocated inputs array.

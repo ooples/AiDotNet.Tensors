@@ -1663,10 +1663,15 @@ public sealed class GradientTape<T> : IDisposable
                         if (nodeToEntryIndex.TryGetValue(node, out int entryIdx))
                             reverseTopoIndices[writeIdx++] = entryIdx;
                     }
-                    if (writeIdx < reverseTopoIndices.Length)
-                        Array.Resize(ref reverseTopoIndices, writeIdx);
-
-                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices, _entries);
+                    // A rebindable plan is correct only when EVERY graph node has a matching
+                    // current-tape entry. Graph-only nodes cannot be represented by an entry-index
+                    // replay. Never cache a partial walk: falling back to DFS costs time; replaying
+                    // a partial walk silently loses gradients.
+                    if (writeIdx == reverseTopoIndices.Length)
+                    {
+                        RebindablePlanCache<T>.Store(
+                            patternHash, _entries.Count, reverseTopoIndices, _entries);
+                    }
                 }
             }
 
