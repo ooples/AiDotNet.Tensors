@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'vision-box-iou', 'rglru', 'convolution')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -27,6 +27,8 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'rng-dropout' { '--direct-ptx-profile-rng-dropout' }
+    'rng-stochastic' { '--direct-ptx-profile-rng-stochastic' }
     'vision-box-iou' { '--direct-ptx-profile-vision-box-iou' }
     'rglru' { '--direct-ptx-profile-rglru' }
     'convolution' { '--direct-ptx-profile-convolution' }
@@ -38,6 +40,8 @@ $kernel = switch ($Target) {
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
+    'rng-dropout' { 'regex:aidotnet_philox_dropout_f32' }
+    'rng-stochastic' { 'regex:aidotnet_(philox_dropout|philox_uniform|philox_normal|philox_bernoulli_mask|philox_drop_threshold_mask|dropout_backward|philox_gumbel_softmax32|philox_importance_sampling64|bias_philox_dropout256|fused_ddim_step|philox_categorical32|gumbel_softmax_backward32|philox_rrelu|rrelu|rrelu_backward)_f32' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'vision-box-iou' { 'regex:aidotnet_(fused_pairwise_box_iou_f32|vision_.*)' }
     'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
@@ -49,6 +53,8 @@ $expectedLaunches = switch ($Target) {
     'decode' { 2 }
     'paged-prefill' { 1 }
     'attention-backward' { 3 }
+    'rng-dropout' { 3 }
+    'rng-stochastic' { 45 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'vision-box-iou' { 31 }
