@@ -2032,7 +2032,9 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Reshape", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var originalShape = tensor.Shape.ToArray();
-        var result = tensor.Reshape(newShape);
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
         AutoTracer.RecordOp("Reshape", result, eng => eng.Reshape(tensor, newShape));
         return result;
@@ -7144,8 +7146,15 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < src.Length; i++)
                 dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
         }
+        // Match the mathematical contract used by PyTorch/JAX and by this method's graph-mode
+        // path: round is piecewise constant, so its derivative is zero almost everywhere. A
+        // straight-through estimator is an optimization policy for quantization-aware training,
+        // not the derivative of a basic arithmetic primitive; silently applying it here made the
+        // same expression differentiate differently in eager and captured execution. Callers that
+        // intentionally need an STE must opt into a dedicated estimator rather than changing the
+        // meaning of TensorRound for every loss (notably angular anti-wrapping).
         DifferentiableOps.RecordUnary("Round", result, tensorOrig,
-            BackwardFunctions<T>.StraightThroughBackward);
+            BackwardFunctions<T>.SignBackward);
         { var c = tensor; AutoTracer.RecordOp("Round", result, eng => eng.TensorRound(c)); }
         return result;
     }
@@ -12306,8 +12315,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Return a contiguous transposed copy for API compatibility.
         // The lazy graph path uses a more efficient execute delegate.
-        var view = tensor.Transpose();
-        var result = view.Contiguous();
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+        {
+            var view = tensor.Transpose();
+            result = view.Contiguous();
+        }
         DifferentiableOps.RecordUnary("TensorTranspose", result, tensor, BackwardFunctions<T>.TransposeBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorTranspose", result, eng => eng.TensorTranspose(c)); }
         return result;
@@ -14856,15 +14869,35 @@ public partial class CpuEngine : ITensorLevelEngine
                                     flippedF[fBase + kh * kernelWidth + kw] =
                                         kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
                         }
-                    var fusedResult = Conv2D<float>(gradOutFloat, flippedKernel, 1, padHt, 1);
-                    var fusedF = (float[])(object)fusedResult.GetFlattenedData();
                     var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;
-                    if (accumulate)
-                        for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
+                    const int UnitStride = 1;
+                    const int UnitDilation = 1;
+                    if (!accumulate)
+                    {
+                        // Write through to the caller-owned destination. This
+                        // preserves the overwrite contract while avoiding the
+                        // allocating scalar overload and a full result copy.
+                        Conv2DInto(
+                            (Tensor<float>)(object)dest,
+                            gradOutFloat,
+                            flippedKernel,
+                            new[] { UnitStride, UnitStride },
+                            new[] { padHt, padWt },
+                            new[] { UnitDilation, UnitDilation });
+                    }
                     else
-                        Array.Copy(fusedF, 0, destFused, destOffFused, totalFused);
+                    {
+                        var fusedResult = Conv2D<float>(
+                            gradOutFloat,
+                            flippedKernel,
+                            UnitStride,
+                            padHt,
+                            UnitDilation);
+                        var fusedF = (float[])(object)fusedResult.GetFlattenedData();
+                        for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
+                    }
                     return;
                 }
             }
@@ -34085,8 +34118,27 @@ public partial class CpuEngine : ITensorLevelEngine
             resultData[flatIdx] = tensorData[inputFlat];
         });
 
-        DifferentiableOps.RecordUnary("TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward, new object[] { start });
-        AutoTracer.RecordOp("TensorSlice", result, eng => eng.TensorSlice(tensor, start, length));
+        // A tape is an immutable record of the FORWARD call. `start` and `length` are mutable
+        // caller-owned arrays, and high-throughput callers commonly reuse one buffer across a
+        // loop. Capturing either array by reference lets a later mutation rewrite an earlier
+        // node's backward/replay semantics (RAFT's two flow-channel slices both became channel 1,
+        // dropping channel 0's gradient). Snapshot metadata only when a consumer will retain it;
+        // ordinary eager inference keeps the allocation-free path.
+        if (DifferentiableOps.IsRecording<T>())
+        {
+            var recordedStart = (int[])start.Clone();
+            DifferentiableOps.RecordUnary(
+                "TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward,
+                new object[] { recordedStart });
+        }
+        if (AutoTracer.ShouldRecord)
+        {
+            var tracedStart = (int[])start.Clone();
+            var tracedLength = (int[])length.Clone();
+            AutoTracer.RecordOp(
+                "TensorSlice", result,
+                eng => eng.TensorSlice(tensor, tracedStart, tracedLength));
+        }
         return result;
     }
 
@@ -34569,8 +34621,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorPermute", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        // Use tensor's built-in Transpose method
-        var result = tensor.Transpose(axes);
+        // Use tensor's built-in Transpose method. The engine registers the operation-specific
+        // edge below, so suppress the Tensor API's direct-call fallback for this one delegation.
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Transpose(axes);
         DifferentiableOps.RecordUnary("TensorPermute", result, tensor, BackwardFunctions<T>.PermuteBackward, new object[] { axes });
         AutoTracer.RecordOp("TensorPermute", result, eng => eng.TensorPermute(tensor, axes));
         return result;
@@ -34615,7 +34670,9 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis; i < rank; i++)
             newShape[i + 1] = tensor._shape[i];
 
-        var result = tensor.Reshape(newShape);
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("TensorExpandDims", result, tensor, BackwardFunctions<T>.ExpandDimsBackward, new object[] { axis });
         AutoTracer.RecordOp("TensorExpandDims", result, eng => eng.TensorExpandDims(tensor, axis));
         return result;
@@ -34665,7 +34722,9 @@ public partial class CpuEngine : ITensorLevelEngine
             if (shape.Count == 0) shape.Add(1);
         }
 
-        var squeezeResult = tensor.Reshape(shape.ToArray());
+        Tensor<T> squeezeResult;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            squeezeResult = tensor.Reshape(shape.ToArray());
         DifferentiableOps.RecordUnary("TensorSqueeze", squeezeResult, tensor, BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
         AutoTracer.RecordOp("TensorSqueeze", squeezeResult, eng => squeezeResult);
         return squeezeResult;

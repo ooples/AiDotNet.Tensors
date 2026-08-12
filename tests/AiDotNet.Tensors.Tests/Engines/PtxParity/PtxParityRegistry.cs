@@ -194,6 +194,16 @@ public static class PtxParityRegistry
             "runs the exact SM86 direct route and incumbent NVRTC kernel against an independent fp64 " +
             "full-sequence recurrence oracle at 2e-5, and proves direct route entry over repeated launches."),
 
+        new PtxParitySpec("PtxFusedPairwiseBoxIouF32Kernel", PtxParityStatus.Deferred,
+            "pairwise BoxIoU (#851)",
+            "the dedicated SM86 test and benchmark harness compare direct PTX and the established CUDA route " +
+            "against an fp64 oracle, but the driver-only matrix cannot run on CPU-only CI; retain the explicit " +
+            "deferral until resident-GPU evidence is attached."),
+        new PtxParitySpec("PtxVisionKernel", PtxParityStatus.Deferred,
+            "vision/detection/ROI/geometry specialization family (#851)",
+            "all 120 closed specializations pass static ABI/emitter validation and have driver-only direct-PTX " +
+            "versus established-CUDA checks; the operation-specific fp64 resident-GPU oracle matrix remains " +
+            "deferred until the required SM86 hardware run."),
         // Issue #854 specialized-scientific / ANN / hypercomplex / hyperbolic / quantum / Instant-NGP
         // kernels. Each has a GPU-gated DriverOnly CPU-fp64-oracle parity test, an emitter structure
         // test, and a backend dispatch test in DirectPtxScientificTests. The three-way gate-toggle
