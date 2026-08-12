@@ -1,0 +1,918 @@
+#if NET6_0_OR_GREATER
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text.RegularExpressions;
+using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+public sealed class DirectPtxVisionBoxIouTests
+{
+    private sealed class TrackedResource : IDisposable
+    {
+        internal bool IsDisposed { get; private set; }
+        internal bool ThrowOnDispose { get; init; }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
+    }
+
+    public static IEnumerable<object[]> VisionDefinitions()
+    {
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.DistanceBoxIou, 1024, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.CompleteBoxIou, 1024, 1024)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.BoxArea, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.BoxConvert, 256, 0, 2)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.IoULoss, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.GIoULoss, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.DIoULoss, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.CIoULoss, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.IoULossBackward, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.GIoULossBackward, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.DIoULossBackward, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.CIoULossBackward, 256)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.IouFamilyBackwardB, 256, 256, 3)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Nms, 256,
+            Flags: 1, ScalarBits: BitConverter.SingleToInt32Bits(0.5f))];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Nms, 256,
+            ScalarBits: BitConverter.SingleToInt32Bits(0.5f))];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.RoiAlign,
+            1, 256, 56, 56, 256, 7, 7, 256, 2 | 0x100,
+            BitConverter.SingleToInt32Bits(0.25f))];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 256, 0,
+            BitConverter.SingleToInt32Bits(0.25f))];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.PsRoiAlign,
+            1, 196, 56, 56, 256, 7, 7, 4, 2,
+            BitConverter.SingleToInt32Bits(0.25f))];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.PsRoiPool,
+            1, 196, 56, 56, 256, 7, 7, 4, 0,
+            BitConverter.SingleToInt32Bits(0.25f))];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Cross3, 256, 1)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 0)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 1)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 2)];
+        yield return [new DirectPtxVisionSpec(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 3)];
+    }
+
+    private static IEnumerable<DirectPtxVisionSpec> AllAdmittedDefinitions()
+    {
+        (int N, int M)[] pairShapes =
+            [(256, 256), (1024, 256), (1024, 1024), (4096, 256)];
+        DirectPtxVisionOperation[] metrics =
+        [
+            DirectPtxVisionOperation.GeneralizedBoxIou,
+            DirectPtxVisionOperation.DistanceBoxIou,
+            DirectPtxVisionOperation.CompleteBoxIou
+        ];
+        foreach (DirectPtxVisionOperation operation in metrics)
+        foreach ((int n, int m) in pairShapes)
+            yield return new(operation, n, m);
+
+        DirectPtxVisionOperation[] vectors =
+        [
+            DirectPtxVisionOperation.BoxArea,
+            DirectPtxVisionOperation.IoULoss,
+            DirectPtxVisionOperation.GIoULoss,
+            DirectPtxVisionOperation.DIoULoss,
+            DirectPtxVisionOperation.CIoULoss,
+            DirectPtxVisionOperation.IoULossBackward,
+            DirectPtxVisionOperation.GIoULossBackward,
+            DirectPtxVisionOperation.DIoULossBackward,
+            DirectPtxVisionOperation.CIoULossBackward
+        ];
+        foreach (DirectPtxVisionOperation operation in vectors)
+        foreach (int n in new[] { 256, 1024, 4096 })
+            yield return new(operation, n);
+
+        foreach (int n in new[] { 256, 1024, 4096 })
+        for (int from = 0; from < 3; from++)
+        for (int to = 0; to < 3; to++)
+            yield return new(DirectPtxVisionOperation.BoxConvert, n, from, to);
+
+        foreach (bool ownerA in new[] { true, false })
+        foreach (int n in new[] { 256, 1024 })
+        foreach (int m in new[] { 256, 1024 })
+        for (int variant = 0; variant < 4; variant++)
+            yield return new(
+                ownerA ? DirectPtxVisionOperation.IouFamilyBackwardA :
+                    DirectPtxVisionOperation.IouFamilyBackwardB,
+                n, m, variant);
+
+        foreach (int n in new[] { 256, 1024 })
+        foreach (int flags in new[] { 0, 1 })
+            yield return new(DirectPtxVisionOperation.Nms, n, Flags: flags,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+
+        yield return new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28);
+        yield return new(DirectPtxVisionOperation.MasksToBoxes, 64, 64, 64);
+        foreach (bool aligned in new[] { false, true })
+            yield return new(DirectPtxVisionOperation.RoiAlign,
+                1, 256, 56, 56, 256, 7, 7, 256,
+                2 | (aligned ? 0x100 : 0), BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 256, 0,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.PsRoiAlign,
+            1, 196, 56, 56, 256, 7, 7, 4, 2,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.PsRoiPool,
+            1, 196, 56, 56, 256, 7, 7, 4, 0,
+            BitConverter.SingleToInt32Bits(0.25f));
+
+        foreach ((int outer, int inner) in new[] { (256, 1), (1024, 1), (256, 64) })
+            yield return new(DirectPtxVisionOperation.Cross3, outer, inner);
+        foreach ((int n0, int n1) in new[] { (256, 256), (1024, 256) })
+        for (int flags = 0; flags < 4; flags++)
+            yield return new(DirectPtxVisionOperation.Meshgrid2D, n0, n1, Flags: flags);
+    }
+
+    [Fact]
+    public void Emitter_BakesExactShapeAndUsesPointerOnlyAbi()
+    {
+        string ptx = PtxFusedPairwiseBoxIouF32Kernel.EmitPtx(8, 6, 1024, 256);
+        Assert.Contains(".target sm_86", ptx);
+        Assert.Contains("ld.global.v4.f32", ptx);
+        Assert.Contains("div.rn.f32", ptx);
+        Assert.Contains("shr.u32 %r3, %r2, 8", ptx);
+        Assert.Contains("and.b32 %r4, %r2, 255", ptx);
+        Assert.DoesNotContain(".param .u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("stride", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("nvrtc", ptx, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("setp.ge.u32", ptx, StringComparison.Ordinal);
+        AssertPtxRegisterAndLabelClosure(ptx);
+    }
+
+    [Fact]
+    public void SpecializationMatrix_IsExactSm86AndUnpromoted()
+    {
+        Assert.True(DirectPtxArchitecture.HasValidatedVision(8, 6));
+        Assert.False(DirectPtxArchitecture.HasValidatedVision(8, 0));
+        Assert.False(DirectPtxArchitecture.HasValidatedVision(8, 9));
+        Assert.False(DirectPtxArchitecture.HasValidatedVision(9, 0));
+        Assert.True(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(256, 256));
+        Assert.True(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(1024, 1024));
+        Assert.False(PtxFusedPairwiseBoxIouF32Kernel.IsSupportedShape(257, 256));
+        Assert.False(PtxFusedPairwiseBoxIouF32Kernel.AnyShapePromoted);
+        Assert.Throws<NotSupportedException>(() =>
+            PtxFusedPairwiseBoxIouF32Kernel.EmitPtx(8, 9, 256, 256));
+        Assert.Throws<NotSupportedException>(() => PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.BoxArea, 256),
+            DirectPtxArchitectureFamily.Ada, 8, 9));
+    }
+
+    [Fact]
+    public void FamilyAdmissionTable_FailsClosedForEveryUnsupportedAxis()
+    {
+        Assert.True(DirectPtxVisionSpecializations.TryPairwise(
+            DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryPairwise(
+            DirectPtxVisionOperation.Nms, 256, 256, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryPairwise(
+            DirectPtxVisionOperation.GeneralizedBoxIou, 257, 256, out _));
+
+        Assert.True(DirectPtxVisionSpecializations.TryVector(
+            DirectPtxVisionOperation.CIoULossBackward, 4096, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryVector(
+            DirectPtxVisionOperation.Cross3, 4096, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryVector(
+            DirectPtxVisionOperation.BoxArea, 255, out _));
+
+        Assert.True(DirectPtxVisionSpecializations.TryBoxConvert(256, 0, 2, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryBoxConvert(256, -1, 2, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryBoxConvert(256, 0, 3, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryPairwiseBackward(
+            true, 256, 256, 4, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryPairwiseBackward(
+            true, 4096, 256, 0, out _));
+
+        Assert.True(DirectPtxVisionSpecializations.TryNms(256, 0.5f, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryNms(255, 0.5f, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryNms(256, float.NaN, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryNms(256, 1.01f, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryNms(256, 0.25f, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryMasksToBoxes(256, 28, 27, out _));
+
+        Assert.True(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.RoiAlign,
+            1, 256, 56, 56, 256, 7, 7, 256, 0.25f, 2, true, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.BoxArea,
+            1, 256, 56, 56, 256, 7, 7, 256, 0.25f, 2, true, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.RoiAlign,
+            1, 256, 56, 56, 256, 7, 7, 256, 0.25f, 1, true, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 256, 0f, 0, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 256, 0.5f, 0, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 4, 0.25f, 0, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryRoi(
+            DirectPtxVisionOperation.PsRoiAlign,
+            1, 196, 56, 56, 256, 7, 7, 4, 0.25f, 2, true, out _));
+
+        Assert.False(DirectPtxVisionSpecializations.TryCross3(1024, 2, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryMeshgrid2D(
+            1024, 256, 2, false, out _));
+        Assert.False(DirectPtxVisionSpecializations.TryMeshgrid2D(
+            1024, 255, 0, false, out _));
+
+        Assert.True(DirectPtxVisionSpecializations.IsAdmitted(
+            new(DirectPtxVisionOperation.Nms, 256, Flags: 1,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f))));
+        Assert.False(DirectPtxVisionSpecializations.IsAdmitted(
+            new(DirectPtxVisionOperation.Nms, 256, D7: 1, Flags: 1,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f))));
+        Assert.False(DirectPtxVisionSpecializations.IsAdmitted(
+            new((DirectPtxVisionOperation)int.MaxValue, 256)));
+        Assert.Throws<NotSupportedException>(() => PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.BoxArea, 257),
+            DirectPtxArchitectureFamily.Ampere, 8, 6));
+
+        DirectPtxVisionDefinition plainNms = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.Nms, 256,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f)),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(new DirectPtxExtent(1), plainNms.Blueprint.Tensors[2].LogicalExtent);
+        Assert.Contains("testp.notanumber.f32", plainNms.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("testp.nan.f32", plainNms.Ptx, StringComparison.Ordinal);
+
+        DirectPtxVisionDefinition masksToBoxes = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(40, masksToBoxes.Blueprint.ResourceBudget.MaxRegistersPerThread);
+
+        DirectPtxVisionDefinition roiPool = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.RoiPool,
+                1, 256, 56, 56, 256, 7, 7, 256, 0,
+                BitConverter.SingleToInt32Bits(0.25f)),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.DoesNotContain("ld.global.v4.f32", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.Contains("ld.global.f32 %f1, [%rd4+4]", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.Contains("ld.global.f32 %f4, [%rd4+16]", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("cvt.rni.s32.f32", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.Contains("cvt.rmi.s32.f32", roiPool.Ptx, StringComparison.Ordinal);
+        Assert.Contains("cvt.rpi.s32.f32", roiPool.Ptx, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TensorContracts_RejectWrongExtentAndAlignment_AndPermitOnlyReadAliases()
+    {
+        DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        DirectPtxTensorContract aContract = definition.Blueprint.Tensors[0];
+        DirectPtxTensorContract bContract = definition.Blueprint.Tensors[1];
+        DirectPtxTensorContract outputContract = definition.Blueprint.Tensors[2];
+
+        Assert.Throws<ArgumentException>(() => DirectPtxTensorView.Create(
+            new FakeGpuBuffer(new IntPtr(0x1000), checked((long)aContract.RequiredBytes + 4)),
+            aContract));
+        Assert.Throws<ArgumentException>(() => DirectPtxTensorView.Create(
+            new FakeGpuBuffer(new IntPtr(0x1004), checked((long)aContract.RequiredBytes)),
+            aContract));
+
+        Assert.Equal("byteOffset", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DirectPtxTensorContract(
+                "misaligned-boxes", aContract.PhysicalType, aContract.Layout,
+                aContract.LogicalExtent, aContract.PhysicalExtent,
+                aContract.AlignmentBytes, aContract.Access,
+                DirectPtxExtentMode.Exact, byteOffset: 4)).ParamName);
+        Assert.Equal("byteOffset", Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DirectPtxTensorContract(
+                "partial-element-boxes", aContract.PhysicalType, aContract.Layout,
+                aContract.LogicalExtent, aContract.PhysicalExtent,
+                alignmentBytes: 2, access: aContract.Access,
+                DirectPtxExtentMode.Exact, byteOffset: 2)).ParamName);
+
+        var offsetContract = new DirectPtxTensorContract(
+            "offset-boxes", aContract.PhysicalType, aContract.Layout,
+            aContract.LogicalExtent, aContract.PhysicalExtent,
+            aContract.AlignmentBytes, aContract.Access,
+            DirectPtxExtentMode.Exact, byteOffset: 16);
+        var offsetBuffer = new FakeGpuBuffer(
+            new IntPtr(0x1000), checked((long)offsetContract.RequiredBytes + 16));
+        DirectPtxTensorView offsetView = DirectPtxTensorView.Create(
+            offsetBuffer, offsetContract);
+        Assert.Equal(new IntPtr(0x1010), offsetView.Pointer);
+
+        DirectPtxTensorView a = DirectPtxTensorView.Create(
+            new FakeGpuBuffer(new IntPtr(0x1000), checked((long)aContract.RequiredBytes)),
+            aContract);
+        DirectPtxTensorView bAlias = DirectPtxTensorView.Create(
+            new FakeGpuBuffer(new IntPtr(0x1000), checked((long)bContract.RequiredBytes)),
+            bContract);
+        DirectPtxTensorView output = DirectPtxTensorView.Create(
+            new FakeGpuBuffer(new IntPtr(0x100000), checked((long)outputContract.RequiredBytes)),
+            outputContract);
+        PtxVisionKernel.ValidateViews(definition.Blueprint, [a, bAlias, output]);
+
+        DirectPtxTensorView outputAlias = DirectPtxTensorView.Create(
+            new FakeGpuBuffer(new IntPtr(0x1000), checked((long)outputContract.RequiredBytes)),
+            outputContract);
+        Assert.Throws<ArgumentException>(() =>
+            PtxVisionKernel.ValidateViews(definition.Blueprint, [a, bAlias, outputAlias]));
+        Assert.Throws<ArgumentException>(() =>
+            PtxVisionKernel.ValidateViews(definition.Blueprint, [a, bAlias]));
+    }
+
+    [Fact]
+    public void FeatureOverrides_AreThreadLocalAndRestoreDisabledState()
+    {
+        static (bool? Experiment, bool? Route, bool Enabled) ObserveOnNewThread()
+        {
+            var observed = (Experiment: (bool?)true, Route: (bool?)true, Enabled: false);
+            var worker = new System.Threading.Thread(() => observed = (
+                DirectPtxFeatureGate.VisionExperimentOverride,
+                DirectPtxFeatureGate.VisionGateOverride,
+                DirectPtxFeatureGate.IsVisionBoxIouEnabled));
+            worker.Start();
+            worker.Join();
+            return observed;
+        }
+
+        bool? oldExperiment = DirectPtxFeatureGate.VisionExperimentOverride;
+        bool? oldRoute = DirectPtxFeatureGate.VisionGateOverride;
+        try
+        {
+            var baseline = ObserveOnNewThread();
+            Assert.Null(baseline.Experiment);
+            Assert.Null(baseline.Route);
+
+            DirectPtxFeatureGate.VisionExperimentOverride = true;
+            Assert.True(DirectPtxFeatureGate.IsVisionBoxIouEnabled);
+            Assert.True(DirectPtxFeatureGate.IsVisionOperationEnabled(
+                DirectPtxVisionOperation.RoiAlign));
+
+            var otherThread = ObserveOnNewThread();
+            Assert.Null(otherThread.Experiment);
+            Assert.Null(otherThread.Route);
+            Assert.Equal(baseline.Enabled, otherThread.Enabled);
+
+            DirectPtxFeatureGate.VisionGateOverride = false;
+            Assert.False(DirectPtxFeatureGate.IsVisionBoxIouEnabled);
+            Assert.False(DirectPtxFeatureGate.IsVisionOperationEnabled(
+                DirectPtxVisionOperation.RoiAlign));
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionGateOverride = oldRoute;
+            DirectPtxFeatureGate.VisionExperimentOverride = oldExperiment;
+        }
+    }
+
+    [Fact]
+    public void FeatureGate_InvalidVisionOrdinalsDoNotIndexOutsideGateTable()
+    {
+        Exception? error = Record.Exception(() =>
+        {
+            _ = DirectPtxFeatureGate.IsVisionOperationEnabled(
+                (DirectPtxVisionOperation)(-1));
+            _ = DirectPtxFeatureGate.IsVisionOperationEnabled(
+                (DirectPtxVisionOperation)int.MaxValue);
+        });
+        Assert.Null(error);
+    }
+
+    [Fact]
+    public void FamilyEmitter_UsesExactPointerOnlyAbi()
+    {
+        DirectPtxVisionSpec[] admitted = AllAdmittedDefinitions().ToArray();
+        Assert.Equal(120, admitted.Length);
+        Assert.Equal(admitted.Length, admitted.Distinct().Count());
+        foreach (DirectPtxVisionSpec spec in admitted)
+        {
+            Assert.True(DirectPtxVisionSpecializations.IsAdmitted(spec));
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                spec, DirectPtxArchitectureFamily.Ampere, 8, 6);
+            Assert.Contains(".target sm_86", definition.Ptx);
+            Assert.Contains(PtxVisionEmitter.EntryPoint(spec.Operation), definition.Ptx);
+            Assert.DoesNotContain(".param .u32", definition.Ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain(".local", definition.Ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("stride", definition.Ptx, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("nvrtc", definition.Ptx, StringComparison.OrdinalIgnoreCase);
+            AssertPtxRegisterAndLabelClosure(definition.Ptx);
+            Assert.NotEmpty(definition.Blueprint.Tensors);
+            Assert.All(definition.Blueprint.Tensors, contract =>
+            {
+                Assert.Equal(DirectPtxExtentMode.Exact, contract.ExtentMode);
+                Assert.Equal(16, contract.AlignmentBytes);
+                Assert.Equal((nuint)0, contract.ByteOffset);
+                Assert.Equal(contract.LogicalExtent, contract.PhysicalExtent);
+            });
+        }
+    }
+
+    [Fact]
+    public void BackwardEmitter_UsesSharedAnalyticFastMathAndHoistsOwnerBox()
+    {
+        DirectPtxVisionDefinition aligned = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.CIoULossBackward, 256),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Contains("deterministic-analytic", aligned.Blueprint.Variant,
+            StringComparison.Ordinal);
+        Assert.Equal("analytical reverse mode; CIoU alpha detached",
+            aligned.Blueprint.Semantics["method"]);
+        Assert.Contains("rcp.approx.ftz.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rcp.approx.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("div.rn.f32", aligned.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("0.001", aligned.Ptx, StringComparison.Ordinal);
+
+        DirectPtxVisionDefinition pair = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        int ownerLoad = pair.Ptx.IndexOf(
+            "ld.global.v4.f32 {%f0,%f1,%f2,%f3}", StringComparison.Ordinal);
+        int loop = pair.Ptx.IndexOf("PAIR_GRAD_LOOP:", StringComparison.Ordinal);
+        int opposingLoad = pair.Ptx.IndexOf(
+            "ld.global.v4.f32 {%f4,%f5,%f6,%f7}", loop,
+            StringComparison.Ordinal);
+        Assert.InRange(ownerLoad, 0, loop - 1);
+        Assert.True(opposingLoad > loop);
+        Assert.DoesNotContain("finite difference",
+            pair.Blueprint.Semantics["method"], StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void FamilyEmitter_GlobalIndexStrideMatchesNonDefaultBlockGeometry()
+    {
+        DirectPtxVisionDefinition pair = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(128u, pair.BlockX);
+        Assert.Contains("mad.lo.u32 %r2, %r0, 128, %r1", pair.Ptx,
+            StringComparison.Ordinal);
+
+        DirectPtxVisionDefinition masks = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+        Assert.Equal(64u, masks.BlockX);
+        Assert.Contains("mad.lo.u32 %r2, %r0, 64, %r1", masks.Ptx,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BoxConvertBlueprint_RecordsSourceAndDestinationCoordinateLayouts()
+    {
+        DirectPtxPhysicalLayout[] layouts =
+        [
+            DirectPtxPhysicalLayout.BoxXyxy,
+            DirectPtxPhysicalLayout.BoxXywh,
+            DirectPtxPhysicalLayout.BoxCxcywh
+        ];
+
+        for (int from = 0; from < layouts.Length; from++)
+        for (int to = 0; to < layouts.Length; to++)
+        {
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                new(DirectPtxVisionOperation.BoxConvert, 256, from, to),
+                DirectPtxArchitectureFamily.Ampere, 8, 6);
+
+            Assert.Equal(layouts[from], definition.Blueprint.Tensors[0].Layout);
+            Assert.Equal(layouts[to], definition.Blueprint.Tensors[1].Layout);
+        }
+    }
+
+    [Fact]
+    public void NmsEmitter_UsesDeterministicCooperativeBlock()
+    {
+        DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+            new(DirectPtxVisionOperation.Nms, 1024, Flags: 1,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f)),
+            DirectPtxArchitectureFamily.Ampere, 8, 6);
+
+        Assert.Equal(1u, definition.GridX);
+        Assert.Equal(256u, definition.BlockX);
+        Assert.Equal(2048,
+            definition.Blueprint.ResourceBudget.MaxStaticSharedBytes);
+        Assert.Equal(
+            "deterministic cooperative block: parallel argmax and suppression",
+            definition.Blueprint.Semantics["execution"]);
+        Assert.Contains("NMS_FIND_LOCAL:", definition.Ptx, StringComparison.Ordinal);
+        Assert.Contains("NMS_SUPPRESS_LOCAL:", definition.Ptx, StringComparison.Ordinal);
+        Assert.Contains("bar.sync 0", definition.Ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("single deterministic controller thread",
+            definition.Ptx, StringComparison.Ordinal);
+        AssertPtxRegisterAndLabelClosure(definition.Ptx);
+    }
+
+    [Fact]
+    public void NmsBlueprint_FormatsThresholdInvariantly()
+    {
+        CultureInfo oldCulture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("fr-FR");
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                new(DirectPtxVisionOperation.Nms, 256,
+                    ScalarBits: BitConverter.SingleToInt32Bits(0.5f)),
+                DirectPtxArchitectureFamily.Ampere, 8, 6);
+
+            Assert.Contains("threshold-0.5", definition.Blueprint.Variant,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("threshold-0,5", definition.Blueprint.Variant,
+                StringComparison.Ordinal);
+            Assert.Equal("0.5", definition.Blueprint.Semantics["threshold"]);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = oldCulture;
+        }
+    }
+
+    [Fact]
+    public void RoiEmitter_DividesBinSizesLikeEstablishedCudaKernels()
+    {
+        DirectPtxVisionSpec[] specs =
+        [
+            new(DirectPtxVisionOperation.RoiAlign,
+                1, 256, 56, 56, 256, 7, 7, 256, 2,
+                BitConverter.SingleToInt32Bits(0.25f)),
+            new(DirectPtxVisionOperation.RoiPool,
+                1, 256, 56, 56, 256, 7, 7, 256,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.25f)),
+            new(DirectPtxVisionOperation.PsRoiAlign,
+                1, 196, 56, 56, 256, 7, 7, 4, 2,
+                BitConverter.SingleToInt32Bits(0.25f)),
+            new(DirectPtxVisionOperation.PsRoiPool,
+                1, 196, 56, 56, 256, 7, 7, 4,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.25f))
+        ];
+
+        foreach (DirectPtxVisionSpec spec in specs)
+        {
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                spec, DirectPtxArchitectureFamily.Ampere, 8, 6);
+            Assert.Contains("div.rn.f32 %f7, %f5, 0f40E00000",
+                definition.Ptx, StringComparison.Ordinal);
+            Assert.Contains("div.rn.f32 %f8, %f6, 0f40E00000",
+                definition.Ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("mul.rn.f32 %f7, %f5",
+                definition.Ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("mul.rn.f32 %f8, %f6",
+                definition.Ptx, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void VisionPostLoadInitialization_DisposesAndPreservesPrimaryFailure()
+    {
+        var resource = new TrackedResource { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("resource validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackedResource, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void VisionPostLoadInitialization_TransfersSuccessfulOwnership()
+    {
+        var resource = new TrackedResource();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
+        Assert.True(resource.IsDisposed);
+    }
+
+    private static void AssertPtxRegisterAndLabelClosure(string ptx)
+    {
+        var limits = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (Match declaration in Regex.Matches(
+                     ptx, @"\.reg\s+\.(?:pred|b32|b64|f32)\s+%(rd|r|f|p)<(\d+)>;"))
+            limits[declaration.Groups[1].Value] = int.Parse(declaration.Groups[2].Value);
+        Assert.Equal(4, limits.Count);
+        foreach (Match reference in Regex.Matches(ptx, @"%(rd|r|f|p)(\d+)"))
+        {
+            string kind = reference.Groups[1].Value;
+            int index = int.Parse(reference.Groups[2].Value);
+            Assert.True(limits.TryGetValue(kind, out int limit) && index < limit,
+                $"PTX register %{kind}{index} exceeds its declared range.");
+        }
+
+        string[] labels = Regex.Matches(ptx, @"(?m)^\s*([A-Z][A-Z0-9_]*)\s*:")
+            .Select(match => match.Groups[1].Value).ToArray();
+        Assert.Equal(labels.Length, labels.Distinct(StringComparer.Ordinal).Count());
+        var defined = labels.ToHashSet(StringComparer.Ordinal);
+        foreach (Match branch in Regex.Matches(ptx, @"\bbra\s+([A-Z][A-Z0-9_]*)"))
+            Assert.Contains(branch.Groups[1].Value, defined);
+        Assert.DoesNotMatch(
+            new Regex(@"st\.global[^;]*,\s*(?:0f[0-9A-F]+|-?\d+)\s*;",
+                RegexOptions.CultureInvariant), ptx);
+    }
+
+    [Fact]
+    public void CoverageManifest_AssignsOnlyImplementedDirectPtxCells()
+    {
+        Assert.Equal(29, DirectPtxVisionCoverageManifest.All.Count);
+        Assert.Equal(
+            DirectPtxVisionCoverageManifest.All.Count,
+            DirectPtxVisionCoverageManifest.All.Select(cell => cell.Api).Distinct(StringComparer.Ordinal).Count());
+        DirectPtxVisionCoverageCell golden =
+            DirectPtxVisionCoverageManifest.Get(
+                "IEngine.BoxIou -> IDetectionBackend.BoxIou");
+        Assert.Equal(DirectPtxVisionCoverageStatus.ExperimentalDirectPtx, golden.Status);
+        Assert.All(DirectPtxVisionCoverageManifest.All, cell =>
+            Assert.Equal(DirectPtxVisionCoverageStatus.ExperimentalDirectPtx, cell.Status));
+        Assert.All(DirectPtxVisionCoverageManifest.All, cell =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(cell.ExistingImplementation));
+            Assert.False(string.IsNullOrWhiteSpace(cell.DirectPtxAssignment));
+        });
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(VisionDefinitions))]
+    public void DriverOnly_FamilyPrewarmsCapturesAndRetainsZeroLocalBytes(
+        object value)
+    {
+        var spec = (DirectPtxVisionSpec)value;
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.PrewarmDirectPtxVisionKernel(spec),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+            DirectPtxVisionDefinition definition = PtxVisionEmitter.Emit(
+                spec, DirectPtxArchitectureFamily.Ampere, 8, 6);
+            IGpuBuffer[] buffers = definition.Blueprint.Tensors
+                .Select(contract => backend.AllocateBuffer(
+                    new float[checked((int)(contract.RequiredBytes / 4))]))
+                .ToArray();
+            try
+            {
+                void Launch()
+                {
+                    if (!backend.TryDirectPtxVisionKernel(
+                            spec, buffers[0], At(buffers, 1), At(buffers, 2),
+                            At(buffers, 3), At(buffers, 4), At(buffers, 5)))
+                        throw new InvalidOperationException(
+                            backend.DirectPtxLastError ?? "Direct PTX family dispatch failed.");
+                }
+                Launch();
+                IntPtr graph = backend.CaptureGraph(Launch);
+                Assert.NotEqual(IntPtr.Zero, graph);
+                try
+                {
+                    backend.EnqueueCapturedGraph(graph);
+                    backend.Synchronize();
+                }
+                finally
+                {
+                    backend.DestroyCapturedGraph(graph);
+                }
+                Assert.True(backend.TryGetDirectPtxVisionAudit(spec, out var audit));
+                Assert.Equal(0, audit.Function.LocalBytesPerThread);
+                Assert.True(backend.DirectPtxVisionDispatchCount(spec.Operation) >= 2);
+            }
+            finally
+            {
+                foreach (IGpuBuffer buffer in buffers) buffer.Dispose();
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
+        }
+    }
+
+    private static IGpuBuffer? At(IGpuBuffer[] buffers, int index) =>
+        index < buffers.Length ? buffers[index] : null;
+
+    [SkippableFact]
+    public void DriverOnly_CompleteBoxIouMatchesFp64Oracle()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
+        try
+        {
+            const int n = 256, m = 256;
+            var spec = new DirectPtxVisionSpec(
+                DirectPtxVisionOperation.CompleteBoxIou, n, m);
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.PrewarmDirectPtxVisionKernel(spec),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+            float[] a = Boxes(n, 851_017);
+            float[] b = Boxes(m, 851_031);
+            using var aBuffer = backend.AllocateBuffer(a);
+            using var bBuffer = backend.AllocateBuffer(b);
+            using var output = backend.AllocateBuffer(checked(n * m));
+            Assert.True(backend.TryDirectPtxVisionKernel(
+                spec, aBuffer, bBuffer, output), backend.DirectPtxLastError);
+            backend.Synchronize();
+            Assert.True(
+                MaximumCompleteBoxIouError(a, b, backend.DownloadBuffer(output), n, m) <= 5e-5,
+                "CompleteBoxIoU exceeded its fp64 oracle tolerance.");
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
+        }
+    }
+
+    [SkippableFact]
+    public void DriverOnly_PublicNmsRouteInitializesScratchWithoutClearingUnusedOutput()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
+        try
+        {
+            const int length = 256;
+            var spec = new DirectPtxVisionSpec(
+                DirectPtxVisionOperation.Nms, length,
+                ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.PrewarmDirectPtxVisionKernel(spec),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+            var boxData = new float[length * 4];
+            for (int i = 0; i < length; i++)
+            {
+                boxData[i * 4 + 2] = 1f;
+                boxData[i * 4 + 3] = 1f;
+            }
+            using var boxes = backend.AllocateBuffer(boxData);
+            using var scores = backend.AllocateBuffer(Enumerable.Repeat(1f, length).ToArray());
+            using var classes = backend.AllocateBuffer(new float[1]);
+            using var suppressed = backend.AllocateBuffer(Enumerable.Repeat(1f, length).ToArray());
+            using var output = backend.AllocateBuffer(Enumerable.Repeat(-7f, length).ToArray());
+            using var count = backend.AllocateBuffer(new[] { -3f });
+
+            backend.Nms(boxes, scores, classes, suppressed, output, count,
+                length, 0.5f, batched: 0);
+            backend.Synchronize();
+
+            Assert.Equal(1f, backend.DownloadBuffer(count)[0]);
+            float[] actual = backend.DownloadBuffer(output);
+            Assert.Equal(0f, actual[0]);
+            Assert.All(actual.Skip(1), value => Assert.Equal(-7f, value));
+            Assert.True(backend.DirectPtxVisionDispatchCount(
+                DirectPtxVisionOperation.Nms) >= 1);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(256, 256)]
+    [InlineData(1024, 256)]
+    [InlineData(1024, 1024)]
+    [InlineData(4096, 256)]
+    public void DriverOnly_PublicRoutePrewarmsCapturesAndMatchesOracle(int n, int m)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? old = DirectPtxFeatureGate.VisionExperimentOverride;
+        DirectPtxFeatureGate.VisionExperimentOverride = true;
+        try
+        {
+            using var backend = new CudaBackend();
+            Skip.IfNot(backend.PrewarmDirectPtxVisionBoxIou(n, m),
+                backend.DirectPtxLastError ?? "Requires the exact SM86 specialization.");
+            float[] a = Boxes(n, 17);
+            float[] b = Boxes(m, 31);
+            using var aBuffer = backend.AllocateBuffer(a);
+            using var bBuffer = backend.AllocateBuffer(b);
+            using var output = backend.AllocateBuffer(checked(n * m));
+            void Launch() => backend.BoxIou(aBuffer, bBuffer, output, n, m);
+            IntPtr graph = backend.CaptureGraph(Launch);
+            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+            IntPtr secondGraph = backend.CaptureGraph(Launch);
+            Assert.NotEqual(IntPtr.Zero, secondGraph);
+            Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+            try
+            {
+                backend.EnqueueCapturedGraph(graph);
+                backend.EnqueueCapturedGraph(secondGraph);
+                backend.Synchronize();
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(graph);
+                try
+                {
+                    Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+                }
+                finally
+                {
+                    backend.DestroyCapturedGraph(secondGraph);
+                }
+            }
+            float[] actual = backend.DownloadBuffer(output);
+            Assert.True(MaximumError(a, b, actual, n, m) <= 2e-6f);
+            Assert.True(backend.DirectPtxVisionBoxIouDispatchCount >= 1);
+            Assert.Equal(0, backend.DirectPtxVisionBoxIouPinnedKernelCount);
+            Assert.True(backend.TryGetDirectPtxVisionBoxIouAudit(n, m, out var audit));
+            Assert.Equal(0, audit.Function.LocalBytesPerThread);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.VisionExperimentOverride = old;
+        }
+    }
+
+    private static float[] Boxes(int count, int seed)
+    {
+        var random = new Random(seed);
+        var result = new float[count * 4];
+        for (int i = 0; i < count; i++)
+        {
+            float x = random.NextSingle() * 100f;
+            float y = random.NextSingle() * 100f;
+            result[i * 4] = x;
+            result[i * 4 + 1] = y;
+            result[i * 4 + 2] = x + random.NextSingle() * 25f;
+            result[i * 4 + 3] = y + random.NextSingle() * 25f;
+        }
+        return result;
+    }
+
+    private static double MaximumError(float[] a, float[] b, float[] actual, int n, int m)
+    {
+        double error = 0;
+        for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++)
+        {
+            double ax1 = a[i * 4], ay1 = a[i * 4 + 1], ax2 = a[i * 4 + 2], ay2 = a[i * 4 + 3];
+            double bx1 = b[j * 4], by1 = b[j * 4 + 1], bx2 = b[j * 4 + 2], by2 = b[j * 4 + 3];
+            double areaA = Math.Max(ax2 - ax1, 0) * Math.Max(ay2 - ay1, 0);
+            double areaB = Math.Max(bx2 - bx1, 0) * Math.Max(by2 - by1, 0);
+            double intersection = Math.Max(Math.Min(ax2, bx2) - Math.Max(ax1, bx1), 0) *
+                Math.Max(Math.Min(ay2, by2) - Math.Max(ay1, by1), 0);
+            double union = areaA + areaB - intersection;
+            double expected = union > 0 ? intersection / union : 0;
+            error = Math.Max(error, Math.Abs(expected - actual[i * m + j]));
+        }
+        return error;
+    }
+
+    private static double MaximumCompleteBoxIouError(
+        float[] a, float[] b, float[] actual, int n, int m)
+    {
+        double error = 0;
+        for (int i = 0; i < n; i++)
+        for (int j = 0; j < m; j++)
+        {
+            double ax1 = a[i * 4], ay1 = a[i * 4 + 1], ax2 = a[i * 4 + 2], ay2 = a[i * 4 + 3];
+            double bx1 = b[j * 4], by1 = b[j * 4 + 1], bx2 = b[j * 4 + 2], by2 = b[j * 4 + 3];
+            double aw = Math.Max(ax2 - ax1, 0), ah = Math.Max(ay2 - ay1, 0);
+            double bw = Math.Max(bx2 - bx1, 0), bh = Math.Max(by2 - by1, 0);
+            double intersection = Math.Max(Math.Min(ax2, bx2) - Math.Max(ax1, bx1), 0) *
+                Math.Max(Math.Min(ay2, by2) - Math.Max(ay1, by1), 0);
+            double union = aw * ah + bw * bh - intersection;
+            double iou = union > 0 ? intersection / union : 0;
+            double dx = (ax1 + ax2 - bx1 - bx2) * 0.5;
+            double dy = (ay1 + ay2 - by1 - by2) * 0.5;
+            double ew = Math.Max(ax2, bx2) - Math.Min(ax1, bx1);
+            double eh = Math.Max(ay2, by2) - Math.Min(ay1, by1);
+            double diagonal = ew * ew + eh * eh;
+            double diou = diagonal > 0 ? iou - (dx * dx + dy * dy) / diagonal : iou;
+            double v = 0, alpha = 0;
+            if (ah > 0 && bh > 0)
+            {
+                double aspect = Math.Atan(aw / ah) - Math.Atan(bw / bh);
+                v = 4 / (Math.PI * Math.PI) * aspect * aspect;
+                double denominator = 1 - iou + v;
+                alpha = denominator > 0 ? v / denominator : 0;
+            }
+            error = Math.Max(error, Math.Abs(diou - alpha * v - actual[i * m + j]));
+        }
+        return error;
+    }
+
+    private sealed class FakeGpuBuffer(IntPtr handle, long sizeInBytes) : IGpuBuffer
+    {
+        public int Size => checked((int)(sizeInBytes / 4));
+        public long SizeInBytes { get; } = sizeInBytes;
+        public IntPtr Handle { get; } = handle;
+        public void Dispose() { }
+    }
+}
+#endif
