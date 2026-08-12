@@ -3270,6 +3270,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunUnary<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
+        // Same precision guard as TryRunBinary: do not upload CPU-resident doubles into a
+        // single-precision kernel. Sqrt is the one that mattered for Adam. See IsGpuPrecisionSafe.
+        if (!IsGpuPrecisionSafe(input))
+            return null;
+
         if (!TryGetBackend(out var backend))
             return null;
 
@@ -3455,9 +3460,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Tensor-aware TryRunBinary: checks GPU activation cache BEFORE triggering CPU materialization.
     /// </summary>
+    /// <summary>
+    /// True when running <typeparamref name="T"/> through a single-precision GPU kernel cannot
+    /// silently lose precision the caller asked for.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Narrowing double -> float is intended only at a real device boundary, for data that already
+    /// lives on the device. The upload-compute-download paths are the opposite case: the operands
+    /// are CPU-resident, so they get copied into a float kernel and the caller receives
+    /// float-accurate answers despite having asked for double.
+    /// </para>
+    /// <para>
+    /// Measured before this guard: <c>AiDotNetEngine.Current.Multiply</c> on a CPU-resident
+    /// <c>Vector&lt;double&gt;</c> returned 0.30000001192092896 where double gives
+    /// 0.30000000000000004 -- 3.974E-008 relative, which is float32 epsilon (~1.19e-7), not double
+    /// (~2.2e-16). The same ops on an explicitly constructed <c>CpuEngine</c> were exact, so the
+    /// kernels were never the problem; the dispatch was. It also cost a host-&gt;device-&gt;host round
+    /// trip PER OP on data that never needed to leave the CPU.
+    /// </para>
+    /// <para>
+    /// Tensors that really are device-resident are unaffected: they are served by the resident
+    /// paths (<c>TryBinaryResidentOutOfPlace</c> and friends), which run before this check.
+    /// </para>
+    /// </remarks>
+    private static bool IsGpuPrecisionSafe<T>(Tensor<T> a, Tensor<T>? b = null)
+    {
+        if (typeof(T) != typeof(double)) return true;          // float/half already match the kernels
+        if (a.IsGpuResident) return true;                      // already on the device by the caller's choice
+        if (b is not null && b.IsGpuResident) return true;
+        return false;
+    }
+
     private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
+        // Fall through to base (CpuEngine), which computes in the declared T, rather than uploading
+        // CPU-resident doubles into a single-precision kernel. See IsGpuPrecisionSafe.
+        if (!IsGpuPrecisionSafe(left, right))
+            return null;
+
         if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
