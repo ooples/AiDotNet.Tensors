@@ -3667,6 +3667,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
+        // A T[] is CPU memory by definition -- see the note on the binary array overload.
+        if (typeof(T) == typeof(double))
+            return null;
+
         if (!TryGetBackend(out var backend))
             return null;
 
@@ -3694,6 +3698,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
+        // A T[] is CPU memory by definition, so uploading double data into a single-precision
+        // kernel here is ALWAYS a silent precision loss -- there is no device residency to respect.
+        // This is the overload the explicit IEngine.Add/Subtract/Multiply/Divide vector members
+        // call via GetDataArray(), which is how CPU-resident doubles were reaching a float kernel.
+        // See IsGpuPrecisionSafe; returning null falls through to base (CpuEngine).
+        if (typeof(T) == typeof(double))
+            return null;
+
         if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
@@ -3724,6 +3736,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
+        // A T[] is CPU memory by definition -- see the note on the binary array overload. Note this
+        // overload's kernel signature takes a `float` scalar, so a double scalar could never have
+        // survived the call in the first place.
+        if (typeof(T) == typeof(double))
+            return null;
+
         if (!TryGetBackend(out var backend))
             return null;
 
