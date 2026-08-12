@@ -142,7 +142,7 @@ public sealed class Conv2DDegenerateSpatialGradientTests : IDisposable
                 source[i] = original;
 
                 float numerical = (plus - minus) / (2f * Epsilon);
-                AssertClose(analytical![i], numerical, $"source shape [{string.Join(",", source._shape)}], index {i}");
+                AssertClose(analytical![i], numerical, $"source shape [{string.Join(",", source.Shape.ToArray())}], index {i}");
             }
         }
     }

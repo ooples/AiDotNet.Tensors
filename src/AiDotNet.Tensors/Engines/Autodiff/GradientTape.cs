@@ -662,7 +662,7 @@ public sealed class GradientTape<T> : IDisposable
                         }
                     }
 
-                    DifferentiableOps.BeginBackwardStep(grads);
+                    var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
                     try
                     {
                         step.Backward(gradOutput, step.Inputs, step.Output,
@@ -670,7 +670,7 @@ public sealed class GradientTape<T> : IDisposable
                     }
                     finally
                     {
-                        DifferentiableOps.EndBackwardStep<T>();
+                        DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                     }
 
                     // Release this node-output's gradient now that its backward has
@@ -1133,14 +1133,14 @@ public sealed class GradientTape<T> : IDisposable
                 // Invoke the backward function. Phase A (#338) timing
                 // wrapper records per-op ticks when AIDOTNET_BWD_TIMING=1.
                 long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                DifferentiableOps.BeginBackwardStep(grads);
+                var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
                 try
                 {
                     entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
                 }
                 finally
                 {
-                    DifferentiableOps.EndBackwardStep<T>();
+                    DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                 }
                 if (BackwardTiming.Enabled)
                     BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);

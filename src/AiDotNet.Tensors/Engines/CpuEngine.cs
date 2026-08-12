@@ -14872,6 +14872,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;
+                    const int UnitStride = 1;
+                    const int UnitDilation = 1;
                     if (!accumulate)
                     {
                         // Write through to the caller-owned destination. This
@@ -14881,13 +14883,18 @@ public partial class CpuEngine : ITensorLevelEngine
                             (Tensor<float>)(object)dest,
                             gradOutFloat,
                             flippedKernel,
-                            new[] { 1, 1 },
+                            new[] { UnitStride, UnitStride },
                             new[] { padHt, padWt },
-                            new[] { 1, 1 });
+                            new[] { UnitDilation, UnitDilation });
                     }
                     else
                     {
-                        var fusedResult = Conv2D<float>(gradOutFloat, flippedKernel, 1, padHt, 1);
+                        var fusedResult = Conv2D<float>(
+                            gradOutFloat,
+                            flippedKernel,
+                            UnitStride,
+                            padHt,
+                            UnitDilation);
                         var fusedF = (float[])(object)fusedResult.GetFlattenedData();
                         for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
                     }

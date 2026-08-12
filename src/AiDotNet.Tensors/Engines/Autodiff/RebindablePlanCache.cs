@@ -207,7 +207,7 @@ internal static class RebindablePlanCache<T>
                     continue;
 
                 long start = timing ? Stopwatch.GetTimestamp() : 0;
-                DifferentiableOps.BeginBackwardStep(grads);
+                var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
                 try
                 {
                     entry.Backward(
@@ -220,7 +220,7 @@ internal static class RebindablePlanCache<T>
                 }
                 finally
                 {
-                    DifferentiableOps.EndBackwardStep<T>();
+                    DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                 }
                 if (timing)
                 {

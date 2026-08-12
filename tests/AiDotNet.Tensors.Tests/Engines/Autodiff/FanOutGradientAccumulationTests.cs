@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// reasoning that wrote the backward, would agree with a wrong backward.
 /// </para>
 /// </remarks>
+[Collection("EngineCurrentGlobalState")]
 public class FanOutGradientAccumulationTests
 {
     private static IEngine Engine => AiDotNetEngine.Current;

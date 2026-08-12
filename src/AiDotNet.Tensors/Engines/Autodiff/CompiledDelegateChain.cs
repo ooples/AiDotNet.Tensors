@@ -223,7 +223,7 @@ internal sealed class CompiledDelegateChain<T>
                 continue;
 
             long start = timing ? Stopwatch.GetTimestamp() : 0;
-            DifferentiableOps.BeginBackwardStep(grads);
+            var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
             try
             {
                 step.Backward(gradOutput, step.Inputs, step.Output,
@@ -231,7 +231,7 @@ internal sealed class CompiledDelegateChain<T>
             }
             finally
             {
-                DifferentiableOps.EndBackwardStep<T>();
+                DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
             }
             if (timing)
             {

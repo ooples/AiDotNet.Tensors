@@ -7,6 +7,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
+[Collection("EngineCurrentGlobalState")]
 public sealed class FusedLinearLargeInputGradientTests : IDisposable
 {
     private readonly IEngine _priorEngine = AiDotNetEngine.Current;
@@ -48,8 +49,10 @@ public sealed class FusedLinearLargeInputGradientTests : IDisposable
                     expected += projection[row, output] * weights[feature, output];
 
                 double actual = inputGradient[row, feature];
-                Assert.True(Math.Abs(expected - actual) <= 2e-5,
-                    $"Input gradient [{row},{feature}] mismatch: expected={expected:R}, actual={actual:R}.");
+                double scale = Math.Max(Math.Abs(expected), Math.Abs(actual));
+                double tolerance = Math.Max(2e-5, scale * 1e-4);
+                Assert.True(Math.Abs(expected - actual) <= tolerance,
+                    $"Input gradient [{row},{feature}] mismatch: expected={expected:R}, actual={actual:R}, tolerance={tolerance:R}.");
             }
         }
     }

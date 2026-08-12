@@ -210,12 +210,35 @@ internal static class DifferentiableOps
     internal static TensorViewRecordingSuppression SuppressTensorViewRecording()
     {
         s_tensorViewRecordingSuppressionDepth++;
-        return new TensorViewRecordingSuppression();
+        return new TensorViewRecordingSuppression(new TensorViewRecordingSuppressionState());
     }
 
     internal readonly struct TensorViewRecordingSuppression : IDisposable
     {
-        public void Dispose() => s_tensorViewRecordingSuppressionDepth--;
+        private readonly TensorViewRecordingSuppressionState? _state;
+
+        internal TensorViewRecordingSuppression(TensorViewRecordingSuppressionState state)
+        {
+            _state = state;
+        }
+
+        public void Dispose()
+        {
+            // A reference-backed lease makes disposal idempotent even when this
+            // readonly struct is copied: every copy observes the same release bit.
+            if (_state is null || _state.IsReleased)
+            {
+                return;
+            }
+
+            _state.IsReleased = true;
+            s_tensorViewRecordingSuppressionDepth--;
+        }
+    }
+
+    internal sealed class TensorViewRecordingSuppressionState
+    {
+        internal bool IsReleased;
     }
 
     /// <summary>
@@ -481,7 +504,7 @@ internal static class DifferentiableOps
         IEngine engine)
     {
         bool needsOutOfPlace = _isBackwardCreateGraph;
-        bool wasAlreadyOwned = !needsOutOfPlace && IsAccumulatorBufferOwned(grads, grad);
+        bool wasAlreadyOwned = !needsOutOfPlace && IsAccumulatorBufferOwned(grad);
         int idx = tensor._gradIndex;
         if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length
             && _indexedGrads[idx] != null)
@@ -594,7 +617,7 @@ internal static class DifferentiableOps
                     {
                         var previous = existing;
                         existing = existing.Contiguous();
-                        ReplaceAccumulatorBufferOwner(grads, tensor, previous, existing);
+                        ReplaceAccumulatorBufferOwner(tensor, previous, existing);
                     }
 
                     // A contribution can be the same tensor object as this
@@ -603,10 +626,10 @@ internal static class DifferentiableOps
                     // another input has had a chance to consume it. Detach this
                     // one slot out-of-place; ordinary unique accumulation stays
                     // on the zero-allocation in-place path.
-                    if (ReferenceEquals(existing, gradForInPlace))
+                    if (HasOverlappingStorage(existing, gradForInPlace))
                     {
                         accumulated = AddAliasedContributionOutOfPlace(existing, gradForInPlace, engine);
-                        ReplaceAccumulatorBufferOwner(grads, tensor, existing, accumulated);
+                        ReplaceAccumulatorBufferOwner(tensor, existing, accumulated);
                     }
                     else
                     {
@@ -625,7 +648,7 @@ internal static class DifferentiableOps
                 // isolates a contribution already owned by another slot.
                 var stored = needsOutOfPlace
                     ? grad
-                    : TakeAccumulatorBuffer(grads, tensor, gradForInPlace);
+                    : TakeAccumulatorBuffer(tensor, gradForInPlace);
                 _indexedGrads[idx] = stored;
                 tensor.Grad = stored;
             }
@@ -649,14 +672,14 @@ internal static class DifferentiableOps
                     var previous = existingDict;
                     existingDict = existingDict.Contiguous();
                     grads[tensor] = existingDict;
-                    ReplaceAccumulatorBufferOwner(grads, tensor, previous, existingDict);
+                    ReplaceAccumulatorBufferOwner(tensor, previous, existingDict);
                 }
-                if (ReferenceEquals(existingDict, gradForInPlace))
+                if (HasOverlappingStorage(existingDict, gradForInPlace))
                 {
                     var accumulated = AddAliasedContributionOutOfPlace(existingDict, gradForInPlace, engine);
                     grads[tensor] = accumulated;
                     tensor.Grad = accumulated;
-                    ReplaceAccumulatorBufferOwner(grads, tensor, existingDict, accumulated);
+                    ReplaceAccumulatorBufferOwner(tensor, existingDict, accumulated);
                 }
                 else
                 {
@@ -669,30 +692,33 @@ internal static class DifferentiableOps
         {
             var stored = needsOutOfPlace
                 ? grad
-                : TakeAccumulatorBuffer(grads, tensor, gradForInPlace);
+                : TakeAccumulatorBuffer(tensor, gradForInPlace);
             grads[tensor] = stored;
             tensor.Grad = stored;
         }
     }
 
     /// <summary>
-    /// Tracks ownership of donated first-write buffers for one backward dictionary.
+    /// Tracks ownership of donated first-write buffers for one backward step.
     /// </summary>
     /// <remarks>
     /// The reverse map makes the common unique-buffer path O(1) and zero-copy while
     /// identifying the exceptional case where one backward function offers the same
     /// contribution object to several inputs. It is thread-local because a tape's
-    /// backward walk is single-threaded, and it is cleared at both boundaries of
-    /// every backward operation so later operations cannot inherit stale ownership.
+    /// backward walk is single-threaded. Nested backward operations install their own
+    /// map and restore the outer map when they finish, so inner execution cannot erase
+    /// the outer operation's donation history.
     /// </remarks>
     private static class GradientAccumulatorOwnership<T>
     {
         [ThreadStatic]
         internal static Dictionary<Tensor<T>, Tensor<T>>? Owners;
+
+        [ThreadStatic]
+        internal static Stack<Dictionary<Tensor<T>, Tensor<T>>>? Available;
     }
 
-    private static Dictionary<Tensor<T>, Tensor<T>> GetAccumulatorOwners<T>(
-        Dictionary<Tensor<T>, Tensor<T>> grads)
+    private static Dictionary<Tensor<T>, Tensor<T>> GetAccumulatorOwners<T>()
     {
         GradientAccumulatorOwnership<T>.Owners ??=
             new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -709,25 +735,43 @@ internal static class DifferentiableOps
     /// offered the identical object receives an isolated copy.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void BeginBackwardStep<T>(Dictionary<Tensor<T>, Tensor<T>> grads)
-        => GetAccumulatorOwners(grads).Clear();
+    internal static Dictionary<Tensor<T>, Tensor<T>>? BeginBackwardStep<T>()
+    {
+        var previous = GradientAccumulatorOwnership<T>.Owners;
+        var available = GradientAccumulatorOwnership<T>.Available;
+        var current = available is { Count: > 0 }
+            ? available.Pop()
+            : new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        current.Clear();
+        GradientAccumulatorOwnership<T>.Owners = current;
+        return previous;
+    }
 
-    /// <summary>Releases the final strong references held by one donation scope.</summary>
+    /// <summary>
+    /// Releases one donation scope and restores the enclosing scope, if any.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void EndBackwardStep<T>()
-        => GradientAccumulatorOwnership<T>.Owners?.Clear();
+    internal static void EndBackwardStep<T>(Dictionary<Tensor<T>, Tensor<T>>? previous)
+    {
+        var completed = GradientAccumulatorOwnership<T>.Owners;
+        GradientAccumulatorOwnership<T>.Owners = previous;
+        if (completed is null || ReferenceEquals(completed, previous))
+        {
+            return;
+        }
 
-    private static bool IsAccumulatorBufferOwned<T>(
-        Dictionary<Tensor<T>, Tensor<T>> grads,
-        Tensor<T> buffer)
-        => GetAccumulatorOwners(grads).ContainsKey(buffer);
+        completed.Clear();
+        (GradientAccumulatorOwnership<T>.Available ??= new()).Push(completed);
+    }
+
+    private static bool IsAccumulatorBufferOwned<T>(Tensor<T> buffer)
+        => GetAccumulatorOwners<T>().ContainsKey(buffer);
 
     private static Tensor<T> TakeAccumulatorBuffer<T>(
-        Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> destination,
         Tensor<T> contribution)
     {
-        var owners = GetAccumulatorOwners(grads);
+        var owners = GetAccumulatorOwners<T>();
         if (!owners.ContainsKey(contribution))
         {
             owners[contribution] = destination;
@@ -744,14 +788,27 @@ internal static class DifferentiableOps
     }
 
     private static void ReplaceAccumulatorBufferOwner<T>(
-        Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> destination,
         Tensor<T> previous,
         Tensor<T> replacement)
     {
-        var owners = GetAccumulatorOwners(grads);
+        var owners = GetAccumulatorOwners<T>();
         owners.Remove(previous);
         owners[replacement] = destination;
+    }
+
+    private static bool HasOverlappingStorage<T>(Tensor<T> left, Tensor<T> right)
+    {
+        if (!ReferenceEquals(left._storage, right._storage))
+        {
+            return false;
+        }
+
+        long leftStart = left._storageOffset;
+        long rightStart = right._storageOffset;
+        long leftEnd = leftStart + left.Length;
+        long rightEnd = rightStart + right.Length;
+        return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     private static Tensor<T> AddAliasedContributionOutOfPlace<T>(

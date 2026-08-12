@@ -1702,6 +1702,8 @@ internal static class CompiledBackwardWalk<T>
         // calls per entry. CLR allows byref locals for managed pointers to
         // struct types; the JIT keeps them in a register or stack slot.
         var entryRefLocal = il.DeclareLocal(typeof(TapeEntry<T>).MakeByRefType());
+        var previousAccumulatorOwnersLocal = il.DeclareLocal(
+            typeof(Dictionary<Tensor<T>, Tensor<T>>));
 
         // state = InitState(loss, reservedCount)
         il.Emit(OpCodes.Ldarg_1);
@@ -1806,9 +1808,8 @@ internal static class CompiledBackwardWalk<T>
             // operation. The specialised walker bypasses ProcessEntry, so it
             // must emit the same begin/finally/end contract as every delegate
             // execution path.
-            il.Emit(OpCodes.Ldloca, stateLocal);
-            il.Emit(OpCodes.Ldfld, gradsField);
             il.Emit(OpCodes.Call, beginBackwardStepMethod);
+            il.Emit(OpCodes.Stloc, previousAccumulatorOwnersLocal);
             il.BeginExceptionBlock();
 
             // Inliner registry check: if this backward method has a
@@ -1863,6 +1864,7 @@ internal static class CompiledBackwardWalk<T>
             }
 
             il.BeginFinallyBlock();
+            il.Emit(OpCodes.Ldloc, previousAccumulatorOwnersLocal);
             il.Emit(OpCodes.Call, endBackwardStepMethod);
             il.EndExceptionBlock();
 
@@ -1974,7 +1976,7 @@ internal static class CompiledBackwardWalkHelpers<T>
         if (!state.Grads.TryGetValue(entry.Output, out var gradOutput))
             return true;
 
-        DifferentiableOps.BeginBackwardStep(state.Grads);
+        var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
         try
         {
             entry.Backward(
@@ -1987,7 +1989,7 @@ internal static class CompiledBackwardWalkHelpers<T>
         }
         finally
         {
-            DifferentiableOps.EndBackwardStep<T>();
+            DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
         }
         return true;
     }

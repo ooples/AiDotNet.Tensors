@@ -142,7 +142,7 @@ internal sealed class OptimizedBackwardPlan<T>
 
                 entry.ValidateInputVersions();
 
-                DifferentiableOps.BeginBackwardStep(grads);
+                var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
                 try
                 {
                     // Try optimized path for MatMul operations
@@ -172,7 +172,7 @@ internal sealed class OptimizedBackwardPlan<T>
                 }
                 finally
                 {
-                    DifferentiableOps.EndBackwardStep<T>();
+                    DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                 }
             }
         }
