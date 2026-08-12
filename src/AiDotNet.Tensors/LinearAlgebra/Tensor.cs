@@ -269,16 +269,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var savedState = new object[] { (int[])_shape.Clone() };
         Engines.Autodiff.BackwardFunction<T> backward =
             Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward;
-        if (Engines.Autodiff.GradientTape<T>.Current is { } tape)
+        if (Engines.Autodiff.GradientTape<T>.Current is not null
+            && !Engines.Autodiff.DifferentiableOps.IsTensorViewRecordingSuppressed)
         {
-            var node = Engines.Autodiff.GradNodePool<T>.Rent();
-            node.OwningTape = tape;
-            node.Backward = backward;
-            node.Output = result;
-            node.Input0 = this;
-            node.InputCount = 1;
-            node.SavedState = savedState;
-            result.GradFn = node;
+            // Views and materialized copies must use the same recording funnel as engine ops.
+            // Creating only a GradNode makes the eager DFS backward appear correct, but leaves
+            // no TapeEntry for compiled/rebindable replay. A repeated fresh tape would then
+            // silently omit this edge and stop the gradient at the view.
+            Engines.Autodiff.DifferentiableOps.RecordUnary(
+                "Contiguous", result, this, backward, savedState);
         }
 
         var graphScope = Engines.Compilation.GraphMode.Current;
@@ -313,16 +312,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Engines.Autodiff.BackwardFunction<T> backward,
         object[] savedState)
     {
-        if (Engines.Autodiff.GradientTape<T>.Current is { } tape)
+        if (Engines.Autodiff.GradientTape<T>.Current is not null
+            && !Engines.Autodiff.DifferentiableOps.IsTensorViewRecordingSuppressed)
         {
-            var node = Engines.Autodiff.GradNodePool<T>.Rent();
-            node.OwningTape = tape;
-            node.Backward = backward;
-            node.Output = view;
-            node.Input0 = this;
-            node.InputCount = 1;
-            node.SavedState = savedState;
-            view.GradFn = node;
+            // Record both representations atomically: the GradNode used by eager DFS and the
+            // TapeEntry used by compiled/rebindable walks. Keeping a graph-only edge here made
+            // correctness depend on which backward executor happened to run.
+            Engines.Autodiff.DifferentiableOps.RecordUnary(
+                opName, view, this, backward, savedState);
         }
 
         var graphScope = Engines.Compilation.GraphMode.Current;
