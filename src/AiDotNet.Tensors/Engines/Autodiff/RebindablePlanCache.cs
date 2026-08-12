@@ -207,13 +207,21 @@ internal static class RebindablePlanCache<T>
                     continue;
 
                 long start = timing ? Stopwatch.GetTimestamp() : 0;
-                entry.Backward(
-                    gradOutput,
-                    entry.GetInputsArrayInto(inputsBuffer1, inputsBuffer2, inputsBuffer3),
-                    entry.Output,
-                    entry.SavedState ?? Array.Empty<object>(),
-                    engine,
-                    grads);
+                var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
+                try
+                {
+                    entry.Backward(
+                        gradOutput,
+                        entry.GetInputsArrayInto(inputsBuffer1, inputsBuffer2, inputsBuffer3),
+                        entry.Output,
+                        entry.SavedState ?? Array.Empty<object>(),
+                        engine,
+                        grads);
+                }
+                finally
+                {
+                    DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
+                }
                 if (timing)
                 {
                     long ticks = Stopwatch.GetTimestamp() - start;

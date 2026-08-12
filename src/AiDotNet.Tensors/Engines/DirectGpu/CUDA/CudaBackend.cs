@@ -10124,6 +10124,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVector(
+                DirectPtxVisionOperation.IoULoss,
+                predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("iou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: iou_loss");
         using var _ = PushContext();
@@ -10137,6 +10140,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVector(
+                DirectPtxVisionOperation.GIoULoss,
+                predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("giou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: giou_loss");
         using var _ = PushContext();
@@ -10150,6 +10156,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVector(
+                DirectPtxVisionOperation.DIoULoss,
+                predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("diou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: diou_loss");
         using var _ = PushContext();
@@ -10163,6 +10172,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVector(
+                DirectPtxVisionOperation.CIoULoss,
+                predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("ciou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: ciou_loss");
         using var _ = PushContext();
@@ -10177,6 +10189,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer gradPredicted, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVectorBackward(
+                DirectPtxVisionOperation.IoULossBackward,
+                gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("iou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: iou_loss_backward");
         using var _ = PushContext();
@@ -10191,6 +10206,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer gradPredicted, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVectorBackward(
+                DirectPtxVisionOperation.GIoULossBackward,
+                gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("giou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: giou_loss_backward");
         using var _ = PushContext();
@@ -10205,6 +10223,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer gradPredicted, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVectorBackward(
+                DirectPtxVisionOperation.DIoULossBackward,
+                gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("diou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: diou_loss_backward");
         using var _ = PushContext();
@@ -10219,6 +10240,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer gradPredicted, int numBoxes)
     {
         if (numBoxes <= 0) return;
+        if (TryDirectPtxVisionVectorBackward(
+                DirectPtxVisionOperation.CIoULossBackward,
+                gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("ciou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: ciou_loss_backward");
         using var _ = PushContext();
@@ -11452,6 +11476,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
     public unsafe void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize)
     {
+        if (TryDirectPtxVisionCross3(
+                a, b, output, outerSize, innerSize)) return;
         var kernel = ResolveParity210Kernel("parity210_cross3");
         using var _ = PushContext();
         int __total = outerSize*innerSize; if (__total <= 0) return;
@@ -11738,6 +11764,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
     public unsafe void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w)
     {
+        if (TryDirectPtxVisionMasksToBoxes(
+                masks, output, n, h, w)) return;
         var kernel = ResolveParity210Kernel("parity210_masks_to_boxes");
         using var _ = PushContext();
         int __total = n; if (__total <= 0) return;
@@ -11749,6 +11777,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
     public unsafe void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n)
     {
+        if (TryDirectPtxVisionBoxIou(boxes, boxes, iou, n, n)) return;
         var kernel = ResolveParity210Kernel("parity210_pairwise_iou");
         using var _ = PushContext();
         int __total = n*n; if (__total <= 0) return;

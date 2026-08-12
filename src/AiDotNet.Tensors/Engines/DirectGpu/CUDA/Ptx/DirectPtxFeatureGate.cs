@@ -30,6 +30,8 @@ internal static class DirectPtxFeatureGate
     internal const string Solve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVE_4X4";
     internal const string TriangularSolve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRIANGULAR_SOLVE_4X4";
     internal const string SolverBackward4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVER_BACKWARD_4X4";
+    internal const string VisionBoxIouEnvironmentVariable = "AIDOTNET_DIRECT_PTX_VISION_BOX_IOU";
+    internal const string VisionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_VISION";
     internal const string RecurrentStateEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RECURRENT_STATE";
     internal const string ConvolutionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CONVOLUTION";
     internal const string AutotuneEnvironmentVariable = "AIDOTNET_DIRECT_PTX_AUTOTUNE";
@@ -45,8 +47,6 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
-    private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
-    private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentCholesky4x4Enabled = ReadEnabled(Cholesky4x4EnvironmentVariable);
     private static readonly bool EnvironmentLuFactor4x4Enabled = ReadEnabled(LuFactor4x4EnvironmentVariable);
     private static readonly bool EnvironmentQr4x4Enabled = ReadEnabled(Qr4x4EnvironmentVariable);
@@ -58,6 +58,11 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentSolve4x4Enabled = ReadEnabled(Solve4x4EnvironmentVariable);
     private static readonly bool EnvironmentTriangularSolve4x4Enabled = ReadEnabled(TriangularSolve4x4EnvironmentVariable);
     private static readonly bool EnvironmentSolverBackward4x4Enabled = ReadEnabled(SolverBackward4x4EnvironmentVariable);
+    private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
+    private static readonly bool EnvironmentVisionBoxIouEnabled = ReadEnabled(VisionBoxIouEnvironmentVariable);
+    private static readonly bool EnvironmentVisionEnabled = ReadEnabled(VisionEnvironmentVariable);
+    private static readonly bool[] EnvironmentVisionOperationEnabled = ReadVisionOperationGates();
     private static readonly bool EnvironmentRecurrentStateEnabled = ReadEnabled(RecurrentStateEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
@@ -76,6 +81,26 @@ internal static class DirectPtxFeatureGate
     internal static bool NormalizationExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
     internal static bool ConvolutionExperimentOverride { get; set; }
+
+    [ThreadStatic]
+    private static bool? _visionExperimentOverride;
+
+    [ThreadStatic]
+    private static bool? _visionGateOverride;
+
+    /// <summary>Thread-isolated static/driver-test opt-in for the unpromoted specialization.</summary>
+    internal static bool? VisionExperimentOverride
+    {
+        get => _visionExperimentOverride;
+        set => _visionExperimentOverride = value;
+    }
+
+    /// <summary>Benchmark-only route selector; false forces the established backend.</summary>
+    internal static bool? VisionGateOverride
+    {
+        get => _visionGateOverride;
+        set => _visionGateOverride = value;
+    }
 
     [ThreadStatic] private static bool? s_cholesky4x4ExperimentOverride;
     [ThreadStatic] private static bool? s_solver4x4ExperimentOverride;
@@ -152,6 +177,18 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsSolverBackward4x4Enabled => Solver4x4ExperimentOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentSolverBackward4x4Enabled);
+    internal static bool IsVisionBoxIouEnabled => VisionGateOverride ??
+        VisionExperimentOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentVisionEnabled || EnvironmentVisionBoxIouEnabled);
+
+    internal static bool IsVisionOperationEnabled(DirectPtxVisionOperation operation)
+    {
+        int ordinal = (int)operation;
+        bool operationEnabled = (uint)ordinal < (uint)EnvironmentVisionOperationEnabled.Length &&
+            EnvironmentVisionOperationEnabled[ordinal];
+        return VisionGateOverride ?? VisionExperimentOverride ?? TestOverride ??
+            (EnvironmentMasterEnabled || EnvironmentVisionEnabled || operationEnabled);
+    }
     internal static bool IsRecurrentStateEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentRecurrentStateEnabled);
     /// <summary>Softmax-family (issue #840) rollout gate; disabled by default.</summary>
@@ -181,6 +218,49 @@ internal static class DirectPtxFeatureGate
     private static bool ReadEnabled(string variable) =>
         string.Equals(Environment.GetEnvironmentVariable(variable), "1", StringComparison.Ordinal);
 
+    private static bool[] ReadVisionOperationGates()
+    {
+        Array values = Enum.GetValues(typeof(DirectPtxVisionOperation));
+        int maximum = 0;
+        foreach (DirectPtxVisionOperation operation in values)
+            maximum = Math.Max(maximum, (int)operation);
+        var enabled = new bool[maximum + 1];
+        foreach (DirectPtxVisionOperation operation in values)
+        {
+            string suffix = VisionGateSuffix(operation);
+            enabled[(int)operation] = ReadEnabled(VisionEnvironmentVariable + "_" + suffix);
+        }
+        return enabled;
+    }
+
+    private static string VisionGateSuffix(DirectPtxVisionOperation operation) => operation switch
+    {
+        DirectPtxVisionOperation.GeneralizedBoxIou => "GENERALIZED_BOX_IOU",
+        DirectPtxVisionOperation.DistanceBoxIou => "DISTANCE_BOX_IOU",
+        DirectPtxVisionOperation.CompleteBoxIou => "COMPLETE_BOX_IOU",
+        DirectPtxVisionOperation.BoxArea => "BOX_AREA",
+        DirectPtxVisionOperation.BoxConvert => "BOX_CONVERT",
+        DirectPtxVisionOperation.IoULoss => "IOU_LOSS",
+        DirectPtxVisionOperation.GIoULoss => "GIOU_LOSS",
+        DirectPtxVisionOperation.DIoULoss => "DIOU_LOSS",
+        DirectPtxVisionOperation.CIoULoss => "CIOU_LOSS",
+        DirectPtxVisionOperation.IoULossBackward => "IOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.GIoULossBackward => "GIOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.DIoULossBackward => "DIOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.CIoULossBackward => "CIOU_LOSS_BACKWARD",
+        DirectPtxVisionOperation.IouFamilyBackwardA => "IOU_FAMILY_BACKWARD_A",
+        DirectPtxVisionOperation.IouFamilyBackwardB => "IOU_FAMILY_BACKWARD_B",
+        DirectPtxVisionOperation.Nms => "NMS",
+        DirectPtxVisionOperation.MasksToBoxes => "MASKS_TO_BOXES",
+        DirectPtxVisionOperation.RoiAlign => "ROI_ALIGN",
+        DirectPtxVisionOperation.RoiPool => "ROI_POOL",
+        DirectPtxVisionOperation.PsRoiAlign => "PS_ROI_ALIGN",
+        DirectPtxVisionOperation.PsRoiPool => "PS_ROI_POOL",
+        DirectPtxVisionOperation.Cross3 => "CROSS3",
+        DirectPtxVisionOperation.Meshgrid2D => "MESHGRID_2D",
+        _ => throw new ArgumentOutOfRangeException(nameof(operation))
+    };
+
     private static int ReadCacheCapacity()
     {
         string? text = Environment.GetEnvironmentVariable(CacheCapacityEnvironmentVariable);
@@ -206,8 +286,8 @@ internal enum DirectPtxPhysicalLayout
     RowMajor2D,
     /// <summary>Dense row-major [batch, row, column] matrices.</summary>
     BatchedRowMajorMatrix,
-    /// <summary>Dense canonical [batch, channel, spatial] (NCHW-flattened).</summary>
-    Nchw,
+    /// <summary>Dense row-major [dim0, dim1, dim2].</summary>
+    RowMajor3D,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -224,6 +304,20 @@ internal enum DirectPtxPhysicalLayout
     AttentionBias,
     /// <summary>One-dimensional canonical vector.</summary>
     Vector,
+    /// <summary>Dense row-major bounding boxes in canonical XYXY order.</summary>
+    BoxXyxy,
+    /// <summary>Dense row-major bounding boxes in XYWH order.</summary>
+    BoxXywh,
+    /// <summary>Dense row-major bounding boxes in center-X/center-Y/width/height order.</summary>
+    BoxCxcywh,
+    /// <summary>Dense images with batch/channel/height/width order.</summary>
+    Nchw,
+    /// <summary>Dense images with batch/height/width/channel order.</summary>
+    Nhwc,
+    /// <summary>Dense normalized sampling coordinates ending in 2 or 3.</summary>
+    SamplingGrid,
+    /// <summary>ROI rows [batchIndex,x1,y1,x2,y2].</summary>
+    RoiBoxes,
     /// <summary>Block table plus packed pages for decode attention.</summary>
     PagedKv,
     /// <summary>Dense row-major [batch, sequence, feature].</summary>
@@ -270,10 +364,10 @@ internal readonly struct DirectPtxTensorView
 
     internal static DirectPtxTensorView Create(
         IGpuBuffer buffer,
-        DirectPtxTensorContract contract,
-        nuint byteOffset = 0)
+        DirectPtxTensorContract contract)
     {
         PtxCompat.ThrowIfNull(buffer, nameof(buffer));
+        nuint byteOffset = contract.ByteOffset;
         if (buffer.Handle == IntPtr.Zero)
             throw new ArgumentException("The GPU buffer has no device pointer.", nameof(buffer));
         nuint allocationBytes = checked((nuint)buffer.SizeInBytes);
@@ -352,10 +446,10 @@ internal readonly struct DirectPtxTensorView
 
     internal static DirectPtxTensorView CreateOwned(
         DirectPtxBuffer buffer,
-        DirectPtxTensorContract contract,
-        nuint byteOffset = 0)
+        DirectPtxTensorContract contract)
     {
         PtxCompat.ThrowIfNull(buffer, nameof(buffer));
+        nuint byteOffset = contract.ByteOffset;
         nuint end = checked(byteOffset + contract.RequiredBytes);
         if (buffer.Pointer == IntPtr.Zero || end > buffer.ByteLength ||
             (contract.ExtentMode == DirectPtxExtentMode.Exact && end != buffer.ByteLength))
@@ -365,6 +459,10 @@ internal readonly struct DirectPtxTensorView
         if ((pointer & (nuint)(contract.AlignmentBytes - 1)) != 0)
             throw new ArgumentException(
                 $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
+        if (byteOffset % (nuint)contract.ElementBytes != 0 ||
+            buffer.ByteLength % (nuint)contract.ElementBytes != 0)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' extent/offset is incompatible with {contract.PhysicalType}.", nameof(buffer));
         return new DirectPtxTensorView(
             PtxCompat.ToIntPtr(pointer), contract.RequiredBytes, buffer.ByteLength,
             contract.PhysicalType, contract.Layout, contract.LogicalExtent,
