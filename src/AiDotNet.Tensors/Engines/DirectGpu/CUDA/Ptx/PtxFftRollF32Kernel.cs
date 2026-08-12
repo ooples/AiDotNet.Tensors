@@ -55,7 +55,7 @@ internal sealed class PtxFftRollF32Kernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     /// <summary>The fftshift roll amount for a physical axis length <paramref name="dim"/> (floor(dim/2)).</summary>

@@ -26,6 +26,8 @@ public sealed class CudaEventContextIsolationTests
     [SkippableFact]
     public void AlternatingBackendsKeepEventsOnTheirOwningContexts()
     {
+        Skip.IfNot(CudaNativeBindings.IsAvailable,
+            "Requires an NVIDIA CUDA driver and GPU.");
         using var first = new CudaBackend();
         using var second = new CudaBackend();
         Skip.IfNot(first.IsAvailable && second.IsAvailable,

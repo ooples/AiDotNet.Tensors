@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'complex-multiply', 'convolution')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'vision-box-iou', 'rglru', 'convolution')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -28,6 +28,8 @@ $switch = switch ($Target) {
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'complex-multiply' { '--direct-ptx-profile-complex-multiply' }
+    'vision-box-iou' { '--direct-ptx-profile-vision-box-iou' }
+    'rglru' { '--direct-ptx-profile-rglru' }
     'convolution' { '--direct-ptx-profile-convolution' }
 }
 $kernel = switch ($Target) {
@@ -36,20 +38,24 @@ $kernel = switch ($Target) {
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
+    'complex-multiply' { 'regex:aidotnet_fused_complex_multiply_f32' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
-    'complex-multiply' { 'regex:aidotnet_fused_complex_multiply_f32' }
+    'vision-box-iou' { 'regex:aidotnet_(fused_pairwise_box_iou_f32|vision_.*)' }
+    'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
     'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
     'residual-rmsnorm' { 4 }
     'decode' { 2 }
+    'complex-multiply' { 4 }
     'paged-prefill' { 1 }
     'attention-backward' { 3 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
-    'complex-multiply' { 4 }
+    'vision-box-iou' { 31 }
+    'rglru' { 1 }
     'convolution' { 1 }
 }
 $metricNames = @(

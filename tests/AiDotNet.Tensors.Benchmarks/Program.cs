@@ -51,6 +51,25 @@ class Program
             return;
         }
 
+        // GPU-free cubin generation and verification for the online-attention family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-attention")
         {
             DirectPtxAttentionExperiment.Run();
@@ -109,6 +128,41 @@ class Program
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
             bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
             DirectPtxQkvRopeCacheExperiment.Run(runs, includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-vision-box-iou")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxVisionBoxIouExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-vision-family")
+        {
+            // Documented usage: --direct-ptx-vision-family [runs] [operation].
+            // Parse the optional run count first, then the optional operation, and
+            // reject any trailing token the handler cannot consume instead of
+            // silently discarding it.
+            int runs = 3;
+            int index = 1;
+            if (index < args.Length && int.TryParse(args[index], out int parsedRuns))
+            {
+                runs = parsedRuns;
+                index++;
+            }
+            string? operation = null;
+            if (index < args.Length)
+            {
+                operation = args[index];
+                index++;
+            }
+            if (index < args.Length)
+            {
+                Console.Error.WriteLine(
+                    "Usage: --direct-ptx-vision-family [runs] [operation]");
+                Environment.ExitCode = 1;
+                return;
+            }
+            DirectPtxVisionFamilyExperiment.Run(runs, operation);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-complex-multiply")
@@ -187,6 +241,12 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-competitor")
         {
             KernelCompetitorTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-championship")
+        {
+            KernelChampionshipTool.Run(args.Skip(1).ToArray());
             return;
         }
 
@@ -372,6 +432,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
         {
             DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-vision-box-iou")
+        {
+            DirectPtxProfileTarget.RunVisionBoxIou();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-complex-multiply")
@@ -1331,6 +1396,11 @@ class Program
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
+        Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
+        Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
+        Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
         Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");
@@ -1343,6 +1413,8 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
         Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
         Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
+        Console.WriteLine("  --direct-ptx-profile-vision-box-iou: deterministic Nsight Compute vision target");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
         Console.WriteLine("  --kernel-oracle: generated-family performance vs spec-derived ceilings");

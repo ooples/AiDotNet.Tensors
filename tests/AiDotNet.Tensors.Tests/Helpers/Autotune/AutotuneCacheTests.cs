@@ -372,6 +372,26 @@ public sealed class AutotuneCacheTests : IDisposable
         Assert.Equal(200.0, loaded.MeasuredGflops);
     }
 
+    [Fact]
+    public void Store_InvalidatesMemo_WhenRewriteKeepsSameTimestamp()
+    {
+        AutotuneCache.Store(Gemm, Shape256, MakeWinner("v1", 100.0));
+        KernelChoice? first = AutotuneCache.Lookup(Gemm, Shape256);
+        Assert.Equal("v1", first!.Variant); // populate the stat-validated memo
+
+        string directory = Path.Combine(_tempRoot, AutotuneCache.CurrentHardwareFingerprint);
+        string path = Assert.Single(Directory.GetFiles(directory, "*.json"));
+        DateTime originalWriteTime = File.GetLastWriteTimeUtc(path);
+
+        AutotuneCache.Store(Gemm, Shape256, MakeWinner("v2", 200.0));
+        File.SetLastWriteTimeUtc(path, originalWriteTime);
+
+        KernelChoice? loaded = AutotuneCache.Lookup(Gemm, Shape256);
+        Assert.NotNull(loaded);
+        Assert.Equal("v2", loaded!.Variant);
+        Assert.Equal(200.0, loaded.MeasuredGflops);
+    }
+
     // ── WarmupAsync ──────────────────────────────────────────────────────────
     [Fact]
     public async Task WarmupAsync_SkipsCachedTargets_AndBenchmarksMisses()

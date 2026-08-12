@@ -54,7 +54,7 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, NumPhaseBins);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, NumPhaseBins, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, NumPhaseBins, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, NumPhaseBins, activeBlocks, _module);
     }
 
     internal unsafe void Launch(

@@ -72,15 +72,25 @@ internal sealed class PtxFusedPagedPrefillAttentionD64Kernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             queryHeads, keyValueHeads, queryCount, startPosition,
             blockSize, poolBlocks, scale, WarpsPerBlock);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo functionInfo);
-        FunctionInfo = functionInfo;
-        int blockThreads = WarpsPerBlock * 32;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            blockThreads, activeBlocks, _module.JitInfoLog);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    EntryPoint, out DirectPtxFunctionInfo functionInfo);
+                int blockThreads = WarpsPerBlock * 32;
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    EntryPoint, functionInfo, blockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
+                    blockThreads, activeBlocks, module);
+                return (Function: function, FunctionInfo: functionInfo, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        FunctionInfo = loaded.Value.FunctionInfo;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -90,11 +100,11 @@ internal sealed class PtxFusedPagedPrefillAttentionD64Kernel : IDisposable
         DirectPtxTensorView blockTable,
         DirectPtxTensorView output)
     {
-        Require(query, Blueprint.Tensors[0], nameof(query));
-        Require(keyPages, Blueprint.Tensors[1], nameof(keyPages));
-        Require(valuePages, Blueprint.Tensors[2], nameof(valuePages));
-        Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
-        Require(output, Blueprint.Tensors[4], nameof(output));
+        DirectPtxAbi.Require(query, Blueprint.Tensors[0], nameof(query));
+        DirectPtxAbi.Require(keyPages, Blueprint.Tensors[1], nameof(keyPages));
+        DirectPtxAbi.Require(valuePages, Blueprint.Tensors[2], nameof(valuePages));
+        DirectPtxAbi.Require(blockTable, Blueprint.Tensors[3], nameof(blockTable));
+        DirectPtxAbi.Require(output, Blueprint.Tensors[4], nameof(output));
         if (output.Pointer == query.Pointer || output.Pointer == keyPages.Pointer ||
             output.Pointer == valuePages.Pointer || output.Pointer == blockTable.Pointer)
             throw new ArgumentException("Paged-prefill output may not alias Q, K, V, or the block table.", nameof(output));
@@ -109,17 +119,6 @@ internal sealed class PtxFusedPagedPrefillAttentionD64Kernel : IDisposable
             (uint)(WarpsPerBlock * 32), 1, 1, 0, arguments);
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength < contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 
     public void Dispose() => _module.Dispose();
 

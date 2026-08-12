@@ -46,7 +46,7 @@ internal sealed class PtxApplyWindowF32Kernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     internal unsafe void Launch(

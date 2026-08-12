@@ -53,7 +53,7 @@ internal sealed class PtxBatchedFftButterflyF32Kernel : IDisposable
         int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
         Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module.JitInfoLog);
+            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
     }
 
     /// <summary>Launches one stage over all rows. <paramref name="stride"/> is the current radix-2 span
