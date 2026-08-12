@@ -31,7 +31,18 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal string DeviceUuid { get; }
     internal int DriverVersion { get; }
     internal string DeviceFingerprint { get; }
+    internal Helpers.Autotune.GpuDeviceFingerprint Fingerprint { get; }
     internal IntPtr Stream => _stream;
+    internal uint StreamFlags
+    {
+        get
+        {
+            using var _ = Enter();
+            Check(CudaNativeBindings.cuStreamGetFlags(_stream, out uint flags),
+                "cuStreamGetFlags");
+            return flags;
+        }
+    }
 
     internal static bool IsAvailable => CudaNativeBindings.IsAvailable;
 
@@ -58,7 +69,12 @@ internal sealed class DirectPtxRuntime : IDisposable
             device, CudaDeviceAttribute.MaxRegistersPerBlock);
 
         Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
-        Check(CudaNativeBindings.cuStreamCreate(out _stream, 1), "cuStreamCreate(non-blocking)");
+        // Standalone buffers use the synchronous Driver-API copy calls, which execute
+        // in the legacy default-stream ordering domain. A blocking stream preserves
+        // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
+        // and can let a freshly launched block observe pre-upload allocation contents.
+        Check(CudaNativeBindings.cuStreamCreate(out _stream, CudaNativeBindings.CU_STREAM_DEFAULT),
+            "cuStreamCreate(blocking)");
         _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation
         // below has an explicit, balanced push/pop boundary.
@@ -81,7 +97,11 @@ internal sealed class DirectPtxRuntime : IDisposable
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
-        DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+        Fingerprint = Helpers.Autotune.GpuDeviceFingerprint.FromCuda(
+            DeviceName, DeviceUuid, major, minor, DriverVersion);
+        // Byte-identical to the legacy fingerprint string, so existing on-disk
+        // autotune caches keyed by DeviceFingerprint remain valid.
+        DeviceFingerprint = Fingerprint.ToCacheToken();
     }
 
     /// <summary>
@@ -128,14 +148,18 @@ internal sealed class DirectPtxRuntime : IDisposable
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
-        DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+        Fingerprint = Helpers.Autotune.GpuDeviceFingerprint.FromCuda(
+            DeviceName, DeviceUuid, major, minor, DriverVersion);
+        // Byte-identical to the legacy fingerprint string, so existing on-disk
+        // autotune caches keyed by DeviceFingerprint remain valid.
+        DeviceFingerprint = Fingerprint.ToCacheToken();
     }
 
-    // Device register-file capacity drives the per-thread register ceiling in
-    // DirectPtxResourceBudget.Validate so it scales with the hardware instead of
-    // a hardcoded literal. Treated as advisory: a driver that cannot report the
-    // attribute yields 0, and the validator then falls back to the kernel's
-    // explicit design cap plus the driver's own occupancy calculator.
+    /// <summary>
+    /// Reads a device register-file capacity attribute, returning 0 when the driver
+    /// cannot report it. Non-fatal by design: the register ceiling it feeds degrades
+    /// to "unbounded" rather than failing kernel construction on an older driver.
+    /// </summary>
     private static int QueryRegisterCapacity(int device, CudaDeviceAttribute attribute)
     {
         if (CuBlasNative.cuDeviceGetAttribute(out int value, (int)attribute, device)
@@ -160,8 +184,6 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
-    private static string BuildDeviceFingerprint(string uuid, int major, int minor, int driverVersion) =>
-        $"gpu-{uuid}-sm{major}{minor}-drv{driverVersion.ToString(CultureInfo.InvariantCulture)}";
 
     internal ContextScope Enter()
     {
@@ -240,10 +262,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal void Synchronize()
     {
         using var _ = Enter();
-        if (_stream != IntPtr.Zero)
-            Check(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
-        else
-            Check(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
+        Check(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
     }
 
     internal DirectPtxGraph CaptureGraph(Action launch)
@@ -502,19 +521,21 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)source.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Source is larger than the device buffer.", nameof(source));
         using var _ = _runtime.Enter();
+        // Do not let a host write race earlier work on this runtime's stream.
+        // A stream-local barrier preserves ordering without stalling unrelated
+        // streams or other contexts on the device.
+        _runtime.Synchronize();
         fixed (T* pSource = source)
         {
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyHtoD(_pointer, (IntPtr)pSource, checked((ulong)bytes)),
                 "cuMemcpyHtoD");
-            // Standalone runtimes launch on a CU_STREAM_NON_BLOCKING stream.
-            // A synchronous pageable-host copy is issued in the null-stream
-            // ordering domain and therefore does not establish an edge to that
-            // stream. Complete the transfer before the caller can enqueue a
-            // kernel, or concurrent contexts can observe an incompletely staged
-            // input and leave apparently random output blocks at zero.
+            // The synchronous pageable-host copy stages through the default
+            // stream. Complete that stream before a caller can enqueue new work
+            // on the runtime's CU_STREAM_NON_BLOCKING stream.
             DirectPtxRuntime.Check(
-                CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+                CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero),
+                "cuStreamSynchronize(upload staging)");
         }
     }
 
@@ -523,11 +544,9 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)destination.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Destination is larger than the device buffer.", nameof(destination));
         using var _ = _runtime.Enter();
-        // The null-stream DtoH copy does not wait for work in the runtime's
-        // non-blocking stream. Make Download independently correct even when a
-        // caller omits an explicit Synchronize before reading the result.
-        DirectPtxRuntime.Check(
-            CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(download)");
+        // Make Download independently correct when the caller omits an explicit
+        // barrier, while waiting only for the stream that produces this buffer.
+        _runtime.Synchronize();
         fixed (T* pDestination = destination)
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyDtoH((IntPtr)pDestination, _pointer, checked((ulong)bytes)),
@@ -589,6 +608,9 @@ internal sealed class DirectPtxModule : IDisposable
         DirectPtxRuntime.Check(
             CudaNativeBindings.cuModuleGetFunction(out IntPtr function, _module, name),
             $"cuModuleGetFunction({name})");
+        // Carry this device's register-file capacity alongside the per-function JIT
+        // attributes so the resource budget can scale its register ceiling to the real
+        // GPU instead of a hardcoded literal.
         info = DirectPtxFunctionInfo.Query(function) with
         {
             MaxRegistersPerMultiprocessor = _runtime.MaxRegistersPerMultiprocessor,
@@ -679,7 +701,8 @@ internal readonly record struct DirectPtxFunctionInfo(
     // Device register-file capacity carried alongside the per-function JIT
     // attributes so the resource budget can derive an occupancy-scaled register
     // ceiling for this exact GPU. Populated by DirectPtxModule.GetFunction from
-    // the runtime; 0 when the driver cannot report it.
+    // the runtime; 0 when the driver cannot report it. Defaulted so every
+    // existing construction site stays valid.
     int MaxRegistersPerMultiprocessor = 0,
     int MaxRegistersPerBlock = 0)
 {

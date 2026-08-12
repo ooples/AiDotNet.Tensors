@@ -56,7 +56,7 @@ internal sealed class PtxConvTranspose2DNchw3x3BackwardInputF32Kernel : IDisposa
         Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal static DirectPtxKernelBlueprint CreateBlueprint(

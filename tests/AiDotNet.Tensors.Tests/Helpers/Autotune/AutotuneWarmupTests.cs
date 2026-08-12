@@ -110,6 +110,33 @@ public sealed class AutotuneWarmupTests : IDisposable
     }
 
     [Fact]
+    public async Task WarmupCommonKernels_PersistsStructuredParameters_WhenEntryProvidesThem()
+    {
+        var id = new KernelId("unit-test", "stub-tiled");
+        // Entry supplies structured launch parameters per variant. Before the fix
+        // the warmup path stored only Variant + GFLOPS and dropped these.
+        AutotuneKernelCatalog.Register(new AutotuneCatalogEntry(
+            id,
+            variants: _ => new[] { "tile-8", "tile-16" },
+            benchmarkVariant: (shape, variant, ct) =>
+                Task.FromResult(variant == "tile-16" ? 200.0 : 80.0),
+            parametersFor: (shape, variant) =>
+                new System.Collections.Generic.Dictionary<string, string>(System.StringComparer.Ordinal)
+                {
+                    ["Tile"] = variant == "tile-16" ? "16" : "8",
+                    ["Source"] = "warmup"
+                }));
+
+        await AutotuneCache.WarmupCommonKernelsAsync(new[] { new[] { 32, 64 } });
+
+        var choice = AutotuneCache.Lookup(id, new ShapeProfile(32, 64));
+        Assert.NotNull(choice);
+        Assert.Equal("tile-16", choice!.Variant);
+        Assert.Equal("16", choice.Parameters["Tile"]);   // winner's parameters now persist
+        Assert.Equal("warmup", choice.Parameters["Source"]);
+    }
+
+    [Fact]
     public async Task WarmupCommonKernels_SecondRun_SkipsAlreadyCachedEntries()
     {
         int benchmarkCalls = 0;

@@ -2,6 +2,7 @@
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -299,12 +300,6 @@ public static class CuBlasNative
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPopCurrent_v2")]
     public static extern CudaResult cuCtxPopCurrent(out IntPtr context);
-
-    /// <summary>
-    /// Synchronizes the current context.
-    /// </summary>
-    [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
-    public static extern CudaResult cuCtxSynchronize();
 
     /// <summary>
     /// Allocates device memory.
@@ -993,7 +988,7 @@ public sealed class CudaBlasContext : IDisposable
     public void Synchronize()
     {
         ThrowIfDisposed();
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize");
     }
 
     private void ThrowIfDisposed()

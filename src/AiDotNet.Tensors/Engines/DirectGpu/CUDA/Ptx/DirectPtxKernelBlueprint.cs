@@ -20,6 +20,9 @@ internal enum DirectPtxArchitectureFamily
 
 internal static class DirectPtxArchitecture
 {
+    private static bool IsGa102Sm86(int major, int minor) =>
+        (major, minor) == (8, 6);
+
     internal static DirectPtxArchitectureFamily Classify(int major, int minor) => (major, minor) switch
     {
         (8, 9) => DirectPtxArchitectureFamily.Ada,
@@ -35,13 +38,32 @@ internal static class DirectPtxArchitecture
     /// implementation instead of silently inheriting Ampere's tuning.
     /// </summary>
     internal static bool HasValidatedOnlineAttention(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The first QKV/RoPE/cache specialization is measured and promoted only
     /// on GA102/SM86. Other Ampere variants remain independent tuning domains.
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
+        IsGa102Sm86(major, minor);
+
+    /// <summary>The first vision-family specializations are emitted only for GA102/SM86.</summary>
+    internal static bool HasValidatedVision(int major, int minor) =>
+        IsGa102Sm86(major, minor);
+
+    /// <summary>
+    /// The issue-#846 recurrent specialization is validated only on exact
+    /// GA102/SM86. Other architectures remain separate tuning domains.
+    /// </summary>
+    internal static bool HasValidatedRgLruScan(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The checked-in softmax-family specializations (issue #840) are measured and
+    /// promoted only on GA10x/SM86. Other architectures fail closed to the established
+    /// backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedSoftmax(int major, int minor) =>
         (major, minor) == (8, 6);
 
     /// <summary>
@@ -51,7 +73,7 @@ internal static class DirectPtxArchitecture
     /// rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedFusedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The mixed-precision (FP16 / W8A8) fused-linear decode specializations are
@@ -60,7 +82,7 @@ internal static class DirectPtxArchitecture
     /// own specialization rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedMixedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The fused residual + bias + LayerNorm + GELU decode specialization is
@@ -69,7 +91,7 @@ internal static class DirectPtxArchitecture
     /// own specialization rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The quantized (W8A8) decode-linear specialization is measured only on
@@ -77,7 +99,7 @@ internal static class DirectPtxArchitecture
     /// whole Ampere family would run PTX that was never validated on SM80/SM87.
     /// </summary>
     internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// Issue #841's first convolution emitter deliberately targets one exact
@@ -85,7 +107,15 @@ internal static class DirectPtxArchitecture
     /// attached; other SMs must use the established backend.
     /// </summary>
     internal static bool HasExperimentalConvolution(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
+
+    /// <summary>
+    /// The checked-in specialized-scientific/hypercomplex/quantum specializations (issue
+    /// #854) are measured and promoted only on GA10x/SM86. Other architectures fail closed
+    /// to the established backend rather than inheriting Ampere's tuning.
+    /// </summary>
+    internal static bool HasValidatedScientific(int major, int minor) =>
+        IsGa102Sm86(major, minor);
 }
 
 internal enum DirectPtxExtentMode
@@ -159,6 +189,7 @@ internal readonly record struct DirectPtxTensorContract
     internal DirectPtxExtent LogicalExtent { get; }
     internal DirectPtxExtent PhysicalExtent { get; }
     internal int AlignmentBytes { get; }
+    internal nuint ByteOffset { get; }
     internal DirectPtxTensorAccess Access { get; }
     internal DirectPtxExtentMode ExtentMode { get; }
 
@@ -170,54 +201,84 @@ internal readonly record struct DirectPtxTensorContract
         DirectPtxExtent physicalExtent,
         int alignmentBytes,
         DirectPtxTensorAccess access,
-        DirectPtxExtentMode extentMode = DirectPtxExtentMode.AtLeast)
+        DirectPtxExtentMode extentMode = DirectPtxExtentMode.AtLeast,
+        nuint byteOffset = 0)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A tensor ABI name is required.", nameof(name));
         if (alignmentBytes <= 0 || (alignmentBytes & (alignmentBytes - 1)) != 0)
             throw new ArgumentOutOfRangeException(nameof(alignmentBytes), "Alignment must be a power of two.");
         if (physicalExtent.ElementCount < logicalExtent.ElementCount)
             throw new ArgumentException("Physical extent cannot be smaller than logical extent.", nameof(physicalExtent));
+        if (byteOffset % (nuint)alignmentBytes != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(byteOffset), "Byte offset must be a multiple of the required alignment.");
+        int elementBytes = ElementSize(physicalType);
+        if (byteOffset % (nuint)elementBytes != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(byteOffset), "Byte offset must be a multiple of the tensor element size.");
         Name = name;
         PhysicalType = physicalType;
         Layout = layout;
         LogicalExtent = logicalExtent;
         PhysicalExtent = physicalExtent;
         AlignmentBytes = alignmentBytes;
+        ByteOffset = byteOffset;
         Access = access;
         ExtentMode = extentMode;
     }
 
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
-    internal int ElementBytes => PhysicalType switch
+    internal int ElementBytes => ElementSize(PhysicalType);
+
+    private static int ElementSize(DirectPtxPhysicalType physicalType) => physicalType switch
     {
-        DirectPtxPhysicalType.Int8 => 1,
+        DirectPtxPhysicalType.Int8 or DirectPtxPhysicalType.UInt8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
-        _ => throw new ArgumentOutOfRangeException(nameof(PhysicalType))
+        _ => throw new ArgumentOutOfRangeException(nameof(physicalType))
     };
 }
 
-/// <param name="MaxRegistersPerThread">
-/// Optional explicit per-thread register cap. When positive it acts as an extra
-/// (tighter) design ceiling on top of the device-derived one; <c>0</c> means the
-/// ceiling is derived purely from the device register file, so the kernel is not
-/// pinned to a hardcoded literal and scales across GPU generations.
-/// </param>
 internal readonly record struct DirectPtxResourceBudget(
     int MaxRegistersPerThread,
     int MaxStaticSharedBytes,
     int MaxLocalBytesPerThread,
-    int MinBlocksPerMultiprocessor)
+    int MinBlocksPerMultiprocessor,
+    int MeasuredRegistersPerThread = 0)
 {
+    // NVIDIA allocates registers in 256-register warp quanta. For a full
+    // 32-thread warp, one occupancy bucket is therefore eight registers per
+    // thread. Keep measured baselines inside their current bucket: harmless
+    // driver/JIT variation within the bucket passes, while a change that can
+    // affect occupancy still trips the release gate.
+    private const int RegistersPerThreadAllocationQuantum = 256 / 32;
+
+    internal static DirectPtxResourceBudget FromDriverMeasurement(
+        int measuredRegistersPerThread,
+        int maxStaticSharedBytes,
+        int maxLocalBytesPerThread,
+        int minBlocksPerMultiprocessor)
+    {
+        if (measuredRegistersPerThread <= 0)
+            throw new ArgumentOutOfRangeException(nameof(measuredRegistersPerThread));
+        int maxRegistersPerThread = checked(
+            ((measuredRegistersPerThread + RegistersPerThreadAllocationQuantum - 1) /
+             RegistersPerThreadAllocationQuantum) * RegistersPerThreadAllocationQuantum);
+        return new DirectPtxResourceBudget(
+            maxRegistersPerThread,
+            maxStaticSharedBytes,
+            maxLocalBytesPerThread,
+            minBlocksPerMultiprocessor,
+            measuredRegistersPerThread);
+    }
+
     /// <summary>
-    /// Derives the per-thread register ceiling from THIS device's register file
-    /// so the kernel's occupancy intent (<see cref="MinBlocksPerMultiprocessor"/>
-    /// blocks of <paramref name="blockThreads"/> threads) is enforced against real
-    /// hardware rather than a literal. Returns <see cref="int.MaxValue"/> when the
-    /// driver reports no register capacity (older drivers), in which case the
-    /// standalone bound is skipped and the driver occupancy calculator plus the
-    /// zero-local-bytes invariant remain the device-aware guards.
+    /// Derives the per-thread register ceiling from THIS device's register file so the
+    /// kernel's occupancy intent (<see cref="MinBlocksPerMultiprocessor"/> blocks of
+    /// <paramref name="blockThreads"/> threads) is enforced against real hardware rather
+    /// than a literal. Returns <see cref="int.MaxValue"/> when the driver reports no
+    /// register capacity, in which case only an explicit design cap applies.
     /// </summary>
     internal static int DeriveRegisterCeiling(
         DirectPtxFunctionInfo info, int blockThreads, int minBlocksPerMultiprocessor)
@@ -295,21 +356,6 @@ internal sealed record DirectPtxKernelAudit(
     string CubinSourceKey = "",
     string? CubinPath = null)
 {
-    internal static DirectPtxKernelAudit Create(
-        DirectPtxKernelBlueprint blueprint,
-        string deviceFingerprint,
-        string ptx,
-        DirectPtxFunctionInfo function,
-        int blockThreads,
-        int activeBlocksPerMultiprocessor,
-        string jitInfoLog)
-    {
-        string hash = DirectPtxCubinArtifactCache.ComputePtxSha256(ptx);
-        return new DirectPtxKernelAudit(
-            blueprint.Id, deviceFingerprint, hash, function, blockThreads,
-            activeBlocksPerMultiprocessor, jitInfoLog, DateTime.UtcNow);
-    }
-
     internal static DirectPtxKernelAudit Create(
         DirectPtxKernelBlueprint blueprint,
         string deviceFingerprint,

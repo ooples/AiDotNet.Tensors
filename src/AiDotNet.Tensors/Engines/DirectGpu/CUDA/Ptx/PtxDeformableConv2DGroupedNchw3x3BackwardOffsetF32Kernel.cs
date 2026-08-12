@@ -68,7 +68,7 @@ internal sealed class PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel :
         Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal static DirectPtxKernelBlueprint CreateBlueprint(

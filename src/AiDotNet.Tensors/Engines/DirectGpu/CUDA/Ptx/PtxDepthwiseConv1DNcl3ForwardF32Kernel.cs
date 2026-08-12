@@ -55,7 +55,7 @@ internal sealed class PtxDepthwiseConv1DNcl3ForwardF32Kernel : IDisposable
         Blueprint.ResourceBudget.Validate(EntryPoint, functionInfo, BlockThreads, activeBlocks);
         Audit = DirectPtxKernelAudit.Create(
             Blueprint, runtime.DeviceFingerprint, Ptx, functionInfo,
-            BlockThreads, activeBlocks, _module.JitInfoLog);
+            BlockThreads, activeBlocks, _module);
     }
 
     internal static DirectPtxKernelBlueprint CreateBlueprint(
