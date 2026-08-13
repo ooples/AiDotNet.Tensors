@@ -214,7 +214,7 @@ public partial class CpuEngine
             }
     }
 
-    private static void MesaScanBackward<T>(
+    protected static void MesaScanBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {

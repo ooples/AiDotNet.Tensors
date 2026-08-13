@@ -10107,13 +10107,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
-    // Mesa online least-squares scan. GPU inference uses a single resident scan per
-    // batch/head; an active tape deliberately uses CpuEngine's analytic reverse pass.
+    // Mesa online least-squares scan. Forward stays resident on the selected GPU
+    // backend under an active tape; the recorded node reuses CpuEngine's analytic
+    // reverse pass until a native GPU backward kernel is available.
     public override Tensor<T> MesaScanForward<T>(
         Tensor<T> q, Tensor<T> k, Tensor<T> v, Tensor<T> initialWeights,
         T regularization, int numHeads)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
             q.Rank != 3 || numHeads <= 0)
             return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
 
@@ -10148,6 +10149,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, batch * time * model,
             new[] { batch, time, model });
         outputBuffer.RelinquishOwnership();
+        Autodiff.DifferentiableOps.RecordIfActive<T>(
+            "MesaScan", result,
+            new[] { q, k, v, initialWeights },
+            MesaScanBackward<T>,
+            savedState: new object[] { regularization!, numHeads });
         return result;
     }
 
@@ -10155,7 +10161,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> input, Tensor<T> activeMask, Tensor<T> transition,
         Tensor<T> inputMap, Tensor<T> outputMap, Tensor<T> skip)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
             input.Rank != 3 || activeMask.Rank != 3 || transition.Rank != 2)
             return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
         int batch=input.Shape._dims[0], time=input.Shape._dims[1], model=input.Shape._dims[2];
@@ -10173,7 +10179,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var h=AllocateOutputBuffer(backend,batch*experts*state);
         backend.RoutedDiagonalSsmScanForward(x.Buffer,m.Buffer,a.Buffer,ib.Buffer,oc.Buffer,d.Buffer,y.Buffer,h.Buffer,batch,time,model,experts,state);
         var result=DeferTensorResult<T>(backend,y.Buffer,batch*time*experts*model,new[]{batch,time,experts,model});
-        y.RelinquishOwnership();return result;
+        y.RelinquishOwnership();
+        Autodiff.DifferentiableOps.RecordIfActive(
+            "RoutedDiagonalSsmScanForward", result,
+            new[] { input, activeMask, transition, inputMap, outputMap, skip },
+            RoutedDiagonalSsmBackward<T>);
+        return result;
     }
 
     // Fused Mamba-2 SSD scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.

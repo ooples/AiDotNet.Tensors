@@ -93,7 +93,7 @@ public partial class CpuEngine
             }
     }
 
-    private static void RoutedDiagonalSsmBackward<T>(
+    protected static void RoutedDiagonalSsmBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
