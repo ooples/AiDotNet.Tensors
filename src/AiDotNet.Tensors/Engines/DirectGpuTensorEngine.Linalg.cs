@@ -161,7 +161,8 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>GPU-accelerated reduced QR via Modified Gram–Schmidt.</summary>
-    internal (Tensor<float>? Q, Tensor<float>? R) TryGpuQrReduced(Tensor<float> input)
+    internal (Tensor<float>? Q, Tensor<float>? R) TryGpuQrReduced(
+        Tensor<float> input, bool directOnly = false)
     {
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
@@ -187,7 +188,13 @@ public partial class DirectGpuTensorEngine
         float[] qArr;
         try
         {
-            lin.LinalgQrReduced(inBuf.Buffer, qBuf.Buffer, rBuf.Buffer, batch, m, n);
+            if (directOnly)
+            {
+                if (backend is not IExtendedLinalgBackend extended)
+                    throw new NotSupportedException("The active backend has no direct-PTX QR route.");
+                extended.LinalgQrReducedDirect(inBuf.Buffer, qBuf.Buffer, rBuf.Buffer, batch, m, n);
+            }
+            else lin.LinalgQrReduced(inBuf.Buffer, qBuf.Buffer, rBuf.Buffer, batch, m, n);
             qArr = FinishGpuOp<float>(backend, qBuf, batch * m * k);
             // qBuf ownership now in caches. rBuf still owned by us.
         }
@@ -235,7 +242,8 @@ public partial class DirectGpuTensorEngine
     // released right after the download.
 
     /// <summary>GPU-accelerated symmetric eigendecomposition.</summary>
-    internal (Tensor<float>? Eigenvalues, Tensor<float>? Eigenvectors) TryGpuEigh(Tensor<float> input)
+    internal (Tensor<float>? Eigenvalues, Tensor<float>? Eigenvectors) TryGpuEigh(
+        Tensor<float> input, bool upper)
     {
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
@@ -263,7 +271,12 @@ public partial class DirectGpuTensorEngine
         float[] wArr;
         try
         {
-            lin.LinalgEigh(inBuf.Buffer, wBuf.Buffer, vBuf.Buffer, batch, n);
+            if (backend is IExtendedLinalgBackend extended)
+                extended.LinalgEighSymmetric(inBuf.Buffer, wBuf.Buffer, vBuf.Buffer, batch, n, upper);
+            else if (upper)
+                lin.LinalgEigh(inBuf.Buffer, wBuf.Buffer, vBuf.Buffer, batch, n);
+            else
+                throw new NotSupportedException("The established GPU Eigh backend is upper-triangle only.");
             wArr = FinishGpuOp<float>(backend, wBuf, batch * n);
             // wBuf ownership handed off; vBuf still ours.
         }
@@ -299,7 +312,324 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>GPU exact-shape reduced SVD through the optional extended solver backend.</summary>
+    internal (Tensor<float>? U, Tensor<float>? S, Tensor<float>? Vh) TryGpuSvdReduced(
+        Tensor<float> input,
+        bool fullMatrices)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return (null, null, null);
+        int rank = input.Rank;
+        if (rank < 2) return (null, null, null);
+        int m = input.Shape[rank - 2], n = input.Shape[rank - 1];
+        // The first direct specialization is square 4x4; reduced and complete
+        // SVD have identical output extents in this regime.
+        if (m != 4 || n != 4) return (null, null, null);
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++) batch = checked(batch * input._shape[i]);
+        if (batch == 0) return (null, null, null);
+
+        using var inBuf = GetOrAllocateBuffer(backend, input);
+        var uBuf = AllocateOutputBuffer(backend, batch * 16);
+        var sBuf = AllocateOutputBuffer(backend, batch * 4);
+        var vhBuf = AllocateOutputBuffer(backend, batch * 16);
+        float[] u;
+        try
+        {
+            lin.LinalgSvdReduced(inBuf.Buffer, uBuf.Buffer, sBuf.Buffer, vhBuf.Buffer, batch, m, n);
+            u = FinishGpuOp<float>(backend, uBuf, batch * 16);
+        }
+        catch
+        {
+            uBuf.Dispose(); sBuf.Dispose(); vhBuf.Dispose();
+            return (null, null, null);
+        }
+        float[] s;
+        try { s = FinishGpuOp<float>(backend, sBuf, batch * 4); }
+        catch { sBuf.Dispose(); vhBuf.Dispose(); return (null, null, null); }
+        float[] vh;
+        try { vh = FinishGpuOp<float>(backend, vhBuf, batch * 16); }
+        catch { vhBuf.Dispose(); return (null, null, null); }
+
+        try
+        {
+            int[] matrixShape = (int[])input._shape.Clone();
+            int[] singularShape = new int[rank - 1];
+            for (int i = 0; i < rank - 2; i++) singularShape[i] = input._shape[i];
+            singularShape[rank - 2] = 4;
+            return (new Tensor<float>(u, matrixShape), new Tensor<float>(s, singularShape),
+                new Tensor<float>(vh, matrixShape));
+        }
+        catch { return (null, null, null); }
+    }
+
+    /// <summary>GPU exact-shape LU solve for one vector RHS per 4x4 factor.</summary>
+    internal Tensor<float>? TryGpuLuSolve(
+        Tensor<float> lu,
+        Tensor<int> pivots,
+        Tensor<float> rhs)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return null;
+        int rank = lu.Rank;
+        if (rank < 2 || lu.Shape[rank - 2] != 4 || lu.Shape[rank - 1] != 4)
+            return null;
+        bool vector = rhs.Rank == rank - 1;
+        if (!vector || rhs.Shape[rhs.Rank - 1] != 4) return null;
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++) batch = checked(batch * lu._shape[i]);
+        if (batch == 0 || pivots.Length != batch * 4 || rhs.Length != batch * 4) return null;
+
+        using var luBuf = GetOrAllocateBuffer(backend, lu);
+        using var rhsBuf = GetOrAllocateBuffer(backend, rhs);
+        float[] pivotBits = new float[pivots.Length];
+        Buffer.BlockCopy(pivots.GetDataArray(), 0, pivotBits, 0, pivots.Length * sizeof(int));
+        using var pivBuf = new OwnedBuffer(backend.AllocateBuffer(pivotBits), ownsBuffer: true);
+        var outBuf = AllocateOutputBuffer(backend, rhs.Length);
+        float[] result;
+        try
+        {
+            lin.LinalgLuSolve(luBuf.Buffer, pivBuf.Buffer, rhsBuf.Buffer, outBuf.Buffer,
+                batch, 4, 1, rhsIsVector: true);
+            result = FinishGpuOp<float>(backend, outBuf, rhs.Length);
+        }
+        catch
+        {
+            outBuf.Dispose();
+            return null;
+        }
+
+        // FinishGpuOp transfers the output buffer to the backend cache. Keep
+        // tensor materialization outside the buffer-owned failure region so a
+        // constructor failure cannot return the same buffer twice.
+        try { return new Tensor<float>(result, (int[])rhs._shape.Clone()); }
+        catch { return null; }
+    }
+
     // ── Small helpers specific to linalg buffer plumbing ────────────────────
+
+    /// <summary>Exact-shape lower LDL factorization through direct PTX.</summary>
+    internal (Tensor<float>? LD, Tensor<int>? Pivots) TryGpuLdlFactor(
+        Tensor<float> input, bool upper)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return (null, null);
+        int rank = input.Rank;
+        if (rank < 2 || input.Shape[rank - 2] != 4 || input.Shape[rank - 1] != 4)
+            return (null, null);
+        int batch = Batch4x4(input);
+        if (batch == 0) return (null, null);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var pivotBuffer = AllocateInt32Buffer(backend, batch * 4);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * 16);
+        float[] ld;
+        try
+        {
+            lin.LinalgLdlFactor(inputBuffer.Buffer, outputBuffer.Buffer, pivotBuffer.Buffer,
+                batch, 4, upper);
+            ld = FinishGpuOp<float>(backend, outputBuffer, batch * 16);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            return (null, null);
+        }
+        try
+        {
+            int[] pivots = DownloadInt32(backend, pivotBuffer.Buffer, batch * 4);
+            int[] pivotShape = new int[rank - 1];
+            for (int i = 0; i < rank - 2; i++) pivotShape[i] = input._shape[i];
+            pivotShape[rank - 2] = 4;
+            return (new Tensor<float>(ld, (int[])input._shape.Clone()),
+                new Tensor<int>(pivots, pivotShape));
+        }
+        catch { return (null, null); }
+    }
+
+    /// <summary>Exact-shape lower LDL vector solve through direct PTX.</summary>
+    internal Tensor<float>? TryGpuLdlSolve(
+        Tensor<float> ld, Tensor<int> pivots, Tensor<float> rhs, bool upper)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return null;
+        int rank = ld.Rank;
+        int batch = Batch4x4(ld);
+        if (batch == 0 || rhs.Rank != rank - 1 || rhs.Shape[rhs.Rank - 1] != 4 ||
+            pivots.Length != batch * 4 || rhs.Length != batch * 4)
+            return null;
+        using var ldBuffer = GetOrAllocateBuffer(backend, ld);
+        using var rhsBuffer = GetOrAllocateBuffer(backend, rhs);
+        using var pivotBuffer = UploadInt32(backend, pivots);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * 4);
+        float[] output;
+        try
+        {
+            lin.LinalgLdlSolve(ldBuffer.Buffer, pivotBuffer.Buffer, rhsBuffer.Buffer,
+                outputBuffer.Buffer, batch, 4, upper, rhsIsVector: true);
+            output = FinishGpuOp<float>(backend, outputBuffer, batch * 4);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            return null;
+        }
+        try { return new Tensor<float>(output, (int[])rhs._shape.Clone()); }
+        catch { return null; }
+    }
+
+    /// <summary>Fused exact-shape general vector solve, optionally returning info.</summary>
+    internal (Tensor<float>? Solution, Tensor<int>? Info) TryGpuSolveVector(
+        Tensor<float> input, Tensor<float> rhs)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return (null, null);
+        int rank = input.Rank;
+        int batch = Batch4x4(input);
+        if (batch == 0 || rhs.Rank != rank - 1 || rhs.Shape[rhs.Rank - 1] != 4 ||
+            rhs.Length != batch * 4)
+            return (null, null);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var rhsBuffer = GetOrAllocateBuffer(backend, rhs);
+        using var infoBuffer = AllocateInt32Buffer(backend, batch);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * 4);
+        float[] output;
+        try
+        {
+            lin.LinalgSolveVector(inputBuffer.Buffer, rhsBuffer.Buffer, outputBuffer.Buffer,
+                infoBuffer.Buffer, batch, 4);
+            output = FinishGpuOp<float>(backend, outputBuffer, batch * 4);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            return (null, null);
+        }
+        try
+        {
+            return (new Tensor<float>(output, (int[])rhs._shape.Clone()),
+                BuildInfoTensor(input._shape, DownloadInt32(backend, infoBuffer.Buffer, batch)));
+        }
+        catch { return (null, null); }
+    }
+
+    /// <summary>Exact-shape non-unit triangular vector solve through direct PTX.</summary>
+    internal Tensor<float>? TryGpuTriangularSolveVector(
+        Tensor<float> input, Tensor<float> rhs, bool upper, bool unitDiagonal)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return null;
+        int rank = input.Rank;
+        int batch = Batch4x4(input);
+        if (batch == 0 || rhs.Rank != rank - 1 || rhs.Shape[rhs.Rank - 1] != 4 ||
+            rhs.Length != batch * 4)
+            return null;
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var rhsBuffer = GetOrAllocateBuffer(backend, rhs);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * 4);
+        float[] output;
+        try
+        {
+            lin.LinalgTriangularSolveVector(inputBuffer.Buffer, rhsBuffer.Buffer,
+                outputBuffer.Buffer, batch, 4, upper, unitDiagonal);
+            output = FinishGpuOp<float>(backend, outputBuffer, batch * 4);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            return null;
+        }
+        try { return new Tensor<float>(output, (int[])rhs._shape.Clone()); }
+        catch { return null; }
+    }
+
+    /// <summary>Fused lower-Cholesky gradient specialization.</summary>
+    internal Tensor<float>? TryGpuCholeskyBackwardLower(
+        Tensor<float> factor, Tensor<float> gradOutput)
+    {
+        if (!SameExactMatrix4x4Shape(factor, gradOutput, out int batch) ||
+            !TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return null;
+        using var factorBuffer = GetOrAllocateBuffer(backend, factor);
+        using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        var outputBuffer = AllocateOutputBuffer(backend, batch * 16);
+        float[] output;
+        try
+        {
+            lin.LinalgCholeskyBackwardLower(factorBuffer.Buffer, gradBuffer.Buffer,
+                outputBuffer.Buffer, batch, 4);
+            output = FinishGpuOp<float>(backend, outputBuffer, batch * 16);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            return null;
+        }
+        try { return new Tensor<float>(output, (int[])factor._shape.Clone()); }
+        catch { return null; }
+    }
+
+    /// <summary>Fused exact-shape vector-solve gradient specialization.</summary>
+    internal (Tensor<float>? GradInput, Tensor<float>? GradRhs) TryGpuSolveBackwardVector(
+        Tensor<float> input, Tensor<float> solution, Tensor<float> gradOutput)
+    {
+        int rank = input.Rank;
+        int batch = Batch4x4(input);
+        if (batch == 0 || solution.Rank != rank - 1 || gradOutput.Rank != rank - 1 ||
+            solution.Length != batch * 4 || gradOutput.Length != batch * 4 ||
+            !TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
+            return (null, null);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var solutionBuffer = GetOrAllocateBuffer(backend, solution);
+        using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        var gradInputBuffer = AllocateOutputBuffer(backend, batch * 16);
+        var gradRhsBuffer = AllocateOutputBuffer(backend, batch * 4);
+        float[] gradInput;
+        try
+        {
+            lin.LinalgSolveBackwardVector(inputBuffer.Buffer, solutionBuffer.Buffer,
+                gradBuffer.Buffer, gradInputBuffer.Buffer, gradRhsBuffer.Buffer, batch, 4);
+            gradInput = FinishGpuOp<float>(backend, gradInputBuffer, batch * 16);
+        }
+        catch
+        {
+            gradInputBuffer.Dispose(); gradRhsBuffer.Dispose();
+            return (null, null);
+        }
+        float[] gradRhs;
+        try { gradRhs = FinishGpuOp<float>(backend, gradRhsBuffer, batch * 4); }
+        catch { gradRhsBuffer.Dispose(); return (null, null); }
+        try
+        {
+            return (new Tensor<float>(gradInput, (int[])input._shape.Clone()),
+                new Tensor<float>(gradRhs, (int[])solution._shape.Clone()));
+        }
+        catch { return (null, null); }
+    }
+
+    private static int Batch4x4(Tensor<float> input)
+    {
+        if (input.Rank < 2 || input.Shape[input.Rank - 2] != 4 || input.Shape[input.Rank - 1] != 4)
+            return 0;
+        int batch = 1;
+        for (int i = 0; i < input.Rank - 2; i++) batch = checked(batch * input._shape[i]);
+        return batch;
+    }
+
+    private static bool SameExactMatrix4x4Shape(
+        Tensor<float> left, Tensor<float> right, out int batch)
+    {
+        batch = Batch4x4(left);
+        if (batch == 0 || left.Rank != right.Rank || left.Length != right.Length) return false;
+        for (int i = 0; i < left.Rank; i++) if (left.Shape[i] != right.Shape[i]) return false;
+        return true;
+    }
+
+    private static OwnedBuffer UploadInt32(IDirectGpuBackend backend, Tensor<int> values)
+    {
+        float[] bits = new float[values.Length];
+        Buffer.BlockCopy(values.GetDataArray(), 0, bits, 0, values.Length * sizeof(int));
+        return new OwnedBuffer(backend.AllocateBuffer(bits), ownsBuffer: true);
+    }
 
     private static OwnedBuffer AllocateInt32Buffer(IDirectGpuBackend backend, int count)
     {

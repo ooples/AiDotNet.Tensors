@@ -28,6 +28,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </remarks>
 public sealed partial class CudaBackend
 {
+    // CaptureGraph/TryUpdateCapturedGraph use THREAD_LOCAL capture and invoke
+    // their actions synchronously. Direct resident dispatch can therefore
+    // recognize the supported capture path without polling the driver on
+    // every already-resident eager launch.
+    private bool _backendStreamCaptureActive;
+
     /// <summary>
     /// This backend's CUDA context handle. Exposed so the GPU offload allocator
     /// can SHARE it (allocate pinned moment/weight buffers in the same context
@@ -68,6 +74,7 @@ public sealed partial class CudaBackend
         // capturing state (which would break every subsequent op on it).
         try
         {
+            _backendStreamCaptureActive = true;
             launch();
         }
         catch (Exception ex)
@@ -77,6 +84,10 @@ public sealed partial class CudaBackend
             if (abortedGraph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(abortedGraph);
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return IntPtr.Zero;
+        }
+        finally
+        {
+            _backendStreamCaptureActive = false;
         }
 
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
@@ -137,8 +148,20 @@ public sealed partial class CudaBackend
     {
         if (graphExec == IntPtr.Zero) return;
         using var _ = PushContext();
+        EnqueueCapturedGraphCurrentContext(graphExec);
+    }
+
+    /// <summary>Enqueues a graph after the caller has validated this backend's context.</summary>
+    private void EnqueueCapturedGraphCurrentContext(IntPtr graphExec)
+    {
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+    }
+
+    /// <summary>Destroys a graph after the caller has validated this backend's context.</summary>
+    private static void DestroyCapturedGraphCurrentContext(IntPtr graphExec)
+    {
+        if (graphExec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(graphExec);
     }
 
     /// <summary>
@@ -184,13 +207,21 @@ public sealed partial class CudaBackend
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return false;
         }
-        try { relaunch(); }
+        try
+        {
+            _backendStreamCaptureActive = true;
+            relaunch();
+        }
         catch
         {
             CudaNativeBindings.cuStreamEndCapture(_stream, out var g);
             if (g != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(g);
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return false;
+        }
+        finally
+        {
+            _backendStreamCaptureActive = false;
         }
 
         if (CudaNativeBindings.cuStreamEndCapture(_stream, out var newGraph) != CudaResult.Success || newGraph == IntPtr.Zero)
@@ -294,6 +325,17 @@ public sealed partial class CudaBackend
     {
         if (!IsAvailable) return false;
         using var _ = PushContext();
+        return IsStreamCapturingCurrentContext();
+    }
+
+    /// <summary>
+    /// Capture query for dispatchers that have already established this
+    /// backend's context on the calling thread. Keeping this separate from the
+    /// public diagnostic avoids a redundant push/pop pair in resident-kernel
+    /// hot paths while preserving the external-capture safety check.
+    /// </summary>
+    private bool IsStreamCapturingCurrentContext()
+    {
         if (CudaNativeBindings.cuStreamIsCapturing(_stream, out int status) != CudaResult.Success)
             return false;
         return status != 0;
