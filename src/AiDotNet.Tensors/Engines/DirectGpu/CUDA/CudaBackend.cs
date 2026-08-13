@@ -15847,6 +15847,83 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, (uint)(batch * groups), 256, args);
     }
 
+    public unsafe void MesaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+        IGpuBuffer regularization, IGpuBuffer output,
+        IGpuBuffer workWeights, IGpuBuffer covariance,
+        int batch, int time, int model, int heads, int headDim)
+    {
+        if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
+            model != heads * headDim || headDim > 32)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+        // The kernel indexes these buffers from the dimensions above with no bounds
+        // check of its own. An undersized buffer reaching cuLaunchKernel is how this
+        // backend takes an out-of-bounds device access and faults the whole context
+        // with a sticky CUDA-700, so the capacities are checked here. Size is the
+        // element count.
+        long qkvElements = (long)batch * time * model;
+        long weightElements = (long)heads * headDim * headDim;
+        long perBatchWeightElements = (long)batch * heads * headDim * headDim;
+        RequireCapacity(q, qkvElements, nameof(q), "batch*time*model");
+        RequireCapacity(k, qkvElements, nameof(k), "batch*time*model");
+        RequireCapacity(v, qkvElements, nameof(v), "batch*time*model");
+        RequireCapacity(output, qkvElements, nameof(output), "batch*time*model");
+        RequireCapacity(initialWeights, weightElements, nameof(initialWeights), "heads*headDim*headDim");
+        RequireCapacity(regularization, 1, nameof(regularization), "1");
+        RequireCapacity(workWeights, perBatchWeightElements, nameof(workWeights), "batch*heads*headDim*headDim");
+        RequireCapacity(covariance, perBatchWeightElements, nameof(covariance), "batch*heads*headDim*headDim");
+        if (!_kernelCache.TryGetValue("mesa_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mesa_scan_forward");
+        using var _ = PushContext();
+        IntPtr pq=q.Handle, pk=k.Handle, pv=v.Handle, pw=initialWeights.Handle, pr=regularization.Handle,
+            po=output.Handle, pww=workWeights.Handle, pc=covariance.Handle;
+        void** args=stackalloc void*[13];
+        args[0]=&pq; args[1]=&pk; args[2]=&pv; args[3]=&pw; args[4]=&pr; args[5]=&po; args[6]=&pww; args[7]=&pc;
+        args[8]=&batch; args[9]=&time; args[10]=&model; args[11]=&heads; args[12]=&headDim;
+        uint total=(uint)(batch*heads);
+        LaunchKernel(kernel, (total+(uint)DefaultBlockSize-1)/(uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// Rejects a device buffer that cannot hold the element count the kernel will
+    /// index. These scan kernels perform no bounds checking, so an undersized
+    /// buffer becomes an out-of-bounds device access and a sticky CUDA-700 that
+    /// takes down the whole context.
+    /// </summary>
+    private static void RequireCapacity(
+        IGpuBuffer buffer, long requiredElements, string parameter, string formula)
+    {
+        if (buffer is null) throw new ArgumentNullException(parameter);
+        if (buffer.Size < requiredElements)
+            throw new ArgumentException(
+                $"{parameter} buffer too small: capacity={buffer.Size} elements, " +
+                $"required={requiredElements} ({formula}).",
+                parameter);
+    }
+
+    public unsafe void RoutedDiagonalSsmScanForward(
+        IGpuBuffer input,IGpuBuffer activeMask,IGpuBuffer transition,IGpuBuffer inputMap,IGpuBuffer outputMap,IGpuBuffer skip,
+        IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
+    {
+        if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
+        // Same contract as MesaScanForward: the kernel trusts these extents.
+        long inputElements = (long)batch * time * model;
+        long maskElements = (long)batch * time * experts;
+        long diagElements = (long)experts * state;
+        RequireCapacity(input, inputElements, nameof(input), "batch*time*model");
+        RequireCapacity(activeMask, maskElements, nameof(activeMask), "batch*time*experts");
+        RequireCapacity(transition, diagElements, nameof(transition), "experts*state");
+        RequireCapacity(inputMap, (long)experts * state * model, nameof(inputMap), "experts*state*model");
+        RequireCapacity(outputMap, (long)experts * model * state, nameof(outputMap), "experts*model*state");
+        RequireCapacity(skip, (long)experts * model, nameof(skip), "experts*model");
+        RequireCapacity(output, (long)batch * time * experts * model, nameof(output), "batch*time*experts*model");
+        RequireCapacity(stateScratch, (long)batch * experts * state, nameof(stateScratch), "batch*experts*state");
+        if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new InvalidOperationException("CUDA kernel not found: routed_diagonal_ssm_scan_forward");
+        using var _=PushContext();IntPtr px=input.Handle,pm=activeMask.Handle,pa=transition.Handle,pb=inputMap.Handle,pc=outputMap.Handle,pd=skip.Handle,po=output.Handle,ph=stateScratch.Handle;
+        void** args=stackalloc void*[13];args[0]=&px;args[1]=&pm;args[2]=&pa;args[3]=&pb;args[4]=&pc;args[5]=&pd;args[6]=&po;args[7]=&ph;args[8]=&batch;args[9]=&time;args[10]=&model;args[11]=&experts;args[12]=&state;
+        uint total=(uint)(batch*experts);LaunchKernel(kernel,(total+(uint)DefaultBlockSize-1)/(uint)DefaultBlockSize,(uint)DefaultBlockSize,args);
+    }
+
     // ── Fused Mamba-2 SSD scan forward (#1464) ─────────────────────────────────────────────
     public unsafe void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,

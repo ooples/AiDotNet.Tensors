@@ -173,6 +173,8 @@ internal static class OpRegistry
         "Rwkv4WkvForward",
         "MambaSelectiveScanForward",
         "ComplexDiagonalSsmScanForward",
+        "MesaScanForward",
+        "RoutedDiagonalSsmScanForward",
         "RgLruScanForward",
         "GlaScanForward",
         "GatedDeltaNetScanForward",

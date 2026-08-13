@@ -1539,6 +1539,36 @@ public static class OpParityRegistry
             e => e.ComplexDiagonalSsmScanForward(cx.F(), car.F(), cai.F(), cbr.F(), cbi.F(), ccr.F(), cci.F(), cd.F()),
             e => e.ComplexDiagonalSsmScanForward(cx.D(), car.D(), cai.D(), cbr.D(), cbi.D(), ccr.D(), cci.D(), cd.D()),
             ParityTol.Accum(1e-3), opMethod: "ComplexDiagonalSsmScanForward");
+        // Mesa test-time-training scan: q/k/v [B,S,D], initial weights [H,D/H,D/H].
+        var mesaQ = OpInput.Rand(3680, seqShape);
+        var mesaK = OpInput.Rand(3681, seqShape);
+        var mesaV = OpInput.Rand(3682, seqShape);
+        var mesaW = OpInput.Rand(3683, new[] { H, D / H, D / H });
+        yield return new OpCase("MesaScanForward[2,4,6;h2]", "scan",
+            e => e.MesaScanForward(mesaQ.F(), mesaK.F(), mesaV.F(), mesaW.F(), 0.7f, H),
+            e => e.MesaScanForward(mesaQ.D(), mesaK.D(), mesaV.D(), mesaW.D(), 0.7, H),
+            ParityTol.Accum(2e-3), opMethod: "MesaScanForward");
+        // Sparse expert routing: mask selects experts while the other tensors carry expert-local SSM state.
+        const int E = 3;
+        // RandPositive(0.0, 1.0) never yields a zero, so every token was routed to
+        // every expert and the inactive-expert branch - h[s] = 0 * (A*h + Bx), the
+        // branch this change adds - was never exercised by parity. Zero one expert
+        // per timestep in a fixed pattern so both branches are covered.
+        var routedMaskData = new double[B * S * E];
+        for (int b = 0; b < B; b++)
+            for (int s = 0; s < S; s++)
+                for (int e = 0; e < E; e++)
+                    routedMaskData[((b * S) + s) * E + e] =
+                        (s + e) % E == 0 ? 0.0 : 0.25 + (0.25 * ((s + e) % E));
+        var routedMask = OpInput.From(routedMaskData, new[] { B, S, E });
+        var routedA = OpInput.Rand(3691, new[] { E, ST }, 0.1, 0.8);
+        var routedB = OpInput.Rand(3692, new[] { E, ST, D });
+        var routedC = OpInput.Rand(3693, new[] { E, D, ST });
+        var routedSkip = OpInput.Rand(3694, new[] { E, D });
+        yield return new OpCase("RoutedDiagonalSsmScanForward[2,4,6;e3]", "scan",
+            e => e.RoutedDiagonalSsmScanForward(mx.F(), routedMask.F(), routedA.F(), routedB.F(), routedC.F(), routedSkip.F()),
+            e => e.RoutedDiagonalSsmScanForward(mx.D(), routedMask.D(), routedA.D(), routedB.D(), routedC.D(), routedSkip.D()),
+            ParityTol.Accum(1e-3), opMethod: "RoutedDiagonalSsmScanForward");
         // Mamba2 SSD: delta [B,S,H], aLog/D per-head [H], shared B/C [B,S,ST].
         var m2delta = OpInput.RandPositive(3606, new[] { B, S, H }, 0.1, 1.0);
         var m2aLog = OpInput.Rand(3607, new[] { H });

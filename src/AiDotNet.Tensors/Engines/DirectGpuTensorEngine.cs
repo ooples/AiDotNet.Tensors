@@ -10107,6 +10107,104 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
+    // Mesa online least-squares scan. Forward stays resident on the selected GPU
+    // backend under an active tape; the recorded node reuses CpuEngine's analytic
+    // reverse pass until a native GPU backward kernel is available.
+    public override Tensor<T> MesaScanForward<T>(
+        Tensor<T> q, Tensor<T> k, Tensor<T> v, Tensor<T> initialWeights,
+        T regularization, int numHeads)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            q.Rank != 3 || numHeads <= 0)
+            return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
+
+        int batch = q.Shape._dims[0];
+        int time = q.Shape._dims[1];
+        int model = q.Shape._dims[2];
+        if (batch <= 0 || time <= 0 || model <= 0 || model % numHeads != 0 ||
+            k.Rank != 3 || v.Rank != 3 || !q.Shape.Equals(k.Shape) || !q.Shape.Equals(v.Shape))
+            return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
+
+        int headDim = model / numHeads;
+        if (headDim > 32 || initialWeights.Rank != 3 ||
+            initialWeights.Shape._dims[0] != numHeads ||
+            initialWeights.Shape._dims[1] != headDim || initialWeights.Shape._dims[2] != headDim)
+            return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
+
+        using var qBuffer = GetOrAllocateBuffer(backend, q);
+        using var kBuffer = GetOrAllocateBuffer(backend, k);
+        using var vBuffer = GetOrAllocateBuffer(backend, v);
+        using var w0Buffer = GetOrAllocateBuffer(backend, initialWeights);
+        // regularization crosses the ABI as a one-float device buffer, which is a
+        // deliberate contract shared by all six backend kernels (see
+        // IDirectGpuBackend.MesaScanForward) rather than something to narrow to a
+        // scalar here. The buffer is still required, but the Tensor<T> wrapper that
+        // used to be built around it on every call is not.
+        using var regularizationBuffer = GetOrAllocateBuffer(backend, new[] { regularization });
+        using var outputBuffer = AllocateOutputBuffer(backend, batch * time * model);
+        int matrixScratch = batch * numHeads * headDim * headDim;
+        using var workWeights = AllocateOutputBuffer(backend, matrixScratch);
+        using var covariance = AllocateOutputBuffer(backend, matrixScratch);
+
+        backend.MesaScanForward(
+            qBuffer.Buffer, kBuffer.Buffer, vBuffer.Buffer, w0Buffer.Buffer,
+            regularizationBuffer.Buffer, outputBuffer.Buffer, workWeights.Buffer, covariance.Buffer,
+            batch, time, model, numHeads, headDim);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, batch * time * model,
+            new[] { batch, time, model });
+        outputBuffer.RelinquishOwnership();
+        Autodiff.DifferentiableOps.RecordIfActive<T>(
+            "MesaScanForward", result,
+            new[] { q, k, v, initialWeights },
+            MesaScanBackward<T>,
+            savedState: new object[] { regularization!, numHeads });
+        return result;
+    }
+
+    public override Tensor<T> RoutedDiagonalSsmScanForward<T>(
+        Tensor<T> input, Tensor<T> activeMask, Tensor<T> transition,
+        Tensor<T> inputMap, Tensor<T> outputMap, Tensor<T> skip)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            input.Rank != 3 || activeMask.Rank != 3 || transition.Rank != 2)
+            return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
+        int batch = input.Shape._dims[0];
+        int time = input.Shape._dims[1];
+        int model = input.Shape._dims[2];
+        int experts = activeMask.Shape._dims[2];
+        int state = transition.Shape._dims[1];
+        if (batch <= 0 || time <= 0 || model <= 0 || experts <= 0 || state <= 0 || state > 64 ||
+            activeMask.Shape._dims[0] != batch || activeMask.Shape._dims[1] != time ||
+            transition.Shape._dims[0] != experts ||
+            inputMap.Rank != 3 || inputMap.Shape._dims[0] != experts ||
+            inputMap.Shape._dims[1] != state || inputMap.Shape._dims[2] != model ||
+            outputMap.Rank != 3 || outputMap.Shape._dims[0] != experts ||
+            outputMap.Shape._dims[1] != model || outputMap.Shape._dims[2] != state ||
+            skip.Rank != 2 || skip.Shape._dims[0] != experts || skip.Shape._dims[1] != model)
+            return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
+
+        using var x = GetOrAllocateBuffer(backend, input);
+        using var m = GetOrAllocateBuffer(backend, activeMask);
+        using var a = GetOrAllocateBuffer(backend, transition);
+        using var ib = GetOrAllocateBuffer(backend, inputMap);
+        using var oc = GetOrAllocateBuffer(backend, outputMap);
+        using var d = GetOrAllocateBuffer(backend, skip);
+        using var y = AllocateOutputBuffer(backend, batch * time * experts * model);
+        using var h = AllocateOutputBuffer(backend, batch * experts * state);
+        backend.RoutedDiagonalSsmScanForward(
+            x.Buffer, m.Buffer, a.Buffer, ib.Buffer, oc.Buffer, d.Buffer, y.Buffer, h.Buffer,
+            batch, time, model, experts, state);
+        var result = DeferTensorResult<T>(
+            backend, y.Buffer, batch * time * experts * model,
+            new[] { batch, time, experts, model });
+        y.RelinquishOwnership();
+        Autodiff.DifferentiableOps.RecordIfActive(
+            "RoutedDiagonalSsmScanForward", result,
+            new[] { input, activeMask, transition, inputMap, outputMap, skip },
+            RoutedDiagonalSsmBackward<T>);
+        return result;
+    }
+
     // Fused Mamba-2 SSD scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
     public override Tensor<T> Mamba2SsdScanForward<T>(
         Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam, int numHeads)
