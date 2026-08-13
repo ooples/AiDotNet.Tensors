@@ -13,6 +13,25 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the spectral family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-spectral-sass")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.AuditSass(args);
+            return;
+        }
+
         // GPU-free cubin generation and verification for the online-attention family.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
@@ -166,6 +185,13 @@ class Program
                 ? args[operationIndex + 1]
                 : null;
             DirectPtxRngStochasticExperiment.Run(runs, includeExternal, family, operation);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-complex-multiply")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool oracleOnly = args.Contains("--oracle-only", StringComparer.Ordinal);
+            DirectPtxComplexMultiplyExperiment.Run(runs, oracleOnly);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
@@ -449,6 +475,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-stochastic")
         {
             DirectPtxProfileTarget.RunRngStochastic();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-complex-multiply")
+        {
+            DirectPtxProfileTarget.RunComplexMultiply();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")

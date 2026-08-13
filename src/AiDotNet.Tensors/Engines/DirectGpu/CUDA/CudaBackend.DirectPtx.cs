@@ -29,6 +29,8 @@ public sealed partial class CudaBackend
         _directPtxPagedPrefillKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxAttentionBackwardKey, PtxFusedAttentionBackwardD64Kernel>
         _directPtxAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxComplexMultiplyKey, PtxFusedComplexMultiplyF32Kernel>
+        _directPtxComplexMultiplyKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxFlashAttentionBackwardKey, PtxFlashAttentionBackwardD64Kernel>
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxCholesky4x4Key, PtxRegisterCholesky4x4F32Kernel>
@@ -44,6 +46,7 @@ public sealed partial class CudaBackend
     private readonly DirectPtxKernelCache<DirectPtxVisionBoxIouKey, PtxFusedPairwiseBoxIouF32Kernel>
         _directPtxVisionBoxIouKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private DirectPtxRuntime? _directPtxRuntime;
+    private long _directPtxComplexMultiplyDispatchCount;
     private long _directPtxCholesky4x4DispatchCount;
 
     private sealed class DirectPtxCapturePinSet
@@ -238,6 +241,9 @@ public sealed partial class CudaBackend
         DirectPtxFeatureGate.IsQkvRopeCacheEnabled && IsAvailable &&
         DirectPtxArchitecture.HasValidatedQkvRopeCache(_ccMajor, _ccMinor);
 
+    internal bool IsDirectPtxComplexMultiplyEnabled =>
+        DirectPtxFeatureGate.IsComplexMultiplyEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedComplexMultiply(_ccMajor, _ccMinor);
     internal bool IsDirectPtxCholesky4x4Enabled =>
         DirectPtxFeatureGate.IsCholesky4x4Enabled && IsAvailable &&
         DirectPtxArchitecture.IsCholesky4x4ExperimentArchitecture(_ccMajor, _ccMinor);
@@ -454,6 +460,13 @@ public sealed partial class CudaBackend
         }
         audit = null!;
         return false;
+    }
+
+    internal long DirectPtxComplexMultiplyDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxComplexMultiplyDispatchCount);
+    internal int DirectPtxComplexMultiplyPinnedKernelCount
+    {
+        get { lock (_directPtxLock) return _directPtxComplexMultiplyKernels.PinnedCount; }
     }
 
     internal long DirectPtxCholesky4x4DispatchCount =>
@@ -2466,6 +2479,199 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>
+    /// Attempts an exact contiguous interleaved FP32 complex multiply. All
+    /// tensor and shape checks occur before module lookup; the PTX ABI receives
+    /// only the two input pointers and one output pointer.
+    /// </summary>
+    /// <remarks>
+    /// Tried before the general issue-#854 scientific kernel: this
+    /// specialization admits only four exact pair counts, so any other
+    /// shape must fall through rather than be narrowed here.
+    /// </remarks>
+    internal bool TryDirectPtxSpectralComplexMultiply(
+        IGpuBuffer left,
+        IGpuBuffer right,
+        IGpuBuffer output,
+        int numPairs)
+    {
+        if (!DirectPtxFeatureGate.IsComplexMultiplyEnabled)
+        {
+            DirectPtxLastError = "complex-multiply-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "complex-multiply-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedComplexMultiply(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "complex-multiply-architecture-not-validated";
+            return false;
+        }
+        if (left is null || right is null || output is null)
+        {
+            DirectPtxLastError = "complex-multiply-null-buffer";
+            return false;
+        }
+        if (!PtxFusedComplexMultiplyF32Kernel.IsSupportedShape(numPairs))
+        {
+            DirectPtxLastError = "complex-multiply-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedComplexMultiplyF32Kernel.IsPromotedShape(numPairs) &&
+            !DirectPtxFeatureGate.ComplexMultiplyExperimentOverride)
+        {
+            DirectPtxLastError = "complex-multiply-performance-gate-not-met";
+            return false;
+        }
+
+        long expectedElements = checked(2L * numPairs);
+        long expectedBytes = checked(expectedElements * sizeof(float));
+        if (left.Size != expectedElements || right.Size != expectedElements ||
+            output.Size != expectedElements ||
+            left.SizeInBytes != expectedBytes || right.SizeInBytes != expectedBytes ||
+            output.SizeInBytes != expectedBytes)
+        {
+            DirectPtxLastError = "complex-multiply-physical-extent-mismatch";
+            return false;
+        }
+        if (left.Handle == IntPtr.Zero || right.Handle == IntPtr.Zero ||
+            output.Handle == IntPtr.Zero)
+        {
+            DirectPtxLastError = "complex-multiply-invalid-device-pointer";
+            return false;
+        }
+        if (((PtxCompat.ToNuint(left.Handle) | PtxCompat.ToNuint(right.Handle) |
+              PtxCompat.ToNuint(output.Handle)) & 15u) != 0)
+        {
+            DirectPtxLastError = "complex-multiply-alignment-mismatch";
+            return false;
+        }
+        if (DirectPtxComplexMultiplyBuffersOverlap(output, left) ||
+            DirectPtxComplexMultiplyBuffersOverlap(output, right))
+        {
+            DirectPtxLastError = "complex-multiply-output-alias-not-supported";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxComplexMultiplyKey(numPairs);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxComplexMultiplyKernels.TryGetValue(
+                    key, out PtxFusedComplexMultiplyF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX complex multiply must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheComplexMultiplyKernelSlow(key);
+                }
+                // Pin() is the permanent pin for captures the cache cannot observe.
+                // A CaptureGraph-owned capture must acquire through the active
+                // pin set, or ReleaseDirectPtxGraphPins cannot release this module
+                // when the graph is destroyed and the entry stays pinned for the
+                // life of the backend.
+                if (capturing &&
+                    !PinDirectPtxKernelForCapture(_directPtxComplexMultiplyKernels, key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX complex-multiply module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(left, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(right, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(output, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxComplexMultiplyDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedComplexMultiplyF32Kernel CreateAndCacheComplexMultiplyKernelSlow(
+        DirectPtxComplexMultiplyKey key) =>
+        _directPtxComplexMultiplyKernels.GetOrAdd(key, () =>
+            new PtxFusedComplexMultiplyF32Kernel(_directPtxRuntime!, key.NumPairs));
+
+    internal bool PrewarmDirectPtxComplexMultiply(int numPairs)
+    {
+        if (!DirectPtxFeatureGate.IsComplexMultiplyEnabled || !IsAvailable ||
+            !DirectPtxArchitecture.HasValidatedComplexMultiply(_ccMajor, _ccMinor) ||
+            !PtxFusedComplexMultiplyF32Kernel.IsSupportedShape(numPairs) ||
+            (!PtxFusedComplexMultiplyF32Kernel.IsPromotedShape(numPairs) &&
+             !DirectPtxFeatureGate.ComplexMultiplyExperimentOverride))
+        {
+            DirectPtxLastError = "complex-multiply-prewarm-not-eligible";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX complex-multiply prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxComplexMultiplyKey(numPairs);
+                if (!_directPtxComplexMultiplyKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheComplexMultiplyKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxComplexMultiplyAudit(
+        int numPairs,
+        out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxComplexMultiplyKey(numPairs);
+            if (_directPtxComplexMultiplyKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    private static bool DirectPtxComplexMultiplyBuffersOverlap(
+        IGpuBuffer left,
+        IGpuBuffer right)
+    {
+        nuint leftStart = PtxCompat.ToNuint(left.Handle);
+        nuint rightStart = PtxCompat.ToNuint(right.Handle);
+        nuint leftEnd = checked(leftStart + (nuint)left.SizeInBytes);
+        nuint rightEnd = checked(rightStart + (nuint)right.SizeInBytes);
+        return leftStart < rightEnd && rightStart < leftEnd;
+    }
+
     private void DisposeDirectPtxRuntime()
     {
         lock (_directPtxLock)
@@ -2478,6 +2684,7 @@ public sealed partial class CudaBackend
             _directPtxPagedPrefillKernels.Dispose();
             _directPtxAttentionBackwardKernels.Dispose();
             _directPtxFlashAttentionBackwardKernels.Dispose();
+            _directPtxComplexMultiplyKernels.Dispose();
             _directPtxQkvRopeCacheKernels.Dispose();
             _directPtxVisionBoxIouKernels.Dispose();
             _directPtxVisionKernels.Dispose();
@@ -2644,6 +2851,7 @@ public sealed partial class CudaBackend
         bool IsCausal,
         int ScaleBits,
         int BiasBatchStride);
+    private readonly record struct DirectPtxComplexMultiplyKey(int NumPairs);
     private readonly record struct DirectPtxQkvRopeCacheKey(
         int Heads,
         int CacheCapacity,

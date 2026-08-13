@@ -88,6 +88,29 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The first interleaved complex-multiply candidate is admitted only for
+    /// the exact GA102/SM86 validation domain.
+    /// </summary>
+    internal static bool HasValidatedComplexMultiply(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The complex conjugate and magnitude specializations are measured only on
+    /// GA102/SM86, matching their complex-multiply sibling.
+    /// </summary>
+    internal static bool HasValidatedComplexUnary(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The issue-#850 spectral/audio transform layer (FFT, STFT, mel, resample,
+    /// and the vocoder/pooling kernels) is measured only on GA102/SM86. It owns
+    /// its own predicate rather than borrowing the complex-unary one so the two
+    /// families can be promoted, or held back, independently.
+    /// </summary>
+    internal static bool HasValidatedSpectral(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The fused-linear + GELU decode specializations are measured and promoted
     /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
     /// tuning domains and must supply and benchmark their own specialization
