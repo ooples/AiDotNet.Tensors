@@ -1525,6 +1525,20 @@ public static class OpParityRegistry
             e => e.MambaSelectiveScanForward(mx.F(), mdelta.F(), maLog.F(), mb.F(), mc.F(), md.F()),
             e => e.MambaSelectiveScanForward(mx.D(), mdelta.D(), maLog.D(), mb.D(), mc.D(), md.D()),
             ParityTol.Accum(1e-3), opMethod: "MambaSelectiveScanForward");
+        // Grouped complex diagonal SSM: input [B,S,G,W], A [G,ST], B [G,ST,W], C [G,W,ST], D [G,W].
+        const int G = 2, W = 3;
+        var cx = OpInput.Rand(3670, new[] { B, S, G, W });
+        var car = OpInput.Rand(3671, new[] { G, ST });
+        var cai = OpInput.Rand(3672, new[] { G, ST });
+        var cbr = OpInput.Rand(3673, new[] { G, ST, W });
+        var cbi = OpInput.Rand(3674, new[] { G, ST, W });
+        var ccr = OpInput.Rand(3675, new[] { G, W, ST });
+        var cci = OpInput.Rand(3676, new[] { G, W, ST });
+        var cd = OpInput.Rand(3677, new[] { G, W });
+        yield return new OpCase("ComplexDiagonalSsmScanForward[2,4,2,3]", "scan",
+            e => e.ComplexDiagonalSsmScanForward(cx.F(), car.F(), cai.F(), cbr.F(), cbi.F(), ccr.F(), cci.F(), cd.F()),
+            e => e.ComplexDiagonalSsmScanForward(cx.D(), car.D(), cai.D(), cbr.D(), cbi.D(), ccr.D(), cci.D(), cd.D()),
+            ParityTol.Accum(1e-3), opMethod: "ComplexDiagonalSsmScanForward");
         // Mamba2 SSD: delta [B,S,H], aLog/D per-head [H], shared B/C [B,S,ST].
         var m2delta = OpInput.RandPositive(3606, new[] { B, S, H }, 0.1, 1.0);
         var m2aLog = OpInput.Rand(3607, new[] { H });

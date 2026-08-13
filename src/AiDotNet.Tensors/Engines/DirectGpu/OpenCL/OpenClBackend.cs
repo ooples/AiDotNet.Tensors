@@ -13126,6 +13126,29 @@ KERNEL VARIANTS (A/B testing):
             _context?.Finish();
         }
 
+        public void ComplexDiagonalSsmScanForward(
+            IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+            IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+            IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+            IGpuBuffer output, int batch, int time, int groups, int width, int state)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context is not initialized.");
+            if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM dimensions must be positive.");
+            if (!_kernelCache.TryGetValue("complex_diagonal_ssm_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: complex_diagonal_ssm_scan_forward");
+            int total = batch * groups;
+            using var stateR = AllocateBuffer(total * state);
+            using var stateI = AllocateBuffer(total * state);
+            IGpuBuffer[] buffers = { input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip, output, stateR, stateI };
+            for (uint i=0;i<buffers.Length;i++) kernel.SetArg(i, ((DirectOpenClGpuBuffer)buffers[i]).Buffer.Handle);
+            kernel.SetArg(11u,batch); kernel.SetArg(12u,time); kernel.SetArg(13u,groups); kernel.SetArg(14u,width); kernel.SetArg(15u,state);
+            int local = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(((total+local-1)/local)*local, local);
+            _context.Finish();
+        }
+
         // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
         public void Mamba2SsdScanForward(
             IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
