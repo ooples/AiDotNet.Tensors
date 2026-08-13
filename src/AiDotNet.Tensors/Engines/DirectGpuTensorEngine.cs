@@ -10150,7 +10150,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             new[] { batch, time, model });
         outputBuffer.RelinquishOwnership();
         Autodiff.DifferentiableOps.RecordIfActive<T>(
-            "MesaScan", result,
+            "MesaScanForward", result,
             new[] { q, k, v, initialWeights },
             MesaScanBackward<T>,
             savedState: new object[] { regularization!, numHeads });

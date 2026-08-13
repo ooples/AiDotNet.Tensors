@@ -2675,7 +2675,12 @@ internal static class BackwardFunctions<T>
                 // The old d*2 lookup interpreted padding from axis zero forward, so it was
                 // accidentally correct only when every padded axis used the same values.
                 int paddingAxis = inShape.Length - 1 - d;
-                int padBefore = paddingAxis * 2 < padding.Length
+                // Forward applies only complete (before, after) pairs, i.e.
+                // padding.Length / 2 of them. Testing paddingAxis * 2 against the
+                // raw length instead accepts a dangling odd entry: forward padding
+                // [1] pads nothing, while this would shift the source coordinate by
+                // one and read the wrong gradient.
+                int padBefore = paddingAxis < padding.Length / 2
                     ? padding[paddingAxis * 2]
                     : 0;
                 dstIdx += (coords[d] + padBefore) * stride;

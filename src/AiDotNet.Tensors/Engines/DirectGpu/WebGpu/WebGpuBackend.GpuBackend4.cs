@@ -8,6 +8,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend
 {
+    /// <summary>
+    /// Upper bound on the Mesa head dimension. It is a runtime and storage
+    /// contract: the shader sizes its thread-local scratch arrays from the same
+    /// bound, so this admission check and that allocation must stay in step.
+    /// </summary>
+    private const int MesaMaxHeadDim = 32;
+
     #region Optimizer Operations
 
     public void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient, float learningRate, float weightDecay, int size)
@@ -949,8 +956,10 @@ public sealed partial class WebGpuBackend
         int batch, int time, int model, int heads, int headDim)
     {
         if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
-            model != heads * headDim || headDim > 32)
-            throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+            model != heads * headDim || headDim > MesaMaxHeadDim)
+            throw new ArgumentOutOfRangeException(
+                nameof(batch),
+                $"Mesa dimensions are invalid or headDim exceeds {MesaMaxHeadDim}.");
         DispatchRecurrence("mesa", WebGpuRecurrenceKernels.MesaScan, batch * heads,
             new[] { q, k, v, initialWeights, regularization, output, workWeights, covariance },
             new[] { batch, time, model, heads, headDim });

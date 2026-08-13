@@ -38,7 +38,7 @@ public partial class CpuEngine
         }
 
         DifferentiableOps.RecordIfActive<T>(
-            "MesaScan", output,
+            "MesaScanForward", output,
             new[] { q, k, v, initialWeights },
             MesaScanBackward<T>,
             savedState: new object[] { regularization!, numHeads });

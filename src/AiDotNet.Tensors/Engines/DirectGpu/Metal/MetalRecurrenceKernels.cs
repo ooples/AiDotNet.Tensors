@@ -249,6 +249,10 @@ kernel void complex_diagonal_ssm_scan_forward(
     }
 }
 
+// The Mesa head dimension is a runtime and storage contract: it bounds both the
+// admission check below and the thread-local scratch arrays, so the two can never
+// be allowed to drift apart.
+#define MESA_MAX_HEADDIM 32
 kernel void mesa_scan_forward(
     device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
     device const float* V [[buffer(2)]], device const float* W0 [[buffer(3)]],
@@ -258,12 +262,12 @@ kernel void mesa_scan_forward(
     constant int& model [[buffer(10)]], constant int& heads [[buffer(11)]],
     constant int& headDim [[buffer(12)]], uint gid [[thread_position_in_grid]])
 {
-    int bh=(int)gid; if(bh>=batch*heads || headDim>32)return;
+    int bh=(int)gid; if(bh>=batch*heads || headDim>MESA_MAX_HEADDIM)return;
     int b=bh/heads,h=bh%heads,matrix=headDim*headDim,base=bh*matrix,w0Base=h*matrix;
     float invLambda=1.0f/regularization[0];
     for(int i=0;i<matrix;i++){workW[base+i]=W0[w0Base+i];covariance[base+i]=0.0f;}
     for(int i=0;i<headDim;i++)covariance[base+i*headDim+i]=invLambda;
-    thread float pk[32],error[32],row[32];
+    thread float pk[MESA_MAX_HEADDIM],error[MESA_MAX_HEADDIM],row[MESA_MAX_HEADDIM];
     for(int t=0;t<time;t++){
         int vb=(b*time+t)*model+h*headDim;
         for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=covariance[base+i*headDim+j]*K[vb+j];pk[i]=s;}
