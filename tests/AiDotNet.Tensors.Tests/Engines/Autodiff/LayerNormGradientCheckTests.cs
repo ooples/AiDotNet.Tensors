@@ -25,6 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Runs on whatever <see cref="AiDotNetEngine.Current"/> is configured (CPU in CI,
 /// GPU when present) — the finite-difference check is backend-agnostic.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class LayerNormGradientCheckTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

@@ -50,6 +50,24 @@ public class RoiAudioOpsTests
     }
 
     [Fact]
+    public void RoIPool_MidpointCoordinatesRoundAwayFromZero()
+    {
+        // CUDA roundf and torchvision's C++ round select (1,1) for +0.5.
+        // Math.Round's default ties-to-even would incorrectly select (0,0).
+        var img = new Tensor<float>(
+            new float[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+            new[] { 1, 1, 3, 3 });
+        var boxes = new Tensor<float>(
+            new float[] { 0, 0.5f, 0.5f, 0.5f, 0.5f },
+            new[] { 1, 5 });
+
+        using Tensor<float> output = _cpu.RoIPool(
+            img, boxes, 1, 1, 1.0f);
+
+        Assert.Equal(5f, output.AsSpan()[0]);
+    }
+
+    [Fact]
     public void RoIAlign_EmptyBoxList_ReturnsEmpty()
     {
         var img = new Tensor<float>(new float[4], new[] { 1, 1, 2, 2 });

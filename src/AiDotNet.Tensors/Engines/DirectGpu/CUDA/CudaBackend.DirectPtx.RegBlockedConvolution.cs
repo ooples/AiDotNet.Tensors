@@ -69,7 +69,8 @@ public sealed partial class CudaBackend
                 }
                 _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                 PtxConv2DNchwK1RegBlockedKernel kernel = GetOrCreateRegBlockedConvKernel();
-                if (capturing && !_directPtxRegBlockedConvKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxRegBlockedConvKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the register-blocked convolution module for CUDA graph capture.");
                 lock (GpuDispatchLock)
