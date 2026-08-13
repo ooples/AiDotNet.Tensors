@@ -841,6 +841,20 @@ public sealed unsafe partial class VulkanBackend
         => GlslNaryOp(VulkanRecurrenceKernels.MambaScan, new[] { x, delta, aLog, bParam, cParam, dParam, output },
             batch * innerDim, new[] { (uint)batch, (uint)seqLen, (uint)innerDim, (uint)stateDim });
 
+    public void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state)
+    {
+        if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM width/state must be in [1,256].");
+        GlslNaryOp(VulkanRecurrenceKernels.ComplexDiagonalSsmScan,
+            new[] { input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip, output }, batch * groups,
+            new[] { (uint)batch, (uint)time, (uint)groups, (uint)width, (uint)state });
+    }
+
     public void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)

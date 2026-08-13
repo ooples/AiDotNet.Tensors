@@ -502,6 +502,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "RgLruScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         "Rwkv4WkvForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         "MambaSelectiveScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "ComplexDiagonalSsmScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         "Mamba2SsdScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
         "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<Int32>)",
         "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",

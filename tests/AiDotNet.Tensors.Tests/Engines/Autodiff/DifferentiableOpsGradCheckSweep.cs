@@ -332,6 +332,9 @@ public class DifferentiableOpsGradCheckSweep
         // d [innerDim].
         ["MambaSelectiveScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([4, 2], r),
                                               SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([4], r)],
+        ["ComplexDiagonalSsmScanForward"] = r => [SafeTensor([1, 3, 2, 2], r), SafeTensor([2, 3], r), SafeTensor([2, 3], r),
+                                                   SafeTensor([2, 3, 2], r), SafeTensor([2, 3, 2], r),
+                                                   SafeTensor([2, 2, 3], r), SafeTensor([2, 2, 3], r), SafeTensor([2, 2], r)],
         // Mamba-2 SSD is per-HEAD where Mamba S6 is per-channel: delta is [B, L, numHeads], and aLog
         // and dParam are per-head SCALAR vectors of length numHeads rather than S6's
         // [innerDim, stateDim] matrix and [innerDim] vector. That is the "scalar-decay"

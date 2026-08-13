@@ -929,6 +929,19 @@ public sealed partial class WebGpuBackend
         => DispatchRecurrence("mamba", WebGpuRecurrenceKernels.MambaScan, batch * innerDim,
             new[] { x, delta, aLog, bParam, cParam, dParam, output }, new[] { batch, seqLen, innerDim, stateDim });
 
+    public void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state)
+    {
+        if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM width/state must be in [1,256].");
+        DispatchRecurrence("complex_diagonal_ssm", WebGpuRecurrenceKernels.ComplexDiagonalSsmScan,
+            batch * groups, new[] { input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip, output }, new[] { batch, time, groups, width, state });
+    }
+
     public void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)

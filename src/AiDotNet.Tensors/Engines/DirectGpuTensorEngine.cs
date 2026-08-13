@@ -10057,6 +10057,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Grouped complex diagonal SSM scan. GPU inference uses a resident fused kernel; when the tape
+    // is active, CpuEngine records the single analytic BPTT node.
+    public override Tensor<T> ComplexDiagonalSsmScanForward<T>(
+        Tensor<T> input, Tensor<T> transitionReal, Tensor<T> transitionImag,
+        Tensor<T> inputMapReal, Tensor<T> inputMapImag,
+        Tensor<T> outputMapReal, Tensor<T> outputMapImag, Tensor<T> skip)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            input.Rank != 4 || transitionReal.Rank != 2)
+            return base.ComplexDiagonalSsmScanForward(
+                input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip);
+
+        int batch = input.Shape._dims[0];
+        int time = input.Shape._dims[1];
+        int groups = input.Shape._dims[2];
+        int width = input.Shape._dims[3];
+        int state = transitionReal.Shape._dims[1];
+        if (state > 256 || width > 256)
+            throw new NotSupportedException(
+                $"The GPU complex diagonal SSM scan supports width/state up to 256; got width={width}, state={state}.");
+        if (transitionReal.Shape._dims[0] != groups || transitionImag.Rank != 2 ||
+            transitionImag.Shape._dims[0] != groups || transitionImag.Shape._dims[1] != state ||
+            inputMapReal.Rank != 3 || inputMapReal.Shape._dims[0] != groups || inputMapReal.Shape._dims[1] != state || inputMapReal.Shape._dims[2] != width ||
+            inputMapImag.Rank != 3 || inputMapImag.Shape._dims[0] != groups || inputMapImag.Shape._dims[1] != state || inputMapImag.Shape._dims[2] != width ||
+            outputMapReal.Rank != 3 || outputMapReal.Shape._dims[0] != groups || outputMapReal.Shape._dims[1] != width || outputMapReal.Shape._dims[2] != state ||
+            outputMapImag.Rank != 3 || outputMapImag.Shape._dims[0] != groups || outputMapImag.Shape._dims[1] != width || outputMapImag.Shape._dims[2] != state ||
+            skip.Rank != 2 || skip.Shape._dims[0] != groups || skip.Shape._dims[1] != width)
+            return base.ComplexDiagonalSsmScanForward(
+                input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip);
+
+        using var x = GetOrAllocateBuffer(backend, input);
+        using var ar = GetOrAllocateBuffer(backend, transitionReal);
+        using var ai = GetOrAllocateBuffer(backend, transitionImag);
+        using var br = GetOrAllocateBuffer(backend, inputMapReal);
+        using var bi = GetOrAllocateBuffer(backend, inputMapImag);
+        using var cr = GetOrAllocateBuffer(backend, outputMapReal);
+        using var ci = GetOrAllocateBuffer(backend, outputMapImag);
+        using var d = GetOrAllocateBuffer(backend, skip);
+        using var y = AllocateOutputBuffer(backend, batch * time * groups * width);
+        backend.ComplexDiagonalSsmScanForward(
+            x.Buffer, ar.Buffer, ai.Buffer, br.Buffer, bi.Buffer, cr.Buffer, ci.Buffer, d.Buffer, y.Buffer,
+            batch, time, groups, width, state);
+        var result = DeferTensorResult<T>(backend, y.Buffer, batch * time * groups * width,
+            new[] { batch, time, groups, width });
+        y.RelinquishOwnership();
+        return result;
+    }
+
     // Fused Mamba-2 SSD scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
     public override Tensor<T> Mamba2SsdScanForward<T>(
         Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam, int numHeads)

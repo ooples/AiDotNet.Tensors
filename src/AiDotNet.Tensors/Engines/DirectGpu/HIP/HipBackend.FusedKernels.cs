@@ -699,6 +699,24 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
+    public unsafe void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state)
+    {
+        if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM dimensions must be in [1,256] for width/state.");
+        if (!_kernelCache.TryGetValue("complex_diagonal_ssm_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: complex_diagonal_ssm_scan_forward");
+        IntPtr px=input.Handle, par=transitionReal.Handle, pai=transitionImag.Handle, pbr=inputMapReal.Handle,
+            pbi=inputMapImag.Handle, pcr=outputMapReal.Handle, pci=outputMapImag.Handle, pd=skip.Handle, po=output.Handle;
+        void** args = stackalloc void*[14];
+        args[0]=&px; args[1]=&par; args[2]=&pai; args[3]=&pbr; args[4]=&pbi; args[5]=&pcr; args[6]=&pci; args[7]=&pd; args[8]=&po;
+        args[9]=&batch; args[10]=&time; args[11]=&groups; args[12]=&width; args[13]=&state;
+        LaunchKernel(kernel, (uint)(batch * groups), 256, args);
+    }
+
     // ── Fused Mamba-2 SSD scan forward (#1464) ─────────────────────────────────────────────
     public unsafe void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,

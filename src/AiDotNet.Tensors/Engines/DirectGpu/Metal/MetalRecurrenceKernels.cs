@@ -219,6 +219,36 @@ kernel void mamba_selective_scan_forward(
     }
 }
 
+kernel void complex_diagonal_ssm_scan_forward(
+    device const float* X [[buffer(0)]], device const float* Ar [[buffer(1)]],
+    device const float* Ai [[buffer(2)]], device const float* Br [[buffer(3)]],
+    device const float* Bi [[buffer(4)]], device const float* Cr [[buffer(5)]],
+    device const float* Ci [[buffer(6)]], device const float* D [[buffer(7)]],
+    device float* output [[buffer(8)]], constant int& batch [[buffer(9)]],
+    constant int& time [[buffer(10)]], constant int& groups [[buffer(11)]],
+    constant int& width [[buffer(12)]], constant int& state [[buffer(13)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= batch*groups) return;
+    int b=(int)gid/groups, g=(int)gid%groups;
+    thread float hr[256], hi[256];
+    for (int n=0;n<state;n++) { hr[n]=0.0f; hi[n]=0.0f; }
+    for (int t=0;t<time;t++) {
+        int xBase=((b*time+t)*groups+g)*width;
+        for (int n=0;n<state;n++) {
+            int a=g*state+n, bm=(g*state+n)*width; float oldR=hr[n], oldI=hi[n];
+            float nextR=Ar[a]*oldR-Ai[a]*oldI, nextI=Ar[a]*oldI+Ai[a]*oldR;
+            for (int w=0;w<width;w++) { float xv=X[xBase+w]; nextR+=Br[bm+w]*xv; nextI+=Bi[bm+w]*xv; }
+            hr[n]=nextR; hi[n]=nextI;
+        }
+        for (int w=0;w<width;w++) {
+            int cm=(g*width+w)*state; float y=D[g*width+w]*X[xBase+w];
+            for (int n=0;n<state;n++) y+=Cr[cm+n]*hr[n]-Ci[cm+n]*hi[n];
+            output[xBase+w]=y;
+        }
+    }
+}
+
 // ── Mamba-2 SSD scan forward ───────────────────────────────────────────────────────────────
 kernel void mamba2_ssd_scan_forward(
     device const float* X [[buffer(0)]], device const float* delta [[buffer(1)]],

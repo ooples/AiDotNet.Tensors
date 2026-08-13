@@ -49,8 +49,37 @@ __kernel void mamba_selective_scan_forward(
         output[baseID + di] = y + D[di] * xv;
     }
 }
+
+__kernel void complex_diagonal_ssm_scan_forward(
+    __global const float* X, __global const float* Ar, __global const float* Ai,
+    __global const float* Br, __global const float* Bi,
+    __global const float* Cr, __global const float* Ci, __global const float* D,
+    __global float* output, __global float* stateR, __global float* stateI,
+    int batch, int time, int groups, int width, int state)
+{
+    int bg = get_global_id(0);
+    if (bg >= batch * groups) return;
+    int b = bg / groups, g = bg % groups;
+    int hbase = bg * state;
+    for (int n=0;n<state;n++) { stateR[hbase+n]=0.0f; stateI[hbase+n]=0.0f; }
+    for (int t=0;t<time;t++) {
+        int xBase=((b*time+t)*groups+g)*width;
+        for (int n=0;n<state;n++) {
+            int a=g*state+n, bm=(g*state+n)*width;
+            float oldR=stateR[hbase+n], oldI=stateI[hbase+n];
+            float nextR=Ar[a]*oldR-Ai[a]*oldI, nextI=Ar[a]*oldI+Ai[a]*oldR;
+            for (int w=0;w<width;w++) { float xv=X[xBase+w]; nextR+=Br[bm+w]*xv; nextI+=Bi[bm+w]*xv; }
+            stateR[hbase+n]=nextR; stateI[hbase+n]=nextI;
+        }
+        for (int w=0;w<width;w++) {
+            int cm=(g*width+w)*state; float y=D[g*width+w]*X[xBase+w];
+            for (int n=0;n<state;n++) y+=Cr[cm+n]*stateR[hbase+n]-Ci[cm+n]*stateI[hbase+n];
+            output[xBase+w]=y;
+        }
+    }
+}
 ";
     }
 
-    public static string[] GetKernelNames() => new[] { "mamba_selective_scan_forward" };
+    public static string[] GetKernelNames() => new[] { "mamba_selective_scan_forward", "complex_diagonal_ssm_scan_forward" };
 }

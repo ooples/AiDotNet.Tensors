@@ -4321,6 +4321,28 @@ public interface IEngine
         Tensor<T> dParam);
 
     /// <summary>
+    /// Fused grouped complex diagonal state-space scan with an analytic BPTT backward pass.
+    /// The recurrence is evaluated over <c>input [batch,time,group,width]</c>, using complex
+    /// transition <c>A [group,state]</c>, input map <c>B [group,state,width]</c>, output map
+    /// <c>C [group,width,state]</c>, and real diagonal skip <c>D [group,width]</c>. The returned
+    /// tensor has the same shape as <paramref name="input"/>.
+    /// </summary>
+    /// <remarks>
+    /// Real and imaginary parts are supplied separately. Callers are responsible for any continuous-
+    /// to-discrete parameterization, which keeps that parameterization visible to autodiff while the
+    /// time-dependent recurrence is represented by one tape node.
+    /// </remarks>
+    Tensor<T> ComplexDiagonalSsmScanForward<T>(
+        Tensor<T> input,
+        Tensor<T> transitionReal,
+        Tensor<T> transitionImag,
+        Tensor<T> inputMapReal,
+        Tensor<T> inputMapImag,
+        Tensor<T> outputMapReal,
+        Tensor<T> outputMapImag,
+        Tensor<T> skip);
+
+    /// <summary>
     /// Fused RG-LRU (Griffin/Hawk/RecurrentGemma) gated linear recurrence over a whole sequence as one
     /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.RgLruScan.cs</c> (#1464).
     /// </summary>

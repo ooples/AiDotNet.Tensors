@@ -170,6 +170,28 @@ void main() {
     }
 }";
 
+    public static string ComplexDiagonalSsmScan => Header + @"
+layout(set=0,binding=0) readonly buffer Xb { float X[]; };
+layout(set=0,binding=1) readonly buffer Arb { float Ar[]; };
+layout(set=0,binding=2) readonly buffer Aib { float Ai[]; };
+layout(set=0,binding=3) readonly buffer Brb { float Br[]; };
+layout(set=0,binding=4) readonly buffer Bib { float Bi[]; };
+layout(set=0,binding=5) readonly buffer Crb { float Cr[]; };
+layout(set=0,binding=6) readonly buffer Cib { float Ci[]; };
+layout(set=0,binding=7) readonly buffer Db { float D[]; };
+layout(set=0,binding=8) writeonly buffer Ob { float outp[]; };
+layout(push_constant) uniform PC { uint batch; uint time; uint groups; uint width; uint state; };
+void main() {
+    int gid=int(gl_GlobalInvocationID.x), G=int(groups), T=int(time), W=int(width), S=int(state);
+    if (gid>=int(batch)*G) return; int b=gid/G, g=gid%G; float hr[256]; float hi[256];
+    for(int n=0;n<S;n++){hr[n]=0.0;hi[n]=0.0;}
+    for(int t=0;t<T;t++) { int xb=((b*T+t)*G+g)*W;
+        for(int n=0;n<S;n++){int a=g*S+n,bm=(g*S+n)*W;float orr=hr[n],oi=hi[n];float nr=Ar[a]*orr-Ai[a]*oi,ni=Ar[a]*oi+Ai[a]*orr;
+            for(int w=0;w<W;w++){float xv=X[xb+w];nr+=Br[bm+w]*xv;ni+=Bi[bm+w]*xv;}hr[n]=nr;hi[n]=ni;}
+        for(int w=0;w<W;w++){int cm=(g*W+w)*S;float y=D[g*W+w]*X[xb+w];for(int n=0;n<S;n++)y+=Cr[cm+n]*hr[n]-Ci[cm+n]*hi[n];outp[xb+w]=y;}
+    }
+}";
+
     public static string Mamba2Ssd => Header + @"
 layout(set=0,binding=0) readonly buffer Xb { float X[]; };
 layout(set=0,binding=1) readonly buffer Dtb { float delta[]; };

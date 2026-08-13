@@ -3060,6 +3060,13 @@ public interface IDirectGpuBackend : IDisposable
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim);
 
+    /// <summary>Grouped complex diagonal state-space scan with device-resident inputs and output.</summary>
+    void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state);
+
     /// <summary>
     /// Fused Mamba-2 SSD scan forward (#1464). x: [batch, seqLen, innerDim];
     /// delta: [batch, seqLen, numHeads]; aLog/dParam: [numHeads]; bParam/cParam: [batch, seqLen, stateDim];
