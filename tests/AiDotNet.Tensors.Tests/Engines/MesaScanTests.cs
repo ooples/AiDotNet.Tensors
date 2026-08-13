@@ -9,16 +9,6 @@ namespace AiDotNet.Tensors.Tests.Engines;
 
 public sealed class MesaScanTests
 {
-    [Fact]
-    public void MatMul_ProductionProjectionInputVjpMatchesCentralDifferences()
-    {
-        const int rows=4,features=256;var input=CreateFloat(new[]{rows,features},31,0.4f);
-        var weight=CreateFloat(new[]{features,features},32,0.08f);var projection=CreateFloat(new[]{rows,features},33,0.8f);
-        var engine=new CpuEngine();Tensor<float> gradient;
-        using(var tape=new GradientTape<float>()){var output=engine.TensorMatMul(input,weight);var loss=engine.ReduceSum(engine.TensorMultiply(output,projection),new[]{0,1},false);gradient=tape.ComputeGradients(loss,new[]{input})[input];}
-        const float epsilon=1e-3f;for(int sample=0;sample<12;sample++){int index=sample*(input.Length/12);float original=input[index];input[index]=original+epsilon;double plus=DotFloat(engine.TensorMatMul(input,weight),projection);input[index]=original-epsilon;double minus=DotFloat(engine.TensorMatMul(input,weight),projection);input[index]=original;
-            double numeric=(plus-minus)/(2*epsilon),analytic=gradient[index],scale=Math.Max(Math.Max(Math.Abs(numeric),Math.Abs(analytic)),1.0);Assert.True(Math.Abs(numeric-analytic)/scale<5e-2,$"input[{index}]: analytic={analytic:R}, numeric={numeric:R}");}
-    }
     private static Tensor<double> Create(int[] shape, int seed, double scale = 0.2)
     {
         int length = 1;

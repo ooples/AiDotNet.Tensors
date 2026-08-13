@@ -163,55 +163,18 @@ public partial class CpuEngine
         // projection amplifies the VJP error by orders of magnitude. Keep the public storage and
         // result float32, but perform the sequential state evolution in float64, like mixed-precision
         // optimizers keep their master state in FP32 for FP16 parameters.
-        int matrixSize = dim * dim;
-        double invLambda = 1.0 / regularization;
-        for (int b = 0; b < batch; b++)
-            for (int h = 0; h < heads; h++)
-            {
-                int w0Base = h * matrixSize;
-                var weights = new double[matrixSize];
-                var covariance = new double[matrixSize];
-                for (int i = 0; i < matrixSize; i++) weights[i] = w0[w0Base + i];
-                for (int i = 0; i < dim; i++) covariance[i * dim + i] = invLambda;
-                var pk = new double[dim];
-                var error = new double[dim];
-                var row = new double[dim];
-                for (int t = 0; t < time; t++)
-                {
-                    int vectorBase = (b * time + t) * model + h * dim;
-                    for (int i = 0; i < dim; i++)
-                    {
-                        double sum = 0;
-                        for (int j = 0; j < dim; j++) sum += covariance[i * dim + j] * k[vectorBase + j];
-                        pk[i] = sum;
-                    }
-                    double denominator = 1;
-                    for (int i = 0; i < dim; i++) denominator += k[vectorBase + i] * pk[i];
-                    for (int i = 0; i < dim; i++)
-                        for (int j = 0; j < dim; j++)
-                            covariance[i * dim + j] -= pk[i] * pk[j] / denominator;
-                    for (int i = 0; i < dim; i++)
-                    {
-                        double prediction = 0;
-                        for (int j = 0; j < dim; j++) prediction += weights[i * dim + j] * k[vectorBase + j];
-                        error[i] = prediction - v[vectorBase + i];
-                    }
-                    for (int j = 0; j < dim; j++)
-                    {
-                        double sum = 0;
-                        for (int i = 0; i < dim; i++) sum += k[vectorBase + i] * covariance[i * dim + j];
-                        row[j] = sum;
-                    }
-                    for (int i = 0; i < dim; i++)
-                        for (int j = 0; j < dim; j++) weights[i * dim + j] -= error[i] * row[j];
-                    for (int i = 0; i < dim; i++)
-                    {
-                        double sum = 0;
-                        for (int j = 0; j < dim; j++) sum += weights[i * dim + j] * q[vectorBase + j];
-                        output[vectorBase + i] = (float)sum;
-                    }
-                }
-            }
+        double[] qDouble = Array.ConvertAll(q, static value => (double)value);
+        double[] kDouble = Array.ConvertAll(k, static value => (double)value);
+        double[] vDouble = Array.ConvertAll(v, static value => (double)value);
+        double[] w0Double = Array.ConvertAll(w0, static value => (double)value);
+        var outputDouble = new double[output.Length];
+
+        MesaForwardCore(
+            qDouble, kDouble, vDouble, w0Double, outputDouble, regularization,
+            batch, time, model, heads, dim);
+
+        for (int i = 0; i < output.Length; i++)
+            output[i] = (float)outputDouble[i];
     }
 
     protected static void MesaScanBackward<T>(

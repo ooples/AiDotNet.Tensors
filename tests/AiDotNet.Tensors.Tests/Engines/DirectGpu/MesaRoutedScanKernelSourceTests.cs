@@ -18,6 +18,8 @@ public sealed class MesaRoutedScanKernelSourceTests
         string source=GetStaticString(typeName,memberName);
         Assert.Contains("mesa_scan_forward",source,StringComparison.Ordinal);
         Assert.Contains("routed_diagonal_ssm_scan_forward",source,StringComparison.Ordinal);
+        Assert.Contains("denom",source,StringComparison.Ordinal);
+        Assert.Contains("covariance",source,StringComparison.OrdinalIgnoreCase);
         Assert.Contains("active*next",source,StringComparison.Ordinal);
         Assert.Contains("active*y",source,StringComparison.Ordinal);
     }

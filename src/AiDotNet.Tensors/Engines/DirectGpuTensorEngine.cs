@@ -10164,21 +10164,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
             input.Rank != 3 || activeMask.Rank != 3 || transition.Rank != 2)
             return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
-        int batch=input.Shape._dims[0], time=input.Shape._dims[1], model=input.Shape._dims[2];
-        int experts=activeMask.Shape._dims[2], state=transition.Shape._dims[1];
-        if (batch<=0 || time<=0 || model<=0 || experts<=0 || state<=0 || state>64 ||
-            activeMask.Shape._dims[0]!=batch || activeMask.Shape._dims[1]!=time ||
-            transition.Shape._dims[0]!=experts || inputMap.Rank!=3 || inputMap.Shape._dims[0]!=experts || inputMap.Shape._dims[1]!=state || inputMap.Shape._dims[2]!=model ||
-            outputMap.Rank!=3 || outputMap.Shape._dims[0]!=experts || outputMap.Shape._dims[1]!=model || outputMap.Shape._dims[2]!=state ||
-            skip.Rank!=2 || skip.Shape._dims[0]!=experts || skip.Shape._dims[1]!=model)
+        int batch = input.Shape._dims[0];
+        int time = input.Shape._dims[1];
+        int model = input.Shape._dims[2];
+        int experts = activeMask.Shape._dims[2];
+        int state = transition.Shape._dims[1];
+        if (batch <= 0 || time <= 0 || model <= 0 || experts <= 0 || state <= 0 || state > 64 ||
+            activeMask.Shape._dims[0] != batch || activeMask.Shape._dims[1] != time ||
+            transition.Shape._dims[0] != experts ||
+            inputMap.Rank != 3 || inputMap.Shape._dims[0] != experts ||
+            inputMap.Shape._dims[1] != state || inputMap.Shape._dims[2] != model ||
+            outputMap.Rank != 3 || outputMap.Shape._dims[0] != experts ||
+            outputMap.Shape._dims[1] != model || outputMap.Shape._dims[2] != state ||
+            skip.Rank != 2 || skip.Shape._dims[0] != experts || skip.Shape._dims[1] != model)
             return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
-        using var x=GetOrAllocateBuffer(backend,input);using var m=GetOrAllocateBuffer(backend,activeMask);
-        using var a=GetOrAllocateBuffer(backend,transition);using var ib=GetOrAllocateBuffer(backend,inputMap);
-        using var oc=GetOrAllocateBuffer(backend,outputMap);using var d=GetOrAllocateBuffer(backend,skip);
-        using var y=AllocateOutputBuffer(backend,batch*time*experts*model);
-        using var h=AllocateOutputBuffer(backend,batch*experts*state);
-        backend.RoutedDiagonalSsmScanForward(x.Buffer,m.Buffer,a.Buffer,ib.Buffer,oc.Buffer,d.Buffer,y.Buffer,h.Buffer,batch,time,model,experts,state);
-        var result=DeferTensorResult<T>(backend,y.Buffer,batch*time*experts*model,new[]{batch,time,experts,model});
+
+        using var x = GetOrAllocateBuffer(backend, input);
+        using var m = GetOrAllocateBuffer(backend, activeMask);
+        using var a = GetOrAllocateBuffer(backend, transition);
+        using var ib = GetOrAllocateBuffer(backend, inputMap);
+        using var oc = GetOrAllocateBuffer(backend, outputMap);
+        using var d = GetOrAllocateBuffer(backend, skip);
+        using var y = AllocateOutputBuffer(backend, batch * time * experts * model);
+        using var h = AllocateOutputBuffer(backend, batch * experts * state);
+        backend.RoutedDiagonalSsmScanForward(
+            x.Buffer, m.Buffer, a.Buffer, ib.Buffer, oc.Buffer, d.Buffer, y.Buffer, h.Buffer,
+            batch, time, model, experts, state);
+        var result = DeferTensorResult<T>(
+            backend, y.Buffer, batch * time * experts * model,
+            new[] { batch, time, experts, model });
         y.RelinquishOwnership();
         Autodiff.DifferentiableOps.RecordIfActive(
             "RoutedDiagonalSsmScanForward", result,
