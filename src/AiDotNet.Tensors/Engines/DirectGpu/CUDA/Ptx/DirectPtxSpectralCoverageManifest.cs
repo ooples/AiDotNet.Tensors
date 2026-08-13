@@ -4,6 +4,12 @@ using System.Linq;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
+// PEER-BACKEND COVERAGE. Every cell in this manifest is implemented as a CUDA
+// Direct PTX kernel only; there is no equivalent HIP, Metal, OpenCL, Vulkan or
+// WebGPU kernel for any of them. That gap is tracked per backend in issue #941
+// (parent #850), following the same shape as #682. A cell must not be admitted
+// as CUDA-only without that follow-up remaining open.
+
 internal enum DirectPtxSpectralCoverageStatus
 {
     ExistingBackend,
