@@ -653,6 +653,17 @@ internal static class SimdConvHelper
         }
     }
 
+    [MethodImpl(HotInline)]
+    private static void GetInteriorRowRange(int outputHeight, int padding, out int start, out int end)
+    {
+        int boundaryRows = Math.Max(0, padding);
+        start = Math.Min(boundaryRows, outputHeight);
+        // Clamp the bottom boundary after the top boundary. Without this,
+        // inputs whose padded output is shorter than both boundary regions
+        // process the same row in both loops (for example, 1x1 + 3x3/pad1).
+        end = Math.Max(start, outputHeight - boundaryRows);
+    }
+
     /// <summary>
     /// Per-(ic, oc) Vector256&lt;double&gt; 3×3 conv. Loads 9 broadcasted kernel
     /// values, then sweeps the output rows with 4-double FMA accumulators.
@@ -677,9 +688,7 @@ internal static class SimdConvHelper
 
         if (dilationH == 1 && dilationW == 1)
         {
-            int ohStart = padH > 0 ? padH : 0;
-            int ohEnd = outHeight - (padH > 0 ? padH : 0);
-            if (ohEnd > outHeight) ohEnd = outHeight;
+            GetInteriorRowRange(outHeight, padH, out int ohStart, out int ohEnd);
 
             // Top boundary rows
             for (int topOh = 0; topOh < ohStart && topOh < outHeight; topOh++)
@@ -1651,9 +1660,7 @@ internal static class SimdConvHelper
         if (dilationH == 1 && dilationW == 1)
         {
             // Process interior rows (no top/bottom boundary)
-            int ohStart = padH > 0 ? padH : 0;
-            int ohEnd = outHeight - (padH > 0 ? padH : 0);
-            if (ohEnd > outHeight) ohEnd = outHeight;
+            GetInteriorRowRange(outHeight, padH, out int ohStart, out int ohEnd);
 
             // Handle boundary rows at top
             for (int topOh = 0; topOh < ohStart && topOh < outHeight; topOh++)
@@ -1979,9 +1986,7 @@ internal static class SimdConvHelper
         if (dilationH == 1 && dilationW == 1)
         {
             // Process interior rows (no top/bottom boundary)
-            int ohStart = padH > 0 ? padH : 0;
-            int ohEnd = outHeight - (padH > 0 ? padH : 0);
-            if (ohEnd > outHeight) ohEnd = outHeight;
+            GetInteriorRowRange(outHeight, padH, out int ohStart, out int ohEnd);
 
             // Handle boundary rows at top
             for (int oh = 0; oh < ohStart && oh < outHeight; oh++)

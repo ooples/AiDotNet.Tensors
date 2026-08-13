@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// reasoning that wrote the backward, would agree with a wrong backward.
 /// </para>
 /// </remarks>
+[Collection("EngineCurrentGlobalState")]
 public class FanOutGradientAccumulationTests
 {
     private static IEngine Engine => AiDotNetEngine.Current;
@@ -92,6 +93,40 @@ public class FanOutGradientAccumulationTests
                     + "received ONE branch's gradient instead of the sum of all branches.");
             }
         }
+    }
+
+    [Fact]
+    public async Task FirstWriteGradientSlots_OwnIndependentStorage()
+    {
+        await Task.Yield();
+
+        using var tape = new GradientTape<double>();
+        var x = Vec(0.5, -1.25, 2.0);
+        var y = Vec(-0.75, 1.5, 0.25);
+        var loss = SumAll(Engine.TensorAdd(x, y));
+
+        var grads = tape.ComputeGradients(loss, new List<Tensor<double>> { x, y });
+
+        Assert.NotSame(grads[x], grads[y]);
+        double originalY = grads[y][0];
+        grads[x][0] = 17.0;
+        Assert.Equal(originalY, grads[y][0]);
+    }
+
+    [Fact]
+    public async Task NestedIdentityFanOut_AccumulatesEveryPathExactlyOnce()
+    {
+        await Task.Yield();
+
+        using var tape = new GradientTape<double>();
+        var x = Vec(0.5, -1.25, 2.0);
+        var left = Engine.TensorAdd(x, x);
+        var right = Engine.TensorAdd(x, x);
+        var loss = SumAll(Engine.TensorAdd(left, right));
+
+        var grads = tape.ComputeGradients(loss, new List<Tensor<double>> { x });
+
+        AssertClose(new[] { 4.0, 4.0, 4.0 }, grads[x].ToArray(), "nested identity fan-out", 1e-12);
     }
 
     [Fact]
