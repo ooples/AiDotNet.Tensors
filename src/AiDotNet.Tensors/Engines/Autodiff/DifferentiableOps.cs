@@ -591,7 +591,15 @@ internal static class DifferentiableOps
             try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                 $"[ALIAS] accumgrad op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}: gradRes={grad.TryGetGpuBuffer() is not null} gradContig={grad.IsContiguous} existRes={(exi?.TryGetGpuBuffer() is not null)}" + System.Environment.NewLine); } catch { }
         }
-        var gradForInPlace = grad.IsContiguous ? grad : grad.Contiguous();
+        // LAZY, because the out-of-place path never uses it. Computing this eagerly called
+        // .Contiguous() on every non-contiguous incoming gradient even when needsOutOfPlace is
+        // true -- and that branch deliberately keeps `grad` itself, so the materialized copy was
+        // allocated, never read, and immediately garbage. Backward ops that permute, reshape or
+        // slice always hand in a non-contiguous view, so this fired on exactly the ops most likely
+        // to carry a full parameter-sized gradient.
+        Tensor<T>? gradForInPlaceCache = null;
+        Tensor<T> GradForInPlace() =>
+            gradForInPlaceCache ??= (grad.IsContiguous ? grad : grad.Contiguous());
 
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
         int idx = tensor._gradIndex;
@@ -626,14 +634,14 @@ internal static class DifferentiableOps
                     // another input has had a chance to consume it. Detach this
                     // one slot out-of-place; ordinary unique accumulation stays
                     // on the zero-allocation in-place path.
-                    if (HasOverlappingStorage(existing, gradForInPlace))
+                    if (HasOverlappingStorage(existing, GradForInPlace()))
                     {
-                        accumulated = AddAliasedContributionOutOfPlace(existing, gradForInPlace, engine);
+                        accumulated = AddAliasedContributionOutOfPlace(existing, GradForInPlace(), engine);
                         ReplaceAccumulatorBufferOwner(tensor, existing, accumulated);
                     }
                     else
                     {
-                        engine.TensorAddInPlace(existing, gradForInPlace);
+                        engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;
                     }
                 }
@@ -648,7 +656,7 @@ internal static class DifferentiableOps
                 // isolates a contribution already owned by another slot.
                 var stored = needsOutOfPlace
                     ? grad
-                    : TakeAccumulatorBuffer(tensor, gradForInPlace);
+                    : TakeAccumulatorBuffer(tensor, GradForInPlace());
                 _indexedGrads[idx] = stored;
                 tensor.Grad = stored;
             }
@@ -674,16 +682,16 @@ internal static class DifferentiableOps
                     grads[tensor] = existingDict;
                     ReplaceAccumulatorBufferOwner(tensor, previous, existingDict);
                 }
-                if (HasOverlappingStorage(existingDict, gradForInPlace))
+                if (HasOverlappingStorage(existingDict, GradForInPlace()))
                 {
-                    var accumulated = AddAliasedContributionOutOfPlace(existingDict, gradForInPlace, engine);
+                    var accumulated = AddAliasedContributionOutOfPlace(existingDict, GradForInPlace(), engine);
                     grads[tensor] = accumulated;
                     tensor.Grad = accumulated;
                     ReplaceAccumulatorBufferOwner(tensor, existingDict, accumulated);
                 }
                 else
                 {
-                    engine.TensorAddInPlace(existingDict, gradForInPlace);
+                    engine.TensorAddInPlace(existingDict, GradForInPlace());
                     tensor.Grad = existingDict;
                 }
             }
@@ -692,7 +700,7 @@ internal static class DifferentiableOps
         {
             var stored = needsOutOfPlace
                 ? grad
-                : TakeAccumulatorBuffer(tensor, gradForInPlace);
+                : TakeAccumulatorBuffer(tensor, GradForInPlace());
             grads[tensor] = stored;
             tensor.Grad = stored;
         }
