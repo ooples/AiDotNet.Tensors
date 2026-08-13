@@ -7970,10 +7970,14 @@ internal static class BackwardFunctions<T>
         {
             int n = (int)numOps.ToDouble(b[k * 5]);
             if (n < 0 || n >= N) continue;
-            int x1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 1]) * spatialScale);
-            int y1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 2]) * spatialScale);
-            int x2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 3]) * spatialScale);
-            int y2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 4]) * spatialScale);
+            // Reconstruct bin bounds with the same away-from-zero rule the forward
+            // RoIPool uses. Math.Round's default ties-to-even would place a
+            // half-valued coordinate in a different pixel than the forward pass,
+            // scattering the gradient to the wrong argmax pixel.
+            int x1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 1]) * spatialScale, MidpointRounding.AwayFromZero);
+            int y1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 2]) * spatialScale, MidpointRounding.AwayFromZero);
+            int x2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 3]) * spatialScale, MidpointRounding.AwayFromZero);
+            int y2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 4]) * spatialScale, MidpointRounding.AwayFromZero);
             int roiW = Math.Max(x2 - x1 + 1, 1);
             int roiH = Math.Max(y2 - y1 + 1, 1);
             double binH = (double)roiH / outH;

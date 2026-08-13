@@ -73,6 +73,16 @@ public static class OpParityRegistry
             e => e.GumbelSoftmax(singletonLogits.D(), 0.7, false, 1),
             ParityTol.Exact, opMethod: "GumbelSoftmax");
 
+        var categoricalProbabilitiesData = new double[64];
+        categoricalProbabilitiesData[0] = 1.0;
+        categoricalProbabilitiesData[32] = 1.0;
+        var categoricalProbabilities = OpInput.From(
+            categoricalProbabilitiesData, new[] { 2, 32 });
+        yield return new OpCase("TensorCategoricalSample[2,32;seeded-onehot]", "random",
+            e => e.TensorCategoricalSample(categoricalProbabilities.F(), -1, 42),
+            e => e.TensorCategoricalSample(categoricalProbabilities.D(), -1, 42),
+            ParityTol.Exact, opMethod: "TensorCategoricalSample");
+
         var constantSamples = OpInput.From(Enumerable.Repeat(2.0, 8).ToArray(), new[] { 2, 4 });
         var importanceWeights = OpInput.From(
             new[] { 1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0 }, new[] { 2, 4 });
