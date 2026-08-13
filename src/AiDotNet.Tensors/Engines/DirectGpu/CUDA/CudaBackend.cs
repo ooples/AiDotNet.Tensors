@@ -314,6 +314,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public CudaBackend(int deviceIndex)
     {
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
+        // Resolve explicit configuration before native probing or the availability fallback. A
+        // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
+        // be hidden by converting the backend into an unavailable instance.
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
@@ -362,7 +366,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // tracked as follow-up work.
             MaxBufferAllocBytes = (long)totalMem;
 
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuCtxCreate(
+                    out _cudaContext, contextScheduling, device),
+                "cuCtxCreate");
             LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
@@ -5096,13 +5103,36 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     internal void EnsureContextCurrent()
     {
         IntPtr ctx = _cudaContext;
-        if (ctx != IntPtr.Zero && !IsRuntimeTearingDown && LiveContexts.ContainsKey(ctx))
-            CudaNativeBindings.cuCtxSetCurrent(ctx);
+        if (ctx != IntPtr.Zero && _threadCurrentContext != ctx && !IsRuntimeTearingDown &&
+            LiveContexts.ContainsKey(ctx))
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuCtxSetCurrent(ctx),
+                "cuCtxSetCurrent");
+            // PushContext already relies on this per-thread ownership marker. Keep the set-current
+            // path coherent with it so every resident direct kernel does not repeat a native context
+            // call after this thread has been validated for the same backend.
+            _threadCurrentContext = ctx;
+        }
         DrainPendingFinalizerFrees();
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
         DrainPendingContextDestroys();
+    }
+
+    /// <summary>
+    /// Fast current-context assertion for an already-validated bound launch. Deferred finalizer
+    /// work still forces the complete path; the common case is a thread-local comparison only.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void EnsureContextCurrentForBoundLaunch()
+    {
+        if (_threadCurrentContext == _cudaContext &&
+            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty)
+            return;
+        EnsureContextCurrent();
     }
 
     // #226 CONCURRENCY FIX: the calling thread's OWN cuBLAS handle for THIS engine (created lazily on first
@@ -16552,16 +16582,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (_cudaContext != IntPtr.Zero)
         {
+            IntPtr context = _cudaContext;
             // Unregister + destroy under the lifecycle lock so a concurrent buffer finalizer can't
             // observe the context as live and then fault on it after we destroy it (TOCTOU). A buffer
             // finalized after this point sees it gone and skips its native free (cuCtxDestroy reclaims
             // that memory anyway).
             lock (ContextLifecycleLock)
             {
-                LiveContexts.TryRemove(_cudaContext, out _);
-                CuBlasNative.cuCtxDestroy(_cudaContext);
+                LiveContexts.TryRemove(context, out _);
+                CuBlasNative.cuCtxDestroy(context);
                 _cudaContext = IntPtr.Zero;
             }
+            if (_threadCurrentContext == context) _threadCurrentContext = IntPtr.Zero;
         }
 
         GC.SuppressFinalize(this);
