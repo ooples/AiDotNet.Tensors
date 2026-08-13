@@ -3749,6 +3749,18 @@ public partial class DirectGpuTensorEngine
         => TensorSearchSorted(boundaries, input, right);
 
     /// <inheritdoc/>
+    public new (Tensor<T> X, Tensor<T> Y) TensorMeshgrid<T>(Tensor<T> x, Tensor<T> y)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (y is null) throw new ArgumentNullException(nameof(y));
+        Tensor<T>[] grids = TensorMeshgrid([x, y], "xy");
+        return (grids[0], grids[1]);
+    }
+
+    (Tensor<T> X, Tensor<T> Y) IEngine.TensorMeshgrid<T>(Tensor<T> x, Tensor<T> y) =>
+        TensorMeshgrid(x, y);
+
+    /// <inheritdoc/>
     public override Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij")
     {
         if (tensors is null) throw new ArgumentNullException(nameof(tensors));
@@ -3760,7 +3772,7 @@ public partial class DirectGpuTensorEngine
         }
         if (indexing != "ij" && indexing != "xy")
             throw new ArgumentException("indexing must be 'ij' or 'xy'");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out _))
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.TensorMeshgrid(tensors, indexing);
 
         // Each output grid k = input k reshaped onto its output axis (size n_k, 1s elsewhere) then
@@ -3772,6 +3784,45 @@ public partial class DirectGpuTensorEngine
             for (int i = 0; i < d; i++) outShape[i] = tensors[i]._shape[0];
             bool xy = indexing == "xy" && d >= 2;
             if (xy) { int tmp = outShape[0]; outShape[0] = outShape[1]; outShape[1] = tmp; }
+
+            if (d == 2 && !IsTapeActive<T>() &&
+                backend is IDirectPtxVisionBackend directPtx &&
+                directPtx.CanDirectPtxMeshgrid2D(
+                    tensors[0]._shape[0], tensors[1]._shape[0], xy))
+            {
+                int n0 = tensors[0]._shape[0], n1 = tensors[1]._shape[0];
+                int outputLength = checked(n0 * n1);
+                using var source0 = GetOrAllocateBuffer(backend, tensors[0]);
+                using var source1 = GetOrAllocateBuffer(backend, tensors[1]);
+                IGpuBuffer? output0 = null, output1 = null;
+                Tensor<T>? direct0 = null, direct1 = null;
+                try
+                {
+                    output0 = backend.AllocateBuffer(outputLength);
+                    output1 = backend.AllocateBuffer(outputLength);
+                    if (directPtx.TryDirectPtxMeshgrid2DPair(
+                            source0.Buffer, source1.Buffer, output0, output1,
+                            n0, n1, xy))
+                    {
+                        direct0 = DeferTensorResult<T>(backend, output0, outputLength, outShape);
+                        output0 = null;
+                        direct1 = DeferTensorResult<T>(backend, output1, outputLength, outShape);
+                        output1 = null;
+                        return [direct0, direct1];
+                    }
+                }
+                catch
+                {
+                    direct0?.Dispose();
+                    direct1?.Dispose();
+                    throw;
+                }
+                finally
+                {
+                    output0?.Dispose();
+                    output1?.Dispose();
+                }
+            }
 
             var result = new Tensor<T>[d];
             for (int k = 0; k < d; k++)
@@ -7076,11 +7127,29 @@ public partial class DirectGpuTensorEngine
         using (new NoGradScope<T>())
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var uniform = ((IEngine)this).TensorRandomUniform<T>(input.Shape.ToArray());
-            var clamped = TensorClamp(uniform, numOps.FromDouble(1e-10), numOps.FromDouble(1.0 - 1e-10));
-            var gumbel = TensorNegate(TensorLog(TensorNegate(TensorLog(clamped))));
-            var perturbed = TensorDivideScalar(TensorAdd(input, gumbel), numOps.FromDouble(temperature));
-            softResult = ((IEngine)this).TensorSoftmax(perturbed, normalizedAxis);
+            int innerSize = input.Shape._dims[normalizedAxis];
+            bool contiguousLastAxis = normalizedAxis == input.Rank - 1 && input.IsContiguous;
+            if (contiguousLastAxis && backend is IGpuBatchExecution batchBackend)
+            {
+                int outerSize = input.Length / innerSize;
+                using var inputBuffer = GetOrAllocateBuffer(backend, input);
+                ulong seed = (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
+                softResult = DispatchDeferredGpuOp<T>(
+                    backend,
+                    input.Length,
+                    input.Shape.ToArray(),
+                    output => batchBackend.GumbelSoftmax(
+                        inputBuffer.Buffer, output, outerSize, innerSize,
+                        Convert.ToSingle(temperature), seed));
+            }
+            else
+            {
+                var uniform = ((IEngine)this).TensorRandomUniform<T>(input.Shape.ToArray());
+                var clamped = TensorClamp(uniform, numOps.FromDouble(1e-10), numOps.FromDouble(1.0 - 1e-10));
+                var gumbel = TensorNegate(TensorLog(TensorNegate(TensorLog(clamped))));
+                var perturbed = TensorDivideScalar(TensorAdd(input, gumbel), numOps.FromDouble(temperature));
+                softResult = ((IEngine)this).TensorSoftmax(perturbed, normalizedAxis);
+            }
 
             if (!hard)
             {
@@ -7109,6 +7178,80 @@ public partial class DirectGpuTensorEngine
         return result;
     }
 
+    Tensor<T> IEngine.TensorCategoricalSample<T>(
+        Tensor<T> probabilities,
+        int axis,
+        int? seed)
+    {
+        if (probabilities is null) throw new ArgumentNullException(nameof(probabilities));
+        int normalizedAxis = axis < 0 ? probabilities.Rank + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= probabilities.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis));
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive ||
+            normalizedAxis != probabilities.Rank - 1 || !probabilities.IsContiguous ||
+            !TryGetBackend(out var backend))
+            return base.TensorCategoricalSample(probabilities, axis, seed);
+
+        int classes = probabilities.Shape[normalizedAxis];
+        int rows = probabilities.Length / classes;
+        ulong deviceSeed = seed.HasValue
+            ? unchecked((ulong)(uint)seed.Value)
+            : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
+
+        if (backend is ICategoricalSamplingBackend categorical &&
+            categorical.CanCategoricalSample(rows, classes))
+        {
+            using var probabilityBuffer = GetOrAllocateBuffer(backend, probabilities);
+            return DispatchDeferredGpuOp<T>(
+                backend,
+                probabilities.Length,
+                probabilities.Shape.ToArray(),
+                output =>
+                {
+                    if (!categorical.TryCategoricalSample(
+                            probabilityBuffer.Buffer, output, rows, classes, deviceSeed))
+                        throw new NotSupportedException(
+                            "The current backend does not admit this categorical PTX specialization.");
+                });
+        }
+
+        // The direct-PTX rollout is disabled by default. Preserve a resident CUDA/Vulkan
+        // fallback by applying the Gumbel-max identity:
+        // argmax(log(probability) + Gumbel(0, 1)) is an exact categorical draw.
+        // This keeps the operation on device and honors the public seed without creating
+        // a global CDF; the fallback needs only a compact one-index-per-row scratch buffer.
+        var seededGumbelBackend = backend as ISeededGumbelSoftmaxBackend;
+        var batchBackend = backend as IGpuBatchExecution;
+        if (seededGumbelBackend is null && batchBackend is null)
+            return base.TensorCategoricalSample(probabilities, axis, seed);
+        using (new NoGradScope<T>())
+        {
+            using var logProbabilities = TensorLog(probabilities);
+            using var logBuffer = GetOrAllocateBuffer(backend, logProbabilities);
+            using var softSample = DispatchDeferredGpuOp<T>(
+                backend,
+                probabilities.Length,
+                probabilities.Shape.ToArray(),
+                output =>
+                {
+                    if (seededGumbelBackend is not null)
+                        seededGumbelBackend.GumbelSoftmax(
+                            logBuffer.Buffer, output, rows, classes, 1f, deviceSeed);
+                    else
+                        batchBackend!.GumbelSoftmax(
+                            logBuffer.Buffer, output, rows, classes, 1f, deviceSeed);
+                });
+            using var softBuffer = GetOrAllocateBuffer(backend, softSample);
+            using var selectedIndices = backend.AllocateBuffer(rows);
+            backend.ArgMaxAxis(softBuffer.Buffer, selectedIndices, rows, classes);
+            return DispatchDeferredGpuOp<T>(
+                backend,
+                probabilities.Length,
+                probabilities.Shape.ToArray(),
+                output => backend.OneHotKernel(selectedIndices, output, rows, classes));
+        }
+    }
+
     // #775: Gumbel-softmax backward = softmax backward scaled by 1/temperature (the gradient flows
     // through the softmax, divided by the temperature). Reuse the GPU-resident SoftmaxBackward (via the
     // interface so the override is hit) then TensorMultiplyScalar. Defer to base under tape/GraphMode.
@@ -7116,6 +7259,32 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || temperature <= 0)
             return base.GumbelSoftmaxBackward(gradOutput, output, temperature, axis);
+        int normalizedAxis = axis < 0 ? output.Rank + axis : axis;
+        if (typeof(T) == typeof(float) && normalizedAxis >= 0 &&
+            normalizedAxis == output.Rank - 1 &&
+            output.IsContiguous && gradOutput.IsContiguous &&
+            TryGetBackend(out var backend) && backend is IGumbelSoftmaxBackwardBackend gumbelBackward)
+        {
+            int classes = output.Shape[normalizedAxis];
+            int rows = output.Length / classes;
+            if (gumbelBackward.CanGumbelSoftmaxBackward(rows, classes))
+            {
+                using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+                using var outputBuffer = GetOrAllocateBuffer(backend, output);
+                return DispatchDeferredGpuOp<T>(
+                    backend,
+                    output.Length,
+                    output.Shape.ToArray(),
+                    gradInput =>
+                    {
+                        if (!gumbelBackward.TryGumbelSoftmaxBackward(
+                                gradOutputBuffer.Buffer, outputBuffer.Buffer, gradInput,
+                                rows, classes, Convert.ToSingle(temperature)))
+                            throw new NotSupportedException(
+                                "The admitted Gumbel-softmax backward PTX specialization rejected dispatch.");
+                    });
+            }
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var softmaxGrad = ((IEngine)this).SoftmaxBackward(gradOutput, output, axis);
         return TensorMultiplyScalar(softmaxGrad, numOps.FromDouble(1.0 / temperature));

@@ -92,6 +92,63 @@ class Program
             DirectPtxQkvRopeCacheExperiment.Run(runs, includeExternal);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-vision-box-iou")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxVisionBoxIouExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-vision-family")
+        {
+            // Documented usage: --direct-ptx-vision-family [runs] [operation].
+            // Parse the optional run count first, then the optional operation, and
+            // reject any trailing token the handler cannot consume instead of
+            // silently discarding it.
+            int runs = 3;
+            int index = 1;
+            if (index < args.Length && int.TryParse(args[index], out int parsedRuns))
+            {
+                runs = parsedRuns;
+                index++;
+            }
+            string? operation = null;
+            if (index < args.Length)
+            {
+                operation = args[index];
+                index++;
+            }
+            if (index < args.Length)
+            {
+                Console.Error.WriteLine(
+                    "Usage: --direct-ptx-vision-family [runs] [operation]");
+                Environment.ExitCode = 1;
+                return;
+            }
+            DirectPtxVisionFamilyExperiment.Run(runs, operation);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-rng-dropout")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxRngDropoutExperiment.Run(runs, includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-rng-stochastic")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            int familyIndex = Array.IndexOf(args, "--family");
+            string? family = familyIndex >= 0 && familyIndex + 1 < args.Length
+                ? args[familyIndex + 1]
+                : null;
+            int operationIndex = Array.IndexOf(args, "--operation");
+            string? operation = operationIndex >= 0 && operationIndex + 1 < args.Length
+                ? args[operationIndex + 1]
+                : null;
+            DirectPtxRngStochasticExperiment.Run(runs, includeExternal, family, operation);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -429,6 +486,21 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-qkv-rope-cache")
         {
             DirectPtxProfileTarget.RunQkvRopeCache();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-vision-box-iou")
+        {
+            DirectPtxProfileTarget.RunVisionBoxIou();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-dropout")
+        {
+            DirectPtxProfileTarget.RunRngDropout();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-stochastic")
+        {
+            DirectPtxProfileTarget.RunRngStochastic();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")
@@ -1390,6 +1462,8 @@ class Program
         Console.WriteLine("  --direct-ptx-normalization [runs] [all|row|row256|row2048|row8192|channel]: issue #838 resident production-route screen");
         Console.WriteLine("  --export-direct-ptx-normalization-cubins [directory]: compile and preserve release SM86 cubins");
         Console.WriteLine("  --audit-direct-ptx-normalization-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
+        Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
+        Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
         Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
         Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
@@ -1409,6 +1483,7 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");
         Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
         Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
+        Console.WriteLine("  --direct-ptx-profile-vision-box-iou: deterministic Nsight Compute vision target");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
         Console.WriteLine("  --kernel-oracle: generated-family performance vs spec-derived ceilings");
