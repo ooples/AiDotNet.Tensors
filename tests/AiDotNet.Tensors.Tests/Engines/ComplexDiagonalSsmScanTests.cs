@@ -87,6 +87,87 @@ public sealed class ComplexDiagonalSsmScanTests
     }
 
     [Fact]
+    public void Backward_AllEightInputsMatchProjectedCentralFiniteDifferences()
+    {
+        const int batch = 1, time = 4, groups = 3, width = 2, state = 2;
+        Tensor<double>[] p = Inputs(batch, time, groups, width, state);
+        var projection = Tensor(new[] { batch, time, groups, width }, 19, 0.7);
+        var engine = new CpuEngine();
+        Dictionary<Tensor<double>, Tensor<double>> gradients;
+
+        using (var tape = new GradientTape<double>())
+        {
+            Tensor<double> projected = engine.TensorMultiply(Scan(engine, p), projection);
+            Tensor<double> objective = engine.ReduceSum(projected, new[] { 0, 1, 2, 3 }, keepDims: false);
+            gradients = tape.ComputeGradients(objective, p);
+        }
+
+        const double epsilon = 1e-6;
+        foreach (Tensor<double> parameter in p)
+        {
+            double[] data = parameter.GetDataArray()!;
+            Tensor<double> analytic = gradients[parameter];
+            for (int i = 0; i < data.Length; i++)
+            {
+                double original = data[i];
+                data[i] = original + epsilon;
+                double plus = Project(engine, p, projection);
+                data[i] = original - epsilon;
+                double minus = Project(engine, p, projection);
+                data[i] = original;
+
+                double numeric = (plus - minus) / (2 * epsilon);
+                double calculated = analytic.GetFlat(i);
+                double tolerance = 2e-6 + 2e-5 * Math.Abs(numeric);
+                Assert.True(Math.Abs(numeric - calculated) <= tolerance,
+                    $"projected gradient mismatch for input {Array.IndexOf(p, parameter)}, element {i}: " +
+                    $"analytic={calculated:R}, numeric={numeric:R}");
+            }
+        }
+    }
+
+    [Fact]
+    public void ComplexEmaSpecialization_ComposedInputGradientMatchesFiniteDifferences()
+    {
+        const int batch = 1, time = 4, channels = 5;
+        var input = Tensor(new[] { batch, time, channels }, 23, 0.4);
+        var alphaReal = Tensor(new[] { channels }, 24, 0.45);
+        var alphaImag = Tensor(new[] { channels }, 25, 0.25);
+        var gamma = Tensor(new[] { channels }, 26, 0.3);
+        var beta = Tensor(new[] { channels }, 27, 0.2);
+        var projection = Tensor(new[] { batch, time, channels }, 28, 0.7);
+        var engine = new CpuEngine();
+        Tensor<double> inputGradient;
+
+        using (var tape = new GradientTape<double>())
+        {
+            Tensor<double> objective = ComplexEmaObjective(
+                engine, input, alphaReal, alphaImag, gamma, beta, projection);
+            inputGradient = tape.ComputeGradients(objective, new[] { input })[input];
+        }
+
+        const double epsilon = 1e-6;
+        int[] samples = { 0, input.Length / 3, input.Length - 1 };
+        foreach (int index in samples)
+        {
+            double original = input[index];
+            input[index] = original + epsilon;
+            double plus = ComplexEmaObjective(
+                engine, input, alphaReal, alphaImag, gamma, beta, projection)[0];
+            input[index] = original - epsilon;
+            double minus = ComplexEmaObjective(
+                engine, input, alphaReal, alphaImag, gamma, beta, projection)[0];
+            input[index] = original;
+
+            double numeric = (plus - minus) / (2 * epsilon);
+            double calculated = inputGradient[index];
+            double tolerance = 2e-6 + 2e-5 * Math.Abs(numeric);
+            Assert.True(Math.Abs(numeric - calculated) <= tolerance,
+                $"complex EMA input[{index}] mismatch: analytic={calculated:R}, numeric={numeric:R}");
+        }
+    }
+
+    [Fact]
     public void Contract_RejectsMismatchedGroupedMaps()
     {
         Tensor<double>[] p = Inputs(batch: 1, time: 2, groups: 2, width: 3, state: 4);
@@ -104,6 +185,55 @@ public sealed class ComplexDiagonalSsmScanTests
         double sum = 0;
         foreach (double value in tensor.GetDataArray()!) sum += value;
         return sum;
+    }
+
+    private static double Project(
+        CpuEngine engine,
+        Tensor<double>[] inputs,
+        Tensor<double> projection)
+    {
+        Tensor<double> output = Scan(engine, inputs);
+        double sum = 0;
+        for (int i = 0; i < output.Length; i++)
+            sum += output.GetFlat(i) * projection.GetFlat(i);
+        return sum;
+    }
+
+    private static Tensor<double> ComplexEmaObjective(
+        CpuEngine engine,
+        Tensor<double> input,
+        Tensor<double> alphaReal,
+        Tensor<double> alphaImag,
+        Tensor<double> gamma,
+        Tensor<double> beta,
+        Tensor<double> projection)
+    {
+        int batch = input.Shape[0];
+        int time = input.Shape[1];
+        int channels = input.Shape[2];
+        var one = new Tensor<double>(new[] { channels });
+        one.Fill(1.0);
+        var zero = new Tensor<double>(new[] { channels });
+        var scanned = engine.ComplexDiagonalSsmScanForward(
+            engine.Reshape(input, new[] { batch, time, channels, 1 }),
+            engine.Reshape(alphaReal, new[] { channels, 1 }),
+            engine.Reshape(alphaImag, new[] { channels, 1 }),
+            engine.Reshape(engine.TensorSubtract(one, alphaReal), new[] { channels, 1, 1 }),
+            engine.Reshape(engine.TensorNegate(alphaImag), new[] { channels, 1, 1 }),
+            engine.Reshape(one, new[] { channels, 1, 1 }),
+            engine.Reshape(zero, new[] { channels, 1, 1 }),
+            engine.Reshape(zero, new[] { channels, 1 }));
+        var normalized = engine.LayerNorm(
+            engine.Reshape(scanned, new[] { batch, time, channels }),
+            gamma,
+            beta,
+            1e-5,
+            out _,
+            out _);
+        return engine.ReduceSum(
+            engine.TensorMultiply(normalized, projection),
+            new[] { 0, 1, 2 },
+            keepDims: false);
     }
 
     private static double[] Reference(
