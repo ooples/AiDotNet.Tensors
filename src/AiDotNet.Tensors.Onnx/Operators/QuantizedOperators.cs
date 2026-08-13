@@ -208,7 +208,7 @@ internal static class QuantizedOperators
                 var xsTimesWs = ctx.Engine.TensorMultiply(xScale, wScale);
                 var bF = MultiplyByScale(ctx, bInt, xsTimesWs);
                 var reshapedBias = ctx.Engine.Reshape(bF, new[] { 1, bF._shape[0], 1, 1 });
-                convResult = ctx.Engine.TensorBroadcastAdd(convResult, reshapedBias);
+                convResult = ctx.Engine.TensorAdd(convResult, reshapedBias);
             }
 
             // Requantize output: round(convResult / y_scale) + y_zero_point.
@@ -372,12 +372,12 @@ internal static class QuantizedOperators
     {
         if (scale.Rank == 0 || (scale.Rank == 1 && scale._shape[0] == 1))
         {
-            return ctx.Engine.TensorBroadcastMultiply(x, scale);
+            return ctx.Engine.TensorMultiply(x, scale);
         }
         if (scale.Rank == 1 && x.Rank >= 1 && axis < x.Rank && scale._shape[0] == x._shape[axis])
         {
             var reshaped = ReshapeForAxisBroadcast(ctx, scale, x.Rank, axis);
-            return ctx.Engine.TensorBroadcastMultiply(x, reshaped);
+            return ctx.Engine.TensorMultiply(x, reshaped);
         }
         throw new NotSupportedException(
             $"Quantize scale of shape [{string.Join(",", scale._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
@@ -388,12 +388,12 @@ internal static class QuantizedOperators
         if (scale.Rank == 0 || (scale.Rank == 1 && scale._shape[0] == 1))
         {
             var reciprocal = Reciprocal(ctx, scale);
-            return ctx.Engine.TensorBroadcastMultiply(x, reciprocal);
+            return ctx.Engine.TensorMultiply(x, reciprocal);
         }
         if (scale.Rank == 1 && x.Rank >= 1 && axis < x.Rank && scale._shape[0] == x._shape[axis])
         {
             var reshaped = ReshapeForAxisBroadcast(ctx, scale, x.Rank, axis);
-            return ctx.Engine.TensorBroadcastDivide(x, reshaped);
+            return ctx.Engine.TensorDivide(x, reshaped);
         }
         throw new NotSupportedException(
             $"Quantize scale of shape [{string.Join(",", scale._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
@@ -402,11 +402,11 @@ internal static class QuantizedOperators
     private static Tensor<T> AddScalarOrPerAxis<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> zp, int axis = 1) where T : unmanaged
     {
         if (zp.Rank == 0 || (zp.Rank == 1 && zp._shape[0] == 1))
-            return ctx.Engine.TensorBroadcastAdd(x, zp);
+            return ctx.Engine.TensorAdd(x, zp);
         if (zp.Rank == 1 && x.Rank >= 1 && axis < x.Rank && zp._shape[0] == x._shape[axis])
         {
             var reshaped = ReshapeForAxisBroadcast(ctx, zp, x.Rank, axis);
-            return ctx.Engine.TensorBroadcastAdd(x, reshaped);
+            return ctx.Engine.TensorAdd(x, reshaped);
         }
         throw new NotSupportedException(
             $"Quantize zero_point of shape [{string.Join(",", zp._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");
@@ -415,11 +415,11 @@ internal static class QuantizedOperators
     private static Tensor<T> SubScalarOrPerAxis<T>(OnnxTranslationContext<T> ctx, Tensor<T> x, Tensor<T> zp, int axis = 1) where T : unmanaged
     {
         if (zp.Rank == 0 || (zp.Rank == 1 && zp._shape[0] == 1))
-            return ctx.Engine.TensorBroadcastSubtract(x, zp);
+            return ctx.Engine.TensorSubtract(x, zp);
         if (zp.Rank == 1 && x.Rank >= 1 && axis < x.Rank && zp._shape[0] == x._shape[axis])
         {
             var reshaped = ReshapeForAxisBroadcast(ctx, zp, x.Rank, axis);
-            return ctx.Engine.TensorBroadcastSubtract(x, reshaped);
+            return ctx.Engine.TensorSubtract(x, reshaped);
         }
         throw new NotSupportedException(
             $"Quantize zero_point of shape [{string.Join(",", zp._shape)}] against data of rank {x.Rank} along axis {axis} is not supported.");

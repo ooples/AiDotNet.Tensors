@@ -907,6 +907,26 @@ internal static class BackwardFunctions<T>
     // Broadcast operations: reduce gradient along broadcast dims
     // ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// d(expand(a))/da = sum of the gradient over every axis that was stretched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This single unary rule replaces the reduction that the four binary broadcast backwards each
+    /// perform on their own. An expand is a stride-0 view: one stored element is read once per
+    /// position along the stretched axis, so its gradient is the sum of the gradient at all those
+    /// positions. Leaving the sum out is the classic broadcasting bug — every forward value stays
+    /// correct while the operand's gradient comes back too small by exactly the stretch factor.
+    /// </para>
+    /// </remarks>
+    internal static void ExpandBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var grad = ReduceGradToShape(gradOutput, inputs[0]._shape, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>d(broadcast_add(a,b))/da = reduce_grad(grad, a.shape), d/db = reduce_grad(grad, b.shape)</summary>
     internal static void BroadcastAddBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -935,8 +955,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var fullGradA = engine.TensorBroadcastMultiply(gradOutput, inputs[1]);
-        var fullGradB = engine.TensorBroadcastMultiply(gradOutput, inputs[0]);
+        var fullGradA = engine.TensorMultiply(gradOutput, inputs[1]);
+        var fullGradB = engine.TensorMultiply(gradOutput, inputs[0]);
         var gradA = ReduceGradToShape(fullGradA, inputs[0]._shape, engine);
         var gradB = ReduceGradToShape(fullGradB, inputs[1]._shape, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
@@ -948,12 +968,12 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var fullGradA = engine.TensorBroadcastDivide(gradOutput, inputs[1]);
+        var fullGradA = engine.TensorDivide(gradOutput, inputs[1]);
         var gradA = ReduceGradToShape(fullGradA, inputs[0]._shape, engine);
 
-        var bSquared = engine.TensorBroadcastMultiply(inputs[1], inputs[1]);
-        var negGradA = engine.TensorNegate(engine.TensorBroadcastMultiply(gradOutput, inputs[0]));
-        var fullGradB = engine.TensorBroadcastDivide(negGradA, bSquared);
+        var bSquared = engine.TensorMultiply(inputs[1], inputs[1]);
+        var negGradA = engine.TensorNegate(engine.TensorMultiply(gradOutput, inputs[0]));
+        var fullGradB = engine.TensorDivide(negGradA, bSquared);
         var gradB = ReduceGradToShape(fullGradB, inputs[1]._shape, engine);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
@@ -1221,9 +1241,9 @@ internal static class BackwardFunctions<T>
             var std = engine.TensorSqrt(engine.TensorAddScalar(variance, eps)); // [C]
             var inv = engine.TensorReciprocal(std);                             // 1/std [C]
             var scale = engine.TensorMultiply(inputs[1], inv);                  // gamma/std [C]
-            gradInput = engine.TensorBroadcastMultiply(gradOutput, engine.Reshape(scale, bshape));
-            var xhat = engine.TensorBroadcastMultiply(
-                engine.TensorBroadcastSubtract(inputs[0], engine.Reshape(mean, bshape)),
+            gradInput = engine.TensorMultiply(gradOutput, engine.Reshape(scale, bshape));
+            var xhat = engine.TensorMultiply(
+                engine.TensorSubtract(inputs[0], engine.Reshape(mean, bshape)),
                 engine.Reshape(inv, bshape));
             gradGamma = engine.ReduceSum(engine.TensorMultiply(gradOutput, xhat), new[] { 0, 2, 3 }, false);
             gradBeta = engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }, false);
@@ -3593,9 +3613,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // dx = gradOutput * exp(x - lse) = gradOutput * softmax(x)
-        var shifted = engine.TensorBroadcastSubtract(inputs[0], output);
+        var shifted = engine.TensorSubtract(inputs[0], output);
         var softmax = engine.TensorExp(shifted);
-        var grad = engine.TensorBroadcastMultiply(gradOutput, softmax);
+        var grad = engine.TensorMultiply(gradOutput, softmax);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3641,9 +3661,9 @@ internal static class BackwardFunctions<T>
             }
         }
 
-        var scaledInput = engine.TensorBroadcastMultiply(reducedGrad, inputs[0]);
+        var scaledInput = engine.TensorMultiply(reducedGrad, inputs[0]);
         var normClamped = engine.TensorClamp(reducedNorm, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
-        var grad = engine.TensorBroadcastDivide(scaledInput, normClamped);
+        var grad = engine.TensorDivide(scaledInput, normClamped);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -5412,11 +5432,11 @@ internal static class BackwardFunctions<T>
             int n = inputs[1]._shape[1];
 
             var bBroadcast = inputs[1].Reshape(new[] { batch, 1, n });
-            var dA = engine.ReduceSum(engine.TensorBroadcastMultiply(gradOutput, bBroadcast), new[] { 2 });
+            var dA = engine.ReduceSum(engine.TensorMultiply(gradOutput, bBroadcast), new[] { 2 });
             DifferentiableOps.AccumulateGrad(grads, inputs[0], dA.Reshape(inputs[0]._shape), engine);
 
             var aBroadcast = inputs[0].Reshape(new[] { batch, m, 1 });
-            var dB = engine.ReduceSum(engine.TensorBroadcastMultiply(gradOutput, aBroadcast), new[] { 1 });
+            var dB = engine.ReduceSum(engine.TensorMultiply(gradOutput, aBroadcast), new[] { 1 });
             DifferentiableOps.AccumulateGrad(grads, inputs[1], dB.Reshape(inputs[1]._shape), engine);
             return;
         }
@@ -5508,7 +5528,7 @@ internal static class BackwardFunctions<T>
         var totalSum = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
         var cumGrad = engine.TensorCumSum(gradOutput, axis);
         // Use BroadcastAdd since totalSum has keepDims=true (size-1 on axis)
-        var totalPlusGrad = engine.TensorBroadcastAdd(totalSum, gradOutput);
+        var totalPlusGrad = engine.TensorAdd(totalSum, gradOutput);
         var grad = engine.TensorSubtract(totalPlusGrad, cumGrad);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -5651,7 +5671,7 @@ internal static class BackwardFunctions<T>
                 // re-computing. Slow but correct.
                 preActivation = engine.TensorMatMul(inputs[0], inputs[1]);
                 if (inputs.Length > 2)
-                    preActivation = engine.TensorBroadcastAdd(preActivation, inputs[2]);
+                    preActivation = engine.TensorAdd(preActivation, inputs[2]);
             }
             gradOutput = ApplyActivationDerivative(gradOutput, preActivation, activation, engine, activationParams);
         }
@@ -7950,10 +7970,14 @@ internal static class BackwardFunctions<T>
         {
             int n = (int)numOps.ToDouble(b[k * 5]);
             if (n < 0 || n >= N) continue;
-            int x1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 1]) * spatialScale);
-            int y1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 2]) * spatialScale);
-            int x2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 3]) * spatialScale);
-            int y2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 4]) * spatialScale);
+            // Reconstruct bin bounds with the same away-from-zero rule the forward
+            // RoIPool uses. Math.Round's default ties-to-even would place a
+            // half-valued coordinate in a different pixel than the forward pass,
+            // scattering the gradient to the wrong argmax pixel.
+            int x1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 1]) * spatialScale, MidpointRounding.AwayFromZero);
+            int y1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 2]) * spatialScale, MidpointRounding.AwayFromZero);
+            int x2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 3]) * spatialScale, MidpointRounding.AwayFromZero);
+            int y2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 4]) * spatialScale, MidpointRounding.AwayFromZero);
             int roiW = Math.Max(x2 - x1 + 1, 1);
             int roiH = Math.Max(y2 - y1 + 1, 1);
             double binH = (double)roiH / outH;

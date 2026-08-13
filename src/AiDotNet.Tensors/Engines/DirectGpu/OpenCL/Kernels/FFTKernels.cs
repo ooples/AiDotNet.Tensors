@@ -15,8 +15,10 @@ public static class FFTKernels
     public static string GetSource() => @"
 // Bit-reversal permutation for FFT
 __kernel void bit_reverse_permutation(
-    __global float* real,
-    __global float* imag,
+    __global const float* srcReal,
+    __global const float* srcImag,
+    __global float* dstReal,
+    __global float* dstImag,
     const int n,
     const int log2n)
 {
@@ -31,21 +33,17 @@ __kernel void bit_reverse_permutation(
         temp >>= 1;
     }
 
-    // Only swap if i < j to avoid double-swapping
-    if (i < j) {
-        float tmpReal = real[i];
-        float tmpImag = imag[i];
-        real[i] = real[j];
-        imag[i] = imag[j];
-        real[j] = tmpReal;
-        imag[j] = tmpImag;
-    }
+    // Out of place: each work item writes one destination; src and dst must be distinct allocations.
+    dstReal[i] = srcReal[j];
+    dstImag[i] = srcImag[j];
 }
 
-// Batched bit-reversal permutation
+// Batched bit-reversal permutation, OUT OF PLACE; src and dst must be distinct allocations.
 __kernel void batched_bit_reverse(
-    __global float* real,
-    __global float* imag,
+    __global const float* srcReal,
+    __global const float* srcImag,
+    __global float* dstReal,
+    __global float* dstImag,
     const int batch,
     const int n,
     const int log2n)
@@ -63,15 +61,9 @@ __kernel void batched_bit_reverse(
         temp >>= 1;
     }
 
-    if (i < j) {
-        int baseIdx = b * n;
-        float tmpReal = real[baseIdx + i];
-        float tmpImag = imag[baseIdx + i];
-        real[baseIdx + i] = real[baseIdx + j];
-        imag[baseIdx + i] = imag[baseIdx + j];
-        real[baseIdx + j] = tmpReal;
-        imag[baseIdx + j] = tmpImag;
-    }
+    int baseIdx = b * n;
+    dstReal[baseIdx + i] = srcReal[baseIdx + j];
+    dstImag[baseIdx + i] = srcImag[baseIdx + j];
 }
 
 // Cooley-Tukey FFT butterfly operation for a single stage.
@@ -477,8 +469,10 @@ __kernel void fft_cols_butterfly(
 
 // Row-wise bit reversal for 2D FFT
 __kernel void bit_reverse_rows(
-    __global float* real,
-    __global float* imag,
+    __global const float* srcReal,
+    __global const float* srcImag,
+    __global float* dstReal,
+    __global float* dstImag,
     const int height,
     const int width,
     const int log2width)
@@ -496,21 +490,18 @@ __kernel void bit_reverse_rows(
         temp >>= 1;
     }
 
-    if (col < j) {
-        int baseIdx = row * width;
-        float tmpReal = real[baseIdx + col];
-        float tmpImag = imag[baseIdx + col];
-        real[baseIdx + col] = real[baseIdx + j];
-        imag[baseIdx + col] = imag[baseIdx + j];
-        real[baseIdx + j] = tmpReal;
-        imag[baseIdx + j] = tmpImag;
-    }
+    // Out of place: one destination per work item. See batched_bit_reverse.
+    int baseIdx = row * width;
+    dstReal[baseIdx + col] = srcReal[baseIdx + j];
+    dstImag[baseIdx + col] = srcImag[baseIdx + j];
 }
 
 // Column-wise bit reversal for 2D FFT
 __kernel void bit_reverse_cols(
-    __global float* real,
-    __global float* imag,
+    __global const float* srcReal,
+    __global const float* srcImag,
+    __global float* dstReal,
+    __global float* dstImag,
     const int height,
     const int width,
     const int log2height)
@@ -528,16 +519,11 @@ __kernel void bit_reverse_cols(
         temp >>= 1;
     }
 
-    if (row < j) {
-        int i_idx = row * width + col;
-        int j_idx = j * width + col;
-        float tmpReal = real[i_idx];
-        float tmpImag = imag[i_idx];
-        real[i_idx] = real[j_idx];
-        imag[i_idx] = imag[j_idx];
-        real[j_idx] = tmpReal;
-        imag[j_idx] = tmpImag;
-    }
+    // Out of place: one destination per work item. See batched_bit_reverse.
+    int i_idx = row * width + col;
+    int j_idx = j * width + col;
+    dstReal[i_idx] = srcReal[j_idx];
+    dstImag[i_idx] = srcImag[j_idx];
 }
 ";
 

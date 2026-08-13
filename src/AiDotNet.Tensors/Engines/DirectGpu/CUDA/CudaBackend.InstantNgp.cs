@@ -1,3 +1,5 @@
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
@@ -18,6 +20,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(numPoints * featuresPerLevel);
         if (total <= 0) return;
+        if (TryDirectPtxInstantNgpHashEncode(positions, hashTable, output, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
         var kernel = ResolveInstantNgpKernel("instant_ngp_hash_encode_level");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -37,6 +40,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(tableSize * featuresPerLevel);
         if (total <= 0) return;
+        if (TryDirectPtxInstantNgpHashEncodeBackward(positions, outputGradient, tableGradient, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
         var kernel = ResolveInstantNgpKernel("instant_ngp_hash_encode_level_backward");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -157,6 +161,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
     {
         int total = checked(numVertices * numVertices);
         if (total <= 0) return;
+        if (TryDirectPtxUniformMeshLaplacian(faces, output, numFaces, numVertices)) return;
         var kernel = ResolveInstantNgpKernel("resident_uniform_mesh_laplacian");
         using var _ = PushContext();
         IntPtr f = faces.Handle, o = output.Handle;
@@ -260,6 +265,10 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
         IGpuBuffer tValuesCoarse, IGpuBuffer weightsCoarse, IGpuBuffer fineTValues,
         int numRays, int numCoarseSamples, int numFineSamples, uint seed)
     {
+        if (TryDirectPtxImportanceSamplingF32(
+                tValuesCoarse, weightsCoarse, fineTValues,
+                numRays, numCoarseSamples, numFineSamples, seed))
+            return;
         int total = checked(numRays * numFineSamples);
         if (total <= 0) return;
         var kernel = ResolveInstantNgpKernel("importance_sampling");
@@ -280,6 +289,11 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
         int batched)
     {
         if (length <= 0) return;
+        long stateBytes = checked((long)length * sizeof(float));
+        MemsetBuffer(suppressed, 0, stateBytes);
+        if (TryDirectPtxVisionNms(
+                boxes, scores, classIds, suppressed, outputCapacity, outputCount,
+                length, iouThreshold, batched != 0)) return;
         var kernel = ResolveInstantNgpKernel("resident_nms");
         using var _ = PushContext();
         IntPtr b = boxes.Handle, s = scores.Handle, c = classIds.Handle;

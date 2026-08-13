@@ -196,4 +196,24 @@ public class CodegenAutotuneIdentityTests
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
+
+    [Fact]
+    public void Cache_InvalidOptionalPath_IsTreatedAsEmpty()
+    {
+        string previous = CodegenAutotuneCache.CachePath;
+        try
+        {
+            CodegenAutotuneCache.CachePath = "invalid\0autotune.tsv";
+            CodegenAutotuneCache.Invalidate();
+
+            var spec = CodegenKernelSpec.DepthwiseConv2D3x3BiasRelu(1, 32, 16, 16);
+            var identity = CodegenAutotuneIdentity.Create(spec, "gpu-a-sm86-drv1", 8, 6);
+            Assert.Null(CodegenAutotuneCache.WinnerFor("depthwise", identity));
+        }
+        finally
+        {
+            CodegenAutotuneCache.CachePath = previous;
+            CodegenAutotuneCache.Invalidate();
+        }
+    }
 }

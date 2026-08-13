@@ -1,585 +1,320 @@
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using AiDotNet.Tensors.Engines;
+// Copyright (c) AiDotNet. All rights reserved.
+
+using System;
+using System.Globalization;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
-using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
-/// <summary>Issue #840 exact contiguous FP32 row-softmax championship.</summary>
+/// <summary>
+/// Compares every issue #840 direct-PTX softmax-family cell with the CUDA implementation
+/// reached when the experiment gate is closed.
+/// </summary>
+/// <remarks>
+/// Both sides launch on the same backend stream and are bracketed by CUDA events from a
+/// borrowed <see cref="DirectPtxRuntime"/>. Each direct row also proves that its dispatch
+/// counter advanced and compares one result with the incumbent before reporting a ratio.
+/// This prevents an ineligible shape from being timed as a false direct-PTX win.
+/// </remarks>
 internal static class DirectPtxSoftmaxExperiment
 {
-    private const int Warmups = 30;
-    private const int Samples = 101;
-    private const int DeviceLaunches = 50;
-    private static readonly (int Rows, int Columns)[] Shapes =
-        [(256, 128), (2048, 64), (2048, 128), (8192, 128)];
+    private const int Rows = 2048;
+    private const int Columns = 1024;
+    private const int Count = Rows * Columns;
+    private static string[] _operationFilter = Array.Empty<string>();
 
-    private readonly record struct Distribution(
-        double Mean, double Median, double P95, double P99);
-
-    internal static void Run(int independentRuns = 1)
+    internal static void Run(string[] args)
     {
-        if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
-        bool? previousGate = DirectPtxFeatureGate.TestOverride;
-        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
-        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
-        try
-        {
-            PrintHostFingerprint();
-            Console.WriteLine(
-                $"Direct-PTX FP32 row softmax: {independentRuns} run(s), " +
-                $"{Warmups} warmups + {Samples} samples/cell");
-            Console.WriteLine(
-                $"Device samples average {DeviceLaunches} launches; useful model is " +
-                "5 FLOPs/element and 8 useful bytes/element.");
-            PrintHeader();
-            for (int run = 1; run <= independentRuns; run++)
-            foreach ((int rows, int columns) in Shapes)
-                RunCell(run, rows, columns);
-            RunCudnnCompetitors(independentRuns);
-            RunPyTorchCompetitors(independentRuns);
-        }
-        finally
-        {
-            DirectPtxFeatureGate.TestOverride = previousGate;
-            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
-        }
-    }
-
-    internal static void RunCudnnOnly(int independentRuns = 1)
-    {
-        if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
-        PrintHostFingerprint();
-        PrintHeader();
-        RunCudnnCompetitors(independentRuns);
-    }
-
-    internal static void RunAiDotNetOnly(
-        int independentRuns = 1,
-        int blockThreads = 0)
-    {
-        if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
-        if (blockThreads is not (0 or 128 or 256 or 512))
-            throw new ArgumentOutOfRangeException(nameof(blockThreads));
-        bool? previousGate = DirectPtxFeatureGate.TestOverride;
-        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
-        int previousBlockThreads = DirectPtxFeatureGate.SoftmaxBlockThreadsExperimentOverride;
-        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
-        DirectPtxFeatureGate.SoftmaxBlockThreadsExperimentOverride = blockThreads;
-        try
-        {
-            PrintHostFingerprint();
-            Console.WriteLine(blockThreads == 0
-                ? "Direct PTX launch geometry: selected exact-shape mapping"
-                : $"Direct PTX launch geometry: {blockThreads} threads/block");
-            PrintHeader();
-            for (int run = 1; run <= independentRuns; run++)
-            foreach ((int rows, int columns) in Shapes)
-                RunCell(run, rows, columns);
-        }
-        finally
-        {
-            DirectPtxFeatureGate.TestOverride = previousGate;
-            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
-            DirectPtxFeatureGate.SoftmaxBlockThreadsExperimentOverride = previousBlockThreads;
-        }
-    }
-
-    private static void RunCell(int run, int rows, int columns)
-    {
+        _operationFilter = args ?? Array.Empty<string>();
+        GpuBenchmarkEnvironment.RequireIdleGpu("direct-ptx-softmax-start");
         using var backend = new CudaBackend();
-        if (run == 1 && rows == Shapes[0].Rows && columns == Shapes[0].Columns)
-            Console.WriteLine($"GPU: {backend.DeviceName}");
-        int elements = checked(rows * columns);
-        float[] inputHost = BuildInput(elements, 20262100 + run * 100 + rows + columns);
-        float[] expected = Oracle(inputHost, rows, columns);
-        using var input = backend.AllocateBuffer(inputHost);
-        using var baselineOutput = backend.AllocateBuffer(elements);
-        using var directOutput = backend.AllocateBuffer(elements);
-
-        void BaselineLaunch() => backend.Softmax(input, baselineOutput, rows, columns);
-        void DirectLaunch()
+        if (!backend.IsAvailable)
         {
-            if (!backend.TryDirectPtxSoftmax(input, directOutput, rows, columns))
-                throw new InvalidOperationException(backend.DirectPtxLastError);
+            Console.WriteLine("CUDA backend unavailable; softmax comparison skipped.");
+            return;
         }
 
-        // Force the established path even when a developer has enabled the
-        // process-wide softmax gate. The unpromoted experiment override must
-        // never leak into the baseline cell.
+        using var timer = new DirectPtxRuntime(
+            backend.CudaContextHandle, backend.DefaultStream.Handle);
+        bool? previousGate = DirectPtxFeatureGate.TestOverride;
+        bool previousExperiment = DirectPtxFeatureGate.SoftmaxExperimentOverride;
+
+        try
+        {
+            float[] input = Values(Count, 17, 1.0f / 64.0f);
+            float[] gradient = Values(Count, 31, 1.0f / 128.0f);
+            float[] probabilities = SoftmaxReference(input);
+            float[] lse = LogSumExpReference(input);
+            float[] rowGradient = Values(Rows, 43, 1.0f / 32.0f);
+            float[] mask = new float[Count];
+            for (int i = 0; i < mask.Length; i++) mask[i] = i % 7 == 0 ? 1f : 0f;
+
+            using var inputBuffer = backend.AllocateBuffer(input);
+            using var gradientBuffer = backend.AllocateBuffer(gradient);
+            using var probabilityBuffer = backend.AllocateBuffer(probabilities);
+            using var lseBuffer = backend.AllocateBuffer(lse);
+            using var rowGradientBuffer = backend.AllocateBuffer(rowGradient);
+            using var maskBuffer = backend.AllocateBuffer(mask);
+
+            Console.WriteLine();
+            Console.WriteLine("DIRECT PTX SOFTMAX FAMILY - shipped CUDA incumbent vs issue #840 kernel");
+            Console.WriteLine("device: {0}", backend.DeviceName);
+            Console.WriteLine("shape: [{0},{1}] FP32; same stream; paired CUDA-event samples", Rows, Columns);
+            Console.WriteLine();
+            Console.WriteLine("{0,-30} {1,14} {2,14} {3,9} {4,11}  {5}",
+                "operator", "incumbent", "direct PTX", "ratio", "max error", "verdict");
+
+            CompareTwoOutput(
+                backend, timer, "Softmax", Count, 2e-3,
+                inputBuffer,
+                static (b, i, o) => b.Softmax(i, o, Rows, Columns),
+                () => backend.DirectPtxSoftmaxDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "SoftmaxRows", Count, 2e-3,
+                inputBuffer,
+                static (b, i, o) => b.SoftmaxRows(i, o, Rows, Columns),
+                () => backend.DirectPtxSoftmaxDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "SoftmaxBackward", Count, 2e-3,
+                probabilityBuffer,
+                (b, _, o) => b.SoftmaxBackward(gradientBuffer, probabilityBuffer, o, Rows, Columns),
+                () => backend.DirectPtxSoftmaxBackwardDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "LogSoftmax", Count, 2e-3,
+                inputBuffer,
+                static (b, i, o) => b.LogSoftmax(i, o, Rows, Columns),
+                () => backend.DirectPtxLogSoftmaxDispatchCount);
+            CompareReduction(
+                backend, timer, "LogSumExpAxis", Count, 2e-3,
+                inputBuffer,
+                static (b, i, o) => b.LogSumExpAxis(i, o, Rows, Columns),
+                () => backend.DirectPtxLogSumExpDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "LogSumExpBackward", Count, 2e-3,
+                inputBuffer,
+                (b, _, o) => b.LogSumExpBackward(
+                    rowGradientBuffer, inputBuffer, lseBuffer, o, Rows, Columns),
+                () => backend.DirectPtxLogSumExpBackwardDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "MaskedFill", Count, 0.0,
+                inputBuffer,
+                (b, i, o) => b.MaskedFillKernel(i, maskBuffer, o, -10_000f, Count),
+                () => backend.DirectPtxMaskedFillDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "MaskedFillBackward", Count, 0.0,
+                gradientBuffer,
+                (b, i, o) => b.MaskedFillBackward(i, maskBuffer, o, Count),
+                () => backend.DirectPtxMaskedFillBackwardDispatchCount);
+            CompareTwoOutput(
+                backend, timer, "Sparsemax", Count, 2e-3,
+                inputBuffer,
+                static (b, i, o) => b.Sparsemax(i, o, Rows, Columns),
+                () => backend.DirectPtxSparsemaxDispatchCount,
+                workMultiplier: PtxSparsemaxKernel.BisectionSteps);
+            CompareTwoOutput(
+                backend, timer, "TaylorSoftmax", Count, 2e-5,
+                inputBuffer,
+                static (b, i, o) => b.TaylorSoftmax(i, o, Rows, Columns),
+                () => backend.DirectPtxTaylorSoftmaxDispatchCount);
+
+            Console.WriteLine();
+            Console.WriteLine("A diagnostic device-median win must clear both the paired-ratio spread and");
+            Console.WriteLine("the production >=1.10x threshold. Promotion additionally requires device P95,");
+            Console.WriteLine("zero-allocation/resource, and three-independent-process release evidence.");
+            Console.WriteLine("measurement protocol: {0}", CodegenMeasurementProtocol.Tag);
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previousGate;
+            DirectPtxFeatureGate.SoftmaxExperimentOverride = previousExperiment;
+            _operationFilter = Array.Empty<string>();
+        }
+
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("direct-ptx-softmax-end", afterSuite: true);
+    }
+
+    private static void CompareTwoOutput(
+        CudaBackend backend,
+        DirectPtxRuntime timer,
+        string label,
+        int outputCount,
+        double tolerance,
+        IGpuBuffer input,
+        Action<CudaBackend, IGpuBuffer, IGpuBuffer> launch,
+        Func<long> dispatchCount,
+        int workMultiplier = 1)
+    {
+        if (!ShouldRun(label)) return;
+        using var incumbentOutput = backend.AllocateBuffer(outputCount);
+        using var directOutput = backend.AllocateBuffer(outputCount);
+        Compare(
+            backend, timer, label, outputCount, tolerance,
+            () => launch(backend, input, incumbentOutput), incumbentOutput,
+            () => launch(backend, input, directOutput), directOutput,
+            dispatchCount, workMultiplier);
+    }
+
+    private static void CompareReduction(
+        CudaBackend backend,
+        DirectPtxRuntime timer,
+        string label,
+        int inputCount,
+        double tolerance,
+        IGpuBuffer input,
+        Action<CudaBackend, IGpuBuffer, IGpuBuffer> launch,
+        Func<long> dispatchCount)
+    {
+        if (!ShouldRun(label)) return;
+        using var incumbentOutput = backend.AllocateBuffer(Rows);
+        using var directOutput = backend.AllocateBuffer(Rows);
+        Compare(
+            backend, timer, label, inputCount, tolerance,
+            () => launch(backend, input, incumbentOutput), incumbentOutput,
+            () => launch(backend, input, directOutput), directOutput,
+            dispatchCount, workMultiplier: 2);
+    }
+
+    private static void Compare(
+        CudaBackend backend,
+        DirectPtxRuntime timer,
+        string label,
+        int workElements,
+        double tolerance,
+        Action launchIncumbent,
+        IGpuBuffer incumbentOutput,
+        Action launchDirect,
+        IGpuBuffer directOutput,
+        Func<long> dispatchCount,
+        int workMultiplier)
+    {
+        SetIncumbent();
+        launchIncumbent();
+        backend.Synchronize();
+        float[] expected = backend.DownloadBuffer(incumbentOutput);
+
+        long before = dispatchCount();
+        SetDirect();
+        launchDirect();
+        backend.Synchronize();
+        if (dispatchCount() <= before)
+            throw new InvalidOperationException(
+                $"{label} did not dispatch direct PTX: {backend.DirectPtxLastError}");
+        float[] actual = backend.DownloadBuffer(directOutput);
+        double error = MaxAbsoluteError(expected, actual);
+
+        long workUnits = checked((long)workElements * sizeof(float) * workMultiplier);
+        StableTimer.PairResult timing = StableTimer.MeasurePair(
+            timer,
+            () => { SetIncumbent(); launchIncumbent(); },
+            () => { SetDirect(); launchDirect(); },
+            workUnits,
+            workUnits);
+
+        string verdict;
+        if (error > tolerance)
+        {
+            verdict = "NOT EQUIVALENT -- withhold";
+        }
+        else if (!timing.Stable)
+        {
+            verdict = "NOT MEASURABLE";
+        }
+        else
+        {
+            double noiseFloor = 1.0 + timing.RelativeSpread;
+            double productionFloor = DirectPtxReleaseGatePolicy
+                .ProductionDefault.MinimumMedianSpeedup;
+            double floor = Math.Max(noiseFloor, productionFloor);
+            verdict = timing.Ratio >= floor ? "DEVICE MEDIAN WIN -- release evidence pending"
+                : timing.Ratio < 1.0 / floor ? "incumbent wins -- diagnose"
+                : "BELOW PRODUCTION GATE -- diagnose";
+        }
+
+        Console.WriteLine("{0,-30} {1,14} {2,14} {3,9} {4,11}  {5}",
+            label,
+            timing.A.Describe(),
+            timing.B.Describe(),
+            timing.DescribeRatio(),
+            error.ToString("0.00E+00", CultureInfo.InvariantCulture),
+            verdict);
+    }
+
+    private static void SetIncumbent()
+    {
         DirectPtxFeatureGate.SoftmaxExperimentOverride = false;
         DirectPtxFeatureGate.TestOverride = false;
-        BaselineLaunch();
-        backend.Synchronize();
-        float baselineError = MaximumError(backend.DownloadBuffer(baselineOutput), expected);
-        MeasureAndPrint(run, rows, columns, "AiDotNet CUDA eager", backend,
-            BaselineLaunch, baselineError, temporaryBytes: 0);
-        MeasureGraphAndPrint(run, rows, columns, "AiDotNet CUDA graph", backend,
-            BaselineLaunch, baselineError, temporaryBytes: 0);
+    }
 
-        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
+    private static bool ShouldRun(string label)
+    {
+        if (_operationFilter.Length == 0) return true;
+        foreach (string requested in _operationFilter)
+            if (string.Equals(requested, label, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private static void SetDirect()
+    {
         DirectPtxFeatureGate.TestOverride = true;
-        if (!backend.PrewarmDirectPtxSoftmax(rows, columns))
-            throw new InvalidOperationException(backend.DirectPtxLastError);
-        DirectLaunch();
-        backend.Synchronize();
-        float directError = MaximumError(backend.DownloadBuffer(directOutput), expected);
-        if (!backend.TryGetDirectPtxSoftmaxAudit(
-            rows, columns, out DirectPtxKernelAudit audit))
-            throw new InvalidOperationException("No audit for measured softmax PTX module.");
-        MeasureAndPrint(run, rows, columns, "Direct PTX eager", backend,
-            DirectLaunch, directError, temporaryBytes: 0, audit);
-        MeasureGraphAndPrint(run, rows, columns, "Direct PTX graph", backend,
-            DirectLaunch, directError, temporaryBytes: 0, audit);
-        Console.WriteLine(
-            $"    audit={audit.BlueprintId} sha={audit.PtxSha256} device={audit.DeviceFingerprint}");
+        DirectPtxFeatureGate.SoftmaxExperimentOverride = true;
     }
 
-    private static void MeasureAndPrint(
-        int run, int rows, int columns, string method,
-        CudaBackend backend, Action launch, float error, long temporaryBytes,
-        DirectPtxKernelAudit? audit = null)
+    private static float[] Values(int count, int salt, float scale)
     {
-        Distribution device = MeasureDevice(backend, launch);
-        Distribution e2e = MeasureEndToEnd(backend, launch);
-        long allocation = MeasureAllocation(backend, launch);
-        Print(run, rows, columns, method, device, e2e,
-            allocation, temporaryBytes, error, audit);
+        var values = new float[count];
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (((i * 37L + salt) % 97) - 48) * scale;
+        return values;
     }
 
-    private static void MeasureGraphAndPrint(
-        int run, int rows, int columns, string method,
-        CudaBackend backend, Action launch, float error, long temporaryBytes,
-        DirectPtxKernelAudit? audit = null)
-    {
-        Distribution device = MeasureDevice(backend, launch);
-        IntPtr graph = backend.CaptureGraph(launch);
-        try
-        {
-            void GraphLaunch() => backend.LaunchCapturedGraph(graph);
-            Distribution e2e = MeasureEndToEnd(backend, GraphLaunch);
-            long allocation = MeasureAllocation(backend, GraphLaunch);
-            Print(run, rows, columns, method, device, e2e,
-                allocation, temporaryBytes, error, audit);
-        }
-        finally { backend.DestroyCapturedGraph(graph); }
-    }
-
-    private static Distribution MeasureDevice(CudaBackend backend, Action action)
-    {
-        for (int i = 0; i < Warmups; i++) action();
-        backend.Synchronize();
-        var values = new double[Samples];
-        using IGpuEvent start = backend.CreateEvent(enableTiming: true);
-        using IGpuEvent end = backend.CreateEvent(enableTiming: true);
-        IntPtr batchGraph = backend.CaptureGraph(() =>
-        {
-            for (int launch = 0; launch < DeviceLaunches; launch++) action();
-        });
-        try
-        {
-            for (int i = 0; i < Warmups; i++) backend.LaunchCapturedGraph(batchGraph);
-            backend.Synchronize();
-            for (int sample = 0; sample < values.Length; sample++)
-            {
-                backend.RecordEvent(start, backend.DefaultStream);
-                backend.LaunchCapturedGraph(batchGraph);
-                backend.RecordEvent(end, backend.DefaultStream);
-                end.Synchronize();
-                values[sample] =
-                    backend.GetEventElapsedTime(start, end) * 1_000.0 / DeviceLaunches;
-            }
-        }
-        finally { backend.DestroyCapturedGraph(batchGraph); }
-        return Summarize(values);
-    }
-
-    private static Distribution MeasureEndToEnd(CudaBackend backend, Action action)
-    {
-        for (int i = 0; i < Warmups; i++) action();
-        backend.Synchronize();
-        var values = new double[Samples];
-        double scale = 1_000_000.0 / Stopwatch.Frequency;
-        for (int sample = 0; sample < values.Length; sample++)
-        {
-            long start = Stopwatch.GetTimestamp();
-            action();
-            backend.Synchronize();
-            values[sample] = (Stopwatch.GetTimestamp() - start) * scale;
-        }
-        return Summarize(values);
-    }
-
-    private static long MeasureAllocation(CudaBackend backend, Action action)
-    {
-        for (int i = 0; i < 8; i++) action();
-        backend.Synchronize();
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < Samples; i++) action();
-        long bytes = (GC.GetAllocatedBytesForCurrentThread() - before) / Samples;
-        backend.Synchronize();
-        return bytes;
-    }
-
-    private static Distribution Summarize(double[] values)
-    {
-        Array.Sort(values);
-        return new Distribution(values.Average(), Percentile(values, 0.50),
-            Percentile(values, 0.95), Percentile(values, 0.99));
-    }
-
-    private static double Percentile(double[] sorted, double percentile)
-    {
-        double position = (sorted.Length - 1) * percentile;
-        int lower = (int)position;
-        int upper = Math.Min(lower + 1, sorted.Length - 1);
-        return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
-    }
-
-    private static void PrintHeader()
-    {
-        Console.WriteLine(
-            "run rows  cols  method                    dev mean/med/p95/p99 us       " +
-            "e2e mean/med/p95/p99 us       GFLOPS TFLOPS  GB/s allocB tmpB err      R/S/L/B");
-        Console.WriteLine(new string('-', 184));
-    }
-
-    private static void PrintHostFingerprint()
-    {
-        Console.WriteLine(
-            $"Host: OS={RuntimeInformation.OSDescription}; " +
-            $"runtime={RuntimeInformation.FrameworkDescription}; " +
-            $"arch={RuntimeInformation.ProcessArchitecture}; " +
-            $"CUDA-driver={CudaNativeBindings.DriverVersion}; " +
-            $"stopwatch-hz={Stopwatch.Frequency}");
-    }
-
-    private static void Print(
-        int run, int rows, int columns, string method,
-        Distribution device, Distribution e2e, long allocation,
-        long temporaryBytes, float error, DirectPtxKernelAudit? audit)
-    {
-        double elements = (double)rows * columns;
-        double gflops = elements * 5.0 / (device.Median * 1e-6) / 1e9;
-        double tflops = gflops / 1_000.0;
-        double bandwidth = elements * 8.0 / (device.Median * 1e-6) / 1e9;
-        string resources = audit is null ? "-/-/-/-" :
-            $"{audit.Function.RegistersPerThread}/{audit.Function.StaticSharedBytes}/" +
-            $"{audit.Function.LocalBytesPerThread}/{audit.ActiveBlocksPerMultiprocessor}";
-        Console.WriteLine(
-            $"{run,3} {rows,5} {columns,5} {method,-25} " +
-            $"{device.Mean,6:F2}/{device.Median,6:F2}/{device.P95,6:F2}/{device.P99,6:F2}   " +
-            $"{e2e.Mean,6:F2}/{e2e.Median,6:F2}/{e2e.P95,6:F2}/{e2e.P99,6:F2}   " +
-            $"{gflops,7:F1} {tflops,6:F3} {bandwidth,5:F1} {allocation,6} {temporaryBytes,4} " +
-            $"{error,8:E1} {resources}");
-        EmitEvidence(run, rows, columns, method, device, allocation, temporaryBytes, error, audit);
-    }
-
-    // Machine-readable evidence line consumed by
-    // Profiling/run-direct-ptx-softmax-evidence.ps1, which aggregates across
-    // independent clean processes and evaluates DirectPtxReleaseGate. Device
-    // median/P95 (microseconds) are the timed quantities the gate compares.
-    private static void EmitEvidence(
-        int run, int rows, int columns, string method,
-        Distribution device, long allocation, long temporaryBytes,
-        float error, DirectPtxKernelAudit? audit)
-    {
-        var c = System.Globalization.CultureInfo.InvariantCulture;
-        int localBytes = audit?.Function.LocalBytesPerThread ?? 0;
-        Console.WriteLine(
-            "softmax_evidence_json={" +
-            $"\"run\":{run},\"rows\":{rows},\"columns\":{columns}," +
-            $"\"method\":\"{method}\"," +
-            $"\"median_us\":{device.Median.ToString("R", c)}," +
-            $"\"p95_us\":{device.P95.ToString("R", c)}," +
-            $"\"managed_bytes\":{allocation},\"temp_bytes\":{temporaryBytes}," +
-            $"\"max_error\":{error.ToString("R", c)},\"local_bytes\":{localBytes}" +
-            "}");
-    }
-
-    private static float[] Oracle(float[] input, int rows, int columns)
+    private static float[] SoftmaxReference(float[] input)
     {
         var output = new float[input.Length];
-        for (int row = 0; row < rows; row++)
+        for (int row = 0; row < Rows; row++)
         {
-            int rowBase = row * columns;
-            double maximum = double.NegativeInfinity;
-            for (int column = 0; column < columns; column++)
-                maximum = Math.Max(maximum, input[rowBase + column]);
+            int start = row * Columns;
+            double max = double.NegativeInfinity;
+            for (int column = 0; column < Columns; column++)
+                max = Math.Max(max, input[start + column]);
             double sum = 0;
-            for (int column = 0; column < columns; column++)
-                sum += Math.Exp(input[rowBase + column] - maximum);
-            for (int column = 0; column < columns; column++)
-                output[rowBase + column] =
-                    (float)(Math.Exp(input[rowBase + column] - maximum) / sum);
+            for (int column = 0; column < Columns; column++)
+                sum += Math.Exp(input[start + column] - max);
+            for (int column = 0; column < Columns; column++)
+                output[start + column] = (float)(Math.Exp(input[start + column] - max) / sum);
         }
         return output;
     }
 
-    private static float[] BuildInput(int elements, int seed)
+    private static float[] LogSumExpReference(float[] input)
     {
-        var input = new float[elements];
-        for (int i = 0; i < input.Length; i++)
-            input[i] = ((i * 17 + seed) % 257 - 128) / 32f;
-        return input;
+        var output = new float[Rows];
+        for (int row = 0; row < Rows; row++)
+        {
+            int start = row * Columns;
+            double max = double.NegativeInfinity;
+            for (int column = 0; column < Columns; column++)
+                max = Math.Max(max, input[start + column]);
+            double sum = 0;
+            for (int column = 0; column < Columns; column++)
+                sum += Math.Exp(input[start + column] - max);
+            output[row] = (float)(max + Math.Log(sum));
+        }
+        return output;
     }
 
-    private static float MaximumError(float[] actual, float[] expected)
+    private static double MaxAbsoluteError(float[] expected, float[] actual)
     {
-        float maximum = 0;
-        for (int i = 0; i < actual.Length; i++)
-            maximum = MathF.Max(maximum, MathF.Abs(actual[i] - expected[i]));
-        return maximum;
-    }
-
-    private static void RunCudnnCompetitors(int independentRuns)
-    {
-        ConfigureCudnnLibraryDirectory();
-        if (!CuDnnContext.IsAvailable)
+        if (expected.Length != actual.Length) return double.PositiveInfinity;
+        double max = 0;
+        for (int i = 0; i < expected.Length; i++)
         {
-            Console.WriteLine("cuDNN GPU competitor: INELIGIBLE (cuDNN is unavailable).");
-            return;
+            if (!float.IsFinite(expected[i]) || !float.IsFinite(actual[i]))
+                return double.PositiveInfinity;
+            max = Math.Max(max, Math.Abs((double)expected[i] - actual[i]));
         }
-        try
-        {
-            Console.WriteLine($"cuDNN GPU competitor: version {CuDnnContext.Version}");
-            for (int run = 1; run <= independentRuns; run++)
-            foreach ((int rows, int columns) in Shapes)
-                RunCudnnCell(run, rows, columns);
-        }
-        catch (Exception exception)
-        {
-            Console.WriteLine(
-                $"cuDNN GPU competitor: INELIGIBLE ({exception.GetType().Name}: " +
-                $"{exception.Message}).");
-        }
-    }
-
-    private static void ConfigureCudnnLibraryDirectory()
-    {
-        if (!OperatingSystem.IsWindows()) return;
-        try
-        {
-            var start = new ProcessStartInfo
-            {
-                FileName = Environment.GetEnvironmentVariable("PYTHON") ?? "python",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            start.ArgumentList.Add("-c");
-            start.ArgumentList.Add(
-                "import os,torch;print(os.path.join(os.path.dirname(torch.__file__),'lib'))");
-            using Process process = Process.Start(start) ??
-                throw new InvalidOperationException("Could not query the PyTorch library path.");
-            string directory = process.StandardOutput.ReadToEnd().Trim();
-            string error = process.StandardError.ReadToEnd().Trim();
-            process.WaitForExit();
-            if (process.ExitCode != 0 || !Directory.Exists(directory))
-                throw new InvalidOperationException(
-                    $"PyTorch library discovery failed ({process.ExitCode}): {error}");
-            if (!SetDllDirectory(directory))
-                throw new InvalidOperationException(
-                    $"SetDllDirectory failed for '{directory}' (Win32 {Marshal.GetLastWin32Error()}).");
-        }
-        catch (Exception exception)
-        {
-            Console.WriteLine(
-                $"cuDNN dependency discovery warning: {exception.GetType().Name}: " +
-                exception.Message);
-        }
-    }
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetDllDirectory(string pathName);
-
-    private static void RunCudnnCell(int run, int rows, int columns)
-    {
-        int elements = checked(rows * columns);
-        float[] inputHost = BuildInput(elements, 20262100 + run * 100 + rows + columns);
-        float[] expected = Oracle(inputHost, rows, columns);
-        using var backend = new CudaBackend();
-        backend.EnsureContextCurrent();
-        using var context = CuDnnContext.ForCurrentContext();
-        using var input = backend.AllocateBuffer(inputHost);
-        using var output = backend.AllocateBuffer(elements);
-        using var inputDescriptor = new CuDnnTensorDescriptor();
-        using var outputDescriptor = new CuDnnTensorDescriptor();
-        inputDescriptor.Set4D(CuDnnNative.CudnnDataType.Float, rows, columns, 1, 1);
-        outputDescriptor.Set4D(CuDnnNative.CudnnDataType.Float, rows, columns, 1, 1);
-        IntPtr stream = backend.DefaultStream.Handle;
-        CuDnnContext.CheckStatus(
-            CuDnnNative.cudnnSetStream(context.Handle, stream),
-            "cudnnSetStream(softmax benchmark)");
-        void Launch()
-        {
-            float alpha = 1f, beta = 0f;
-            CuDnnContext.CheckStatus(
-                CuDnnNative.cudnnSoftmaxForward(
-                    context.Handle,
-                    CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
-                    CuDnnNative.CudnnSoftmaxMode.Channel,
-                    ref alpha,
-                    inputDescriptor.Handle, input.Handle,
-                    ref beta,
-                    outputDescriptor.Handle, output.Handle),
-                "cudnnSoftmaxForward");
-        }
-        void Synchronize() => backend.Synchronize();
-
-        for (int i = 0; i < Warmups; i++) Launch();
-        Synchronize();
-        float error = MaximumError(backend.DownloadBuffer(output), expected);
-        Distribution device = MeasureCudnnDevice(stream, Launch);
-        Distribution eagerE2e = MeasureCudnnEndToEnd(Launch, Synchronize);
-        long allocation = MeasureCudnnAllocation(Launch, Synchronize);
-        Print(run, rows, columns, "cuDNN accurate eager", device, eagerE2e,
-            allocation, 0, error, audit: null);
-
-        (IntPtr graph, IntPtr graphExec) = CaptureCudnnGraph(stream, Launch, 1);
-        try
-        {
-            void GraphLaunch() => CheckCuda(
-                CudaNativeBindings.cuGraphLaunch(graphExec, stream),
-                "cuGraphLaunch(cuDNN softmax)");
-            Distribution graphE2e = MeasureCudnnEndToEnd(GraphLaunch, Synchronize);
-            long graphAllocation = MeasureCudnnAllocation(GraphLaunch, Synchronize);
-            Print(run, rows, columns, "cuDNN accurate graph", device, graphE2e,
-                graphAllocation, 0, error, audit: null);
-        }
-        finally
-        {
-            _ = CudaNativeBindings.cuGraphExecDestroy(graphExec);
-            _ = CudaNativeBindings.cuGraphDestroy(graph);
-        }
-    }
-
-    private static Distribution MeasureCudnnDevice(IntPtr stream, Action launch)
-    {
-        (IntPtr graph, IntPtr graphExec) = CaptureCudnnGraph(
-            stream, launch, DeviceLaunches);
-        CheckCuda(CudaNativeBindings.cuEventCreate(out IntPtr start, 0),
-            "cuEventCreate(start)");
-        CheckCuda(CudaNativeBindings.cuEventCreate(out IntPtr end, 0),
-            "cuEventCreate(end)");
-        try
-        {
-            for (int i = 0; i < Warmups; i++)
-                CheckCuda(CudaNativeBindings.cuGraphLaunch(graphExec, stream),
-                    "cuGraphLaunch(cuDNN warmup)");
-            CheckCuda(CudaNativeBindings.cuStreamSynchronize(stream),
-                "cuStreamSynchronize(cuDNN warmup)");
-            var values = new double[Samples];
-            for (int sample = 0; sample < values.Length; sample++)
-            {
-                CheckCuda(CudaNativeBindings.cuEventRecord(start, stream),
-                    "cuEventRecord(start)");
-                CheckCuda(CudaNativeBindings.cuGraphLaunch(graphExec, stream),
-                    "cuGraphLaunch(cuDNN device sample)");
-                CheckCuda(CudaNativeBindings.cuEventRecord(end, stream),
-                    "cuEventRecord(end)");
-                CheckCuda(CudaNativeBindings.cuEventSynchronize(end),
-                    "cuEventSynchronize(end)");
-                CheckCuda(CudaNativeBindings.cuEventElapsedTime(
-                    out float milliseconds, start, end), "cuEventElapsedTime");
-                values[sample] = milliseconds * 1_000.0 / DeviceLaunches;
-            }
-            return Summarize(values);
-        }
-        finally
-        {
-            _ = CudaNativeBindings.cuEventDestroy(end);
-            _ = CudaNativeBindings.cuEventDestroy(start);
-            _ = CudaNativeBindings.cuGraphExecDestroy(graphExec);
-            _ = CudaNativeBindings.cuGraphDestroy(graph);
-        }
-    }
-
-    private static Distribution MeasureCudnnEndToEnd(Action launch, Action synchronize)
-    {
-        for (int i = 0; i < Warmups; i++) launch();
-        synchronize();
-        var values = new double[Samples];
-        double scale = 1_000_000.0 / Stopwatch.Frequency;
-        for (int sample = 0; sample < values.Length; sample++)
-        {
-            long start = Stopwatch.GetTimestamp();
-            launch();
-            synchronize();
-            values[sample] = (Stopwatch.GetTimestamp() - start) * scale;
-        }
-        return Summarize(values);
-    }
-
-    private static long MeasureCudnnAllocation(Action launch, Action synchronize)
-    {
-        for (int i = 0; i < 8; i++) launch();
-        synchronize();
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < Samples; i++) launch();
-        long bytes = (GC.GetAllocatedBytesForCurrentThread() - before) / Samples;
-        synchronize();
-        return bytes;
-    }
-
-    private static (IntPtr Graph, IntPtr GraphExec) CaptureCudnnGraph(
-        IntPtr stream, Action launch, int launches)
-    {
-        CheckCuda(CudaNativeBindings.cuStreamBeginCapture(
-            stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
-            "cuStreamBeginCapture(cuDNN softmax)");
-        for (int i = 0; i < launches; i++) launch();
-        CheckCuda(CudaNativeBindings.cuStreamEndCapture(stream, out IntPtr graph),
-            "cuStreamEndCapture(cuDNN softmax)");
-        try
-        {
-            CheckCuda(CudaNativeBindings.cuGraphInstantiate(
-                out IntPtr graphExec, graph, 0),
-                "cuGraphInstantiate(cuDNN softmax)");
-            return (graph, graphExec);
-        }
-        catch
-        {
-            _ = CudaNativeBindings.cuGraphDestroy(graph);
-            throw;
-        }
-    }
-
-    private static void CheckCuda(CudaResult result, string operation)
-    {
-        if (result != CudaResult.Success)
-            throw new InvalidOperationException($"{operation} failed: {result}.");
-    }
-
-    private static void RunPyTorchCompetitors(int independentRuns)
-    {
-        string script = Path.Combine(AppContext.BaseDirectory, "BaselineRunners", "py",
-            "run_direct_ptx_softmax_competitors.py");
-        if (!File.Exists(script))
-            script = Path.Combine(AppContext.BaseDirectory, "run_direct_ptx_softmax_competitors.py");
-        if (!File.Exists(script))
-        {
-            Console.WriteLine("PyTorch GPU competitors: INELIGIBLE (runner was not copied).");
-            return;
-        }
-        var start = new ProcessStartInfo
-        {
-            FileName = Environment.GetEnvironmentVariable("PYTHON") ?? "python",
-            UseShellExecute = false
-        };
-        start.ArgumentList.Add(script);
-        start.ArgumentList.Add("--runs");
-        start.ArgumentList.Add(independentRuns.ToString(
-            System.Globalization.CultureInfo.InvariantCulture));
-        using Process process = Process.Start(start) ??
-            throw new InvalidOperationException("Could not start the PyTorch softmax runner.");
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"PyTorch softmax runner exited with code {process.ExitCode}.");
+        return max;
     }
 }

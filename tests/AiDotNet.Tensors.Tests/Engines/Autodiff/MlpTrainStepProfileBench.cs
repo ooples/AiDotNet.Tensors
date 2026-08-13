@@ -79,7 +79,7 @@ public class MlpTrainStepProfileBench
             for (int l = 0; l < 4; l++)
             {
                 var lin = _engine.TensorMatMul(h, W[l]);
-                var bia = _engine.TensorBroadcastAdd(lin, bb[l]);
+                var bia = _engine.TensorAdd(lin, bb[l]);
                 h = l < 3 ? _engine.ReLU(bia) : bia;
             }
             return h;
@@ -93,7 +93,7 @@ public class MlpTrainStepProfileBench
             for (int l = 0; l < 4; l++)
             {
                 var lin = _engine.TensorMatMul(h, W[l]);
-                var bia = _engine.TensorBroadcastAdd(lin, bb[l]);
+                var bia = _engine.TensorAdd(lin, bb[l]);
                 h = l < 3 ? _engine.ReLU(bia) : bia;
             }
             var loss = _engine.ReduceSum(h, new[] { 0, 1 }, keepDims: false);
@@ -111,7 +111,7 @@ public class MlpTrainStepProfileBench
             for (int l = 0; l < 4; l++)
             {
                 var lin = _engine.TensorMatMul(h, W[l]);
-                var bia = _engine.TensorBroadcastAdd(lin, bb[l]);
+                var bia = _engine.TensorAdd(lin, bb[l]);
                 h = l < 3 ? _engine.ReLU(bia) : bia;
             }
             var loss = _engine.ReduceSum(h, new[] { 0, 1 }, keepDims: false);
@@ -166,7 +166,7 @@ public class MlpTrainStepProfileBench
             for (int l = 0; l < 4; l++)
             {
                 var lin = _engine.TensorMatMul(h, W[l]);
-                var bia = _engine.TensorBroadcastAdd(lin, bb[l]);
+                var bia = _engine.TensorAdd(lin, bb[l]);
                 h = l < 3 ? _engine.ReLU(bia) : bia;
             }
             _engine.ReduceSum(h, new[] { 0, 1 }, keepDims: false);

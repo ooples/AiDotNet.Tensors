@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <summary>
 /// Correctness tests for <c>IEngine.TensorBroadcastTo</c> — the three-tier
 /// broadcast primitive that replaces the
-/// <c>TensorBroadcastAdd(x, new Tensor&lt;T&gt;(targetShape))</c> anti-pattern.
+/// <c>TensorAdd(x, new Tensor&lt;T&gt;(targetShape))</c> anti-pattern.
 ///
 /// <para>Tier 1 (identity): shapes already equal → returned as-is, zero cost.
 /// Tier 2 (leading-1s): source shape matches target tail, target prepends only
@@ -117,11 +117,11 @@ public class TensorBroadcastToTests
     public void TierParityVsBroadcastAdd_MiddleAxisExpand()
     {
         // Semantic parity: TensorBroadcastTo(x, target) must produce the
-        // same values as the old idiom TensorBroadcastAdd(x, zeros(target)).
+        // same values as the old idiom TensorAdd(x, zeros(target)).
         var input = MakeSequential(new[] { 2, 1, 3 });
         var target = new[] { 2, 5, 3 };
         var newPath = _engine.TensorBroadcastTo(input, target);
-        var oldPath = _engine.TensorBroadcastAdd(input, new Tensor<float>(target));
+        var oldPath = _engine.TensorAdd(input, new Tensor<float>(target));
 
         Assert.Equal(newPath.Shape.ToArray(), oldPath.Shape.ToArray());
         for (int i = 0; i < newPath.Length; i++)

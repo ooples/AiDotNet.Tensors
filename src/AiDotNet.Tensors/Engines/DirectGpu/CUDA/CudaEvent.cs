@@ -17,6 +17,8 @@ public sealed class CudaEvent : IGpuEvent
     /// <inheritdoc/>
     public IntPtr Handle => _handle;
 
+    internal CudaBackend Backend => _backend;
+
     /// <inheritdoc/>
     public bool IsRecorded => _isRecorded;
 
@@ -54,6 +56,20 @@ public sealed class CudaEvent : IGpuEvent
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         _enableTiming = enableTiming;
+        _backend.EnsureContextCurrent();
+
+        CudaStream? cudaStream = null;
+        if (stream is not null)
+        {
+            cudaStream = stream as CudaStream ??
+                throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+            if (!ReferenceEquals(cudaStream.Backend, _backend))
+                throw new ArgumentException(
+                    "Event and stream must belong to the same CUDA backend.", nameof(stream));
+            cudaStream.ThrowIfDisposed();
+        }
+
+        _backend.EnsureContextCurrent();
 
         IntPtr eventHandle;
         CudaResult result;
@@ -71,10 +87,25 @@ public sealed class CudaEvent : IGpuEvent
         CuBlasNative.CheckCudaResult(result, "cuEventCreate");
         _handle = eventHandle;
 
-        // Record on the stream if provided
-        if (stream != null)
+        try
         {
-            Record(stream);
+            if (cudaStream is not null)
+                Record(cudaStream);
+        }
+        catch
+        {
+            try
+            {
+                _backend.EnsureContextCurrent();
+                if (_handle != IntPtr.Zero)
+                    _ = CudaNativeBindings.cuEventDestroy(_handle);
+            }
+            catch
+            {
+                // Constructor cleanup must not hide the original recording failure.
+            }
+            _handle = IntPtr.Zero;
+            throw;
         }
     }
 
@@ -86,11 +117,15 @@ public sealed class CudaEvent : IGpuEvent
     {
         ThrowIfDisposed();
 
-        if (stream is not CudaStream)
+        if (stream is not CudaStream cudaStream)
         {
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
         }
+        if (!ReferenceEquals(cudaStream.Backend, _backend))
+            throw new ArgumentException(
+                "Event and stream must belong to the same CUDA backend.", nameof(stream));
 
+        _backend.EnsureContextCurrent();
         var result = CudaNativeBindings.cuEventRecord(_handle, stream.Handle);
         CuBlasNative.CheckCudaResult(result, "cuEventRecord");
         _isRecorded = true;
@@ -106,6 +141,7 @@ public sealed class CudaEvent : IGpuEvent
             return; // Nothing to synchronize
         }
 
+        _backend.EnsureContextCurrent();
         var result = CudaNativeBindings.cuEventSynchronize(_handle);
         CuBlasNative.CheckCudaResult(result, "cuEventSynchronize");
     }
@@ -120,6 +156,7 @@ public sealed class CudaEvent : IGpuEvent
             return false;
         }
 
+        _backend.EnsureContextCurrent();
         var result = CudaNativeBindings.cuEventQuery(_handle);
 
         if (result == CudaResult.Success)
@@ -145,6 +182,9 @@ public sealed class CudaEvent : IGpuEvent
         {
             throw new ArgumentException("Event must be a CudaEvent", nameof(startEvent));
         }
+        if (!ReferenceEquals(cudaStartEvent._backend, _backend))
+            throw new ArgumentException(
+                "Elapsed-time events must belong to the same CUDA backend.", nameof(startEvent));
 
         if (!_enableTiming)
         {
@@ -160,6 +200,7 @@ public sealed class CudaEvent : IGpuEvent
         Synchronize();
         cudaStartEvent.Synchronize();
 
+        _backend.EnsureContextCurrent();
         float elapsedMs;
         var result = CudaNativeBindings.cuEventElapsedTime(
             out elapsedMs,
@@ -192,6 +233,7 @@ public sealed class CudaEvent : IGpuEvent
         {
             try
             {
+                _backend.EnsureContextCurrent();
                 CudaNativeBindings.cuEventDestroy(_handle);
             }
             catch

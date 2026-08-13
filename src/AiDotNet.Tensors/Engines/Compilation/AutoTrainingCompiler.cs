@@ -281,12 +281,17 @@ internal static class AutoTrainingCompiler
         hash ^= typeof(T).GetHashCode();
         hash *= unchecked((long)0x100000001b3L);
 
-        HashSet<Tensor<T>>? produced = null;
+        // Track the ordinal of each produced tensor for every hash, not only the
+        // value-sensitive compiler hash. Operation names and shapes do not describe a DAG:
+        // a dead recorded branch and a loss-connected branch can have the same flat op sequence.
+        // Reusing one branch's reverse-topology plan for the other silently omits gradients.
+        var producerOrdinals = StructureHashScratch<T>.ProducerOrdinals ??=
+            new Dictionary<Tensor<T>, int>(TensorIdentityComparer<T>.Instance);
+        producerOrdinals.Clear();
         HashSet<Tensor<T>>? parameters = null;
         Dictionary<Tensor<T>, long>? leafValueHashes = null;
         if (sources is not null)
         {
-            produced = new HashSet<Tensor<T>>(TensorIdentityComparer<T>.Instance);
             parameters = new HashSet<Tensor<T>>(TensorIdentityComparer<T>.Instance);
             leafValueHashes = new Dictionary<Tensor<T>, long>(TensorIdentityComparer<T>.Instance);
             foreach (var source in sources)
@@ -295,52 +300,81 @@ internal static class AutoTrainingCompiler
             }
         }
 
-        for (int i = 0; i < entryCount; i++)
+        try
         {
-            ref var entry = ref entries[i];
-            hash ^= entry.OperationName.GetHashCode();
-            hash *= unchecked((long)0x100000001b3L);
-            if (entry.Output is not null)
+            for (int i = 0; i < entryCount; i++)
             {
-                // Shape only - NOT identity. Two steps with the same model
-                // shape produce the same structure hash.
-                foreach (int dim in entry.Output._shape)
+                ref var entry = ref entries[i];
+                hash ^= entry.OperationName.GetHashCode();
+                hash *= unchecked((long)0x100000001b3L);
+                if (entry.Output is not null)
                 {
-                    hash ^= dim;
+                    // Shape only - NOT identity. Two steps with the same model
+                    // shape produce the same structure hash.
+                    hash ^= entry.Output._shape.Length;
                     hash *= unchecked((long)0x100000001b3L);
-                }
-            }
-
-            if (produced is not null && parameters is not null && leafValueHashes is not null)
-            {
-                if (!TryHashLeafValue(entry.Input0, produced, parameters, leafValueHashes, ref hash)
-                    || !TryHashLeafValue(entry.Input1, produced, parameters, leafValueHashes, ref hash)
-                    || !TryHashLeafValue(entry.Input2, produced, parameters, leafValueHashes, ref hash))
-                {
-                    return false;
-                }
-
-                // Variadic ops (Concat, Stack, TensorAddMany) keep inputs 4+ ONLY here, and
-                // TapeEntry treats this array as the authoritative input list when it is set.
-                // Reading Input0-2 alone would let a data-derived constant in an extra slot
-                // escape the hash entirely - precisely the staleness this method exists to catch.
-                var overflow = entry.InputsOverflow;
-                if (overflow is not null)
-                {
-                    for (int j = 0; j < overflow.Length; j++)
+                    foreach (int dim in entry.Output._shape)
                     {
-                        if (!TryHashLeafValue(overflow[j], produced, parameters, leafValueHashes, ref hash))
+                        hash ^= dim;
+                        hash *= unchecked((long)0x100000001b3L);
+                    }
+                }
+
+                // Encode input arity, order, and connectivity. Leaves share a stable sentinel;
+                // produced inputs use their forward entry ordinal, which is stable across fresh
+                // executions without retaining tensor identity in the cache key.
+                hash ^= entry.InputCount;
+                hash *= unchecked((long)0x100000001b3L);
+                if (entry.InputsOverflow is not null)
+                {
+                    for (int j = 0; j < entry.InputsOverflow.Length; j++)
+                        HashInputTopology(entry.InputsOverflow[j], producerOrdinals, ref hash);
+                }
+                else
+                {
+                    HashInputTopology(entry.Input0, producerOrdinals, ref hash);
+                    if (entry.InputCount >= 2) HashInputTopology(entry.Input1, producerOrdinals, ref hash);
+                    if (entry.InputCount >= 3) HashInputTopology(entry.Input2, producerOrdinals, ref hash);
+                }
+
+                if (parameters is not null && leafValueHashes is not null)
+                {
+                    if (!TryHashLeafValue(entry.Input0, producerOrdinals, parameters, leafValueHashes, ref hash)
+                        || !TryHashLeafValue(entry.Input1, producerOrdinals, parameters, leafValueHashes, ref hash)
+                        || !TryHashLeafValue(entry.Input2, producerOrdinals, parameters, leafValueHashes, ref hash))
+                    {
+                        return false;
+                    }
+
+                    // Variadic ops (Concat, Stack, TensorAddMany) keep inputs 4+ ONLY here, and
+                    // TapeEntry treats this array as the authoritative input list when it is set.
+                    // Reading Input0-2 alone would let a data-derived constant in an extra slot
+                    // escape the hash entirely - precisely the staleness this method exists to catch.
+                    var overflow = entry.InputsOverflow;
+                    if (overflow is not null)
+                    {
+                        for (int j = 0; j < overflow.Length; j++)
                         {
-                            return false;
+                            if (!TryHashLeafValue(overflow[j], producerOrdinals, parameters, leafValueHashes, ref hash))
+                            {
+                                return false;
+                            }
                         }
                     }
                 }
 
-                if (entry.Output is not null) produced.Add(entry.Output);
+                if (entry.Output is not null) producerOrdinals[entry.Output] = i;
             }
-        }
 
-        return true;
+            return true;
+        }
+        finally
+        {
+            // Thread-static reuse keeps the structure-only hot path allocation-free after warmup,
+            // while clearing references prevents one training graph from being retained by its
+            // worker thread. Hash computation is synchronous and never re-enters itself.
+            producerOrdinals.Clear();
+        }
     }
 
     /// <summary>
@@ -357,11 +391,31 @@ internal static class AutoTrainingCompiler
         public int GetHashCode(Tensor<TElement> obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 
+    private static class StructureHashScratch<TElement>
+    {
+        [ThreadStatic]
+        internal static Dictionary<Tensor<TElement>, int>? ProducerOrdinals;
+    }
+
     /// <summary>
     /// Largest non-parameter leaf whose values are folded into the hash. Beyond this, hashing on
     /// every step would outweigh the benefit of compiling, so the tape is declared uncompilable.
     /// </summary>
     private const int MaxHashedConstantElements = 4096;
+
+    private static void HashInputTopology<T>(
+        Tensor<T>? input,
+        Dictionary<Tensor<T>, int> producerOrdinals,
+        ref long hash)
+    {
+        // Distinguish null from a leaf even though normal recorded operations do not use null
+        // inputs. This keeps malformed/manual entries from aliasing valid structures.
+        int token = input is null
+            ? int.MinValue
+            : producerOrdinals.TryGetValue(input, out int producer) ? producer : -1;
+        hash ^= token;
+        hash *= unchecked((long)0x100000001b3L);
+    }
 
     /// <summary>
     /// Folds a leaf constant's values into the hash. Returns false when the leaf is too large to
@@ -375,14 +429,14 @@ internal static class AutoTrainingCompiler
     /// </param>
     private static bool TryHashLeafValue<T>(
         Tensor<T>? candidate,
-        HashSet<Tensor<T>> produced,
+        Dictionary<Tensor<T>, int> producerOrdinals,
         HashSet<Tensor<T>> parameters,
         Dictionary<Tensor<T>, long> leafValueHashes,
         ref long hash)
     {
         // Only LEAVES matter: anything an earlier entry produced is recomputed on replay.
         if (candidate is null) return true;
-        if (produced.Contains(candidate)) return true;
+        if (producerOrdinals.ContainsKey(candidate)) return true;
         // Parameters legitimately change every step; the plan binds them by identity.
         if (parameters.Contains(candidate)) return true;
 
@@ -421,6 +475,17 @@ internal static class AutoTrainingCompiler
         foreach (int dim in leaf._shape)
         {
             valueHash ^= dim;
+            valueHash *= unchecked((long)0x100000001b3L);
+        }
+
+        // Strides too, because shape alone stopped identifying a leaf once broadcasting began
+        // stretching operands into views. A [1,2] and a [2,1] constant both reach here as [2,2]
+        // views over the same two stored numbers, differing ONLY in which axis carries stride 0 —
+        // so hashing shape and values would hand both the same plan key and let a plan compiled
+        // for the row broadcast be replayed for the column one.
+        foreach (int stride in leaf._strides)
+        {
+            valueHash ^= stride;
             valueHash *= unchecked((long)0x100000001b3L);
         }
 

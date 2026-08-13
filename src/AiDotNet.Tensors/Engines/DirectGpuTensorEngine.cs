@@ -8701,9 +8701,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <c>catch</c> blocks that route selected GPU kernels, including Power, conv / transpose / unfold-fold /
     /// pooling / locally-connected / deformable / attention operations, to their CPU reference RETHROW instead of
     /// silently falling back. Because the per-kernel fallback now lives partly inside the individual backends
-    /// (Metal / Vulkan implement the conv/pool family in their own classes), the flag is a process-wide
-    /// <c>static</c> so those backend <c>catch</c> blocks can honor it too
-    /// (<see cref="ThrowOnGpuKernelFallback"/> is read from <c>DirectGpuTensorEngine</c> by the backends).
+    /// (Metal / Vulkan implement the conv/pool family in their own classes), the accessor is <c>static</c> so
+    /// those backend <c>catch</c> blocks can honor it too. Its backing field remains <c>[ThreadStatic]</c>:
+    /// backends read the current test thread's value through <see cref="ThrowOnGpuKernelFallback"/>, while
+    /// parallel test threads retain their independent defaults.
     /// <para>
     /// <see cref="GpuConvKernelCoverageTests"/> (in the test project) enables it so the GPU-vs-CPU accuracy
     /// gate PROVES the GPU kernel actually ran on-device — a kernel that threw (or a backend that silently
@@ -14348,29 +14349,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
-                float scale = 1.0f / (1.0f - (float)dropoutRate);
                 ulong seed = NextStochasticSeed();
-                using var temporary = backend.AllocateBuffer(input.Length);
-                backend.Dropout(inputBuffer.Buffer, temporary, maskBuffer, input.Length,
-                    (float)dropoutRate, seed, true);
-
-                bool fused = backend.TryFusedBiasDropout(
-                    inputBuffer.Buffer, outputBuffer, biasBuffer.Buffer, maskBuffer,
-                    rows, cols, (float)dropoutRate, scale);
-
-                if (!fused)
+                bool philoxFused = backend is IPhiloxBiasDropoutBackend philoxBackend &&
+                    philoxBackend.TryFusedBiasPhiloxDropout(
+                        inputBuffer.Buffer, outputBuffer, biasBuffer.Buffer, maskBuffer,
+                        rows, cols, (float)dropoutRate, seed);
+                if (!philoxFused)
                 {
-                    backend.BiasAdd(inputBuffer.Buffer, biasBuffer.Buffer, outputBuffer, rows, cols);
-                }
+                    float scale = 1.0f / (1.0f - (float)dropoutRate);
+                    using var temporary = backend.AllocateBuffer(input.Length);
+                    backend.Dropout(inputBuffer.Buffer, temporary, maskBuffer, input.Length,
+                        (float)dropoutRate, seed, true);
 
-                // The dropout kernels historically recomputed 1/(1-p) on-device. OpenCL's
-                // reciprocal can differ from the CPU/API value by one ULP, and the fused kernel
-                // only needs a zero/non-zero mask. Canonicalize the public mask to the host scale
-                // on every backend, then use that exact mask for the unfused result as well.
-                backend.NotEqualScalar(maskBuffer, maskBuffer, 0f, input.Length);
-                backend.Scale(maskBuffer, maskBuffer, scale, input.Length);
-                if (!fused)
-                    backend.Multiply(outputBuffer, maskBuffer, outputBuffer, input.Length);
+                    bool fused = backend.TryFusedBiasDropout(
+                        inputBuffer.Buffer, outputBuffer, biasBuffer.Buffer, maskBuffer,
+                        rows, cols, (float)dropoutRate, scale);
+
+                    if (!fused)
+                        backend.BiasAdd(inputBuffer.Buffer, biasBuffer.Buffer, outputBuffer, rows, cols);
+
+                    // The established kernels need a canonical public FP32 mask. The direct-PTX
+                    // fused path writes that exact mask itself and therefore skips these launches.
+                    backend.NotEqualScalar(maskBuffer, maskBuffer, 0f, input.Length);
+                    backend.Scale(maskBuffer, maskBuffer, scale, input.Length);
+                    if (!fused)
+                        backend.Multiply(outputBuffer, maskBuffer, outputBuffer, input.Length);
+                }
             }
 
             int[] shape = input.Shape.ToArray();
@@ -15615,6 +15619,105 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     #region Broadcast Operations
 
     /// <summary>
+    /// Executes an arbitrary NumPy-compatible binary broadcast entirely on the active GPU backend.
+    /// </summary>
+    /// <remarks>
+    /// Every direct backend implements <see cref="IDirectGpuBackend.TileAxis"/> and the four binary
+    /// element-wise primitives. Composing those shared operations gives CUDA, HIP, Metal, OpenCL,
+    /// Vulkan, and WebGPU one rank-generic fallback while the specialized one-kernel paths below
+    /// continue to own the common last-axis cases. This deliberately materializes only the operands
+    /// that need expansion; it never downloads either operand to perform index mapping on the CPU.
+    /// </remarks>
+    private Tensor<T>? TryRunGeneralBroadcastBinary<T>(
+        Tensor<T> a,
+        Tensor<T> b,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> operation)
+    {
+        if (!TryGetBackend(out var backend))
+            return null;
+
+        // GetOrAllocateBuffer and every TileAxis expansion below may allocate synchronously. CUDA
+        // forbids those allocations after cuStreamBeginCapture (CUDA 906), so decline the composed
+        // path before touching either input and let the established caller fallback own the case.
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing())
+            return null;
+
+        if (!CanBroadcast(a.Shape._dims, b.Shape._dims))
+            return null;
+
+        int rank = Math.Max(a.Rank, b.Rank);
+        var outputShape = new int[rank];
+        var shapeA = new int[rank];
+        var shapeB = new int[rank];
+        int offsetA = rank - a.Rank;
+        int offsetB = rank - b.Rank;
+
+        for (int axis = 0; axis < rank; axis++)
+        {
+            int dimA = axis < offsetA ? 1 : a.Shape._dims[axis - offsetA];
+            int dimB = axis < offsetB ? 1 : b.Shape._dims[axis - offsetB];
+            shapeA[axis] = dimA;
+            shapeB[axis] = dimB;
+            outputShape[axis] = dimA == 1 ? dimB : dimA;
+        }
+
+        int outputLength = 1;
+        for (int axis = 0; axis < rank; axis++)
+            outputLength = checked(outputLength * outputShape[axis]);
+
+        // No kernel launch or device allocation is needed for an empty broadcast result.
+        if (outputLength == 0)
+            return new Tensor<T>(outputShape);
+
+        using var inputA = GetOrAllocateBuffer(backend, a);
+        using var inputB = GetOrAllocateBuffer(backend, b);
+        var temporaries = new List<IGpuBuffer>();
+
+        try
+        {
+            IGpuBuffer Expand(IGpuBuffer input, int[] currentShape, int currentLength)
+            {
+                IGpuBuffer current = input;
+                for (int axis = 0; axis < rank; axis++)
+                {
+                    if (currentShape[axis] == outputShape[axis])
+                        continue;
+
+                    // CanBroadcast above proves every differing source dimension is one.
+                    int outerSize = 1;
+                    for (int d = 0; d < axis; d++)
+                        outerSize = checked(outerSize * currentShape[d]);
+                    int innerSize = 1;
+                    for (int d = axis + 1; d < rank; d++)
+                        innerSize = checked(innerSize * currentShape[d]);
+
+                    int repeats = outputShape[axis];
+                    int expandedLength = checked(currentLength * repeats);
+                    IGpuBuffer expanded = backend.AllocateBuffer(expandedLength);
+                    temporaries.Add(expanded);
+                    backend.TileAxis(current, expanded, outerSize, 1, innerSize, repeats);
+                    current = expanded;
+                    currentShape[axis] = repeats;
+                    currentLength = expandedLength;
+                }
+                return current;
+            }
+
+            IGpuBuffer expandedA = Expand(inputA.Buffer, shapeA, a.Length);
+            IGpuBuffer expandedB = Expand(inputB.Buffer, shapeB, b.Length);
+            return DispatchDeferredGpuOp<T>(backend, outputLength, outputShape,
+                output => operation(backend, expandedA, expandedB, output, outputLength));
+        }
+        finally
+        {
+            // Keep every expansion alive until the final binary launch has been enqueued on the
+            // backend stream/queue, then release in reverse dependency order.
+            for (int i = temporaries.Count - 1; i >= 0; i--)
+                temporaries[i].Dispose();
+        }
+    }
+
+    /// <summary>
     /// GPU-accelerated TensorBroadcastMultiply operation.
     /// Performs element-wise multiplication with NumPy-style broadcasting.
     /// </summary>
@@ -15724,13 +15827,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Multiply(expandedA, bufferB.Buffer, output, b.Length)));
             }
 
-            // Fallback to CPU for complex broadcast patterns
-            GpuLaunchProbe.OnFallback($"TensorBroadcastMultiply:no-branch a={string.Join("x", a.Shape._dims)} b={string.Join("x", b.Shape._dims)}", null);
+            // Rank-generic path: expand only the stretched axes with backend.TileAxis, then multiply.
+            // TileAxis + Multiply are part of IDirectGpuBackend, so this remains native on all six
+            // direct GPU backends instead of silently downloading complex broadcast shapes to CPU.
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Multiply(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+
+            GpuLaunchProbe.OnFallback($"TensorBroadcastMultiply:incompatible a={string.Join("x", a.Shape._dims)} b={string.Join("x", b.Shape._dims)}", null);
             return base.TensorBroadcastMultiply(a, b);
         }
         catch (Exception exBm)
         {
             GpuLaunchProbe.OnFallback("TensorBroadcastMultiply:threw", exBm);
+            if (ThrowOnGpuKernelFallback) throw;
             return base.TensorBroadcastMultiply(a, b);
         }
     }
@@ -20698,6 +20808,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch { }
         }
+
+        try
+        {
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Add(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastAdd:general", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+        }
         return base.TensorBroadcastAdd(a, b);
     }
 
@@ -20750,6 +20872,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch { }
         }
+
+        try
+        {
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Subtract(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastSubtract:general", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+        }
         return base.TensorBroadcastSubtract(a, b);
     }
 
@@ -20801,6 +20935,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Divide(bufA.Buffer, expandedB.Buffer, output, a.Length)));
             }
             catch { }
+        }
+
+        try
+        {
+            if (TryRunGeneralBroadcastBinary(a, b,
+                    static (be, left, right, output, size) => be.Divide(left, right, output, size)) is { } general)
+                return RecordGpuResult(general);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorBroadcastDivide:general", ex);
+            if (ThrowOnGpuKernelFallback) throw;
         }
         return base.TensorBroadcastDivide(a, b);
     }
@@ -20941,21 +21087,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             try
             {
+                bool fusedTraining = false;
                 if (training)
                 {
-                    // Seeded training uses the same counter-based stateless generator as the CPU path so
-                    // the per-element slopes match bit-for-bit; unseeded uses a monotonic process seed.
+                    // Seeded training is reproducible within the selected RNG ABI. The experimental
+                    // admitted path owns a versioned Philox stream; the established fallback retains
+                    // its existing generator. Unseeded calls use a monotonic engine-owned seed.
                     ulong gpuSeed = seed.HasValue
                         ? (ulong)(uint)seed.GetValueOrDefault()
                         : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
-                    backend.GenerateRandomUniform(bufNoise.Buffer, tensor.Length, lowerF, upperF, gpuSeed);
+                    fusedTraining = tensor.IsContiguous &&
+                        backend is IPhiloxRReluBackend philoxRrelu &&
+                        philoxRrelu.TryFusedPhiloxRRelu(
+                            bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer,
+                            tensor.Length, lowerF, upperF, gpuSeed);
+                    if (!fusedTraining)
+                        backend.GenerateRandomUniform(
+                            bufNoise.Buffer, tensor.Length, lowerF, upperF, gpuSeed);
                 }
                 else
                 {
                     float mid = (float)((lower + upper) / 2.0);
                     backend.Fill(bufNoise.Buffer, mid, tensor.Length);
                 }
-                backend.RRelu(bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer, tensor.Length);
+                if (!fusedTraining)
+                    backend.RRelu(bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer, tensor.Length);
                 var output = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
                 bufOut.RelinquishOwnership();
                 var noise = DeferTensorResult<T>(backend, bufNoise.Buffer, tensor.Length, tensor.Shape.ToArray());
@@ -22562,13 +22718,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorRepeatElements(tensor, repeats, axis);
     }
 
-    // GenerateDropoutMask and GenerateGaussianNoise return Vector<T> and need CPU-side
-    // post-processing (scale multiplication), so they must download immediately.
+    // These public operations return host vectors, so a successful GPU route must
+    // download the final result immediately. Resident callers should use the tensor APIs.
     Vector<T> IEngine.GenerateDropoutMask<T>(int length, T dropoutRate, T scale, int? seed)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { float keepProb = 1f - Convert.ToSingle(dropoutRate); ulong s = seed.HasValue ? (ulong)seed.Value : (ulong)Environment.TickCount; using var go=bb.AllocateBuffer(length); bb.DropoutMask(go,length,keepProb,s); float[] result=bb.DownloadBuffer(go); float sc=Convert.ToSingle(scale); for(int i=0;i<length;i++) result[i]*=sc; return new Vector<T>((T[])(object)result); } catch{} }
-        return base.GenerateDropoutMask(length,dropoutRate,scale,seed);
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        {
+            try
+            {
+                float dropProbability = Convert.ToSingle(dropoutRate);
+                float outputScale = Convert.ToSingle(scale);
+                bool finiteDropProbability =
+                    !float.IsNaN(dropProbability) && !float.IsInfinity(dropProbability);
+                bool finiteOutputScale =
+                    !float.IsNaN(outputScale) && !float.IsInfinity(outputScale);
+                if (finiteDropProbability && dropProbability > 0f &&
+                    dropProbability < 1f && finiteOutputScale)
+                {
+                    ulong threshold64 = (ulong)Math.Floor(
+                        dropProbability * 4_294_967_296.0);
+                    if (threshold64 is > 0 and <= uint.MaxValue)
+                    {
+                        uint rngSeed = seed.HasValue
+                            ? unchecked((uint)seed.GetValueOrDefault())
+                            : unchecked((uint)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
+                        using var output = backend.AllocateBuffer(length);
+                        backend.GenerateStatelessDropoutMask(
+                            output, length, (uint)threshold64, outputScale, rngSeed);
+                        return new Vector<T>((T[])(object)backend.DownloadBuffer(output));
+                    }
+                }
+            }
+            catch
+            {
+                // Preserve the established generic/edge-contract fallback below.
+            }
+        }
+        return base.GenerateDropoutMask(length, dropoutRate, scale, seed);
     }
 
     Vector<T> IEngine.GenerateGaussianNoise<T>(int length, T mean, T standardDeviation, int? seed)
@@ -23240,26 +23426,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return DispatchDeferredGpuOp<T>(backend, total, shape,
                         output => backend.Fill(output, 0f, total));
 
-                if (seed.HasValue)
-                {
-                    uint thresholdBits = checked((uint)StatelessRandom.ProbabilityThreshold(dropProbability));
-                    uint randomSeed = unchecked((uint)seed.Value);
-                    return DispatchDeferredGpuOp<T>(backend, total, shape,
-                        output => backend.GenerateStatelessDropoutMask(
-                            output, total, thresholdBits, outputScale, randomSeed));
-                }
-
-                using var random = AllocateOutputBuffer(backend, total);
-                using var threshold = AllocateOutputBuffer(backend, total);
-                return DispatchDeferredGpuOp<T>(backend, total, shape, output =>
-                {
-                    backend.GenerateRandomUniform(
-                        random.Buffer, total, 0f, 1f, unchecked((ulong)Environment.TickCount));
-                    backend.Fill(threshold.Buffer, dropProbability, total);
-                    backend.LessThan(random.Buffer, threshold.Buffer, output, total);
-                    backend.Scale(output, output, -outputScale, total);
-                    backend.AddScalar(output, output, outputScale, total);
-                });
+                uint thresholdBits = checked((uint)
+                    StatelessRandom.ProbabilityThreshold(dropProbability));
+                uint randomSeed = seed.HasValue
+                    ? unchecked((uint)seed.Value)
+                    : unchecked((uint)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
+                return DispatchDeferredGpuOp<T>(backend, total, shape,
+                    output => backend.GenerateStatelessDropoutMask(
+                        output, total, thresholdBits, outputScale, randomSeed));
             }
             catch { }
         }

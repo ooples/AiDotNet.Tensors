@@ -73,6 +73,16 @@ public static class OpParityRegistry
             e => e.GumbelSoftmax(singletonLogits.D(), 0.7, false, 1),
             ParityTol.Exact, opMethod: "GumbelSoftmax");
 
+        var categoricalProbabilitiesData = new double[64];
+        categoricalProbabilitiesData[0] = 1.0;
+        categoricalProbabilitiesData[32] = 1.0;
+        var categoricalProbabilities = OpInput.From(
+            categoricalProbabilitiesData, new[] { 2, 32 });
+        yield return new OpCase("TensorCategoricalSample[2,32;seeded-onehot]", "random",
+            e => e.TensorCategoricalSample(categoricalProbabilities.F(), -1, 42),
+            e => e.TensorCategoricalSample(categoricalProbabilities.D(), -1, 42),
+            ParityTol.Exact, opMethod: "TensorCategoricalSample");
+
         var constantSamples = OpInput.From(Enumerable.Repeat(2.0, 8).ToArray(), new[] { 2, 4 });
         var importanceWeights = OpInput.From(
             new[] { 1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0 }, new[] { 2, 4 });
@@ -2715,14 +2725,19 @@ public static class OpParityRegistry
         yield return B("TensorCopysign", "arithmetic", (e, u, v) => e.TensorCopysign(u, v), (e, u, v) => e.TensorCopysign(u, v), ParityTol.Exact, a, b);
         yield return B("TensorLogAddExp", "arithmetic", (e, u, v) => e.TensorLogAddExp(u, v), (e, u, v) => e.TensorLogAddExp(u, v), ParityTol.Ulp(64, 1e-6), a, b);
 
-        // Broadcast binary (row broadcast [1,64] over [4,64]).
-        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorBroadcastAdd(u, v), (e, u, v) => e.TensorBroadcastAdd(u, v), ParityTol.Exact, a, brow);
-        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, a, brow);
-        yield return B("TensorBroadcastMultiply", "arithmetic", (e, u, v) => e.TensorBroadcastMultiply(u, v), (e, u, v) => e.TensorBroadcastMultiply(u, v), ParityTol.Ulp(2, 1e-6), a, brow);
-        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
-        yield return B("TensorBroadcastAdd", "arithmetic", (e, u, v) => e.TensorBroadcastAdd(u, v), (e, u, v) => e.TensorBroadcastAdd(u, v), ParityTol.Exact, square, bcol);
-        yield return B("TensorBroadcastSubtract", "arithmetic", (e, u, v) => e.TensorBroadcastSubtract(u, v), (e, u, v) => e.TensorBroadcastSubtract(u, v), ParityTol.Exact, square, bcol);
-        yield return B("TensorBroadcastDivide", "arithmetic", (e, u, v) => e.TensorBroadcastDivide(u, v), (e, u, v) => e.TensorBroadcastDivide(u, v), ParityTol.Ulp(4, 1e-6), square, OpInput.Rand(407, new[] { 64, 1 }, 0.5, 3.0));
+        // Broadcast binary. These used to name TensorBroadcastAdd and friends; those are gone from
+        // IEngine and the plain ops broadcast implicitly, so the cases now drive TensorAdd et al.
+        // They need Bb rather than B: the display id is built from the FIRST operand's shape alone,
+        // so "TensorAdd[4,64]" here would collide with the equal-shape case above and the registry
+        // dictionary would throw on the duplicate key, failing every parity test at once.
+        yield return Bb("TensorAdd", "bcast-row", "arithmetic", (e, u, v) => e.TensorAdd(u, v), (e, u, v) => e.TensorAdd(u, v), ParityTol.Exact, a, brow);
+        yield return Bb("TensorSubtract", "bcast-row", "arithmetic", (e, u, v) => e.TensorSubtract(u, v), (e, u, v) => e.TensorSubtract(u, v), ParityTol.Exact, a, brow);
+        yield return Bb("TensorMultiply", "bcast-row", "arithmetic", (e, u, v) => e.TensorMultiply(u, v), (e, u, v) => e.TensorMultiply(u, v), ParityTol.Ulp(2, 1e-6), a, brow);
+        yield return Bb("TensorDivide", "bcast-row", "arithmetic", (e, u, v) => e.TensorDivide(u, v), (e, u, v) => e.TensorDivide(u, v), ParityTol.Ulp(4, 1e-6), a, OpInput.Rand(404, new[] { 1, 64 }, 0.5, 3.0));
+        yield return Bb("TensorAdd", "bcast-col", "arithmetic", (e, u, v) => e.TensorAdd(u, v), (e, u, v) => e.TensorAdd(u, v), ParityTol.Exact, square, bcol);
+        yield return Bb("TensorSubtract", "bcast-col", "arithmetic", (e, u, v) => e.TensorSubtract(u, v), (e, u, v) => e.TensorSubtract(u, v), ParityTol.Exact, square, bcol);
+        yield return Bb("TensorMultiply", "bcast-col", "arithmetic", (e, u, v) => e.TensorMultiply(u, v), (e, u, v) => e.TensorMultiply(u, v), ParityTol.Ulp(2, 1e-6), square, bcol);
+        yield return Bb("TensorDivide", "bcast-col", "arithmetic", (e, u, v) => e.TensorDivide(u, v), (e, u, v) => e.TensorDivide(u, v), ParityTol.Ulp(4, 1e-6), square, OpInput.Rand(407, new[] { 64, 1 }, 0.5, 3.0));
 
         // Scalar-arg ops.
         yield return new OpCase("TensorAddScalar[4,64]", "arithmetic", e => e.TensorAddScalar(a.F(), 1.5f), e => e.TensorAddScalar(a.D(), 1.5), ParityTol.Exact, opMethod: "TensorAddScalar");
@@ -2762,6 +2777,15 @@ public static class OpParityRegistry
         string method, string cat, System.Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> f,
         System.Func<IEngine, Tensor<double>, Tensor<double>, Tensor<double>> d, ParityTol tol, OpInput a, OpInput b)
         => new OpCase($"{method}[{Dims(a)}]", cat, e => f(e, a.F(), b.F()), e => d(e, a.D(), b.D()), tol, opMethod: method);
+
+    /// <summary>
+    /// Binary case with a tag in the display id, for when two cases share an IEngine method and a
+    /// first-operand shape. <c>opMethod</c> still carries the bare method so coverage resolves it.
+    /// </summary>
+    private static OpCase Bb(
+        string method, string tag, string cat, System.Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> f,
+        System.Func<IEngine, Tensor<double>, Tensor<double>, Tensor<double>> d, ParityTol tol, OpInput a, OpInput b)
+        => new OpCase($"{method}[{Dims(a)};{tag}]", cat, e => f(e, a.F(), b.F()), e => d(e, a.D(), b.D()), tol, opMethod: method);
 
     public static IEnumerable<OpCase> Elementwise()
     {

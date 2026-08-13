@@ -50,7 +50,7 @@ public class MathInvariantTests
     [Fact] public void Add_Inverse() => AZ(E.TensorAdd(R([64], 1), E.TensorMultiplyScalar(R([64], 1), -1f)));
     [Fact] public void AddScalar_Correct() { var a = R([64], 1); var r = E.TensorAddScalar(a, 5f); var ad = a.GetDataArray(); var rd = r.GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(ad[i] + 5f, rd[i], Tol); }
     [Fact] public void Add_LargeArray() => Assert.Equal(10000, E.TensorAdd(R([10000], 1), R([10000], 2)).Length);
-    [Fact] public void BroadcastAdd_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastAdd(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
+    [Fact] public void BroadcastAdd_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorAdd(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
     [Fact] public void AddInPlace_Modifies() { var a = R([64], 1); var b = R([64], 2); var orig = (float[])a.GetDataArray().Clone(); E.TensorAddInPlace(a, b); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(orig[i] + bd[i], ad[i], Tol); }
 
     // ================================================================
@@ -69,7 +69,7 @@ public class MathInvariantTests
     [Fact] public void Multiply_Zero() => AZ(E.TensorMultiplyScalar(R([64], 1), 0f));
     [Fact] public void Multiply_Negate() => AE(E.TensorMultiplyScalar(R([64], 1), -1f), E.TensorNegate(R([64], 1)));
     [Fact] public void Distributive() { var a = R([64], 1); var b = R([64], 2); var c = R([64], 3); AE(E.TensorMultiply(a, E.TensorAdd(b, c)), E.TensorAdd(E.TensorMultiply(a, b), E.TensorMultiply(a, c)), 1e-3f); }
-    [Fact] public void BroadcastMultiply_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastMultiply(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
+    [Fact] public void BroadcastMultiply_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorMultiply(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
 
     // ================================================================
     // DIVISION (4)
@@ -77,7 +77,7 @@ public class MathInvariantTests
     [Fact] public void Divide_BySelf() { var a = RP([64], 1); var r = E.TensorDivide(a, a).GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(1f, r[i], 1e-3f); }
     [Fact] public void DivideScalar_IsMultiplyInverse() => AE(E.TensorDivideScalar(R([64], 1), 2f), E.TensorMultiplyScalar(R([64], 1), 0.5f), 1e-3f);
     [Fact] public void Divide_ByOne() => AE(E.TensorDivideScalar(R([64], 1), 1f), R([64], 1));
-    [Fact] public void BroadcastDivide_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastDivide(R([4, 8], 1), RP([1, 8], 2)).Shape.ToArray());
+    [Fact] public void BroadcastDivide_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorDivide(R([4, 8], 1), RP([1, 8], 2)).Shape.ToArray());
 
     // ================================================================
     // UNARY MATH (12)
