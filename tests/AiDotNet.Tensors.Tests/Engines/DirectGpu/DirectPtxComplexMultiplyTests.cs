@@ -641,6 +641,11 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(2, Count(ptx, "abs.f32"));
         Assert.Equal(4, Count(ptx, "selp.f32"));            // quadrant + degenerate folding
+        // The atan2 quotient must be correctly rounded, matching the phase-precision
+        // contract PtxComplexPhaseKernel establishes; fma is the intended minimax form.
+        Assert.Contains("rcp.rn.f32", ptx);
+        Assert.DoesNotContain("rcp.approx.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("fma.rn.f32", ptx);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
     }
 
@@ -1594,7 +1599,8 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("cos.approx.f32", ptx);
         Assert.Contains("sin.approx.f32", ptx);
         Assert.Contains("sqrt.rn.f32", ptx);
-        Assert.Contains("rcp.approx.f32", ptx);   // atan2 minimax
+        Assert.Contains("rcp.rn.f32", ptx);       // atan2 quotient, correctly rounded
+        Assert.DoesNotContain("rcp.approx.f32", ptx, StringComparison.Ordinal);
         Assert.Equal(2, Count(ptx, "fma.rn.f32 %f0, %f5, %f8, %f0") + Count(ptx, "fma.rn.f32 %f1, %f5, %f9, %f1"));
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxStftMagPhaseF32Kernel.IsSupportedShape(4, 1408, 512, 128, 8, 257));
@@ -2388,7 +2394,9 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("max.f32", ptx);
         Assert.Contains("min.f32", ptx);
         Assert.Contains("tanh.approx.f32", ptx);
-        Assert.Contains("st.global.f32 [%rd4], 0f00000000", ptx);   // imag = 0
+        Assert.Contains("mov.f32 %f2, 0f00000000", ptx);            // imag = 0, via a register
+        Assert.Contains("st.global.f32 [%rd4], %f2", ptx);
+        Assert.DoesNotContain("st.global.f32 [%rd4], 0f00000000", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxCavityBounceInplaceF32Kernel.IsSupportedShape(8192));
         Assert.False(PtxCavityBounceInplaceF32Kernel.IsPromotedShape(8192));

@@ -45,7 +45,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The checked-in build-spectrum specialization is admitted only on SM86.");
         Validate(batch, numFreqs, numFrames, nFft);
-        ValidateBlockThreads(batch, numFrames, blockThreads);
+        ValidateBlockThreads(blockThreads);
         Batch = batch;
         NumFreqs = numFreqs;
         NumFrames = numFrames;
@@ -55,11 +55,22 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             batch, numFreqs, numFrames, nFft, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(
@@ -94,7 +105,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         Validate(batch, numFreqs, numFrames, nFft);
-        ValidateBlockThreads(batch, numFrames, blockThreads);
+        ValidateBlockThreads(blockThreads);
         int magStride = checked(numFreqs * numFrames);
         int mirrorEnd = numFreqs - 1;   // loop3 runs k in [1, numFreqs-1)
         int total = checked(batch * numFrames);
@@ -253,7 +264,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
                 "and batch*numFrames*nFft<=2^26.");
     }
 
-    private static void ValidateBlockThreads(int batch, int numFrames, int blockThreads)
+    private static void ValidateBlockThreads(int blockThreads)
     {
         if (blockThreads is not (128 or 256 or 512))
             throw new ArgumentOutOfRangeException(nameof(blockThreads),

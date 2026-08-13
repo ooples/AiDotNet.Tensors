@@ -51,15 +51,27 @@ internal sealed class PtxOverlapAddF32Kernel : IDisposable
         HopLength = hopLength;
         OutputLength = outputLength;
         BlockThreads = blockThreads;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, numFrames, nFft, outputLength, blockThreads);
+        Blueprint = CreateBlueprint(
+            runtime.ArchitectureFamily, numFrames, nFft, hopLength, outputLength, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             numFrames, nFft, hopLength, outputLength, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(
@@ -151,7 +163,8 @@ internal sealed class PtxOverlapAddF32Kernel : IDisposable
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
-        DirectPtxArchitectureFamily architecture, int numFrames, int nFft, int outputLength, int blockThreads)
+        DirectPtxArchitectureFamily architecture, int numFrames, int nFft, int hopLength,
+        int outputLength, int blockThreads)
     {
         var framesExtent = new DirectPtxExtent(checked(numFrames * nFft));
         var windowExtent = new DirectPtxExtent(nFft);
@@ -160,7 +173,7 @@ internal sealed class PtxOverlapAddF32Kernel : IDisposable
             Operation: "overlap-add-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"b{blockThreads}-nf{numFrames}-fft{nFft}-out{outputLength}",
+            Variant: $"b{blockThreads}-nf{numFrames}-fft{nFft}-hop{hopLength}-out{outputLength}",
             Tensors:
             [
                 new("frames", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,

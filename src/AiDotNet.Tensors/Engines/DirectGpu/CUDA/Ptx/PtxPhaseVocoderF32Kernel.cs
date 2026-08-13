@@ -47,7 +47,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The checked-in phase-vocoder specialization is admitted only on SM86.");
         Validate(leading, nFramesV, nFreqV, outFrames);
-        ValidateBlockThreads(leading, nFreqV, blockThreads);
+        ValidateBlockThreads(blockThreads);
         Leading = leading;
         NFramesV = nFramesV;
         NFreqV = nFreqV;
@@ -57,11 +57,22 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             leading, nFramesV, nFreqV, outFrames, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(
@@ -72,6 +83,12 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         Require(phase, Blueprint.Tensors[1], nameof(phase));
         Require(newMag, Blueprint.Tensors[2], nameof(newMag));
         Require(newPhase, Blueprint.Tensors[3], nameof(newPhase));
+        // rate is a per-launch scalar, so IsSupportedShape cannot relate it to
+        // outFrames and nFramesV. A non-finite or non-positive rate produces a
+        // negative or NaN source index, so reject it at the ABI boundary.
+        if (!(rate > 0f) || float.IsInfinity(rate))
+            throw new ArgumentOutOfRangeException(
+                nameof(rate), rate, "The phase-vocoder rate must be finite and positive.");
 
         IntPtr magPointer = mag.Pointer, phasePointer = phase.Pointer;
         IntPtr newMagPointer = newMag.Pointer, newPhasePointer = newPhase.Pointer;
@@ -100,7 +117,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         Validate(leading, nFramesV, nFreqV, outFrames);
-        ValidateBlockThreads(leading, nFreqV, blockThreads);
+        ValidateBlockThreads(blockThreads);
         int stride = checked(nFramesV * nFreqV);
         int outStride = checked(outFrames * nFreqV);
         int lastFrame = nFramesV - 1;
@@ -150,10 +167,19 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         ptx.AppendLine("    cvt.rn.f32.u32 %f2, %r7;");                    // tF
         ptx.AppendLine("    mul.rn.f32 %f3, %f2, %f0;");                   // srcT = t*rate
         ptx.AppendLine("    cvt.rmi.s32.f32 %r8, %f3;");                   // t0 = floor(srcT)
+        // t0 is an index into the mag/phase allocations, so it must be clamped
+        // before use, not just t1. Launch rejects non-finite and non-positive
+        // rate, but rate * (outFrames - 1) can still exceed the last frame.
+        ptx.AppendLine("    max.s32 %r8, %r8, 0;");                        // t0 >= 0
+        ptx.AppendLine($"    min.s32 %r8, %r8, {lastFrame};");            // t0 <= nFramesV-1
         ptx.AppendLine("    add.s32 %r13, %r8, 1;");                       // t0 + 1
         ptx.AppendLine($"    min.s32 %r9, %r13, {lastFrame};");           // t1 = min(t0+1, nFramesV-1)
         ptx.AppendLine("    cvt.rn.f32.s32 %f4, %r8;");                    // t0F
         ptx.AppendLine("    sub.rn.f32 %f5, %f3, %f4;");                   // frac = srcT - t0
+        // A clamped t0 leaves frac outside [0,1]; hold the edge frame rather
+        // than extrapolating off the end of the signal.
+        ptx.AppendLine("    max.f32 %f5, %f5, 0f00000000;");
+        ptx.AppendLine($"    min.f32 %f5, %f5, {one};");
         ptx.AppendLine($"    sub.rn.f32 %f6, {one}, %f5;");               // 1 - frac
         // mag indices: baseB + t*nFreqV + f
         ptx.AppendLine($"    mad.lo.u32 %r10, %r8, {nFreqV}, %r3;");      // t0*nFreqV + f
@@ -258,7 +284,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
                 "and both leading*nFramesV*nFreqV and leading*outFrames*nFreqV <= 2^26.");
     }
 
-    private static void ValidateBlockThreads(int leading, int nFreqV, int blockThreads)
+    private static void ValidateBlockThreads(int blockThreads)
     {
         if (blockThreads is not (128 or 256 or 512))
             throw new ArgumentOutOfRangeException(nameof(blockThreads),

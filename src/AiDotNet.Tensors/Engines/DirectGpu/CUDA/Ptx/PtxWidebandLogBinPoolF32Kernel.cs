@@ -50,14 +50,26 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         NumBins = numBins;
         Usable = usable;
         BlockThreads = blockThreads;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, totalSegBatch, fftSize, numBins, blockThreads);
+        Blueprint = CreateBlueprint(
+            runtime.ArchitectureFamily, totalSegBatch, fftSize, numBins, usable, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, totalSegBatch, fftSize, numBins, usable, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(DirectPtxTensorView magBuf, DirectPtxTensorView output)
@@ -170,7 +182,8 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
-        DirectPtxArchitectureFamily architecture, int totalSegBatch, int fftSize, int numBins, int blockThreads)
+        DirectPtxArchitectureFamily architecture, int totalSegBatch, int fftSize, int numBins,
+        int usable, int blockThreads)
     {
         var magExtent = new DirectPtxExtent(checked(totalSegBatch * fftSize));
         var outExtent = new DirectPtxExtent(checked(totalSegBatch * numBins));
@@ -178,7 +191,7 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
             Operation: "wideband-log-bin-pool-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"b{blockThreads}-seg{totalSegBatch}-fft{fftSize}-bins{numBins}",
+            Variant: $"b{blockThreads}-seg{totalSegBatch}-fft{fftSize}-bins{numBins}-usable{usable}",
             Tensors:
             [
                 new("magBuf", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,

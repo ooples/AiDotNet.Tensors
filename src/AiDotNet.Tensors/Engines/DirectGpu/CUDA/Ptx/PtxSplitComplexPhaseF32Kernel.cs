@@ -44,11 +44,22 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, count, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, count, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(DirectPtxTensorView inReal, DirectPtxTensorView inImag, DirectPtxTensorView outPhase)
@@ -116,7 +127,7 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
         ptx.AppendLine("    max.f32 %f4, %f2, %f3;");          // mx
         ptx.AppendLine("    min.f32 %f5, %f2, %f3;");          // mn
         ptx.AppendLine($"    setp.lt.f32 %p0, %f4, {tiny};");
-        ptx.AppendLine("    rcp.approx.f32 %f6, %f4;");
+        ptx.AppendLine("    rcp.rn.f32 %f6, %f4;");
         ptx.AppendLine("    mul.rn.f32 %f7, %f5, %f6;");        // a = mn/mx
         ptx.AppendLine("    mul.rn.f32 %f8, %f7, %f7;");        // t = a^2
         ptx.AppendLine($"    mov.f32 %f9, {c4};");

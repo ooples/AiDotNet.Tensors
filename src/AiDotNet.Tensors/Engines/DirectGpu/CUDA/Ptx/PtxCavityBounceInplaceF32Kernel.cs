@@ -44,11 +44,22 @@ internal sealed class PtxCavityBounceInplaceF32Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, total, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, total, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(DirectPtxTensorView workReal, DirectPtxTensorView workImag, float invN)
@@ -114,7 +125,10 @@ internal sealed class PtxCavityBounceInplaceF32Kernel : IDisposable
         ptx.AppendLine("    tanh.approx.f32 %f0, %f0;");
         ptx.AppendLine("    st.global.f32 [%rd3], %f0;");
         ptx.AppendLine("    add.u64 %rd4, %rd1, %rd2;");
-        ptx.AppendLine("    st.global.f32 [%rd4], 0f00000000;");   // workImag = 0
+        // st.global.f32 takes a register source; an immediate operand is invalid
+        // PTX, so materialize the zero first (%f<3> already reserves %f2).
+        ptx.AppendLine("    mov.f32 %f2, 0f00000000;");
+        ptx.AppendLine("    st.global.f32 [%rd4], %f2;");            // workImag = 0
         ptx.AppendLine("$CB_RET:");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");

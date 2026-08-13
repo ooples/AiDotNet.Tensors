@@ -48,7 +48,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The checked-in STFT mag/phase specialization is admitted only on SM86.");
         Validate(batch, lp, nFft, hop, numFrames, numFreqs);
-        ValidateBlockThreads(batch, numFrames, numFreqs, blockThreads);
+        ValidateBlockThreads(blockThreads);
         Batch = batch;
         Lp = lp;
         NFft = nFft;
@@ -60,11 +60,22 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             batch, lp, nFft, hop, numFrames, numFreqs, blockThreads);
         _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // _module owns a CUDA module handle. If any step below throws, the
+        // caller never receives this instance and cannot dispose it, so the
+        // handle must be released here before the exception propagates.
+        try
+        {
+            _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        }
+        catch
+        {
+            _module.Dispose();
+            throw;
+        }
     }
 
     internal unsafe void Launch(
@@ -101,7 +112,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         Validate(batch, lp, nFft, hop, numFrames, numFreqs);
-        ValidateBlockThreads(batch, numFrames, numFreqs, blockThreads);
+        ValidateBlockThreads(blockThreads);
         string negTwoPiOverN = Hex((float)(-2.0 * Math.PI / nFft));
         int magStride = checked(numFreqs * numFrames);
         int total = checked(batch * numFreqs * numFrames);
@@ -186,7 +197,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         ptx.AppendLine("    max.f32 %f14, %f12, %f13;");        // mx
         ptx.AppendLine("    min.f32 %f15, %f12, %f13;");        // mn
         ptx.AppendLine($"    setp.lt.f32 %p0, %f14, {tiny};");
-        ptx.AppendLine("    rcp.approx.f32 %f16, %f14;");
+        ptx.AppendLine("    rcp.rn.f32 %f16, %f14;");
         ptx.AppendLine("    mul.rn.f32 %f17, %f15, %f16;");     // a = mn/mx
         ptx.AppendLine("    mul.rn.f32 %f18, %f17, %f17;");     // t = a^2
         ptx.AppendLine($"    mov.f32 %f19, {c4};");
@@ -272,7 +283,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
                 "batch*numFreqs*numFrames<=2^24.");
     }
 
-    private static void ValidateBlockThreads(int batch, int numFrames, int numFreqs, int blockThreads)
+    private static void ValidateBlockThreads(int blockThreads)
     {
         if (blockThreads is not (128 or 256 or 512))
             throw new ArgumentOutOfRangeException(nameof(blockThreads),

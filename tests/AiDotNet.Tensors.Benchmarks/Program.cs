@@ -35,25 +35,6 @@ class Program
         // GPU-free cubin generation and verification for the online-attention family.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
-            return;
-        }
-
-        // GPU-free cubin generation and verification for the online-attention family.
-        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
-        {
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args.Skip(1).ToArray());
             return;
         }
@@ -263,12 +244,6 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-competitor")
         {
             KernelCompetitorTool.Run(args.Skip(1).ToArray());
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--kernel-championship")
-        {
-            KernelChampionshipTool.Run(args.Skip(1).ToArray());
             return;
         }
 
@@ -1446,7 +1421,6 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-flash-attention-backward: deterministic Nsight Flash-backward target");
         Console.WriteLine("  --direct-ptx-profile-convolution: deterministic Nsight convolution target");
         Console.WriteLine("  --direct-ptx-profile-vision-box-iou: deterministic Nsight Compute vision target");
-        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --direct-ptx-verify-ncu <csv>: enforce zero executed spill/local-memory counters");
         Console.WriteLine("  --head-to-head: generated kernels vs the shipped CUDA incumbents");
         Console.WriteLine("  --kernel-oracle: generated-family performance vs spec-derived ceilings");
