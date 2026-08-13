@@ -47,13 +47,31 @@ public class CpuResidentDoublePrecisionTests
     public static TheoryData<string> Engines => new()
     {
         "cpu",
-        "ambient",   // whatever AiDotNetEngine.Current is on this machine, GPU included
+        "gpu",
     };
 
+    /// <summary>
+    /// Binds the second case to <see cref="DirectGpuTensorEngine"/> EXPLICITLY, and skips when the
+    /// host has no device backend.
+    /// </summary>
+    /// <remarks>
+    /// This case used to resolve <c>AiDotNetEngine.Current</c>, which defaults to
+    /// <see cref="CpuEngine"/> and only auto-detects a GPU when one is present (never on net471).
+    /// On any CPU-only machine — every CI runner here — it therefore ran the same engine as the
+    /// "cpu" case and asserted nothing new, so the regression this whole file exists to catch
+    /// (double narrowed to float across the upload/compute/download path) had NO coverage while
+    /// the suite reported green. Constructing the engine directly makes the GPU case either run
+    /// against the GPU or announce itself as skipped, instead of silently passing as a duplicate.
+    /// </remarks>
     private static IEngine Resolve(string which)
-        => which == "cpu" ? new CpuEngine() : AiDotNetEngine.Current;
+    {
+        if (which == "cpu") return new CpuEngine();
+        var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/…).");
+        return gpu;
+    }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Engines))]
     public void MultiplyVectorByVector_IsExactDouble(string which)
     {
@@ -62,7 +80,7 @@ public class CpuResidentDoublePrecisionTests
         Assert.Equal(A * B, result[0]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Engines))]
     public void AddVectorToVector_IsExactDouble(string which)
     {
@@ -71,7 +89,7 @@ public class CpuResidentDoublePrecisionTests
         Assert.Equal(A + B, result[0]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Engines))]
     public void SubtractVectorFromVector_IsExactDouble(string which)
     {
@@ -80,7 +98,7 @@ public class CpuResidentDoublePrecisionTests
         Assert.Equal(A - B, result[0]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Engines))]
     public void DivideVectorByVector_IsExactDouble(string which)
     {
@@ -89,7 +107,7 @@ public class CpuResidentDoublePrecisionTests
         Assert.Equal(A / B, result[0]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Engines))]
     public void SqrtOfVector_IsExactDouble(string which)
     {
@@ -103,7 +121,7 @@ public class CpuResidentDoublePrecisionTests
     /// narrowing op anywhere in the chain moves the result, so this fails even if only one overload
     /// regresses.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Engines))]
     public void AdamStyleUpdateChain_IsExactDouble(string which)
     {
