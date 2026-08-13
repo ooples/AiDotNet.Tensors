@@ -316,6 +316,11 @@ public partial class CpuEngine
 
                 var adjW = new T[matrixSize];
                 var adjP = new T[matrixSize];
+                // The reverse loop already swaps its previous-step adjoints in, so the
+                // two buffers can simply rotate. Allocating them per timestep cost
+                // 2 * batch * heads * time matrixSize arrays per backward call.
+                var adjWScratch = new T[matrixSize];
+                var adjPScratch = new T[matrixSize];
                 var adjPk = new T[dim];
                 var adjError = new T[dim];
                 var adjRow = new T[dim];
@@ -362,7 +367,7 @@ public partial class CpuEngine
                     }
 
                     // W_t = W_(t-1) - error row
-                    var adjWPrev = new T[matrixSize];
+                    T[] adjWPrev = adjWScratch;
                     Array.Copy(adjW, adjWPrev, matrixSize);
                     for (int i = 0; i < dim; i++)
                         for (int j = 0; j < dim; j++)
@@ -395,7 +400,7 @@ public partial class CpuEngine
                     }
 
                     // P_t = P_(t-1) - pk pk^T / denominator
-                    var adjPPrev = new T[matrixSize];
+                    T[] adjPPrev = adjPScratch;
                     Array.Copy(adjP, adjPPrev, matrixSize);
                     T adjDenominator = ops.Zero;
                     T denominatorSquared = ops.Multiply(denominator, denominator);
@@ -427,6 +432,9 @@ public partial class CpuEngine
                                 ops.Multiply(covarianceTrajectory[prev + i * dim + j], adjPk[i]));
                         }
 
+                    // Rotate: this step's source buffers become next step's scratch.
+                    adjWScratch = adjW;
+                    adjPScratch = adjP;
                     adjW = adjWPrev;
                     adjP = adjPPrev;
                 }

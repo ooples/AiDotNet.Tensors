@@ -58,7 +58,7 @@ public partial class CpuEngine
 
     private static void RoutedDiagonalSsmForwardCore<T>(
         T[] input, T[] mask, T[] transition, T[] inputMap, T[] outputMap, T[] skip,
-        T[] output, int batch, int time, int model, int experts, int state, T[]? trajectory)
+        T[]? output, int batch, int time, int model, int experts, int state, T[]? trajectory)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         for (int b = 0; b < batch; b++)
@@ -92,7 +92,7 @@ public partial class CpuEngine
                         T y = ops.Multiply(skip[dBase + d], input[xBase + d]);
                         for (int s = 0; s < state; s++)
                             y = ops.Add(y, ops.Multiply(outputMap[cBase + d * state + s], h[s]));
-                        output[yBase + d] = ops.Multiply(active, y);
+                        if (output is not null) output[yBase + d] = ops.Multiply(active, y);
                     }
                 }
             }
@@ -113,7 +113,10 @@ public partial class CpuEngine
         RoutedDiagonalSsmForwardCore(
             input.GetDataArray()!, mask.GetDataArray()!, transition.GetDataArray()!,
             inputMap.GetDataArray()!, outputMap.GetDataArray()!, skip.GetDataArray()!,
-            new T[output.Length], batch, time, model, experts, state, trajectory);
+            // The backward replays the forward only to rebuild `trajectory`; the
+            // outputs are discarded, so do not allocate a batch*time*experts*model
+            // array to throw away.
+            null, batch, time, model, experts, state, trajectory);
         RoutedDiagonalSsmBackwardCore(
             gradOutput.GetDataArray()!, input.GetDataArray()!, mask.GetDataArray()!, transition.GetDataArray()!,
             inputMap.GetDataArray()!, outputMap.GetDataArray()!, skip.GetDataArray()!, trajectory,
