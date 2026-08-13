@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru', 'global-avgpool')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -13,6 +13,17 @@ $ncuSource = if ($NcuPath) {
     (Resolve-Path -LiteralPath $NcuPath).Path
 } else {
     (Get-Command ncu -ErrorAction Stop).Source
+}
+# NVIDIA's Windows installation puts ncu.bat on PATH. Passing a kernel regex
+# containing alternation through that wrapper lets cmd.exe interpret `|` as a
+# pipeline before ncu sees the argument. Resolve the wrapper to the native CLI
+# so PowerShell's argument boundaries are preserved for every profiler target.
+if ([System.IO.Path]::GetExtension($ncuSource) -in @('.bat', '.cmd')) {
+    $nativeNcu = Join-Path (Split-Path -Parent $ncuSource) 'target\windows-desktop-win7-x64\ncu.exe'
+    if (-not (Test-Path -LiteralPath $nativeNcu -PathType Leaf)) {
+        throw "Nsight Compute resolved to wrapper '$ncuSource', but its native CLI was not found at '$nativeNcu'. Pass -NcuPath explicitly."
+    }
+    $ncuSource = (Resolve-Path -LiteralPath $nativeNcu).Path
 }
 $targetDll = Join-Path $PSScriptRoot '..\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks.dll'
 if (-not (Test-Path -LiteralPath $targetDll -PathType Leaf)) {
@@ -28,6 +39,7 @@ $switch = switch ($Target) {
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'global-avgpool' { '--direct-ptx-profile-global-avgpool' }
+    'solvers-4x4' { '--direct-ptx-profile-solvers-4x4' }
     'rng-dropout' { '--direct-ptx-profile-rng-dropout' }
     'rng-stochastic' { '--direct-ptx-profile-rng-stochastic' }
     'vision-box-iou' { '--direct-ptx-profile-vision-box-iou' }
@@ -40,6 +52,7 @@ $kernel = switch ($Target) {
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'global-avgpool' { 'regex:aidotnet_fused_global_avgpool_f32' }
+    'solvers-4x4' { 'regex:aidotnet_register_(cholesky|lu_factor|qr_reduced|eigh_(upper|lower)|svd_reduced|lu_solve_vector|ldl_factor_lower|ldl_solve_lower_vector|solve_vector|triangular_solve_(lower|upper)_vector|cholesky_backward_lower|solve_backward_vector)_4x4_f32' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'rng-dropout' { 'regex:aidotnet_philox_dropout_f32' }
@@ -52,6 +65,7 @@ $kernel = switch ($Target) {
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
     'global-avgpool' { 4 }
+    'solvers-4x4' { 56 }
     'residual-rmsnorm' { 4 }
     'decode' { 2 }
     'paged-prefill' { 1 }
