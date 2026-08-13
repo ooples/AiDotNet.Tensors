@@ -20,6 +20,9 @@ internal enum DirectPtxArchitectureFamily
 
 internal static class DirectPtxArchitecture
 {
+    private static bool IsGa102Sm86(int major, int minor) =>
+        (major, minor) == (8, 6);
+
     internal static DirectPtxArchitectureFamily Classify(int major, int minor) => (major, minor) switch
     {
         (8, 9) => DirectPtxArchitectureFamily.Ada,
@@ -35,13 +38,26 @@ internal static class DirectPtxArchitecture
     /// implementation instead of silently inheriting Ampere's tuning.
     /// </summary>
     internal static bool HasValidatedOnlineAttention(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The first QKV/RoPE/cache specialization is measured and promoted only
     /// on GA102/SM86. Other Ampere variants remain independent tuning domains.
     /// </summary>
     internal static bool HasValidatedQkvRopeCache(int major, int minor) =>
+        IsGa102Sm86(major, minor);
+
+    /// <summary>The first vision-family specializations are emitted only for GA102/SM86.</summary>
+    internal static bool HasValidatedVision(int major, int minor) =>
+        IsGa102Sm86(major, minor);
+
+    /// <summary>
+    /// The first stochastic specialization is deliberately limited to the
+    /// exact SM for which its launch/resource contract was authored. It stays
+    /// behind an experimental gate until correctness, performance, and Nsight
+    /// evidence promote it.
+    /// </summary>
+    internal static bool HasExperimentalRngDropout(int major, int minor) =>
         (major, minor) == (8, 6);
 
     /// <summary>
@@ -74,7 +90,7 @@ internal static class DirectPtxArchitecture
     /// rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedFusedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The mixed-precision (FP16 / W8A8) fused-linear decode specializations are
@@ -83,7 +99,7 @@ internal static class DirectPtxArchitecture
     /// own specialization rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedMixedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The fused residual + bias + LayerNorm + GELU decode specialization is
@@ -92,7 +108,7 @@ internal static class DirectPtxArchitecture
     /// own specialization rather than silently inheriting SM86's launch geometry.
     /// </summary>
     internal static bool HasValidatedResidualLayerNormGelu(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The quantized (W8A8) decode-linear specialization is measured only on
@@ -100,7 +116,7 @@ internal static class DirectPtxArchitecture
     /// whole Ampere family would run PTX that was never validated on SM80/SM87.
     /// </summary>
     internal static bool HasValidatedQuantizedLinear(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// Issue #841's first convolution emitter deliberately targets one exact
@@ -108,7 +124,7 @@ internal static class DirectPtxArchitecture
     /// attached; other SMs must use the established backend.
     /// </summary>
     internal static bool HasExperimentalConvolution(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 
     /// <summary>
     /// The checked-in specialized-scientific/hypercomplex/quantum specializations (issue
@@ -116,7 +132,7 @@ internal static class DirectPtxArchitecture
     /// to the established backend rather than inheriting Ampere's tuning.
     /// </summary>
     internal static bool HasValidatedScientific(int major, int minor) =>
-        (major, minor) == (8, 6);
+        IsGa102Sm86(major, minor);
 }
 
 internal enum DirectPtxExtentMode
@@ -190,6 +206,7 @@ internal readonly record struct DirectPtxTensorContract
     internal DirectPtxExtent LogicalExtent { get; }
     internal DirectPtxExtent PhysicalExtent { get; }
     internal int AlignmentBytes { get; }
+    internal nuint ByteOffset { get; }
     internal DirectPtxTensorAccess Access { get; }
     internal DirectPtxExtentMode ExtentMode { get; }
 
@@ -201,31 +218,42 @@ internal readonly record struct DirectPtxTensorContract
         DirectPtxExtent physicalExtent,
         int alignmentBytes,
         DirectPtxTensorAccess access,
-        DirectPtxExtentMode extentMode = DirectPtxExtentMode.AtLeast)
+        DirectPtxExtentMode extentMode = DirectPtxExtentMode.AtLeast,
+        nuint byteOffset = 0)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A tensor ABI name is required.", nameof(name));
         if (alignmentBytes <= 0 || (alignmentBytes & (alignmentBytes - 1)) != 0)
             throw new ArgumentOutOfRangeException(nameof(alignmentBytes), "Alignment must be a power of two.");
         if (physicalExtent.ElementCount < logicalExtent.ElementCount)
             throw new ArgumentException("Physical extent cannot be smaller than logical extent.", nameof(physicalExtent));
+        if (byteOffset % (nuint)alignmentBytes != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(byteOffset), "Byte offset must be a multiple of the required alignment.");
+        int elementBytes = ElementSize(physicalType);
+        if (byteOffset % (nuint)elementBytes != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(byteOffset), "Byte offset must be a multiple of the tensor element size.");
         Name = name;
         PhysicalType = physicalType;
         Layout = layout;
         LogicalExtent = logicalExtent;
         PhysicalExtent = physicalExtent;
         AlignmentBytes = alignmentBytes;
+        ByteOffset = byteOffset;
         Access = access;
         ExtentMode = extentMode;
     }
 
     internal nuint RequiredBytes => checked((nuint)PhysicalExtent.ElementCount * (nuint)ElementBytes);
-    internal int ElementBytes => PhysicalType switch
+    internal int ElementBytes => ElementSize(PhysicalType);
+
+    private static int ElementSize(DirectPtxPhysicalType physicalType) => physicalType switch
     {
         DirectPtxPhysicalType.Int8 or DirectPtxPhysicalType.UInt8 => 1,
         DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
         DirectPtxPhysicalType.Float32 => 4,
         DirectPtxPhysicalType.Int32 => 4,
-        _ => throw new ArgumentOutOfRangeException(nameof(PhysicalType))
+        _ => throw new ArgumentOutOfRangeException(nameof(physicalType))
     };
 }
 

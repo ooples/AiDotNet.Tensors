@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.123.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.122.0...v0.123.0) (2026-08-12)
+
+
+### Features
+
+* **ptx:** add experimental vision kernel family ([#883](https://github.com/ooples/AiDotNet.Tensors/issues/883)) ([a85a9c3](https://github.com/ooples/AiDotNet.Tensors/commit/a85a9c3a35e345c5709e8db9a84bc32bc6c82daf))
+
+
+### Bug Fixes
+
+* **autodiff:** harden gradient ownership and composite contracts ([#935](https://github.com/ooples/AiDotNet.Tensors/issues/935)) ([c3b64d8](https://github.com/ooples/AiDotNet.Tensors/commit/c3b64d8fa3ec03cc83e31558d4032bb107f37efc))
+
 ## [0.122.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.121.0...v0.122.0) (2026-08-07)
 
 

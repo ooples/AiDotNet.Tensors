@@ -190,8 +190,15 @@ public class DirectPtxReductionTests
 
         using var suffixAllocation = runtime.AllocateBytes(
             kernel.Blueprint.Tensors[0].RequiredBytes + (nuint)16);
+        // main moved the byte offset ONTO the contract (with extra alignment/stride validation)
+        // instead of taking it as a CreateOwned parameter, so build an offset contract here.
+        DirectPtxTensorContract baseContract = kernel.Blueprint.Tensors[0];
+        var offsetContract = new DirectPtxTensorContract(
+            baseContract.Name, baseContract.PhysicalType, baseContract.Layout,
+            baseContract.LogicalExtent, baseContract.PhysicalExtent, baseContract.AlignmentBytes,
+            baseContract.Access, baseContract.ExtentMode, byteOffset: 16);
         DirectPtxTensorView suffix = DirectPtxTensorView.CreateOwned(
-            suffixAllocation, kernel.Blueprint.Tensors[0], 16);
+            suffixAllocation, offsetContract);
         Assert.Throws<ArgumentException>(() => kernel.Launch(
             suffix,
             DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1])));
