@@ -29,12 +29,24 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal string DeviceUuid { get; }
     internal int DriverVersion { get; }
     internal string DeviceFingerprint { get; }
+    internal Helpers.Autotune.GpuDeviceFingerprint Fingerprint { get; }
     internal IntPtr Stream => _stream;
+    internal uint StreamFlags
+    {
+        get
+        {
+            using var _ = Enter();
+            Check(CudaNativeBindings.cuStreamGetFlags(_stream, out uint flags),
+                "cuStreamGetFlags");
+            return flags;
+        }
+    }
 
     internal static bool IsAvailable => CudaNativeBindings.IsAvailable;
 
     internal DirectPtxRuntime(int deviceOrdinal = 0)
     {
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
         Check(CuBlasNative.cuInit(0), "cuInit");
         Check(CuBlasNative.cuDeviceGet(out int device, deviceOrdinal), "cuDeviceGet");
 
@@ -52,7 +64,12 @@ internal sealed class DirectPtxRuntime : IDisposable
             "cuDeviceGetAttribute(MaxThreadsPerMultiprocessor)");
 
         Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
-        Check(CudaNativeBindings.cuStreamCreate(out _stream, 1), "cuStreamCreate(non-blocking)");
+        // Standalone buffers use the synchronous Driver-API copy calls, which execute
+        // in the legacy default-stream ordering domain. A blocking stream preserves
+        // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
+        // and can let a freshly launched block observe pre-upload allocation contents.
+        Check(CudaNativeBindings.cuStreamCreate(out _stream, CudaNativeBindings.CU_STREAM_DEFAULT),
+            "cuStreamCreate(blocking)");
         _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation
         // below has an explicit, balanced push/pop boundary.
@@ -73,7 +90,11 @@ internal sealed class DirectPtxRuntime : IDisposable
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
-        DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+        Fingerprint = Helpers.Autotune.GpuDeviceFingerprint.FromCuda(
+            DeviceName, DeviceUuid, major, minor, DriverVersion);
+        // Byte-identical to the legacy fingerprint string, so existing on-disk
+        // autotune caches keyed by DeviceFingerprint remain valid.
+        DeviceFingerprint = Fingerprint.ToCacheToken();
     }
 
     /// <summary>
@@ -114,7 +135,11 @@ internal sealed class DirectPtxRuntime : IDisposable
         ArchitectureFamily = DirectPtxArchitecture.Classify(major, minor);
         DeviceUuid = QueryDeviceUuid(device);
         DriverVersion = CudaNativeBindings.DriverVersion;
-        DeviceFingerprint = BuildDeviceFingerprint(DeviceUuid, major, minor, DriverVersion);
+        Fingerprint = Helpers.Autotune.GpuDeviceFingerprint.FromCuda(
+            DeviceName, DeviceUuid, major, minor, DriverVersion);
+        // Byte-identical to the legacy fingerprint string, so existing on-disk
+        // autotune caches keyed by DeviceFingerprint remain valid.
+        DeviceFingerprint = Fingerprint.ToCacheToken();
     }
 
     private static unsafe string QueryDeviceUuid(int device)
@@ -133,8 +158,6 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
-    private static string BuildDeviceFingerprint(string uuid, int major, int minor, int driverVersion) =>
-        $"gpu-{uuid}-sm{major}{minor}-drv{driverVersion.ToString(CultureInfo.InvariantCulture)}";
 
     internal ContextScope Enter()
     {
@@ -213,10 +236,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal void Synchronize()
     {
         using var _ = Enter();
-        if (_stream != IntPtr.Zero)
-            Check(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
-        else
-            Check(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
+        Check(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
     }
 
     internal DirectPtxGraph CaptureGraph(Action launch)
@@ -357,6 +377,81 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Measures a microkernel geometry from a captured multi-launch graph so
+    /// host submission gaps cannot dominate the tuner. The returned values are
+    /// per-kernel milliseconds, matching <see cref="MeasureKernelSamples"/>.
+    /// </summary>
+    internal float[] MeasureCapturedKernelSamples(
+        Action launch, int warmup, int samples, int launchesPerSample)
+    {
+        PtxCompat.ThrowIfNull(launch, nameof(launch));
+        if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
+        if (samples <= 0) throw new ArgumentOutOfRangeException(nameof(samples));
+        if (launchesPerSample <= 0) throw new ArgumentOutOfRangeException(nameof(launchesPerSample));
+
+        using var _ = Enter();
+        IntPtr graph = IntPtr.Zero;
+        IntPtr graphExec = IntPtr.Zero;
+        IntPtr start = IntPtr.Zero;
+        IntPtr stop = IntPtr.Zero;
+        bool captureActive = false;
+        try
+        {
+            Check(CudaNativeBindings.cuEventCreate(out start, CudaNativeBindings.CU_EVENT_DEFAULT),
+                "cuEventCreate(tuner start)");
+            Check(CudaNativeBindings.cuEventCreate(out stop, CudaNativeBindings.CU_EVENT_DEFAULT),
+                "cuEventCreate(tuner stop)");
+            Check(CudaNativeBindings.cuStreamBeginCapture(
+                _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+                "cuStreamBeginCapture(tuner)");
+            captureActive = true;
+            Check(CudaNativeBindings.cuEventRecordWithFlags(
+                start, _stream, CudaNativeBindings.CU_EVENT_RECORD_EXTERNAL),
+                "cuEventRecordWithFlags(tuner start)");
+            for (int i = 0; i < launchesPerSample; i++) launch();
+            Check(CudaNativeBindings.cuEventRecordWithFlags(
+                stop, _stream, CudaNativeBindings.CU_EVENT_RECORD_EXTERNAL),
+                "cuEventRecordWithFlags(tuner stop)");
+            CudaResult endResult = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
+            captureActive = false;
+            Check(endResult, "cuStreamEndCapture(tuner)");
+            if (graph == IntPtr.Zero)
+                throw new InvalidOperationException("CUDA tuner capture returned a null graph.");
+            Check(CudaNativeBindings.cuGraphInstantiate(out graphExec, graph, 0),
+                "cuGraphInstantiate(tuner)");
+            CudaNativeBindings.cuGraphDestroy(graph);
+            graph = IntPtr.Zero;
+
+            for (int i = 0; i < warmup; i++)
+                Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch(tuner warmup)");
+            Synchronize();
+
+            var result = new float[samples];
+            for (int sample = 0; sample < samples; sample++)
+            {
+                Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch(tuner sample)");
+                Check(CudaNativeBindings.cuEventSynchronize(stop), "cuEventSynchronize(tuner stop)");
+                Check(CudaNativeBindings.cuEventElapsedTime(out float elapsed, start, stop),
+                    "cuEventElapsedTime(tuner)");
+                result[sample] = elapsed / launchesPerSample;
+            }
+            return result;
+        }
+        finally
+        {
+            if (captureActive)
+            {
+                CudaNativeBindings.cuStreamEndCapture(_stream, out IntPtr aborted);
+                if (aborted != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(aborted);
+            }
+            if (start != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(start);
+            if (stop != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(stop);
+            if (graphExec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(graphExec);
+            if (graph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(graph);
+        }
+    }
+
     internal static void Check(CudaResult result, string operation)
     {
         if (result != CudaResult.Success)
@@ -475,6 +570,10 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)source.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Source is larger than the device buffer.", nameof(source));
         using var _ = _runtime.Enter();
+        // Do not let a host write race earlier work on this runtime's stream.
+        // A stream-local barrier preserves ordering without stalling unrelated
+        // streams or other contexts on the device.
+        _runtime.Synchronize();
         fixed (T* pSource = source)
         {
             DirectPtxRuntime.Check(
@@ -487,7 +586,13 @@ internal sealed class DirectPtxBuffer : IDisposable
             // kernel, or concurrent contexts can observe an incompletely staged
             // input and leave apparently random output blocks at zero.
             DirectPtxRuntime.Check(
-                CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+                CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+            // The synchronous pageable-host copy stages through the default
+            // stream. Complete that stream before a caller can enqueue new work
+            // on the runtime's CU_STREAM_NON_BLOCKING stream.
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuStreamSynchronize(IntPtr.Zero),
+                "cuStreamSynchronize(upload staging)");
         }
     }
 
@@ -500,7 +605,10 @@ internal sealed class DirectPtxBuffer : IDisposable
         // non-blocking stream. Make Download independently correct even when a
         // caller omits an explicit Synchronize before reading the result.
         DirectPtxRuntime.Check(
-            CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize(download)");
+            CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(download)");
+        // Make Download independently correct when the caller omits an explicit
+        // barrier, while waiting only for the stream that produces this buffer.
+        _runtime.Synchronize();
         fixed (T* pDestination = destination)
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyDtoH((IntPtr)pDestination, _pointer, checked((ulong)bytes)),
@@ -585,6 +693,25 @@ internal sealed class DirectPtxModule : IDisposable
             SetMaxDynamicSharedMemory(function, checked((int)sharedMemoryBytes));
 
         using var _ = _runtime.Enter();
+        LaunchCurrentContext(
+            function, gridX, gridY, gridZ, blockX, blockY, blockZ,
+            sharedMemoryBytes, arguments);
+    }
+
+    /// <summary>
+    /// Launches after the owning backend has established the CUDA context on
+    /// the calling thread. Driver-only callers use <see cref="Launch"/>; this
+    /// entry point lets validated resident dispatch avoid a second
+    /// cuCtxGetCurrent call for every kernel submission.
+    /// </summary>
+    internal unsafe void LaunchCurrentContext(
+        IntPtr function,
+        uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ,
+        uint sharedMemoryBytes,
+        void** arguments)
+    {
+        PtxCompat.ThrowIfDisposed(_module == IntPtr.Zero, this);
         DirectPtxRuntime.Check(
             CudaNativeBindings.cuLaunchKernel(
                 function,

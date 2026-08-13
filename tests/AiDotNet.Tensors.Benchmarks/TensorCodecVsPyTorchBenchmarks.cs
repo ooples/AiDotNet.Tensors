@@ -634,9 +634,9 @@ public class TensorCodecVsPyTorchBenchmarks
                 _t_attn_k = torch.randn([8, 64, 32]);
             }
 
-            using (var s = GraphMode.Enable()) { _engine.TensorBroadcastAdd(_ba_input, _ba_bias); _broadcastAddPlan = s.CompileInference<float>(); }
-            using (var s = GraphMode.Enable()) { _engine.TensorBroadcastSubtract(_ba_input, _ba_bias); _broadcastSubPlan = s.CompileInference<float>(); }
-            using (var s = GraphMode.Enable()) { _engine.TensorBroadcastMultiply(_ba_input, _ba_bias); _broadcastMulPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorAdd(_ba_input, _ba_bias); _broadcastAddPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSubtract(_ba_input, _ba_bias); _broadcastSubPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMultiply(_ba_input, _ba_bias); _broadcastMulPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorMatMul(_mat512, _mat512); _matmul512Plan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorMSELoss(_loss_pred, _loss_target); _mseLossPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorCrossEntropyLoss(_loss_pred, _loss_target); _crossEntropyPlan = s.CompileInference<float>(); }
@@ -1052,10 +1052,10 @@ public class TensorCodecVsPyTorchBenchmarks
     }
 
     [Benchmark(Description = "AiDotNet Eager: BroadcastAdd[32x256]+[256]")]
-    public Tensor<float> AiDotNet_BroadcastAdd() => _engine.TensorBroadcastAdd(_ba_input, _ba_bias);
+    public Tensor<float> AiDotNet_BroadcastAdd() => _engine.TensorAdd(_ba_input, _ba_bias);
 
     [Benchmark(Description = "AiDotNet Compiled: BroadcastAdd[32x256]+[256]")]
-    public Tensor<float> AiDotNet_BroadcastAdd_Compiled() => _broadcastAddPlan is not null ? _broadcastAddPlan.Execute() : _engine.TensorBroadcastAdd(_ba_input, _ba_bias);
+    public Tensor<float> AiDotNet_BroadcastAdd_Compiled() => _broadcastAddPlan is not null ? _broadcastAddPlan.Execute() : _engine.TensorAdd(_ba_input, _ba_bias);
 
     [Benchmark(Description = "PyTorch: BroadcastAdd[32x256]+[256]")]
     public TorchTensor PyTorch_BroadcastAdd() => _t_ba_input + _t_ba_bias;
@@ -1126,10 +1126,10 @@ public class TensorCodecVsPyTorchBenchmarks
 
     // --- BroadcastMultiply (scaling pattern) ---
     [Benchmark(Description = "AiDotNet Eager: BroadcastMul[32x256]*[256]")]
-    public Tensor<float> AiDotNet_BroadcastMul() => _engine.TensorBroadcastMultiply(_ba_input, _ba_bias);
+    public Tensor<float> AiDotNet_BroadcastMul() => _engine.TensorMultiply(_ba_input, _ba_bias);
 
     [Benchmark(Description = "AiDotNet Compiled: BroadcastMul[32x256]*[256]")]
-    public Tensor<float> AiDotNet_BroadcastMul_Compiled() => _broadcastMulPlan is not null ? _broadcastMulPlan.Execute() : _engine.TensorBroadcastMultiply(_ba_input, _ba_bias);
+    public Tensor<float> AiDotNet_BroadcastMul_Compiled() => _broadcastMulPlan is not null ? _broadcastMulPlan.Execute() : _engine.TensorMultiply(_ba_input, _ba_bias);
 
     [Benchmark(Description = "PyTorch: BroadcastMul[32x256]*[256]")]
     public TorchTensor PyTorch_BroadcastMul() => _t_ba_input * _t_ba_bias;
@@ -1200,10 +1200,10 @@ public class TensorCodecVsPyTorchBenchmarks
 
     // --- BroadcastSubtract ---
     [Benchmark(Description = "AiDotNet Eager: BroadcastSub[32x256]-[256]")]
-    public Tensor<float> AiDotNet_BroadcastSub() => _engine.TensorBroadcastSubtract(_ba_input, _ba_bias);
+    public Tensor<float> AiDotNet_BroadcastSub() => _engine.TensorSubtract(_ba_input, _ba_bias);
 
     [Benchmark(Description = "AiDotNet Compiled: BroadcastSub[32x256]-[256]")]
-    public Tensor<float> AiDotNet_BroadcastSub_Compiled() => _broadcastSubPlan is not null ? _broadcastSubPlan.Execute() : _engine.TensorBroadcastSubtract(_ba_input, _ba_bias);
+    public Tensor<float> AiDotNet_BroadcastSub_Compiled() => _broadcastSubPlan is not null ? _broadcastSubPlan.Execute() : _engine.TensorSubtract(_ba_input, _ba_bias);
 
     [Benchmark(Description = "PyTorch: BroadcastSub[32x256]-[256]")]
     public TorchTensor PyTorch_BroadcastSub() => _t_ba_input - _t_ba_bias;

@@ -2,6 +2,7 @@
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -299,12 +300,6 @@ public static class CuBlasNative
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPopCurrent_v2")]
     public static extern CudaResult cuCtxPopCurrent(out IntPtr context);
-
-    /// <summary>
-    /// Synchronizes the current context.
-    /// </summary>
-    [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
-    public static extern CudaResult cuCtxSynchronize();
 
     /// <summary>
     /// Allocates device memory.
@@ -821,6 +816,7 @@ public sealed class CudaBlasContext : IDisposable
     public CudaBlasContext(int deviceId = 0)
     {
         _deviceId = deviceId;
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
 
         // Initialize CUDA
         CuBlasNative.CheckCudaResult(CuBlasNative.cuInit(0), "cuInit");
@@ -830,7 +826,9 @@ public sealed class CudaBlasContext : IDisposable
         CuBlasNative.CheckCudaResult(CuBlasNative.cuDeviceGet(out device, deviceId), "cuDeviceGet");
 
         // Create context
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+        CuBlasNative.CheckCudaResult(
+            CuBlasNative.cuCtxCreate(out _cudaContext, contextScheduling, device),
+            "cuCtxCreate");
 
         // Create cuBLAS handle
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
@@ -993,7 +991,7 @@ public sealed class CudaBlasContext : IDisposable
     public void Synchronize()
     {
         ThrowIfDisposed();
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize");
     }
 
     private void ThrowIfDisposed()

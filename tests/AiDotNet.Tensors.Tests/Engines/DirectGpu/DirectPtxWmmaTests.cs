@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -32,11 +33,11 @@ public partial class DirectPtxWmmaTests
         }
     }
 
-    public static TheoryData<int, int, int, int, int, bool, int> OnlineAttentionFamilyReleaseCases
+    public static TheoryData<int, int, int, int, int, bool, int, bool> OnlineAttentionFamilyReleaseCases
     {
         get
         {
-            var data = new TheoryData<int, int, int, int, int, bool, int>();
+            var data = new TheoryData<int, int, int, int, int, bool, int, bool>();
             foreach (DirectPtxOnlineAttentionFamilyReleaseCase releaseCase in
                      DirectPtxOnlineAttentionReleaseMatrix.FamilyCases)
             {
@@ -47,7 +48,8 @@ public partial class DirectPtxWmmaTests
                     releaseCase.QuerySequence,
                     releaseCase.KeyValueSequence,
                     releaseCase.Causal,
-                    releaseCase.CausalQueryOffset);
+                    releaseCase.CausalQueryOffset,
+                    releaseCase.Epilogue);
             }
 
             return data;
@@ -434,7 +436,10 @@ public partial class DirectPtxWmmaTests
             emitSoftmaxStats: true, warpsPerBlock);
         Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
-        Assert.InRange(kernel.FunctionInfo.RegistersPerThread, 1, 255);
+        Assert.InRange(
+            kernel.FunctionInfo.RegistersPerThread,
+            1, kernel.Blueprint.ResourceBudget.MaxRegistersPerThread);
+        Assert.Equal(144, kernel.Blueprint.ResourceBudget.MeasuredRegistersPerThread);
 
         using var qDevice = runtime.AllocateBytes(kernel.QBytes);
         using var kDevice = runtime.AllocateBytes(kernel.KBytes);
@@ -477,11 +482,12 @@ public partial class DirectPtxWmmaTests
     [MemberData(nameof(OnlineAttentionFamilyReleaseCases))]
     public void OnlineAttentionFamilyReleaseCase_HasEmbeddedSm86Cubin(
         int batch, int queryHeads, int keyValueHeads,
-        int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset)
+        int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset,
+        bool fuseLayerNormGelu)
     {
         _ = batch;
         string ptx = PtxOnlineFusedAttention128x64Kernel.EmitFamilyPtx(
-            8, 6, queryHeads, keyValueHeads, isCausal, fuseLayerNormGelu: false,
+            8, 6, queryHeads, keyValueHeads, isCausal, fuseLayerNormGelu,
             0.125f, 1e-5f, querySequence, keyValueSequence,
             emitSoftmaxStats: true, causalQueryOffset: causalQueryOffset);
 
@@ -494,7 +500,8 @@ public partial class DirectPtxWmmaTests
     [MemberData(nameof(OnlineAttentionFamilyReleaseCases))]
     public void DriverOnlyOnlineAttentionFamily_MatchesRectangularGqaOracleAndHasZeroLocalBytes(
         int batch, int queryHeads, int keyValueHeads,
-        int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset)
+        int querySequence, int keyValueSequence, bool isCausal, int causalQueryOffset,
+        bool fuseLayerNormGelu)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         const int dimension = 64;
@@ -504,10 +511,11 @@ public partial class DirectPtxWmmaTests
         using var current = runtime.Enter();
         using var kernel = new PtxOnlineFusedAttention128x64Kernel(
             runtime, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
-            isCausal, false, 0.125f, 1e-5f, emitSoftmaxStats: true,
+            isCausal, fuseLayerNormGelu, 0.125f, 1e-5f, emitSoftmaxStats: true,
             causalQueryOffset: causalQueryOffset);
         Assert.Equal(DirectPtxModuleImageKind.EmbeddedCubin, kernel.Audit.ImageKind);
         Assert.Equal(0, kernel.FunctionInfo.LocalBytesPerThread);
+        Assert.Equal(144, kernel.Blueprint.ResourceBudget.MeasuredRegistersPerThread);
         Assert.Equal((long)batch * queryHeads * querySequence * dimension * sizeof(float),
             (long)kernel.OutputBytes);
         Assert.Equal((long)batch * keyValueHeads * keyValueSequence * dimension * sizeof(ushort),
@@ -516,31 +524,44 @@ public partial class DirectPtxWmmaTests
         using var qDevice = runtime.AllocateBytes(kernel.QBytes);
         using var kDevice = runtime.AllocateBytes(kernel.KBytes);
         using var vDevice = runtime.AllocateBytes(kernel.VBytes);
+        using var gammaDevice = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.GammaBytes);
+        using var betaDevice = runtime.AllocateBytes(PtxOnlineFusedAttention128x64Kernel.BetaBytes);
         using var outputDevice = runtime.AllocateBytes(kernel.OutputBytes);
         using var statsDevice = runtime.AllocateBytes(kernel.StatsBytes);
         var random = new Random(
             20260800 + batch * 1000 + queryHeads * 100 + keyValueHeads * 10 +
-            querySequence + keyValueSequence + (isCausal ? 1 : 0));
+            querySequence + keyValueSequence + (isCausal ? 1 : 0) +
+            (fuseLayerNormGelu ? 2 : 0));
         ushort[] q = RandomHalfRange(
             random, batch * queryHeads * querySequence * dimension, 0.25f);
         ushort[] k = RandomHalfRange(
             random, batch * keyValueHeads * keyValueSequence * dimension, 0.25f);
         ushort[] v = RandomHalfRange(
             random, batch * keyValueHeads * keyValueSequence * dimension, 0.25f);
+        float[] gamma = Enumerable.Range(0, dimension).Select(i => 0.75f + i / 256f).ToArray();
+        float[] beta = Enumerable.Range(0, dimension).Select(i => (i - 32) / 512f).ToArray();
         qDevice.Upload<ushort>(q);
         kDevice.Upload<ushort>(k);
         vDevice.Upload<ushort>(v);
+        gammaDevice.Upload<float>(gamma);
+        betaDevice.Upload<float>(beta);
 
         DirectPtxTensorView qView = DirectPtxTensorView.CreateOwned(qDevice, kernel.Blueprint.Tensors[0]);
         DirectPtxTensorView kView = DirectPtxTensorView.CreateOwned(kDevice, kernel.Blueprint.Tensors[1]);
         DirectPtxTensorView vView = DirectPtxTensorView.CreateOwned(vDevice, kernel.Blueprint.Tensors[2]);
+        DirectPtxTensorView gammaView = fuseLayerNormGelu
+            ? DirectPtxTensorView.CreateOwned(gammaDevice, kernel.Blueprint.Tensors[3])
+            : default;
+        DirectPtxTensorView betaView = fuseLayerNormGelu
+            ? DirectPtxTensorView.CreateOwned(betaDevice, kernel.Blueprint.Tensors[4])
+            : default;
         DirectPtxTensorView outputView = DirectPtxTensorView.CreateOwned(outputDevice, kernel.Blueprint.Tensors[5]);
         DirectPtxTensorView statsView = DirectPtxTensorView.CreateOwned(statsDevice, kernel.Blueprint.Tensors[6]);
-        kernel.Launch(qView, kView, vView, default, default, outputView, statsView);
+        kernel.Launch(qView, kView, vView, gammaView, betaView, outputView, statsView);
         runtime.Synchronize();
         long launchBefore = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < 32; i++)
-            kernel.Launch(qView, kView, vView, default, default, outputView, statsView);
+            kernel.Launch(qView, kView, vView, gammaView, betaView, outputView, statsView);
         long launchAllocated = GC.GetAllocatedBytesForCurrentThread() - launchBefore;
         runtime.Synchronize();
         Assert.True(launchAllocated == 0, $"raw module launch allocated {launchAllocated} bytes");
@@ -550,14 +571,16 @@ public partial class DirectPtxWmmaTests
         statsDevice.Download<float>(actualStats);
 
         (float outputError, float statsError) = ValidateOnlineFamily(
-            actual, actualStats, q, k, v, batch, queryHeads, keyValueHeads,
-            querySequence, keyValueSequence, isCausal, causalQueryOffset);
-        Assert.True(outputError <= 0.012f,
+            actual, actualStats, q, k, v, gamma, beta, batch, queryHeads, keyValueHeads,
+            querySequence, keyValueSequence, isCausal, causalQueryOffset, fuseLayerNormGelu);
+        Assert.True(outputError <= (fuseLayerNormGelu ? 0.025f : 0.012f),
             $"Rectangular GQA PTX max output error {outputError:G9}.");
         Assert.True(statsError <= 0.02f,
             $"Rectangular GQA PTX max LSE error {statsError:G9}.");
         Assert.Contains(queryHeads == keyValueHeads ? "mha" : keyValueHeads == 1 ? "mqa" : "gqa",
             kernel.Blueprint.Semantics["head-mapping"]);
+        Assert.Equal(fuseLayerNormGelu ? "layernorm-affine-tanh-gelu" : "none",
+            kernel.Blueprint.Semantics["epilogue"]);
     }
 
     [SkippableFact]
@@ -701,6 +724,53 @@ public partial class DirectPtxWmmaTests
         Assert.Throws<ArgumentException>(() => DirectPtxTensorView.Create(misaligned, contract));
     }
 
+    [Fact]
+    public void SharedPhysicalAbiValidator_PreservesExactAndAtLeastContracts()
+    {
+        var extent = new DirectPtxExtent(2, 8);
+        var contract = new DirectPtxTensorContract(
+            "shared-abi", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.RowMajor2D,
+            extent, extent, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact);
+        using var buffer = new SyntheticGpuBuffer((IntPtr)0x2000, 32);
+        DirectPtxTensorView view = DirectPtxTensorView.Create(buffer, contract);
+
+        DirectPtxAbi.Require(view, contract, "input");
+        DirectPtxAbi.RequireAtLeast(view, contract, "input");
+
+        var error = Assert.Throws<ArgumentException>(() =>
+            DirectPtxAbi.Require(default, contract, "input"));
+        Assert.Equal("input", error.ParamName);
+        Assert.Contains("shared-abi", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(14, 16)]
+    [InlineData(22, 24)]
+    [InlineData(26, 32)]
+    [InlineData(34, 40)]
+    [InlineData(40, 40)]
+    public void MeasuredResourceBudget_StaysWithinCurrentRegisterAllocationBucket(
+        int measuredRegisters, int expectedMaximum)
+    {
+        DirectPtxResourceBudget budget = DirectPtxResourceBudget.FromDriverMeasurement(
+            measuredRegisters, maxStaticSharedBytes: 0,
+            maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1);
+
+        Assert.Equal(measuredRegisters, budget.MeasuredRegistersPerThread);
+        Assert.Equal(expectedMaximum, budget.MaxRegistersPerThread);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void MeasuredResourceBudget_RejectsNonPositiveMeasurement(int measuredRegisters)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DirectPtxResourceBudget.FromDriverMeasurement(
+                measuredRegisters, maxStaticSharedBytes: 0,
+                maxLocalBytesPerThread: 0, minBlocksPerMultiprocessor: 1));
+    }
+
     [Theory]
     [InlineData(8, 0, (int)DirectPtxArchitectureFamily.Ampere)]
     [InlineData(8, 6, (int)DirectPtxArchitectureFamily.Ampere)]
@@ -715,6 +785,47 @@ public partial class DirectPtxWmmaTests
         Assert.Equal(expected, DirectPtxArchitecture.Classify(major, minor));
         Assert.Equal(major == 8 && minor == 6,
             DirectPtxArchitecture.HasValidatedOnlineAttention(major, minor));
+    }
+
+    [Fact]
+    public void PostLoadInitialization_DisposesResourceAndPreservesFailure()
+    {
+        var resource = new TrackingDisposable();
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackingDisposable, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_CleanupFailureDoesNotMaskPrimaryFailure()
+    {
+        var resource = new TrackingDisposable { ThrowOnDispose = true };
+        var expected = new InvalidOperationException("post-load validation failed");
+
+        var actual = Assert.Throws<InvalidOperationException>(() =>
+            DirectPtxResourceInitialization.Complete<TrackingDisposable, int>(
+                resource, _ => throw expected));
+
+        Assert.Same(expected, actual);
+        Assert.True(resource.IsDisposed);
+    }
+
+    [Fact]
+    public void PostLoadInitialization_TransfersSuccessfulResourceOwnership()
+    {
+        var resource = new TrackingDisposable();
+
+        var loaded = DirectPtxResourceInitialization.Complete(resource, _ => 42);
+
+        Assert.Same(resource, loaded.Resource);
+        Assert.Equal(42, loaded.Value);
+        Assert.False(resource.IsDisposed);
+        loaded.Resource.Dispose();
     }
 
     [Fact]
@@ -782,6 +893,42 @@ public partial class DirectPtxWmmaTests
         Assert.Equal(new[] { 4, 2 }, DirectPtxAttentionAutotuner.Candidates(64));
         Assert.Equal(new[] { 8, 4 }, DirectPtxAttentionAutotuner.Candidates(128));
         Assert.Throws<ArgumentOutOfRangeException>(() => DirectPtxAttentionAutotuner.Candidates(96));
+    }
+
+    [Fact]
+    public void AttentionAutotuner_CandidatesRoundTripOnlySupportedWarpCounts()
+    {
+        IReadOnlyList<AutotuneCandidate> candidates =
+            DirectPtxAttentionAutotuner.CandidateConfigurations(64);
+
+        Assert.Collection(candidates,
+            candidate =>
+            {
+                Assert.True(DirectPtxAttentionAutotuner.TryGetWarps(candidate, 64, out int warps));
+                Assert.Equal(4, warps);
+                Assert.Equal("4", candidate.Parameters["WarpsPerBlock"]);
+            },
+            candidate =>
+            {
+                Assert.True(DirectPtxAttentionAutotuner.TryGetWarps(candidate, 64, out int warps));
+                Assert.Equal(2, warps);
+            });
+
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(
+            new AutotuneCandidate("query-warps-999"), 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(default(AutotuneCandidate), 64, out _));
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(candidates[0], 17, out _));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void AttentionAutotuner_MalformedCacheVariantIsCacheMiss(string variant)
+    {
+        var cached = new KernelChoice { Variant = variant };
+
+        Assert.False(DirectPtxAttentionAutotuner.TryGetWarps(cached, 64, out int warps));
+        Assert.Equal(0, warps);
     }
 
     [Fact]
@@ -4542,13 +4689,16 @@ public partial class DirectPtxWmmaTests
         ushort[] q,
         ushort[] k,
         ushort[] v,
+        float[] gamma,
+        float[] beta,
         int batch,
         int queryHeads,
         int keyValueHeads,
         int querySequence,
         int keyValueSequence,
         bool causal,
-        int causalQueryOffset = 0)
+        int causalQueryOffset,
+        bool epilogue)
     {
         const int dimension = 64;
         const float scale = 0.125f;
@@ -4585,16 +4735,22 @@ public partial class DirectPtxWmmaTests
                     scores[column] = MathF.Exp(scores[column] - maximum);
                     sum += scores[column];
                 }
+                var rowOutput = new float[dimension];
                 for (int d = 0; d < dimension; d++)
                 {
-                    float expected = 0;
+                    float value = 0;
                     for (int column = 0; column <= lastKey; column++)
                     {
                         int valueBase = (flatKeyValueHead * keyValueSequence + column) * dimension;
-                        expected += scores[column] / sum * Half(v[valueBase + d]);
+                        value += scores[column] / sum * Half(v[valueBase + d]);
                     }
+                    rowOutput[d] = value;
+                }
+                ApplyOnlineEpilogue(rowOutput, gamma, beta, epilogue);
+                for (int d = 0; d < dimension; d++)
+                {
                     maxOutputError = MathF.Max(maxOutputError,
-                        MathF.Abs(actual[queryBase + d] - expected));
+                        MathF.Abs(actual[queryBase + d] - rowOutput[d]));
                 }
                 float actualRowStats = actualStats[flatQueryHead * querySequence + row];
                 if (lastKey < 0)
@@ -4643,22 +4799,26 @@ public partial class DirectPtxWmmaTests
                     value += scores[column] / sum * Half(v[column * dimension + d]);
                 rowOutput[d] = value;
             }
-            if (epilogue)
-            {
-                float mean = rowOutput.Average();
-                float variance = rowOutput.Select(x => (x - mean) * (x - mean)).Average();
-                float inverseStd = 1f / MathF.Sqrt(variance + 1e-5f);
-                for (int d = 0; d < dimension; d++)
-                {
-                    float x = (rowOutput[d] - mean) * inverseStd * gamma[d] + beta[d];
-                    rowOutput[d] = 0.5f * x *
-                        (1f + MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-                }
-            }
+            ApplyOnlineEpilogue(rowOutput, gamma, beta, epilogue);
             for (int d = 0; d < dimension; d++)
                 maxError = MathF.Max(maxError, MathF.Abs(actual[row * dimension + d] - rowOutput[d]));
         }
         return maxError;
+    }
+
+    private static void ApplyOnlineEpilogue(
+        float[] rowOutput, float[] gamma, float[] beta, bool epilogue)
+    {
+        if (!epilogue) return;
+        float mean = rowOutput.Average();
+        float variance = rowOutput.Select(x => (x - mean) * (x - mean)).Average();
+        float inverseStd = 1f / MathF.Sqrt(variance + 1e-5f);
+        for (int d = 0; d < rowOutput.Length; d++)
+        {
+            float x = (rowOutput[d] - mean) * inverseStd * gamma[d] + beta[d];
+            rowOutput[d] = 0.5f * x *
+                (1f + MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+        }
     }
 
     private static float Half(ushort bits) => (float)BitConverter.UInt16BitsToHalf(bits);
@@ -4790,7 +4950,13 @@ public partial class DirectPtxWmmaTests
     private sealed class TrackingDisposable : IDisposable
     {
         internal bool IsDisposed { get; private set; }
-        public void Dispose() => IsDisposed = true;
+        internal bool ThrowOnDispose { get; set; }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            if (ThrowOnDispose) throw new InvalidOperationException("cleanup failed");
+        }
     }
 }
 #endif

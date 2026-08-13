@@ -777,6 +777,50 @@ public class CompiledBackwardWalkTests
     }
 
     [Fact]
+    public async Task CompiledWalker_IdentityFanOut_AccumulatesEachPathOnce()
+    {
+        await Task.Yield();
+
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1)
+                {
+                    resetMethod.Invoke(null, null);
+                }
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var x = new Tensor<float>(new[] { 0.5f, -1.25f, 2.0f }, new[] { 3 });
+                var left = engine.TensorAdd(x, x);
+                var right = engine.TensorAdd(x, x);
+                var loss = engine.ReduceSum(engine.TensorAdd(left, right));
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { x });
+
+                Assert.Equal(new[] { 4.0f, 4.0f, 4.0f }, grads[x].ToArray());
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
     public void CompiledWalker_LongTape_ManyOps_ProducesIdenticalGradients()
     {
         // Stress test for the IL emitter — verifies the unrolled

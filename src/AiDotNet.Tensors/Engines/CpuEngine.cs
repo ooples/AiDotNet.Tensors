@@ -2032,7 +2032,9 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Reshape", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var originalShape = tensor.Shape.ToArray();
-        var result = tensor.Reshape(newShape);
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
         AutoTracer.RecordOp("Reshape", result, eng => eng.Reshape(tensor, newShape));
         return result;
@@ -3002,10 +3004,32 @@ public partial class CpuEngine : ITensorLevelEngine
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorAdd");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastAdd(a, b);
+            }
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
@@ -3042,15 +3066,16 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
-        // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
-        // IMPORTANT: use _storage.GetDataArray() (raw backing array) not tensor.GetDataArray() (which copies for views)
+        // Stride-aware: a non-contiguous operand is consumed where it lies, never materialized.
+        //
+        // Routed to the coalescing SIMD kernel rather than walked element-by-element through
+        // LogicalToStorageIndex. The per-element walk was affordable while only the occasional
+        // transposed operand reached here; implicit broadcasting sends every stretched operand down
+        // this branch as a stride-0 view. Measured on [1,64,112,112] + [1,64,1,1] — the Conv+BN
+        // shape the broadcast fast paths exist for — the walk cost 78.2 ms/call against 10.8 ms.
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aRaw = a._storage.GetDataArray(); var bRaw = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[aOff + i], bRaw[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[b.LogicalToStorageIndex(i)]); }
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Add);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -3388,7 +3413,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // breaks CUDA-graph capture); else the eager allocating path.
                         if (eng is DirectGpuTensorEngine baGpu && baGpu.TryBroadcastAddResidentInto(output, capturedA, capturedB))
                             return;
-                        var eager = eng.TensorBroadcastAdd(capturedA, capturedB);
+                        var eager = eng.TensorAdd(capturedA, capturedB);
                         DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                     },
                     BackwardFunctions<T>.BroadcastAddBackward);
@@ -3423,7 +3448,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
             }
             return res;
         }
@@ -3454,7 +3479,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
             }
             return res;
         }
@@ -3465,7 +3490,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (AutoTracer.ShouldRecord)
         {
             var ca = a; var cb = b;
-            AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorBroadcastAdd(ca, cb));
+            AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorAdd(ca, cb));
         }
         return result;
     }
@@ -3489,7 +3514,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // a._shape is not always the final broadcast shape.
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorSubtract(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastSubtractBackward);
             }
         }
@@ -3514,7 +3539,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb));
             }
             return res;
         }
@@ -3537,7 +3562,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         rf[off + c] = af[off + c] - bf[c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb)); }
                 return res;
             }
         }
@@ -3570,14 +3595,14 @@ public partial class CpuEngine : ITensorLevelEngine
                         rd[rRow + c] = ad[aRow + c] - bd[bOff + c];
                 }
                 DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+                { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb)); }
                 return res;
             }
         }
 
         var result = a.BroadcastSubtract(b);
         DifferentiableOps.RecordBinary("TensorBroadcastSubtract", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", result, eng => eng.TensorBroadcastSubtract(ca, cb)); }
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastSubtract", result, eng => eng.TensorSubtract(ca, cb)); }
         return result;
     }
 
@@ -3599,7 +3624,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Same broadcast-shape fix as TensorBroadcastMultiply.
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorDivide(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastDivideBackward);
             }
         }
@@ -3623,14 +3648,14 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorBroadcastDivide(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorDivide(ca, cb));
             }
             return res;
         }
 
         var result = a.BroadcastDivide(b);
         DifferentiableOps.RecordBinary("TensorBroadcastDivide", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastDivide", result, eng => eng.TensorBroadcastDivide(ca, cb)); }
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastDivide", result, eng => eng.TensorDivide(ca, cb)); }
         return result;
     }
 
@@ -3657,7 +3682,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // inside the closure overran it with "Destination is too short".
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { var r = eng.TensorMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastMultiplyBackward);
             }
         }
@@ -3684,7 +3709,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (AutoTracer.ShouldRecord)
             {
                 var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb));
+                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb));
             }
             return res;
         }
@@ -3715,13 +3740,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
             }
             DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
-            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb)); }
+            { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb)); }
             return res;
         }
 
         var result = a.BroadcastMultiply(b);
         DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorBroadcastMultiply(ca, cb)); }
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", result, eng => eng.TensorMultiply(ca, cb)); }
         return result;
     }
 
@@ -5310,10 +5335,32 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastSubtract(a, b);
+            }
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         // Pin the active gradient tape (if any) to THIS engine — same
         // reasoning as the scope.BindEngineIfUnset call below, but for the
@@ -5362,9 +5409,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Subtract);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -5460,10 +5507,32 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
-            // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
-            return TensorBroadcastMultiply(a, b);
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastMultiply(a, b);
+            }
+
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
@@ -5501,9 +5570,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Multiply);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -6173,10 +6242,32 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        // Shapes that differ but are broadcast-compatible are stretched, as NumPy, PyTorch and JAX
+        // all do. Reduce-then-recombine is the most common shape pattern in numerical code — divide
+        // [rows, cols] by a [rows, 1] norm, subtract a [rows, 1] row max, standardize [batch, dim]
+        // against a [1, dim] mean — and requiring an explicitly named alternative for it meant every
+        // call site had to know its operand ranks in advance and pick a different method.
+        //
+        // ShapePolicy.Strict() restores throw-on-mismatch for callers that want the old guarantee,
+        // because the cost of broadcasting is that a transposed operand stops announcing itself.
         if (!ShapesMatch(a._shape, b._shape))
         {
+            if (!ShapePolicy.IsStrict && CanBroadcast(a._shape, b._shape))
+                        {
+                // Delegate to the specialized broadcast implementation rather than expanding both
+                // operands into views here. ExpandTo is free and correct, but it erases the operand
+                // SHAPES the channel-repeat and trailing-repeat fast paths key on -- after expansion
+                // both sides report the common shape and the pattern is invisible. Measured on
+                // [1,64,112,112] + [1,64,1,1] that costs 1.151 ms against 0.445 ms, so the fast paths
+                // stay on the hot route and the stride-0 view serves the general case beneath them.
+                return TensorBroadcastDivide(a, b);
+            }
+
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}."
+                + (CanBroadcast(a._shape, b._shape)
+                    ? " They are broadcast-compatible; this threw because ShapePolicy.Strict() is active."
+                    : string.Empty));
         }
 
         // Lazy graph mode: record and return placeholder
@@ -6204,9 +6295,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
+            // See TensorAdd: implicit broadcasting made this branch the common path.
+            Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Divide);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -7055,8 +7146,15 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < src.Length; i++)
                 dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
         }
+        // Match the mathematical contract used by PyTorch/JAX and by this method's graph-mode
+        // path: round is piecewise constant, so its derivative is zero almost everywhere. A
+        // straight-through estimator is an optimization policy for quantization-aware training,
+        // not the derivative of a basic arithmetic primitive; silently applying it here made the
+        // same expression differentiate differently in eager and captured execution. Callers that
+        // intentionally need an STE must opt into a dedicated estimator rather than changing the
+        // meaning of TensorRound for every loss (notably angular anti-wrapping).
         DifferentiableOps.RecordUnary("Round", result, tensorOrig,
-            BackwardFunctions<T>.StraightThroughBackward);
+            BackwardFunctions<T>.SignBackward);
         { var c = tensor; AutoTracer.RecordOp("Round", result, eng => eng.TensorRound(c)); }
         return result;
     }
@@ -12217,8 +12315,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Return a contiguous transposed copy for API compatibility.
         // The lazy graph path uses a more efficient execute delegate.
-        var view = tensor.Transpose();
-        var result = view.Contiguous();
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+        {
+            var view = tensor.Transpose();
+            result = view.Contiguous();
+        }
         DifferentiableOps.RecordUnary("TensorTranspose", result, tensor, BackwardFunctions<T>.TransposeBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorTranspose", result, eng => eng.TensorTranspose(c)); }
         return result;
@@ -12690,6 +12792,26 @@ public partial class CpuEngine : ITensorLevelEngine
 
         throw new ArgumentException(
             $"TensorMatMulFloatInto: unsupported rank combination {a.Rank} and {b.Rank}");
+    }
+
+    /// <summary>
+    /// Whether two shapes can be broadcast against each other under NumPy rules.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="ComputeBroadcastShape"/>'s compatibility test without allocating a result
+    /// shape or throwing, so the element-wise operators can ask the question cheaply before deciding
+    /// whether to stretch or to reject.
+    /// </remarks>
+    internal static bool CanBroadcast(int[] shape1, int[] shape2)
+    {
+        int maxRank = Math.Max(shape1.Length, shape2.Length);
+        for (int i = 0; i < maxRank; i++)
+        {
+            int dim1 = i < shape1.Length ? shape1[shape1.Length - 1 - i] : 1;
+            int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
+            if (dim1 != dim2 && dim1 != 1 && dim2 != 1) return false;
+        }
+        return true;
     }
 
     private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
@@ -14747,15 +14869,35 @@ public partial class CpuEngine : ITensorLevelEngine
                                     flippedF[fBase + kh * kernelWidth + kw] =
                                         kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
                         }
-                    var fusedResult = Conv2D<float>(gradOutFloat, flippedKernel, 1, padHt, 1);
-                    var fusedF = (float[])(object)fusedResult.GetFlattenedData();
                     var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;
-                    if (accumulate)
-                        for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
+                    const int UnitStride = 1;
+                    const int UnitDilation = 1;
+                    if (!accumulate)
+                    {
+                        // Write through to the caller-owned destination. This
+                        // preserves the overwrite contract while avoiding the
+                        // allocating scalar overload and a full result copy.
+                        Conv2DInto(
+                            (Tensor<float>)(object)dest,
+                            gradOutFloat,
+                            flippedKernel,
+                            new[] { UnitStride, UnitStride },
+                            new[] { padHt, padWt },
+                            new[] { UnitDilation, UnitDilation });
+                    }
                     else
-                        Array.Copy(fusedF, 0, destFused, destOffFused, totalFused);
+                    {
+                        var fusedResult = Conv2D<float>(
+                            gradOutFloat,
+                            flippedKernel,
+                            UnitStride,
+                            padHt,
+                            UnitDilation);
+                        var fusedF = (float[])(object)fusedResult.GetFlattenedData();
+                        for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
+                    }
                     return;
                 }
             }
@@ -22105,6 +22247,68 @@ public partial class CpuEngine : ITensorLevelEngine
             BackwardFunctions<T>.GumbelSoftmaxStraightThroughBackward,
             new object[] { temperature, axis, softResult });
         return hardResult;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorCategoricalSample<T>(
+        Tensor<T> probabilities,
+        int axis = -1,
+        int? seed = null)
+    {
+        if (probabilities is null) throw new ArgumentNullException(nameof(probabilities));
+        int rank = probabilities.Rank;
+        int normalizedAxis = axis < 0 ? rank + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= rank)
+            throw new ArgumentOutOfRangeException(nameof(axis));
+        int classes = probabilities.Shape[normalizedAxis];
+        if (classes <= 0)
+            throw new ArgumentException("Categorical sampling requires a non-empty category axis.", nameof(probabilities));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T[] source = probabilities.GetFlattenedData();
+        var destination = new T[source.Length];
+        int outerSize = 1;
+        int innerSize = 1;
+        for (int i = 0; i < normalizedAxis; i++) outerSize = checked(outerSize * probabilities.Shape[i]);
+        for (int i = normalizedAxis + 1; i < rank; i++) innerSize = checked(innerSize * probabilities.Shape[i]);
+        Random random = seed.HasValue ? new Random(seed.Value) : RandomHelper.ThreadSafeRandom;
+
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            for (int inner = 0; inner < innerSize; inner++)
+            {
+                double sum = 0d;
+                for (int category = 0; category < classes; category++)
+                {
+                    int index = (outer * classes + category) * innerSize + inner;
+                    double probability = numOps.ToDouble(source[index]);
+                    if (double.IsNaN(probability) || double.IsInfinity(probability) || probability < 0d)
+                        throw new ArgumentException(
+                            "Categorical probabilities must be finite and non-negative.", nameof(probabilities));
+                    sum += probability;
+                }
+                if (!(sum > 0d) || double.IsNaN(sum) || double.IsInfinity(sum))
+                    throw new ArgumentException(
+                        "Every categorical slice must have a finite positive sum.", nameof(probabilities));
+                double target = random.NextDouble() * sum;
+                double cumulative = 0d;
+                int selected = classes - 1;
+                for (int category = 0; category < classes; category++)
+                {
+                    int index = (outer * classes + category) * innerSize + inner;
+                    cumulative += numOps.ToDouble(source[index]);
+                    if (target < cumulative)
+                    {
+                        selected = category;
+                        break;
+                    }
+                }
+                int selectedIndex = (outer * classes + selected) * innerSize + inner;
+                destination[selectedIndex] = numOps.One;
+            }
+        }
+
+        return TensorAllocator.Rent<T>(probabilities._shape, destination);
     }
 
     /// <inheritdoc/>
@@ -33914,8 +34118,27 @@ public partial class CpuEngine : ITensorLevelEngine
             resultData[flatIdx] = tensorData[inputFlat];
         });
 
-        DifferentiableOps.RecordUnary("TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward, new object[] { start });
-        AutoTracer.RecordOp("TensorSlice", result, eng => eng.TensorSlice(tensor, start, length));
+        // A tape is an immutable record of the FORWARD call. `start` and `length` are mutable
+        // caller-owned arrays, and high-throughput callers commonly reuse one buffer across a
+        // loop. Capturing either array by reference lets a later mutation rewrite an earlier
+        // node's backward/replay semantics (RAFT's two flow-channel slices both became channel 1,
+        // dropping channel 0's gradient). Snapshot metadata only when a consumer will retain it;
+        // ordinary eager inference keeps the allocation-free path.
+        if (DifferentiableOps.IsRecording<T>())
+        {
+            var recordedStart = (int[])start.Clone();
+            DifferentiableOps.RecordUnary(
+                "TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward,
+                new object[] { recordedStart });
+        }
+        if (AutoTracer.ShouldRecord)
+        {
+            var tracedStart = (int[])start.Clone();
+            var tracedLength = (int[])length.Clone();
+            AutoTracer.RecordOp(
+                "TensorSlice", result,
+                eng => eng.TensorSlice(tensor, tracedStart, tracedLength));
+        }
         return result;
     }
 
@@ -34398,8 +34621,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorPermute", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        // Use tensor's built-in Transpose method
-        var result = tensor.Transpose(axes);
+        // Use tensor's built-in Transpose method. The engine registers the operation-specific
+        // edge below, so suppress the Tensor API's direct-call fallback for this one delegation.
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Transpose(axes);
         DifferentiableOps.RecordUnary("TensorPermute", result, tensor, BackwardFunctions<T>.PermuteBackward, new object[] { axes });
         AutoTracer.RecordOp("TensorPermute", result, eng => eng.TensorPermute(tensor, axes));
         return result;
@@ -34444,7 +34670,9 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis; i < rank; i++)
             newShape[i + 1] = tensor._shape[i];
 
-        var result = tensor.Reshape(newShape);
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("TensorExpandDims", result, tensor, BackwardFunctions<T>.ExpandDimsBackward, new object[] { axis });
         AutoTracer.RecordOp("TensorExpandDims", result, eng => eng.TensorExpandDims(tensor, axis));
         return result;
@@ -34494,7 +34722,9 @@ public partial class CpuEngine : ITensorLevelEngine
             if (shape.Count == 0) shape.Add(1);
         }
 
-        var squeezeResult = tensor.Reshape(shape.ToArray());
+        Tensor<T> squeezeResult;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            squeezeResult = tensor.Reshape(shape.ToArray());
         DifferentiableOps.RecordUnary("TensorSqueeze", squeezeResult, tensor, BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
         AutoTracer.RecordOp("TensorSqueeze", squeezeResult, eng => squeezeResult);
         return squeezeResult;

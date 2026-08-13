@@ -203,15 +203,15 @@ public class GradientTapeRawLeakTests
         var x = x0;
         for (int l = 0; l < L; l++)
         {
-            var hMid = engine.TensorBroadcastAdd(engine.TensorMatMul(x, W1s[l]), b1s[l]);
+            var hMid = engine.TensorAdd(engine.TensorMatMul(x, W1s[l]), b1s[l]);
             // Cubic activation — same pattern the issue's repro uses
             // (engine.TensorMultiply chain).
             var hAct = engine.TensorMultiply(engine.TensorMultiply(hMid, hMid), hMid);
-            var Fx = engine.TensorBroadcastAdd(engine.TensorMatMul(hAct, W2s[l]), b2s[l]);
+            var Fx = engine.TensorAdd(engine.TensorMatMul(hAct, W2s[l]), b2s[l]);
             x = engine.Tanh(engine.TensorAdd(x, Fx));
             x = engine.LayerNorm(x, gamma[l], beta[l], 1e-5, out _, out _);
         }
-        var logits = engine.TensorBroadcastAdd(engine.TensorMatMul(x, Wh), bh);
+        var logits = engine.TensorAdd(engine.TensorMatMul(x, Wh), bh);
         // Use TensorMSELoss as the per-token loss — TensorCrossEntropyLoss
         // requires an int target tensor and the issue's repro uses
         // continuous-target gradients anyway.

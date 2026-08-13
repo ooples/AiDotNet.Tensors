@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.124.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.123.0...v0.124.0) (2026-08-13)
+
+
+### Features
+
+* **ptx:** add register-resident dense solver family ([#882](https://github.com/ooples/AiDotNet.Tensors/issues/882)) ([f130995](https://github.com/ooples/AiDotNet.Tensors/commit/f1309950346d6e5bb68271fa4a156c784b3f2b6b))
+* **ptx:** complete RNG and stochastic kernel family ([#880](https://github.com/ooples/AiDotNet.Tensors/issues/880)) ([c1c9afc](https://github.com/ooples/AiDotNet.Tensors/commit/c1c9afc57e9e32f8eff31f9ec7e34f7a52bd1c69))
+
+
+### Bug Fixes
+
+* engine dispatch must honor tensor residency (CPU-resident double silently computed in float) ([#937](https://github.com/ooples/AiDotNet.Tensors/issues/937)) ([aab2846](https://github.com/ooples/AiDotNet.Tensors/commit/aab28469507bc9846786f4926599a12d56e1c227))
+
+
+### Performance
+
+* **autodiff:** materialize the in-place gradient copy lazily ([#938](https://github.com/ooples/AiDotNet.Tensors/issues/938)) ([8550c42](https://github.com/ooples/AiDotNet.Tensors/commit/8550c42dfafd715aa1d9b765bbd47eba666c9ab5))
+
+## [0.123.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.122.0...v0.123.0) (2026-08-12)
+
+
+### Features
+
+* **ptx:** add experimental vision kernel family ([#883](https://github.com/ooples/AiDotNet.Tensors/issues/883)) ([a85a9c3](https://github.com/ooples/AiDotNet.Tensors/commit/a85a9c3a35e345c5709e8db9a84bc32bc6c82daf))
+
+
+### Bug Fixes
+
+* **autodiff:** harden gradient ownership and composite contracts ([#935](https://github.com/ooples/AiDotNet.Tensors/issues/935)) ([c3b64d8](https://github.com/ooples/AiDotNet.Tensors/commit/c3b64d8fa3ec03cc83e31558d4032bb107f37efc))
+
+## [0.122.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.121.0...v0.122.0) (2026-08-07)
+
+
+### Features
+
+* **autotune:** add stable GPU first-run and community tuning ([#887](https://github.com/ooples/AiDotNet.Tensors/issues/887)) ([219f9c1](https://github.com/ooples/AiDotNet.Tensors/commit/219f9c1c701dbfa5cf0c0eb410a5597f64de179f))
+* **ptx:** add recurrent state golden slice ([#878](https://github.com/ooples/AiDotNet.Tensors/issues/878)) ([f65d334](https://github.com/ooples/AiDotNet.Tensors/commit/f65d3342ff217575f4a58f41193b7ec89a802d85))
+* **ptx:** port softmax, log-softmax, masking, log-sum-exp, and backward fusions ([#840](https://github.com/ooples/AiDotNet.Tensors/issues/840)) ([#884](https://github.com/ooples/AiDotNet.Tensors/issues/884)) ([b1a48f9](https://github.com/ooples/AiDotNet.Tensors/commit/b1a48f9eedc2597d814e1c47ab448e186db5b3cd))
+* **ptx:** port specialized scientific, hypercomplex, and hyperbolic kernels ([#854](https://github.com/ooples/AiDotNet.Tensors/issues/854)) ([#885](https://github.com/ooples/AiDotNet.Tensors/issues/885)) ([a96b638](https://github.com/ooples/AiDotNet.Tensors/commit/a96b638dcec7197473e32af43513ff1c3be987d6))
+* **tensor:** deferred-storage tensors — shape without allocation ([#930](https://github.com/ooples/AiDotNet.Tensors/issues/930)) ([5596d07](https://github.com/ooples/AiDotNet.Tensors/commit/5596d077b7c432dd169905d3c24466a114d169c3))
+
+
+### Bug Fixes
+
+* **tests:** remove duplicate MeasuredResourceBudget theories in DirectPtxWmmaTests ([#934](https://github.com/ooples/AiDotNet.Tensors/issues/934)) ([98d7c47](https://github.com/ooples/AiDotNet.Tensors/commit/98d7c470cc23811170487dff7d1b04754866a93d))
+
+
+### Performance
+
+* **blas:** BCL Vector&lt;T&gt; FP64 streaming microkernel — net471 GEMM was fully scalar ([#933](https://github.com/ooples/AiDotNet.Tensors/issues/933)) ([6db5074](https://github.com/ooples/AiDotNet.Tensors/commit/6db507429d01a002c7d630d5435b639be25ebf64))
+* **codegen:** harden staging and close the championship loop ([#909](https://github.com/ooples/AiDotNet.Tensors/issues/909)) ([c6b71ad](https://github.com/ooples/AiDotNet.Tensors/commit/c6b71ad1fe1dd053ea1893f73da860c42f1e0798))
+
+## [0.121.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.6...v0.121.0) (2026-08-01)
+
+
+### Features
+
+* **engine:** broadcast implicitly on the element-wise operators ([#919](https://github.com/ooples/AiDotNet.Tensors/issues/919)) ([fc390f0](https://github.com/ooples/AiDotNet.Tensors/commit/fc390f007f6897d34443a66e5f3b55204f436e49))
+
+
+### Bug Fixes
+
+* **autodiff:** reject full-span views from tensor pool ([#925](https://github.com/ooples/AiDotNet.Tensors/issues/925)) ([1b0006f](https://github.com/ooples/AiDotNet.Tensors/commit/1b0006f43af5c49df44ac9054b0f152f31b8716e))
+
 ## [0.120.6](https://github.com/ooples/AiDotNet.Tensors/compare/v0.120.5...v0.120.6) (2026-07-31)
 
 

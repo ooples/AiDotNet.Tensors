@@ -47,6 +47,57 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxSoftmaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.Softmax / SoftmaxRows",
+            "Backend_Softmax_ThreeWayParityAndAudit runs the incumbent CUDA route and direct PTX on " +
+            "identical inputs, proves the selected path with the dispatch counter, and checks both against " +
+            "the same double-precision softmax oracle."),
+        new PtxParitySpec("PtxLogSoftmaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.LogSoftmax",
+            "Backend_SoftmaxVariants_ThreeWayParity compares incumbent CUDA and direct PTX independently " +
+            "against the same double-precision log-sum-exp interpretation."),
+        new PtxParitySpec("PtxTaylorSoftmaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.TaylorSoftmax",
+            "Backend_SoftmaxVariants_ThreeWayParity compares both GPU routes against the identical " +
+            "1+x+x^2/2 double-precision normalization oracle."),
+        new PtxParitySpec("PtxSparsemaxKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.Sparsemax",
+            "Backend_SoftmaxVariants_ThreeWayParity compares both GPU routes against the sorted closed-form " +
+            "simplex projection and verifies non-negativity, exact zeros, and row sums."),
+        new PtxParitySpec("PtxSoftmaxBackwardKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.SoftmaxBackward",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity checks incumbent CUDA and direct PTX " +
+            "against the same double-precision Jacobian-vector product."),
+        new PtxParitySpec("PtxLogSumExpKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.LogSumExpAxis",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity checks both GPU routes against a " +
+            "stable double-precision log-sum-exp oracle."),
+        new PtxParitySpec("PtxLogSumExpBackwardKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.LogSumExpBackward",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity supplies the same CPU-derived log " +
+            "partition to both routes, compares both against the derivative oracle, and separately verifies " +
+            "that direct PTX consumes a deliberately changed supplied partition."),
+        new PtxParitySpec("PtxMaskedFillKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.MaskedFillKernel",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity compares incumbent CUDA and direct PTX " +
+            "bit-for-bit against the elementwise mask/select contract."),
+        new PtxParitySpec("PtxMaskedFillBackwardKernel", PtxParityStatus.ThreeWayParity,
+            "CudaBackend.MaskedFillBackward",
+            "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity compares incumbent CUDA and direct PTX " +
+            "bit-for-bit against the masked-gradient contract."),
+        new PtxParitySpec("PtxMaskedSoftmaxKernel", PtxParityStatus.Deferred,
+            "driver-only fused masked-fill + softmax candidate",
+            "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX result against the stable " +
+            "double-precision composed oracle. The candidate has no CudaBackend/public dispatch route, so it " +
+            "cannot yet run the required incumbent-vs-direct-PTX-vs-CPU parity test and remains unpromoted. " +
+            "Wire a backend route and its incumbent composed path before converting this entry to ThreeWayParity."),
+        new PtxParitySpec("PtxMaskedSoftmaxBackwardKernel", PtxParityStatus.Deferred,
+            "driver-only fused masked-softmax backward candidate",
+            "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX gradient against the same " +
+            "double-precision Jacobian-vector-product oracle with the gradient mask applied. The candidate has " +
+            "no CudaBackend/public dispatch route, so it cannot yet run the required three-way parity test and " +
+            "remains unpromoted. Wire that route and incumbent composition before promoting it."),
+
         new PtxParitySpec("PtxFusedResidualRmsNormD64Kernel", PtxParityStatus.Deferred,
             "fused residual + RMSNorm (D=64)",
             "backend method has no public op route on main (only the CUDA RmsNorm path is wired), " +
@@ -181,7 +232,122 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxSoftmaxCrossEntropyDenseKernel", PtxParityStatus.Deferred,
             "fused dense-target softmax cross entropy (#836)",
             "stable loss/gradient driver oracle coverage exists; public fused three-way parity remains pending."),
+        new PtxParitySpec("PtxRegisterCholesky4x4F32Kernel", PtxParityStatus.Deferred,
+            "Linalg.CholeskyEx lower FP32 batched 4x4 (#853)",
+            "a dedicated opt-in DriverOnly structural/parity matrix is checked in; promotion to three-way " +
+            "coverage waits for execution on the admitted SM86 device and attached failure-info evidence."),
+        new PtxParitySpec("PtxRegisterSolver4x4F32Kernel", PtxParityStatus.Deferred,
+            "dense decomposition/solve forward and backward FP32 batched 4x4 family (#853)",
+            "the operation-parameterized DriverOnly matrix and public routing are checked in; three-way " +
+            "classification waits for SM86 execution, operation-specific oracle evidence, and the release gate."),
+        new PtxParitySpec("PtxFusedPhiloxDropoutF32Kernel", PtxParityStatus.Deferred,
+            "fused Philox inverted-dropout forward + saved mask (#849)",
+            "the public route, CPU Philox oracle, established CUDA peer, and exact-shape harness are wired, " +
+            "but three-way device parity is intentionally deferred until exclusive access to the admitted SM86 GPU; " +
+            "non-GPU tests cover the emitter, published Philox vector, admission, and fallback contracts."),
+        new PtxParitySpec("PtxPhiloxFillF32Kernel", PtxParityStatus.Deferred,
+            "Philox uniform, normal, Bernoulli, and stateless drop-threshold fills (#849)",
+            "the public CUDA routes and exact-shape emitters are wired behind the same fail-closed SM86 gate; " +
+            "three-way device parity is deferred until exclusive access to the admitted GPU. Non-GPU tests " +
+            "cover the versioned Philox rounds, exact ABI, range transforms, Box-Muller structure, opposite " +
+            "mask semantics, and architecture rejection."),
+        new PtxParitySpec("PtxDropoutBackwardF32Kernel", PtxParityStatus.Deferred,
+            "saved-mask dropout backward (#849)",
+            "the public CUDA route is wired behind the fail-closed SM86 gate; device parity is deferred " +
+            "until the admitted GPU is available. Static tests prove the exact pointer-only ABI, float4 " +
+            "dataflow, lack of stride/tail branches, and unmeasured-architecture rejection."),
+        new PtxParitySpec("PtxFusedGumbelSoftmax32F32Kernel", PtxParityStatus.Deferred,
+            "Gumbel-softmax over an exact contiguous 32-class last axis (#849)",
+            "the public DirectGpuTensorEngine route now reaches the fused backend kernel and fails closed for " +
+            "unadmitted shapes/SMs. Device parity and distribution checks await the admitted GPU; static tests " +
+            "prove the fixed warp reduction, versioned Philox rounds, no global intermediates, and exact ABI."),
+        new PtxParitySpec("PtxFusedImportanceSampling64F32Kernel", PtxParityStatus.Deferred,
+            "NeRF importance sampling for exact 64-coarse/64-fine layouts (#849)",
+            "the public IEngine route already reaches the CUDA capability and now dispatches direct PTX for " +
+            "admitted shapes. Device distribution/oracle parity awaits the SM86 GPU; static tests prove one-time " +
+            "coarse loads, shared layout, fully unrolled predicated CDF traversal, no tail branch, and exact fallback."),
+        new PtxParitySpec("PtxFusedBiasPhiloxDropout256F32Kernel", PtxParityStatus.Deferred,
+            "bias-add plus Philox inverted dropout for an exact 256-column layout (#849)",
+            "the public FusedBiasDropout path now invokes the optional fused-random capability before allocating " +
+            "the established temporary. Device parity awaits SM86 access; static tests prove the float4 input/bias " +
+            "transactions, fused mask/output stores, repeated-bias address mapping, and pointer-only exact ABI."),
+        new PtxParitySpec("PtxFusedDdimStepF32Kernel", PtxParityStatus.Deferred,
+            "currently advertised deterministic fused DDIM update (#849)",
+            "the public fused-advanced CUDA route now attempts exact-shape direct PTX first. Device parity " +
+            "awaits SM86 access; static tests prove host-collapsed schedule coefficients, two float4 reads, " +
+            "one output write, no intermediate allocation, and no stride/tail branch."),
+        new PtxParitySpec("PtxPhiloxCategorical32F32Kernel", PtxParityStatus.Deferred,
+            "one-hot categorical tensor sampling over an exact 32-class last axis (#849)",
+            "the new public CPU oracle and DirectGpuTensorEngine route are wired; admitted CUDA shapes use " +
+            "a one-warp direct-PTX CDF scan. Device distribution parity awaits SM86 access; static tests " +
+            "prove the prefix scan, one Philox draw per row, no global CDF/index, and exact ABI."),
+        new PtxParitySpec("PtxGumbelSoftmaxBackward32F32Kernel", PtxParityStatus.Deferred,
+            "Gumbel-softmax backward over an exact 32-class last axis (#849)",
+            "the public backward route dispatches this direct specialization before the composed fallback. " +
+            "Device parity awaits SM86 access; static tests prove the one-warp Jacobian reduction, inverse-" +
+            "temperature epilogue, no global reduction temporary, and exact pointer-only ABI."),
+        new PtxParitySpec("PtxFusedPhiloxRreluF32Kernel", PtxParityStatus.Deferred,
+            "Philox slope generation fused into training RReLU with a public saved-noise output (#849)",
+            "the public TensorRReLU route attempts this specialization before the two-launch fallback. " +
+            "Device parity awaits SM86 access; static tests prove float4 Philox generation, one input read, " +
+            "only required saved-noise/output writes, exact pointer-only ABI, and no tail/layout path."),
+        new PtxParitySpec("PtxRreluF32Kernel", PtxParityStatus.Deferred,
+            "saved-noise RReLU forward and backward CUDA-kernel ports (#849)",
+            "the CudaBackend forward/backward methods dispatch exact direct PTX before NVRTC fallback. " +
+            "Device parity awaits SM86 access; static tests prove float4 dataflow, fixed extents, no global " +
+            "intermediate, and unmeasured-architecture rejection."),
+        new PtxParitySpec("PtxFusedRgLruScan128x256Kernel", PtxParityStatus.ThreeWayParity,
+            "RG-LRU scan forward [1,128,256] (#846) — CudaBackend.RgLruScanForward",
+            "DirectPtxRecurrentTests.DriverRgLru_MatchesDoubleOracleAndRoutesDirectPtxRepeatedly " +
+            "runs the exact SM86 direct route and incumbent NVRTC kernel against an independent fp64 " +
+            "full-sequence recurrence oracle at 2e-5, and proves direct route entry over repeated launches."),
 
+        new PtxParitySpec("PtxFusedPairwiseBoxIouF32Kernel", PtxParityStatus.Deferred,
+            "pairwise BoxIoU (#851)",
+            "the dedicated SM86 test and benchmark harness compare direct PTX and the established CUDA route " +
+            "against an fp64 oracle, but the driver-only matrix cannot run on CPU-only CI; retain the explicit " +
+            "deferral until resident-GPU evidence is attached."),
+        new PtxParitySpec("PtxVisionKernel", PtxParityStatus.Deferred,
+            "vision/detection/ROI/geometry specialization family (#851)",
+            "all 120 closed specializations pass static ABI/emitter validation and have driver-only direct-PTX " +
+            "versus established-CUDA checks; the operation-specific fp64 resident-GPU oracle matrix remains " +
+            "deferred until the required SM86 hardware run."),
+        // Issue #854 specialized-scientific / ANN / hypercomplex / hyperbolic / quantum / Instant-NGP
+        // kernels. Each has a GPU-gated DriverOnly CPU-fp64-oracle parity test, an emitter structure
+        // test, and a backend dispatch test in DirectPtxScientificTests. The three-way gate-toggle
+        // parity spec in this harness is deferred pending the scientific parity harness (mirrors the
+        // attention entries above); every op fails closed and is unpromoted until GPU-validated.
+        new PtxParitySpec("PtxComplexMultiplyKernel", PtxParityStatus.Deferred, "complex multiply (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexConjugateKernel", PtxParityStatus.Deferred, "complex conjugate (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexMagnitudeKernel", PtxParityStatus.Deferred, "complex magnitude (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexPhaseKernel", PtxParityStatus.Deferred, "complex phase / atan2 (#854)", ScientificNote),
+        new PtxParitySpec("PtxComplexMatVecKernel", PtxParityStatus.Deferred, "complex mat-vec (#854)", ScientificNote),
+        new PtxParitySpec("PtxOctonionAddKernel", PtxParityStatus.Deferred, "octonion add (#854)", ScientificNote),
+        new PtxParitySpec("PtxOctonionMultiplyKernel", PtxParityStatus.Deferred, "octonion multiply (#854)", ScientificNote),
+        new PtxParitySpec("PtxMobiusAddKernel", PtxParityStatus.Deferred, "mobius add (#854)", ScientificNote),
+        new PtxParitySpec("PtxPoincareDistanceKernel", PtxParityStatus.Deferred, "poincare distance (#854)", ScientificNote),
+        new PtxParitySpec("PtxPoincareProjectKernel", PtxParityStatus.Deferred, "poincare project (#854)", ScientificNote),
+        new PtxParitySpec("PtxPoincareExpMapKernel", PtxParityStatus.Deferred, "poincare exp-map (#854)", ScientificNote),
+        new PtxParitySpec("PtxRbfForwardKernel", PtxParityStatus.Deferred, "rbf forward (#854)", ScientificNote),
+        new PtxParitySpec("PtxPairwiseDistanceKernel", PtxParityStatus.Deferred, "pairwise distance L2/squared (#854)", ScientificNote),
+        new PtxParitySpec("PtxCosineSimilarityKernel", PtxParityStatus.Deferred, "cosine similarity (#854)", ScientificNote),
+        new PtxParitySpec("PtxQuantumMeasurementKernel", PtxParityStatus.Deferred, "quantum measurement (#854)", ScientificNote),
+        new PtxParitySpec("PtxQuantumRotationKernel", PtxParityStatus.Deferred, "quantum rotation (#854)", ScientificNote),
+        new PtxParitySpec("PtxMeasurementForwardKernel", PtxParityStatus.Deferred, "measurement forward (#854)", ScientificNote),
+        new PtxParitySpec("PtxNormalizeProbabilitiesKernel", PtxParityStatus.Deferred, "normalize probabilities (#854)", ScientificNote),
+        new PtxParitySpec("PtxSphericalHarmonicsKernel", PtxParityStatus.Deferred, "spherical harmonics (#854)", ScientificNote),
+        new PtxParitySpec("PtxSphericalHarmonicsBackwardKernel", PtxParityStatus.Deferred, "spherical harmonics backward (#854)", ScientificNote),
+        new PtxParitySpec("PtxSphericalSoftmaxKernel", PtxParityStatus.Deferred, "spherical softmax (#854)", ScientificNote),
+        new PtxParitySpec("PtxCapsuleContractionKernel", PtxParityStatus.Deferred, "capsule predictions/transform (#854)", ScientificNote),
+        new PtxParitySpec("PtxCapsuleWeightedSumKernel", PtxParityStatus.Deferred, "capsule weighted sum (#854)", ScientificNote),
+        new PtxParitySpec("PtxCapsuleAgreementKernel", PtxParityStatus.Deferred, "capsule agreement (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnComputeDistancesKernel", PtxParityStatus.Deferred, "ann compute distances (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnPqDistanceTablesKernel", PtxParityStatus.Deferred, "ann pq distance tables (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnIvfAssignKernel", PtxParityStatus.Deferred, "ann ivf assign (#854)", ScientificNote),
+        new PtxParitySpec("PtxAnnPqAdcScanKernel", PtxParityStatus.Deferred, "ann pq adc scan (#854)", ScientificNote),
+        new PtxParitySpec("PtxInstantNgpHashEncodeKernel", PtxParityStatus.Deferred, "instant-ngp hash encode (#854)", ScientificNote),
+        new PtxParitySpec("PtxInstantNgpHashEncodeBackwardKernel", PtxParityStatus.Deferred, "instant-ngp hash encode backward (#854)", ScientificNote),
+        new PtxParitySpec("PtxMeshLaplacianKernel", PtxParityStatus.Deferred, "uniform mesh laplacian (#854)", ScientificNote),
         new PtxParitySpec("PtxFusedConv2DNchwK1Kernel", PtxParityStatus.Deferred,
             "fused Conv2D + bias + ReLU, exact N1/C64/H16/W16/K64 1x1 fp32 (#841) — " +
             "CudaBackend.TryDirectPtxFusedConv2DBiasRelu",
@@ -649,6 +815,12 @@ public static class PtxParityRegistry
             ">=1.10x-vs-cuDNN performance gate are all pending GPU verification; the emitter is drafted, not " +
             "yet measured. Keep deferred and unpromoted until the three-way matrix and competitive gates pass."),
     };
+
+    private const string ScientificNote =
+        "issue #854 direct-PTX kernel; a GPU-gated DriverOnly CPU-fp64-oracle parity test, an emitter " +
+        "structure test, and a backend dispatch test exist in DirectPtxScientificTests. The three-way " +
+        "gate-toggle parity spec in this harness is deferred pending the scientific parity harness; the " +
+        "op fails closed and stays unpromoted until GPU-validated.";
 
     private static readonly Dictionary<string, PtxParitySpec> ByKernel =
         Specs.ToDictionary(s => s.KernelTypeName, StringComparer.Ordinal);

@@ -15,6 +15,53 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$hostCpuCeilingPercent = 20.0
+$benchmarkOwnedCpuAllowance = 1.5
+if (@(@($Issue834Only, $Issue835Only, $Issue853Only) | Where-Object { $_ }).Count -gt 1) {
+    throw 'Only one issue-specific evidence switch may be selected.'
+}
+
+if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        [System.Runtime.InteropServices.OSPlatform]::Windows) -and
+    -not ('AiDotNetBenchmarkHostCpu' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AiDotNetBenchmarkHostCpu
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileTime
+    {
+        internal uint Low;
+        internal uint High;
+        internal long Ticks { get { return ((long)High << 32) | Low; } }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemTimes(
+        out FileTime idle, out FileTime kernel, out FileTime user);
+
+    public static long[] Snapshot()
+    {
+        FileTime idle, kernel, user;
+        if (!GetSystemTimes(out idle, out kernel, out user))
+            throw new InvalidOperationException(
+                "GetSystemTimes failed with Win32 error " + Marshal.GetLastWin32Error() + ".");
+        return new[] { idle.Ticks, kernel.Ticks, user.Ticks };
+    }
+
+    public static double UsagePercent(long[] before, long[] after)
+    {
+        double idle = after[0] - before[0];
+        double total = (after[1] - before[1]) + (after[2] - before[2]);
+        if (total <= 0.0 || idle < 0.0 || idle > total)
+            throw new InvalidOperationException("Invalid GetSystemTimes interval.");
+        return 100.0 * (total - idle) / total;
+    }
+}
+'@
+}
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $project = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\AiDotNet.Tensors.Benchmarks.csproj'
 $targetDll = Join-Path $repoRoot 'tests\AiDotNet.Tensors.Benchmarks\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks.dll'
@@ -586,6 +633,36 @@ function Get-GpuSnapshot {
     return ($output -join [Environment]::NewLine).Trim()
 }
 
+function Get-HostCpuSnapshot {
+    if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        return $null
+    }
+    return ,([AiDotNetBenchmarkHostCpu]::Snapshot())
+}
+
+function Get-HostCpuUsagePercent($Before, $After) {
+    if ($null -eq $Before -or $null -eq $After) { return $null }
+    return [AiDotNetBenchmarkHostCpu]::UsagePercent($Before, $After)
+}
+
+function Get-AdjustedForeignCpuPercent([double]$UsagePercent) {
+    $busyProcessors = $UsagePercent * [Environment]::ProcessorCount / 100.0
+    return 100.0 * [Math]::Max(0.0, $busyProcessors - $benchmarkOwnedCpuAllowance) /
+        [Environment]::ProcessorCount
+}
+
+function Assert-HostReady([string]$Label) {
+    $before = Get-HostCpuSnapshot
+    if ($null -eq $before) { return }
+    Start-Sleep -Milliseconds 250
+    $after = Get-HostCpuSnapshot
+    $usage = Get-HostCpuUsagePercent $before $after
+    if ($usage -gt $hostCpuCeilingPercent) {
+        throw "[$Label] Host CPU utilization $($usage.ToString('F1'))% exceeds the $($hostCpuCeilingPercent.ToString('F1'))% evidence ceiling."
+    }
+}
+
 function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
     $pythonProcesses = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $_.ProcessName -in @('python', 'python3', 'pythonw')
@@ -723,14 +800,18 @@ try {
 
     if (-not $Issue836Only -and -not $SkipExternal) {
         $python = (Get-Command python -ErrorAction Stop).Source
-        if (-not $Issue835Only) {
+        if ($Issue853Only) {
+            $suites.Add((New-EvidenceSuite 'solvers-4x4-pytorch' $python @(
+                (Join-Path $pythonRoot 'run_direct_ptx_solver4x4_competitors.py'), '--runs', '1')))
+        }
+        if (-not $Issue835Only -and -not $Issue853Only) {
             $suites.Add((New-EvidenceSuite 'attention-family-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_family_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'decode-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_decode_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'paged-prefill-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_paged_prefill_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_attention_backward_competitors.py'), '--runs', '1')))
             $suites.Add((New-EvidenceSuite 'flash-attention-backward-pytorch' $python @((Join-Path $pythonRoot 'run_direct_ptx_flash_attention_backward_competitors.py'), '--runs', '1')))
         }
-        if (-not $Issue834Only) {
+        if (-not $Issue834Only -and -not $Issue853Only) {
             $suites.Add((New-EvidenceSuite 'qkv-rope-cache-pytorch' $python @(
                 (Join-Path $pythonRoot 'run_direct_ptx_qkv_rope_cache_competitors.py'), '--runs', '1', '--json-lines')))
         }
@@ -756,6 +837,7 @@ try {
                     for ($poll = 1; $poll -le 30; $poll++) {
                         try {
                             Assert-GpuReady "$label-start"
+                            Assert-HostReady "$label-start"
                             $consecutiveReadySamples++
                             if ($consecutiveReadySamples -ge 3) {
                                 $ready = $true
@@ -773,7 +855,7 @@ try {
                     $log = Join-Path $evidenceRoot ("{0}.log" -f $label)
                     "# independent process $run/$Runs; suite=$($suite.Name); attempt=$attempt; started_utc=$([DateTime]::UtcNow.ToString('O'))" |
                         Set-Content -LiteralPath $log -Encoding utf8
-                    "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=0" |
+                    "# git_commit=$gitCommit; dirty_worktree=$($dirtyLines.Count -ne 0); AIDOTNET_DIRECT_PTX=1; AIDOTNET_DIRECT_PTX_AUTOTUNE=$autotuneValue" |
                         Add-Content -LiteralPath $log -Encoding utf8
                     "# host_os=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription); powershell=$($PSVersionTable.PSVersion); dotnet=$(& dotnet --version)" |
                         Add-Content -LiteralPath $log -Encoding utf8
@@ -786,6 +868,7 @@ try {
                     # The complete TUI is emitted only to the immutable process log.
                     $arguments = $suite.Arguments
                     $savedErrorAction = $ErrorActionPreference
+                    $hostCpuBefore = Get-HostCpuSnapshot
                     try {
                         # Windows PowerShell wraps a native process's stderr as
                         # ErrorRecord objects. PyTorch uses stderr for backend
@@ -799,6 +882,18 @@ try {
                     finally {
                         $ErrorActionPreference = $savedErrorAction
                     }
+                    $hostCpuAfter = Get-HostCpuSnapshot
+                    $hostCpuUsage = Get-HostCpuUsagePercent $hostCpuBefore $hostCpuAfter
+                    $adjustedForeignCpu = if ($null -eq $hostCpuUsage) {
+                        $null
+                    }
+                    else {
+                        Get-AdjustedForeignCpuPercent $hostCpuUsage
+                    }
+                    if ($null -ne $hostCpuUsage) {
+                        "# host_cpu_average_percent=$($hostCpuUsage.ToString('F2')); adjusted_foreign_percent=$($adjustedForeignCpu.ToString('F2')); logical_processors=$([Environment]::ProcessorCount)" |
+                            Add-Content -LiteralPath $log -Encoding utf8
+                    }
                     "# ending_gpu=$(Get-GpuSnapshot)" | Add-Content -LiteralPath $log -Encoding utf8
                     "# completed_utc=$([DateTime]::UtcNow.ToString('O')); exit_code=$exitCode" |
                         Add-Content -LiteralPath $log -Encoding utf8
@@ -806,15 +901,27 @@ try {
                         throw "Evidence suite '$($suite.Name)' run $run failed with exit code $exitCode. See '$log'."
                     }
 
-                    $contamination = $null
+                    $rejection = $null
+                    $rejectionKind = 'environment'
                     try { Assert-GpuReady "$label-end" -AfterSuite }
-                    catch { $contamination = $_.Exception.Message }
-                    if ($contamination) {
-                        "# rejected_environment=$contamination" | Add-Content -LiteralPath $log -Encoding utf8
+                    catch { $rejection = $_.Exception.Message }
+                    if (-not $rejection -and $null -ne $adjustedForeignCpu -and
+                        $adjustedForeignCpu -gt $hostCpuCeilingPercent) {
+                        $rejection = "[$label] Average adjusted foreign CPU utilization $($adjustedForeignCpu.ToString('F1'))% exceeded the $($hostCpuCeilingPercent.ToString('F1'))% evidence ceiling."
+                    }
+                    if (-not $rejection -and $Issue853Only -and $suite.Name -eq 'solvers-4x4') {
+                        try { Assert-SolverDotnetAcceptedAttempt $log $run }
+                        catch {
+                            $rejection = $_.Exception.Message
+                            $rejectionKind = 'internal_gate'
+                        }
+                    }
+                    if ($rejection) {
+                        "# rejected_$rejectionKind=$rejection" | Add-Content -LiteralPath $log -Encoding utf8
                         $rejected = Join-Path $evidenceRoot ("{0}-attempt-{1:D2}.rejected.txt" -f $label, $attempt)
                         Move-Item -LiteralPath $log -Destination $rejected -Force
                         if ($attempt -gt $ContaminationRetries) {
-                            throw "Evidence suite '$($suite.Name)' run $run remained contaminated after $attempt attempts. Last reason: $contamination"
+                            throw "Evidence suite '$($suite.Name)' run $run was rejected after $attempt attempts. Last reason: $rejection"
                         }
                         Start-Sleep -Seconds 2
                         continue
@@ -861,6 +968,8 @@ try {
         dirty_worktree = $dirtyLines.Count -ne 0
         requested_independent_runs = $Runs
         contamination_retries_per_suite = $ContaminationRetries
+        maximum_adjusted_foreign_host_cpu_percent = $hostCpuCeilingPercent
+        benchmark_owned_cpu_allowance = $benchmarkOwnedCpuAllowance
         issue_834_only = [bool]$Issue834Only
         issue_835_only = [bool]$Issue835Only
         issue_836_only = [bool]$Issue836Only
@@ -868,7 +977,7 @@ try {
         external_gpu_baselines_included = -not [bool]$SkipExternal
         feature_gates = [ordered]@{
             AIDOTNET_DIRECT_PTX = '1'
-            AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+            AIDOTNET_DIRECT_PTX_AUTOTUNE = $autotuneValue
         }
         commands = [ordered]@{
             build = "dotnet build `"$project`" -c Release -f net10.0"

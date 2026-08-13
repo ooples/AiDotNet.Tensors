@@ -217,8 +217,16 @@ public sealed class CompiledBackwardGraph<T>
                 entry.ValidateInputVersions();
                 var inputsArray = entry.GetInputsArrayInto(inputsBuf1, inputsBuf2, inputsBuf3);
                 long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                entry.Backward(gradOutput, inputsArray, entry.Output,
-                    entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+                var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
+                try
+                {
+                    entry.Backward(gradOutput, inputsArray, entry.Output,
+                        entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+                }
+                finally
+                {
+                    DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
+                }
                 if (BackwardTiming.Enabled)
                     BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
             }

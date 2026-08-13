@@ -302,9 +302,8 @@ internal static class DirectPtxCubinArtifactCache
                 }
 
                 string[] columns = line.Split('\t');
-                if (columns.Length <= Math.Max(fileIndex, Math.Max(ptxIndex, cubinIndex)))
-                    throw new InvalidDataException(
-                        "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
+                ValidateEmbeddedManifestRow(
+                    columns, ptxIndex, cubinIndex, fileIndex, resourceName, line);
 
                 string? cubinResource = FindEmbeddedCubinResource(
                     orderedResourceNames, architecture, columns[fileIndex]);
@@ -342,6 +341,24 @@ internal static class DirectPtxCubinArtifactCache
             }
         }
         return result;
+    }
+
+    internal static void ValidateEmbeddedManifestRow(
+        string[] columns,
+        int ptxIndex,
+        int cubinIndex,
+        int fileIndex,
+        string resourceName,
+        string line)
+    {
+        if (columns.Length <= Math.Max(fileIndex, Math.Max(ptxIndex, cubinIndex)) ||
+            string.IsNullOrWhiteSpace(columns[ptxIndex]) ||
+            string.IsNullOrWhiteSpace(columns[cubinIndex]) ||
+            string.IsNullOrWhiteSpace(columns[fileIndex]))
+        {
+            throw new InvalidDataException(
+                "Malformed embedded direct-PTX manifest row in " + resourceName + ": " + line);
+        }
     }
 
     internal static bool TryParseEmbeddedArtifactArchitecture(
