@@ -104,11 +104,11 @@ internal sealed class PtxDeformableConv2DBackwardMaskKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView weights, DirectPtxTensorView offset, DirectPtxTensorView gradOutput, DirectPtxTensorView gradMask)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(weights, Blueprint.Tensors[1], nameof(weights));
-        Require(offset, Blueprint.Tensors[2], nameof(offset));
-        Require(gradOutput, Blueprint.Tensors[3], nameof(gradOutput));
-        Require(gradMask, Blueprint.Tensors[4], nameof(gradMask));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(weights, Blueprint.Tensors[1], nameof(weights));
+        DirectPtxAbiGuard.Require(offset, Blueprint.Tensors[2], nameof(offset));
+        DirectPtxAbiGuard.Require(gradOutput, Blueprint.Tensors[3], nameof(gradOutput));
+        DirectPtxAbiGuard.Require(gradMask, Blueprint.Tensors[4], nameof(gradMask));
         IntPtr iPtr = input.Pointer, wPtr = weights.Pointer, offPtr = offset.Pointer, gPtr = gradOutput.Pointer, mPtr = gradMask.Pointer;
         void** arguments = stackalloc void*[5];
         arguments[0] = &iPtr; arguments[1] = &wPtr; arguments[2] = &offPtr; arguments[3] = &gPtr; arguments[4] = &mPtr;
@@ -116,13 +116,6 @@ internal sealed class PtxDeformableConv2DBackwardMaskKernel : IDisposable
         _module.Launch(_function, (uint)(total / BlockThreads), 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType || view.Layout != contract.Layout ||
-            view.LogicalExtent != contract.LogicalExtent || view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes || view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, DeformableConv2DShape shape)
     {

@@ -126,10 +126,10 @@ internal sealed class PtxWinogradWmmaCoopKernel : IDisposable
     internal unsafe void Launch(
         DirectPtxTensorView u, DirectPtxTensorView v, DirectPtxTensorView bias, DirectPtxTensorView output)
     {
-        Require(u, Blueprint.Tensors[0], nameof(u));
-        Require(v, Blueprint.Tensors[1], nameof(v));
-        Require(bias, Blueprint.Tensors[2], nameof(bias));
-        Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbiGuard.Require(u, Blueprint.Tensors[0], nameof(u));
+        DirectPtxAbiGuard.Require(v, Blueprint.Tensors[1], nameof(v));
+        DirectPtxAbiGuard.Require(bias, Blueprint.Tensors[2], nameof(bias));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[3], nameof(output));
         IntPtr uPtr = u.Pointer, vPtr = v.Pointer, bPtr = bias.Pointer, oPtr = output.Pointer;
         void** args = stackalloc void*[4];
         args[0] = &uPtr; args[1] = &vPtr; args[2] = &bPtr; args[3] = &oPtr;
@@ -142,15 +142,6 @@ internal sealed class PtxWinogradWmmaCoopKernel : IDisposable
             args);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, int n, int c, int h, int w, int k)
     {
