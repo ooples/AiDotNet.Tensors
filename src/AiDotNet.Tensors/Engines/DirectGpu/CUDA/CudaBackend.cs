@@ -4756,6 +4756,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (stream is not CudaStream cudaStream)
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+        if (!ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
 
         return cudaStream.Query();
     }
@@ -7917,6 +7920,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
     {
+        if (training && TryDirectPtxRngDropoutF32(
+            input, output, mask, size, dropoutRate, seed))
+            return;
         if (!_kernelCache.TryGetValue("dropout_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_forward");
 
@@ -7952,6 +7958,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
     {
+        if (TryDirectPtxDropoutBackwardF32(gradOutput, mask, gradInput, size))
+            return;
         if (!_kernelCache.TryGetValue("dropout_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_backward");
 
@@ -9484,6 +9492,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
     {
+        if (TryDirectPtxRreluF32(input, noise, output, size))
+            return;
         if (!_kernelCache.TryGetValue("rrelu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rrelu");
         using var _ = PushContext();
@@ -9495,6 +9505,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
     {
+        if (TryDirectPtxRreluBackwardF32(gradOutput, input, noise, gradInput, size))
+            return;
         if (!_kernelCache.TryGetValue("rrelu_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rrelu_backward");
         using var _ = PushContext();
@@ -14230,6 +14242,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
+        if (TryDirectPtxPhiloxFillF32(
+            output, size, DirectPtxPhiloxFillKind.Uniform, min, max, seed))
+            return;
+        LaunchRandomUniformEstablished(output, size, min, max, seed);
+    }
+
+    private unsafe void LaunchRandomUniformEstablished(
+        IGpuBuffer output, int size, float min, float max, ulong seed)
+    {
         if (!_kernelCache.TryGetValue("generate_random_uniform", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: generate_random_uniform");
 
@@ -14252,6 +14273,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void GenerateStatelessDropoutMask(
         IGpuBuffer output, int size, uint threshold, float scale, uint seed)
     {
+        if (TryDirectPtxPhiloxMaskF32(
+            output, size, DirectPtxPhiloxFillKind.DropThresholdMask,
+            threshold, scale, seed))
+            return;
         if (!_kernelCache.TryGetValue("stateless_dropout_mask", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: stateless_dropout_mask");
 
@@ -14269,6 +14294,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
+        if (TryDirectPtxPhiloxFillF32(
+            output, size, DirectPtxPhiloxFillKind.Normal, mean, stdDev, seed))
+            return;
         if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: generate_random_normal");
 
@@ -14291,7 +14319,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         if (size <= 0) return;
-        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
+        // A deterministic Philox specialization cannot preserve this API's
+        // secure-seeding contract. Bypass Direct PTX explicitly.
+        LaunchRandomUniformEstablished(output, size, min, max, GpuRandomSeed.Create());
     }
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
@@ -17101,6 +17131,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void DropoutMask(IGpuBuffer mask, int size, float keepProb, ulong seed)
     {
+        if (PtxCompat.IsFinite(keepProb) && keepProb > 0f && keepProb < 1f)
+        {
+            ulong threshold64 = (ulong)Math.Floor((double)keepProb * 4_294_967_296.0);
+            if (threshold64 is > 0 and <= uint.MaxValue &&
+                TryDirectPtxPhiloxMaskF32(
+                    mask, size, (uint)threshold64, 1f / keepProb, seed))
+                return;
+        }
         if (!_kernelCache.TryGetValue("dropout_mask", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_mask");
         using var _ = PushContext();
@@ -17112,6 +17150,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GaussianNoise(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
+        if (TryDirectPtxPhiloxFillF32(
+            output, size, DirectPtxPhiloxFillKind.Normal, mean, stdDev, seed))
+            return;
         if (!_kernelCache.TryGetValue("gaussian_noise", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: gaussian_noise");
         using var _ = PushContext();
@@ -17131,6 +17172,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GumbelSoftmax(IGpuBuffer logits, IGpuBuffer output, int outerSize, int innerSize, float temperature, ulong seed)
     {
+        if (TryDirectPtxGumbelSoftmaxF32(
+            logits, output, outerSize, innerSize, temperature, seed))
+            return;
         if (!_kernelCache.TryGetValue("gumbel_softmax", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: gumbel_softmax");
         using var _ = PushContext();

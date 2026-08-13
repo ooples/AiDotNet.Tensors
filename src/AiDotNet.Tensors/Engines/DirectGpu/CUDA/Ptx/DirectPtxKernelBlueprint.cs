@@ -52,6 +52,15 @@ internal static class DirectPtxArchitecture
         IsGa102Sm86(major, minor);
 
     /// <summary>
+    /// The first stochastic specialization is deliberately limited to the
+    /// exact SM for which its launch/resource contract was authored. It stays
+    /// behind an experimental gate until correctness, performance, and Nsight
+    /// evidence promote it.
+    /// </summary>
+    internal static bool HasExperimentalRngDropout(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The first global-average-pool candidate is emitted only for the exact
     /// GA102/SM86 validation domain. Other Ampere devices are separate tuning
     /// and admission domains and must not inherit this specialization.
