@@ -49,7 +49,10 @@ public sealed class MesaRoutedScanGpuParityTests
         try
         {
             const int batch=2,time=4,model=3,experts=3,state=2;
-            float[] input=Values(batch*time*model,11),mask=Values(batch*time*experts,12,0.4f);
+            float[] input=Values(batch*time*model,11);
+            // Fully deterministic: every element is assigned below, so seeding it
+            // first only suggested a randomness this case does not have.
+            float[] mask=new float[batch*time*experts];
             for(int i=0;i<mask.Length;i++)mask[i]=i%3==0?1f:(i%3==1?0.35f:0f);
             float[] transition=Values(experts*state,13,0.6f),inputMap=Values(experts*state*model,14);
             float[] outputMap=Values(experts*model*state,15),skip=Values(experts*model,16);

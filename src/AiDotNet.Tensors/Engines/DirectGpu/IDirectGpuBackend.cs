@@ -3072,6 +3072,12 @@ public interface IDirectGpuBackend : IDisposable
     /// [heads,headDim,headDim]; regularization: one scalar; output: [batch,time,model].
     /// The final two buffers are backend-owned scratch with shape
     /// [batch,heads,headDim,headDim].
+    /// <para>
+    /// regularization is a device buffer holding exactly one float, read as
+    /// regularization[0]. It is deliberately not a plain float parameter: all six
+    /// backend kernels take it as a buffer, so narrowing it to a scalar is a
+    /// six-kernel ABI change rather than a signature tidy-up.
+    /// </para>
     /// </summary>
     void MesaScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,

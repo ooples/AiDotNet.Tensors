@@ -1550,7 +1550,17 @@ public static class OpParityRegistry
             ParityTol.Accum(2e-3), opMethod: "MesaScanForward");
         // Sparse expert routing: mask selects experts while the other tensors carry expert-local SSM state.
         const int E = 3;
-        var routedMask = OpInput.RandPositive(3690, new[] { B, S, E }, 0.0, 1.0);
+        // RandPositive(0.0, 1.0) never yields a zero, so every token was routed to
+        // every expert and the inactive-expert branch - h[s] = 0 * (A*h + Bx), the
+        // branch this change adds - was never exercised by parity. Zero one expert
+        // per timestep in a fixed pattern so both branches are covered.
+        var routedMaskData = new double[B * S * E];
+        for (int b = 0; b < B; b++)
+            for (int s = 0; s < S; s++)
+                for (int e = 0; e < E; e++)
+                    routedMaskData[((b * S) + s) * E + e] =
+                        (s + e) % E == 0 ? 0.0 : 0.25 + (0.25 * ((s + e) % E));
+        var routedMask = OpInput.From(routedMaskData, new[] { B, S, E });
         var routedA = OpInput.Rand(3691, new[] { E, ST }, 0.1, 0.8);
         var routedB = OpInput.Rand(3692, new[] { E, ST, D });
         var routedC = OpInput.Rand(3693, new[] { E, D, ST });

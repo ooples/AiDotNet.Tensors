@@ -4360,6 +4360,9 @@ public interface IEngine
     /// Sparse routed diagonal state-space scan. input is [batch,time,model], activeMask is
     /// [batch,time,experts], transition is [experts,state], inputMap is [experts,state,model],
     /// outputMap is [experts,model,state], and skip is [experts,model].
+    /// Unlike the neighbouring scans, this does NOT preserve the input shape: the
+    /// result is rank-4 [batch,time,experts,model], one model-sized row per expert.
+    /// A gated expert contributes zeros rather than being dropped from the result.
     /// </summary>
     Tensor<T> RoutedDiagonalSsmScanForward<T>(
         Tensor<T> input,

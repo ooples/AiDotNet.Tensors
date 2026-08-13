@@ -77,6 +77,11 @@ public partial class CpuEngine
                         T next = ops.Multiply(transition[aBase + s], h[s]);
                         for (int d = 0; d < model; d++)
                             next = ops.Add(next, ops.Multiply(inputMap[bBase + s * model + d], input[xBase + d]));
+                        // State gating is multiplicative on the WHOLE recurrence:
+                        // h[s] = active * (A_s*h[s] + Bx). An inactive expert therefore
+                        // CLEARS its state and breaks the chain - it does not preserve
+                        // the previous h. All six GPU kernels use this same form, and
+                        // parity depends on every backend keeping it.
                         h[s] = ops.Multiply(active, next);
                         if (trajectory is not null) trajectory[trajectoryBase + (t + 1) * state + s] = h[s];
                     }
