@@ -14812,7 +14812,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (numPairs <= 0) return;
         if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
-        // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
+        // Fail-closed direct-PTX fast paths; both return false until GPU-promoted.
+        // The issue-#850 spectral specialization runs first because it admits
+        // only four exact pair counts, then the general issue-#854 scientific
+        // kernel, which accepts any multiple of its block size.
+        if (TryDirectPtxSpectralComplexMultiply(a, b, output, numPairs)) return;
         if (TryDirectPtxComplexMultiply(a, b, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_multiply");

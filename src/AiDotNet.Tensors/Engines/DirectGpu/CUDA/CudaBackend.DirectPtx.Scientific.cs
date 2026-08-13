@@ -108,14 +108,36 @@ public sealed partial class CudaBackend
     internal bool TryDirectPtxComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int pairs)
     {
         if (!ScientificGateOpen || !PtxComplexMultiplyKernel.IsSupportedPairs(pairs)) return Fail("complex-multiply");
-        long bytes = checked((long)pairs * 2 * sizeof(float));
+        // Preconditions carried over from the #879 spectral slice, whose dispatch this replaced.
+        // That implementation covered only four hardcoded pair counts against this one's general
+        // "multiple of the block width" rule, so its kernel was the narrower half of the merge --
+        // but its argument checking was the stronger half, and these are all kernel-agnostic.
+        // Each failure keeps its own reason string: "complex-multiply" alone cannot distinguish a
+        // closed gate from a null buffer, and DirectPtxLastError is the only diagnostic a caller
+        // gets back from a false return.
+        if (a is null || b is null || output is null) return Fail("complex-multiply-null-buffer");
+        if (a.Handle == IntPtr.Zero || b.Handle == IntPtr.Zero || output.Handle == IntPtr.Zero)
+            return Fail("complex-multiply-released-buffer");
+        long elements = checked(2L * pairs);
+        long bytes = checked(elements * sizeof(float));
+        // Logical element count AND byte extent: a buffer can carry the right byte count at the
+        // wrong element type, which the byte check alone accepts and the kernel then misreads.
+        if (a.Size != elements || b.Size != elements || output.Size != elements)
+            return Fail("complex-multiply-logical-extent-mismatch");
         if (a.SizeInBytes != bytes || b.SizeInBytes != bytes || output.SizeInBytes != bytes) return Fail("complex-multiply-extent");
         var key = new SciCountKey(pairs);
-        return SciDispatch(() =>
+        bool dispatched = SciDispatch(() =>
         {
             var k = _sciComplexMul.GetOrAdd(key, () => new PtxComplexMultiplyKernel(_directPtxRuntime!, pairs));
             Launch3(k.Blueprint, a, b, output, (va, vb, vo) => k.Launch(va, vb, vo));
         }, () => _sciComplexMul.Pin(key));
+        // Feed the per-op counter the #879 experiment asserts on. That harness compares the count
+        // before and after a call to prove the PTX path actually ran rather than silently falling
+        // back to the established backend -- a check the family-wide _sciDispatchCount cannot make,
+        // because any scientific kernel advances it. Keeping it means #879's verification survives
+        // even though its own dispatch was superseded by this one.
+        if (dispatched) System.Threading.Interlocked.Increment(ref _directPtxComplexMultiplyDispatchCount);
+        return dispatched;
     }
 
     internal bool TryDirectPtxComplexConjugate(IGpuBuffer input, IGpuBuffer output, int pairs)
