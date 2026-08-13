@@ -490,10 +490,6 @@ internal static class LinearSolvers
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         // Result shape: reduce (m) dim, produce (..., k) if vector or (..., k, nrhs) if matrix.
-        var shape = new int[b.Rank];
-        for (int i = 0; i < b.Rank; i++) shape[i] = b._shape[i];
-        shape[b.Rank - 2 + (bIsVector ? 1 : 0) - (bIsVector ? 1 : 0)] = shape[b.Rank - 2 + (bIsVector ? 1 : 0) - (bIsVector ? 1 : 0)];
-        // Simpler: construct per-case.
         int[] outShape;
         if (bIsVector)
         {
