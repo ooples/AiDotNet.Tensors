@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.124.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.123.0...v0.124.0) (2026-08-13)
+
+
+### Features
+
+* **ptx:** add register-resident dense solver family ([#882](https://github.com/ooples/AiDotNet.Tensors/issues/882)) ([f130995](https://github.com/ooples/AiDotNet.Tensors/commit/f1309950346d6e5bb68271fa4a156c784b3f2b6b))
+* **ptx:** complete RNG and stochastic kernel family ([#880](https://github.com/ooples/AiDotNet.Tensors/issues/880)) ([c1c9afc](https://github.com/ooples/AiDotNet.Tensors/commit/c1c9afc57e9e32f8eff31f9ec7e34f7a52bd1c69))
+
+
+### Bug Fixes
+
+* engine dispatch must honor tensor residency (CPU-resident double silently computed in float) ([#937](https://github.com/ooples/AiDotNet.Tensors/issues/937)) ([aab2846](https://github.com/ooples/AiDotNet.Tensors/commit/aab28469507bc9846786f4926599a12d56e1c227))
+
+
+### Performance
+
+* **autodiff:** materialize the in-place gradient copy lazily ([#938](https://github.com/ooples/AiDotNet.Tensors/issues/938)) ([8550c42](https://github.com/ooples/AiDotNet.Tensors/commit/8550c42dfafd715aa1d9b765bbd47eba666c9ab5))
+
+## [0.123.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.122.0...v0.123.0) (2026-08-12)
+
+
+### Features
+
+* **ptx:** add experimental vision kernel family ([#883](https://github.com/ooples/AiDotNet.Tensors/issues/883)) ([a85a9c3](https://github.com/ooples/AiDotNet.Tensors/commit/a85a9c3a35e345c5709e8db9a84bc32bc6c82daf))
+
+
+### Bug Fixes
+
+* **autodiff:** harden gradient ownership and composite contracts ([#935](https://github.com/ooples/AiDotNet.Tensors/issues/935)) ([c3b64d8](https://github.com/ooples/AiDotNet.Tensors/commit/c3b64d8fa3ec03cc83e31558d4032bb107f37efc))
+
 ## [0.122.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.121.0...v0.122.0) (2026-08-07)
 
 

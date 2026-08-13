@@ -391,6 +391,511 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.Audit.ToJson());
     }
 
+    internal static void RunVisionBoxIou()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-vision-box-iou-start");
+        using var runtime = new DirectPtxRuntime();
+        (int N, int M)[] shapes = [(256, 256), (1024, 256), (1024, 1024), (4096, 256)];
+        foreach ((int n, int m) in shapes)
+        {
+            using var kernel = new PtxFusedPairwiseBoxIouF32Kernel(runtime, n, m);
+            using var boxesA = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var boxesB = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            boxesA.Upload<float>(new float[n * 4]);
+            boxesB.Upload<float>(new float[m * 4]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(boxesA, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(boxesB, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        foreach (DirectPtxVisionSpec spec in VisionProfileSpecs())
+        {
+            using var kernel = new PtxVisionKernel(runtime, spec);
+            var buffers = new DirectPtxBuffer[kernel.Blueprint.Tensors.Count];
+            try
+            {
+                var views = new DirectPtxTensorView[buffers.Length];
+                for (int i = 0; i < buffers.Length; i++)
+                {
+                    DirectPtxTensorContract contract = kernel.Blueprint.Tensors[i];
+                    buffers[i] = runtime.AllocateBytes(contract.RequiredBytes);
+                    // Derive the element count from the contract's own element size
+                    // instead of assuming 4 bytes, and fail closed for any physical
+                    // type this profiling upload does not model.
+                    int elementCount = checked((int)(
+                        contract.RequiredBytes / (nuint)contract.ElementBytes));
+                    switch (contract.PhysicalType)
+                    {
+                        case DirectPtxPhysicalType.Float32:
+                            buffers[i].Upload<float>(new float[elementCount]);
+                            break;
+                        case DirectPtxPhysicalType.Int32:
+                            buffers[i].Upload<int>(new int[elementCount]);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                "Vision profiling upload does not handle physical type " +
+                                contract.PhysicalType + ".");
+                    }
+                    views[i] = DirectPtxTensorView.CreateOwned(buffers[i], contract);
+                }
+                kernel.Launch(
+                    views[0],
+                    views.Length > 1 ? views[1] : default,
+                    views.Length > 2 ? views[2] : default,
+                    views.Length > 3 ? views[3] : default,
+                    views.Length > 4 ? views[4] : default,
+                    views.Length > 5 ? views[5] : default);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+            finally
+            {
+                foreach (DirectPtxBuffer? buffer in buffers) buffer?.Dispose();
+            }
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-vision-box-iou-end", afterSuite: true);
+    }
+
+    // The number of specs yielded here, plus the 4 fused BoxIoU shapes launched by
+    // RunVisionBoxIou above, must equal $expectedLaunches for the 'vision-box-iou'
+    // target in tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1
+    // (currently 31). Adding or removing a spec here without updating that constant
+    // makes the Nsight verification fail with an opaque row-count error.
+    private static IEnumerable<DirectPtxVisionSpec> VisionProfileSpecs()
+    {
+        yield return new(DirectPtxVisionOperation.GeneralizedBoxIou, 256, 256);
+        yield return new(DirectPtxVisionOperation.DistanceBoxIou, 256, 256);
+        yield return new(DirectPtxVisionOperation.CompleteBoxIou, 256, 256);
+        yield return new(DirectPtxVisionOperation.BoxArea, 256);
+        yield return new(DirectPtxVisionOperation.BoxConvert, 256, 0, 2);
+        yield return new(DirectPtxVisionOperation.IoULoss, 256);
+        yield return new(DirectPtxVisionOperation.GIoULoss, 256);
+        yield return new(DirectPtxVisionOperation.DIoULoss, 256);
+        yield return new(DirectPtxVisionOperation.CIoULoss, 256);
+        yield return new(DirectPtxVisionOperation.IoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.GIoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.DIoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.CIoULossBackward, 256);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardA, 256, 256, 0);
+        yield return new(DirectPtxVisionOperation.IouFamilyBackwardB, 256, 256, 0);
+        yield return new(DirectPtxVisionOperation.Nms, 256,
+            Flags: 0, ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+        yield return new(DirectPtxVisionOperation.Nms, 256,
+            Flags: 1, ScalarBits: BitConverter.SingleToInt32Bits(0.5f));
+        yield return new(DirectPtxVisionOperation.MasksToBoxes, 256, 28, 28);
+        yield return new(DirectPtxVisionOperation.RoiAlign,
+            1, 256, 56, 56, 256, 7, 7, 256, 2 | 0x100,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.RoiPool,
+            1, 256, 56, 56, 256, 7, 7, 256, 0,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.PsRoiAlign,
+            1, 196, 56, 56, 256, 7, 7, 4, 2,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.PsRoiPool,
+            1, 196, 56, 56, 256, 7, 7, 4, 0,
+            BitConverter.SingleToInt32Bits(0.25f));
+        yield return new(DirectPtxVisionOperation.Cross3, 256, 1);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 0);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 1);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 2);
+        yield return new(DirectPtxVisionOperation.Meshgrid2D, 256, 256, Flags: 3);
+    }
+
+    internal static void RunRngDropout()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-dropout-start");
+        using var runtime = new DirectPtxRuntime();
+        foreach (int elements in new[] { 4_096, 65_536, 1_048_576 })
+        {
+            using var kernel = new PtxFusedPhiloxDropoutF32Kernel(runtime, elements);
+            using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var mask = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            input.Upload<float>(new float[elements]);
+            const float dropoutRate = 0.1f;
+            float keep = 1.0f - dropoutRate;
+            uint threshold = (uint)Math.Floor((double)keep * 4_294_967_296.0);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(mask, kernel.Blueprint.Tensors[2]),
+                seed: 0x8490_1234_5678_9ABCul,
+                subsequence: 0,
+                counterOffset: 0,
+                keepThreshold: threshold,
+                inverseKeep: 1.0f / keep);
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-dropout-end");
+    }
+
+    /// <summary>
+    /// Emits exactly one launch for every issue-#849 direct-PTX specialization.
+    /// This is deliberately separate from the dropout-only compatibility target:
+    /// promotion evidence must cover the complete stochastic-kernel set.
+    /// </summary>
+    internal static void RunRngStochastic()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-stochastic-start");
+        using var runtime = new DirectPtxRuntime();
+        const ulong seed = 0x8490_1234_5678_9ABCul;
+        const float dropoutRate = 0.1f;
+        float keep = 1.0f - dropoutRate;
+        uint threshold = (uint)Math.Floor((double)keep * 4_294_967_296.0);
+
+        foreach (int elements in new[] { 4_096, 65_536, 1_048_576 })
+        {
+            using (var kernel = new PtxFusedPhiloxDropoutF32Kernel(runtime, elements))
+            using (var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var mask = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            {
+                input.Upload<float>(new float[elements]);
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(mask, kernel.Blueprint.Tensors[2]),
+                    seed, 0, 0, threshold, 1.0f / keep);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            foreach (DirectPtxPhiloxFillKind kind in Enum.GetValues<DirectPtxPhiloxFillKind>())
+            {
+                using var kernel = new PtxPhiloxFillF32Kernel(runtime, kind, elements);
+                using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+                DirectPtxTensorView outputView =
+                    DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[0]);
+                if (kind is DirectPtxPhiloxFillKind.BernoulliMask or
+                    DirectPtxPhiloxFillKind.DropThresholdMask)
+                    kernel.LaunchMask(outputView, seed, 0, 0, threshold, 1.0f);
+                else
+                    kernel.LaunchRange(outputView, seed, 0, 0,
+                        kind == DirectPtxPhiloxFillKind.Uniform ? -1.0f : 0.0f,
+                        kind == DirectPtxPhiloxFillKind.Uniform ? 1.0f : 1.0f);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxDropoutBackwardF32Kernel(runtime, elements))
+            using (var gradOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var mask = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var gradInput = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            {
+                gradOutput.Upload<float>(new float[elements]);
+                mask.Upload<float>(Enumerable.Repeat(1.0f, elements).ToArray());
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(mask, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(gradInput, kernel.Blueprint.Tensors[2]));
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxFusedDdimStepF32Kernel(runtime, elements))
+            using (var xT = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var epsilon = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            {
+                xT.Upload<float>(new float[elements]);
+                epsilon.Upload<float>(new float[elements]);
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(xT, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(epsilon, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]),
+                    xCoefficient: 0.95f, epsilonCoefficient: -0.05f);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxFusedPhiloxRreluF32Kernel(runtime, elements))
+            using (var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var noise = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            {
+                input.Upload<float>(new float[elements]);
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(noise, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]),
+                    seed, 0, 0, 0.125f, 1.0f / 3.0f);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxRreluF32Kernel(
+                       runtime, DirectPtxRreluKind.Forward, elements))
+            using (var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var noise = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            {
+                input.Upload<float>(new float[elements]);
+                noise.Upload<float>(Enumerable.Repeat(0.2f, elements).ToArray());
+                kernel.LaunchForward(
+                    DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(noise, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]));
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxRreluF32Kernel(
+                       runtime, DirectPtxRreluKind.Backward, elements))
+            using (var gradOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var noise = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            using (var gradInput = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes))
+            {
+                gradOutput.Upload<float>(Enumerable.Repeat(1.0f, elements).ToArray());
+                input.Upload<float>(new float[elements]);
+                noise.Upload<float>(Enumerable.Repeat(0.2f, elements).ToArray());
+                kernel.LaunchBackward(
+                    DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(noise, kernel.Blueprint.Tensors[2]),
+                    DirectPtxTensorView.CreateOwned(gradInput, kernel.Blueprint.Tensors[3]));
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+        }
+
+        foreach (int rows in new[] { 128, 2_048, 32_768 })
+        {
+            int elements = checked(rows * PtxFusedGumbelSoftmax32F32Kernel.InnerSize);
+            using (var kernel = new PtxFusedGumbelSoftmax32F32Kernel(runtime, rows))
+            using (var logits = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            {
+                logits.Upload<float>(new float[elements]);
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(logits, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]),
+                    seed, 0, 0, temperature: 0.7f);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxPhiloxCategorical32F32Kernel(runtime, rows))
+            using (var probabilities = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var oneHot = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            {
+                probabilities.Upload<float>(Enumerable.Repeat(1.0f / 32.0f, elements).ToArray());
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(probabilities, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(oneHot, kernel.Blueprint.Tensors[1]),
+                    seed, 0, 0);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+
+            using (var kernel = new PtxGumbelSoftmaxBackward32F32Kernel(runtime, rows))
+            using (var gradOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes))
+            using (var softOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes))
+            using (var gradInput = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes))
+            {
+                gradOutput.Upload<float>(Enumerable.Repeat(1.0f, elements).ToArray());
+                softOutput.Upload<float>(Enumerable.Repeat(1.0f / 32.0f, elements).ToArray());
+                kernel.Launch(
+                    DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(softOutput, kernel.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(gradInput, kernel.Blueprint.Tensors[2]),
+                    temperature: 0.7f);
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+        }
+
+        foreach (int rays in new[] { 64, 1_024, 16_384 })
+        {
+            int elements = checked(rays * PtxFusedImportanceSampling64F32Kernel.Samples);
+            using var kernel = new PtxFusedImportanceSampling64F32Kernel(runtime, rays);
+            using var tValues = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            tValues.Upload<float>(Enumerable.Range(0, elements)
+                .Select(index => (index % 64) / 63.0f).ToArray());
+            weights.Upload<float>(Enumerable.Repeat(1.0f, elements).ToArray());
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(tValues, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]),
+                seed, 0, 0);
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+
+        foreach (int rows in new[] { 16, 256, 4_096 })
+        {
+            int elements = checked(rows * PtxFusedBiasPhiloxDropout256F32Kernel.Columns);
+            using var kernel = new PtxFusedBiasPhiloxDropout256F32Kernel(runtime, rows);
+            using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+            using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+            using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+            using var mask = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+            input.Upload<float>(new float[elements]);
+            bias.Upload<float>(new float[PtxFusedBiasPhiloxDropout256F32Kernel.Columns]);
+            kernel.Launch(
+                DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+                DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[1]),
+                DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[2]),
+                DirectPtxTensorView.CreateOwned(mask, kernel.Blueprint.Tensors[3]),
+                seed, 0, 0, threshold, 1.0f / keep);
+            runtime.Synchronize();
+            Console.WriteLine(kernel.Audit.ToJson());
+        }
+
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-stochastic-end");
+    }
+
+    internal static void RunSolvers4x4()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-solvers-4x4-start");
+        using var runtime = new DirectPtxRuntime();
+        foreach (int batch in new[] { 1024, 4096, 16384, 65536 })
+        {
+            using (var cholesky = new PtxRegisterCholesky4x4F32Kernel(runtime, batch))
+            using (var input = runtime.AllocateBytes(cholesky.Blueprint.Tensors[0].RequiredBytes))
+            using (var output = runtime.AllocateBytes(cholesky.Blueprint.Tensors[1].RequiredBytes))
+            using (var info = runtime.AllocateBytes(cholesky.Blueprint.Tensors[2].RequiredBytes))
+            {
+                input.Upload<float>(RepeatSolverMatrix(batch,
+                [
+                    9f, 1f, 2f, .5f,
+                    1f, 8f, .25f, 1f,
+                    2f, .25f, 7f, .75f,
+                    .5f, 1f, .75f, 6f
+                ]));
+                cholesky.Launch(
+                    DirectPtxTensorView.CreateOwned(input, cholesky.Blueprint.Tensors[0]),
+                    DirectPtxTensorView.CreateOwned(output, cholesky.Blueprint.Tensors[1]),
+                    DirectPtxTensorView.CreateOwned(info, cholesky.Blueprint.Tensors[2]));
+                runtime.Synchronize();
+                Console.WriteLine(cholesky.Audit.ToJson());
+            }
+
+            foreach (DirectPtxSolver4x4Operation operation in Enum.GetValues<DirectPtxSolver4x4Operation>())
+            {
+                using var kernel = new PtxRegisterSolver4x4F32Kernel(runtime, operation, batch);
+                using var first = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+                using var second = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+                using var third = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+                UploadSolverProfileInputs(operation, batch, first, second, third);
+                if (kernel.Blueprint.Tensors.Count == 3)
+                {
+                    kernel.Launch3(
+                        DirectPtxTensorView.CreateOwned(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(third, kernel.Blueprint.Tensors[2]));
+                }
+                else if (kernel.Blueprint.Tensors.Count == 4)
+                {
+                    using var fourth = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+                    kernel.Launch4(
+                        DirectPtxTensorView.CreateOwned(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(third, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(fourth, kernel.Blueprint.Tensors[3]));
+                }
+                else
+                {
+                    using var fourth = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+                    using var fifth = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+                    kernel.Launch5(
+                        DirectPtxTensorView.CreateOwned(first, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.CreateOwned(second, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.CreateOwned(third, kernel.Blueprint.Tensors[2]),
+                        DirectPtxTensorView.CreateOwned(fourth, kernel.Blueprint.Tensors[3]),
+                        DirectPtxTensorView.CreateOwned(fifth, kernel.Blueprint.Tensors[4]));
+                }
+                runtime.Synchronize();
+                Console.WriteLine(kernel.Audit.ToJson());
+            }
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-solvers-4x4-end");
+    }
+
+    private static void UploadSolverProfileInputs(
+        DirectPtxSolver4x4Operation operation,
+        int batch,
+        DirectPtxBuffer first,
+        DirectPtxBuffer second,
+        DirectPtxBuffer third)
+    {
+        float[] spd =
+        [
+            9f, 1f, 2f, .5f,
+            1f, 8f, .25f, 1f,
+            2f, .25f, 7f, .75f,
+            .5f, 1f, .75f, 6f
+        ];
+        float[] identity =
+            [1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f];
+        float[] lower =
+            [3f, 0f, 0f, 0f, 1f, 4f, 0f, 0f, .5f, 1f, 5f, 0f, .25f, .5f, 1f, 6f];
+        float[] upper =
+            [3f, 1f, .5f, .25f, 0f, 4f, 1f, .5f, 0f, 0f, 5f, 1f, 0f, 0f, 0f, 6f];
+        float[] factor =
+            [3f, 0f, 0f, 0f, 0f, 2.5f, 0f, 0f, 0f, 0f, 2f, 0f, 0f, 0f, 0f, 1.5f];
+        float[] firstMatrix = operation switch
+        {
+            DirectPtxSolver4x4Operation.LuSolveVector or
+            DirectPtxSolver4x4Operation.LdlSolveVectorLower or
+            DirectPtxSolver4x4Operation.SolveBackwardVector => identity,
+            DirectPtxSolver4x4Operation.TriangularSolveVectorLower => lower,
+            DirectPtxSolver4x4Operation.TriangularSolveVectorUpper => upper,
+            DirectPtxSolver4x4Operation.CholeskyBackwardLower => factor,
+            _ => spd
+        };
+        first.Upload<float>(RepeatSolverMatrix(batch, firstMatrix));
+
+        float[] rhs = RepeatSolverVector(batch, [1f, 2f, 3f, 4f]);
+        if (operation is DirectPtxSolver4x4Operation.LuSolveVector or
+            DirectPtxSolver4x4Operation.LdlSolveVectorLower)
+        {
+            int[] pivots = new int[batch * 4];
+            for (int b = 0; b < batch; b++)
+                for (int i = 0; i < 4; i++) pivots[b * 4 + i] = i;
+            second.Upload<int>(pivots);
+            third.Upload<float>(rhs);
+        }
+        else if (operation is DirectPtxSolver4x4Operation.GeneralSolveVector or
+            DirectPtxSolver4x4Operation.TriangularSolveVectorLower or
+            DirectPtxSolver4x4Operation.TriangularSolveVectorUpper)
+        {
+            second.Upload<float>(rhs);
+        }
+        else if (operation == DirectPtxSolver4x4Operation.CholeskyBackwardLower)
+        {
+            second.Upload<float>(RepeatSolverMatrix(batch, identity));
+        }
+        else if (operation == DirectPtxSolver4x4Operation.SolveBackwardVector)
+        {
+            second.Upload<float>(rhs);
+            third.Upload<float>(RepeatSolverVector(batch, [.5f, 1f, 1.5f, 2f]));
+        }
+    }
+
+    private static float[] RepeatSolverMatrix(int batch, float[] matrix)
+    {
+        var result = new float[checked(batch * 16)];
+        for (int b = 0; b < batch; b++) Array.Copy(matrix, 0, result, b * 16, 16);
+        return result;
+    }
+
+    private static float[] RepeatSolverVector(int batch, float[] vector)
+    {
+        var result = new float[checked(batch * 4)];
+        for (int b = 0; b < batch; b++) Array.Copy(vector, 0, result, b * 4, 4);
+        return result;
+    }
+
     internal static void RunRgLru()
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("ncu-rglru-start");
