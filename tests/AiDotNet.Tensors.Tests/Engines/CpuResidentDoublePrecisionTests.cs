@@ -31,8 +31,24 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// single-precision round trip cannot reproduce the double answer.
 /// </para>
 /// </remarks>
-public class CpuResidentDoublePrecisionTests
+public class CpuResidentDoublePrecisionTests : IDisposable
 {
+    // DirectGpuTensorEngine's default constructor OWNS the underlying DirectGpuEngine, so an
+    // undisposed one leaks a GPU backend per case. xUnit builds a fresh test-class instance per
+    // test and disposes it afterwards, so tracking here releases the engine on every path.
+    private readonly System.Collections.Generic.List<IDisposable> _owned = new();
+
+    public void Dispose()
+    {
+        for (int i = _owned.Count - 1; i >= 0; i--)
+        {
+            try { _owned[i].Dispose(); }
+            catch (Exception) { /* a backend that failed to initialize must not mask the result */ }
+        }
+        _owned.Clear();
+        GC.SuppressFinalize(this);
+    }
+
     private static Vector<double> Vec(params double[] values)
     {
         var v = new Vector<double>(values.Length);
@@ -63,10 +79,14 @@ public class CpuResidentDoublePrecisionTests
     /// the suite reported green. Constructing the engine directly makes the GPU case either run
     /// against the GPU or announce itself as skipped, instead of silently passing as a duplicate.
     /// </remarks>
-    private static IEngine Resolve(string which)
+    private IEngine Resolve(string which)
     {
         if (which == "cpu") return new CpuEngine();
         var gpu = new DirectGpuTensorEngine();
+        // Registered BEFORE the skip check on purpose: Skip.If throws, and by then the engine
+        // already owns its backend, so registering afterwards would leak on every skipped run
+        // -- which is EVERY run on a CPU-only host, i.e. the common case.
+        _owned.Add(gpu);
         Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/…).");
         return gpu;
     }
