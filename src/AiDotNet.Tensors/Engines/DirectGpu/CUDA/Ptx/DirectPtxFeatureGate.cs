@@ -30,6 +30,7 @@ internal static class DirectPtxFeatureGate
     internal const string Solve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVE_4X4";
     internal const string TriangularSolve4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRIANGULAR_SOLVE_4X4";
     internal const string SolverBackward4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_SOLVER_BACKWARD_4X4";
+    internal const string RngDropoutEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RNG_DROPOUT";
     internal const string VisionBoxIouEnvironmentVariable = "AIDOTNET_DIRECT_PTX_VISION_BOX_IOU";
     internal const string VisionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_VISION";
     internal const string RecurrentStateEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RECURRENT_STATE";
@@ -46,7 +47,6 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
-    private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentCholesky4x4Enabled = ReadEnabled(Cholesky4x4EnvironmentVariable);
     private static readonly bool EnvironmentLuFactor4x4Enabled = ReadEnabled(LuFactor4x4EnvironmentVariable);
     private static readonly bool EnvironmentQr4x4Enabled = ReadEnabled(Qr4x4EnvironmentVariable);
@@ -58,6 +58,8 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentSolve4x4Enabled = ReadEnabled(Solve4x4EnvironmentVariable);
     private static readonly bool EnvironmentTriangularSolve4x4Enabled = ReadEnabled(TriangularSolve4x4EnvironmentVariable);
     private static readonly bool EnvironmentSolverBackward4x4Enabled = ReadEnabled(SolverBackward4x4EnvironmentVariable);
+    private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentRngDropoutEnabled = ReadEnabled(RngDropoutEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentVisionBoxIouEnabled = ReadEnabled(VisionBoxIouEnvironmentVariable);
@@ -120,6 +122,8 @@ internal static class DirectPtxFeatureGate
     }
 
     internal static bool IsEnabled => IsAttentionEnabled;
+    internal static bool IsRngDropoutEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentRngDropoutEnabled);
 
     internal static bool IsAttentionEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentAttentionEnabled);
@@ -389,6 +393,32 @@ internal readonly struct DirectPtxTensorView
             PtxCompat.ToIntPtr(pointerValue),
             contract.RequiredBytes,
             allocationBytes,
+            contract.PhysicalType,
+            contract.Layout,
+            contract.LogicalExtent,
+            contract.PhysicalExtent,
+            contract.Access);
+    }
+
+    internal static DirectPtxTensorView Create(
+        DirectPtxBuffer buffer,
+        DirectPtxTensorContract contract)
+    {
+        PtxCompat.ThrowIfNull(buffer, nameof(buffer));
+        if (buffer.Pointer == IntPtr.Zero)
+            throw new ArgumentException("The direct PTX buffer has no device pointer.", nameof(buffer));
+        if (buffer.ByteLength != contract.RequiredBytes)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' requires exactly {contract.RequiredBytes} bytes; allocation has {buffer.ByteLength}.",
+                nameof(buffer));
+        nuint pointerValue = PtxCompat.ToNuint(buffer.Pointer);
+        if ((pointerValue & (nuint)(contract.AlignmentBytes - 1)) != 0)
+            throw new ArgumentException(
+                $"Tensor '{contract.Name}' is not {contract.AlignmentBytes}-byte aligned.", nameof(buffer));
+        return new DirectPtxTensorView(
+            buffer.Pointer,
+            contract.RequiredBytes,
+            buffer.ByteLength,
             contract.PhysicalType,
             contract.Layout,
             contract.LogicalExtent,
