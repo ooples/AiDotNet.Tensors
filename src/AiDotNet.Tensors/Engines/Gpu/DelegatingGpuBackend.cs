@@ -1868,6 +1868,26 @@ public class DelegatingGpuBackend : IDirectGpuBackend
             outputMapReal, outputMapImag, skip, output, batch, time, groups, width, state);
 
     /// <inheritdoc/>
+    public virtual void MesaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+        IGpuBuffer regularization, IGpuBuffer output,
+        IGpuBuffer workWeights, IGpuBuffer covariance,
+        int batch, int time, int model, int heads, int headDim)
+        => Inner.MesaScanForward(
+            q, k, v, initialWeights, regularization, output, workWeights, covariance,
+            batch, time, model, heads, headDim);
+
+    /// <inheritdoc/>
+    public virtual void RoutedDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer activeMask, IGpuBuffer transition,
+        IGpuBuffer inputMap, IGpuBuffer outputMap, IGpuBuffer skip,
+        IGpuBuffer output, IGpuBuffer stateScratch,
+        int batch, int time, int model, int experts, int state)
+        => Inner.RoutedDiagonalSsmScanForward(
+            input, activeMask, transition, inputMap, outputMap, skip, output, stateScratch,
+            batch, time, model, experts, state);
+
+    /// <inheritdoc/>
     public virtual void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)

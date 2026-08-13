@@ -942,6 +942,29 @@ public sealed partial class WebGpuBackend
                 outputMapReal, outputMapImag, skip, output }, new[] { batch, time, groups, width, state });
     }
 
+    public void MesaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+        IGpuBuffer regularization, IGpuBuffer output,
+        IGpuBuffer workWeights, IGpuBuffer covariance,
+        int batch, int time, int model, int heads, int headDim)
+    {
+        if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
+            model != heads * headDim || headDim > 32)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+        DispatchRecurrence("mesa", WebGpuRecurrenceKernels.MesaScan, batch * heads,
+            new[] { q, k, v, initialWeights, regularization, output, workWeights, covariance },
+            new[] { batch, time, model, heads, headDim });
+    }
+
+    public void RoutedDiagonalSsmScanForward(
+        IGpuBuffer input,IGpuBuffer activeMask,IGpuBuffer transition,IGpuBuffer inputMap,IGpuBuffer outputMap,IGpuBuffer skip,
+        IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
+    {
+        if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
+        DispatchRecurrence("routed_diagonal_ssm",WebGpuRecurrenceKernels.RoutedDiagonalSsmScan,batch*experts,
+            new[]{input,activeMask,transition,inputMap,outputMap,skip,output,stateScratch},new[]{batch,time,model,experts,state});
+    }
+
     public void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)

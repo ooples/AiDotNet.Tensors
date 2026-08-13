@@ -13149,6 +13149,39 @@ KERNEL VARIANTS (A/B testing):
             _context.Finish();
         }
 
+        public void MesaScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+            IGpuBuffer regularization, IGpuBuffer output,
+            IGpuBuffer workWeights, IGpuBuffer covariance,
+            int batch, int time, int model, int heads, int headDim)
+        {
+            if (_context == null) throw new InvalidOperationException("OpenCL context is not initialized.");
+            if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
+                model != heads * headDim || headDim > 32)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+            if (!_kernelCache.TryGetValue("mesa_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: mesa_scan_forward");
+            IGpuBuffer[] buffers = { q, k, v, initialWeights, regularization, output, workWeights, covariance };
+            for (uint i=0;i<buffers.Length;i++) kernel.SetArg(i, ((DirectOpenClGpuBuffer)buffers[i]).Buffer.Handle);
+            kernel.SetArg(8u,batch); kernel.SetArg(9u,time); kernel.SetArg(10u,model);
+            kernel.SetArg(11u,heads); kernel.SetArg(12u,headDim);
+            int total=batch*heads, local=CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(((total+local-1)/local)*local, local);
+            _context.Finish();
+        }
+
+        public void RoutedDiagonalSsmScanForward(
+            IGpuBuffer input,IGpuBuffer activeMask,IGpuBuffer transition,IGpuBuffer inputMap,IGpuBuffer outputMap,IGpuBuffer skip,
+            IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
+        {
+            if(_context==null)throw new InvalidOperationException("OpenCL context is not initialized.");
+            if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
+            if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new InvalidOperationException("OpenCL kernel not found: routed_diagonal_ssm_scan_forward");
+            IGpuBuffer[] buffers={input,activeMask,transition,inputMap,outputMap,skip,output,stateScratch};for(uint i=0;i<buffers.Length;i++)kernel.SetArg(i,((DirectOpenClGpuBuffer)buffers[i]).Buffer.Handle);
+            kernel.SetArg(8u,batch);kernel.SetArg(9u,time);kernel.SetArg(10u,model);kernel.SetArg(11u,experts);kernel.SetArg(12u,state);
+            int total=batch*experts,local=CalculateOptimalWorkGroupSize1D(total);kernel.Execute1D(((total+local-1)/local)*local,local);_context.Finish();
+        }
+
         // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
         public void Mamba2SsdScanForward(
             IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,

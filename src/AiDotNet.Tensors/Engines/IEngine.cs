@@ -4343,6 +4343,33 @@ public interface IEngine
         Tensor<T> skip);
 
     /// <summary>
+    /// Fused MesaNet locally-optimal test-time-training scan. Q/K/V are
+    /// [batch,time,model], initialWeights is [heads,headDim,headDim], and the
+    /// returned tensor is [batch,time,model]. The CPU implementation records
+    /// one tape node with an exact reverse pass through the Woodbury updates.
+    /// </summary>
+    Tensor<T> MesaScanForward<T>(
+        Tensor<T> q,
+        Tensor<T> k,
+        Tensor<T> v,
+        Tensor<T> initialWeights,
+        T regularization,
+        int numHeads);
+
+    /// <summary>
+    /// Sparse routed diagonal state-space scan. input is [batch,time,model], activeMask is
+    /// [batch,time,experts], transition is [experts,state], inputMap is [experts,state,model],
+    /// outputMap is [experts,model,state], and skip is [experts,model].
+    /// </summary>
+    Tensor<T> RoutedDiagonalSsmScanForward<T>(
+        Tensor<T> input,
+        Tensor<T> activeMask,
+        Tensor<T> transition,
+        Tensor<T> inputMap,
+        Tensor<T> outputMap,
+        Tensor<T> skip);
+
+    /// <summary>
     /// Fused RG-LRU (Griffin/Hawk/RecurrentGemma) gated linear recurrence over a whole sequence as one
     /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.RgLruScan.cs</c> (#1464).
     /// </summary>

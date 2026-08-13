@@ -78,8 +78,43 @@ __kernel void complex_diagonal_ssm_scan_forward(
         }
     }
 }
+
+__kernel void mesa_scan_forward(
+    __global const float* Q, __global const float* K, __global const float* V,
+    __global const float* W0, __global const float* regularization,
+    __global float* output, __global float* workW, __global float* covariance,
+    int batch, int time, int model, int heads, int headDim)
+{
+    int bh=get_global_id(0); if(bh>=batch*heads || headDim>32)return;
+    int b=bh/heads,h=bh%heads,matrix=headDim*headDim,base=bh*matrix,w0Base=h*matrix;
+    float invLambda=1.0f/regularization[0];
+    for(int i=0;i<matrix;i++){workW[base+i]=W0[w0Base+i];covariance[base+i]=0.0f;}
+    for(int i=0;i<headDim;i++)covariance[base+i*headDim+i]=invLambda;
+    float pk[32],error[32],row[32];
+    for(int t=0;t<time;t++){
+        int vb=(b*time+t)*model+h*headDim;
+        for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=covariance[base+i*headDim+j]*K[vb+j];pk[i]=s;}
+        float denom=1.0f;for(int i=0;i<headDim;i++)denom+=K[vb+i]*pk[i];
+        for(int i=0;i<headDim;i++)for(int j=0;j<headDim;j++)covariance[base+i*headDim+j]-=pk[i]*pk[j]/denom;
+        for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=workW[base+i*headDim+j]*K[vb+j];error[i]=s-V[vb+i];}
+        for(int j=0;j<headDim;j++){float s=0.0f;for(int i=0;i<headDim;i++)s+=K[vb+i]*covariance[base+i*headDim+j];row[j]=s;}
+        for(int i=0;i<headDim;i++)for(int j=0;j<headDim;j++)workW[base+i*headDim+j]-=error[i]*row[j];
+        for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=workW[base+i*headDim+j]*Q[vb+j];output[vb+i]=s;}
+    }
+}
+
+__kernel void routed_diagonal_ssm_scan_forward(
+ __global const float* X,__global const float* mask,__global const float* A,__global const float* B,
+ __global const float* C,__global const float* D,__global float* output,__global float* hState,
+ int batch,int time,int model,int experts,int state)
+{
+ int be=get_global_id(0);if(be>=batch*experts)return;int b=be/experts,e=be%experts,hb=be*state;
+ for(int s=0;s<state;s++)hState[hb+s]=0.0f;for(int t=0;t<time;t++){int xb=(b*time+t)*model,mi=(b*time+t)*experts+e;float active=mask[mi];
+  for(int s=0;s<state;s++){float next=A[e*state+s]*hState[hb+s];int bb=(e*state+s)*model;for(int d=0;d<model;d++)next+=B[bb+d]*X[xb+d];hState[hb+s]=active*next;}
+  int yb=((b*time+t)*experts+e)*model;for(int d=0;d<model;d++){float y=D[e*model+d]*X[xb+d];int cb=(e*model+d)*state;for(int s=0;s<state;s++)y+=C[cb+s]*hState[hb+s];output[yb+d]=active*y;}}
+}
 ";
     }
 
-    public static string[] GetKernelNames() => new[] { "mamba_selective_scan_forward", "complex_diagonal_ssm_scan_forward" };
+    public static string[] GetKernelNames() => new[] { "mamba_selective_scan_forward", "complex_diagonal_ssm_scan_forward", "mesa_scan_forward", "routed_diagonal_ssm_scan_forward" };
 }

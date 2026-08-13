@@ -249,6 +249,46 @@ kernel void complex_diagonal_ssm_scan_forward(
     }
 }
 
+kernel void mesa_scan_forward(
+    device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]], device const float* W0 [[buffer(3)]],
+    device const float* regularization [[buffer(4)]], device float* output [[buffer(5)]],
+    device float* workW [[buffer(6)]], device float* covariance [[buffer(7)]],
+    constant int& batch [[buffer(8)]], constant int& time [[buffer(9)]],
+    constant int& model [[buffer(10)]], constant int& heads [[buffer(11)]],
+    constant int& headDim [[buffer(12)]], uint gid [[thread_position_in_grid]])
+{
+    int bh=(int)gid; if(bh>=batch*heads || headDim>32)return;
+    int b=bh/heads,h=bh%heads,matrix=headDim*headDim,base=bh*matrix,w0Base=h*matrix;
+    float invLambda=1.0f/regularization[0];
+    for(int i=0;i<matrix;i++){workW[base+i]=W0[w0Base+i];covariance[base+i]=0.0f;}
+    for(int i=0;i<headDim;i++)covariance[base+i*headDim+i]=invLambda;
+    thread float pk[32],error[32],row[32];
+    for(int t=0;t<time;t++){
+        int vb=(b*time+t)*model+h*headDim;
+        for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=covariance[base+i*headDim+j]*K[vb+j];pk[i]=s;}
+        float denom=1.0f;for(int i=0;i<headDim;i++)denom+=K[vb+i]*pk[i];
+        for(int i=0;i<headDim;i++)for(int j=0;j<headDim;j++)covariance[base+i*headDim+j]-=pk[i]*pk[j]/denom;
+        for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=workW[base+i*headDim+j]*K[vb+j];error[i]=s-V[vb+i];}
+        for(int j=0;j<headDim;j++){float s=0.0f;for(int i=0;i<headDim;i++)s+=K[vb+i]*covariance[base+i*headDim+j];row[j]=s;}
+        for(int i=0;i<headDim;i++)for(int j=0;j<headDim;j++)workW[base+i*headDim+j]-=error[i]*row[j];
+        for(int i=0;i<headDim;i++){float s=0.0f;for(int j=0;j<headDim;j++)s+=workW[base+i*headDim+j]*Q[vb+j];output[vb+i]=s;}
+    }
+}
+
+kernel void routed_diagonal_ssm_scan_forward(
+ device const float* X [[buffer(0)]],device const float* mask [[buffer(1)]],device const float* A [[buffer(2)]],
+ device const float* B [[buffer(3)]],device const float* C [[buffer(4)]],device const float* D [[buffer(5)]],
+ device float* output [[buffer(6)]],device float* hState [[buffer(7)]],constant int& batch [[buffer(8)]],
+ constant int& time [[buffer(9)]],constant int& model [[buffer(10)]],constant int& experts [[buffer(11)]],
+ constant int& state [[buffer(12)]],uint gid [[thread_position_in_grid]])
+{
+ int be=(int)gid;if(be>=batch*experts)return;int b=be/experts,e=be%experts,hb=be*state;
+ for(int s=0;s<state;s++)hState[hb+s]=0.0f;for(int t=0;t<time;t++){int xb=(b*time+t)*model,mi=(b*time+t)*experts+e;float active=mask[mi];
+  for(int s=0;s<state;s++){float next=A[e*state+s]*hState[hb+s];int bb=(e*state+s)*model;for(int d=0;d<model;d++)next+=B[bb+d]*X[xb+d];hState[hb+s]=active*next;}
+  int yb=((b*time+t)*experts+e)*model;for(int d=0;d<model;d++){float y=D[e*model+d]*X[xb+d];int cb=(e*model+d)*state;for(int s=0;s<state;s++)y+=C[cb+s]*hState[hb+s];output[yb+d]=active*y;}}
+}
+
 // ── Mamba-2 SSD scan forward ───────────────────────────────────────────────────────────────
 kernel void mamba2_ssd_scan_forward(
     device const float* X [[buffer(0)]], device const float* delta [[buffer(1)]],
