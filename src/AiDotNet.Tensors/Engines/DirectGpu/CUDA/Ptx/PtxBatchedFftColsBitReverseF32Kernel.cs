@@ -74,8 +74,8 @@ internal sealed class PtxBatchedFftColsBitReverseF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView real, DirectPtxTensorView imag)
     {
-        Require(real, Blueprint.Tensors[0], nameof(real));
-        Require(imag, Blueprint.Tensors[1], nameof(imag));
+        DirectPtxAbiGuard.Require(real, Blueprint.Tensors[0], nameof(real));
+        DirectPtxAbiGuard.Require(imag, Blueprint.Tensors[1], nameof(imag));
 
         IntPtr realPointer = real.Pointer, imagPointer = imag.Pointer;
         void** arguments = stackalloc void*[2];
@@ -227,14 +227,4 @@ internal sealed class PtxBatchedFftColsBitReverseF32Kernel : IDisposable
                 "Batched column FFT bit-reverse block threads must be 128, 256, or 512 and evenly tile height*width.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

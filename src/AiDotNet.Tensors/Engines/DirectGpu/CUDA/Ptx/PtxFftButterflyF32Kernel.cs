@@ -67,8 +67,8 @@ internal sealed class PtxFftButterflyF32Kernel : IDisposable
     /// <paramref name="inverse"/> is 1 for the inverse transform, 0 for forward.</summary>
     internal unsafe void Launch(DirectPtxTensorView real, DirectPtxTensorView imag, int stride, int inverse)
     {
-        Require(real, Blueprint.Tensors[0], nameof(real));
-        Require(imag, Blueprint.Tensors[1], nameof(imag));
+        DirectPtxAbiGuard.Require(real, Blueprint.Tensors[0], nameof(real));
+        DirectPtxAbiGuard.Require(imag, Blueprint.Tensors[1], nameof(imag));
 
         IntPtr realPointer = real.Pointer, imagPointer = imag.Pointer;
         int strideValue = stride, inverseValue = inverse;
@@ -87,13 +87,12 @@ internal sealed class PtxFftButterflyF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int n, int blockThreads = DefaultBlockThreads)
     {
         Validate(n);
         ValidateBlockThreads(n, blockThreads);
-        string twoPi = Hex((float)(2.0 * Math.PI)), negTwoPi = Hex((float)(-2.0 * Math.PI));
+        string twoPi = DirectPtxPtxText.Hex((float)(2.0 * Math.PI)), negTwoPi = DirectPtxPtxText.Hex((float)(-2.0 * Math.PI));
 
         var ptx = new StringBuilder(4_000);
         ptx.AppendLine(".version 7.1");
@@ -219,14 +218,4 @@ internal sealed class PtxFftButterflyF32Kernel : IDisposable
                 "FFT butterfly block threads must be 128, 256, or 512 and evenly tile n/2.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

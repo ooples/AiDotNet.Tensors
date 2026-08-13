@@ -77,7 +77,12 @@ internal static class DirectPtxComplexMultiplyExperiment
     private static void RunDirect(int run, List<Result> results)
     {
         using var backend = new CudaBackend();
-        if (!backend.IsAvailable) return;
+        if (!backend.IsAvailable)
+        {
+            Console.Error.WriteLine(
+                "[complex-multiply] CUDA backend unavailable; the candidate lane produced no rows.");
+            return;
+        }
         bool originalExperiment = DirectPtxFeatureGate.ComplexMultiplyExperimentOverride;
         bool? originalGate = DirectPtxFeatureGate.ComplexMultiplyGateOverride;
         try
@@ -133,7 +138,12 @@ internal static class DirectPtxComplexMultiplyExperiment
     private static void RunEstablished(int run, List<Result> results)
     {
         using var backend = new CudaBackend();
-        if (!backend.IsAvailable) return;
+        if (!backend.IsAvailable)
+        {
+            Console.Error.WriteLine(
+                "[complex-multiply] CUDA backend unavailable; the established lane produced no rows.");
+            return;
+        }
         bool? originalGate = DirectPtxFeatureGate.ComplexMultiplyGateOverride;
         try
         {
@@ -174,7 +184,12 @@ internal static class DirectPtxComplexMultiplyExperiment
     {
         using var direct = new CudaBackend();
         using var incumbent = new CudaBackend();
-        if (!direct.IsAvailable || !incumbent.IsAvailable) return;
+        if (!direct.IsAvailable || !incumbent.IsAvailable)
+        {
+            Console.Error.WriteLine(
+                "[complex-multiply] CUDA backend unavailable; the oracle lane produced no rows.");
+            return;
+        }
 
         bool originalExperiment = DirectPtxFeatureGate.ComplexMultiplyExperimentOverride;
         bool? originalGate = DirectPtxFeatureGate.ComplexMultiplyGateOverride;
@@ -270,8 +285,22 @@ internal static class DirectPtxComplexMultiplyExperiment
                     }
                     finally
                     {
-                        direct.DestroyCapturedGraph(directGraph);
-                        incumbent.DestroyCapturedGraph(incumbentGraph);
+                        // Cleanup runs on the exception path too. Letting a
+                        // DestroyCapturedGraph failure escape here would replace the
+                        // original capture or benchmark exception with a less useful
+                        // one, so report it and preserve the primary failure.
+                        try { direct.DestroyCapturedGraph(directGraph); }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine(
+                                "[complex-multiply] candidate graph cleanup failed: " + ex.Message);
+                        }
+                        try { incumbent.DestroyCapturedGraph(incumbentGraph); }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine(
+                                "[complex-multiply] established graph cleanup failed: " + ex.Message);
+                        }
                     }
                 }
 

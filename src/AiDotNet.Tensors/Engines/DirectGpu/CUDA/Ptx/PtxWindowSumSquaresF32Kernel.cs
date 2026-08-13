@@ -39,7 +39,7 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
         DirectPtxRuntime runtime, int nFft, int hopLength, int outputLength, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in ISTFT window-sum-squares specialization is admitted only on SM86.");
@@ -74,8 +74,8 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView winSqSum, DirectPtxTensorView window)
     {
-        Require(winSqSum, Blueprint.Tensors[0], nameof(winSqSum));
-        Require(window, Blueprint.Tensors[1], nameof(window));
+        DirectPtxAbiGuard.Require(winSqSum, Blueprint.Tensors[0], nameof(winSqSum));
+        DirectPtxAbiGuard.Require(window, Blueprint.Tensors[1], nameof(window));
 
         IntPtr winSqSumPointer = winSqSum.Pointer, windowPointer = window.Pointer;
         void** arguments = stackalloc void*[2];
@@ -111,8 +111,8 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<4>;");
-        ptx.AppendLine("    .reg .b32 %r<8>;");
+        ptx.AppendLine("    .reg .pred %p<6>;");
+        ptx.AppendLine("    .reg .b32 %r<12>;");
         ptx.AppendLine("    .reg .b64 %rd<10>;");
         ptx.AppendLine("    .reg .f32 %f<3>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [winsqsum_ptr];");
@@ -123,10 +123,21 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
         ptx.AppendLine($"    setp.ge.u32 %p0, %r2, {outputLength};");
         ptx.AppendLine("    @%p0 bra $WSS_RET;");
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                    // sum
-        ptx.AppendLine("    mov.u32 %r3, 0;");                             // frame
+        // Frame f covers sample idx exactly when f*hop <= idx < f*hop + nFft,
+        // so only f in [ceil((idx-nFft+1)/hop), idx/hop] can contribute - at
+        // most nFft/hop + 1 frames. Scanning all numFrames instead is O(2^24)
+        // trips per thread at hop=1 for a result that needs a handful.
+        ptx.AppendLine($"    div.u32 %r6, %r2, {hopLength};");             // idx/hop
+        ptx.AppendLine($"    mov.u32 %r9, {numFrames - 1};");
+        ptx.AppendLine("    min.u32 %r6, %r6, %r9;");                      // last frame
+        ptx.AppendLine($"    sub.s32 %r7, %r2, {nFft - 1};");              // d = idx-nFft+1
+        ptx.AppendLine("    setp.lt.s32 %p4, %r7, 1;");
+        ptx.AppendLine($"    add.s32 %r8, %r7, {hopLength - 1};");
+        ptx.AppendLine($"    div.u32 %r8, %r8, {hopLength};");             // ceil(d/hop), d>=1
+        ptx.AppendLine("    selp.b32 %r3, 0, %r8, %p4;");                  // first frame
         ptx.AppendLine("$WSS_LOOP:");
         ptx.AppendLine("    .pragma \"nounroll\";");
-        ptx.AppendLine($"    setp.ge.u32 %p1, %r3, {numFrames};");
+        ptx.AppendLine("    setp.gt.u32 %p1, %r3, %r6;");
         ptx.AppendLine("    @%p1 bra $WSS_WRITE;");
         ptx.AppendLine($"    mul.lo.u32 %r4, %r3, {hopLength};");         // frameStart
         ptx.AppendLine("    sub.s32 %r5, %r2, %r4;");                      // localIdx
@@ -209,14 +220,4 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
                 "ISTFT window-sum-squares block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

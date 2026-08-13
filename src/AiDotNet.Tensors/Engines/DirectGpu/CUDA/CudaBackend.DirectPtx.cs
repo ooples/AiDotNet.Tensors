@@ -2530,7 +2530,13 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheComplexMultiplyKernelSlow(key);
                 }
-                if (capturing && !_directPtxComplexMultiplyKernels.Pin(key))
+                // Pin() is the permanent pin for captures the cache cannot observe.
+                // A CaptureGraph-owned capture must acquire through the active
+                // pin set, or ReleaseDirectPtxGraphPins cannot release this module
+                // when the graph is destroyed and the entry stays pinned for the
+                // life of the backend.
+                if (capturing &&
+                    !PinDirectPtxKernelForCapture(_directPtxComplexMultiplyKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX complex-multiply module for CUDA graph capture.");
                 lock (GpuDispatchLock)

@@ -66,10 +66,10 @@ internal sealed class PtxSplitComplexConjugateF32Kernel : IDisposable
         DirectPtxTensorView inReal, DirectPtxTensorView inImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag)
     {
-        Require(inReal, Blueprint.Tensors[0], nameof(inReal));
-        Require(inImag, Blueprint.Tensors[1], nameof(inImag));
-        Require(outReal, Blueprint.Tensors[2], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[3], nameof(outImag));
+        DirectPtxAbiGuard.Require(inReal, Blueprint.Tensors[0], nameof(inReal));
+        DirectPtxAbiGuard.Require(inImag, Blueprint.Tensors[1], nameof(inImag));
+        DirectPtxAbiGuard.Require(outReal, Blueprint.Tensors[2], nameof(outReal));
+        DirectPtxAbiGuard.Require(outImag, Blueprint.Tensors[3], nameof(outImag));
 
         IntPtr inRealPointer = inReal.Pointer, inImagPointer = inImag.Pointer;
         IntPtr outRealPointer = outReal.Pointer, outImagPointer = outImag.Pointer;
@@ -154,8 +154,9 @@ internal sealed class PtxSplitComplexConjugateF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                // Measured by the offline gate at sm86: 14 registers, so the 16
-                // budget holds - but with only two to spare.
+                // Measured by the offline gate at sm86: 14 registers. The 24
+                // ceiling leaves 10 registers of headroom, matching the slack the
+                // rest of the split-complex family keeps.
                 MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
@@ -198,14 +199,4 @@ internal sealed class PtxSplitComplexConjugateF32Kernel : IDisposable
                 "Split complex conjugate block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

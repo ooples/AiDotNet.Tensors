@@ -77,8 +77,8 @@ internal sealed class PtxFftRollF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[2];
@@ -198,14 +198,4 @@ internal sealed class PtxFftRollF32Kernel : IDisposable
                 "Fft-roll block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

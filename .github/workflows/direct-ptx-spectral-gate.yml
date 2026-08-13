@@ -12,14 +12,14 @@ on:
   pull_request:
     branches: [master, main]
     paths:
+      # Any emitter under Ptx/ can change the generated PTX, and the cubin tool
+      # core decides how it is compiled and hashed. Naming individual kernels
+      # here let most of the family change without ever running this gate, so
+      # the pull_request filter now matches the push filter's breadth.
       - '.github/workflows/direct-ptx-spectral-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedComplexMultiplyF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedComplexUnaryF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxSplitComplexUnaryF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxSplitComplexBinaryF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxSplitComplexConjugateF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSpectralCubinTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
       - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
   push:
     branches: [master, main]
@@ -27,6 +27,7 @@ on:
       - '.github/workflows/direct-ptx-spectral-gate.yml'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSpectralCubinTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
   workflow_dispatch:
 
 concurrency:

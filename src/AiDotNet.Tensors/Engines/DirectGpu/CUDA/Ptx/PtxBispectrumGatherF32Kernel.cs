@@ -72,10 +72,10 @@ internal sealed class PtxBispectrumGatherF32Kernel : IDisposable
         DirectPtxTensorView specReal, DirectPtxTensorView specImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag)
     {
-        Require(specReal, Blueprint.Tensors[0], nameof(specReal));
-        Require(specImag, Blueprint.Tensors[1], nameof(specImag));
-        Require(outReal, Blueprint.Tensors[2], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[3], nameof(outImag));
+        DirectPtxAbiGuard.Require(specReal, Blueprint.Tensors[0], nameof(specReal));
+        DirectPtxAbiGuard.Require(specImag, Blueprint.Tensors[1], nameof(specImag));
+        DirectPtxAbiGuard.Require(outReal, Blueprint.Tensors[2], nameof(outReal));
+        DirectPtxAbiGuard.Require(outImag, Blueprint.Tensors[3], nameof(outImag));
 
         IntPtr specRealPointer = specReal.Pointer, specImagPointer = specImag.Pointer;
         IntPtr outRealPointer = outReal.Pointer, outImagPointer = outImag.Pointer;
@@ -239,14 +239,4 @@ internal sealed class PtxBispectrumGatherF32Kernel : IDisposable
                 "Bispectrum-gather block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

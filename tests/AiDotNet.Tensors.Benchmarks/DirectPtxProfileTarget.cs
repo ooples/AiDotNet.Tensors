@@ -826,6 +826,13 @@ internal static class DirectPtxProfileTarget
             "ncu-rglru-end", afterSuite: true);
     }
 
+    /// <summary>
+    /// Emits exactly one launch per admitted pair count, so this loop's length is
+    /// the launch count run-direct-ptx-ncu.ps1 asserts for the complex-multiply
+    /// target ('complex-multiply' { 4 } in $expectedLaunches). Adding or removing
+    /// a pair count here requires the same edit there, or the Nsight evidence
+    /// check fails with a launch-row mismatch.
+    /// </summary>
     internal static void RunComplexMultiply()
     {
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-complex-multiply-start");

@@ -33,7 +33,7 @@ internal sealed class PtxIstftNormalizeF32Kernel : IDisposable
     internal PtxIstftNormalizeF32Kernel(DirectPtxRuntime runtime, int total, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in ISTFT normalize specialization is admitted only on SM86.");
@@ -64,8 +64,8 @@ internal sealed class PtxIstftNormalizeF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView result, DirectPtxTensorView windowSum)
     {
-        Require(result, Blueprint.Tensors[0], nameof(result));
-        Require(windowSum, Blueprint.Tensors[1], nameof(windowSum));
+        DirectPtxAbiGuard.Require(result, Blueprint.Tensors[0], nameof(result));
+        DirectPtxAbiGuard.Require(windowSum, Blueprint.Tensors[1], nameof(windowSum));
 
         IntPtr resultPointer = result.Pointer, windowSumPointer = windowSum.Pointer;
         void** arguments = stackalloc void*[2];
@@ -81,13 +81,12 @@ internal sealed class PtxIstftNormalizeF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int total, int blockThreads = DefaultBlockThreads)
     {
         Validate(total);
         ValidateBlockThreads(blockThreads);
-        string tiny = Hex(1e-8f);
+        string tiny = DirectPtxPtxText.Hex(1e-8f);
 
         var ptx = new StringBuilder(1_792);
         ptx.AppendLine(".version 7.1");
@@ -181,14 +180,4 @@ internal sealed class PtxIstftNormalizeF32Kernel : IDisposable
                 "ISTFT normalize block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

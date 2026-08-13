@@ -101,8 +101,8 @@ internal sealed class PtxWinogradF23InputTransformFp16Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView transformed)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(transformed, Blueprint.Tensors[1], nameof(transformed));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(transformed, Blueprint.Tensors[1], nameof(transformed));
         IntPtr iPtr = input.Pointer, vPtr = transformed.Pointer;
         void** arguments = stackalloc void*[2];
         arguments[0] = &iPtr; arguments[1] = &vPtr;
@@ -110,15 +110,6 @@ internal sealed class PtxWinogradF23InputTransformFp16Kernel : IDisposable
         _module.Launch(_function, (uint)(total / BlockThreads), 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, int n, int c, int h, int w)
     {

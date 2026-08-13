@@ -38,7 +38,7 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
         DirectPtxRuntime runtime, int batch, int numSamples, int numGammaBands, int gammaIdx)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in PAC modulation-index specialization is admitted only on SM86.");
@@ -71,9 +71,9 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
     internal unsafe void Launch(
         DirectPtxTensorView thetaPhase, DirectPtxTensorView gammaAmp, DirectPtxTensorView output)
     {
-        Require(thetaPhase, Blueprint.Tensors[0], nameof(thetaPhase));
-        Require(gammaAmp, Blueprint.Tensors[1], nameof(gammaAmp));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        DirectPtxAbiGuard.Require(thetaPhase, Blueprint.Tensors[0], nameof(thetaPhase));
+        DirectPtxAbiGuard.Require(gammaAmp, Blueprint.Tensors[1], nameof(gammaAmp));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[2], nameof(output));
 
         IntPtr thetaPointer = thetaPhase.Pointer, gammaPointer = gammaAmp.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[3];
@@ -90,17 +90,16 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int batch, int numSamples, int numGammaBands, int gammaIdx)
     {
         Validate(batch, numSamples, numGammaBands, gammaIdx);
-        string pi = Hex((float)Math.PI);
-        string binScale = Hex((float)(NumPhaseBins / (2.0 * Math.PI)));   // (phase+pi) * 18/(2pi)
-        string ln2 = Hex((float)Math.Log(2.0));
-        string lnN = Hex((float)Math.Log(NumPhaseBins));
-        string invLnN = Hex((float)(1.0 / Math.Log(NumPhaseBins)));
-        string tiny = Hex(1e-12f);
+        string pi = DirectPtxPtxText.Hex((float)Math.PI);
+        string binScale = DirectPtxPtxText.Hex((float)(NumPhaseBins / (2.0 * Math.PI)));   // (phase+pi) * 18/(2pi)
+        string ln2 = DirectPtxPtxText.Hex((float)Math.Log(2.0));
+        string lnN = DirectPtxPtxText.Hex((float)Math.Log(NumPhaseBins));
+        string invLnN = DirectPtxPtxText.Hex((float)(1.0 / Math.Log(NumPhaseBins)));
+        string tiny = DirectPtxPtxText.Hex(1e-12f);
         int gbBase = checked(gammaIdx * batch);      // (gammaIdx*batch + b) * numSamples
         int countsByteOffset = NumPhaseBins * 4;     // countsD starts after 18 sums
 
@@ -279,14 +278,4 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
                 "0<=gammaIdx<numGammaBands, and numGammaBands*batch*numSamples<=2^27.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

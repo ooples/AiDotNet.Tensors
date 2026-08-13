@@ -36,7 +36,7 @@ internal sealed class PtxAmplitudeToDbF32Kernel : IDisposable
         DirectPtxRuntime runtime, int length, bool clipTopDb, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in amplitude-to-db specialization is admitted only on SM86.");
@@ -68,8 +68,8 @@ internal sealed class PtxAmplitudeToDbF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output, float minAmp, float topDbFloor)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer, outputPointer = output.Pointer;
         float minAmpArg = minAmp, topDbFloorArg = topDbFloor;
@@ -88,13 +88,12 @@ internal sealed class PtxAmplitudeToDbF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int length, bool clipTopDb, int blockThreads = DefaultBlockThreads)
     {
         Validate(length);
         ValidateBlockThreads(blockThreads);
-        string twentyLog10Of2 = Hex((float)(20.0 * Math.Log10(2.0)));
+        string twentyLog10Of2 = DirectPtxPtxText.Hex((float)(20.0 * Math.Log10(2.0)));
 
         var ptx = new StringBuilder(2_048);
         ptx.AppendLine(".version 7.1");
@@ -194,14 +193,4 @@ internal sealed class PtxAmplitudeToDbF32Kernel : IDisposable
                 "Amplitude-to-db block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

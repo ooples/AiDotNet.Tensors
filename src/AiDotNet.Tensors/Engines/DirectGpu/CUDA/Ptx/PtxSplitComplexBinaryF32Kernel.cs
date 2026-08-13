@@ -100,12 +100,12 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
         DirectPtxTensorView bReal, DirectPtxTensorView bImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag)
     {
-        Require(aReal, Blueprint.Tensors[0], nameof(aReal));
-        Require(aImag, Blueprint.Tensors[1], nameof(aImag));
-        Require(bReal, Blueprint.Tensors[2], nameof(bReal));
-        Require(bImag, Blueprint.Tensors[3], nameof(bImag));
-        Require(outReal, Blueprint.Tensors[4], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[5], nameof(outImag));
+        DirectPtxAbiGuard.Require(aReal, Blueprint.Tensors[0], nameof(aReal));
+        DirectPtxAbiGuard.Require(aImag, Blueprint.Tensors[1], nameof(aImag));
+        DirectPtxAbiGuard.Require(bReal, Blueprint.Tensors[2], nameof(bReal));
+        DirectPtxAbiGuard.Require(bImag, Blueprint.Tensors[3], nameof(bImag));
+        DirectPtxAbiGuard.Require(outReal, Blueprint.Tensors[4], nameof(outReal));
+        DirectPtxAbiGuard.Require(outImag, Blueprint.Tensors[5], nameof(outImag));
 
         IntPtr aRealPointer = aReal.Pointer, aImagPointer = aImag.Pointer;
         IntPtr bRealPointer = bReal.Pointer, bImagPointer = bImag.Pointer;
@@ -299,14 +299,4 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
                 "Split complex binary block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

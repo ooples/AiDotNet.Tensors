@@ -43,7 +43,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in STFT mag/phase specialization is admitted only on SM86.");
@@ -82,10 +82,10 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         DirectPtxTensorView padded, DirectPtxTensorView window,
         DirectPtxTensorView mag, DirectPtxTensorView phase)
     {
-        Require(padded, Blueprint.Tensors[0], nameof(padded));
-        Require(window, Blueprint.Tensors[1], nameof(window));
-        Require(mag, Blueprint.Tensors[2], nameof(mag));
-        Require(phase, Blueprint.Tensors[3], nameof(phase));
+        DirectPtxAbiGuard.Require(padded, Blueprint.Tensors[0], nameof(padded));
+        DirectPtxAbiGuard.Require(window, Blueprint.Tensors[1], nameof(window));
+        DirectPtxAbiGuard.Require(mag, Blueprint.Tensors[2], nameof(mag));
+        DirectPtxAbiGuard.Require(phase, Blueprint.Tensors[3], nameof(phase));
 
         IntPtr paddedPointer = padded.Pointer, windowPointer = window.Pointer;
         IntPtr magPointer = mag.Pointer, phasePointer = phase.Pointer;
@@ -105,7 +105,6 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(
         int ccMajor, int ccMinor, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs,
@@ -113,12 +112,12 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
     {
         Validate(batch, lp, nFft, hop, numFrames, numFreqs);
         ValidateBlockThreads(blockThreads);
-        string negTwoPiOverN = Hex((float)(-2.0 * Math.PI / nFft));
+        string negTwoPiOverN = DirectPtxPtxText.Hex((float)(-2.0 * Math.PI / nFft));
         int magStride = checked(numFreqs * numFrames);
         int total = checked(batch * numFreqs * numFrames);
-        string c0 = Hex(0.9998660f), c1 = Hex(-0.3302995f), c2 = Hex(0.1801410f),
-               c3 = Hex(-0.0851330f), c4 = Hex(0.0208351f);
-        string pi = Hex((float)Math.PI), halfPi = Hex((float)(Math.PI / 2.0)), tiny = Hex(1e-20f);
+        string c0 = DirectPtxPtxText.Hex(0.9998660f), c1 = DirectPtxPtxText.Hex(-0.3302995f), c2 = DirectPtxPtxText.Hex(0.1801410f),
+               c3 = DirectPtxPtxText.Hex(-0.0851330f), c4 = DirectPtxPtxText.Hex(0.0208351f);
+        string pi = DirectPtxPtxText.Hex((float)Math.PI), halfPi = DirectPtxPtxText.Hex((float)(Math.PI / 2.0)), tiny = DirectPtxPtxText.Hex(1e-20f);
         const string negOne = "0fBF800000";
 
         var ptx = new StringBuilder(5_120);
@@ -290,14 +289,4 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
                 "STFT mag/phase block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

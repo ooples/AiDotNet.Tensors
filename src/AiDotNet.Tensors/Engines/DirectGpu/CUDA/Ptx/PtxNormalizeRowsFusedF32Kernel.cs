@@ -33,7 +33,7 @@ internal sealed class PtxNormalizeRowsFusedF32Kernel : IDisposable
     internal PtxNormalizeRowsFusedF32Kernel(DirectPtxRuntime runtime, int rows, int cols)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in normalize-rows-fused specialization is admitted only on SM86.");
@@ -63,8 +63,8 @@ internal sealed class PtxNormalizeRowsFusedF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[2];
@@ -213,14 +213,4 @@ internal sealed class PtxNormalizeRowsFusedF32Kernel : IDisposable
                 "The normalize-rows-fused family requires rows>=1, cols>=1, and rows*cols<=2^26.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

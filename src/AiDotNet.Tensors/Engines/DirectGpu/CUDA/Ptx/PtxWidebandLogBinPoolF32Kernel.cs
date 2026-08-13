@@ -39,7 +39,7 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in wideband-log-bin-pool specialization is admitted only on SM86.");
@@ -74,8 +74,8 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView magBuf, DirectPtxTensorView output)
     {
-        Require(magBuf, Blueprint.Tensors[0], nameof(magBuf));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbiGuard.Require(magBuf, Blueprint.Tensors[0], nameof(magBuf));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr magPointer = magBuf.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[2];
@@ -92,7 +92,6 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(
         int ccMajor, int ccMinor, int totalSegBatch, int fftSize, int numBins, int usable, int blockThreads = DefaultBlockThreads)
@@ -100,7 +99,7 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         Validate(totalSegBatch, fftSize, numBins, usable);
         ValidateBlockThreads(blockThreads);
         int total = checked(totalSegBatch * numBins);
-        string numBinsF = Hex(numBins), usm1F = Hex(usable - 1), ln2 = Hex((float)Math.Log(2.0));
+        string numBinsF = DirectPtxPtxText.Hex(numBins), usm1F = DirectPtxPtxText.Hex(usable - 1), ln2 = DirectPtxPtxText.Hex((float)Math.Log(2.0));
 
         var ptx = new StringBuilder(3_328);
         ptx.AppendLine(".version 7.1");
@@ -241,14 +240,4 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
                 "Wideband-log-bin-pool block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

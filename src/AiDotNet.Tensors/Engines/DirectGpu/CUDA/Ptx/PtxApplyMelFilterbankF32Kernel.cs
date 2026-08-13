@@ -37,7 +37,7 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
         DirectPtxRuntime runtime, int numFrames, int numFreqs, int nMels, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in mel-filterbank specialization is admitted only on SM86.");
@@ -70,9 +70,9 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView powerSpec, DirectPtxTensorView filterbank, DirectPtxTensorView melSpec)
     {
-        Require(powerSpec, Blueprint.Tensors[0], nameof(powerSpec));
-        Require(filterbank, Blueprint.Tensors[1], nameof(filterbank));
-        Require(melSpec, Blueprint.Tensors[2], nameof(melSpec));
+        DirectPtxAbiGuard.Require(powerSpec, Blueprint.Tensors[0], nameof(powerSpec));
+        DirectPtxAbiGuard.Require(filterbank, Blueprint.Tensors[1], nameof(filterbank));
+        DirectPtxAbiGuard.Require(melSpec, Blueprint.Tensors[2], nameof(melSpec));
 
         IntPtr powerPointer = powerSpec.Pointer, filterPointer = filterbank.Pointer, melPointer = melSpec.Pointer;
         void** arguments = stackalloc void*[3];
@@ -149,9 +149,9 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
     private static DirectPtxKernelBlueprint CreateBlueprint(
         DirectPtxArchitectureFamily architecture, int numFrames, int numFreqs, int nMels, int blockThreads)
     {
-        var powerExtent = new DirectPtxExtent(numFrames * numFreqs);
-        var filterExtent = new DirectPtxExtent(nMels * numFreqs);
-        var melExtent = new DirectPtxExtent(numFrames * nMels);
+        var powerExtent = new DirectPtxExtent(checked(numFrames * numFreqs));
+        var filterExtent = new DirectPtxExtent(checked(nMels * numFreqs));
+        var melExtent = new DirectPtxExtent(checked(numFrames * nMels));
         return new DirectPtxKernelBlueprint(
             Operation: "apply-mel-filterbank-f32",
             Version: 1,
@@ -190,7 +190,13 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
     {
         if (numFrames <= 0 || numFreqs <= 0 || nMels <= 0 || numFreqs > MaxFreqs) return false;
         long cells = (long)numFrames * nMels;
-        return cells > 0 && cells % DefaultBlockThreads == 0 && cells <= MaxCells;
+        if (cells <= 0 || cells % DefaultBlockThreads != 0 || cells > MaxCells) return false;
+        // The power-spectrum and filter buffers are indexed with 32-bit
+        // arithmetic in the emitted PTX, so their extents must be bounded too.
+        long powerCells = (long)numFrames * numFreqs;
+        long filterCells = (long)nMels * numFreqs;
+        return powerCells > 0 && powerCells <= MaxCells
+            && filterCells > 0 && filterCells <= MaxCells;
     }
 
     internal static bool IsPromotedShape(int numFrames, int numFreqs, int nMels) => false;
@@ -209,14 +215,4 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
                 "Mel filterbank block threads must be 128, 256, or 512 and evenly tile (numFrames*nMels).");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

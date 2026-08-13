@@ -40,7 +40,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in build-spectrum specialization is admitted only on SM86.");
@@ -77,10 +77,10 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         DirectPtxTensorView mag, DirectPtxTensorView phase,
         DirectPtxTensorView specRe, DirectPtxTensorView specIm)
     {
-        Require(mag, Blueprint.Tensors[0], nameof(mag));
-        Require(phase, Blueprint.Tensors[1], nameof(phase));
-        Require(specRe, Blueprint.Tensors[2], nameof(specRe));
-        Require(specIm, Blueprint.Tensors[3], nameof(specIm));
+        DirectPtxAbiGuard.Require(mag, Blueprint.Tensors[0], nameof(mag));
+        DirectPtxAbiGuard.Require(phase, Blueprint.Tensors[1], nameof(phase));
+        DirectPtxAbiGuard.Require(specRe, Blueprint.Tensors[2], nameof(specRe));
+        DirectPtxAbiGuard.Require(specIm, Blueprint.Tensors[3], nameof(specIm));
 
         IntPtr magPointer = mag.Pointer, phasePointer = phase.Pointer;
         IntPtr specRePointer = specRe.Pointer, specImPointer = specIm.Pointer;
@@ -271,14 +271,4 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
                 "Build-spectrum block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

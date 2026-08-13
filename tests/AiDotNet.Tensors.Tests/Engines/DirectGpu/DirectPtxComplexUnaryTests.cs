@@ -24,10 +24,9 @@ public class DirectPtxComplexUnaryTests
         Assert.DoesNotContain("ld.global.nc.v2.f32", ptx, StringComparison.Ordinal);
         Assert.Equal(1, Count(ptx, "st.global.v4.f32"));
 
-        // Exactly one negate, applied to the imaginary lane, and the real lane
-        // is stored untouched. neg.f32 flips the sign bit, so NaN payloads and
-        // signed zeros survive as the reference's unary minus leaves them.
-        // One negate per pair, applied to each imaginary lane.
+        // One negate per pair, applied to each imaginary lane; the real lanes are
+        // stored untouched. neg.f32 flips the sign bit, so NaN payloads and signed
+        // zeros survive exactly as the reference's unary minus leaves them.
         Assert.Equal(2, Count(ptx, "neg.f32"));
         Assert.Contains("neg.f32 %f4, %f1;", ptx);
         Assert.Contains("neg.f32 %f5, %f3;", ptx);
@@ -62,8 +61,7 @@ public class DirectPtxComplexUnaryTests
         Assert.DoesNotContain("sqrt.approx", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("rsqrt", ptx, StringComparison.Ordinal);
 
-        // Pair in (8-byte stride), scalar out (4-byte stride).
-        // Two pairs in (16 bytes), two scalars out (8 bytes).
+        // Two pairs in (16-byte stride), two scalars out (8-byte stride).
         Assert.Contains("mul.wide.u32 %rd2, %r2, 16;", ptx);
         Assert.Contains("mul.wide.u32 %rd5, %r2, 8;", ptx);
         Assert.Equal(1, Count(ptx, "st.global.v2.f32"));

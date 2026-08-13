@@ -640,7 +640,9 @@ public class DirectPtxComplexMultiplyTests
         Assert.Equal(2, Count(ptx, "ld.global.nc.f32"));   // re, im
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(2, Count(ptx, "abs.f32"));
-        Assert.Equal(4, Count(ptx, "selp.f32"));            // quadrant + degenerate folding
+        // 3 quadrant folds + 2 degenerate: one picks pi vs 0 from the sign of re,
+        // the other applies it when max(|re|,|im|) is below the tiny threshold.
+        Assert.Equal(5, Count(ptx, "selp.f32"));
         // The atan2 quotient must be correctly rounded, matching the phase-precision
         // contract PtxComplexPhaseKernel establishes; fma is the intended minimax form.
         Assert.Contains("rcp.rn.f32", ptx);
@@ -1388,7 +1390,15 @@ public class DirectPtxComplexMultiplyTests
         string ptx = PtxWindowSumSquaresF32Kernel.EmitPtx(8, 6, 512, 128, 1408);   // numFrames = (1408-512)/128+1 = 8
         Assert.Contains("exact-shape nFft=512 hop=128 outLen=1408 numFrames=8 block=256 op=window-sum-squares", ptx);
         Assert.Equal(2, Count(ptx, "ld.param.u64"));
-        Assert.Contains("setp.ge.u32 %p1, %r3, 8", ptx);           // derived numFrames
+        // The loop walks only the frames whose support covers the sample:
+        // [ceil((idx-nFft+1)/hop), min(numFrames-1, idx/hop)].
+        Assert.Contains("div.u32 %r6, %r2, 128", ptx);             // idx/hop
+        Assert.Contains("mov.u32 %r9, 7", ptx);                    // numFrames-1
+        Assert.Contains("min.u32 %r6, %r6, %r9", ptx);             // last frame
+        Assert.Contains("sub.s32 %r7, %r2, 511", ptx);             // idx-nFft+1
+        Assert.Contains("div.u32 %r8, %r8, 128", ptx);             // ceil(d/hop)
+        Assert.Contains("setp.gt.u32 %p1, %r3, %r6", ptx);         // bounded exit
+        Assert.DoesNotContain("setp.ge.u32 %p1, %r3, 8", ptx);     // no full scan
         Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
         Assert.Contains("fma.rn.f32 %f0, %f1, %f1, %f0", ptx);     // sum += w*w
         Assert.Equal(1, Count(ptx, "ld.global.nc.f32"));

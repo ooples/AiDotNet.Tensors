@@ -64,9 +64,9 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView inReal, DirectPtxTensorView inImag, DirectPtxTensorView outPhase)
     {
-        Require(inReal, Blueprint.Tensors[0], nameof(inReal));
-        Require(inImag, Blueprint.Tensors[1], nameof(inImag));
-        Require(outPhase, Blueprint.Tensors[2], nameof(outPhase));
+        DirectPtxAbiGuard.Require(inReal, Blueprint.Tensors[0], nameof(inReal));
+        DirectPtxAbiGuard.Require(inImag, Blueprint.Tensors[1], nameof(inImag));
+        DirectPtxAbiGuard.Require(outPhase, Blueprint.Tensors[2], nameof(outPhase));
 
         IntPtr inRealPointer = inReal.Pointer, inImagPointer = inImag.Pointer, outPointer = outPhase.Pointer;
         void** arguments = stackalloc void*[3];
@@ -83,15 +83,14 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int count, int blockThreads = DefaultBlockThreads)
     {
         Validate(count);
         ValidateBlockThreads(count, blockThreads);
-        string c0 = Hex(0.9998660f), c1 = Hex(-0.3302995f), c2 = Hex(0.1801410f),
-               c3 = Hex(-0.0851330f), c4 = Hex(0.0208351f);
-        string pi = Hex((float)Math.PI), halfPi = Hex((float)(Math.PI / 2.0)), tiny = Hex(1e-20f);
+        string c0 = DirectPtxPtxText.Hex(0.9998660f), c1 = DirectPtxPtxText.Hex(-0.3302995f), c2 = DirectPtxPtxText.Hex(0.1801410f),
+               c3 = DirectPtxPtxText.Hex(-0.0851330f), c4 = DirectPtxPtxText.Hex(0.0208351f);
+        string pi = DirectPtxPtxText.Hex((float)Math.PI), halfPi = DirectPtxPtxText.Hex((float)(Math.PI / 2.0)), tiny = DirectPtxPtxText.Hex(1e-20f);
         const string negOne = "0fBF800000";
 
         var ptx = new StringBuilder(4_000);
@@ -147,7 +146,12 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
         ptx.AppendLine("    neg.f32 %f15, %f14;");
         ptx.AppendLine("    setp.lt.f32 %p3, %f1, 0f00000000;");  // im < 0
         ptx.AppendLine("    selp.f32 %f14, %f15, %f14, %p3;");
-        ptx.AppendLine("    selp.f32 %f14, 0f00000000, %f14, %p0;");
+        // Degenerate magnitude. atan2f(+-0, re) is pi for a negative real and 0
+        // otherwise, so the guard cannot force 0 unconditionally: it also fires
+        // for a small-but-nonzero negative real, where the reference returns pi.
+        // %p2 already holds re < 0.
+        ptx.AppendLine($"    selp.f32 %f16, {pi}, 0f00000000, %p2;");
+        ptx.AppendLine("    selp.f32 %f14, %f16, %f14, %p0;");
         ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
         ptx.AppendLine("    st.global.f32 [%rd6], %f14;");
         ptx.AppendLine("    ret;");
@@ -216,14 +220,4 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
                 "Split complex phase block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

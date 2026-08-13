@@ -33,7 +33,7 @@ internal sealed class PtxScaleInverseF32Kernel : IDisposable
     internal PtxScaleInverseF32Kernel(DirectPtxRuntime runtime, int count, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in inverse-scale specialization is admitted only on SM86.");
@@ -64,8 +64,8 @@ internal sealed class PtxScaleInverseF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView real, DirectPtxTensorView imag, float scale)
     {
-        Require(real, Blueprint.Tensors[0], nameof(real));
-        Require(imag, Blueprint.Tensors[1], nameof(imag));
+        DirectPtxAbiGuard.Require(real, Blueprint.Tensors[0], nameof(real));
+        DirectPtxAbiGuard.Require(imag, Blueprint.Tensors[1], nameof(imag));
 
         IntPtr realPointer = real.Pointer, imagPointer = imag.Pointer;
         float scaleValue = scale;
@@ -178,14 +178,4 @@ internal sealed class PtxScaleInverseF32Kernel : IDisposable
                 "Inverse-scale block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

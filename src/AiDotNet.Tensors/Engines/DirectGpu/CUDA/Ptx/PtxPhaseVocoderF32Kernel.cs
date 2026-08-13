@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <c>dp - 2*pi*round(dp/(2*pi))</c>. The wrap uses <c>cvt.rni</c> and the interpolation uses fused
 /// arithmetic, so the parity spec is TOLERANCE-based, not bit-exact. <c>leading</c>, <c>nFramesV</c>,
 /// <c>nFreqV</c>, and <c>outFrames</c> are baked; <c>rate</c> is a per-launch <c>.param .f32</c>. The launch
-/// covers exactly <c>leading * nFreqV</c> threads with no bounds guard. Four pointers plus one f32 scalar
+/// rounds the grid up over <c>leading * nFreqV</c> threads and drops the tail lanes with a single guard. Four pointers plus one f32 scalar
 /// reach the launch ABI.
 ///
 /// The specialization stays disabled by default and fails closed until three clean promotion runs clear
@@ -42,7 +42,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in phase-vocoder specialization is admitted only on SM86.");
@@ -79,10 +79,10 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         DirectPtxTensorView mag, DirectPtxTensorView phase,
         DirectPtxTensorView newMag, DirectPtxTensorView newPhase, float rate)
     {
-        Require(mag, Blueprint.Tensors[0], nameof(mag));
-        Require(phase, Blueprint.Tensors[1], nameof(phase));
-        Require(newMag, Blueprint.Tensors[2], nameof(newMag));
-        Require(newPhase, Blueprint.Tensors[3], nameof(newPhase));
+        DirectPtxAbiGuard.Require(mag, Blueprint.Tensors[0], nameof(mag));
+        DirectPtxAbiGuard.Require(phase, Blueprint.Tensors[1], nameof(phase));
+        DirectPtxAbiGuard.Require(newMag, Blueprint.Tensors[2], nameof(newMag));
+        DirectPtxAbiGuard.Require(newPhase, Blueprint.Tensors[3], nameof(newPhase));
         // rate is a per-launch scalar, so IsSupportedShape cannot relate it to
         // outFrames and nFramesV. A non-finite or non-positive rate produces a
         // negative or NaN source index, so reject it at the ABI boundary.
@@ -110,7 +110,6 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(
         int ccMajor, int ccMinor, int leading, int nFramesV, int nFreqV, int outFrames,
@@ -122,7 +121,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         int outStride = checked(outFrames * nFreqV);
         int lastFrame = nFramesV - 1;
         int total = checked(leading * nFreqV);
-        string twoPi = Hex((float)(2.0 * Math.PI)), invTwoPi = Hex((float)(1.0 / (2.0 * Math.PI)));
+        string twoPi = DirectPtxPtxText.Hex((float)(2.0 * Math.PI)), invTwoPi = DirectPtxPtxText.Hex((float)(1.0 / (2.0 * Math.PI)));
         const string one = "0f3F800000";
 
         var ptx = new StringBuilder(4_352);
@@ -261,7 +260,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
                 ["arithmetic"] = "fma lerp + cvt.rni phase wrap; tolerance-based parity, not bit-exact",
                 ["scalar"] = "rate is a per-launch .param .f32",
                 ["loop"] = "per (leading,freq) channel, over outFrames output frames",
-                ["bounds-check"] = "none - the launch covers exactly leading*nFreqV threads",
+                ["bounds-check"] = "single guard - the grid rounds up and one setp.ge.u32 drops the tail lanes",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["byte-offset"] = "zero-entire-allocation-view",
@@ -291,14 +290,4 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
                 "Phase-vocoder block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

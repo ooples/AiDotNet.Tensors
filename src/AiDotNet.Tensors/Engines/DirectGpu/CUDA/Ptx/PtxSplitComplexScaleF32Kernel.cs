@@ -67,10 +67,10 @@ internal sealed class PtxSplitComplexScaleF32Kernel : IDisposable
         DirectPtxTensorView inReal, DirectPtxTensorView inImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag, float scalar)
     {
-        Require(inReal, Blueprint.Tensors[0], nameof(inReal));
-        Require(inImag, Blueprint.Tensors[1], nameof(inImag));
-        Require(outReal, Blueprint.Tensors[2], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[3], nameof(outImag));
+        DirectPtxAbiGuard.Require(inReal, Blueprint.Tensors[0], nameof(inReal));
+        DirectPtxAbiGuard.Require(inImag, Blueprint.Tensors[1], nameof(inImag));
+        DirectPtxAbiGuard.Require(outReal, Blueprint.Tensors[2], nameof(outReal));
+        DirectPtxAbiGuard.Require(outImag, Blueprint.Tensors[3], nameof(outImag));
 
         IntPtr inRealPointer = inReal.Pointer, inImagPointer = inImag.Pointer;
         IntPtr outRealPointer = outReal.Pointer, outImagPointer = outImag.Pointer;
@@ -160,7 +160,13 @@ internal sealed class PtxSplitComplexScaleF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 16,
+                // No offline-gate measurement is recorded for this kernel yet, so
+                // the ceiling follows the split-complex family convention (24)
+                // rather than an unverified tighter number. ResourceBudget.Validate
+                // fails construction outright, so a guessed-low ceiling would take
+                // the operation off the direct-PTX path entirely. Tighten this once
+                // the SM86 gate records the real allocation.
+                MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
@@ -203,14 +209,4 @@ internal sealed class PtxSplitComplexScaleF32Kernel : IDisposable
                 "Split complex scale block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

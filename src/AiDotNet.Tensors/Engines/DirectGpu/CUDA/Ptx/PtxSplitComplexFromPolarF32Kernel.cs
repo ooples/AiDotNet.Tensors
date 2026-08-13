@@ -66,10 +66,10 @@ internal sealed class PtxSplitComplexFromPolarF32Kernel : IDisposable
         DirectPtxTensorView mag, DirectPtxTensorView phase,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag)
     {
-        Require(mag, Blueprint.Tensors[0], nameof(mag));
-        Require(phase, Blueprint.Tensors[1], nameof(phase));
-        Require(outReal, Blueprint.Tensors[2], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[3], nameof(outImag));
+        DirectPtxAbiGuard.Require(mag, Blueprint.Tensors[0], nameof(mag));
+        DirectPtxAbiGuard.Require(phase, Blueprint.Tensors[1], nameof(phase));
+        DirectPtxAbiGuard.Require(outReal, Blueprint.Tensors[2], nameof(outReal));
+        DirectPtxAbiGuard.Require(outImag, Blueprint.Tensors[3], nameof(outImag));
 
         IntPtr magPointer = mag.Pointer, phasePointer = phase.Pointer;
         IntPtr outRealPointer = outReal.Pointer, outImagPointer = outImag.Pointer;
@@ -156,10 +156,13 @@ internal sealed class PtxSplitComplexFromPolarF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                // sin/cos expansion uses 18 registers on the admitted SM86;
-                // the thread-count ceiling, rather than registers, still
-                // limits occupancy for this 256-thread launch.
-                MaxRegistersPerThread: 18,
+                // sin/cos expansion measures 18 registers on the admitted SM86.
+                // The ceiling is 24, not 18: an exact-fit budget would fail
+                // ResourceBudget.Validate - and fall back to NVRTC - on any ptxas
+                // or driver change that allocated a single extra register. The
+                // thread-count ceiling, rather than registers, still limits
+                // occupancy for this 256-thread launch.
+                MaxRegistersPerThread: 24,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
@@ -201,14 +204,4 @@ internal sealed class PtxSplitComplexFromPolarF32Kernel : IDisposable
                 "Split complex from-polar block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

@@ -31,7 +31,7 @@ internal sealed class PtxApplyWindowF32Kernel : IDisposable
     internal PtxApplyWindowF32Kernel(DirectPtxRuntime runtime, int count, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in apply-window specialization is admitted only on SM86.");
@@ -63,9 +63,9 @@ internal sealed class PtxApplyWindowF32Kernel : IDisposable
     internal unsafe void Launch(
         DirectPtxTensorView input, DirectPtxTensorView window, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(window, Blueprint.Tensors[1], nameof(window));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(window, Blueprint.Tensors[1], nameof(window));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[2], nameof(output));
 
         IntPtr inputPointer = input.Pointer, windowPointer = window.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[3];
@@ -177,14 +177,4 @@ internal sealed class PtxApplyWindowF32Kernel : IDisposable
                 "Apply-window block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

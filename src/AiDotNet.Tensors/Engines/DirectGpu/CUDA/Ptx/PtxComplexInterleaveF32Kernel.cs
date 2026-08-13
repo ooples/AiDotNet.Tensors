@@ -57,7 +57,7 @@ internal sealed class PtxComplexInterleaveF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in complex interleave specializations are admitted only on SM86.");
@@ -94,9 +94,9 @@ internal sealed class PtxComplexInterleaveF32Kernel : IDisposable
     /// </summary>
     internal unsafe void Launch(DirectPtxTensorView a, DirectPtxTensorView b, DirectPtxTensorView c)
     {
-        Require(a, Blueprint.Tensors[0], nameof(a));
-        Require(b, Blueprint.Tensors[1], nameof(b));
-        Require(c, Blueprint.Tensors[2], nameof(c));
+        DirectPtxAbiGuard.Require(a, Blueprint.Tensors[0], nameof(a));
+        DirectPtxAbiGuard.Require(b, Blueprint.Tensors[1], nameof(b));
+        DirectPtxAbiGuard.Require(c, Blueprint.Tensors[2], nameof(c));
 
         IntPtr aPointer = a.Pointer, bPointer = b.Pointer, cPointer = c.Pointer;
         void** arguments = stackalloc void*[3];
@@ -259,14 +259,4 @@ internal sealed class PtxComplexInterleaveF32Kernel : IDisposable
                 "Complex interleave block threads must be 128, 256, or 512 and evenly tile the element count.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

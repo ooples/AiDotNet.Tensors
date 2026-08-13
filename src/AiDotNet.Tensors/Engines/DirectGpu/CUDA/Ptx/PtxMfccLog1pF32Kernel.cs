@@ -31,7 +31,7 @@ internal sealed class PtxMfccLog1pF32Kernel : IDisposable
     internal PtxMfccLog1pF32Kernel(DirectPtxRuntime runtime, int count, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in MFCC log1p specialization is admitted only on SM86.");
@@ -62,8 +62,8 @@ internal sealed class PtxMfccLog1pF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[2];
@@ -79,13 +79,12 @@ internal sealed class PtxMfccLog1pF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(int ccMajor, int ccMinor, int count, int blockThreads = DefaultBlockThreads)
     {
         Validate(count);
         ValidateBlockThreads(blockThreads);
-        string ln2 = Hex((float)Math.Log(2.0));
+        string ln2 = DirectPtxPtxText.Hex((float)Math.Log(2.0));
 
         var ptx = new StringBuilder(1_792);
         ptx.AppendLine(".version 7.1");
@@ -176,14 +175,4 @@ internal sealed class PtxMfccLog1pF32Kernel : IDisposable
                 "MFCC log1p block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

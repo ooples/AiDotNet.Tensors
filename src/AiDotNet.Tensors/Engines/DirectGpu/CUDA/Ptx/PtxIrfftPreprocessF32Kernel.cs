@@ -35,7 +35,7 @@ internal sealed class PtxIrfftPreprocessF32Kernel : IDisposable
     internal PtxIrfftPreprocessF32Kernel(DirectPtxRuntime runtime, int n, int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in IRFFT preprocess specialization is admitted only on SM86.");
@@ -69,10 +69,10 @@ internal sealed class PtxIrfftPreprocessF32Kernel : IDisposable
         DirectPtxTensorView inReal, DirectPtxTensorView inImag,
         DirectPtxTensorView fullReal, DirectPtxTensorView fullImag)
     {
-        Require(inReal, Blueprint.Tensors[0], nameof(inReal));
-        Require(inImag, Blueprint.Tensors[1], nameof(inImag));
-        Require(fullReal, Blueprint.Tensors[2], nameof(fullReal));
-        Require(fullImag, Blueprint.Tensors[3], nameof(fullImag));
+        DirectPtxAbiGuard.Require(inReal, Blueprint.Tensors[0], nameof(inReal));
+        DirectPtxAbiGuard.Require(inImag, Blueprint.Tensors[1], nameof(inImag));
+        DirectPtxAbiGuard.Require(fullReal, Blueprint.Tensors[2], nameof(fullReal));
+        DirectPtxAbiGuard.Require(fullImag, Blueprint.Tensors[3], nameof(fullImag));
 
         IntPtr inRealPointer = inReal.Pointer, inImagPointer = inImag.Pointer;
         IntPtr fullRealPointer = fullReal.Pointer, fullImagPointer = fullImag.Pointer;
@@ -211,14 +211,4 @@ internal sealed class PtxIrfftPreprocessF32Kernel : IDisposable
                 "IRFFT preprocess block threads must be 128, 256, or 512 and evenly tile n.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

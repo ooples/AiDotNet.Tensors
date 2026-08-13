@@ -43,7 +43,7 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedComplexUnary(
+        if (!DirectPtxArchitecture.HasValidatedSpectral(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in audio-resample specialization is admitted only on SM86.");
@@ -79,8 +79,8 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[1], nameof(output));
 
         IntPtr inputPointer = input.Pointer, outputPointer = output.Pointer;
         void** arguments = stackalloc void*[2];
@@ -97,7 +97,6 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-    private static string Hex(float value) => "0f" + BitConverter.ToInt32(BitConverter.GetBytes(value), 0).ToString("X8");
 
     internal static string EmitPtx(
         int ccMajor, int ccMinor, int leading, int inLen, int outLen, int up, int down, int halfWidth,
@@ -107,11 +106,11 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         ValidateBlockThreads(blockThreads);
         int total = checked(leading * outLen);
         int twoHalfWidth = 2 * halfWidth;
-        string cutoff = Hex(1f / (up > down ? up : down));
-        string downF = Hex(down), upF = Hex(up);
-        string piC = Hex((float)Math.PI), twoPi = Hex((float)(2.0 * Math.PI)), inv2Pi = Hex((float)(1.0 / (2.0 * Math.PI)));
-        string piOverHalf = Hex((float)(Math.PI / halfWidth));
-        string tiny = Hex(1e-12f);
+        string cutoff = DirectPtxPtxText.Hex(1f / (up > down ? up : down));
+        string downF = DirectPtxPtxText.Hex(down), upF = DirectPtxPtxText.Hex(up);
+        string piC = DirectPtxPtxText.Hex((float)Math.PI), twoPi = DirectPtxPtxText.Hex((float)(2.0 * Math.PI)), inv2Pi = DirectPtxPtxText.Hex((float)(1.0 / (2.0 * Math.PI)));
+        string piOverHalf = DirectPtxPtxText.Hex((float)(Math.PI / halfWidth));
+        string tiny = DirectPtxPtxText.Hex(1e-12f);
         const string half = "0f3F000000", negHalf = "0fBF000000", one = "0f3F800000", zero = "0f00000000";
 
         var ptx = new StringBuilder(5_632);
@@ -262,14 +261,4 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
                 "Audio-resample block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }

@@ -76,10 +76,10 @@ internal sealed class PtxAnalyticSignalMaskF32Kernel : IDisposable
         DirectPtxTensorView specReal, DirectPtxTensorView specImag,
         DirectPtxTensorView outReal, DirectPtxTensorView outImag)
     {
-        Require(specReal, Blueprint.Tensors[0], nameof(specReal));
-        Require(specImag, Blueprint.Tensors[1], nameof(specImag));
-        Require(outReal, Blueprint.Tensors[2], nameof(outReal));
-        Require(outImag, Blueprint.Tensors[3], nameof(outImag));
+        DirectPtxAbiGuard.Require(specReal, Blueprint.Tensors[0], nameof(specReal));
+        DirectPtxAbiGuard.Require(specImag, Blueprint.Tensors[1], nameof(specImag));
+        DirectPtxAbiGuard.Require(outReal, Blueprint.Tensors[2], nameof(outReal));
+        DirectPtxAbiGuard.Require(outImag, Blueprint.Tensors[3], nameof(outImag));
 
         IntPtr specRealPointer = specReal.Pointer, specImagPointer = specImag.Pointer;
         IntPtr outRealPointer = outReal.Pointer, outImagPointer = outImag.Pointer;
@@ -204,8 +204,13 @@ internal sealed class PtxAnalyticSignalMaskF32Kernel : IDisposable
             });
     }
 
+    // fftSize must be even. The emitter treats bin halfN = fftSize >> 1 as a
+    // self-conjugate bin with gain 1, which is only true for an even transform;
+    // for an odd fftSize that bin is an ordinary positive frequency and needs
+    // gain 2, so admitting it would halve that bin's amplitude.
     internal static bool IsSupportedShape(int batch, int fftSize, int binLow, int binHigh) =>
-        batch >= 1 && fftSize >= 2 && binLow >= 0 && binHigh >= binLow && binHigh <= fftSize &&
+        batch >= 1 && fftSize >= 2 && fftSize % 2 == 0 &&
+        binLow >= 0 && binHigh >= binLow && binHigh <= fftSize &&
         (long)batch * fftSize <= (1L << 26);
 
     internal static bool IsPromotedShape(int batch, int fftSize, int binLow, int binHigh) => false;
@@ -214,8 +219,8 @@ internal sealed class PtxAnalyticSignalMaskF32Kernel : IDisposable
     {
         if (!IsSupportedShape(batch, fftSize, binLow, binHigh))
             throw new ArgumentOutOfRangeException(nameof(fftSize),
-                "The analytic-signal-mask family requires batch>=1, fftSize>=2, 0<=binLow<=binHigh<=fftSize, " +
-                "and batch*fftSize<=2^26.");
+                "The analytic-signal-mask family requires batch>=1, an even fftSize>=2, " +
+                "0<=binLow<=binHigh<=fftSize, and batch*fftSize<=2^26.");
     }
 
     private static void ValidateBlockThreads(int blockThreads)
@@ -225,14 +230,4 @@ internal sealed class PtxAnalyticSignalMaskF32Kernel : IDisposable
                 "Analytic-signal-mask block threads must be 128, 256, or 512.");
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
 }
