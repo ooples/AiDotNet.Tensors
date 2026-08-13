@@ -59,14 +59,14 @@ public partial class CpuEngine
         out int width,
         out int state)
     {
-        ArgumentNullException.ThrowIfNull(input);
-        ArgumentNullException.ThrowIfNull(transitionReal);
-        ArgumentNullException.ThrowIfNull(transitionImag);
-        ArgumentNullException.ThrowIfNull(inputMapReal);
-        ArgumentNullException.ThrowIfNull(inputMapImag);
-        ArgumentNullException.ThrowIfNull(outputMapReal);
-        ArgumentNullException.ThrowIfNull(outputMapImag);
-        ArgumentNullException.ThrowIfNull(skip);
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (transitionReal is null) throw new ArgumentNullException(nameof(transitionReal));
+        if (transitionImag is null) throw new ArgumentNullException(nameof(transitionImag));
+        if (inputMapReal is null) throw new ArgumentNullException(nameof(inputMapReal));
+        if (inputMapImag is null) throw new ArgumentNullException(nameof(inputMapImag));
+        if (outputMapReal is null) throw new ArgumentNullException(nameof(outputMapReal));
+        if (outputMapImag is null) throw new ArgumentNullException(nameof(outputMapImag));
+        if (skip is null) throw new ArgumentNullException(nameof(skip));
 
         if (input.Rank != 4)
             throw new ArgumentException(
@@ -95,12 +95,12 @@ public partial class CpuEngine
     {
         if (tensor.Rank != expected.Length)
             throw new ArgumentException(
-                $"{paramName} must have shape [{string.Join(',', expected)}]; got rank {tensor.Rank}.", paramName);
+                $"{paramName} must have shape [{string.Join(",", expected)}]; got rank {tensor.Rank}.", paramName);
         for (int i = 0; i < expected.Length; i++)
         {
             if (tensor.Shape[i] != expected[i])
                 throw new ArgumentException(
-                    $"{paramName} must have shape [{string.Join(',', expected)}]; " +
+                    $"{paramName} must have shape [{string.Join(",", expected)}]; " +
                     $"dimension {i} was {tensor.Shape[i]}.", paramName);
         }
     }
