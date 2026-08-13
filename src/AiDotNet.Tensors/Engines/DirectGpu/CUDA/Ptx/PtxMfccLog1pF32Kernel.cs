@@ -8,7 +8,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// MFCC log compression for issue #850, matching the NVRTC <c>mfcc_log1p</c> kernel:
 /// <c>output[i] = log1p(input[i]) = ln(1 + input[i])</c>. One thread owns one element. PTX has no natural
 /// log primitive, so the value is <c>lg2.approx(1 + x) * ln(2)</c>; the specialization is therefore covered
-/// by a TOLERANCE-based parity spec, not bit-exact. The element <c>count</c> is baked; the launch rounds up
+/// by a TOLERANCE-based parity spec, not bit-exact. That tolerance must be stated in ABSOLUTE terms:
+/// for small <c>x</c> the reference <c>log1p</c> is accurate to ~x while <c>1 + x</c> rounds away most of
+/// the significant digits, so the relative error is unbounded as <c>x</c> approaches zero even though the
+/// absolute error stays tiny. The element <c>count</c> is baked; the launch rounds up
 /// and a single guard drops the tail lanes. Two pointers reach the launch ABI.
 ///
 /// The specialization stays disabled by default and fails closed until three clean promotion runs clear
@@ -148,7 +151,7 @@ internal sealed class PtxMfccLog1pF32Kernel : IDisposable
             {
                 ["formula"] = "output[i] = log1p(input[i]) = ln(1 + input[i])",
                 ["mode"] = "inference-forward-mfcc-log1p",
-                ["arithmetic"] = "lg2.approx(1+x) scaled by ln(2); tolerance-based parity, not bit-exact",
+                ["arithmetic"] = "lg2.approx(1+x) scaled by ln(2); tolerance-based parity, not bit-exact - the tolerance is ABSOLUTE because relative error is unbounded as x approaches zero",
                 ["bounds-check"] = "single guard drops lanes past the element count",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",

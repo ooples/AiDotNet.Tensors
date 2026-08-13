@@ -285,7 +285,8 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxMfccLog1pF32Kernel", PtxParityStatus.Deferred,
             "MFCC log1p compression, fp32 (#850) - CudaBackend.MfccLog1p",
             "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
-            "ln(2). Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
+            "ln(2). Its spec is TOLERANCE-based, not bit-exact, and the tolerance is ABSOLUTE: relative error is " +
+            "unbounded as x approaches zero. Converts to ThreeWayParity (with tolerance) " +
             "when the SM86 run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxNormalizeRowsFusedF32Kernel", PtxParityStatus.Deferred,
             "fused per-row L2 normalization, fp32 (#850) - CudaBackend.NormalizeRowsFused",
@@ -350,8 +351,9 @@ public static class PtxParityRegistry
             "fft sample-frequency generation, fp32 (#850) - Fft.FftFreq / Fft.RFftFreq",
             "one module per (n, op); Full writes the n signed DFT bins [0..split-1, split-n..-1]*scale and " +
             "Real writes the n/2+1 non-negative bins [0..n/2]*scale, with scale=1/(d*n) a per-launch .param " +
-            ".f32. Each output is an integer index cast to fp32 and scaled, so the spec is bit-exact against " +
-            "the reference bins. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted."),
+            ".f32. Each output is an integer index cast to fp32 and scaled, while Fft.FftFreq/RFftFreq accumulate " +
+            "the bin in double, so the spec is TOLERANCE-based rather than bit-exact. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
         new PtxParitySpec("PtxMelFilterbankApplyF32Kernel", PtxParityStatus.Deferred,
             "segmented mel filterbank application, fp32 (#850) - CudaBackend.MelFilterbankApply",
             "one module per (totalSegBatch,specBins,melBins); each thread owns one (seg,mel) output and reduces " +

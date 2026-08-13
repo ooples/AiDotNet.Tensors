@@ -20,8 +20,10 @@ internal enum DirectPtxFftFreqOp
 /// sample frequencies <c>[0,1,…,(n+1)/2-1, (n+1)/2-n,…,-1] * scale</c>; for
 /// <see cref="DirectPtxFftFreqOp.Real"/> it writes the <c>n/2 + 1</c> non-negative frequencies
 /// <c>[0,1,…,n/2] * scale</c>. <c>scale = 1/(d*n)</c> is a per-launch <c>.param .f32</c>. Each output is one
-/// integer index cast to fp32 and scaled, so the specialization is bit-exact against the reference sample
-/// frequencies (the scale itself is computed once on the host). <c>n</c> and the op are baked; the launch
+/// integer index cast to fp32 and scaled. The reference computes each bin in <c>double</c> and converts
+/// once at the end, so this specialization is covered by a TOLERANCE-based parity spec, not bit-exact:
+/// the fp32 index conversion and fp32 scale multiply diverge from the double-precision reference below
+/// 2^24, and integer index rounding diverges above it. <c>n</c> and the op are baked; the launch
 /// rounds up and a single guard drops the tail lanes. One pointer plus one f32 scalar reach the launch ABI.
 ///
 /// The specialization stays disabled by default and fails closed until three clean promotion runs clear
@@ -176,7 +178,7 @@ internal sealed class PtxFftFreqF32Kernel : IDisposable
                     ? "output[i] = ((i < (n+1)/2) ? i : i - n) * scale"
                     : "output[i] = i * scale for i in [0, n/2]",
                 ["mode"] = "inference-forward-fft-freq",
-                ["arithmetic"] = "integer index cast to fp32 and scaled; bit-exact against the reference bins",
+                ["arithmetic"] = "integer index cast to fp32 and scaled; tolerance-based parity, not bit-exact - the reference accumulates the bin in double",
                 ["scalar"] = "scale = 1/(d*n) is a per-launch .param .f32 (computed once on the host)",
                 ["bounds-check"] = "single guard drops lanes past the output length",
                 ["global-intermediates"] = "none",
