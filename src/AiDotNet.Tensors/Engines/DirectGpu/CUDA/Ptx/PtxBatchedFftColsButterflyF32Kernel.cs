@@ -65,7 +65,7 @@ internal sealed class PtxBatchedFftColsButterflyF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }

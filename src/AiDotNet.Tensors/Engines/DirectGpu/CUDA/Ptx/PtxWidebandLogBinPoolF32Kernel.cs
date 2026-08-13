@@ -67,7 +67,7 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }

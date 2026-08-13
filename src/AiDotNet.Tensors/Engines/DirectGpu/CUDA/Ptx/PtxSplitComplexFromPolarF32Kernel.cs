@@ -57,7 +57,7 @@ internal sealed class PtxSplitComplexFromPolarF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }

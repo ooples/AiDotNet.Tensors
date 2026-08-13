@@ -90,7 +90,7 @@ internal sealed class PtxSplitComplexBinaryF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }

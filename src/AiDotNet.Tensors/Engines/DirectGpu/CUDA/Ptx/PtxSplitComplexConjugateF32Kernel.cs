@@ -57,7 +57,7 @@ internal sealed class PtxSplitComplexConjugateF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }

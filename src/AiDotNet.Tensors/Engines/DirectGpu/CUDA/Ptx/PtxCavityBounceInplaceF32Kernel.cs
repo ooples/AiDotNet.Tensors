@@ -57,7 +57,7 @@ internal sealed class PtxCavityBounceInplaceF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }

@@ -67,7 +67,7 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
         }
         catch
         {
-            _module.Dispose();
+            DirectPtxResourceInitialization.DisposeWithoutMaskingFailure(_module);
             throw;
         }
     }
