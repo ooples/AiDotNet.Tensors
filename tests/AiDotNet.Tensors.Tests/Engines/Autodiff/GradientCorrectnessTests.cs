@@ -1479,6 +1479,18 @@ public class GradientCorrectnessTests : IDisposable
     }
 
     [Fact]
+    public void ConstantPad_AsymmetricRank3Gradient_MatchesNumerical()
+    {
+        // Padding is listed last-axis first. Different before/after values on each axis
+        // prevent an axis-order reversal in the backward from hiding behind symmetry.
+        var x = MakeFilled([2, 2, 3], start: 0.25f, step: 0.125f);
+        VerifyGradient(
+            inp => _engine.TensorConstantPad(inp, new[] { 1, 2, 2, 0, 0, 1 }, 0f),
+            x,
+            "ConstantPad_AsymmetricRank3");
+    }
+
+    [Fact]
     public void IndexSelect_Gradient_MatchesNumerical()
     {
         // 2D tensor, select rows 0 and 2 along axis 0
