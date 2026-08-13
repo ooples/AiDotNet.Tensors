@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'vision-box-iou', 'rglru', 'convolution')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -14,6 +14,17 @@ $ncuSource = if ($NcuPath) {
 } else {
     (Get-Command ncu -ErrorAction Stop).Source
 }
+# NVIDIA's Windows installation puts ncu.bat on PATH. Passing a kernel regex
+# containing alternation through that wrapper lets cmd.exe interpret `|` as a
+# pipeline before ncu sees the argument. Resolve the wrapper to the native CLI
+# so PowerShell's argument boundaries are preserved for every profiler target.
+if ([System.IO.Path]::GetExtension($ncuSource) -in @('.bat', '.cmd')) {
+    $nativeNcu = Join-Path (Split-Path -Parent $ncuSource) 'target\windows-desktop-win7-x64\ncu.exe'
+    if (-not (Test-Path -LiteralPath $nativeNcu -PathType Leaf)) {
+        throw "Nsight Compute resolved to wrapper '$ncuSource', but its native CLI was not found at '$nativeNcu'. Pass -NcuPath explicitly."
+    }
+    $ncuSource = (Resolve-Path -LiteralPath $nativeNcu).Path
+}
 $targetDll = Join-Path $PSScriptRoot '..\bin\Release\net10.0\AiDotNet.Tensors.Benchmarks.dll'
 if (-not (Test-Path -LiteralPath $targetDll -PathType Leaf)) {
     throw "Benchmark target is missing. Build AiDotNet.Tensors.Benchmarks in Release/net10.0 first."
@@ -27,6 +38,9 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'solvers-4x4' { '--direct-ptx-profile-solvers-4x4' }
+    'rng-dropout' { '--direct-ptx-profile-rng-dropout' }
+    'rng-stochastic' { '--direct-ptx-profile-rng-stochastic' }
     'vision-box-iou' { '--direct-ptx-profile-vision-box-iou' }
     'rglru' { '--direct-ptx-profile-rglru' }
     'convolution' { '--direct-ptx-profile-convolution' }
@@ -36,8 +50,11 @@ $kernel = switch ($Target) {
     'residual-rmsnorm' { 'regex:aidotnet_fused_residual_rmsnorm_d64' }
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
+    'solvers-4x4' { 'regex:aidotnet_register_(cholesky|lu_factor|qr_reduced|eigh_(upper|lower)|svd_reduced|lu_solve_vector|ldl_factor_lower|ldl_solve_lower_vector|solve_vector|triangular_solve_(lower|upper)_vector|cholesky_backward_lower|solve_backward_vector)_4x4_f32' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
+    'rng-dropout' { 'regex:aidotnet_philox_dropout_f32' }
+    'rng-stochastic' { 'regex:aidotnet_(philox_dropout|philox_uniform|philox_normal|philox_bernoulli_mask|philox_drop_threshold_mask|dropout_backward|philox_gumbel_softmax32|philox_importance_sampling64|bias_philox_dropout256|fused_ddim_step|philox_categorical32|gumbel_softmax_backward32|philox_rrelu|rrelu|rrelu_backward)_f32' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'vision-box-iou' { 'regex:aidotnet_(fused_pairwise_box_iou_f32|vision_.*)' }
     'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
@@ -45,10 +62,13 @@ $kernel = switch ($Target) {
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
+    'solvers-4x4' { 56 }
     'residual-rmsnorm' { 4 }
     'decode' { 2 }
     'paged-prefill' { 1 }
     'attention-backward' { 3 }
+    'rng-dropout' { 3 }
+    'rng-stochastic' { 45 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'vision-box-iou' { 31 }

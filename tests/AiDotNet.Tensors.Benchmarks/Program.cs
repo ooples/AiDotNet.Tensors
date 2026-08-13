@@ -146,6 +146,28 @@ class Program
             DirectPtxVisionFamilyExperiment.Run(runs, operation);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-rng-dropout")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxRngDropoutExperiment.Run(runs, includeExternal);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-rng-stochastic")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            int familyIndex = Array.IndexOf(args, "--family");
+            string? family = familyIndex >= 0 && familyIndex + 1 < args.Length
+                ? args[familyIndex + 1]
+                : null;
+            int operationIndex = Array.IndexOf(args, "--operation");
+            string? operation = operationIndex >= 0 && operationIndex + 1 < args.Length
+                ? args[operationIndex + 1]
+                : null;
+            DirectPtxRngStochasticExperiment.Run(runs, includeExternal, family, operation);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -417,6 +439,16 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-vision-box-iou")
         {
             DirectPtxProfileTarget.RunVisionBoxIou();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-dropout")
+        {
+            DirectPtxProfileTarget.RunRngDropout();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-stochastic")
+        {
+            DirectPtxProfileTarget.RunRngStochastic();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")

@@ -1,0 +1,812 @@
+using System.Diagnostics;
+using System.Text.Json;
+using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Engines.Gpu;
+
+namespace AiDotNet.Tensors.Benchmarks;
+
+/// <summary>Issue #853 resident NVIDIA solver-family evidence generator.</summary>
+internal static class DirectPtxSolver4x4Experiment
+{
+    private const int Warmups = 30;
+    private const int Samples = 101;
+    // WDDM desktop scheduling can preempt a short GPU interval by milliseconds. Start with a
+    // substantial captured batch, then calibrate every method to the same minimum device-time
+    // window. That amortizes fixed preemption without reducing the 101 independent samples or
+    // hiding host submission inside the event interval. The cap bounds graph size on very fast
+    // kernels while preserving at least the original 1,000 launches.
+    private const int BaseDeviceLaunchesPerSample = 1000;
+    private const int DeviceCalibrationSamples = 5;
+    private const double MinimumDeviceSampleMilliseconds = 32.0;
+    private const int MaximumDeviceLaunchesPerSample = 32_000;
+    private const int CalibratedGraphWarmups = 5;
+    private const double MaximumAllowedError = 2e-5;
+    private static readonly int[] Batches = [1024, 4096, 16384, 65536];
+    private static readonly string[] Operations =
+        [
+            "cholesky", "lu-factor", "qr", "eigh", "eigh-lower", "svd", "lu-solve",
+            "ldl-factor", "ldl-solve", "solve", "tri-lower", "tri-upper",
+            "chol-backward", "solve-backward"
+        ];
+
+    private readonly record struct Distribution(double Mean, double Median, double P95, double P99);
+    private readonly record struct DeviceMeasurement(
+        Distribution Distribution, int LaunchesPerSample);
+    private readonly record struct Result(
+        int Run, string Operation, int Batch, string Method,
+        Distribution Device, int DeviceLaunchesPerSample, Distribution EndToEnd,
+        double Gflops, double GbPerSecond,
+        long ManagedBytes, long TemporaryDeviceBytes, double MaximumError,
+        int BlockThreads, int Registers, int SharedBytes, int LocalBytes, int MaxThreadsPerBlock,
+        int ActiveBlocksPerSm, int PtxVersion, int BinaryVersion,
+        string DeviceFingerprint, string PtxSha256, string JitInfoLog,
+        string DotNetRuntime, string OperatingSystem);
+
+    internal static void Run(
+        int independentRuns = 3,
+        bool componentOnly = false,
+        string? operationFilter = null,
+        int? batchFilter = null)
+    {
+        if (independentRuns <= 0) throw new ArgumentOutOfRangeException(nameof(independentRuns));
+        string[] operations = operationFilter is null
+            ? Operations
+            : Operations.Contains(operationFilter, StringComparer.Ordinal)
+                ? [operationFilter]
+                : throw new ArgumentException(
+                    $"Unknown solver operation '{operationFilter}'.", nameof(operationFilter));
+        int[] batches = batchFilter is null
+            ? Batches
+            : Batches.Contains(batchFilter.Value)
+                ? [batchFilter.Value]
+                : throw new ArgumentOutOfRangeException(
+                    nameof(batchFilter), batchFilter, "Unsupported solver batch size.");
+        Console.WriteLine(
+            $"Direct PTX solver family: {independentRuns} clean run(s), {Warmups} warmups + " +
+            $"{Samples} samples, {BaseDeviceLaunchesPerSample}+ calibrated launches/device sample " +
+            $"(target >= {MinimumDeviceSampleMilliseconds:F0} ms, cap {MaximumDeviceLaunchesPerSample}); " +
+            "resident device timing uses captured launch batches while end-to-end timing remains uncaptured.");
+        var results = new List<Result>();
+        for (int run = 1; run <= independentRuns; run++)
+        {
+            using var backend = new CudaBackend();
+            foreach (string operation in operations)
+            foreach (int batch in batches)
+                RunCell(backend, run, operation, batch, results);
+        }
+        Print(results);
+        if (componentOnly)
+        {
+            Console.WriteLine(
+                "COMPONENT PASS: AiDotNet correctness, routing, allocation, timing, and resource evidence is complete; external competitors and Nsight are joined by the release orchestrator.");
+            return;
+        }
+        Console.WriteLine(
+            "HOLD: PyTorch eager/graph and Nsight JSON/CSV must be joined before the release gate can pass.");
+        Environment.ExitCode = 2;
+    }
+
+    private static void RunCell(
+        CudaBackend backend,
+        int run,
+        string operation,
+        int batch,
+        List<Result> results)
+    {
+        float[] matrixHost = Matrices(batch, MatrixFor(operation));
+        float[] vectorHost = Enumerable.Range(0, batch).SelectMany(_ => new[] { 1f, 2f, 3f, 4f }).ToArray();
+        float[] gradVectorHost = Enumerable.Range(0, batch).SelectMany(_ => new[] { .5f, 1f, 1.5f, 2f }).ToArray();
+        float[] pivotBits = new float[batch * 4];
+        int[] identityPivots = Enumerable.Range(0, batch).SelectMany(_ => new[] { 0, 1, 2, 3 }).ToArray();
+        Buffer.BlockCopy(identityPivots, 0, pivotBits, 0, identityPivots.Length * sizeof(int));
+        using var input = backend.AllocateBuffer(matrixHost);
+        using var matrix1 = backend.AllocateBuffer(new float[matrixHost.Length]);
+        using var matrix2 = backend.AllocateBuffer(new float[matrixHost.Length]);
+        using var vector = backend.AllocateBuffer(new float[vectorHost.Length]);
+        using var rhs = backend.AllocateBuffer(vectorHost);
+        using var pivots = backend.AllocateBuffer(pivotBits);
+        using var info = backend.AllocateBuffer(new float[batch]);
+        using var gradMatrix = backend.AllocateBuffer(Matrices(batch, Identity));
+        using var gradVector = backend.AllocateBuffer(gradVectorHost);
+
+        Action direct = operation switch
+        {
+            "cholesky" => () => backend.LinalgCholesky(input, matrix1, info, batch, 4, false),
+            "lu-factor" => () => backend.LinalgLuFactor(input, matrix1, pivots, batch, 4, 4),
+            "qr" => () => backend.LinalgQrReduced(input, matrix1, matrix2, batch, 4, 4),
+            "eigh" => () => backend.LinalgEigh(input, vector, matrix2, batch, 4),
+            "eigh-lower" => () => ((IExtendedLinalgBackend)backend).LinalgEighSymmetric(
+                input, vector, matrix2, batch, 4, upper: false),
+            "svd" => () => ((IExtendedLinalgBackend)backend).LinalgSvdReduced(
+                input, matrix1, vector, matrix2, batch, 4, 4),
+            "lu-solve" => () => ((IExtendedLinalgBackend)backend).LinalgLuSolve(
+                input, pivots, rhs, vector, batch, 4, 1, true),
+            "ldl-factor" => () => ((IExtendedLinalgBackend)backend).LinalgLdlFactor(
+                input, matrix1, pivots, batch, 4, upper: false),
+            "ldl-solve" => () => ((IExtendedLinalgBackend)backend).LinalgLdlSolve(
+                input, pivots, rhs, vector, batch, 4, upper: false, rhsIsVector: true),
+            "solve" => () => ((IExtendedLinalgBackend)backend).LinalgSolveVector(
+                input, rhs, vector, info, batch, 4),
+            "tri-lower" => () => ((IExtendedLinalgBackend)backend).LinalgTriangularSolveVector(
+                input, rhs, vector, batch, 4, upper: false, unitDiagonal: false),
+            "tri-upper" => () => ((IExtendedLinalgBackend)backend).LinalgTriangularSolveVector(
+                input, rhs, vector, batch, 4, upper: true, unitDiagonal: false),
+            "chol-backward" => () => ((IExtendedLinalgBackend)backend).LinalgCholeskyBackwardLower(
+                input, gradMatrix, matrix1, batch, 4),
+            _ => () => ((IExtendedLinalgBackend)backend).LinalgSolveBackwardVector(
+                input, rhs, gradVector, matrix1, vector, batch, 4)
+        };
+        Action? current = operation switch
+        {
+            "cholesky" => () => backend.LinalgCholesky(input, matrix1, info, batch, 4, false),
+            "lu-factor" => () => backend.LinalgLuFactor(input, matrix1, pivots, batch, 4, 4),
+            "qr" => () => backend.LinalgQrReduced(input, matrix1, matrix2, batch, 4, 4),
+            "eigh" => () => backend.LinalgEigh(input, vector, matrix2, batch, 4),
+            _ => null
+        };
+
+        Enable(operation, true);
+        // First uncaptured call performs the bounded cold-path tune when enabled.
+        long dispatchBefore = DispatchCount(backend, operation);
+        direct();
+        long dispatchAfter = DispatchCount(backend, operation);
+        if (dispatchAfter != dispatchBefore + 1 || backend.DirectPtxLastError is not null)
+            throw new InvalidOperationException(
+                $"Direct PTX routing was not exclusive for {operation}/B={batch}: " +
+                $"expected one dispatch, observed {dispatchAfter - dispatchBefore}; " +
+                $"last error={backend.DirectPtxLastError ?? "none"}.");
+        Prewarm(backend, operation, batch);
+        direct(); backend.Synchronize();
+        double error = Error(backend, operation, batch, matrixHost, vectorHost,
+            matrix1, matrix2, vector, pivots, info);
+        if (!double.IsFinite(error) || error > MaximumAllowedError)
+            throw new InvalidOperationException(
+                $"Direct PTX correctness gate failed for {operation}/B={batch}: " +
+                $"maximum error {error:G9} exceeds {MaximumAllowedError:G9}.");
+        DirectPtxKernelAudit audit = Audit(backend, operation, batch);
+        long directBytes = MeasureAllocation(backend, direct);
+        Enable(operation, true);
+        IntPtr graph = backend.CaptureGraph(direct);
+        if (graph == IntPtr.Zero) throw new InvalidOperationException($"Capture failed for {operation}/B={batch}.");
+        try
+        {
+            Action graphLaunch = () => backend.EnqueueCapturedGraph(graph);
+            long graphBytes = MeasureAllocation(backend, graphLaunch);
+
+            long currentBytes = 0;
+            double currentError = 0;
+            if (current is not null)
+            {
+                Enable(operation, false);
+                long establishedBefore = DispatchCount(backend, operation);
+                current(); backend.Synchronize();
+                if (DispatchCount(backend, operation) != establishedBefore)
+                    throw new InvalidOperationException(
+                        $"Established baseline unexpectedly routed through direct PTX for {operation}/B={batch}.");
+                currentBytes = MeasureAllocation(backend, current);
+                currentError = Error(backend, operation, batch, matrixHost, vectorHost,
+                    matrix1, matrix2, vector, pivots, info);
+            }
+
+            Dictionary<string, DeviceMeasurement> device = current is null
+                ? MeasureResidentDeviceInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct))
+                : MeasureResidentDeviceInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct),
+                    ("current", () => Enable(operation, false), current));
+            DeviceMeasurement directDevice = device["direct"];
+            // Graph capture changes submission, not the kernel body. Reuse the isolated kernel
+            // distribution so the graph row does not relabel host graph submissions as device
+            // work; graph submission remains fully represented by the graph E2E distribution.
+            DeviceMeasurement graphDevice = directDevice;
+
+            Dictionary<string, Distribution> endToEnd = current is null
+                ? MeasureEndToEndInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct),
+                    ("graph", static () => { }, graphLaunch))
+                : MeasureEndToEndInterleaved(backend,
+                    ("direct", () => Enable(operation, true), direct),
+                    ("graph", static () => { }, graphLaunch),
+                    ("current", () => Enable(operation, false), current));
+
+            results.Add(Create(run, operation, batch, "Direct PTX CUDA graph", graphDevice,
+                endToEnd["graph"], graphBytes, 0, error, audit, audit.DeviceFingerprint));
+            results.Add(Create(run, operation, batch, "Direct PTX resident", directDevice,
+                endToEnd["direct"], directBytes, 0, error, audit, audit.DeviceFingerprint));
+            if (current is not null)
+                results.Add(Create(run, operation, batch, "AiDotNet CUDA established", device["current"],
+                    endToEnd["current"], currentBytes, 0, currentError, null,
+                    audit.DeviceFingerprint));
+        }
+        finally
+        {
+            backend.DestroyCapturedGraph(graph);
+            Enable(operation, null);
+        }
+    }
+
+    private static long DispatchCount(CudaBackend backend, string operation) =>
+        operation == "cholesky"
+            ? backend.DirectPtxCholesky4x4DispatchCount
+            : backend.DirectPtxSolver4x4DispatchCount;
+
+    private static Result Create(
+        int run, string operation, int batch, string method,
+        DeviceMeasurement device, Distribution e2e, long managedBytes, long tempBytes,
+        double error, DirectPtxKernelAudit? audit, string deviceFingerprint)
+    {
+        double flops = EstimatedFlops(operation, batch);
+        double seconds = device.Distribution.Median * 1e-6;
+        double bytes = BytesMoved(operation, batch);
+        return new Result(run, operation, batch, method,
+            device.Distribution, device.LaunchesPerSample, e2e,
+            flops / seconds / 1e9, bytes / seconds / 1e9,
+            managedBytes, tempBytes, error,
+            audit?.BlockThreads ?? -1,
+            audit?.Function.RegistersPerThread ?? -1,
+            audit?.Function.StaticSharedBytes ?? -1,
+            audit?.Function.LocalBytesPerThread ?? -1,
+            audit?.Function.MaxThreadsPerBlock ?? -1,
+            audit?.ActiveBlocksPerMultiprocessor ?? -1,
+            audit?.Function.PtxVersion ?? -1,
+            audit?.Function.BinaryVersion ?? -1,
+            deviceFingerprint, audit?.PtxSha256 ?? "-", audit?.JitInfoLog ?? "-",
+            Environment.Version.ToString(), Environment.OSVersion.ToString());
+    }
+
+    /// <summary>
+    /// Measures resident kernels in one rotating event queue. Capturing each measurement batch
+    /// prevents an idle WDDM stream from recording host submission latency between the start
+    /// event and the kernel; interleaving prevents a scheduler, clock, or desktop-GPU change
+    /// between disjoint windows from deciding the P95 comparison. Uncaptured submission is
+    /// measured separately by <see cref="MeasureEndToEndInterleaved"/>.
+    /// </summary>
+    private static Dictionary<string, DeviceMeasurement> MeasureResidentDeviceInterleaved(
+        CudaBackend backend,
+        params (string Name, Action Prepare, Action Execute)[] methods)
+    {
+        if (methods.Length == 0) throw new ArgumentException("At least one method is required.", nameof(methods));
+        if (methods.Select(method => method.Name).Distinct(StringComparer.Ordinal).Count() != methods.Length)
+            throw new ArgumentException("Method names must be unique.", nameof(methods));
+        for (int warmup = 0; warmup < Warmups; warmup++)
+        {
+            for (int offset = 0; offset < methods.Length; offset++)
+            {
+                var method = methods[(warmup + offset) % methods.Length];
+                method.Prepare();
+                method.Execute();
+            }
+        }
+        backend.Synchronize();
+        var graphs = new IntPtr[methods.Length];
+        var starts = new IGpuEvent[methods.Length];
+        var stops = new IGpuEvent[methods.Length];
+        var launchesPerSample = new int[methods.Length];
+        var calibrationValues = new double[methods.Length][];
+        var values = new double[methods.Length][];
+        IntPtr CaptureMeasurementGraph(int methodIndex, int launches)
+        {
+            var method = methods[methodIndex];
+            method.Prepare();
+            IntPtr graph = backend.CaptureGraph(() =>
+            {
+                ((CudaEvent)starts[methodIndex]).RecordExternalDuringCapture(backend.DefaultStream);
+                for (int launch = 0; launch < launches; launch++) method.Execute();
+                ((CudaEvent)stops[methodIndex]).RecordExternalDuringCapture(backend.DefaultStream);
+            });
+            if (graph == IntPtr.Zero)
+                throw new InvalidOperationException(
+                    $"Resident device-timing graph capture failed for '{method.Name}'.");
+            return graph;
+        }
+
+        try
+        {
+            for (int i = 0; i < methods.Length; i++)
+            {
+                starts[i] = backend.CreateEvent(true);
+                stops[i] = backend.CreateEvent(true);
+                launchesPerSample[i] = BaseDeviceLaunchesPerSample;
+                calibrationValues[i] = new double[DeviceCalibrationSamples];
+                values[i] = new double[Samples];
+                graphs[i] = CaptureMeasurementGraph(i, BaseDeviceLaunchesPerSample);
+            }
+            for (int warmup = 0; warmup < Warmups; warmup++)
+                for (int offset = 0; offset < methods.Length; offset++)
+                    backend.EnqueueCapturedGraph(graphs[(warmup + offset) % methods.Length]);
+            backend.Synchronize();
+
+            for (int sample = 0; sample < DeviceCalibrationSamples; sample++)
+            {
+                for (int offset = 0; offset < methods.Length; offset++)
+                    backend.EnqueueCapturedGraph(graphs[(sample + offset) % methods.Length]);
+                backend.Synchronize();
+                for (int method = 0; method < methods.Length; method++)
+                    calibrationValues[method][sample] = backend.GetEventElapsedTime(
+                        starts[method], stops[method]);
+            }
+
+            for (int method = 0; method < methods.Length; method++)
+            {
+                double baseBatchMilliseconds = Summarize(calibrationValues[method]).Median;
+                int calibratedLaunches = CalibrateDeviceLaunches(baseBatchMilliseconds);
+                launchesPerSample[method] = calibratedLaunches;
+                if (calibratedLaunches == BaseDeviceLaunchesPerSample) continue;
+
+                backend.DestroyCapturedGraph(graphs[method]);
+                graphs[method] = IntPtr.Zero;
+                graphs[method] = CaptureMeasurementGraph(method, calibratedLaunches);
+            }
+            for (int warmup = 0; warmup < CalibratedGraphWarmups; warmup++)
+                for (int offset = 0; offset < methods.Length; offset++)
+                    backend.EnqueueCapturedGraph(graphs[(warmup + offset) % methods.Length]);
+            backend.Synchronize();
+
+            for (int sample = 0; sample < Samples; sample++)
+            {
+                for (int offset = 0; offset < methods.Length; offset++)
+                {
+                    int method = (sample + offset) % methods.Length;
+                    backend.EnqueueCapturedGraph(graphs[method]);
+                }
+                // The event records live inside each graph. Host scheduling around graph launch
+                // and synchronization is therefore excluded from the device interval.
+                backend.Synchronize();
+                for (int method = 0; method < methods.Length; method++)
+                    values[method][sample] = backend.GetEventElapsedTime(
+                        starts[method], stops[method]) * 1000.0 / launchesPerSample[method];
+            }
+            var result = new Dictionary<string, DeviceMeasurement>(methods.Length, StringComparer.Ordinal);
+            for (int method = 0; method < methods.Length; method++)
+                result.Add(methods[method].Name,
+                    new DeviceMeasurement(Summarize(values[method]), launchesPerSample[method]));
+            return result;
+        }
+        finally
+        {
+            foreach (IntPtr graph in graphs) backend.DestroyCapturedGraph(graph);
+            foreach (IGpuEvent? start in starts) start?.Dispose();
+            foreach (IGpuEvent? stop in stops) stop?.Dispose();
+        }
+    }
+
+    private static int CalibrateDeviceLaunches(double baseBatchMilliseconds)
+    {
+        if (!double.IsFinite(baseBatchMilliseconds) || baseBatchMilliseconds <= 0.0)
+            throw new InvalidOperationException(
+                $"Device timing calibration produced invalid elapsed time {baseBatchMilliseconds:G9} ms.");
+        double multiplier = Math.Ceiling(MinimumDeviceSampleMilliseconds / baseBatchMilliseconds);
+        if (multiplier <= 1.0) return BaseDeviceLaunchesPerSample;
+        double desired = BaseDeviceLaunchesPerSample * multiplier;
+        return desired >= MaximumDeviceLaunchesPerSample
+            ? MaximumDeviceLaunchesPerSample
+            : checked((int)desired);
+    }
+
+    /// <summary>
+    /// Measures competing submission paths in the same rounds, rotating their order. This retains
+    /// synchronized production latency while preventing a scheduler or power-state change between
+    /// three disjoint 101-sample windows from deciding the winner.
+    /// </summary>
+    private static Dictionary<string, Distribution> MeasureEndToEndInterleaved(
+        CudaBackend backend,
+        params (string Name, Action Prepare, Action Execute)[] methods)
+    {
+        if (methods.Length == 0) throw new ArgumentException("At least one method is required.", nameof(methods));
+        if (methods.Select(method => method.Name).Distinct(StringComparer.Ordinal).Count() != methods.Length)
+            throw new ArgumentException("Method names must be unique.", nameof(methods));
+        var samples = methods.ToDictionary(
+            method => method.Name,
+            _ => new double[Samples],
+            StringComparer.Ordinal);
+        for (int warmup = 0; warmup < Warmups; warmup++)
+        {
+            for (int offset = 0; offset < methods.Length; offset++)
+            {
+                var method = methods[(warmup + offset) % methods.Length];
+                method.Prepare();
+                method.Execute();
+            }
+        }
+        backend.Synchronize();
+        double scale = 1_000_000.0 / Stopwatch.Frequency;
+        for (int sample = 0; sample < Samples; sample++)
+        {
+            for (int offset = 0; offset < methods.Length; offset++)
+            {
+                var method = methods[(sample + offset) % methods.Length];
+                method.Prepare();
+                long start = Stopwatch.GetTimestamp();
+                method.Execute();
+                backend.Synchronize();
+                samples[method.Name][sample] = (Stopwatch.GetTimestamp() - start) * scale;
+            }
+        }
+        return samples.ToDictionary(
+            pair => pair.Key,
+            pair => Summarize(pair.Value),
+            StringComparer.Ordinal);
+    }
+
+    private static long MeasureAllocation(CudaBackend backend, Action action)
+    {
+        const int trials = 3;
+        const int callsPerTrial = 257;
+        for (int i = 0; i < 16; i++) action();
+        backend.Synchronize();
+        var totals = new long[trials];
+        for (int trial = 0; trial < trials; trial++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < callsPerTrial; i++) action();
+            totals[trial] = GC.GetAllocatedBytesForCurrentThread() - before;
+            backend.Synchronize();
+        }
+        Array.Sort(totals);
+        // A steady-state allocation appears in every trial. The median rejects a one-time tiered-
+        // runtime or diagnostic allocation on the benchmark thread without hiding repeat churn.
+        return totals[trials / 2] / callsPerTrial;
+    }
+
+    private static Distribution Summarize(double[] values)
+    {
+        Array.Sort(values);
+        return new Distribution(values.Average(), Percentile(values, .50),
+            Percentile(values, .95), Percentile(values, .99));
+    }
+
+    private static double Percentile(double[] sorted, double percentile)
+    {
+        double position = (sorted.Length - 1) * percentile;
+        int lower = (int)position, upper = Math.Min(lower + 1, sorted.Length - 1);
+        return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+    }
+
+    private static void Enable(string operation, bool? value)
+    {
+        if (operation == "cholesky") DirectPtxFeatureGate.Cholesky4x4ExperimentOverride = value;
+        else DirectPtxFeatureGate.Solver4x4ExperimentOverride = value;
+    }
+
+    private static void Prewarm(CudaBackend backend, string operation, int batch)
+    {
+        bool ok = operation == "cholesky"
+            ? backend.PrewarmDirectPtxCholesky4x4(batch)
+            : backend.PrewarmDirectPtxSolver4x4(operation switch
+            {
+                "lu-factor" => DirectPtxSolver4x4Operation.LuFactor,
+                "qr" => DirectPtxSolver4x4Operation.QrReduced,
+                "eigh" => DirectPtxSolver4x4Operation.EighUpper,
+                "eigh-lower" => DirectPtxSolver4x4Operation.EighLower,
+                "svd" => DirectPtxSolver4x4Operation.SvdReduced,
+                "lu-solve" => DirectPtxSolver4x4Operation.LuSolveVector,
+                "ldl-factor" => DirectPtxSolver4x4Operation.LdlFactorLower,
+                "ldl-solve" => DirectPtxSolver4x4Operation.LdlSolveVectorLower,
+                "solve" => DirectPtxSolver4x4Operation.GeneralSolveVector,
+                "tri-lower" => DirectPtxSolver4x4Operation.TriangularSolveVectorLower,
+                "tri-upper" => DirectPtxSolver4x4Operation.TriangularSolveVectorUpper,
+                "chol-backward" => DirectPtxSolver4x4Operation.CholeskyBackwardLower,
+                _ => DirectPtxSolver4x4Operation.SolveBackwardVector
+            }, batch);
+        if (!ok) throw new InvalidOperationException($"Prewarm failed: {backend.DirectPtxLastError}");
+    }
+
+    private static DirectPtxKernelAudit Audit(CudaBackend backend, string operation, int batch)
+    {
+        bool found;
+        DirectPtxKernelAudit audit;
+        if (operation == "cholesky") found = backend.TryGetDirectPtxCholesky4x4Audit(batch, out audit);
+        else found = backend.TryGetDirectPtxSolver4x4Audit(operation switch
+        {
+            "lu-factor" => DirectPtxSolver4x4Operation.LuFactor,
+            "qr" => DirectPtxSolver4x4Operation.QrReduced,
+            "eigh" => DirectPtxSolver4x4Operation.EighUpper,
+            "eigh-lower" => DirectPtxSolver4x4Operation.EighLower,
+            "svd" => DirectPtxSolver4x4Operation.SvdReduced,
+            "lu-solve" => DirectPtxSolver4x4Operation.LuSolveVector,
+            "ldl-factor" => DirectPtxSolver4x4Operation.LdlFactorLower,
+            "ldl-solve" => DirectPtxSolver4x4Operation.LdlSolveVectorLower,
+            "solve" => DirectPtxSolver4x4Operation.GeneralSolveVector,
+            "tri-lower" => DirectPtxSolver4x4Operation.TriangularSolveVectorLower,
+            "tri-upper" => DirectPtxSolver4x4Operation.TriangularSolveVectorUpper,
+            "chol-backward" => DirectPtxSolver4x4Operation.CholeskyBackwardLower,
+            _ => DirectPtxSolver4x4Operation.SolveBackwardVector
+        }, batch, out audit);
+        return found ? audit : throw new InvalidOperationException("Direct PTX audit missing.");
+    }
+
+    private static double Error(
+        CudaBackend backend, string operation, int batch, float[] input, float[] rhs,
+        IGpuBuffer matrix1, IGpuBuffer matrix2, IGpuBuffer vector, IGpuBuffer pivots, IGpuBuffer info)
+    {
+        // Operation-specific residuals are emitted by the external harness as
+        // well; this resident check deliberately samples the first 16 matrices.
+        float[] a = backend.DownloadBuffer(matrix1);
+        if (operation is "lu-solve" or "ldl-solve")
+        {
+            float[] x = backend.DownloadBuffer(vector);
+            return x.Take(64).Zip(rhs.Take(64), (left, right) => Math.Abs(left - right)).Max();
+        }
+        if (operation is "solve" or "tri-lower" or "tri-upper")
+            return SolveError(input, rhs, backend.DownloadBuffer(vector), Math.Min(batch, 16));
+        if (operation == "cholesky") return ReconstructionError(input, a, null, 16, triangular: true);
+        if (operation == "lu-factor")
+            return LuFactorError(input, a, backend.DownloadBuffer(pivots), Math.Min(batch, 16));
+        if (operation == "ldl-factor")
+            return LdlFactorError(input, a, backend.DownloadBuffer(pivots), Math.Min(batch, 16));
+        if (operation == "qr") return ReconstructionError(input, a, backend.DownloadBuffer(matrix2), 16, false);
+        if (operation is "eigh" or "eigh-lower")
+            return EighError(input, backend.DownloadBuffer(vector), backend.DownloadBuffer(matrix2),
+                Math.Min(batch, 16));
+        if (operation == "svd") return SvdError(input, a, backend.DownloadBuffer(vector), backend.DownloadBuffer(matrix2), 16);
+        if (operation == "chol-backward")
+            return CholeskyBackwardDiagonalError(input, a, Math.Min(batch, 16));
+        if (operation == "solve-backward")
+            return SolveBackwardIdentityError(rhs, backend.DownloadBuffer(matrix1),
+                backend.DownloadBuffer(vector), Math.Min(batch, 16));
+        throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown solver benchmark operation.");
+    }
+
+    private static double ReconstructionError(
+        float[] expected, float[] left, float[]? right, int matrices, bool triangular)
+    {
+        double maximum = 0;
+        for (int b = 0; b < matrices; b++)
+        for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+        {
+            double sum = 0;
+            for (int k = 0; k < 4; k++)
+                sum += left[b * 16 + row * 4 + k] *
+                    (triangular ? left[b * 16 + col * 4 + k] : right![b * 16 + k * 4 + col]);
+            maximum = Math.Max(maximum, Math.Abs(sum - expected[b * 16 + row * 4 + col]));
+        }
+        return maximum;
+    }
+
+    private static double SvdError(float[] expected, float[] u, float[] s, float[] vh, int matrices)
+    {
+        double maximum = 0;
+        for (int b = 0; b < matrices; b++)
+        for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+        {
+            double sum = 0;
+            for (int k = 0; k < 4; k++) sum += u[b * 16 + row * 4 + k] * s[b * 4 + k] * vh[b * 16 + k * 4 + col];
+            maximum = Math.Max(maximum, Math.Abs(sum - expected[b * 16 + row * 4 + col]));
+        }
+        return maximum;
+    }
+
+    private static double LuFactorError(float[] input, float[] lu, float[] pivotBits, int matrices)
+    {
+        var pivots = new int[pivotBits.Length];
+        Buffer.BlockCopy(pivotBits, 0, pivots, 0, pivotBits.Length * sizeof(float));
+        double maximum = 0;
+        var permuted = new float[16];
+        for (int b = 0; b < matrices; b++)
+        {
+            Array.Copy(input, b * 16, permuted, 0, 16);
+            for (int step = 0; step < 4; step++)
+            {
+                int pivot = pivots[b * 4 + step];
+                if ((uint)pivot >= 4u) return double.PositiveInfinity;
+                if (pivot == step) continue;
+                for (int col = 0; col < 4; col++)
+                    (permuted[step * 4 + col], permuted[pivot * 4 + col]) =
+                        (permuted[pivot * 4 + col], permuted[step * 4 + col]);
+            }
+
+            for (int row = 0; row < 4; row++)
+            for (int col = 0; col < 4; col++)
+            {
+                double sum = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    double left = row == k ? 1 : row > k ? lu[b * 16 + row * 4 + k] : 0;
+                    double right = k <= col ? lu[b * 16 + k * 4 + col] : 0;
+                    sum += left * right;
+                }
+                maximum = Math.Max(maximum, Math.Abs(sum - permuted[row * 4 + col]));
+            }
+        }
+        return maximum;
+    }
+
+    private static double EighError(float[] input, float[] values, float[] vectors, int matrices)
+    {
+        double maximum = 0;
+        for (int b = 0; b < matrices; b++)
+        for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+        {
+            double av = 0;
+            double orthogonal = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                float symmetric = row <= k
+                    ? input[b * 16 + row * 4 + k]
+                    : input[b * 16 + k * 4 + row];
+                av += symmetric * vectors[b * 16 + k * 4 + col];
+                orthogonal += vectors[b * 16 + k * 4 + row] * vectors[b * 16 + k * 4 + col];
+            }
+            double vd = vectors[b * 16 + row * 4 + col] * values[b * 4 + col];
+            maximum = Math.Max(maximum, Math.Abs(av - vd));
+            maximum = Math.Max(maximum, Math.Abs(orthogonal - (row == col ? 1 : 0)));
+        }
+        return maximum;
+    }
+
+    private static double LdlFactorError(float[] input, float[] ld, float[] pivotBits, int matrices)
+    {
+        var pivots = new int[pivotBits.Length];
+        Buffer.BlockCopy(pivotBits, 0, pivots, 0, pivotBits.Length * sizeof(float));
+        double maximum = 0;
+        var permuted = new float[16];
+        for (int b = 0; b < matrices; b++)
+        {
+            Array.Copy(input, b * 16, permuted, 0, 16);
+            for (int step = 0; step < 4; step++)
+            {
+                int pivot = pivots[b * 4 + step];
+                if ((uint)pivot >= 4u) return double.PositiveInfinity;
+                for (int k = 0; pivot != step && k < 4; k++)
+                {
+                    (permuted[step * 4 + k], permuted[pivot * 4 + k]) =
+                        (permuted[pivot * 4 + k], permuted[step * 4 + k]);
+                }
+                for (int k = 0; pivot != step && k < 4; k++)
+                {
+                    (permuted[k * 4 + step], permuted[k * 4 + pivot]) =
+                        (permuted[k * 4 + pivot], permuted[k * 4 + step]);
+                }
+            }
+            for (int row = 0; row < 4; row++)
+            for (int col = 0; col < 4; col++)
+            {
+                double sum = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    double left = row == k ? 1 : row > k ? ld[b * 16 + row * 4 + k] : 0;
+                    double right = col == k ? 1 : col > k ? ld[b * 16 + col * 4 + k] : 0;
+                    sum += left * ld[b * 16 + k * 4 + k] * right;
+                }
+                maximum = Math.Max(maximum, Math.Abs(sum - permuted[row * 4 + col]));
+            }
+        }
+        return maximum;
+    }
+
+    private static double SolveError(float[] matrix, float[] rhs, float[] solution, int matrices)
+    {
+        double maximum = 0;
+        for (int b = 0; b < matrices; b++)
+        for (int row = 0; row < 4; row++)
+        {
+            double value = 0;
+            for (int col = 0; col < 4; col++)
+                value += matrix[b * 16 + row * 4 + col] * solution[b * 4 + col];
+            maximum = Math.Max(maximum, Math.Abs(value - rhs[b * 4 + row]));
+        }
+        return maximum;
+    }
+
+    private static double CholeskyBackwardDiagonalError(float[] factor, float[] gradient, int matrices)
+    {
+        double maximum = 0;
+        for (int b = 0; b < matrices; b++)
+        for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+        {
+            double expected = row == col ? .5 / factor[b * 16 + row * 5] : 0;
+            maximum = Math.Max(maximum, Math.Abs(gradient[b * 16 + row * 4 + col] - expected));
+        }
+        return maximum;
+    }
+
+    private static double SolveBackwardIdentityError(
+        float[] solution, float[] gradInput, float[] gradRhs, int matrices)
+    {
+        double maximum = 0;
+        for (int b = 0; b < matrices; b++)
+        {
+            for (int row = 0; row < 4; row++)
+            {
+                double expectedGradRhs = .5 * (row + 1);
+                maximum = Math.Max(maximum, Math.Abs(gradRhs[b * 4 + row] - expectedGradRhs));
+                for (int col = 0; col < 4; col++)
+                {
+                    double expected = -expectedGradRhs * solution[b * 4 + col];
+                    maximum = Math.Max(maximum,
+                        Math.Abs(gradInput[b * 16 + row * 4 + col] - expected));
+                }
+            }
+        }
+        return maximum;
+    }
+
+    private static void Print(IReadOnlyList<Result> results)
+    {
+        string contextScheduling = CudaContextScheduling.Describe(
+            CudaContextScheduling.ResolveFromEnvironment());
+        foreach (string fingerprint in results.Select(row => row.DeviceFingerprint).Distinct())
+            Console.WriteLine(
+                $"solver_environment={fingerprint}; cuda_context_scheduling={contextScheduling}; " +
+                $"dotnet={Environment.Version}; os={Environment.OSVersion}");
+        Console.WriteLine(
+            $"{"Run",3} {"Operation",11} {"Batch",7} {"Method",25} {"dev n",7} " +
+            $"{"dev mean",9} {"dev med",9} " +
+            $"{"dev P95",9} {"dev P99",9} {"E2E mean",9} {"E2E med",9} {"E2E P95",9} {"E2E P99",9} " +
+            $"{"GFLOPS",9} {"GB/s",9} {"alloc B",8} {"temp B",8} " +
+            $"{"max err",10} {"block",5} {"regs",5} {"shared",7} {"local",5} {"occ",4}");
+        foreach (Result row in results)
+        {
+            Console.WriteLine($"{row.Run,3} {row.Operation,11} {row.Batch,7} {row.Method,25} " +
+                $"{row.DeviceLaunchesPerSample,7} " +
+                $"{row.Device.Mean,9:F2} {row.Device.Median,9:F2} {row.Device.P95,9:F2} {row.Device.P99,9:F2} " +
+                $"{row.EndToEnd.Mean,9:F2} {row.EndToEnd.Median,9:F2} {row.EndToEnd.P95,9:F2} {row.EndToEnd.P99,9:F2} " +
+                $"{row.Gflops,9:F2} {row.GbPerSecond,9:F2} {row.ManagedBytes,8} {row.TemporaryDeviceBytes,8} " +
+                $"{row.MaximumError,10:G4} {Dash(row.BlockThreads),5} {Dash(row.Registers),5} {Dash(row.SharedBytes),7} " +
+                $"{Dash(row.LocalBytes),5} {Dash(row.ActiveBlocksPerSm),4}");
+            Console.WriteLine("solver_evidence_json=" + JsonSerializer.Serialize(row));
+        }
+    }
+
+    private static string Dash(int value) => value < 0 ? "-" : value.ToString();
+    private static double EstimatedFlops(string operation, int batch) => operation switch
+    {
+        "cholesky" => batch * (64.0 / 3.0),
+        "lu-factor" => batch * (128.0 / 3.0),
+        "qr" => batch * (256.0 / 3.0),
+        "eigh" or "eigh-lower" => batch * 8 * 6 * 96.0,
+        "svd" => batch * (10 * 6 * 96.0 + 256.0),
+        "ldl-factor" => batch * (64.0 / 3.0),
+        "tri-lower" or "tri-upper" => batch * 32.0,
+        "chol-backward" => batch * 384.0,
+        "solve-backward" => batch * 192.0,
+        _ => batch * 64.0
+    };
+    private static double BytesMoved(string operation, int batch) => operation switch
+    {
+        "cholesky" => batch * (64 + 64 + 4.0),
+        "lu-factor" => batch * (64 + 64 + 16.0),
+        "qr" => batch * (64 + 64 + 64.0),
+        "eigh" or "eigh-lower" => batch * (64 + 16 + 64.0),
+        "svd" => batch * (64 + 64 + 16 + 64.0),
+        "ldl-factor" => batch * (64 + 64 + 16.0),
+        "solve" => batch * (64 + 16 + 16 + 4.0),
+        "tri-lower" or "tri-upper" => batch * (64 + 16 + 16.0),
+        "chol-backward" => batch * (64 + 64 + 64.0),
+        "solve-backward" => batch * (64 + 16 + 16 + 64 + 16.0),
+        _ => batch * (64 + 16 + 16 + 16.0)
+    };
+
+    private static float[] MatrixFor(string operation) => operation switch
+    {
+        "lu-solve" or "ldl-solve" or "solve-backward" => Identity,
+        "chol-backward" => CholeskyDiagonal,
+        "tri-lower" => LowerTriangular,
+        "tri-upper" => UpperTriangular,
+        _ => Spd
+    };
+
+    private static float[] Matrices(int batch, float[] matrix)
+    {
+        var result = new float[batch * 16];
+        for (int i = 0; i < batch; i++) Array.Copy(matrix, 0, result, i * 16, 16);
+        return result;
+    }
+
+    private static readonly float[] Spd =
+        [9, 1, 2, .5f, 1, 8, .25f, 1, 2, .25f, 7, .75f, .5f, 1, .75f, 6];
+    private static readonly float[] Identity =
+        [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    private static readonly float[] CholeskyDiagonal =
+        [3, 0, 0, 0, 0, 2.5f, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1.5f];
+    private static readonly float[] LowerTriangular =
+        [3, 0, 0, 0, 1, 4, 0, 0, .5f, 1, 5, 0, .25f, .5f, 1, 6];
+    private static readonly float[] UpperTriangular =
+        [3, 1, .5f, .25f, 0, 4, 1, .5f, 0, 0, 5, 1, 0, 0, 0, 6];
+}

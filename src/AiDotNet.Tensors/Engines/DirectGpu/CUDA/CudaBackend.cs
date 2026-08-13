@@ -314,6 +314,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public CudaBackend(int deviceIndex)
     {
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
+        // Resolve explicit configuration before native probing or the availability fallback. A
+        // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
+        // be hidden by converting the backend into an unavailable instance.
+        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
@@ -362,7 +366,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // tracked as follow-up work.
             MaxBufferAllocBytes = (long)totalMem;
 
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuCtxCreate(
+                    out _cudaContext, contextScheduling, device),
+                "cuCtxCreate");
             LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
@@ -4756,6 +4763,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (stream is not CudaStream cudaStream)
             throw new ArgumentException("Stream must be a CudaStream", nameof(stream));
+        if (!ReferenceEquals(cudaStream.Backend, this))
+            throw new ArgumentException(
+                "Stream must belong to this CUDA backend.", nameof(stream));
 
         return cudaStream.Query();
     }
@@ -5093,13 +5103,36 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     internal void EnsureContextCurrent()
     {
         IntPtr ctx = _cudaContext;
-        if (ctx != IntPtr.Zero && !IsRuntimeTearingDown && LiveContexts.ContainsKey(ctx))
-            CudaNativeBindings.cuCtxSetCurrent(ctx);
+        if (ctx != IntPtr.Zero && _threadCurrentContext != ctx && !IsRuntimeTearingDown &&
+            LiveContexts.ContainsKey(ctx))
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuCtxSetCurrent(ctx),
+                "cuCtxSetCurrent");
+            // PushContext already relies on this per-thread ownership marker. Keep the set-current
+            // path coherent with it so every resident direct kernel does not repeat a native context
+            // call after this thread has been validated for the same backend.
+            _threadCurrentContext = ctx;
+        }
         DrainPendingFinalizerFrees();
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
         DrainPendingContextDestroys();
+    }
+
+    /// <summary>
+    /// Fast current-context assertion for an already-validated bound launch. Deferred finalizer
+    /// work still forces the complete path; the common case is a thread-local comparison only.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void EnsureContextCurrentForBoundLaunch()
+    {
+        if (_threadCurrentContext == _cudaContext &&
+            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty)
+            return;
+        EnsureContextCurrent();
     }
 
     // #226 CONCURRENCY FIX: the calling thread's OWN cuBLAS handle for THIS engine (created lazily on first
@@ -7913,6 +7946,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
     {
+        if (training && TryDirectPtxRngDropoutF32(
+            input, output, mask, size, dropoutRate, seed))
+            return;
         if (!_kernelCache.TryGetValue("dropout_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_forward");
 
@@ -7948,6 +7984,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
     {
+        if (TryDirectPtxDropoutBackwardF32(gradOutput, mask, gradInput, size))
+            return;
         if (!_kernelCache.TryGetValue("dropout_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_backward");
 
@@ -9480,6 +9518,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
     {
+        if (TryDirectPtxRreluF32(input, noise, output, size))
+            return;
         if (!_kernelCache.TryGetValue("rrelu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rrelu");
         using var _ = PushContext();
@@ -9491,6 +9531,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
     {
+        if (TryDirectPtxRreluBackwardF32(gradOutput, input, noise, gradInput, size))
+            return;
         if (!_kernelCache.TryGetValue("rrelu_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rrelu_backward");
         using var _ = PushContext();
@@ -14226,6 +14268,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
+        if (TryDirectPtxPhiloxFillF32(
+            output, size, DirectPtxPhiloxFillKind.Uniform, min, max, seed))
+            return;
+        LaunchRandomUniformEstablished(output, size, min, max, seed);
+    }
+
+    private unsafe void LaunchRandomUniformEstablished(
+        IGpuBuffer output, int size, float min, float max, ulong seed)
+    {
         if (!_kernelCache.TryGetValue("generate_random_uniform", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: generate_random_uniform");
 
@@ -14248,6 +14299,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void GenerateStatelessDropoutMask(
         IGpuBuffer output, int size, uint threshold, float scale, uint seed)
     {
+        if (TryDirectPtxPhiloxMaskF32(
+            output, size, DirectPtxPhiloxFillKind.DropThresholdMask,
+            threshold, scale, seed))
+            return;
         if (!_kernelCache.TryGetValue("stateless_dropout_mask", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: stateless_dropout_mask");
 
@@ -14265,6 +14320,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
+        if (TryDirectPtxPhiloxFillF32(
+            output, size, DirectPtxPhiloxFillKind.Normal, mean, stdDev, seed))
+            return;
         if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: generate_random_normal");
 
@@ -14287,7 +14345,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
     {
         if (size <= 0) return;
-        GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
+        // A deterministic Philox specialization cannot preserve this API's
+        // secure-seeding contract. Bypass Direct PTX explicitly.
+        LaunchRandomUniformEstablished(output, size, min, max, GpuRandomSeed.Create());
     }
 
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
@@ -16522,16 +16582,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (_cudaContext != IntPtr.Zero)
         {
+            IntPtr context = _cudaContext;
             // Unregister + destroy under the lifecycle lock so a concurrent buffer finalizer can't
             // observe the context as live and then fault on it after we destroy it (TOCTOU). A buffer
             // finalized after this point sees it gone and skips its native free (cuCtxDestroy reclaims
             // that memory anyway).
             lock (ContextLifecycleLock)
             {
-                LiveContexts.TryRemove(_cudaContext, out _);
-                CuBlasNative.cuCtxDestroy(_cudaContext);
+                LiveContexts.TryRemove(context, out _);
+                CuBlasNative.cuCtxDestroy(context);
                 _cudaContext = IntPtr.Zero;
             }
+            if (_threadCurrentContext == context) _threadCurrentContext = IntPtr.Zero;
         }
 
         GC.SuppressFinalize(this);
@@ -17097,6 +17159,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void DropoutMask(IGpuBuffer mask, int size, float keepProb, ulong seed)
     {
+        if (PtxCompat.IsFinite(keepProb) && keepProb > 0f && keepProb < 1f)
+        {
+            ulong threshold64 = (ulong)Math.Floor((double)keepProb * 4_294_967_296.0);
+            if (threshold64 is > 0 and <= uint.MaxValue &&
+                TryDirectPtxPhiloxMaskF32(
+                    mask, size, (uint)threshold64, 1f / keepProb, seed))
+                return;
+        }
         if (!_kernelCache.TryGetValue("dropout_mask", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dropout_mask");
         using var _ = PushContext();
@@ -17108,6 +17178,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GaussianNoise(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
+        if (TryDirectPtxPhiloxFillF32(
+            output, size, DirectPtxPhiloxFillKind.Normal, mean, stdDev, seed))
+            return;
         if (!_kernelCache.TryGetValue("gaussian_noise", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: gaussian_noise");
         using var _ = PushContext();
@@ -17127,6 +17200,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GumbelSoftmax(IGpuBuffer logits, IGpuBuffer output, int outerSize, int innerSize, float temperature, ulong seed)
     {
+        if (TryDirectPtxGumbelSoftmaxF32(
+            logits, output, outerSize, innerSize, temperature, seed))
+            return;
         if (!_kernelCache.TryGetValue("gumbel_softmax", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: gumbel_softmax");
         using var _ = PushContext();
