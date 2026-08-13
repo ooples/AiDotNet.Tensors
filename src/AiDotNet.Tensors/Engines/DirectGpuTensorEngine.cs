@@ -10131,12 +10131,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             initialWeights.Shape._dims[1] != headDim || initialWeights.Shape._dims[2] != headDim)
             return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
 
-        var regularizationTensor = new Tensor<T>(new[] { regularization }, new[] { 1 });
         using var qBuffer = GetOrAllocateBuffer(backend, q);
         using var kBuffer = GetOrAllocateBuffer(backend, k);
         using var vBuffer = GetOrAllocateBuffer(backend, v);
         using var w0Buffer = GetOrAllocateBuffer(backend, initialWeights);
-        using var regularizationBuffer = GetOrAllocateBuffer(backend, regularizationTensor);
+        // regularization crosses the ABI as a one-float device buffer, which is a
+        // deliberate contract shared by all six backend kernels (see
+        // IDirectGpuBackend.MesaScanForward) rather than something to narrow to a
+        // scalar here. The buffer is still required, but the Tensor<T> wrapper that
+        // used to be built around it on every call is not.
+        using var regularizationBuffer = GetOrAllocateBuffer(backend, new[] { regularization });
         using var outputBuffer = AllocateOutputBuffer(backend, batch * time * model);
         int matrixScratch = batch * numHeads * headDim * headDim;
         using var workWeights = AllocateOutputBuffer(backend, matrixScratch);
