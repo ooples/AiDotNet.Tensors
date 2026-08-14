@@ -2669,6 +2669,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     lr, b1, b2, wd, len);
                                 break;
                             case OptimizerType.SGDMomentum:
+                                // The GPU kernel implements CLASSICAL momentum only. Running it for a
+                                // Nesterov request would quietly train a different algorithm, which is
+                                // the exact failure this flag was added to remove — so refuse instead.
+                                if (extras.Nesterov)
+                                {
+                                    throw new NotSupportedException(
+                                        "Nesterov momentum is not implemented by the GPU fused optimizer kernel. " +
+                                        "Run this model on the CPU engine, which supports it, or use classical " +
+                                        "momentum. Refusing rather than silently applying classical momentum.");
+                                }
                                 gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
                                     lr, b1, wd, len);
                                 break;
@@ -2827,7 +2837,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.SGDMomentum:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, false);
+                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
                             break;
                         case OptimizerType.AdaMax:
                             if (wd != 0f)
@@ -2850,7 +2860,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.FTRL:
                             // z=pV, n=pVMax; FTRL applies its own L1/L2 regularization.
                             FusedOptimizer.FTRLUpdateSimd(pParam, pGrad, pV, pVMax, len,
-                                lr, extras.L1, extras.L2, extras.LrPower);
+                                lr, extras.L1, extras.L2, extras.LrPower, extras.FtrlBeta);
                             break;
                         case OptimizerType.ASGD:
                             {
@@ -3291,6 +3301,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     lr, b1, b2, wd, len);
                                 break;
                             case OptimizerType.SGDMomentum:
+                                // The GPU kernel implements CLASSICAL momentum only. Running it for a
+                                // Nesterov request would quietly train a different algorithm, which is
+                                // the exact failure this flag was added to remove — so refuse instead.
+                                if (extras.Nesterov)
+                                {
+                                    throw new NotSupportedException(
+                                        "Nesterov momentum is not implemented by the GPU fused optimizer kernel. " +
+                                        "Run this model on the CPU engine, which supports it, or use classical " +
+                                        "momentum. Refusing rather than silently applying classical momentum.");
+                                }
                                 gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
                                     lr, b1, wd, len);
                                 break;
@@ -3412,7 +3432,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.SGDMomentum:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, false);
+                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
                             break;
                         case OptimizerType.AdaMax:
                             if (wd != 0f)
@@ -3432,7 +3452,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.FTRL:
                             FusedOptimizer.FTRLUpdateSimd(pParam, pGrad, pV, pVMax, len,
-                                lr, extras.L1, extras.L2, extras.LrPower);
+                                lr, extras.L1, extras.L2, extras.LrPower, extras.FtrlBeta);
                             break;
                         case OptimizerType.ASGD:
                             {
