@@ -97,6 +97,20 @@ public static class PtxParityRegistry
             "int8 weights and activations with per-tensor activation scale and per-column weight scales. " +
             "A three-way spec needs a quantization-aware oracle (dequantize in fp64, then fuse) rather " +
             "than a direct float comparison, so it is deferred until that oracle exists."),
+        new PtxParitySpec("PtxFusedGlobalMaxPoolF32Kernel", PtxParityStatus.Deferred,
+            "global max pool 2D, fp32 (#842) - CudaBackend.GlobalMaxPool2D (value path)",
+            "a max reduction only selects an element, so its three-way spec can assert bit-for-bit " +
+            "equality with no tolerance. Two things the spec must cover explicitly: an all-NaN plane, " +
+            "which must reduce to -inf in both legs, and the fact that only the VALUE path is ported - " +
+            "when saveIndices is set the established kernel must still run, so the spec has to prove " +
+            "the direct-PTX lane is not taken in that case."),
+
+        new PtxParitySpec("PtxFusedGlobalAvgPoolF32Kernel", PtxParityStatus.Deferred,
+            "global average pool 2D, fp32 (#842) — CudaBackend.GlobalAvgPool2D",
+            "has a public route, but its tests compare the PTX result against a CPU reference only, so " +
+            "the gate-off CUDA==CPU leg is unproven. Converts to ThreeWayParity by mirroring " +
+            "BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle over GlobalAvgPool2D; the per-plane " +
+            "warp reduction accumulates, so that spec needs a summation-order-aware tolerance."),
         new PtxParitySpec("PtxSoftmaxKernel", PtxParityStatus.ThreeWayParity,
             "CudaBackend.Softmax / SoftmaxRows",
             "Backend_Softmax_ThreeWayParityAndAudit runs the incumbent CUDA route and direct PTX on " +

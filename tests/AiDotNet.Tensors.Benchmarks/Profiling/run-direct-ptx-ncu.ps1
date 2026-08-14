@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'convolution', 'rng-dropout', 'rng-stochastic', 'vision-box-iou', 'rglru', 'solvers-4x4', 'complex-multiply')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'convolution', 'rng-dropout', 'rng-stochastic', 'vision-box-iou', 'rglru', 'solvers-4x4', 'global-avgpool', 'complex-multiply')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -38,6 +38,7 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'global-avgpool' { '--direct-ptx-profile-global-avgpool' }
     'complex-multiply' { '--direct-ptx-profile-complex-multiply' }
     'solvers-4x4' { '--direct-ptx-profile-solvers-4x4' }
     'rng-dropout' { '--direct-ptx-profile-rng-dropout' }
@@ -51,6 +52,7 @@ $kernel = switch ($Target) {
     'residual-rmsnorm' { 'regex:aidotnet_fused_residual_rmsnorm_d64' }
     'decode' { 'regex:aidotnet_(flash|paged)_decode_d64' }
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
+    'global-avgpool' { 'regex:aidotnet_fused_global_avgpool_f32' }
     'solvers-4x4' { 'regex:aidotnet_register_(cholesky|lu_factor|qr_reduced|eigh_(upper|lower)|svd_reduced|lu_solve_vector|ldl_factor_lower|ldl_solve_lower_vector|solve_vector|triangular_solve_(lower|upper)_vector|cholesky_backward_lower|solve_backward_vector)_4x4_f32' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
     'complex-multiply' { 'regex:aidotnet_fused_complex_multiply_f32' }
@@ -64,6 +66,7 @@ $kernel = switch ($Target) {
 }
 $expectedLaunches = switch ($Target) {
     'attention' { 16 }
+    'global-avgpool' { 4 }
     'solvers-4x4' { 56 }
     'residual-rmsnorm' { 4 }
     'decode' { 2 }

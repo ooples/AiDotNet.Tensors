@@ -247,6 +247,12 @@ class Program
             DirectPtxGeGluExperiment.RunSwiGluForward(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-global-avgpool")
+        {
+            DirectPtxGlobalAvgPoolExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int gapRuns) ? gapRuns : 1);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-normalization-sass")
         {
             if (args.Length < 2)
@@ -558,6 +564,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-stochastic")
         {
             DirectPtxProfileTarget.RunRngStochastic();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-global-avgpool")
+        {
+            DirectPtxProfileTarget.RunGlobalAvgPool();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-complex-multiply")
