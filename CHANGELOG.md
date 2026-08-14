@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.126.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.125.0...v0.126.0) (2026-08-14)
+
+
+### Features
+
+* **ptx:** add convolution golden slice ([#877](https://github.com/ooples/AiDotNet.Tensors/issues/877)) ([3038daf](https://github.com/ooples/AiDotNet.Tensors/commit/3038daffbcd56ffb899fc3201ca21c589880d43c))
+* **ptx:** global average pooling blueprint ([#842](https://github.com/ooples/AiDotNet.Tensors/issues/842)) ([#876](https://github.com/ooples/AiDotNet.Tensors/issues/876)) ([6806cb9](https://github.com/ooples/AiDotNet.Tensors/commit/6806cb9e40e4bee0553c5550356e520c2285515c))
+
+
+### Bug Fixes
+
+* **streaming:** make paged tensor access mutation-safe ([#945](https://github.com/ooples/AiDotNet.Tensors/issues/945)) ([4965fc0](https://github.com/ooples/AiDotNet.Tensors/commit/4965fc0973083e5aa5c338ced7731423c6ced082))
+
 ## [0.125.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.124.0...v0.125.0) (2026-08-13)
 
 

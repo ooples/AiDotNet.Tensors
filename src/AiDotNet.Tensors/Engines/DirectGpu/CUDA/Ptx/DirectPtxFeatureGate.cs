@@ -21,6 +21,7 @@ internal static class DirectPtxFeatureGate
     internal const string CastFp16EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP16";
     internal const string CastFp32EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP32";
     internal const string Transpose2DEnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRANSPOSE2D";
+    internal const string GlobalAvgPoolEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GLOBAL_AVGPOOL";
     internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string Cholesky4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CHOLESKY_4X4";
@@ -68,6 +69,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentCastFp16Enabled = ReadEnabled(CastFp16EnvironmentVariable);
     private static readonly bool EnvironmentCastFp32Enabled = ReadEnabled(CastFp32EnvironmentVariable);
     private static readonly bool EnvironmentTranspose2DEnabled = ReadEnabled(Transpose2DEnvironmentVariable);
+    private static readonly bool EnvironmentGlobalAvgPoolEnabled = ReadEnabled(GlobalAvgPoolEnvironmentVariable);
     private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentVisionBoxIouEnabled = ReadEnabled(VisionBoxIouEnvironmentVariable);
@@ -87,6 +89,19 @@ internal static class DirectPtxFeatureGate
     internal static bool CastFp32ExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to transpose cells that have not passed promotion.</summary>
     internal static bool Transpose2DExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_globalAvgPoolExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to global-average-pool cells that have not passed
+    /// promotion. Thread-local state prevents parallel tests or benchmarks from
+    /// enabling an experimental route in an unrelated dispatcher.
+    /// </summary>
+    internal static bool GlobalAvgPoolExperimentOverride
+    {
+        get => s_globalAvgPoolExperimentOverride;
+        set => s_globalAvgPoolExperimentOverride = value;
+    }
     /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
     internal static bool FusedLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
@@ -190,6 +205,8 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsTranspose2DEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentTranspose2DEnabled);
+    internal static bool IsGlobalAvgPoolEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentGlobalAvgPoolEnabled);
     internal static bool IsComplexMultiplyEnabled => ComplexMultiplyGateOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentComplexMultiplyEnabled);
 
