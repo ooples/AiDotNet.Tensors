@@ -61,9 +61,9 @@ public sealed class CompiledTrainingPlanCleanupTests
     private static void AssertContainsTensorKeys(HashSet<object> protect, Tensor<float> tensor)
     {
         Assert.Contains(tensor.DataVector, protect);
-        var backing = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (backing is not null)
-            Assert.Contains(backing, protect);
+        var backing = tensor.GetBackingArrayForCacheLookupUnsafe()
+            ?? throw new InvalidOperationException("Expected CPU tensor to expose a backing array.");
+        Assert.Contains(backing, protect);
     }
 
     private static CompiledTrainingPlan<float> CreatePlan(
