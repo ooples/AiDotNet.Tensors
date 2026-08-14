@@ -137,6 +137,39 @@ public class WeightStreamingTransparentAccessTests : IDisposable
         Assert.Equal(4f, t[1, 1]);
     }
 
+    [Theory]
+    [InlineData(StreamingStoreDtype.Bf16)]
+    [InlineData(StreamingStoreDtype.Bf16Stochastic)]
+    [InlineData(StreamingStoreDtype.Int8)]
+    [InlineData(StreamingStoreDtype.Int4)]
+    public void QuantizedStreamingWeight_RejectsMutationBeforeItCanBeLost(StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            TransparentAutoEviction = true,
+            StreamingStoreDtype = storeDtype,
+        });
+
+        float[] expected = { 1f, -2f, 3f, -4f };
+        var t = new Tensor<float>(expected, new[] { 2, 2 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        var error = Assert.Throws<InvalidOperationException>(() => t[0, 1] = 99f);
+        Assert.Contains("quantized inference encoding", error.Message, StringComparison.Ordinal);
+        Assert.Throws<InvalidOperationException>(() => t.SetFlat(1, 99f));
+        Assert.Throws<InvalidOperationException>(() => t.CopyFromArray(new[] { 9f, 9f, 9f, 9f }));
+        Assert.Throws<InvalidOperationException>(() => _ = t.Memory);
+
+        // The rejected write must leave the canonical store readable rather than accepting a
+        // mutation that disappears on the next page-out/page-in cycle.
+        Assert.NotEqual(99f, t[0, 1]);
+    }
+
     [Fact]
     public void ToArray_OnDroppedStreamingWeight_AutoRehydrates()
     {

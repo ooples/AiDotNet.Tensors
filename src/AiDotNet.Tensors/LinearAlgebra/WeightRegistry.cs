@@ -787,7 +787,7 @@ public static class WeightRegistry
                 //   • training → LOSSLESS (byte-shuffle + Deflate): bit-exact, so the fp32/fp64
                 //     masters are preserved EXACTLY (no convergence risk) while still reclaiming
                 //     ~1.18x. The quantized tiers are NEVER chosen here: their eviction write-back
-                //     is native-only (TryWriteBackResidentForStreaming), so a mutated quantized
+                //     is unsupported (TryWriteBackResidentForStreaming), so a mutated quantized
                 //     weight would silently lose its update. Inference weights are read-only, so
                 //     the quantized tiers below are safe only in that mode.
                 //   • inference → RAM-aware (ResolveAutoInferenceEncoding): bf16 by default, but
@@ -1255,19 +1255,33 @@ public static class WeightRegistry
     }
 
     /// <summary>
-    /// Re-serializes a resident, native-encoded streaming weight's CURRENT data into its pool entry
+    /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry
     /// under the same handle (#1715). Called by <see cref="Tensor{T}.TryWriteBackResidentForStreaming"/>
     /// before a mutated weight is dropped, so the mutation reaches disk and a later
     /// <see cref="Materialize{T}"/> rehydrates it rather than the stale register-time snapshot.
     /// </summary>
-    internal static bool WriteBackResidentNative<T>(Tensor<T> weight)
+    internal static bool WriteBackResident<T>(Tensor<T> weight)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.StreamingPoolHandle < 0) return false;
         if (weight.DataVector.Length != weight.Length) return false;
-        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
-        var bytes = new byte[byteCount];
-        SerializeToBytes(weight, bytes, StreamingEncoding.Native, stochastic: false);
+        byte[] bytes;
+        if (weight.StreamingStoreEncoding == StreamingEncoding.Lossless)
+        {
+            // Training's Auto tier is lossless. Re-encode the current values exactly so an
+            // optimizer update survives owner shedding and the variable-size entry remains valid.
+            bytes = SerializeLossless(weight);
+        }
+        else if (weight.StreamingStoreEncoding == StreamingEncoding.Native)
+        {
+            int byteCount = CheckedStreamingByteCount<T>(weight.Length);
+            bytes = new byte[byteCount];
+            SerializeToBytes(weight, bytes, StreamingEncoding.Native, stochastic: false);
+        }
+        else
+        {
+            return false;
+        }
         StreamingTensorPool pool;
         lock (_lock) { pool = StreamingPoolUnlocked(); }
         pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
@@ -1316,19 +1330,21 @@ public static class WeightRegistry
             long victim = victimNode.Value;
             _materializedBytes.TryGetValue(victim, out long victimBytes);
 
-            // Persist + drop the coldest owner, but only UNTRACK it after both succeed. If write-back
-            // returns false (non-native/aliased — nothing to persist) or the drop returns false
-            // (shared refcount), the owner must stay resident AND accounted; untracking it first
-            // would leak its bytes from the budget (the resident copy still exists). Order: write-back
-            // FIRST so the dropped bytes are recoverable from the pool/disk.
+            // Persist + drop the coldest owner, but only UNTRACK it after both succeed. Quantized
+            // inference owners are immutable, so their pool snapshot is already authoritative;
+            // native/lossless owners must write back successfully first. A write-back failure or
+            // shared refcount leaves the owner resident AND accounted so no mutation can be lost.
             bool shed;
             if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
             {
-                bool wroteBack = false;
-                try { wroteBack = owner.TryWriteBackResidentForStreaming(); }
-                catch { /* best-effort */ }
+                bool safeToDrop = owner.StreamingStoreIsReadOnly;
+                if (!safeToDrop)
+                {
+                    try { safeToDrop = owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* leave resident + accounted; correctness beats the soft budget */ }
+                }
                 shed = false;
-                if (wroteBack)
+                if (safeToDrop)
                 {
                     try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
                     catch { /* shared refcount → leave resident + accounted */ }
@@ -1339,7 +1355,7 @@ public static class WeightRegistry
                 shed = true; // dead owner: no resident copy remains to account
             }
 
-            // Coldest owner can't be shed yet (non-native, or shared ref) — stop. Bounding is
+            // Coldest owner can't be shed yet (write-back failed, or shared ref) — stop. Bounding is
             // best-effort; never untrack/forget a still-resident owner.
             if (!shed) break;
             _materializedLru.Remove(victimNode);
@@ -2262,18 +2278,22 @@ public static class WeightRegistry
                 // #1715: the pool just paged out this handle's snapshot taken at register time. If the
                 // owner MUTATED its resident copy since (a GetParameters round-trip / optimizer step),
                 // that snapshot is stale — write the owner's CURRENT bytes back BEFORE dropping so a
-                // later Materialize rehydrates the mutation, not the stale value. Native-gated inside
-                // TryWriteBackResidentForStreaming, so read-only inference (bf16/quant store) is a no-op.
-                // Unlike the materialized-owner SHED loop (NoteMaterializedAndShed), the drop here is safe
-                // regardless of the write-back RESULT: a native owner's write-back persists the mutation
-                // before the drop, and a non-native owner's resident copy is a re-derivable dequant of the
-                // pool's quantized snapshot (re-materialize re-derives it) — so the snapshot stays
-                // authoritative either way. (Training uses the FullPrecision/native store, so a mutated
-                // owner is always native and always writes back.)
-                try { owner.TryWriteBackResidentForStreaming(); }
-                catch { /* best-effort write-back; never block the drop */ }
-                try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
-                catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
+                // later Materialize rehydrates the mutation, not the stale value. Writable-encoding-gated
+                // inside TryWriteBackResidentForStreaming, so read-only inference (bf16/int8/int4) is a no-op.
+                // A quantized owner is immutable, so its registered snapshot remains authoritative.
+                // A native/lossless owner may have changed and is dropped only after exact write-back
+                // succeeds. Never convert a persistence failure into silent parameter loss.
+                bool safeToDrop = owner.StreamingStoreIsReadOnly;
+                if (!safeToDrop)
+                {
+                    try { safeToDrop = owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* leave resident; correctness beats reclaiming this owner */ }
+                }
+                if (safeToDrop)
+                {
+                    try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                    catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
+                }
             }
         }
     }

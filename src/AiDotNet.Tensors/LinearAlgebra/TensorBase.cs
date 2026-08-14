@@ -23,6 +23,10 @@ internal interface IStreamingDroppable
     /// -1 when not registered.</summary>
     long StreamingPoolHandle { get; }
 
+    /// <summary>Whether the pool encoding is an immutable quantized inference format whose
+    /// registered snapshot remains authoritative without write-back.</summary>
+    bool StreamingStoreIsReadOnly { get; }
+
     /// <summary>Drops this tensor's resident in-memory data (the streaming
     /// pool keeps the canonical copy). Returns <c>false</c> without dropping
     /// when the storage is still shared (refcount &gt; 1) — e.g. an autodiff
@@ -32,7 +36,8 @@ internal interface IStreamingDroppable
     /// <summary>Re-serializes this tensor's CURRENT resident data into its streaming-pool entry
     /// under the same handle, so a later drop + rehydrate returns the current (possibly mutated)
     /// values rather than the stale snapshot taken at register time (#1715). Returns <c>false</c>
-    /// (no-op) when the weight isn't a resident, full-precision streaming weight. Call BEFORE
+    /// (no-op) when the weight isn't resident or its encoding is not writable. Native and lossless
+    /// stores are writable; quantized inference stores are rejected before mutation. Call BEFORE
     /// dropping a mutated streaming weight so the mutation is not lost.</summary>
     bool TryWriteBackResidentForStreaming();
 }
@@ -531,8 +536,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // If this tensor was aliasing a zero-copy mmap slice, the mapping is no
         // longer referenced once storage is dropped — release it now.
         DisposeStreamingMmapOwner();
-        // Drop any no-upcast int8 weight too — the pool holds the canonical bytes.
+        // Drop any no-upcast quantized weight too — the pool holds the canonical bytes.
         StreamingInt8 = null;
+        StreamingInt4 = null;
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
         return true;
@@ -548,24 +554,29 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
 
     long IStreamingDroppable.StreamingPoolHandle => StreamingPoolHandle;
 
+    bool IStreamingDroppable.StreamingStoreIsReadOnly
+        => StreamingStoreEncoding != StreamingEncoding.Native
+            && StreamingStoreEncoding != StreamingEncoding.Lossless;
+
     bool IStreamingDroppable.TryWriteBackResidentForStreaming() => TryWriteBackResidentForStreaming();
 
     /// <summary>
     /// Re-serializes this tensor's current resident data into its streaming-pool entry (#1715).
-    /// Native (full-precision) streaming weights only: a lossy store (bf16/int8/int4) is taken by
-    /// read-only inference and its owner is never mutated, so skip it; a non-resident / view / quant
-    /// tensor has nothing to write back. The new bytes overwrite the pool entry under the same handle
-    /// (marked dirty), so the next eviction persists them to disk and a later <c>Materialize</c>
-    /// rehydrates the mutation instead of the stale register-time snapshot.
+    /// Native (full-precision) and lossless streaming weights only: a lossy store (bf16/int8/int4)
+    /// is read-only and rejected by <see cref="EnsureOwnedForWrite"/> before mutation. A non-resident,
+    /// view, or quantized tensor has nothing to write back. The new bytes overwrite the pool entry
+    /// under the same handle (marked dirty), so the next eviction persists them to disk and a later
+    /// <c>Materialize</c> rehydrates the mutation instead of the stale register-time snapshot.
     /// </summary>
     internal bool TryWriteBackResidentForStreaming()
     {
         if (StreamingPoolHandle < 0) return false;
-        if (StreamingStoreEncoding != StreamingEncoding.Native) return false;
+        if (StreamingStoreEncoding != StreamingEncoding.Native
+            && StreamingStoreEncoding != StreamingEncoding.Lossless) return false;
         if (DataVector.Length != Length) return false;            // already dropped / no-upcast quant
         if (!IsContiguous || _storageOffset != 0 || IsView) return false;
         // Streaming weights are concrete Tensor<T>; serialization needs the concrete type.
-        return this is Tensor<T> concrete && WeightRegistry.WriteBackResidentNative(concrete);
+        return this is Tensor<T> concrete && WeightRegistry.WriteBackResident(concrete);
     }
 
     /// <summary>
@@ -2675,6 +2686,22 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// </summary>
     protected void EnsureOwnedForWrite()
     {
+        // bf16/int8/int4 are read-only inference encodings. Their pool entry is the canonical
+        // quantized snapshot, and re-encoding an arbitrary mutation would compound quantization
+        // error on every eviction. Failing at the common writable-storage gate covers indexers,
+        // CopyFromArray, engine spans, retained backing arrays, and in-place kernels instead of
+        // accepting an update that a later eviction would silently discard. Lossless is writable:
+        // its exact re-encoder is used by TryWriteBackResidentForStreaming.
+        if (StreamingPoolHandle >= 0
+            && StreamingStoreEncoding != StreamingEncoding.Native
+            && StreamingStoreEncoding != StreamingEncoding.Lossless)
+        {
+            throw new InvalidOperationException(
+                "Cannot mutate a streaming tensor stored with a quantized inference encoding " +
+                "(bf16, int8, or int4). Configure StreamingStoreDtype.FullPrecision or Lossless " +
+                "before registering weights that will be updated.");
+        }
+
         var family = _cowFamily;
         if (family is null) return;
         family.DetachForWrite(this);
