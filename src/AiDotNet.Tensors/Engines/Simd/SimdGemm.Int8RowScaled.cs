@@ -132,6 +132,9 @@ internal static partial class SimdGemm
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (bInt8 is null) throw new ArgumentNullException(nameof(bInt8));
         if (c is null) throw new ArgumentNullException(nameof(c));
+        if (m < 0) throw new ArgumentOutOfRangeException(nameof(m), m, "m must be non-negative.");
+        if (k < 0) throw new ArgumentOutOfRangeException(nameof(k), k, "k must be non-negative.");
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n), n, "n must be non-negative.");
         if (rowScales.Length < n)
             throw new ArgumentException(
                 $"rowScales.Length ({rowScales.Length}) must be >= n ({n}).",
@@ -140,7 +143,7 @@ internal static partial class SimdGemm
             throw new ArgumentException(
                 $"bInt8.Length ({bInt8.Length}) must be >= n*k ({(long)n * k}) for the [n, k] layout.",
                 nameof(bInt8));
-        if (m <= 0 || n <= 0 || k <= 0) { Array.Clear(c, 0, c.Length); return; }
+        if (m == 0 || n == 0 || k == 0) { Array.Clear(c, 0, c.Length); return; }
         if ((long)a.Length < (long)m * k)
             throw new ArgumentException(
                 $"a.Length ({a.Length}) must be >= m*k ({(long)m * k}).", nameof(a));

@@ -46,6 +46,11 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public partial class CpuEngine : ITensorLevelEngine
 {
+    // Conv3D's im2col expansion can be tens of times larger than the input. Keep the combined
+    // columns + GEMM-output scratch below a fixed process-friendly ceiling and stream larger
+    // volumes through row tiles instead of risking multi-gigabyte allocations.
+    private const long Conv3DIm2ColWorkspaceBytes = 256L * 1024 * 1024;
+
     private static int _randomNormalSeedCounter = Environment.TickCount;
     private const int TensorMatMulGemvParallelThreshold = 128 * 1024;
     private const double CapsuleSquashEpsilon = 1e-8;
@@ -19997,63 +20002,96 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
+        int elementSize;
+        if (typeof(T) == typeof(float)) elementSize = sizeof(float);
+        else if (typeof(T) == typeof(double)) elementSize = sizeof(double);
+        else return false;
+
         int rows = (int)rowsLong;
         int columnsPerRow = (int)columnsLong;
-        var columns = new T[(int)columnElementsLong];
-        var flatOutput = new T[(int)flatOutputElementsLong];
+        long elementsPerTileRow = columnsLong + outChannels;
+        long bytesPerTileRow = checked(elementsPerTileRow * elementSize);
+        if (bytesPerTileRow > Conv3DIm2ColWorkspaceBytes)
+            return false;
+
+        int tileCapacity = (int)Math.Min(rowsLong,
+            Math.Max(1L, Conv3DIm2ColWorkspaceBytes / bytesPerTileRow));
+        int columnCapacity = checked(tileCapacity * columnsPerRow);
+        int flatCapacity = checked(tileCapacity * outChannels);
+        var columns = System.Buffers.ArrayPool<T>.Shared.Rent(columnCapacity);
+        var flatOutput = System.Buffers.ArrayPool<T>.Shared.Rent(flatCapacity);
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
-
-        Helpers.CpuIm2Col3DHelper.BuildColumns(
-            inputData, columns,
-            batch, inChannels, depth, height, width,
-            kernelDepth, kernelHeight, kernelWidth,
-            outputDepth, outputHeight, outputWidth,
-            strideDepth, strideHeight, strideWidth,
-            padDepth, padHeight, padWidth,
-            dilationDepth, dilationHeight, dilationWidth);
-
-        bool multiplied;
-        if (typeof(T) == typeof(float))
-        {
-            multiplied = Helpers.BlasProvider.TryGemmEx(
-                rows, outChannels, columnsPerRow,
-                (float[])(object)columns, 0, columnsPerRow, false,
-                (float[])(object)kernelData, 0, columnsPerRow, true,
-                (float[])(object)flatOutput, 0, outChannels);
-        }
-        else if (typeof(T) == typeof(double))
-        {
-            multiplied = Helpers.BlasProvider.TryGemmEx(
-                rows, outChannels, columnsPerRow,
-                (double[])(object)columns, 0, columnsPerRow, false,
-                (double[])(object)kernelData, 0, columnsPerRow, true,
-                (double[])(object)flatOutput, 0, outChannels);
-        }
-        else
-        {
-            return false;
-        }
-
-        if (!multiplied) return false;
-
         result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
         var outputData = result.GetDataArray();
         int spatial = outputDepth * outputHeight * outputWidth;
-
-        // GEMM emits [B*OD*OH*OW, OC] (NDHWC flattening). Conv3D's public
-        // contract is NCDHW, so transpose the channel axis into its final layout.
-        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, flatOutput.Length, batchChannel =>
+        try
         {
-            int b = batchChannel / outChannels;
-            int oc = batchChannel % outChannels;
-            int outputBase = (b * outChannels + oc) * spatial;
-            int flatBase = b * spatial * outChannels + oc;
-            for (int position = 0; position < spatial; position++)
-                outputData[outputBase + position] = flatOutput[flatBase + position * outChannels];
-        });
+            for (int rowStart = 0; rowStart < rows; rowStart += tileCapacity)
+            {
+                int tileRows = Math.Min(tileCapacity, rows - rowStart);
+                Helpers.CpuIm2Col3DHelper.BuildColumnsRange(
+                    inputData, columns, rowStart, tileRows,
+                    batch, inChannels, depth, height, width,
+                    kernelDepth, kernelHeight, kernelWidth,
+                    outputDepth, outputHeight, outputWidth,
+                    strideDepth, strideHeight, strideWidth,
+                    padDepth, padHeight, padWidth,
+                    dilationDepth, dilationHeight, dilationWidth);
 
-        return true;
+                bool multiplied;
+                if (typeof(T) == typeof(float))
+                {
+                    multiplied = Helpers.BlasProvider.TryGemmEx(
+                        tileRows, outChannels, columnsPerRow,
+                        (float[])(object)columns, 0, columnsPerRow, false,
+                        (float[])(object)kernelData, 0, columnsPerRow, true,
+                        (float[])(object)flatOutput, 0, outChannels);
+                }
+                else
+                {
+                    multiplied = Helpers.BlasProvider.TryGemmEx(
+                        tileRows, outChannels, columnsPerRow,
+                        (double[])(object)columns, 0, columnsPerRow, false,
+                        (double[])(object)kernelData, 0, columnsPerRow, true,
+                        (double[])(object)flatOutput, 0, outChannels);
+                }
+
+                if (!multiplied)
+                {
+                    result.Dispose();
+                    result = null!;
+                    return false;
+                }
+
+                // GEMM emits [tileRows, OC] in NDHWC row order. Scatter the tile directly into
+                // Conv3D's NCDHW result so no full-size flat output temporary is needed.
+                int currentRowStart = rowStart;
+                CpuParallelSettings.ParallelForOrSerial(0, tileRows,
+                    (long)tileRows * outChannels, localRow =>
+                {
+                    int globalRow = currentRowStart + localRow;
+                    int b = globalRow / spatial;
+                    int position = globalRow - b * spatial;
+                    int flatBase = localRow * outChannels;
+                    for (int oc = 0; oc < outChannels; oc++)
+                        outputData[(b * outChannels + oc) * spatial + position] = flatOutput[flatBase + oc];
+                });
+            }
+
+            return true;
+        }
+        catch
+        {
+            result.Dispose();
+            result = null!;
+            throw;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<T>.Shared.Return(columns);
+            System.Buffers.ArrayPool<T>.Shared.Return(flatOutput);
+        }
     }
 
     /// <inheritdoc/>
@@ -35293,7 +35331,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         var tensor = new Tensor<T>(shape);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(tensor.DataVector.AsWritableSpan());
+        rng.FillUniform(tensor.AsWritableSpan());
         return tensor;
     }
 
@@ -46556,7 +46594,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Zero allocations, zero copy passes — SIMD kernel reads/writes the tensor memory directly.
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
             ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
             var srcD = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
@@ -46570,7 +46608,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
             ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
             var srcF = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
@@ -46586,7 +46624,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // net471 fallback: no MemoryMarshal.CreateSpan. Use temp buffer path.
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             var srcD = new double[n];
             var dstD = new double[n];
             for (int i = 0; i < n; i++)
@@ -46603,7 +46641,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             var srcF = new float[n];
             var dstF = new float[n];
             for (int i = 0; i < n; i++)
@@ -46783,7 +46821,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
             }
             Engines.Simd.SimdKernels.Tanh(srcD, dstD);
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
             return result;
@@ -46799,7 +46837,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
             }
             Engines.Simd.SimdKernels.Tanh(srcF, dstF);
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
@@ -46833,7 +46871,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 fixed (float* ip = srcF) fixed (float* op = dstF)
                     Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
             }
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
@@ -46853,7 +46891,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 fixed (double* ip = srcD) fixed (double* op = dstD)
                     Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
             }
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
             return result;
@@ -46888,7 +46926,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var iSpan = imag.DataVector.AsSpan();
             var rSpan = real.DataVector.AsSpan();
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
             {
                 ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
@@ -46904,7 +46942,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var iSpan = imag.DataVector.AsSpan();
             var rSpan = real.DataVector.AsSpan();
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
             {
                 ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);

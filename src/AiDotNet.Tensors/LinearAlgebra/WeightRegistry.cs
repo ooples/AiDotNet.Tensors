@@ -1523,6 +1523,18 @@ public static class WeightRegistry
                 return;
             }
         }
+        // Native and lossless stores are writable. Persist the CURRENT resident values before
+        // dropping their owner; otherwise ReleaseToPool alone would resurrect the stale snapshot
+        // captured at registration. Quantized inference stores are immutable and their original
+        // pool snapshot remains authoritative.
+        bool storeIsReadOnly = weight.StreamingStoreEncoding != StreamingEncoding.Native
+            && weight.StreamingStoreEncoding != StreamingEncoding.Lossless;
+        if (!storeIsReadOnly && !weight.TryWriteBackResidentForStreaming())
+        {
+            weight.StreamingDropDeferred = true;
+            return;
+        }
+
         // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
         // weight's storage can be SHARED (refcount > 1) at release time when a
         // peer holds a second reference for the duration of the layer's Forward:

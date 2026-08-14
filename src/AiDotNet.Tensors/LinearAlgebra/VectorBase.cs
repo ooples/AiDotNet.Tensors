@@ -39,6 +39,19 @@ public abstract class VectorBase<T>
     private int _logicalLength;
 
     /// <summary>
+    /// Optional owner-supplied guard invoked before this vector exposes mutable storage. Tensor
+    /// owners use it to enforce streaming-store and copy-on-write invariants even when trusted
+    /// engine code reaches the backing vector directly.
+    /// </summary>
+    private System.Action? _beforeWrite;
+
+    /// <summary>Installs the owner validation that must run before mutable storage is exposed.</summary>
+    internal void SetBeforeWriteGuard(System.Action? beforeWrite)
+    {
+        _beforeWrite = beforeWrite;
+    }
+
+    /// <summary>
     /// Optional memory owner for pooled memory management.
     /// When set, the vector's memory comes from a pool and should be returned when disposed.
     /// </summary>
@@ -254,6 +267,7 @@ public abstract class VectorBase<T>
         set
         {
             ValidateIndex(index);
+            _beforeWrite?.Invoke();
             EnsureMaterialized();
             _memory.Span[index] = value;
         }
@@ -334,6 +348,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
+        _beforeWrite?.Invoke();
         EnsureMaterialized();
         return _memory.Span;
     }
@@ -407,6 +422,7 @@ public abstract class VectorBase<T>
     /// </summary>
     internal T[] GetDataArray()
     {
+        _beforeWrite?.Invoke();
         // GPU-resident lazy allocation: allocate backing array on first CPU access
         if (IsLazyAllocated)
         {
@@ -466,6 +482,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        _beforeWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
     }
@@ -826,6 +843,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void AddInPlace(VectorBase<T> other)
     {
+        _beforeWrite?.Invoke();
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
@@ -938,6 +956,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void SubtractInPlace(VectorBase<T> other)
     {
+        _beforeWrite?.Invoke();
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
@@ -1042,6 +1061,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void MultiplyInPlace(T scalar)
     {
+        _beforeWrite?.Invoke();
 #if NET5_0_OR_GREATER
         var arr = _cachedArray;
         if (arr is not null)
@@ -1137,6 +1157,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void DivideInPlace(T scalar)
     {
+        _beforeWrite?.Invoke();
         EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, _memory.Span);
     }

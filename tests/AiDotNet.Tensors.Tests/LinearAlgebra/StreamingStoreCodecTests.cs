@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -13,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// handling, and — the key training-safety property — that STOCHASTIC rounding
 /// is unbiased (the decoded mean of many quantizations equals the original).
 /// </summary>
+[Collection("BlasManaged-Pool-Serial")]
 public class StreamingStoreCodecTests
 {
     private struct Rng
@@ -200,10 +202,12 @@ public class StreamingStoreCodecTests
         Assert.True(Math.Sqrt(sum2 / ref2) < 0.02, "fp64→int8 RMS error ~1%");
     }
 
-    [Fact]
-    public void Int8_TransposedEncoders_AreByteEquivalentToMaterializedTranspose()
+    [Theory]
+    [InlineData(56, 17)]
+    [InlineData(56, 200)]
+    public void Int8_TransposedEncoders_AreByteEquivalentToMaterializedTranspose(
+        int sourceRows, int sourceColumns)
     {
-        const int sourceRows = 56, sourceColumns = 17;
         var sourceFloat = new float[sourceRows * sourceColumns];
         var sourceDouble = new double[sourceFloat.Length];
         for (int i = 0; i < sourceFloat.Length; i++)
@@ -323,11 +327,14 @@ public class StreamingStoreCodecTests
     }
 
     [Theory]
-    [InlineData(8)]  // even groups can encode in parallel without sharing packed bytes
-    [InlineData(7)]  // odd groups intentionally use the sequential nibble-safe path
-    public void Int4_TransposedEncoders_AreByteEquivalentToMaterializedTranspose(int groupSize)
+    [InlineData(56, 17, 8)]   // tiled fast path, one column tile
+    [InlineData(56, 200, 8)]  // tiled fast path, multiple parallel column tiles
+    [InlineData(56, 17, 7)]   // odd groups use the sequential nibble-safe fallback
+    [InlineData(56, 17, 16)]  // even, non-dividing rows: parallel per-group fallback
+    [InlineData(56, 17, 9)]   // odd with a partial final group
+    public void Int4_TransposedEncoders_AreByteEquivalentToMaterializedTranspose(
+        int sourceRows, int sourceColumns, int groupSize)
     {
-        const int sourceRows = 56, sourceColumns = 17;
         var sourceFloat = new float[sourceRows * sourceColumns];
         var sourceDouble = new double[sourceFloat.Length];
         for (int i = 0; i < sourceFloat.Length; i++)
@@ -358,6 +365,48 @@ public class StreamingStoreCodecTests
         StreamingStoreCodec.EncodeInt4TransposedDouble(
             sourceDouble, actualDouble, sourceRows, sourceColumns, groupSize);
         Assert.Equal(expectedDouble, actualDouble);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TransposedQuantizedEncoders_PreserveArgumentExceptionAcrossParallelBackends(
+        bool useCooperativePool)
+    {
+        const int sourceRows = 256, sourceColumns = 512, groupSize = 16;
+        int count = sourceRows * sourceColumns;
+        var sourceFloat = new float[count];
+        var sourceDouble = new double[count];
+        sourceFloat[200] = float.NaN;
+        sourceDouble[200] = double.PositiveInfinity;
+
+        bool previous = CpuParallelSettings.UseCooperativePool;
+        try
+        {
+            CpuParallelSettings.UseCooperativePool = useCooperativePool;
+
+            var int8Float = new byte[StreamingStoreCodec.Int8BufferBytes(count, sourceColumns)];
+            var int8Double = new byte[int8Float.Length];
+            var int4Float = new byte[StreamingStoreCodec.Int4BufferBytes(count, groupSize)];
+            var int4Double = new byte[int4Float.Length];
+
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt8TransposedFloat(
+                    sourceFloat, int8Float, sourceRows, sourceColumns)).Message);
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt8TransposedDouble(
+                    sourceDouble, int8Double, sourceRows, sourceColumns)).Message);
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt4TransposedFloat(
+                    sourceFloat, int4Float, sourceRows, sourceColumns, groupSize)).Message);
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt4TransposedDouble(
+                    sourceDouble, int4Double, sourceRows, sourceColumns, groupSize)).Message);
+        }
+        finally
+        {
+            CpuParallelSettings.UseCooperativePool = previous;
+        }
     }
 
     [Theory]

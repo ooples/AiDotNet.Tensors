@@ -86,7 +86,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Internal accessor for the backing vector. Used by DirectGpuTensorEngine to check
     /// activation cache without triggering CPU materialization.
     /// </summary>
-    internal Vector<T> DataVector => _data;
+    internal Vector<T> DataVector
+    {
+        get
+        {
+            // DataVector is intentionally available to trusted engine code, but the returned
+            // Vector is mutable. Attach the tensor owner's guard before exposing it so a direct
+            // AsWritableSpan/indexer/in-place call cannot bypass streaming or COW safety.
+            _data.SetBeforeWriteGuard(EnsureDataVectorWriteAllowed);
+            return _data;
+        }
+    }
 
     /// <summary>
     /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
@@ -2695,7 +2705,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// shares storage with an independent family. Moving the whole family preserves the normal
     /// rule that writes through a source or any of its metadata views remain mutually visible.
     /// </summary>
-    protected void EnsureOwnedForWrite()
+    private void EnsureStreamingStoreWritable()
     {
         // bf16/int8/int4 are read-only inference encodings. Their pool entry is the canonical
         // quantized snapshot, and re-encoding an arbitrary mutation would compound quantization
@@ -2712,6 +2722,23 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 "(bf16, int8, or int4). Configure StreamingStoreDtype.FullPrecision or Lossless " +
                 "before registering weights that will be updated.");
         }
+    }
+
+    /// <summary>Validates mutations attempted through the trusted backing-vector accessor.</summary>
+    private void EnsureDataVectorWriteAllowed()
+    {
+        EnsureStreamingStoreWritable();
+        if (_cowFamily?.RequiresDetach == true)
+        {
+            throw new InvalidOperationException(
+                "Cannot mutate a copy-on-write tensor through DataVector. Use the tensor writable " +
+                "span or indexer so its alias family can detach before the write.");
+        }
+    }
+
+    protected void EnsureOwnedForWrite()
+    {
+        EnsureStreamingStoreWritable();
 
         var family = _cowFamily;
         if (family is null) return;

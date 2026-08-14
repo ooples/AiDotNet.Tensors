@@ -531,6 +531,10 @@ internal static class StreamingStoreCodec
         // The production Linear layout uses K divisible by the even default group size. Encode a
         // block of output columns together so each source-row read is contiguous and the packed
         // destination cache lines remain hot. This is byte-identical to materializing Wᵀ first.
+        // THREAD-SAFETY INVARIANT: an even groupSize that divides sourceRows forces sourceRows to
+        // be even, so every packed byte lies inside one transposed output row. Column tiles never
+        // read-modify-write a shared nibble byte. Do not relax this guard for odd sourceRows
+        // without serializing the packing pass.
         if ((groupSize & 1) == 0 && sourceRows % groupSize == 0)
         {
             const int columnBlock = 64;
@@ -636,6 +640,10 @@ internal static class StreamingStoreCodec
         WriteInt32(dst, 0, count);
         WriteInt32(dst, 4, groupSize);
 
+        // THREAD-SAFETY INVARIANT: an even groupSize that divides sourceRows forces sourceRows to
+        // be even, so every packed byte lies inside one transposed output row. Column tiles never
+        // read-modify-write a shared nibble byte. Do not relax this guard for odd sourceRows
+        // without serializing the packing pass.
         if ((groupSize & 1) == 0 && sourceRows % groupSize == 0)
         {
             const int columnBlock = 64;

@@ -205,6 +205,21 @@ public class SgemmWithInt8RowScaledCachedBTests
             Assert.Equal(0f, c[i]);
     }
 
+    [Theory]
+    [InlineData(-1, 0, 0, "m")]
+    [InlineData(0, -1, 0, "k")]
+    [InlineData(0, 0, -1, "n")]
+    public void NegativeDimensions_ThrowBeforeTheZeroDimensionFastPath(
+        int m, int k, int n, string parameterName)
+    {
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            SimdGemm.SgemmWithInt8RowScaledCachedB(
+                Array.Empty<float>(), Array.Empty<sbyte>(), ReadOnlySpan<float>.Empty,
+                Array.Empty<float>(), m, k, n));
+
+        Assert.Equal(parameterName, exception.ParamName);
+    }
+
     [Fact]
     public void RowScalesTooShort_Throws()
     {

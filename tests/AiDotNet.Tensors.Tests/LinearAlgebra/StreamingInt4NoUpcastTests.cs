@@ -260,6 +260,7 @@ public class StreamingInt4NoUpcastTests
     {
         var a = actual.AsSpan();
         var e = expected.AsSpan();
+        Assert.Equal(e.Length, a.Length);
         double errorSquared = 0.0, expectedSquared = 0.0;
         for (int i = 0; i < a.Length; i++)
         {

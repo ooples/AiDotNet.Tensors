@@ -401,9 +401,39 @@ internal sealed class PersistentParallelExecutor
         {
             int gm = CpuParallelSettings.MaxDegreeOfParallelism;
             int md = maxDop > 0 ? Math.Min(maxDop, gm) : gm;
-            System.Threading.Tasks.Parallel.For(0, numChunks,
-                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, md) },
-                action);
+            try
+            {
+                System.Threading.Tasks.Parallel.For(0, numChunks,
+                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, md) },
+                    action);
+            }
+            catch (AggregateException aggregate)
+            {
+                // The cooperative executor exposes a worker's original exception. Parallel.For
+                // wraps the same failure in AggregateException, which made caller-visible behavior
+                // depend on the operational A/B switch. Preserve the raw exception contract when
+                // every worker reported the same exception family; retain AggregateException for
+                // genuinely heterogeneous concurrent failures.
+                var failures = aggregate.Flatten().InnerExceptions;
+                if (failures.Count > 0)
+                {
+                    Type failureType = failures[0].GetType();
+                    bool sameType = true;
+                    for (int i = 1; i < failures.Count; i++)
+                    {
+                        if (failures[i].GetType() != failureType)
+                        {
+                            sameType = false;
+                            break;
+                        }
+                    }
+
+                    if (sameType)
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+                }
+
+                throw;
+            }
             return;
         }
 

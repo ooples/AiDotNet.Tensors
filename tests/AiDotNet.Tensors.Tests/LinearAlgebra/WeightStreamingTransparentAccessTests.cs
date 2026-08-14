@@ -165,6 +165,7 @@ public class WeightStreamingTransparentAccessTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => t.SetFlat(1, 99f));
         Assert.Throws<InvalidOperationException>(() => t.CopyFromArray(new[] { 9f, 9f, 9f, 9f }));
         Assert.Throws<InvalidOperationException>(() => _ = t.Memory);
+        Assert.Throws<InvalidOperationException>(() => t.DataVector.AsWritableSpan());
 
         // The rejected write must leave the canonical store readable rather than accepting a
         // mutation that disappears on the next page-out/page-in cycle.
