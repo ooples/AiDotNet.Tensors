@@ -122,25 +122,16 @@ internal sealed class PtxWinogradWmmaPipelinedKernel : IDisposable
     internal unsafe void Launch(
         DirectPtxTensorView u, DirectPtxTensorView input, DirectPtxTensorView bias, DirectPtxTensorView output)
     {
-        Require(u, Blueprint.Tensors[0], nameof(u));
-        Require(input, Blueprint.Tensors[1], nameof(input));
-        Require(bias, Blueprint.Tensors[2], nameof(bias));
-        Require(output, Blueprint.Tensors[3], nameof(output));
+        DirectPtxAbiGuard.Require(u, Blueprint.Tensors[0], nameof(u));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[1], nameof(input));
+        DirectPtxAbiGuard.Require(bias, Blueprint.Tensors[2], nameof(bias));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[3], nameof(output));
         IntPtr uPtr = u.Pointer, iPtr = input.Pointer, bPtr = bias.Pointer, oPtr = output.Pointer;
         void** args = stackalloc void*[4];
         args[0] = &uPtr; args[1] = &iPtr; args[2] = &bPtr; args[3] = &oPtr;
         _module.Launch(_function, (uint)(Tiles / TileP), 1, 1, BlockThreads, 1, 1, 0, args);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     // Emit the input transform for one 16-channel chunk into shared buffer at byte
     // offset bufOff. 128 items (8 tiles x 16 chunk-channels); thread guarded to tid<128.
