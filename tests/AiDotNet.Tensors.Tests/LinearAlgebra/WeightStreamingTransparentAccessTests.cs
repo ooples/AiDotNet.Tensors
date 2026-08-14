@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -168,6 +169,47 @@ public class WeightStreamingTransparentAccessTests : IDisposable
         // The rejected write must leave the canonical store readable rather than accepting a
         // mutation that disappears on the next page-out/page-in cycle.
         Assert.NotEqual(99f, t[0, 1]);
+    }
+
+    [Theory]
+    [InlineData(StreamingStoreDtype.Bf16)]
+    [InlineData(StreamingStoreDtype.Bf16Stochastic)]
+    [InlineData(StreamingStoreDtype.Int8)]
+    [InlineData(StreamingStoreDtype.Int4)]
+    public void QuantizedStreamingEmbeddingLookup_IsReadOnlyAndSurvivesEviction(
+        StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            TransparentAutoEviction = true,
+            StreamingStoreDtype = storeDtype,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+
+        var embeddings = new Tensor<float>(
+            new[] { -4f, -3f, -2f, -1f, 0f, 1f, 2f, 3f, 4f, 5f, 6f, 7f },
+            new[] { 3, 4 });
+        embeddings.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(embeddings);
+        Assert.Equal(0, embeddings.DataVector.Length);
+
+        var indices = new Tensor<int>(new[] { 2, 0 }, new[] { 2 });
+        var result = new CpuEngine().TensorEmbeddingLookup<float, int>(embeddings, indices);
+
+        // Compare against the canonical decoded values, rather than the original fp32 values:
+        // int8/int4 are intentionally lossy. The important contract is that a pure engine read
+        // neither requests mutation nor changes which rows the gather returns.
+        var decoded = embeddings.AsSpan();
+        var actual = result.AsSpan();
+        Assert.Equal(8, actual.Length);
+        for (int column = 0; column < 4; column++)
+        {
+            Assert.Equal(decoded[8 + column], actual[column]);
+            Assert.Equal(decoded[column], actual[4 + column]);
+        }
     }
 
     [Fact]

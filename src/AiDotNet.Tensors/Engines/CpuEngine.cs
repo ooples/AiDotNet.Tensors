@@ -33549,11 +33549,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         // held-out). Refresh the shared idxSnap from the live indices tensor so BOTH this
                         // forward gather AND the matching backward (which holds the same idxSnap array) use the
                         // current step's tokens. Covered by EmbeddingIndicesMustRefreshAcrossStep_NotFrozenAtCompileTime.
-                        var liveRaw = capturedIndices.GetDataArray();
+                        var liveRaw = capturedIndices.GetReadOnlyDataArray();
                         for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveRaw[i]);
                         // Replay forward: re-execute the row-gather into
                         // the pre-allocated output buffer.
-                        var embDataLocal = capturedEmb.GetDataArray();
+                        // Embedding tables are input operands. Inference may keep them in a
+                        // quantized streaming store, whose writable accessors intentionally
+                        // reject mutation; asking for write intent here made a pure gather fail
+                        // after its first eviction. Keep only the destination writable.
+                        var embDataLocal = capturedEmb.GetReadOnlyDataArray();
                         var outDataLocal = output.GetDataArray();
                         for (int i = 0; i < n; i++)
                         {
@@ -33574,9 +33578,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<TValue>(outputShape);
-        var embData = embeddings.GetDataArray();
+        var embData = embeddings.GetReadOnlyDataArray();
         var resultData = result.GetDataArray();
-        var idxData = indices.GetDataArray();
+        var idxData = indices.GetReadOnlyDataArray();
 
         // For each index, copy the entire embedding row. Promote to long
         // for the bounds check so a TIndex=long input with an index that
@@ -33666,8 +33670,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         // via banker's rounding (matches Convert.ToInt32(double)
                         // semantics used by the eager path so any code that flips
                         // between fused and eager produces identical lookups).
-                        var idxData = capturedFloatIdx.GetDataArray();
-                        var embData = capturedEmb.GetDataArray();
+                        var idxData = capturedFloatIdx.GetReadOnlyDataArray();
+                        var embData = capturedEmb.GetReadOnlyDataArray();
                         var outData = output.GetDataArray();
                         for (int i = 0; i < n; i++)
                         {
@@ -33690,7 +33694,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // so eager-path callers transparently get all the work done by the
         // tape-registration + GPU paths in TensorEmbeddingLookup.
         var intIndices = new Tensor<int>(floatIndices._shape);
-        var floatData = floatIndices.GetDataArray();
+        var floatData = floatIndices.GetReadOnlyDataArray();
         var intData = intIndices.GetDataArray();
         var nopsEager = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < numIndices; i++)
@@ -33713,7 +33717,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         int n = indices.Length;
         var snap = new long[n];
-        var raw = indices.GetDataArray();
+        var raw = indices.GetReadOnlyDataArray();
         for (int i = 0; i < n; i++) snap[i] = Convert.ToInt64(raw[i]);
         return snap;
     }
@@ -33733,8 +33737,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradEmbeddings = new Tensor<TValue>(new[] { vocabSize, embeddingDim });
         var gradEmbData = gradEmbeddings.GetDataArray();
 
-        var gradData = gradOutput.GetDataArray();
-        var idxData = indices.GetDataArray();
+        var gradData = gradOutput.GetReadOnlyDataArray();
+        var idxData = indices.GetReadOnlyDataArray();
         int numIndices = indices.Length;
 
         // Scatter-add: for each index, accumulate gradients to the embedding row.
