@@ -25,8 +25,10 @@ public class StreamingMaterializedOwnerBoundTests
 
     private static float Base(int i, int j) => (i * 31 + j) % 251 * 0.5f - 60f;
 
-    [Fact]
-    public void ManyMaterializedOwners_StayBounded_AndMutationsSurviveShed()
+    [Theory]
+    [InlineData(StreamingStoreDtype.FullPrecision)]
+    [InlineData(StreamingStoreDtype.Lossless)]
+    public void ManyMaterializedOwners_StayBounded_AndMutationsSurviveShed(StreamingStoreDtype storeDtype)
     {
         var dir = Path.Combine(Path.GetTempPath(), "aidotnet-1715-" + Guid.NewGuid().ToString("N"));
         try
@@ -36,9 +38,10 @@ public class StreamingMaterializedOwnerBoundTests
                 StreamingBackingStorePath = dir,
                 StreamingPoolMaxResidentBytes = Cap,
                 TransparentAutoEviction = true,
-                // Full precision so the write-back round-trip is exact (the round-trip contract test
-                // asserts exact equality; bf16/lossy stores would lose the mutation's low bits).
-                StreamingStoreDtype = StreamingStoreDtype.FullPrecision,
+                // Both native and lossless are exact writable encodings. Running the same forced
+                // owner-shed round trip for each prevents training's Auto/Lossless tier from
+                // accepting optimizer updates that disappear on eviction.
+                StreamingStoreDtype = storeDtype,
             });
 
             // Register N streaming weights. RegisterWeight snapshots each into the pool and drops its

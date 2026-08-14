@@ -22,8 +22,19 @@ public class DeterministicModeTests
         {
             BlasProvider.SetDeterministicMode(true);
             Assert.True(BlasProvider.IsDeterministicMode);
+            if (BlasProvider.HasRawSgemm)
+                Assert.Equal(1, BlasProvider.GetOpenBlasThreadCount());
+
             BlasProvider.SetDeterministicMode(false);
             Assert.False(BlasProvider.IsDeterministicMode);
+            if (BlasProvider.HasRawSgemm)
+            {
+                // Regression: passing zero to openblas_set_num_threads did not restore the
+                // provider default on several builds, leaving every production GEMM pinned to
+                // one thread after a deterministic test. The cached applied count must always be
+                // an explicit positive value now.
+                Assert.True(BlasProvider.GetOpenBlasThreadCount() > 0);
+            }
         }
         finally
         {

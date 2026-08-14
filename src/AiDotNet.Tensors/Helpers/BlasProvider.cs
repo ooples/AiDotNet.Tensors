@@ -105,6 +105,28 @@ internal static class BlasProvider
     private static int _openblasThreadCount = -1; // -1 = unset
 
     /// <summary>
+    /// Resolves the explicit OpenBLAS thread count used when leaving deterministic mode. Passing
+    /// zero to <c>openblas_set_num_threads</c> does not restore the library default on all builds;
+    /// several builds simply retain the prior single-thread setting. Respect the standard provider
+    /// environment knobs first, then use AiDotNet's process-level CPU parallelism policy.
+    /// </summary>
+    private static int ResolveParallelOpenBlasThreadCount()
+    {
+        foreach (string variable in new[] { "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS" })
+        {
+            string? raw = Environment.GetEnvironmentVariable(variable);
+            if (int.TryParse(raw, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out int configured)
+                && configured > 0)
+            {
+                return configured;
+            }
+        }
+
+        return Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+    }
+
+    /// <summary>
     /// Sets the OpenBLAS internal thread count. Pass 1 to force deterministic
     /// single-threaded GEMM. Caller must verify <see cref="HasNativeDgemm"/>
     /// is true before calling, otherwise the P/Invoke will throw.
@@ -231,7 +253,7 @@ internal static class BlasProvider
                 if (_openblasScopeDepth == 0)
                 {
                     int restore = _openblasScopeRestoreTarget;
-                    TrySetOpenBlasThreads(restore < 0 ? 0 : restore);
+                    TrySetOpenBlasThreads(restore < 0 ? ResolveParallelOpenBlasThreadCount() : restore);
                 }
             }
         }
@@ -1054,7 +1076,7 @@ internal static class BlasProvider
         // on top of the managed-side determinism the SimdGemm fallback
         // already guarantees. Restoring multi-threading on disable lets
         // perf go back up for callers that re-enter non-deterministic mode.
-        TrySetOpenBlasThreads(deterministic ? 1 : 0);
+        TrySetOpenBlasThreads(deterministic ? 1 : ResolveParallelOpenBlasThreadCount());
         // Unify the switch (plan item 1.4): deterministic mode must ALSO make the
         // order-dependent reduction/accumulation kernels bit-reproducible — their
         // multi-threaded partial-sum combine is non-associative. Previously callers
