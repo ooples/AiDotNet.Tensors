@@ -484,6 +484,80 @@ public sealed class TensorArena : IDisposable
         return arr;
     }
 
+    /// <summary>
+    /// Promotes an already-rented arena tensor from scratch storage to the pinned tier.
+    /// </summary>
+    /// <remarks>
+    /// Parameter initialization commonly flows through an engine operation and only becomes
+    /// identifiable as long-lived when the layer calls <c>RegisterPersistentTensor</c>. At that
+    /// point the wrapper may already live in the resettable tensor ring. Leaving it there lets a
+    /// later layer-boundary reset reissue the SAME tensor object as scratch, including reshaping it
+    /// in place. Remove both the wrapper and its backing array from the resettable pools so model
+    /// state remains stable for the arena's lifetime.
+    /// </remarks>
+    internal void PinExistingTensor<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        if (_disposed || tensor is null)
+            return;
+
+        T[]? backing = tensor.GetLiveBackingArrayOrNull();
+        if (backing is null)
+            return;
+
+        bool ownedByArena = false;
+
+        if (_tensorRing is not null)
+        {
+            for (int bucketIndex = 0; bucketIndex < _tensorRingCount; bucketIndex++)
+            {
+                if (_tensorRing[bucketIndex] is not List<object> bucket)
+                    continue;
+
+                for (int itemIndex = 0; itemIndex < bucket.Count; itemIndex++)
+                {
+                    if (!ReferenceEquals(bucket[itemIndex], tensor))
+                        continue;
+
+                    bucket.RemoveAt(itemIndex);
+                    if (_tensorRingCursors![bucketIndex] > itemIndex)
+                        _tensorRingCursors[bucketIndex]--;
+                    ownedByArena = true;
+                    break;
+                }
+            }
+        }
+
+        for (int i = _ringBackingArrays.Count - 1; i >= 0; i--)
+        {
+            if (!ReferenceEquals(_ringBackingArrays[i].Arr, backing))
+                continue;
+            _ringBackingArrays.RemoveAt(i);
+            ownedByArena = true;
+        }
+
+        var scratchKey = (typeof(T), backing.Length);
+        if (_pool.TryGetValue(scratchKey, out var arrays))
+        {
+            for (int i = arrays.Count - 1; i >= 0; i--)
+            {
+                if (!ReferenceEquals(arrays[i], backing))
+                    continue;
+                arrays.RemoveAt(i);
+                if (_cursor[scratchKey] > i)
+                    _cursor[scratchKey]--;
+                ownedByArena = true;
+            }
+        }
+
+        if (!ownedByArena)
+            return;
+
+        for (int i = 0; i < _pinnedArrays.Count; i++)
+            if (ReferenceEquals(_pinnedArrays[i], backing))
+                return;
+        _pinnedArrays.Add(backing);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private T[]? TryAllocateCore<T>(int elementCount, bool clear)
     {

@@ -105,6 +105,30 @@ public class PackAOnlyStrategyTailTests
         }
     }
 
+    [Theory]
+    [InlineData(12, 8, 9, 5, 4, 4)]
+    [InlineData(24, 16, 11, 10, 6, 8)]
+    public void Run_MisalignedMc_DoesNotCreatePartialPackedStripe(
+        int m, int n, int k, int mc, int mr, int nr)
+    {
+        var rng = new Random(1409 + m + n + k + mc + mr + nr);
+        var a = RandD(m * k, rng);
+        var b = RandD(k * n, rng);
+        var c = new double[m * n];
+
+        PackAOnlyStrategy.Run<double>(
+            a, k, false, b, n, c, n, m, n, k,
+            mc: mc, kc: 7, mr: mr, nr: nr,
+            options: new BlasOptions<double> { NumThreads = -1 });
+
+        var expected = Reference(a, b, m, n, k);
+        double tol = 1e-9 * Math.Max(1, k);
+        for (int i = 0; i < c.Length; i++)
+            Assert.True(Math.Abs(expected[i] - c[i]) <= tol,
+                $"[m={m},n={n},k={k},mc={mc},mr={mr},nr={nr}] idx {i}: " +
+                $"{expected[i]} vs {c[i]} (tol={tol})");
+    }
+
     private static double[] Reference(double[] a, double[] b, int m, int n, int k)
     {
         var e = new double[m * n];

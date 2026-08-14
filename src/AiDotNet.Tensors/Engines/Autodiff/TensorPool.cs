@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -101,7 +101,7 @@ public static class TensorPool<T>
         // even without _gpuBuffer set (Half-resident store). Pooling it would FORCE that download to recycle the
         // array. Skip — the few recycled bytes aren't worth breaking residency; the temp is GC'd. Complements the
         // _gpuBuffer check above.
-        var unsafeBacking = tensor.DataVector.GetBackingArrayUnsafe();
+        var unsafeBacking = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsPending(unsafeBacking)) return;
 
         // Issue #338 view-safety: refuse view-tensors whose backing
