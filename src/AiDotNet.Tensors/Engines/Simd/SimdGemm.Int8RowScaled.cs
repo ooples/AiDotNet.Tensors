@@ -38,6 +38,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -98,6 +99,12 @@ internal static partial class SimdGemm
     /// <param name="m">Output rows (batch).</param>
     /// <param name="k">Inner dim.</param>
     /// <param name="n">Output cols (features).</param>
+    /// <remarks>
+    /// This span-compatible adapter is retained for direct kernel callers. The engine-owned hot
+    /// path uses the array overload below so bounded native routes can pin stable buffers without
+    /// copying. Arbitrary spans cannot safely recover their backing-array offset, so this adapter
+    /// owns bounded input/output copies and preserves the original span surface.
+    /// </remarks>
     public static void SgemmWithInt8RowScaledCachedB(
         ReadOnlySpan<float> a,
         sbyte[] bInt8,
@@ -105,7 +112,26 @@ internal static partial class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+        float[] input = a.ToArray();
+        var output = new float[c.Length];
+        SgemmWithInt8RowScaledCachedB(input, bInt8, rowScales, output, m, k, n);
+        output.AsSpan().CopyTo(c);
+    }
+
+    /// <summary>
+    /// Array-backed engine hot path. Stable arrays let the bounded medium-width route use the
+    /// shared BLAS provider directly while wide matrices stay in the no-upcast managed kernel.
+    /// </summary>
+    public static void SgemmWithInt8RowScaledCachedB(
+        float[] a,
+        sbyte[] bInt8,
+        ReadOnlySpan<float> rowScales,
+        float[] c,
+        int m, int k, int n)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
         if (bInt8 is null) throw new ArgumentNullException(nameof(bInt8));
+        if (c is null) throw new ArgumentNullException(nameof(c));
         if (rowScales.Length < n)
             throw new ArgumentException(
                 $"rowScales.Length ({rowScales.Length}) must be >= n ({n}).",
@@ -114,35 +140,50 @@ internal static partial class SimdGemm
             throw new ArgumentException(
                 $"bInt8.Length ({bInt8.Length}) must be >= n*k ({(long)n * k}) for the [n, k] layout.",
                 nameof(bInt8));
-        if (m <= 0 || n <= 0 || k <= 0) { c.Clear(); return; }
+        if (m <= 0 || n <= 0 || k <= 0) { Array.Clear(c, 0, c.Length); return; }
+        if ((long)a.Length < (long)m * k)
+            throw new ArgumentException(
+                $"a.Length ({a.Length}) must be >= m*k ({(long)m * k}).", nameof(a));
+        if ((long)c.Length < (long)m * n)
+            throw new ArgumentException(
+                $"c.Length ({c.Length}) must be >= m*n ({(long)m * n}).", nameof(c));
 
-        c.Clear();
+        c.AsSpan(0, checked(m * n)).Clear();
 
-        // Path A: large-n / AVX-512 — fall back to a one-time on-the-fly
-        // dequant + standard SGEMM. The packed tiled path is sized for the
-        // Nc=4096 sub-block budget; once n exceeds that, the per-tile dequant
-        // overhead in the cached path equals or exceeds a single-pass FP32
-        // dequant + the existing SgemmAddInternal large-n fast path.
-        if (n > Nc || Avx512Sgemm.CanUse)
+        // Path A: for a medium-width AVX-512 shape, one-time dequant + the highly tuned SGEMM can
+        // still beat the AVX2 int8-widening tiles. Wide N must NOT take this route: a paper-scale
+        // [4096,16384] FFN would expand 268 MiB per projection on one thread. The tiled path below
+        // now partitions every output column across cached sub-blocks, so it remains genuinely
+        // no-upcast above Nc=4096.
+        if (n <= Nc && Avx512Sgemm.CanUse)
         {
             // Allocate a single FP32 buffer for the full dequantized B and
-            // run the standard Sgemm. This path is rare (n > 4096 is unusual
-            // for transformer FFN; or AVX-512 hosts where Sgemm dispatches
-            // straight to the 512-bit kernel and per-tile dequant isn't a
-            // win). We don't cache this path — it's the cold/edge case.
+            // run the standard Sgemm. This path is bounded to N <= Nc; wide transformer FFNs stay
+            // in the no-upcast tiled path. We don't cache this medium-width edge case.
             var dequantFull = System.Buffers.ArrayPool<float>.Shared.Rent(n * k);
             try
             {
                 DequantizeInt8WithRowScalesToFloat32_Reference(
                     bInt8, dequantFull.AsSpan(0, n * k), rowScales, n, k);
                 // bInt8 is [n, k] row-major; Sgemm wants B in [k, n].
-                // Use transB:true to read the dequantized [n, k] buffer
-                // through Sgemm's transposed-B path.
-                SgemmAddInternal(
-                    a, k, false,
-                    dequantFull.AsSpan(0, n * k), k, true,
-                    c, m, k, n,
-                    allowParallel: true, clearedOutput: true);
+                // Use transB:true to read the dequantized [n, k] buffer through the shared BLAS
+                // dispatcher. The former SgemmAddInternal call bypassed native BLAS entirely, so
+                // paper-scale FFNs (N=16,384) ran the managed fallback even in production mode and
+                // timed out. TryGemmEx retains the deterministic/managed/autotuned routing contract
+                // and uses native multi-threaded BLAS when selected. Keep the original kernel as a
+                // defensive fallback if a provider reports failure.
+                if (!BlasProvider.TryGemmEx(
+                        m, n, k,
+                        a, 0, k, false,
+                        dequantFull, 0, k, true,
+                        c, 0, n))
+                {
+                    SgemmAddInternal(
+                        a.AsSpan(0, m * k), k, false,
+                        dequantFull.AsSpan(0, n * k), k, true,
+                        c.AsSpan(0, m * n), m, k, n,
+                        allowParallel: true, clearedOutput: true);
+                }
             }
             finally
             {
@@ -224,7 +265,11 @@ internal static partial class SimdGemm
         int maxThreads = Math.Max(1, Math.Min(Environment.ProcessorCount, Int8RowScaledMaxGridThreads));
         int numPcIters = (k + Kc - 1) / Kc;
 
-        int nc0 = Math.Min(Nc, n);
+        // Partition the ENTIRE output width. The previous Math.Min(Nc, n) packed only the first
+        // 4096 columns and forced every wider projection into full fp32 dequantization. Sub-blocks
+        // already carry independent packed buffers and global column offsets, so they naturally
+        // scale across N without another operation or model-specific loop.
+        int nc0 = n;
         int desiredColSubs = Math.Max(1, maxThreads / numRowBlocks);
         int maxColSubs = Math.Max(1, nc0 / (Nr * 4));
         int numColSubBlocks = Math.Min(desiredColSubs, maxColSubs);
@@ -238,22 +283,28 @@ internal static partial class SimdGemm
         int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
         int lastColSubWidth = nc0 - (numColSubBlocks - 1) * colSubSize;
         int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
-        int packedBSizePerSub = Kc * Math.Max(colSubRounded, lastColSubRounded);
+        int maxPackedColumns = Math.Max(colSubRounded, lastColSubRounded);
 
         var packedSubs = new sbyte[numPcIters * numColSubBlocks][];
-        for (int pcIter = 0; pcIter < numPcIters; pcIter++)
+        int totalPackTasks = packedSubs.Length;
+        void PackTask(int task)
         {
+            int pcIter = task / numColSubBlocks;
+            int cs = task % numColSubBlocks;
             int pc = pcIter * Kc;
             int kc = Math.Min(Kc, k - pc);
-            for (int cs = 0; cs < numColSubBlocks; cs++)
-            {
-                int jStart = cs * colSubSize;
-                int subNc = (cs == numColSubBlocks - 1) ? (nc0 - jStart) : colSubSize;
-                var int8Buf = new sbyte[packedBSizePerSub];
-                PackBInt8FromNK(bInt8, int8Buf, k, n, pc, kc, jStart, subNc);
-                packedSubs[pcIter * numColSubBlocks + cs] = int8Buf;
-            }
+            int jStart = cs * colSubSize;
+            int subNc = (cs == numColSubBlocks - 1) ? (nc0 - jStart) : colSubSize;
+            var int8Buf = new sbyte[checked(kc * maxPackedColumns)];
+            PackBInt8FromNK(bInt8, int8Buf, k, n, pc, kc, jStart, subNc);
+            packedSubs[task] = int8Buf;
         }
+
+        // First-use packing is part of cold inference latency. Paper-scale weights previously packed
+        // all Kc×N panels serially even though every destination buffer is independent. Fan the same
+        // stable panel decomposition across the persistent executor; the total-work overload keeps
+        // tiny matrices inline and avoids parallel-startup noise.
+        Helpers.CpuParallelSettings.LightweightParallel(totalPackTasks, (long)n * k, PackTask);
 
         // Defensive copy so the cache key (the sbyte[] reference) is
         // honoured at lookup time — if the caller mutates rowScales
@@ -363,7 +414,7 @@ internal static partial class SimdGemm
         try
         {
             int jc = 0;
-            int nc = Math.Min(Nc, n);
+            int nc = n;
             float[] rowScalesArr = cached.RowScales;
 
             for (int pcIter = 0; pcIter < cached.NumPcIters; pcIter++)
@@ -470,7 +521,7 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
-    /// Reference dequantizer for the large-n / AVX-512 fallback path. Walks
+    /// Reference dequantizer for the bounded AVX-512 fallback path. Walks
     /// the source <c>[n, k]</c> sbyte layout directly (no pack) and writes
     /// the same <c>[n, k]</c> layout in FP32 — the caller passes this to
     /// SgemmAddInternal with <c>transB:true</c>.

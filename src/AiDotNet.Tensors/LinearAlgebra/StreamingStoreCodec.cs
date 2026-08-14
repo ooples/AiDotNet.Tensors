@@ -225,6 +225,123 @@ internal static class StreamingStoreCodec
         }
     }
 
+    /// <summary>
+    /// Fused transpose + per-output-row int8 encoding for a logical Linear weight
+    /// <c>[sourceRows, sourceColumns]</c>. Writes the kernel-ready <c>[sourceColumns, sourceRows]</c>
+    /// layout directly, avoiding a full-size transposed fp32 temporary. Output rows are independent
+    /// and are quantized in parallel for paper-scale weights.
+    /// </summary>
+    internal static void EncodeInt8TransposedFloat(
+        float[] src, byte[] dst, int sourceRows, int sourceColumns)
+    {
+        if (sourceRows <= 0 || sourceColumns <= 0 || (long)sourceRows * sourceColumns != src.Length)
+            throw new ArgumentException("int8 transposed encode dimensions must match src.Length.", nameof(src));
+        int dataOff = Int8HeaderBytes(sourceColumns);
+        WriteInt32(dst, 0, sourceColumns);
+
+        // One-output-column tasks walk src with a sourceColumns-sized stride. On a [4096,16384]
+        // projection that fetches a separate cache line for every scalar and made first-use encoding
+        // take tens of seconds. Work in cache-line-aligned column tiles instead: each source row is
+        // consumed contiguously while only a small set of destination cache lines stays hot.
+        const int columnBlock = 64;
+        int blockCount = (sourceColumns + columnBlock - 1) / columnBlock;
+        Helpers.CpuParallelSettings.LightweightParallel(blockCount, src.Length, block =>
+        {
+            int columnStart = block * columnBlock;
+            int width = Math.Min(columnBlock, sourceColumns - columnStart);
+            var maxima = new float[width];
+
+            for (int inputRow = 0; inputRow < sourceRows; inputRow++)
+            {
+                int sourceBase = inputRow * sourceColumns + columnStart;
+                for (int column = 0; column < width; column++)
+                {
+                    int sourceIndex = sourceBase + column;
+                    float value = src[sourceIndex];
+                    if (float.IsNaN(value) || float.IsInfinity(value))
+                        throw new ArgumentException(
+                            $"int8 streaming-store encoder cannot encode non-finite value at index {sourceIndex} (got {value}).",
+                            nameof(src));
+                    float magnitude = Math.Abs(value);
+                    if (magnitude > maxima[column]) maxima[column] = magnitude;
+                }
+            }
+
+            var inverses = new double[width];
+            for (int column = 0; column < width; column++)
+            {
+                float scale = maxima[column] > 0f ? maxima[column] / 127f : 1f;
+                WriteScaleAt(dst, 4 + (columnStart + column) * 4, scale);
+                inverses[column] = 1.0 / scale;
+            }
+
+            for (int inputRow = 0; inputRow < sourceRows; inputRow++)
+            {
+                int sourceBase = inputRow * sourceColumns + columnStart;
+                for (int column = 0; column < width; column++)
+                {
+                    int outputRow = columnStart + column;
+                    dst[dataOff + outputRow * sourceRows + inputRow]
+                        = QuantOne(src[sourceBase + column], inverses[column]);
+                }
+            }
+        });
+    }
+
+    /// <summary>fp64 counterpart of <see cref="EncodeInt8TransposedFloat"/>.</summary>
+    internal static void EncodeInt8TransposedDouble(
+        double[] src, byte[] dst, int sourceRows, int sourceColumns)
+    {
+        if (sourceRows <= 0 || sourceColumns <= 0 || (long)sourceRows * sourceColumns != src.Length)
+            throw new ArgumentException("int8 transposed encode dimensions must match src.Length.", nameof(src));
+        int dataOff = Int8HeaderBytes(sourceColumns);
+        WriteInt32(dst, 0, sourceColumns);
+
+        const int columnBlock = 64;
+        int blockCount = (sourceColumns + columnBlock - 1) / columnBlock;
+        Helpers.CpuParallelSettings.LightweightParallel(blockCount, src.Length, block =>
+        {
+            int columnStart = block * columnBlock;
+            int width = Math.Min(columnBlock, sourceColumns - columnStart);
+            var maxima = new double[width];
+
+            for (int inputRow = 0; inputRow < sourceRows; inputRow++)
+            {
+                int sourceBase = inputRow * sourceColumns + columnStart;
+                for (int column = 0; column < width; column++)
+                {
+                    int sourceIndex = sourceBase + column;
+                    double value = src[sourceIndex];
+                    if (double.IsNaN(value) || double.IsInfinity(value))
+                        throw new ArgumentException(
+                            $"int8 streaming-store encoder cannot encode non-finite value at index {sourceIndex} (got {value}).",
+                            nameof(src));
+                    double magnitude = Math.Abs(value);
+                    if (magnitude > maxima[column]) maxima[column] = magnitude;
+                }
+            }
+
+            var inverses = new double[width];
+            for (int column = 0; column < width; column++)
+            {
+                float scale = maxima[column] > 0.0 ? (float)(maxima[column] / 127.0) : 1f;
+                WriteScaleAt(dst, 4 + (columnStart + column) * 4, scale);
+                inverses[column] = 1.0 / scale;
+            }
+
+            for (int inputRow = 0; inputRow < sourceRows; inputRow++)
+            {
+                int sourceBase = inputRow * sourceColumns + columnStart;
+                for (int column = 0; column < width; column++)
+                {
+                    int outputRow = columnStart + column;
+                    dst[dataOff + outputRow * sourceRows + inputRow]
+                        = QuantOne(src[sourceBase + column], inverses[column]);
+                }
+            }
+        });
+    }
+
     /// <summary>per-row int8 → fp32 (dequant fallback). <paramref name="src"/> is the encoded buffer.</summary>
     internal static void DecodeInt8Float(ReadOnlySpan<byte> src, Span<float> dst)
     {
@@ -388,6 +505,225 @@ internal static class StreamingStoreCodec
             double inv = 1.0 / scale;
             for (int j = 0; j < len; j++) PackNibble(dst, dataOff, baseI + j, QuantOneInt4(src[baseI + j], inv));
         }
+    }
+
+    /// <summary>
+    /// Fused transpose + int4 group encoding for a logical Linear weight
+    /// <c>[sourceRows, sourceColumns]</c>. The encoded element at flat index <c>i</c> is read from
+    /// the corresponding position in the transposed <c>[sourceColumns, sourceRows]</c> view, so no
+    /// full-size floating-point transpose is allocated. Even-sized groups occupy disjoint packed
+    /// bytes and can therefore be encoded independently in parallel.
+    /// </summary>
+    internal static void EncodeInt4TransposedFloat(
+        float[] src, byte[] dst, int sourceRows, int sourceColumns, int groupSize)
+    {
+        if (sourceRows <= 0 || sourceColumns <= 0 || (long)sourceRows * sourceColumns != src.Length)
+            throw new ArgumentException("int4 transposed encode dimensions must match src.Length.", nameof(src));
+        if (groupSize <= 0)
+            throw new ArgumentException($"int4 encode: groupSize ({groupSize}) must be > 0.", nameof(groupSize));
+
+        int count = src.Length;
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        WriteInt32(dst, 0, count);
+        WriteInt32(dst, 4, groupSize);
+
+        // The production Linear layout uses K divisible by the even default group size. Encode a
+        // block of output columns together so each source-row read is contiguous and the packed
+        // destination cache lines remain hot. This is byte-identical to materializing Wᵀ first.
+        if ((groupSize & 1) == 0 && sourceRows % groupSize == 0)
+        {
+            const int columnBlock = 64;
+            int blockCount = (sourceColumns + columnBlock - 1) / columnBlock;
+            Helpers.CpuParallelSettings.LightweightParallel(blockCount, count, block =>
+            {
+                int columnStart = block * columnBlock;
+                int width = Math.Min(columnBlock, sourceColumns - columnStart);
+                var maxima = new float[width];
+                var inverses = new double[width];
+
+                for (int rowStart = 0; rowStart < sourceRows; rowStart += groupSize)
+                {
+                    Array.Clear(maxima, 0, width);
+                    for (int inputRow = rowStart; inputRow < rowStart + groupSize; inputRow++)
+                    {
+                        int sourceBase = inputRow * sourceColumns + columnStart;
+                        for (int column = 0; column < width; column++)
+                        {
+                            int sourceIndex = sourceBase + column;
+                            float value = src[sourceIndex];
+                            if (float.IsNaN(value) || float.IsInfinity(value))
+                                throw new ArgumentException(
+                                    $"int4 streaming-store encoder cannot encode non-finite value at index {sourceIndex} (got {value}).",
+                                    nameof(src));
+                            float magnitude = Math.Abs(value);
+                            if (magnitude > maxima[column]) maxima[column] = magnitude;
+                        }
+                    }
+
+                    for (int column = 0; column < width; column++)
+                    {
+                        float scale = maxima[column] > 0f ? maxima[column] / 7f : 1f;
+                        int transposedIndex = (columnStart + column) * sourceRows + rowStart;
+                        WriteScaleAt(dst, 8 + (transposedIndex / groupSize) * 4, scale);
+                        inverses[column] = 1.0 / scale;
+                    }
+
+                    for (int inputRow = rowStart; inputRow < rowStart + groupSize; inputRow++)
+                    {
+                        int sourceBase = inputRow * sourceColumns + columnStart;
+                        for (int column = 0; column < width; column++)
+                        {
+                            int transposedIndex = (columnStart + column) * sourceRows + inputRow;
+                            PackNibble(dst, dataOff, transposedIndex,
+                                QuantOneInt4(src[sourceBase + column], inverses[column]));
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        void EncodeGroup(int group)
+        {
+            int baseI = group * groupSize;
+            int len = Math.Min(groupSize, count - baseI);
+            float amax = 0f;
+            for (int j = 0; j < len; j++)
+            {
+                int transposedIndex = baseI + j;
+                int sourceIndex = (transposedIndex % sourceRows) * sourceColumns
+                    + transposedIndex / sourceRows;
+                float value = src[sourceIndex];
+                if (float.IsNaN(value) || float.IsInfinity(value))
+                    throw new ArgumentException(
+                        $"int4 streaming-store encoder cannot encode non-finite value at index {sourceIndex} (got {value}).",
+                        nameof(src));
+                float magnitude = Math.Abs(value);
+                if (magnitude > amax) amax = magnitude;
+            }
+
+            float scale = amax > 0f ? amax / 7f : 1f;
+            WriteScaleAt(dst, 8 + group * 4, scale);
+            double inv = 1.0 / scale;
+            for (int j = 0; j < len; j++)
+            {
+                int transposedIndex = baseI + j;
+                int sourceIndex = (transposedIndex % sourceRows) * sourceColumns
+                    + transposedIndex / sourceRows;
+                PackNibble(dst, dataOff, transposedIndex, QuantOneInt4(src[sourceIndex], inv));
+            }
+        }
+
+        if ((groupSize & 1) == 0)
+            Helpers.CpuParallelSettings.LightweightParallel(numGroups, count, EncodeGroup);
+        else
+            for (int group = 0; group < numGroups; group++) EncodeGroup(group);
+    }
+
+    /// <summary>fp64 counterpart of <see cref="EncodeInt4TransposedFloat"/>.</summary>
+    internal static void EncodeInt4TransposedDouble(
+        double[] src, byte[] dst, int sourceRows, int sourceColumns, int groupSize)
+    {
+        if (sourceRows <= 0 || sourceColumns <= 0 || (long)sourceRows * sourceColumns != src.Length)
+            throw new ArgumentException("int4 transposed encode dimensions must match src.Length.", nameof(src));
+        if (groupSize <= 0)
+            throw new ArgumentException($"int4 encode: groupSize ({groupSize}) must be > 0.", nameof(groupSize));
+
+        int count = src.Length;
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        WriteInt32(dst, 0, count);
+        WriteInt32(dst, 4, groupSize);
+
+        if ((groupSize & 1) == 0 && sourceRows % groupSize == 0)
+        {
+            const int columnBlock = 64;
+            int blockCount = (sourceColumns + columnBlock - 1) / columnBlock;
+            Helpers.CpuParallelSettings.LightweightParallel(blockCount, count, block =>
+            {
+                int columnStart = block * columnBlock;
+                int width = Math.Min(columnBlock, sourceColumns - columnStart);
+                var maxima = new double[width];
+                var inverses = new double[width];
+
+                for (int rowStart = 0; rowStart < sourceRows; rowStart += groupSize)
+                {
+                    Array.Clear(maxima, 0, width);
+                    for (int inputRow = rowStart; inputRow < rowStart + groupSize; inputRow++)
+                    {
+                        int sourceBase = inputRow * sourceColumns + columnStart;
+                        for (int column = 0; column < width; column++)
+                        {
+                            int sourceIndex = sourceBase + column;
+                            double value = src[sourceIndex];
+                            if (double.IsNaN(value) || double.IsInfinity(value))
+                                throw new ArgumentException(
+                                    $"int4 streaming-store encoder cannot encode non-finite value at index {sourceIndex} (got {value}).",
+                                    nameof(src));
+                            double magnitude = Math.Abs(value);
+                            if (magnitude > maxima[column]) maxima[column] = magnitude;
+                        }
+                    }
+
+                    for (int column = 0; column < width; column++)
+                    {
+                        float scale = maxima[column] > 0.0 ? (float)(maxima[column] / 7.0) : 1f;
+                        int transposedIndex = (columnStart + column) * sourceRows + rowStart;
+                        WriteScaleAt(dst, 8 + (transposedIndex / groupSize) * 4, scale);
+                        inverses[column] = 1.0 / scale;
+                    }
+
+                    for (int inputRow = rowStart; inputRow < rowStart + groupSize; inputRow++)
+                    {
+                        int sourceBase = inputRow * sourceColumns + columnStart;
+                        for (int column = 0; column < width; column++)
+                        {
+                            int transposedIndex = (columnStart + column) * sourceRows + inputRow;
+                            PackNibble(dst, dataOff, transposedIndex,
+                                QuantOneInt4(src[sourceBase + column], inverses[column]));
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        void EncodeGroup(int group)
+        {
+            int baseI = group * groupSize;
+            int len = Math.Min(groupSize, count - baseI);
+            double amax = 0.0;
+            for (int j = 0; j < len; j++)
+            {
+                int transposedIndex = baseI + j;
+                int sourceIndex = (transposedIndex % sourceRows) * sourceColumns
+                    + transposedIndex / sourceRows;
+                double value = src[sourceIndex];
+                if (double.IsNaN(value) || double.IsInfinity(value))
+                    throw new ArgumentException(
+                        $"int4 streaming-store encoder cannot encode non-finite value at index {sourceIndex} (got {value}).",
+                        nameof(src));
+                double magnitude = Math.Abs(value);
+                if (magnitude > amax) amax = magnitude;
+            }
+
+            float scale = amax > 0.0 ? (float)(amax / 7.0) : 1f;
+            WriteScaleAt(dst, 8 + group * 4, scale);
+            double inv = 1.0 / scale;
+            for (int j = 0; j < len; j++)
+            {
+                int transposedIndex = baseI + j;
+                int sourceIndex = (transposedIndex % sourceRows) * sourceColumns
+                    + transposedIndex / sourceRows;
+                PackNibble(dst, dataOff, transposedIndex, QuantOneInt4(src[sourceIndex], inv));
+            }
+        }
+
+        if ((groupSize & 1) == 0)
+            Helpers.CpuParallelSettings.LightweightParallel(numGroups, count, EncodeGroup);
+        else
+            for (int group = 0; group < numGroups; group++) EncodeGroup(group);
     }
 
     /// <summary>int4 group-quant → fp32 (dequant). <paramref name="src"/> is the encoded buffer.</summary>

@@ -1054,16 +1054,20 @@ public static class WeightRegistry
             int rows = tensor.Int8QuantRows;
             if (typeof(T) == typeof(float))
             {
-                var srcF = (float[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
+                var srcF = (float[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt8TransposedFloat(srcF, dst, tensor._shape[0], tensor._shape[1]);
+                else
+                    StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
-                var srcD = (double[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
+                var srcD = (double[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt8TransposedDouble(srcD, dst, tensor._shape[0], tensor._shape[1]);
+                else
+                    StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
                 return;
             }
             throw new NotSupportedException(
@@ -1082,16 +1086,20 @@ public static class WeightRegistry
             int gs = StreamingStoreCodec.DefaultInt4GroupSize;
             if (typeof(T) == typeof(float))
             {
-                var srcF = (float[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt4Float(srcF, dst, gs);
+                var srcF = (float[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt4TransposedFloat(srcF, dst, tensor._shape[0], tensor._shape[1], gs);
+                else
+                    StreamingStoreCodec.EncodeInt4Float(srcF, dst, gs);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
-                var srcD = (double[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt4Double(srcD, dst, gs);
+                var srcD = (double[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt4TransposedDouble(srcD, dst, tensor._shape[0], tensor._shape[1], gs);
+                else
+                    StreamingStoreCodec.EncodeInt4Double(srcD, dst, gs);
                 return;
             }
             throw new NotSupportedException(

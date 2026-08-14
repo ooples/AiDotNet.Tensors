@@ -12892,6 +12892,17 @@ public partial class CpuEngine : ITensorLevelEngine
         // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, p });
 
+#if NET5_0_OR_GREATER
+        // A streamed inference weight is stored in the quantized kernel layout [P,N]
+        // even though its logical tensor shape remains [N,P]. Consume that representation
+        // directly before any Data/AsSpan access can lazily create a full fp32 copy. This
+        // makes the no-upcast contract apply to ordinary TensorMatMul, not only FusedLinear.
+        if (TryTensorMatMulStreamingWeight(a, b, result, m, n, p))
+        {
+            return result;
+        }
+#endif
+
         if (p == 1 && TryTensorMatMulGemv(a, b, result, m, n))
         {
             return result;
@@ -13036,6 +13047,45 @@ public partial class CpuEngine : ITensorLevelEngine
 
         return result;
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Executes <c>A[rows,K] * B[K,N]</c> directly from B's no-upcast int8/int4
+    /// streaming representation. Returns false for normal, non-float, or training
+    /// weights without touching their data.
+    /// </summary>
+    private static bool TryTensorMatMulStreamingWeight<T>(
+        Tensor<T> a, Tensor<T> b, Tensor<T> result, int rows, int k, int outputColumns)
+    {
+        if (typeof(T) != typeof(float) || !a.IsContiguous || !b.IsContiguous)
+        {
+            return false;
+        }
+
+        var q8 = b.GetMaterializedStreamingInt8();
+        if (q8 is not null && q8.Rows == outputColumns && q8.K == k)
+        {
+            var input = (float[])(object)a.GetReadOnlyDataArray();
+            var output = (float[])(object)result.GetDataArray();
+            Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
+                input, q8.Data, q8.Scales, output, rows, k, outputColumns);
+            return true;
+        }
+
+        var q4 = b.GetMaterializedStreamingInt4();
+        if (q4 is not null && q4.Rows == outputColumns && q4.K == k)
+        {
+            var input = (float[])(object)a.GetReadOnlyDataArray();
+            var output = (float[])(object)result.GetDataArray();
+            Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
+                input, q4.Data, q4.GroupScales, q4.GroupSize,
+                output, rows, k, outputColumns);
+            return true;
+        }
+
+        return false;
+    }
+#endif
 
     /// <summary>
     /// Sub-E (#373): inference fast path that consumes a pre-packed weight handle
@@ -13259,6 +13309,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
+
+#if NET5_0_OR_GREATER
+        // All batch slices are contiguous in A, so the broadcast ND x 2D operation is
+        // one [batchSize*M,K] projection. Route streamed weights before bData/Data is
+        // requested; those accessors intentionally dequantize as a generic fallback.
+        if (TryTensorMatMulStreamingWeight(a, b, result, batchSize * m, n, p))
+        {
+            return result;
+        }
+#endif
 
         var aData = a.GetReadOnlyDataArray();
         var bData = b.GetReadOnlyDataArray();
@@ -38751,7 +38811,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var inA = (float[])(object)input.GetReadOnlyDataArray();
                     var outA = (float[])(object)int8Result.GetDataArray();
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
-                        inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
+                        inA, q8.Data, q8.Scales, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
                         var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
@@ -39051,7 +39111,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var inA = (float[])(object)input.GetReadOnlyDataArray();
                     var outA = (float[])(object)destination.GetDataArray();
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
-                        inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
+                        inA, q8.Data, q8.Scales, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
                         var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;

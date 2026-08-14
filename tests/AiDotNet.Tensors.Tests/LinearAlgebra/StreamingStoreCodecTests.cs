@@ -201,6 +201,40 @@ public class StreamingStoreCodecTests
     }
 
     [Fact]
+    public void Int8_TransposedEncoders_AreByteEquivalentToMaterializedTranspose()
+    {
+        const int sourceRows = 56, sourceColumns = 17;
+        var sourceFloat = new float[sourceRows * sourceColumns];
+        var sourceDouble = new double[sourceFloat.Length];
+        for (int i = 0; i < sourceFloat.Length; i++)
+        {
+            sourceFloat[i] = (float)(Math.Sin(i * 0.17) * (1 + i % 11));
+            sourceDouble[i] = Math.Cos(i * 0.11) * (1 + i % 7);
+        }
+
+        var transposedFloat = new float[sourceFloat.Length];
+        var transposedDouble = new double[sourceDouble.Length];
+        for (int row = 0; row < sourceRows; row++)
+        for (int column = 0; column < sourceColumns; column++)
+        {
+            transposedFloat[column * sourceRows + row] = sourceFloat[row * sourceColumns + column];
+            transposedDouble[column * sourceRows + row] = sourceDouble[row * sourceColumns + column];
+        }
+
+        var expectedFloat = new byte[StreamingStoreCodec.Int8BufferBytes(sourceFloat.Length, sourceColumns)];
+        var actualFloat = new byte[expectedFloat.Length];
+        StreamingStoreCodec.EncodeInt8Float(transposedFloat, expectedFloat, sourceColumns);
+        StreamingStoreCodec.EncodeInt8TransposedFloat(sourceFloat, actualFloat, sourceRows, sourceColumns);
+        Assert.Equal(expectedFloat, actualFloat);
+
+        var expectedDouble = new byte[StreamingStoreCodec.Int8BufferBytes(sourceDouble.Length, sourceColumns)];
+        var actualDouble = new byte[expectedDouble.Length];
+        StreamingStoreCodec.EncodeInt8Double(transposedDouble, expectedDouble, sourceColumns);
+        StreamingStoreCodec.EncodeInt8TransposedDouble(sourceDouble, actualDouble, sourceRows, sourceColumns);
+        Assert.Equal(expectedDouble, actualDouble);
+    }
+
+    [Fact]
     public void Int4_RoundTrip_8xSmaller_WithinGroupPrecision()
     {
         var rng = new Rng(13);
@@ -286,6 +320,44 @@ public class StreamingStoreCodecTests
         double sum2 = 0, ref2 = 0;
         for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += src[i] * src[i]; }
         Assert.True(Math.Sqrt(sum2 / ref2) < 0.18, "fp64→int4 group-quant RMS error ~12-15%");
+    }
+
+    [Theory]
+    [InlineData(8)]  // even groups can encode in parallel without sharing packed bytes
+    [InlineData(7)]  // odd groups intentionally use the sequential nibble-safe path
+    public void Int4_TransposedEncoders_AreByteEquivalentToMaterializedTranspose(int groupSize)
+    {
+        const int sourceRows = 56, sourceColumns = 17;
+        var sourceFloat = new float[sourceRows * sourceColumns];
+        var sourceDouble = new double[sourceFloat.Length];
+        for (int i = 0; i < sourceFloat.Length; i++)
+        {
+            sourceFloat[i] = (float)(Math.Sin(i * 0.17) * (1 + i % 11));
+            sourceDouble[i] = Math.Cos(i * 0.11) * (1 + i % 7);
+        }
+
+        var transposedFloat = new float[sourceFloat.Length];
+        var transposedDouble = new double[sourceDouble.Length];
+        for (int row = 0; row < sourceRows; row++)
+        for (int column = 0; column < sourceColumns; column++)
+        {
+            transposedFloat[column * sourceRows + row] = sourceFloat[row * sourceColumns + column];
+            transposedDouble[column * sourceRows + row] = sourceDouble[row * sourceColumns + column];
+        }
+
+        var expectedFloat = new byte[StreamingStoreCodec.Int4BufferBytes(sourceFloat.Length, groupSize)];
+        var actualFloat = new byte[expectedFloat.Length];
+        StreamingStoreCodec.EncodeInt4Float(transposedFloat, expectedFloat, groupSize);
+        StreamingStoreCodec.EncodeInt4TransposedFloat(
+            sourceFloat, actualFloat, sourceRows, sourceColumns, groupSize);
+        Assert.Equal(expectedFloat, actualFloat);
+
+        var expectedDouble = new byte[StreamingStoreCodec.Int4BufferBytes(sourceDouble.Length, groupSize)];
+        var actualDouble = new byte[expectedDouble.Length];
+        StreamingStoreCodec.EncodeInt4Double(transposedDouble, expectedDouble, groupSize);
+        StreamingStoreCodec.EncodeInt4TransposedDouble(
+            sourceDouble, actualDouble, sourceRows, sourceColumns, groupSize);
+        Assert.Equal(expectedDouble, actualDouble);
     }
 
     [Theory]
