@@ -2174,11 +2174,11 @@ public class GpuCpuConsistencyTests
                 sparseValues, sparseBias, FusedActivationType.None);
 
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                actualLora.DataVector.GetBackingArrayUnsafe()!));
+                actualLora.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                actualDdim.DataVector.GetBackingArrayUnsafe()!));
+                actualDdim.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                actualSparse.DataVector.GetBackingArrayUnsafe()!));
+                actualSparse.GetBackingArrayForCacheLookupUnsafe()!));
             AssertTensorClose(expectedLora, actualLora, "fused LoRA");
             AssertTensorClose(expectedDdim, actualDdim, "fused DDIM");
             AssertTensorClose(expectedSparse, actualSparse, "fused sparse linear");
@@ -2212,9 +2212,9 @@ public class GpuCpuConsistencyTests
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
                 testElements.DataVector));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                selected.DataVector.GetBackingArrayUnsafe()!));
+                selected.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                inverted.DataVector.GetBackingArrayUnsafe()!));
+                inverted.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.Equal(new[] { false, true, false, true, true, false },
                 selected.GetDataArray().Select(value => (bool)value).ToArray());
             Assert.Equal(new[] { true, false, true, false, false, true },
@@ -2245,7 +2245,7 @@ public class GpuCpuConsistencyTests
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
                 values.DataVector));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                mask.DataVector.GetBackingArrayUnsafe()!));
+                mask.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
                 selected.DataVector));
             Assert.Equal(new[] { -3f, -1f, 2f }, selected.GetDataArray());
@@ -2375,13 +2375,13 @@ public class GpuCpuConsistencyTests
             var interfaceEmbedded = engine.Embedding(indices, embeddingTable);
 
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                indices.DataVector.GetBackingArrayUnsafe()!));
+                indices.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                rowIndices.DataVector.GetBackingArrayUnsafe()!));
+                rowIndices.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                columnIndices.DataVector.GetBackingArrayUnsafe()!));
+                columnIndices.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-                mask.DataVector.GetBackingArrayUnsafe()!));
+                mask.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(copied.DataVector));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(filled.DataVector));
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(put.DataVector));
@@ -2511,11 +2511,11 @@ public class GpuCpuConsistencyTests
 
         Assert.Equal(0, GpuLaunchProbe.Readbacks);
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-            sourceIndices.DataVector.GetBackingArrayUnsafe()!));
+            sourceIndices.GetBackingArrayForCacheLookupUnsafe()!));
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
-            targetIndices.DataVector.GetBackingArrayUnsafe()!));
-        var actualBacking = actual.DataVector.GetBackingArrayUnsafe();
-        var coefficientBacking = actualCoefficients.DataVector.GetBackingArrayUnsafe();
+            targetIndices.GetBackingArrayForCacheLookupUnsafe()!));
+        var actualBacking = actual.GetBackingArrayForCacheLookupUnsafe();
+        var coefficientBacking = actualCoefficients.GetBackingArrayForCacheLookupUnsafe();
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector)
             || (actualBacking is not null &&
                 AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualBacking)));
@@ -2565,7 +2565,7 @@ public class GpuCpuConsistencyTests
             vertices, residentFaces, LaplacianType.Uniform);
 
         Assert.Equal(0, GpuLaunchProbe.Readbacks);
-        var faceBacking = residentFaces.DataVector.GetBackingArrayUnsafe();
+        var faceBacking = residentFaces.GetBackingArrayForCacheLookupUnsafe();
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
                 residentFaces.DataVector)
             || (faceBacking is not null &&

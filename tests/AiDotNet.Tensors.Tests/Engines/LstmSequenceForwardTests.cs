@@ -83,6 +83,32 @@ public class LstmSequenceForwardTests
     }
 
     [Fact]
+    public void LstmSequenceForward_NonContiguousSequenceView_MatchesContiguousInput()
+    {
+        const int batch = 2, seq = 4, inFeatures = 3, hidden = 5;
+        var rng = new Random(2027);
+
+        // Model the layout produced by audio models: [B, channels, seq] is
+        // permuted to [B, seq, channels] without copying before it reaches LSTM.
+        var channelsFirst = MakeRandom(rng, batch, inFeatures, seq);
+        var sequenceView = _engine.TensorPermute(channelsFirst, new[] { 0, 2, 1 });
+        var contiguous = sequenceView.Contiguous();
+        var wIh = MakeRandom(rng, 4 * hidden, inFeatures);
+        var wHh = MakeRandom(rng, 4 * hidden, hidden);
+        var bIh = MakeRandom1D(rng, 4 * hidden);
+        var bHh = MakeRandom1D(rng, 4 * hidden);
+
+        Assert.False(sequenceView.IsContiguous);
+
+        var expected = _engine.LstmSequenceForward(
+            contiguous, null, null, wIh, wHh, bIh, bHh, returnSequences: true);
+        var actual = _engine.LstmSequenceForward(
+            sequenceView, null, null, wIh, wHh, bIh, bHh, returnSequences: true);
+
+        AssertClose(actual, expected, atol: 1e-6f);
+    }
+
+    [Fact]
     public void LstmSequenceForward_FinalStates_EnableChunkedInference()
     {
         const int batch = 2, seq = 6, inFeatures = 3, hidden = 5, half = 3;

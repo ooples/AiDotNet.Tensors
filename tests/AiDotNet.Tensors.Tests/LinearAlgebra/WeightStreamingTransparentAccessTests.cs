@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -101,6 +102,166 @@ public class WeightStreamingTransparentAccessTests : IDisposable
         // A single-element read through the flat indexer must auto-rehydrate.
         Assert.Equal(30f, t[2]);
         Assert.Equal(50f, t[4]);
+    }
+
+    [Fact]
+    public void MultiDimensionalIndexer_OnDroppedStreamingWeight_AutoRehydrates()
+    {
+        float[] expected = { 10f, 20f, 30f, 40f, 50f, 60f };
+        var t = new Tensor<float>(expected, new[] { 2, 3 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        // DenseLayer's adaptive resize copies weights through t[input, output]. The
+        // multi-index accessor must provide the same transparent streaming contract as
+        // flat indexing rather than reading the dropped, zero-length backing Vector.
+        Assert.Equal(30f, t[0, 2]);
+        Assert.Equal(50f, t[1, 1]);
+        Assert.Equal(expected.Length, t.DataVector.Length);
+    }
+
+    [Fact]
+    public void MultiDimensionalIndexerWrite_OnDroppedStreamingWeight_PreservesOtherValues()
+    {
+        float[] expected = { 1f, 2f, 3f, 4f };
+        var t = new Tensor<float>(expected, new[] { 2, 2 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        t[1, 0] = 99f;
+
+        Assert.Equal(1f, t[0, 0]);
+        Assert.Equal(2f, t[0, 1]);
+        Assert.Equal(99f, t[1, 0]);
+        Assert.Equal(4f, t[1, 1]);
+    }
+
+    [Theory]
+    [InlineData(StreamingStoreDtype.Bf16)]
+    [InlineData(StreamingStoreDtype.Bf16Stochastic)]
+    [InlineData(StreamingStoreDtype.Int8)]
+    [InlineData(StreamingStoreDtype.Int4)]
+    public void QuantizedStreamingWeight_RejectsMutationBeforeItCanBeLost(StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            TransparentAutoEviction = true,
+            StreamingStoreDtype = storeDtype,
+        });
+
+        float[] expected = { 1f, -2f, 3f, -4f };
+        var t = new Tensor<float>(expected, new[] { 2, 2 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        var error = Assert.Throws<InvalidOperationException>(() => t[0, 1] = 99f);
+        Assert.Contains("quantized inference encoding", error.Message, StringComparison.Ordinal);
+        Assert.Throws<InvalidOperationException>(() => t.SetFlat(1, 99f));
+        Assert.Throws<InvalidOperationException>(() => t.CopyFromArray(new[] { 9f, 9f, 9f, 9f }));
+        Assert.Throws<InvalidOperationException>(() => _ = t.Memory);
+        Assert.Throws<InvalidOperationException>(() => t.DataVector.AsWritableSpan());
+
+        // Materialize a floating-point owner, then attempt both raw-array escape paths. Each
+        // closure would mutate the backing storage if the DataVector guard were bypassed.
+        _ = t[0, 0];
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            var backing = t.DataVector.GetBackingArrayUnsafe();
+            backing![0] = 99f;
+        });
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            if (t.DataVector.TryGetBackingArraySegment(out var backing, out int offset))
+                backing![offset] = 99f;
+        });
+
+        // The rejected write must leave the canonical store readable rather than accepting a
+        // mutation that disappears on the next page-out/page-in cycle.
+        Assert.NotEqual(99f, t[0, 1]);
+    }
+
+    [Theory]
+    [InlineData(StreamingStoreDtype.Bf16)]
+    [InlineData(StreamingStoreDtype.Bf16Stochastic)]
+    [InlineData(StreamingStoreDtype.Int8)]
+    [InlineData(StreamingStoreDtype.Int4)]
+    public void QuantizedStreamingEmbeddingLookup_IsReadOnlyAndSurvivesEviction(
+        StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            TransparentAutoEviction = true,
+            StreamingStoreDtype = storeDtype,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+
+        var embeddings = new Tensor<float>(
+            new[] { -4f, -3f, -2f, -1f, 0f, 1f, 2f, 3f, 4f, 5f, 6f, 7f },
+            new[] { 3, 4 });
+        embeddings.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(embeddings);
+        Assert.Equal(0, embeddings.DataVector.Length);
+
+        var indices = new Tensor<int>(new[] { 2, 0 }, new[] { 2 });
+        var result = new CpuEngine().TensorEmbeddingLookup<float, int>(embeddings, indices);
+
+        // Compare against the canonical decoded values, rather than the original fp32 values:
+        // int8/int4 are intentionally lossy. The important contract is that a pure engine read
+        // neither requests mutation nor changes which rows the gather returns.
+        var decoded = embeddings.AsSpan();
+        var actual = result.AsSpan();
+        Assert.Equal(8, actual.Length);
+        for (int column = 0; column < 4; column++)
+        {
+            Assert.Equal(decoded[8 + column], actual[column]);
+            Assert.Equal(decoded[column], actual[4 + column]);
+        }
+    }
+
+    [Theory]
+    [InlineData(StreamingStoreDtype.Bf16)]
+    [InlineData(StreamingStoreDtype.Bf16Stochastic)]
+    [InlineData(StreamingStoreDtype.Int8)]
+    [InlineData(StreamingStoreDtype.Int4)]
+    public void QuantizedInferenceStore_EnteringTraining_PromotesToWritableLossless(
+        StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            TransparentAutoEviction = true,
+            StreamingStoreDtype = storeDtype,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+
+        var weight = new Tensor<float>(new[] { 1f, -2f, 3f, -4f }, new[] { 2, 2 });
+        weight.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(weight);
+        Assert.NotEqual(StreamingEncoding.Lossless, weight.StreamingStoreEncoding);
+
+        WeightRegistry.SetStreamingExecutionTraining(true);
+
+        Assert.Equal(StreamingEncoding.Lossless, weight.StreamingStoreEncoding);
+        weight[0, 1] = 99f;
+        Assert.Equal(99f, weight[0, 1]);
+
+        // Prove the promoted canonical store is writable, not merely that the resident owner
+        // bypassed the quantized guard: write back, evict the owner, and rehydrate the update.
+        Assert.True(WeightRegistry.WriteBackResident(weight));
+        WeightRegistry.ReleaseToPool(weight);
+        Assert.Equal(0, weight.DataVector.Length);
+        Assert.Equal(99f, weight[0, 1]);
     }
 
     [Fact]
