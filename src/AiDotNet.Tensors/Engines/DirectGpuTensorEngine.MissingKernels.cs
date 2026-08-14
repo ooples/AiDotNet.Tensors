@@ -3469,7 +3469,7 @@ public partial class DirectGpuTensorEngine
     private static bool TryCountHostMask(Tensor<Bit> mask, out int count)
     {
         count = 0;
-        var backingArray = mask.DataVector.GetBackingArrayUnsafe();
+        var backingArray = mask.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is null
             || Helpers.DeferredArrayMaterializer.IsPending(backingArray)
             || Helpers.DeferredArrayMaterializer.IsPending(mask.DataVector))
@@ -3497,7 +3497,7 @@ public partial class DirectGpuTensorEngine
     private static bool HasResidentIndexStorage(Tensor<int> indices)
     {
         if (indices.IsGpuResident) return true;
-        var backingArray = indices.DataVector.GetBackingArrayUnsafe();
+        var backingArray = indices.GetBackingArrayForCacheLookupUnsafe();
         return backingArray is not null &&
             Helpers.DeferredArrayMaterializer.IsPending(backingArray);
     }
@@ -6687,7 +6687,7 @@ public partial class DirectGpuTensorEngine
     private static bool HasResidentTensorStorage<T>(Tensor<T> tensor)
     {
         if (tensor.IsGpuResident) return true;
-        var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
+        var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         return backingArray is not null &&
             Helpers.DeferredArrayMaterializer.IsPending(backingArray);
     }
