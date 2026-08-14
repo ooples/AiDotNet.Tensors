@@ -19,6 +19,8 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class DirectPtxConvolutionArtifactTool
 {
     private const string ManifestFileName = "convolution-cubins.tsv";
+    private const int LegacyManifestPipelineVersion = 2;
+    private const string PipelineVersionPrefix = "# pipeline-version=";
 
     private readonly record struct ExpectedArtifact(
         string BlueprintId, string PtxSha256, string SourceKey);
@@ -42,6 +44,8 @@ internal static class DirectPtxConvolutionArtifactTool
         var manifest = new List<string>
         {
             "# generator=CUDA Driver Linker",
+            PipelineVersionPrefix + DirectPtxCubinArtifactCache.PipelineVersion.ToString(
+                CultureInfo.InvariantCulture),
             "# device-fingerprint=" + runtime.DeviceFingerprint,
             "# target=sm" + runtime.ComputeCapabilityMajor.ToString(CultureInfo.InvariantCulture) +
                 runtime.ComputeCapabilityMinor.ToString(CultureInfo.InvariantCulture),
@@ -302,6 +306,29 @@ internal static class DirectPtxConvolutionArtifactTool
         if (!File.Exists(manifestPath))
             throw new FileNotFoundException("The convolution cubin manifest is missing.", manifestPath);
 
+        string[] manifestLines = File.ReadAllLines(manifestPath);
+        int manifestPipelineVersion = LegacyManifestPipelineVersion;
+        foreach (string line in manifestLines)
+        {
+            if (!line.StartsWith(PipelineVersionPrefix, StringComparison.Ordinal))
+                continue;
+            if (!int.TryParse(
+                    line.Substring(PipelineVersionPrefix.Length),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out manifestPipelineVersion))
+                throw new InvalidDataException(
+                    "The convolution cubin manifest has an invalid pipeline version: " + line);
+            break;
+        }
+        if (manifestPipelineVersion != LegacyManifestPipelineVersion &&
+            manifestPipelineVersion != DirectPtxCubinArtifactCache.PipelineVersion)
+            throw new InvalidDataException(
+                "The convolution cubin manifest uses unsupported pipeline version " +
+                manifestPipelineVersion.ToString(CultureInfo.InvariantCulture) + ".");
+        bool usesCurrentSourceKeys =
+            manifestPipelineVersion == DirectPtxCubinArtifactCache.PipelineVersion;
+
         IReadOnlyList<ExpectedArtifact> expected = CreateExpectedArtifacts();
         var expectedByBlueprint = new Dictionary<string, ExpectedArtifact>(
             expected.Count, StringComparer.Ordinal);
@@ -317,7 +344,7 @@ internal static class DirectPtxConvolutionArtifactTool
         var observedBlueprints = new HashSet<string>(StringComparer.Ordinal);
         var observedSourceKeys = new HashSet<string>(StringComparer.Ordinal);
         int manifestRows = 0;
-        foreach (string line in File.ReadLines(manifestPath))
+        foreach (string line in manifestLines)
         {
             if (line.Length == 0 || line[0] == '#' ||
                 line.StartsWith("blueprint-id", StringComparison.Ordinal))
@@ -338,9 +365,13 @@ internal static class DirectPtxConvolutionArtifactTool
                 throw new InvalidDataException("The manifest repeats blueprint id: " + blueprintId);
             if (!string.Equals(blueprintId, specialization.BlueprintId, StringComparison.Ordinal) ||
                 !string.Equals(ptxSha256, specialization.PtxSha256, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(sourceKey, specialization.SourceKey, StringComparison.Ordinal))
+                (usesCurrentSourceKeys &&
+                 !string.Equals(sourceKey, specialization.SourceKey, StringComparison.Ordinal)))
                 throw new InvalidDataException(
                     "The manifest PTX identity is stale for " + specialization.BlueprintId + ".");
+            if (!IsSha256(sourceKey))
+                throw new InvalidDataException(
+                    "The manifest source key is not a SHA-256 identity: " + sourceKey);
             observedSourceKeys.Add(sourceKey);
             if (!string.Equals(fileName, sourceKey + ".cubin", StringComparison.Ordinal))
                 throw new InvalidDataException("The manifest cubin filename is not content-addressed: " + fileName);
@@ -363,16 +394,19 @@ internal static class DirectPtxConvolutionArtifactTool
         }
 
         int diskCubins = Directory.GetFiles(artifactDirectory, "*.cubin", SearchOption.TopDirectoryOnly).Length;
-        if (diskCubins != expectedSourceKeys.Count ||
-            !observedSourceKeys.SetEquals(expectedSourceKeys))
+        if (diskCubins != observedSourceKeys.Count ||
+            (usesCurrentSourceKeys && !observedSourceKeys.SetEquals(expectedSourceKeys)))
             throw new InvalidDataException(
                 "The artifact directory must contain exactly " +
-                expectedSourceKeys.Count.ToString(CultureInfo.InvariantCulture) + " cubin(s); found " +
+                observedSourceKeys.Count.ToString(CultureInfo.InvariantCulture) + " cubin(s); found " +
                 diskCubins.ToString(CultureInfo.InvariantCulture) + ".");
         Console.WriteLine("Verified " + expected.Count.ToString(CultureInfo.InvariantCulture) +
-            " current-source PTX identity(ies) and " +
-            expectedSourceKeys.Count.ToString(CultureInfo.InvariantCulture) +
-            " distinct content-addressed SM86 cubin(s).");
+            " PTX identity(ies) and " +
+            observedSourceKeys.Count.ToString(CultureInfo.InvariantCulture) +
+            " distinct content-addressed SM86 cubin(s) from manifest pipeline v" +
+            manifestPipelineVersion.ToString(CultureInfo.InvariantCulture) +
+            " against runtime pipeline v" +
+            DirectPtxCubinArtifactCache.PipelineVersion.ToString(CultureInfo.InvariantCulture) + ".");
     }
 
     // The exact promoted register-blocked specialization: ResNet c64 1x1
@@ -719,6 +753,21 @@ internal static class DirectPtxConvolutionArtifactTool
     {
         using SHA256 sha = SHA256.Create();
         return PtxCompat.ToHexString(sha.ComputeHash(bytes)).ToLowerInvariant();
+    }
+
+    private static bool IsSha256(string value)
+    {
+        if (value.Length != 64)
+            return false;
+        for (int i = 0; i < value.Length; i++)
+        {
+            char ch = value[i];
+            if (!((ch >= '0' && ch <= '9') ||
+                  (ch >= 'a' && ch <= 'f') ||
+                  (ch >= 'A' && ch <= 'F')))
+                return false;
+        }
+        return true;
     }
 
     private static void Export(
