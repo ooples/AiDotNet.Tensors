@@ -304,6 +304,39 @@ public class WeightRegistryStreamingTests : IDisposable
         Assert.Equal(30f, span[2]);
     }
 
+    [Theory]
+    [InlineData(StreamingStoreDtype.FullPrecision)]
+    [InlineData(StreamingStoreDtype.Lossless)]
+    public void ReleaseToPool_WritesBackMutableStoresBeforeDropping(
+        StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            StreamingStoreDtype = storeDtype,
+        });
+
+        var t = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 3 })
+        {
+            Lifetime = WeightLifetime.Streaming,
+        };
+        WeightRegistry.RegisterWeight(t);
+        WeightRegistry.Materialize(t);
+        t[1] = 99f;
+
+        // Release is the only lifecycle call after mutation. It must persist the current values
+        // before dropping the owner rather than restoring the registration-time snapshot later.
+        WeightRegistry.ReleaseToPool(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        WeightRegistry.Materialize(t);
+        Assert.Equal(1f, t[0]);
+        Assert.Equal(99f, t[1]);
+        Assert.Equal(3f, t[2]);
+    }
+
     [Fact]
     public void ReleaseToPool_RefcountTwo_DefersDrop_DoesNotThrow()
     {
