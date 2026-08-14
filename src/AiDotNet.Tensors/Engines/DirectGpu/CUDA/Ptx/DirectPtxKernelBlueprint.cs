@@ -88,6 +88,29 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The first interleaved complex-multiply candidate is admitted only for
+    /// the exact GA102/SM86 validation domain.
+    /// </summary>
+    internal static bool HasValidatedComplexMultiply(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The complex conjugate and magnitude specializations are measured only on
+    /// GA102/SM86, matching their complex-multiply sibling.
+    /// </summary>
+    internal static bool HasValidatedComplexUnary(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
+    /// The issue-#850 spectral/audio transform layer (FFT, STFT, mel, resample,
+    /// and the vocoder/pooling kernels) is measured only on GA102/SM86. It owns
+    /// its own predicate rather than borrowing the complex-unary one so the two
+    /// families can be promoted, or held back, independently.
+    /// </summary>
+    internal static bool HasValidatedSpectral(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The fused-linear + GELU decode specializations are measured and promoted
     /// only on GA10x/SM86. Other Ampere variants (SM80, SM87) are independent
     /// tuning domains and must supply and benchmark their own specialization
@@ -304,6 +327,26 @@ internal readonly record struct DirectPtxResourceBudget(
             measuredRegistersPerThread);
     }
 
+    /// <summary>
+    /// Derives the per-thread register ceiling from THIS device's register file so the
+    /// kernel's occupancy intent (<see cref="MinBlocksPerMultiprocessor"/> blocks of
+    /// <paramref name="blockThreads"/> threads) is enforced against real hardware rather
+    /// than a literal. Returns <see cref="int.MaxValue"/> when the driver reports no
+    /// register capacity, in which case only an explicit design cap applies.
+    /// </summary>
+    internal static int DeriveRegisterCeiling(
+        DirectPtxFunctionInfo info, int blockThreads, int minBlocksPerMultiprocessor)
+    {
+        int ceiling = int.MaxValue;
+        if (blockThreads > 0 && minBlocksPerMultiprocessor > 0 &&
+            info.MaxRegistersPerMultiprocessor > 0)
+            ceiling = Math.Min(ceiling,
+                info.MaxRegistersPerMultiprocessor / (minBlocksPerMultiprocessor * blockThreads));
+        if (blockThreads > 0 && info.MaxRegistersPerBlock > 0)
+            ceiling = Math.Min(ceiling, info.MaxRegistersPerBlock / blockThreads);
+        return ceiling;
+    }
+
     internal void Validate(
         string kernelName,
         DirectPtxFunctionInfo info,
@@ -313,9 +356,20 @@ internal readonly record struct DirectPtxResourceBudget(
         if (info.LocalBytesPerThread > MaxLocalBytesPerThread)
             throw new InvalidOperationException(
                 $"Direct PTX kernel '{kernelName}' has {info.LocalBytesPerThread} local bytes/thread; budget is {MaxLocalBytesPerThread}.");
-        if (info.RegistersPerThread > MaxRegistersPerThread)
+
+        // The register ceiling scales with the device register file. An explicit
+        // MaxRegistersPerThread (when > 0) tightens it further as a design guard.
+        int deviceCeiling = DeriveRegisterCeiling(info, blockThreads, MinBlocksPerMultiprocessor);
+        int explicitCeiling = MaxRegistersPerThread > 0 ? MaxRegistersPerThread : int.MaxValue;
+        int effectiveCeiling = Math.Min(deviceCeiling, explicitCeiling);
+        if (effectiveCeiling != int.MaxValue && info.RegistersPerThread > effectiveCeiling)
             throw new InvalidOperationException(
-                $"Direct PTX kernel '{kernelName}' uses {info.RegistersPerThread} registers/thread; budget is {MaxRegistersPerThread}.");
+                $"Direct PTX kernel '{kernelName}' uses {info.RegistersPerThread} registers/thread; " +
+                $"ceiling is {effectiveCeiling} (device {info.MaxRegistersPerMultiprocessor} regs/SM, " +
+                $"{info.MaxRegistersPerBlock} regs/block; target {MinBlocksPerMultiprocessor} blocks x " +
+                $"{blockThreads} threads" +
+                (MaxRegistersPerThread > 0 ? $"; design cap {MaxRegistersPerThread}" : "") + ").");
+
         if (info.StaticSharedBytes > MaxStaticSharedBytes)
             throw new InvalidOperationException(
                 $"Direct PTX kernel '{kernelName}' uses {info.StaticSharedBytes} static shared bytes; budget is {MaxStaticSharedBytes}.");
