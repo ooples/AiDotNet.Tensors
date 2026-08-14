@@ -19818,9 +19818,32 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Check kernel size, stride, padding, and dilation parameters for input size {depth}x{height}x{width}.");
         }
 
+        // Float/double Conv3D is a matrix multiplication after im2col. The former direct
+        // implementation below performs seven scalar loops for every output element; on a
+        // paper-scale 3D U-Net that made each 32^3 inference take ~34 seconds. Build the
+        // receptive-field rows once and contract them with all output kernels in one BLAS GEMM.
+        // This remains the CpuEngine implementation of the existing cross-backend IEngine op;
+        // GPU backends keep their resident Conv3D kernels and model/layer code stays unchanged.
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && TryConv3DIm2ColGemm(
+                input, kernel,
+                batch, inChannels, depth, height, width,
+                outChannels, kernelDepth, kernelHeight, kernelWidth,
+                outputDepth, outputHeight, outputWidth,
+                strideD, strideH, strideW,
+                padD, padH, padW,
+                dilationD, dilationH, dilationW,
+                out var gemmResult))
+        {
+            DifferentiableOps.RecordBinary("Conv3D", gemmResult, input, kernel, BackwardFunctions<T>.Conv3DBackward,
+                new object[] { stride, padding, dilation });
+            AutoTracer.RecordOp("Conv3D", gemmResult, eng => eng.Conv3D(input, kernel, stride, padding, dilation));
+            return gemmResult;
+        }
+
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
         var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
@@ -19873,6 +19896,104 @@ public partial class CpuEngine : ITensorLevelEngine
             new object[] { stride, padding, dilation });
         AutoTracer.RecordOp("Conv3D", result, eng => eng.Conv3D(input, kernel, stride, padding, dilation));
         return result;
+    }
+
+    private static bool TryConv3DIm2ColGemm<T>(
+        Tensor<T> input,
+        Tensor<T> kernel,
+        int batch,
+        int inChannels,
+        int depth,
+        int height,
+        int width,
+        int outChannels,
+        int kernelDepth,
+        int kernelHeight,
+        int kernelWidth,
+        int outputDepth,
+        int outputHeight,
+        int outputWidth,
+        int strideDepth,
+        int strideHeight,
+        int strideWidth,
+        int padDepth,
+        int padHeight,
+        int padWidth,
+        int dilationDepth,
+        int dilationHeight,
+        int dilationWidth,
+        out Tensor<T> result)
+    {
+        result = null!;
+
+        long rowsLong = (long)batch * outputDepth * outputHeight * outputWidth;
+        long columnsLong = (long)inChannels * kernelDepth * kernelHeight * kernelWidth;
+        long columnElementsLong = rowsLong * columnsLong;
+        long flatOutputElementsLong = rowsLong * outChannels;
+        if (rowsLong <= 0 || columnsLong <= 0
+            || rowsLong > int.MaxValue || columnsLong > int.MaxValue
+            || columnElementsLong > int.MaxValue || flatOutputElementsLong > int.MaxValue)
+        {
+            return false;
+        }
+
+        int rows = (int)rowsLong;
+        int columnsPerRow = (int)columnsLong;
+        var columns = new T[(int)columnElementsLong];
+        var flatOutput = new T[(int)flatOutputElementsLong];
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
+
+        Helpers.CpuIm2Col3DHelper.BuildColumns(
+            inputData, columns,
+            batch, inChannels, depth, height, width,
+            kernelDepth, kernelHeight, kernelWidth,
+            outputDepth, outputHeight, outputWidth,
+            strideDepth, strideHeight, strideWidth,
+            padDepth, padHeight, padWidth,
+            dilationDepth, dilationHeight, dilationWidth);
+
+        bool multiplied;
+        if (typeof(T) == typeof(float))
+        {
+            multiplied = Helpers.BlasProvider.TryGemmEx(
+                rows, outChannels, columnsPerRow,
+                (float[])(object)columns, 0, columnsPerRow, false,
+                (float[])(object)kernelData, 0, columnsPerRow, true,
+                (float[])(object)flatOutput, 0, outChannels);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            multiplied = Helpers.BlasProvider.TryGemmEx(
+                rows, outChannels, columnsPerRow,
+                (double[])(object)columns, 0, columnsPerRow, false,
+                (double[])(object)kernelData, 0, columnsPerRow, true,
+                (double[])(object)flatOutput, 0, outChannels);
+        }
+        else
+        {
+            return false;
+        }
+
+        if (!multiplied) return false;
+
+        result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
+        var outputData = result.GetDataArray();
+        int spatial = outputDepth * outputHeight * outputWidth;
+
+        // GEMM emits [B*OD*OH*OW, OC] (NDHWC flattening). Conv3D's public
+        // contract is NCDHW, so transpose the channel axis into its final layout.
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, flatOutput.Length, batchChannel =>
+        {
+            int b = batchChannel / outChannels;
+            int oc = batchChannel % outChannels;
+            int outputBase = (b * outChannels + oc) * spatial;
+            int flatBase = b * spatial * outChannels + oc;
+            for (int position = 0; position < spatial; position++)
+                outputData[outputBase + position] = flatOutput[flatBase + position * outChannels];
+        });
+
+        return true;
     }
 
     /// <inheritdoc/>
