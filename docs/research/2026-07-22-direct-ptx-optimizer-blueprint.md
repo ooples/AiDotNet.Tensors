@@ -11,7 +11,7 @@ Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 This increment establishes the issue-#848 assembly line and implements one exact
 contiguous Ampere FP32 candidate: a **fused SGD-with-momentum update step**:
 
-```
+```text
 g' = grad + weightDecay * param
 v  = momentum * v + g'
 param = param - learningRate * v
@@ -35,20 +35,25 @@ sparse-update, EMA, and public-routing families.
 ## Formal contiguous ABI
 
 | Tensor | Extent | Access | Alignment |
-|---|---:|---|---|---:|
+|---|---|---|---:|
 | param    | `[size]` FP32 vector | read-write | 16 B |
 | gradient | `[size]` FP32 vector | read       | 16 B |
 | velocity | `[size]` FP32 vector | read-write | 16 B |
 
-The launch has three 64-bit pointer parameters. **Hyperparameters are module
-identity, not launch arguments:** the learning rate, momentum, and weight decay
-are baked as immediate operands, exactly like the residual-RMSNorm kernel's
-epsilon, so the pointer-only ABI carries no scalar parameters. A distinct
-`(size, lr, momentum, weightDecay)` tuple yields a distinct cached module; a
-constant-hyperparameter training regime caches exactly one module and a
-learning-rate schedule caches a bounded, LRU-evicted set. Admitted sizes:
-`65536, 262144, 1048576, 4194304`; Ampere only; else exact-reason fallback. The
-`weightDecay == 0` path emits one fewer FMA per element.
+The launch takes three 64-bit pointers followed by the scalars.
+**Hyperparameters are launch arguments, not module identity:** the learning rate,
+momentum, and weight decay arrive as launch parameters, so the emitted PTX depends
+only on the shape and on whether the weight-decay term is present. Module identity
+is therefore the `(size, hasWeightDecay)` pair, and one module serves an entire
+learning-rate schedule instead of forcing a fresh JIT and module load on every step
+that changes a hyperparameter. Keying on the scalar bits compiled byte-identical
+PTX into separate modules and churned the LRU continuously.
+
+Admitted sizes: `65536, 262144, 1048576, 4194304`; SM86 only; else exact-reason
+fallback. The `weightDecay == 0` specialization emits one fewer FMA per element,
+which is why the decay presence -- and only the decay presence -- stays part of the
+key. Adam's bias corrections remain host-precomputed and reach the kernel as launch
+scalars for the same reason.
 
 ## Fair-comparison notes (apples-to-apples)
 
@@ -75,8 +80,9 @@ pointwise blueprint already had to exclude a run for.
 Focused tests enforce pointer-only PTX with three vector loads, twelve (or eight,
 without weight decay) fused-multiply-adds, two vector stores, no `.shared`/
 `.local`/`bar.sync`/stride/`.param .u32`, a closed unpromoted size domain,
-non-finite-hyperparameter rejection, manifest completeness with exactly one
-experimental cell and no promoted cell, and (on a validated Ampere device)
+non-finite-hyperparameter rejection, manifest completeness with exactly two
+experimental cells -- `CudaBackend.AdamUpdate` and `CudaBackend.SgdMomentumUpdate`
+-- and no promoted cell, and (on a validated SM86 device)
 param-and-velocity parity within relative tolerance with zero local and
 static-shared bytes and at least three active blocks per SM.
 

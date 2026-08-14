@@ -2550,6 +2550,16 @@ public sealed partial class CudaBackend
             return false;
         }
 
+        // These Try* methods are internal entry points that tests and benchmarks call directly,
+        // so every sibling route guards its buffers explicitly rather than relying on the one
+        // public caller that happens to check. Without this a null argument escapes as a
+        // NullReferenceException instead of a clean false plus a reason string.
+        if (param is null || gradient is null || velocity is null)
+        {
+            DirectPtxLastError = "sgd-momentum-null-buffer";
+            return false;
+        }
+
         long bytes = checked((long)size * sizeof(float));
         if (param.SizeInBytes != bytes || gradient.SizeInBytes != bytes || velocity.SizeInBytes != bytes)
         {
@@ -2559,18 +2569,19 @@ public sealed partial class CudaBackend
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
-            var key = new DirectPtxSgdMomentumKey(
-                size,
-                PtxCompat.SingleToInt32Bits(learningRate),
-                PtxCompat.SingleToInt32Bits(momentum),
-                PtxCompat.SingleToInt32Bits(weightDecay));
+            // Identity is shape plus weight-decay presence, nothing else. EmitPtx varies only on
+            // those two, so keying on the scalar bits compiled byte-identical PTX into a separate
+            // module per learning rate: a schedule triggered a fresh JIT and module load every
+            // step, and churned the 16-entry LRU continuously.
+            var key = new DirectPtxSgdMomentumKey(size, weightDecay != 0f);
             lock (_directPtxLock)
             {
                 if (!_directPtxSgdMomentumKernels.TryGetValue(
                     key, out PtxFusedSgdMomentumF32Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX SGD-momentum must be prewarmed before CUDA graph capture.";
@@ -2579,11 +2590,22 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheSgdMomentumKernelSlow(key);
                 }
+                // A cache HIT during capture reached the launch with no pin. A graph executable
+                // retains this CUfunction after capture, and cuModuleUnload invalidates function
+                // handles, so a captured specialization must never become an LRU victim -- a
+                // replayed graph would call a freed function. Every sibling route pins here.
+                if (capturing &&
+                    !PinDirectPtxKernelForCapture(_directPtxSgdMomentumKernels, key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX SGD-momentum module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(param, kernel.Blueprint.Tensors[0]),
                         DirectPtxTensorView.Create(gradient, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(velocity, kernel.Blueprint.Tensors[2]));
+                        DirectPtxTensorView.Create(velocity, kernel.Blueprint.Tensors[2]),
+                        learningRate,
+                        momentum,
+                        weightDecay);
             }
             System.Threading.Interlocked.Increment(ref _directPtxSgdMomentumDispatchCount);
             DirectPtxLastError = null;
@@ -2602,10 +2624,7 @@ public sealed partial class CudaBackend
         DirectPtxSgdMomentumKey key) =>
         _directPtxSgdMomentumKernels.GetOrAdd(key, () =>
             new PtxFusedSgdMomentumF32Kernel(
-                _directPtxRuntime!, key.Size,
-                PtxCompat.Int32BitsToSingle(key.LearningRateBits),
-                PtxCompat.Int32BitsToSingle(key.MomentumBits),
-                PtxCompat.Int32BitsToSingle(key.WeightDecayBits)));
+                _directPtxRuntime!, key.Size, key.HasWeightDecay));
 
     /// <summary>
     /// Attempts exact contiguous FP32 global average pooling of a
@@ -3179,11 +3198,16 @@ public sealed partial class CudaBackend
         int QuerySequence,
         int KeyValueSequence,
         int ScaleBits);
+    /// <summary>
+    /// Module identity for the SGD-momentum specialization: the only two things its PTX varies on.
+    /// </summary>
+    /// <remarks>
+    /// The hyperparameters are launch parameters and deliberately absent. Including them made one
+    /// module per learning rate for byte-identical code, so a schedule re-JITed every step.
+    /// </remarks>
     private readonly record struct DirectPtxSgdMomentumKey(
         int Size,
-        int LearningRateBits,
-        int MomentumBits,
-        int WeightDecayBits);
+        bool HasWeightDecay);
     private readonly record struct DirectPtxFlashAttentionBackwardKey(
         int Batch,
         int Heads,

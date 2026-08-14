@@ -77,15 +77,29 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         Size = size;
         BlockThreads = blockThreads;
         HasWeightDecay = hyperparameters.WeightDecay > 0f;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, size, blockThreads);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, size, HasWeightDecay, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             size, HasWeightDecay, blockThreads);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+
+        // Own the module from the moment it loads. ResourceBudget.Validate exists to trip on
+        // codegen drift, and a throw from a constructor makes Dispose unreachable, so without this
+        // the CUmodule is abandoned for the process lifetime -- and the caller catches, returns a
+        // clean false, and leaks another on the next retry.
+        DirectPtxModule module = runtime.LoadModule(Ptx);
+        try
+        {
+            _module = module;
+            _function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, module);
+        }
+        catch
+        {
+            module.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -104,6 +118,21 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         Require(gradient, Blueprint.Tensors[1], nameof(gradient));
         Require(firstMoment, Blueprint.Tensors[2], nameof(firstMoment));
         Require(secondMoment, Blueprint.Tensors[3], nameof(secondMoment));
+        // The blueprint declares param, m and v mutually disjoint, and nothing checked it.
+        // Require validates type, layout, extents and non-null pointers, but not overlap. Three
+        // things break on an aliased launch: the three in-place stores have no defined ordering
+        // between threads, so optimizer state corrupts silently across steps; the gradient load is
+        // ld.global.nc.v4.f32, which asserts non-aliasing to the compiler, making an aliased
+        // gradient undefined behaviour rather than merely wrong; and the failure is silent, which
+        // is exactly the stake HasValidatedAdamUpdate names -- corrupting training state rather
+        // than returning a visibly wrong value. The SGD sibling enforces the same contract.
+        if (Overlaps(param, firstMoment) || Overlaps(param, secondMoment) ||
+            Overlaps(firstMoment, secondMoment) || Overlaps(param, gradient) ||
+            Overlaps(gradient, firstMoment) || Overlaps(gradient, secondMoment))
+            throw new ArgumentException(
+                "The Adam update specialization does not admit aliasing: param, gradient, m and v " +
+                "must be mutually disjoint.");
+
         hyperparameters.Validate();
         if (hyperparameters.WeightDecay > 0f != HasWeightDecay)
             throw new ArgumentException(
@@ -260,12 +289,20 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         return ptx.ToString();
     }
 
-    private static string Literal(float value) =>
-        "0f" + PtxCompat.SingleToUInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
+    /// <summary>Whether two views share any byte of device memory.</summary>
+    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
+    {
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
+        nuint leftEnd = checked(leftStart + left.ByteLength);
+        nuint rightEnd = checked(rightStart + right.ByteLength);
+        return leftStart < rightEnd && rightStart < leftEnd;
+    }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
         DirectPtxArchitectureFamily architecture,
         int size,
+        bool hasWeightDecay,
         int blockThreads)
     {
         var extent = new DirectPtxExtent(size);
@@ -273,7 +310,10 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
             Operation: "adam-update-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"linear-vec4-b{blockThreads}-n{size}",
+            // EmitPtx emits a different body for each weight-decay presence -- an extra parameter
+            // load plus two instructions per element -- so omitting it here gave two distinct
+            // modules one identity.
+            Variant: $"linear-vec4-b{blockThreads}-n{size}-{(hasWeightDecay ? "wd" : "nowd")}",
             Tensors:
             [
                 new("param", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -355,8 +395,10 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
 }
 
 /// <summary>
-/// The Adam scalars baked into a module. Every field participates in the kernel
-/// cache key, so two steps with different hyperparameters never share a module.
+/// The Adam scalars carried to the kernel as LAUNCH parameters. They are not baked into module
+/// identity -- the module key is (size, hasWeightDecay) -- so one module serves an entire run and
+/// the step counter never triggers a recompile. The two bias corrections are precomputed here on
+/// the host to keep powf out of the kernel.
 /// </summary>
 internal readonly struct DirectPtxAdamHyperparameters : IEquatable<DirectPtxAdamHyperparameters>
 {

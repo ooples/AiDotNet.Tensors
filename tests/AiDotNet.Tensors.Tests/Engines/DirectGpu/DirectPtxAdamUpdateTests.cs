@@ -142,8 +142,18 @@ public class DirectPtxAdamUpdateTests
         Defaults(weightDecay: 0.01f, step: 7).Validate();
     }
 
+    /// <summary>
+    /// The hyperparameter record preserves its scalars bit-exactly, including the step counter.
+    /// </summary>
+    /// <remarks>
+    /// This does NOT mean distinct scalars produce distinct modules -- they are launch parameters,
+    /// and module identity is (size, hasWeightDecay), so a learning-rate schedule reuses one module.
+    /// What matters is that the bits a caller supplies reach the launch unchanged: the two bias
+    /// corrections are precomputed on the host, so a value mangled in this record would silently
+    /// compute a different step with no shape or admission check able to notice.
+    /// </remarks>
     [Fact]
-    public void Hyperparameters_KeyOnExactBitsSoDistinctStepsNeverShareAModule()
+    public void Hyperparameters_PreserveLaunchScalarBitsExactly()
     {
         var a = Defaults(step: 1);
         var b = Defaults(step: 2);

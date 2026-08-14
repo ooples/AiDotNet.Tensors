@@ -79,8 +79,24 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
-    /// <summary>Benchmark-only access to SGD-momentum cells that have not passed promotion.</summary>
-    internal static bool SgdMomentumExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_sgdMomentumExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to SGD-momentum cells that have not passed promotion. Thread-local
+    /// state prevents parallel tests or benchmarks from enabling an experimental route in an
+    /// unrelated dispatcher, matching the global-average-pool and complex-multiply overrides.
+    /// </summary>
+    /// <remarks>
+    /// As a process-global static this defeated the fail-closed guarantee: while one test held it
+    /// set, every other thread could dispatch the unpromoted SGD route, which also made concurrent
+    /// results order-dependent.
+    /// </remarks>
+    internal static bool SgdMomentumExperimentOverride
+    {
+        get => s_sgdMomentumExperimentOverride;
+        set => s_sgdMomentumExperimentOverride = value;
+    }
     [ThreadStatic]
     private static bool s_globalAvgPoolExperimentOverride;
 

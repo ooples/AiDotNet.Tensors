@@ -82,11 +82,15 @@ internal static class DirectPtxSgdMomentumExperiment
     private static void RunDirect(List<Result> results)
     {
         using var runtime = new DirectPtxRuntime();
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere) return;
+        // The exact admission predicate, not the broad Ampere family check: the kernel constructor
+        // admits SM86 only, so on SM80 or another non-SM86 Ampere device the old check let us
+        // through and the constructor threw instead of skipping.
+        if (!DirectPtxArchitecture.HasValidatedSgdMomentum(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
         using (runtime.Enter())
         foreach (int size in Sizes)
         {
-            using var kernel = new PtxFusedSgdMomentumF32Kernel(runtime, size, LearningRate, Momentum, WeightDecay);
+            using var kernel = new PtxFusedSgdMomentumF32Kernel(runtime, size, WeightDecay != 0f);
             float[] param = Values(size, 100 + size);
             float[] grad = Values(size, 300 + size);
             float[] velocity = Values(size, 500 + size);
@@ -97,7 +101,8 @@ internal static class DirectPtxSgdMomentumExperiment
             Action launch = () => kernel.Launch(
                 DirectPtxTensorView.CreateOwned(paramBuffer, kernel.Blueprint.Tensors[0]),
                 DirectPtxTensorView.CreateOwned(gradBuffer, kernel.Blueprint.Tensors[1]),
-                DirectPtxTensorView.CreateOwned(velocityBuffer, kernel.Blueprint.Tensors[2]));
+                DirectPtxTensorView.CreateOwned(velocityBuffer, kernel.Blueprint.Tensors[2]),
+                LearningRate, Momentum, WeightDecay);
             paramBuffer.Upload<float>(param);
             velocityBuffer.Upload<float>(velocity);
             launch(); runtime.Synchronize();

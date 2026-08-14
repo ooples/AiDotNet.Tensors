@@ -199,6 +199,27 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        // GPU-free cubin generation, verification and SASS audit for the optimizer family.
+        // Without these the artifact pipeline had no way to invoke DirectPtxOptimizerCubinTool
+        // through the benchmark executable, which is how every other family is driven.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-optimizer-cubins")
+        {
+            Environment.ExitCode = DirectPtxOptimizerCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-optimizer-cubins")
+        {
+            Environment.ExitCode = DirectPtxOptimizerCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-optimizer-sass")
+        {
+            Environment.ExitCode = DirectPtxOptimizerCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--direct-ptx-sgd-momentum")
         {
             DirectPtxSgdMomentumExperiment.Run(
@@ -1456,6 +1477,9 @@ class Program
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
         Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
         Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
+        Console.WriteLine("  --generate-direct-ptx-optimizer-cubins <ptxas> <output>: build the release optimizer cubin set");
+        Console.WriteLine("  --verify-direct-ptx-optimizer-cubins <ptxas> <artifacts>: verify release optimizer cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-optimizer-sass <nvdisasm> <artifacts> <evidence>: audit final optimizer SASS for local memory");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
         Console.WriteLine("  --direct-ptx-convolution-resnet [--no-external]: ResNet-class convolution promotion matrix");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");

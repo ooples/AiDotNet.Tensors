@@ -11,10 +11,11 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// Focused coverage for the exact-shape FP32 fused SGD-with-momentum direct-PTX
 /// family (issue #848). The emitter and shape-domain assertions run without a
-/// GPU; the driver correctness assertion is skipped unless a validated Ampere
-/// device is present. The learning rate, momentum, and weight decay are baked
-/// module identity. Disabled by default; fails closed until three clean
-/// promotion runs clear the release gate.
+/// GPU; the driver correctness assertion is skipped unless a validated SM86
+/// device is present. The learning rate, momentum, and weight decay are LAUNCH
+/// PARAMETERS, not module identity: the module key is (size, hasWeightDecay), so
+/// one module serves an entire learning-rate schedule. Disabled by default; fails
+/// closed until three clean promotion runs clear the release gate.
 /// </summary>
 public class DirectPtxSgdMomentumTests
 {
@@ -140,9 +141,13 @@ public class DirectPtxSgdMomentumTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in SGD-momentum specialization is validated on Ampere.");
-        using var kernel = new PtxFusedSgdMomentumF32Kernel(runtime, size, lr, momentum, weightDecay);
+        // The exact admission predicate. The family check passed on any Ampere device, so SM80
+        // reached a constructor that admits SM86 only and threw instead of skipping.
+        Skip.IfNot(
+            DirectPtxArchitecture.HasValidatedSgdMomentum(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in SGD-momentum specialization is admitted only on SM86.");
+        using var kernel = new PtxFusedSgdMomentumF32Kernel(runtime, size, weightDecay != 0f);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
         Assert.True(kernel.Audit.ActiveBlocksPerMultiprocessor >= 3);
@@ -173,7 +178,8 @@ public class DirectPtxSgdMomentumTests
         kernel.Launch(
             DirectPtxTensorView.CreateOwned(paramBuffer, kernel.Blueprint.Tensors[0]),
             DirectPtxTensorView.CreateOwned(gradBuffer, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(velocityBuffer, kernel.Blueprint.Tensors[2]));
+            DirectPtxTensorView.CreateOwned(velocityBuffer, kernel.Blueprint.Tensors[2]),
+            lr, momentum, weightDecay);
         runtime.Synchronize();
 
         var actualParam = new float[size];

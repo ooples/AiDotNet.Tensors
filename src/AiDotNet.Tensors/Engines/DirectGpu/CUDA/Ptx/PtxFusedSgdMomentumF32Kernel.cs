@@ -17,9 +17,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// commits the updated velocity and param — so the intermediate decayed
 /// gradient and the velocity update are <b>never materialized</b> to global
 /// memory (the naive path is two or three separate elementwise kernels, each a
-/// full global round-trip). The learning rate, momentum, and weight decay are
-/// module identity (baked immediates), exactly like the residual-RMSNorm
-/// kernel's epsilon; the pointer-only launch ABI carries no scalar parameters.
+/// full global round-trip). Only the SHAPE and the weight-decay presence are baked
+/// into module identity; the learning rate, momentum, and decay arrive as launch
+/// parameters, so one module serves an entire schedule instead of forcing a fresh
+/// JIT on every step that changes a hyperparameter.
 /// There are no shared-memory, local-memory, global-intermediate, temporary-
 /// allocation, division, remainder, or stride parameters. Disabled by default;
 /// fails closed until three clean promotion runs clear the release gate.
@@ -37,21 +38,24 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
     private readonly IntPtr _function;
 
     internal int Size { get; }
-    internal float LearningRate { get; }
-    internal float Momentum { get; }
-    internal float WeightDecay { get; }
     internal int BlockThreads { get; }
     internal int ElementsPerBlock => BlockThreads * ElementsPerThread;
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
+    /// <summary>
+    /// Builds the specialization for one shape and weight-decay presence.
+    /// </summary>
+    /// <remarks>
+    /// The hyperparameters are deliberately NOT constructor arguments: they are launch parameters,
+    /// so keying a module cache on them would compile byte-identical PTX into a separate module for
+    /// every learning rate a schedule visits.
+    /// </remarks>
     internal PtxFusedSgdMomentumF32Kernel(
         DirectPtxRuntime runtime,
         int size,
-        float learningRate,
-        float momentum,
-        float weightDecay,
+        bool hasWeightDecay,
         int blockThreads = DefaultBlockThreads)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
@@ -61,43 +65,69 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
                 "The checked-in FP32 SGD-momentum specialization is admitted only on SM86.");
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
-        ValidateHyperparameters(learningRate, momentum, weightDecay);
         Size = size;
-        LearningRate = learningRate;
-        Momentum = momentum;
-        WeightDecay = weightDecay;
         BlockThreads = blockThreads;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, size, learningRate, momentum, weightDecay, blockThreads);
-        HasWeightDecay = weightDecay != 0f;
+        HasWeightDecay = hasWeightDecay;
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, size, hasWeightDecay, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             size, HasWeightDecay, blockThreads);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+
+        // Own the module from the moment it loads. Every step below can throw --
+        // ResourceBudget.Validate exists precisely to trip on codegen drift -- and a throw from a
+        // constructor makes Dispose unreachable, so without this the CUmodule is abandoned for the
+        // process lifetime. TryDirectPtxSgdMomentum catches and returns a clean false, so each
+        // retry would leak another one.
+        DirectPtxModule module = runtime.LoadModule(Ptx);
+        try
+        {
+            _module = module;
+            _function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+            int activeBlocks = module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, module);
+        }
+        catch
+        {
+            module.Dispose();
+            throw;
+        }
     }
 
+    /// <summary>
+    /// Runs one SGD-momentum step. The hyperparameters are launch parameters, so one module serves
+    /// every step of a schedule.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="weightDecay"/> must agree with <see cref="HasWeightDecay"/>: the decay FMA
+    /// is baked, so a non-zero decay against a module emitted without it would silently drop the
+    /// term, and a zero decay against one emitted with it would spend the FMA on a no-op.
+    /// </remarks>
     internal unsafe void Launch(
         DirectPtxTensorView param,
         DirectPtxTensorView gradient,
-        DirectPtxTensorView velocity)
+        DirectPtxTensorView velocity,
+        float learningRate,
+        float momentum,
+        float weightDecay)
     {
         Require(param, Blueprint.Tensors[0], nameof(param));
         Require(gradient, Blueprint.Tensors[1], nameof(gradient));
         Require(velocity, Blueprint.Tensors[2], nameof(velocity));
         if (Overlaps(param, gradient) || Overlaps(param, velocity) || Overlaps(gradient, velocity))
             throw new ArgumentException("The SGD-momentum specialization does not admit aliasing.");
+        ValidateHyperparameters(learningRate, momentum, weightDecay);
+        if ((weightDecay != 0f) != HasWeightDecay)
+            throw new ArgumentException(
+                "This module was emitted with weight-decay=" + HasWeightDecay +
+                "; the launch weightDecay does not match the baked body.", nameof(weightDecay));
 
         IntPtr paramPointer = param.Pointer;
         IntPtr gradientPointer = gradient.Pointer;
         IntPtr velocityPointer = velocity.Pointer;
         // Negated once here so the parameter update stays a single fma per
         // element rather than a multiply followed by a subtract.
-        float negLearningRate = -LearningRate;
-        float momentum = Momentum;
-        float weightDecay = WeightDecay;
+        float negLearningRate = -learningRate;
         void** arguments = stackalloc void*[6];
         arguments[0] = &paramPointer;
         arguments[1] = &gradientPointer;
@@ -116,9 +146,6 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
     }
 
     public void Dispose() => _module.Dispose();
-
-    private static string HexFloat(float value) =>
-        "0f" + PtxCompat.SingleToUInt32Bits(value).ToString("X8", CultureInfo.InvariantCulture);
 
     /// <summary>
     /// Emits the module. Only the SHAPE and the weight-decay presence are baked;
@@ -192,9 +219,7 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
     private static DirectPtxKernelBlueprint CreateBlueprint(
         DirectPtxArchitectureFamily architecture,
         int size,
-        float learningRate,
-        float momentum,
-        float weightDecay,
+        bool hasWeightDecay,
         int blockThreads)
     {
         var extent = new DirectPtxExtent(size);
@@ -202,7 +227,9 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
             Operation: "sgd-momentum-f32",
             Version: 1,
             Architecture: architecture,
-            Variant: $"linear-vec4-b{blockThreads}-n{size}-lr{PtxCompat.SingleToUInt32Bits(learningRate):X8}-m{PtxCompat.SingleToUInt32Bits(momentum):X8}-wd{PtxCompat.SingleToUInt32Bits(weightDecay):X8}",
+            // Identity is shape plus weight-decay presence -- the only two things EmitPtx varies
+            // on. Encoding the scalar bits gave byte-identical modules distinct identities.
+            Variant: $"linear-vec4-b{blockThreads}-n{size}-{(hasWeightDecay ? "wd" : "nowd")}",
             Tensors:
             [
                 new("param", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -224,10 +251,13 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "g'=grad+wd*param; v=momentum*v+g'; param-=lr*v",
-                ["mode"] = "inference-forward-fused-optimizer-step",
-                ["learning-rate"] = learningRate.ToString("R", CultureInfo.InvariantCulture),
-                ["momentum"] = momentum.ToString("R", CultureInfo.InvariantCulture),
-                ["weight-decay"] = weightDecay.ToString("R", CultureInfo.InvariantCulture),
+                // This kernel mutates parameters and velocity in place: it is a training step,
+                // not an inference forward. The label reaches the kernel audit and the offline
+                // manifest tooling, so a wrong one propagates into the recorded evidence.
+                ["mode"] = "training-sgd-momentum-update-in-place",
+                ["learning-rate"] = "launch-parameter",
+                ["momentum"] = "launch-parameter",
+                ["weight-decay"] = hasWeightDecay ? "launch-parameter-term-present" : "absent",
                 ["input"] = "fp32",
                 ["output"] = "fp32-param-and-velocity-in-place",
                 ["elements-per-thread"] = ElementsPerThread.ToString(),
