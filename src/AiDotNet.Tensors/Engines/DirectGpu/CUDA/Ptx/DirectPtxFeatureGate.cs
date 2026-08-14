@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
+    internal const string GlobalAvgPoolEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GLOBAL_AVGPOOL";
     internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
@@ -69,6 +70,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentRngDropoutEnabled = ReadEnabled(RngDropoutEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentGlobalAvgPoolEnabled = ReadEnabled(GlobalAvgPoolEnvironmentVariable);
     private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
@@ -85,6 +87,19 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_globalAvgPoolExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to global-average-pool cells that have not passed
+    /// promotion. Thread-local state prevents parallel tests or benchmarks from
+    /// enabling an experimental route in an unrelated dispatcher.
+    /// </summary>
+    internal static bool GlobalAvgPoolExperimentOverride
+    {
+        get => s_globalAvgPoolExperimentOverride;
+        set => s_globalAvgPoolExperimentOverride = value;
+    }
     /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
     internal static bool FusedLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
@@ -186,6 +201,8 @@ internal static class DirectPtxFeatureGate
     internal static bool IsFlashAttentionBackwardEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashAttentionBackwardEnabled);
 
+    internal static bool IsGlobalAvgPoolEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentGlobalAvgPoolEnabled);
     internal static bool IsComplexMultiplyEnabled => ComplexMultiplyGateOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentComplexMultiplyEnabled);
 
