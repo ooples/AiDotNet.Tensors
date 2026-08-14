@@ -40,6 +40,11 @@ internal interface IStreamingDroppable
     /// stores are writable; quantized inference stores are rejected before mutation. Call BEFORE
     /// dropping a mutated streaming weight so the mutation is not lost.</summary>
     bool TryWriteBackResidentForStreaming();
+
+    /// <summary>Promotes a quantized inference snapshot to an exact writable streaming
+    /// encoding before a model enters training. Implemented on the closed generic owner so
+    /// the non-generic registry can migrate mixed element types one tensor at a time.</summary>
+    void PromoteStreamingStoreForTraining();
 }
 
 /// <summary>
@@ -559,6 +564,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             && StreamingStoreEncoding != StreamingEncoding.Lossless;
 
     bool IStreamingDroppable.TryWriteBackResidentForStreaming() => TryWriteBackResidentForStreaming();
+
+    void IStreamingDroppable.PromoteStreamingStoreForTraining()
+    {
+        if (this is Tensor<T> tensor)
+            WeightRegistry.PromoteStoreForTraining(tensor);
+    }
 
     /// <summary>
     /// Re-serializes this tensor's current resident data into its streaming-pool entry (#1715).

@@ -212,6 +212,43 @@ public class WeightStreamingTransparentAccessTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(StreamingStoreDtype.Bf16)]
+    [InlineData(StreamingStoreDtype.Bf16Stochastic)]
+    [InlineData(StreamingStoreDtype.Int8)]
+    [InlineData(StreamingStoreDtype.Int4)]
+    public void QuantizedInferenceStore_EnteringTraining_PromotesToWritableLossless(
+        StreamingStoreDtype storeDtype)
+    {
+        WeightRegistry.Reset();
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingBackingStorePath = _backingDir,
+            TransparentAutoEviction = true,
+            StreamingStoreDtype = storeDtype,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+
+        var weight = new Tensor<float>(new[] { 1f, -2f, 3f, -4f }, new[] { 2, 2 });
+        weight.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(weight);
+        Assert.NotEqual(StreamingEncoding.Lossless, weight.StreamingStoreEncoding);
+
+        WeightRegistry.SetStreamingExecutionTraining(true);
+
+        Assert.Equal(StreamingEncoding.Lossless, weight.StreamingStoreEncoding);
+        weight[0, 1] = 99f;
+        Assert.Equal(99f, weight[0, 1]);
+
+        // Prove the promoted canonical store is writable, not merely that the resident owner
+        // bypassed the quantized guard: write back, evict the owner, and rehydrate the update.
+        Assert.True(WeightRegistry.WriteBackResident(weight));
+        WeightRegistry.ReleaseToPool(weight);
+        Assert.Equal(0, weight.DataVector.Length);
+        Assert.Equal(99f, weight[0, 1]);
+    }
+
     [Fact]
     public void ToArray_OnDroppedStreamingWeight_AutoRehydrates()
     {

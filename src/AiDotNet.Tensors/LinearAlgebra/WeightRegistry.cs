@@ -650,7 +650,57 @@ public static class WeightRegistry
     /// </summary>
     public static void SetStreamingExecutionTraining(bool? isTraining)
     {
-        lock (_lock) { _streamingTrainingMode = isTraining; }
+        List<IStreamingDroppable>? ownersToPromote = null;
+        lock (_lock)
+        {
+            _streamingTrainingMode = isTraining;
+            if (isTraining == true && _ownerByHandle.Count > 0)
+            {
+                ownersToPromote = new List<IStreamingDroppable>(_ownerByHandle.Count);
+                foreach (var weak in _ownerByHandle.Values)
+                {
+                    if (weak.TryGetTarget(out var owner) && owner.StreamingStoreIsReadOnly)
+                        ownersToPromote.Add(owner);
+                }
+            }
+        }
+
+        // Do not hold the registry lock while decoding or replacing pool entries. Materialize
+        // takes the pool lock and may drain owner state back through the registry; keeping the
+        // outer lock here would invert that ordering. Promote one owner at a time so switching a
+        // foundation model from Predict to Train never materializes the full parameter set.
+        if (ownersToPromote is not null)
+        {
+            foreach (var owner in ownersToPromote)
+                owner.PromoteStreamingStoreForTraining();
+            DrainOwnerDropsAfterEviction();
+        }
+    }
+
+    /// <summary>
+    /// Converts one already-registered quantized inference weight to the exact lossless training
+    /// store under the same handle. The current execution mode must already be training so
+    /// <see cref="Materialize{T}"/> decodes int8/int4 into a writable floating-point owner rather
+    /// than attaching the no-upcast inference form.
+    /// </summary>
+    internal static void PromoteStoreForTraining<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming || weight.StreamingPoolHandle < 0) return;
+        if (weight.StreamingStoreEncoding == StreamingEncoding.Native
+            || weight.StreamingStoreEncoding == StreamingEncoding.Lossless) return;
+
+        Materialize(weight);
+        byte[] bytes = SerializeLossless(weight);
+        StreamingTensorPool pool;
+        lock (_lock) { pool = StreamingPoolUnlocked(); }
+        pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
+        weight.StreamingStoreEncoding = StreamingEncoding.Lossless;
+
+        // The pool now owns the exact decoded snapshot. Drop this temporary owner before moving
+        // to the next weight; a failed drop merely leaves one writable tensor resident and is
+        // retried by the normal deferred-drop lifecycle.
+        ReleaseToPool(weight);
     }
 
     /// <summary>
