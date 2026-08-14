@@ -87,7 +87,7 @@ public class SgemmWithInt8RowScaledCachedBTests
     [InlineData(32, 256, 64, 5)]    // medium k inside Kc
     [InlineData(8, 1024, 16, 6)]    // k > Kc — exercise pcIter loop
     [InlineData(8, 600, 32, 7)]     // k % Kc != 0 — tail Kc panel
-    [InlineData(4, 32, 5000, 8)]    // n > Nc — large-n fallback path
+    [InlineData(4, 32, 5000, 8)]    // n > Nc — multi-panel no-upcast path
     // CodeRabbit #427 review comment regression: canParallelize=true AND
     // NumColSubBlocks=1 (n < Nr*4 ≈ 64). m*k*n = 64*1024*32 = 2 MiB hits
     // ParallelWorkThreshold's 2 MiB floor on any core count; n=32 < 64 forces
@@ -98,9 +98,12 @@ public class SgemmWithInt8RowScaledCachedBTests
         var tc = BuildRandomCase(m, k, n, seed);
         var c = new float[m * n];
 
+        // Arrays exercise the engine hot-path overload. In particular n=5000 must cross the
+        // Nc=4096 boundary while remaining in the no-upcast multi-panel path; the former fallback
+        // expanded every wide quantized projection into a full fp32 temporary.
         SimdGemm.SgemmWithInt8RowScaledCachedB(
-            tc.a.AsSpan(), tc.bInt8, tc.rowScales.AsSpan(),
-            c.AsSpan(), m, k, n);
+            tc.a, tc.bInt8, tc.rowScales.AsSpan(),
+            c, m, k, n);
 
         double snr = SnrDb(tc.cRef, c);
         Assert.True(snr >= 30.0, $"SNR {snr:F1} dB below 30 dB threshold (m={m}, k={k}, n={n})");
@@ -200,6 +203,21 @@ public class SgemmWithInt8RowScaledCachedBTests
 
         for (int i = 0; i < c.Length; i++)
             Assert.Equal(0f, c[i]);
+    }
+
+    [Theory]
+    [InlineData(-1, 0, 0, "m")]
+    [InlineData(0, -1, 0, "k")]
+    [InlineData(0, 0, -1, "n")]
+    public void NegativeDimensions_ThrowBeforeTheZeroDimensionFastPath(
+        int m, int k, int n, string parameterName)
+    {
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            SimdGemm.SgemmWithInt8RowScaledCachedB(
+                Array.Empty<float>(), Array.Empty<sbyte>(), ReadOnlySpan<float>.Empty,
+                Array.Empty<float>(), m, k, n));
+
+        Assert.Equal(parameterName, exception.ParamName);
     }
 
     [Fact]

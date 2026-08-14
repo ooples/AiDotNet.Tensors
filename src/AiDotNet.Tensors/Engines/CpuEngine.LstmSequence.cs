@@ -328,18 +328,25 @@ public partial class CpuEngine
 
         try
         {
+            // LSTM is also used after channel/sequence permutations (for example,
+            // Demucs feeds a [B, seq, channels] view).  Keep the zero-copy hot path
+            // for ordinary tensors while materializing only operands whose logical
+            // row-major order is not represented by one contiguous span.
+            var inputData = input.GetFlattenedData();
+            var wIhData = wIh.GetFlattenedData();
+
             // Wx = input @ wIh^T using SimdGemm with transB=true.
             // input rows = totalRows, K = inFeatures, wIh rows = gateRows, ldb = inFeatures.
             SimdGemm.Sgemm(
-                input.AsSpan(), inFeatures, false,
-                wIh.AsSpan(), inFeatures, true,
+                inputData.AsSpan(), inFeatures, false,
+                wIhData.AsSpan(), inFeatures, true,
                 wxBuf.AsSpan(0, totalRows * gateRows),
                 totalRows, inFeatures, gateRows);
 
             // Fold bIh into Wx (broadcast add) — SIMD-friendly contiguous loop.
             if (bIh is not null)
             {
-                var bIhArr = bIh.AsSpan();
+                var bIhArr = bIh.GetFlattenedData().AsSpan();
                 for (int r = 0; r < totalRows; r++)
                 {
                     int off = r * gateRows;
@@ -348,10 +355,10 @@ public partial class CpuEngine
                 }
             }
 
-            var wHhSpan = wHh.AsSpan();
-            float[]? bHhArr = bHh?.ToArray();
-            float[]? h0Arr = h0?.ToArray();
-            float[]? c0Arr = c0?.ToArray();
+            var wHhSpan = wHh.GetFlattenedData().AsSpan();
+            float[]? bHhArr = bHh?.GetFlattenedData();
+            float[]? h0Arr = h0?.GetFlattenedData();
+            float[]? c0Arr = c0?.GetFlattenedData();
 
             // #477: the recurrent GEMM h_prev @ wHh^T runs once per timestep. The old
             // transB=true Sgemm re-transposed wHh on EVERY step. Pre-transpose wHh
@@ -638,7 +645,7 @@ public partial class CpuEngine
         var wIhT = lstmPool.Rent(inFeatures * gateRows);
         var wxBuf = lstmPool.Rent(wxRows * gateRows);
         {
-            var wIhSrc = wIh.AsSpan();
+            var wIhSrc = wIh.GetFlattenedData().AsSpan();
             for (int g = 0; g < gateRows; g++)
                 for (int fcol = 0; fcol < inFeatures; fcol++)
                     wIhT[fcol * gateRows + g] = wIhSrc[g * inFeatures + fcol];
@@ -654,7 +661,7 @@ public partial class CpuEngine
         if (bIh is not null)
         {
             var ops = MathHelper.GetNumericOperations<T>();
-            var bIhSpan = bIh.AsSpan();
+            var bIhSpan = bIh.GetFlattenedData().AsSpan();
             for (int r = 0; r < wxRows; r++)
             {
                 int off = r * gateRows;
@@ -683,6 +690,7 @@ public partial class CpuEngine
 
         var opsT = MathHelper.GetNumericOperations<T>();
         var wxSpanRO = new ReadOnlySpan<T>(wxBuf, 0, wxRows * gateRows);
+        var bHhData = bHh?.GetFlattenedData();
 
         // #478: pool the per-timestep hidden GEMM. The old TensorMatMulTransposed(hPrev, wHh) allocated
         // a fresh [batch, 4*hidden] output (plus the GEMM's packing scratch) EVERY step. Pre-transpose
@@ -692,7 +700,7 @@ public partial class CpuEngine
         var wHhT = lstmPool.Rent(hidden * gateRows);
         var hhBuf = lstmPool.Rent(batch * gateRows);
         {
-            var wHhSrc = wHh.AsSpan();
+            var wHhSrc = wHh.GetFlattenedData().AsSpan();
             for (int g = 0; g < gateRows; g++)
                 for (int hcol = 0; hcol < hidden; hcol++)
                     wHhT[hcol * gateRows + g] = wHhSrc[g * hidden + hcol];
@@ -717,8 +725,8 @@ public partial class CpuEngine
             var hCurrSpan = hCurr.AsWritableSpan();
             var cCurrSpan = cCurr.AsWritableSpan();
             var cPrevSpan = cbufs[cur].AsSpan();
-            bool hasBhh = bHh is not null;
-            ReadOnlySpan<T> bHhSpan = hasBhh ? bHh!.AsSpan() : default;
+            bool hasBhh = bHhData is not null;
+            ReadOnlySpan<T> bHhSpan = hasBhh ? bHhData.AsSpan() : default;
 
             for (int b = 0; b < batch; b++)
             {
@@ -819,7 +827,7 @@ public partial class CpuEngine
         if (source is null)
             dst.Slice(0, n).Clear();
         else
-            source.AsSpan().Slice(0, n).CopyTo(dst.Slice(0, n));
+            source.GetFlattenedData().AsSpan(0, n).CopyTo(dst.Slice(0, n));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

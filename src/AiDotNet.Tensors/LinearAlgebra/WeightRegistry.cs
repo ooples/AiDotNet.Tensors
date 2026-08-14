@@ -650,7 +650,57 @@ public static class WeightRegistry
     /// </summary>
     public static void SetStreamingExecutionTraining(bool? isTraining)
     {
-        lock (_lock) { _streamingTrainingMode = isTraining; }
+        List<IStreamingDroppable>? ownersToPromote = null;
+        lock (_lock)
+        {
+            _streamingTrainingMode = isTraining;
+            if (isTraining == true && _ownerByHandle.Count > 0)
+            {
+                ownersToPromote = new List<IStreamingDroppable>(_ownerByHandle.Count);
+                foreach (var weak in _ownerByHandle.Values)
+                {
+                    if (weak.TryGetTarget(out var owner) && owner.StreamingStoreIsReadOnly)
+                        ownersToPromote.Add(owner);
+                }
+            }
+        }
+
+        // Do not hold the registry lock while decoding or replacing pool entries. Materialize
+        // takes the pool lock and may drain owner state back through the registry; keeping the
+        // outer lock here would invert that ordering. Promote one owner at a time so switching a
+        // foundation model from Predict to Train never materializes the full parameter set.
+        if (ownersToPromote is not null)
+        {
+            foreach (var owner in ownersToPromote)
+                owner.PromoteStreamingStoreForTraining();
+            DrainOwnerDropsAfterEviction();
+        }
+    }
+
+    /// <summary>
+    /// Converts one already-registered quantized inference weight to the exact lossless training
+    /// store under the same handle. The current execution mode must already be training so
+    /// <see cref="Materialize{T}"/> decodes int8/int4 into a writable floating-point owner rather
+    /// than attaching the no-upcast inference form.
+    /// </summary>
+    internal static void PromoteStoreForTraining<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming || weight.StreamingPoolHandle < 0) return;
+        if (weight.StreamingStoreEncoding == StreamingEncoding.Native
+            || weight.StreamingStoreEncoding == StreamingEncoding.Lossless) return;
+
+        Materialize(weight);
+        byte[] bytes = SerializeLossless(weight);
+        StreamingTensorPool pool;
+        lock (_lock) { pool = StreamingPoolUnlocked(); }
+        pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
+        weight.StreamingStoreEncoding = StreamingEncoding.Lossless;
+
+        // The pool now owns the exact decoded snapshot. Drop this temporary owner before moving
+        // to the next weight; a failed drop merely leaves one writable tensor resident and is
+        // retried by the normal deferred-drop lifecycle.
+        ReleaseToPool(weight);
     }
 
     /// <summary>
@@ -787,7 +837,7 @@ public static class WeightRegistry
                 //   • training → LOSSLESS (byte-shuffle + Deflate): bit-exact, so the fp32/fp64
                 //     masters are preserved EXACTLY (no convergence risk) while still reclaiming
                 //     ~1.18x. The quantized tiers are NEVER chosen here: their eviction write-back
-                //     is native-only (TryWriteBackResidentForStreaming), so a mutated quantized
+                //     is unsupported (TryWriteBackResidentForStreaming), so a mutated quantized
                 //     weight would silently lose its update. Inference weights are read-only, so
                 //     the quantized tiers below are safe only in that mode.
                 //   • inference → RAM-aware (ResolveAutoInferenceEncoding): bf16 by default, but
@@ -1004,16 +1054,20 @@ public static class WeightRegistry
             int rows = tensor.Int8QuantRows;
             if (typeof(T) == typeof(float))
             {
-                var srcF = (float[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
+                var srcF = (float[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt8TransposedFloat(srcF, dst, tensor._shape[0], tensor._shape[1]);
+                else
+                    StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
-                var srcD = (double[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
+                var srcD = (double[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt8TransposedDouble(srcD, dst, tensor._shape[0], tensor._shape[1]);
+                else
+                    StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
                 return;
             }
             throw new NotSupportedException(
@@ -1032,16 +1086,20 @@ public static class WeightRegistry
             int gs = StreamingStoreCodec.DefaultInt4GroupSize;
             if (typeof(T) == typeof(float))
             {
-                var srcF = (float[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt4Float(srcF, dst, gs);
+                var srcF = (float[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt4TransposedFloat(srcF, dst, tensor._shape[0], tensor._shape[1], gs);
+                else
+                    StreamingStoreCodec.EncodeInt4Float(srcF, dst, gs);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
-                var srcD = (double[])(object)tensor.AsSpan().ToArray();
-                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
-                StreamingStoreCodec.EncodeInt4Double(srcD, dst, gs);
+                var srcD = (double[])(object)tensor.GetReadOnlyDataArray();
+                if (tensor.Int8StoreTransposed)
+                    StreamingStoreCodec.EncodeInt4TransposedDouble(srcD, dst, tensor._shape[0], tensor._shape[1], gs);
+                else
+                    StreamingStoreCodec.EncodeInt4Double(srcD, dst, gs);
                 return;
             }
             throw new NotSupportedException(
@@ -1255,19 +1313,33 @@ public static class WeightRegistry
     }
 
     /// <summary>
-    /// Re-serializes a resident, native-encoded streaming weight's CURRENT data into its pool entry
+    /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry
     /// under the same handle (#1715). Called by <see cref="Tensor{T}.TryWriteBackResidentForStreaming"/>
     /// before a mutated weight is dropped, so the mutation reaches disk and a later
     /// <see cref="Materialize{T}"/> rehydrates it rather than the stale register-time snapshot.
     /// </summary>
-    internal static bool WriteBackResidentNative<T>(Tensor<T> weight)
+    internal static bool WriteBackResident<T>(Tensor<T> weight)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.StreamingPoolHandle < 0) return false;
         if (weight.DataVector.Length != weight.Length) return false;
-        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
-        var bytes = new byte[byteCount];
-        SerializeToBytes(weight, bytes, StreamingEncoding.Native, stochastic: false);
+        byte[] bytes;
+        if (weight.StreamingStoreEncoding == StreamingEncoding.Lossless)
+        {
+            // Training's Auto tier is lossless. Re-encode the current values exactly so an
+            // optimizer update survives owner shedding and the variable-size entry remains valid.
+            bytes = SerializeLossless(weight);
+        }
+        else if (weight.StreamingStoreEncoding == StreamingEncoding.Native)
+        {
+            int byteCount = CheckedStreamingByteCount<T>(weight.Length);
+            bytes = new byte[byteCount];
+            SerializeToBytes(weight, bytes, StreamingEncoding.Native, stochastic: false);
+        }
+        else
+        {
+            return false;
+        }
         StreamingTensorPool pool;
         lock (_lock) { pool = StreamingPoolUnlocked(); }
         pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
@@ -1316,19 +1388,21 @@ public static class WeightRegistry
             long victim = victimNode.Value;
             _materializedBytes.TryGetValue(victim, out long victimBytes);
 
-            // Persist + drop the coldest owner, but only UNTRACK it after both succeed. If write-back
-            // returns false (non-native/aliased — nothing to persist) or the drop returns false
-            // (shared refcount), the owner must stay resident AND accounted; untracking it first
-            // would leak its bytes from the budget (the resident copy still exists). Order: write-back
-            // FIRST so the dropped bytes are recoverable from the pool/disk.
+            // Persist + drop the coldest owner, but only UNTRACK it after both succeed. Quantized
+            // inference owners are immutable, so their pool snapshot is already authoritative;
+            // native/lossless owners must write back successfully first. A write-back failure or
+            // shared refcount leaves the owner resident AND accounted so no mutation can be lost.
             bool shed;
             if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
             {
-                bool wroteBack = false;
-                try { wroteBack = owner.TryWriteBackResidentForStreaming(); }
-                catch { /* best-effort */ }
+                bool safeToDrop = owner.StreamingStoreIsReadOnly;
+                if (!safeToDrop)
+                {
+                    try { safeToDrop = owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* leave resident + accounted; correctness beats the soft budget */ }
+                }
                 shed = false;
-                if (wroteBack)
+                if (safeToDrop)
                 {
                     try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
                     catch { /* shared refcount → leave resident + accounted */ }
@@ -1339,7 +1413,7 @@ public static class WeightRegistry
                 shed = true; // dead owner: no resident copy remains to account
             }
 
-            // Coldest owner can't be shed yet (non-native, or shared ref) — stop. Bounding is
+            // Coldest owner can't be shed yet (write-back failed, or shared ref) — stop. Bounding is
             // best-effort; never untrack/forget a still-resident owner.
             if (!shed) break;
             _materializedLru.Remove(victimNode);
@@ -1449,6 +1523,18 @@ public static class WeightRegistry
                 return;
             }
         }
+        // Native and lossless stores are writable. Persist the CURRENT resident values before
+        // dropping their owner; otherwise ReleaseToPool alone would resurrect the stale snapshot
+        // captured at registration. Quantized inference stores are immutable and their original
+        // pool snapshot remains authoritative.
+        bool storeIsReadOnly = weight.StreamingStoreEncoding != StreamingEncoding.Native
+            && weight.StreamingStoreEncoding != StreamingEncoding.Lossless;
+        if (!storeIsReadOnly && !weight.TryWriteBackResidentForStreaming())
+        {
+            weight.StreamingDropDeferred = true;
+            return;
+        }
+
         // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
         // weight's storage can be SHARED (refcount > 1) at release time when a
         // peer holds a second reference for the duration of the layer's Forward:
@@ -2262,18 +2348,22 @@ public static class WeightRegistry
                 // #1715: the pool just paged out this handle's snapshot taken at register time. If the
                 // owner MUTATED its resident copy since (a GetParameters round-trip / optimizer step),
                 // that snapshot is stale — write the owner's CURRENT bytes back BEFORE dropping so a
-                // later Materialize rehydrates the mutation, not the stale value. Native-gated inside
-                // TryWriteBackResidentForStreaming, so read-only inference (bf16/quant store) is a no-op.
-                // Unlike the materialized-owner SHED loop (NoteMaterializedAndShed), the drop here is safe
-                // regardless of the write-back RESULT: a native owner's write-back persists the mutation
-                // before the drop, and a non-native owner's resident copy is a re-derivable dequant of the
-                // pool's quantized snapshot (re-materialize re-derives it) — so the snapshot stays
-                // authoritative either way. (Training uses the FullPrecision/native store, so a mutated
-                // owner is always native and always writes back.)
-                try { owner.TryWriteBackResidentForStreaming(); }
-                catch { /* best-effort write-back; never block the drop */ }
-                try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
-                catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
+                // later Materialize rehydrates the mutation, not the stale value. Writable-encoding-gated
+                // inside TryWriteBackResidentForStreaming, so read-only inference (bf16/int8/int4) is a no-op.
+                // A quantized owner is immutable, so its registered snapshot remains authoritative.
+                // A native/lossless owner may have changed and is dropped only after exact write-back
+                // succeeds. Never convert a persistence failure into silent parameter loss.
+                bool safeToDrop = owner.StreamingStoreIsReadOnly;
+                if (!safeToDrop)
+                {
+                    try { safeToDrop = owner.TryWriteBackResidentForStreaming(); }
+                    catch { /* leave resident; correctness beats reclaiming this owner */ }
+                }
+                if (safeToDrop)
+                {
+                    try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                    catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
+                }
             }
         }
     }

@@ -143,8 +143,9 @@ public partial class CpuEngine
     }
 
     /// <summary>
-    /// Float32 fast path. Calls <see cref="SimdGemm.Sgemm"/> directly for the
-    /// four projections, writes Q/K/V into <c>[B, heads, seq, dHead]</c>
+    /// Float32 fast path. Calls <see cref="SimdGemm.Sgemm"/> directly for normal
+    /// weights and the no-upcast int8/int4 kernels for streamed weights, writes
+    /// Q/K/V into <c>[B, heads, seq, dHead]</c>
     /// layout inline via a small post-GEMM scatter (one O(B*seq*dModel)
     /// memory pass instead of three through <see cref="Tensor{T}.Transpose"/>),
     /// reuses pooled scratch buffers across the whole call, and only
@@ -160,6 +161,27 @@ public partial class CpuEngine
         int totalRows = batch * seqLen;
         var pool = ArrayPool<float>.Shared;
 
+#if NET5_0_OR_GREATER
+        // Resolve the kernel-ready forms before touching any weight span. AsSpan is the
+        // intentional generic fallback that dequantizes a streamed weight to fp32; doing
+        // that for four paper-scale attention matrices defeated streaming and was visible
+        // as TensorBase.DequantizeStreamingInt8 in exact-model traces.
+        var qQ8 = qWeight.GetMaterializedStreamingInt8();
+        var kQ8 = kWeight.GetMaterializedStreamingInt8();
+        var vQ8 = vWeight.GetMaterializedStreamingInt8();
+        var oQ8 = outWeight.GetMaterializedStreamingInt8();
+        var qQ4 = qQ8 is null ? qWeight.GetMaterializedStreamingInt4() : null;
+        var kQ4 = kQ8 is null ? kWeight.GetMaterializedStreamingInt4() : null;
+        var vQ4 = vQ8 is null ? vWeight.GetMaterializedStreamingInt4() : null;
+        var oQ4 = oQ8 is null ? outWeight.GetMaterializedStreamingInt4() : null;
+        bool hasQuantizedProjection = qQ8 is not null || kQ8 is not null || vQ8 is not null || oQ8 is not null
+            || qQ4 is not null || kQ4 is not null || vQ4 is not null || oQ4 is not null;
+#else
+        StreamingInt8Weight? qQ8 = null, kQ8 = null, vQ8 = null, oQ8 = null;
+        StreamingInt4Weight? qQ4 = null, kQ4 = null, vQ4 = null, oQ4 = null;
+        bool hasQuantizedProjection = false;
+#endif
+
         // Fused QKV projection: one [B*seq, dModel] @ [dModel, 3*dModel] GEMM
         // instead of three @ [dModel, dModel]. Reads `input` once (vs 3×), one
         // dispatch (vs 3), and a wider N=3*dModel that the SIMD microkernel
@@ -167,7 +189,10 @@ public partial class CpuEngine
         // projection GEMM quality). Output rows are [q(dModel)|k(dModel)|v(dModel)].
         int dModel3 = 3 * dModel;
         var qkvFlatBuf = pool.Rent(totalRows * dModel3);
-        var fusedWBuf = pool.Rent(dModel * dModel3);    // [dModel, 3*dModel] = [qW | kW | vW]
+        // Quantized kernels produce one contiguous projection at a time; normal fp32
+        // retains the faster single fused-QKV GEMM. Rent only the scratch each route uses.
+        var fusedWBuf = hasQuantizedProjection ? null : pool.Rent(dModel * dModel3);
+        var projectionBuf = hasQuantizedProjection ? pool.Rent(totalRows * dModel) : null;
         var concatBuf = pool.Rent(totalRows * dModel); // [B*seq, dModel] attention output, pre out-proj
 
         var output = AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, dModel });
@@ -179,13 +204,24 @@ public partial class CpuEngine
             // weight once (cheap: dModel*3*dModel = ~48 KB at the AIsEval shape),
             // then ONE GEMM input[B*seq, dModel] @ fusedW[dModel, 3*dModel] ->
             // qkvFlat[B*seq, 3*dModel]. Each output row is [q|k|v].
-            var inputSpan = input.AsSpan();
+            var inputArray = input.GetReadOnlyDataArray();
+            var inputSpan = inputArray.AsSpan(0, totalRows * dModel);
             int batchSeqRows = totalRows;
+            if (hasQuantizedProjection)
+            {
+                ProjectMhaFloat(inputArray, qWeight, qQ8, qQ4, projectionBuf!, batchSeqRows, dModel);
+                CopyMhaProjection(projectionBuf!, qkvFlatBuf, batchSeqRows, dModel, dModel3, 0);
+                ProjectMhaFloat(inputArray, kWeight, kQ8, kQ4, projectionBuf!, batchSeqRows, dModel);
+                CopyMhaProjection(projectionBuf!, qkvFlatBuf, batchSeqRows, dModel, dModel3, dModel);
+                ProjectMhaFloat(inputArray, vWeight, vQ8, vQ4, projectionBuf!, batchSeqRows, dModel);
+                CopyMhaProjection(projectionBuf!, qkvFlatBuf, batchSeqRows, dModel, dModel3, 2 * dModel);
+            }
+            else
             {
                 var qWS = qWeight.AsSpan();
                 var kWS = kWeight.AsSpan();
                 var vWS = vWeight.AsSpan();
-                var fW = fusedWBuf.AsSpan();
+                var fW = fusedWBuf!.AsSpan();
                 for (int kk = 0; kk < dModel; kk++)
                 {
                     int dstRow = kk * dModel3;
@@ -193,13 +229,13 @@ public partial class CpuEngine
                     kWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + dModel, dModel));
                     vWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + 2 * dModel, dModel));
                 }
+                using (Profiling.Profiler.OpScope("MHA.QKVproj"))
+                SimdGemm.Sgemm(
+                    inputSpan, dModel, false,
+                    fusedWBuf.AsSpan(0, dModel * dModel3), dModel3, false,
+                    qkvFlatBuf.AsSpan(0, totalRows * dModel3),
+                    batchSeqRows, dModel, dModel3);
             }
-            using (Profiling.Profiler.OpScope("MHA.QKVproj"))
-            SimdGemm.Sgemm(
-                inputSpan, dModel, false,
-                fusedWBuf.AsSpan(0, dModel * dModel3), dModel3, false,
-                qkvFlatBuf.AsSpan(0, totalRows * dModel3),
-                batchSeqRows, dModel, dModel3);
 
             // ---- Transpose-fused SDPA (#476 root-cause-2). ----
             // Instead of three full [B,seq,dModel]→[B,H,seq,dHead] transpose
@@ -221,19 +257,73 @@ public partial class CpuEngine
 
             // ---- Output projection: [B*seq, dModel] @ outWeight [dModel, dModel] -> output. ----
             using (Profiling.Profiler.OpScope("MHA.OutProj"))
-            SimdGemm.Sgemm(
-                concatBuf.AsSpan(0, totalRows * dModel), dModel, false,
-                outWeight.AsSpan(), dModel, false,
-                output.AsWritableSpan(),
-                batchSeqRows, dModel, dModel);
+            if (hasQuantizedProjection)
+            {
+                ProjectMhaFloat(
+                    concatBuf, outWeight, oQ8, oQ4,
+                    (float[])(object)output.GetDataArray(), batchSeqRows, dModel);
+            }
+            else
+            {
+                SimdGemm.Sgemm(
+                    concatBuf.AsSpan(0, totalRows * dModel), dModel, false,
+                    outWeight.AsSpan(), dModel, false,
+                    output.AsWritableSpan(),
+                    batchSeqRows, dModel, dModel);
+            }
 
             return output;
         }
         finally
         {
             pool.Return(qkvFlatBuf);
-            pool.Return(fusedWBuf);
+            if (fusedWBuf is not null) pool.Return(fusedWBuf);
+            if (projectionBuf is not null) pool.Return(projectionBuf);
             pool.Return(concatBuf);
+        }
+    }
+
+    /// <summary>Projects one MHA matrix without dequantizing a streamed weight.</summary>
+    private static void ProjectMhaFloat(
+        float[] input,
+        Tensor<float> weight,
+        StreamingInt8Weight? q8,
+        StreamingInt4Weight? q4,
+        float[] output,
+        int rows,
+        int dModel)
+    {
+#if NET5_0_OR_GREATER
+        if (q8 is not null && q8.Rows == dModel && q8.K == dModel)
+        {
+            SimdGemm.SgemmWithInt8RowScaledCachedB(
+                input, q8.Data, q8.Scales, output, rows, dModel, dModel);
+            return;
+        }
+
+        if (q4 is not null && q4.Rows == dModel && q4.K == dModel)
+        {
+            SimdGemm.SgemmWithInt4GroupScaledDispatch(
+                input, q4.Data, q4.GroupScales, q4.GroupSize,
+                output, rows, dModel, dModel);
+            return;
+        }
+#endif
+
+        SimdGemm.Sgemm(
+            input.AsSpan(0, rows * dModel), dModel, false,
+            weight.AsSpan(), dModel, false,
+            output.AsSpan(0, rows * dModel), rows, dModel, dModel);
+    }
+
+    private static void CopyMhaProjection(
+        float[] source, float[] destination,
+        int rows, int dModel, int destinationStride, int destinationColumn)
+    {
+        for (int row = 0; row < rows; row++)
+        {
+            source.AsSpan(row * dModel, dModel).CopyTo(
+                destination.AsSpan(row * destinationStride + destinationColumn, dModel));
         }
     }
 

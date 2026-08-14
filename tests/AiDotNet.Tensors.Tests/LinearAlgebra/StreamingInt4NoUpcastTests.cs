@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -137,6 +138,140 @@ public class StreamingInt4NoUpcastTests
         }
         finally { Cleanup(dir); }
     }
+
+#if NET5_0_OR_GREATER
+    [Fact]
+    public void Int4Weight_ThroughTensorMatMul2DAndBatched_StaysQuantized()
+    {
+        const int inDim = 64, outDim = 48, rows = 6;
+        var engine = new CpuEngine();
+        var weights = CreateWeightData(inDim * outDim, 0.08f);
+        var inputs = CreateWeightData(rows * inDim, 0.4f);
+        var dequantized = DequantizeInt4PerOutput(weights, inDim, outDim);
+        var referenceWeight = new Tensor<float>(dequantized, new[] { inDim, outDim });
+        var x2 = new Tensor<float>(inputs, new[] { rows, inDim });
+        var x3 = new Tensor<float>(inputs, new[] { 2, rows / 2, inDim });
+        var expected2 = engine.TensorMatMul(x2, referenceWeight);
+        var expected3 = engine.TensorMatMul(x3, referenceWeight);
+
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int4mm-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Int4,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var streamed = new Tensor<float>(weights, new[] { inDim, outDim })
+            {
+                Lifetime = WeightLifetime.Streaming,
+            };
+            WeightRegistry.RegisterWeight(streamed);
+
+            AssertRelativeClose(engine.TensorMatMul(x2, streamed), expected2, 0.01);
+            Assert.NotNull(streamed.StreamingInt4);
+            Assert.Equal(0, streamed.DataVector.Length);
+
+            AssertRelativeClose(engine.TensorMatMul(x3, streamed), expected3, 0.01);
+            Assert.NotNull(streamed.StreamingInt4);
+            Assert.Equal(0, streamed.DataVector.Length);
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void Int4Weights_ThroughMultiHeadAttention_StayQuantized()
+    {
+        const int batch = 2, seq = 3, dModel = 32, heads = 4;
+        var engine = new CpuEngine();
+        var inputData = CreateWeightData(batch * seq * dModel, 0.3f);
+        var input = new Tensor<float>(inputData, new[] { batch, seq, dModel });
+        var qData = CreateWeightData(dModel * dModel, 0.05f, 1);
+        var kData = CreateWeightData(dModel * dModel, 0.05f, 2);
+        var vData = CreateWeightData(dModel * dModel, 0.05f, 3);
+        var oData = CreateWeightData(dModel * dModel, 0.05f, 4);
+        Tensor<float> Reference(float[] data) => new(
+            DequantizeInt4PerOutput(data, dModel, dModel), new[] { dModel, dModel });
+        var expected = engine.MultiHeadAttentionForward(
+            input, Reference(qData), Reference(kData), Reference(vData), Reference(oData), heads);
+
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int4mha-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 4L * 1024 * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Int4,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            Tensor<float> Stream(float[] data)
+            {
+                var weight = new Tensor<float>(data, new[] { dModel, dModel })
+                {
+                    Lifetime = WeightLifetime.Streaming,
+                };
+                WeightRegistry.RegisterWeight(weight);
+                return weight;
+            }
+
+            var q = Stream(qData);
+            var k = Stream(kData);
+            var v = Stream(vData);
+            var o = Stream(oData);
+            var actual = engine.MultiHeadAttentionForward(input, q, k, v, o, heads);
+
+            foreach (var weight in new[] { q, k, v, o })
+            {
+                Assert.NotNull(weight.StreamingInt4);
+                Assert.Equal(0, weight.DataVector.Length);
+            }
+            AssertRelativeClose(actual, expected, 0.02);
+        }
+        finally { Cleanup(dir); }
+    }
+
+    private static float[] DequantizeInt4PerOutput(float[] logical, int inputColumns, int outputColumns)
+    {
+        int groupSize = StreamingStoreCodec.DefaultInt4GroupSize;
+        var encoded = new byte[StreamingStoreCodec.Int4BufferBytes(logical.Length, groupSize)];
+        StreamingStoreCodec.EncodeInt4TransposedFloat(
+            logical, encoded, inputColumns, outputColumns, groupSize);
+        var transposed = new float[logical.Length];
+        StreamingStoreCodec.DecodeInt4Float(encoded, transposed);
+        var result = new float[logical.Length];
+        for (int input = 0; input < inputColumns; input++)
+            for (int output = 0; output < outputColumns; output++)
+                result[input * outputColumns + output] = transposed[output * inputColumns + input];
+        return result;
+    }
+
+    private static float[] CreateWeightData(int count, float magnitude, int phase = 0)
+    {
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = (float)Math.Sin((i + phase * 19) * 0.017) * magnitude;
+        return result;
+    }
+
+    private static void AssertRelativeClose(Tensor<float> actual, Tensor<float> expected, double tolerance)
+    {
+        var a = actual.AsSpan();
+        var e = expected.AsSpan();
+        Assert.Equal(e.Length, a.Length);
+        double errorSquared = 0.0, expectedSquared = 0.0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            double error = a[i] - e[i];
+            errorSquared += error * error;
+            expectedSquared += (double)e[i] * e[i];
+        }
+        double relative = Math.Sqrt(errorSquared / Math.Max(1e-30, expectedSquared));
+        Assert.True(relative < tolerance, $"relative RMS error {relative:E3} exceeded {tolerance:E3}");
+    }
+#endif
 
     private static void Cleanup(string dir)
     {
