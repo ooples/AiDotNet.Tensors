@@ -106,9 +106,9 @@ internal sealed class PtxWinogradWmmaBatchedGemmKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView u, DirectPtxTensorView v, DirectPtxTensorView m)
     {
-        Require(u, Blueprint.Tensors[0], nameof(u));
-        Require(v, Blueprint.Tensors[1], nameof(v));
-        Require(m, Blueprint.Tensors[2], nameof(m));
+        DirectPtxAbiGuard.Require(u, Blueprint.Tensors[0], nameof(u));
+        DirectPtxAbiGuard.Require(v, Blueprint.Tensors[1], nameof(v));
+        DirectPtxAbiGuard.Require(m, Blueprint.Tensors[2], nameof(m));
         IntPtr uPtr = u.Pointer, vPtr = v.Pointer, mPtr = m.Pointer;
         void** args = stackalloc void*[3];
         args[0] = &uPtr; args[1] = &vPtr; args[2] = &mPtr;
@@ -120,15 +120,6 @@ internal sealed class PtxWinogradWmmaBatchedGemmKernel : IDisposable
             args);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     // WMMA batched GEMM: M[xi][ko,pp] = sum_c U[xi][ko,c] * V[xi][pp,c]. A=U row-major
     // [K,C]; B=V row-major [P,C] loaded col-major (= V^T) so the mma yields U*V.

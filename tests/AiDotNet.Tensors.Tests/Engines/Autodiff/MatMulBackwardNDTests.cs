@@ -13,6 +13,44 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public class MatMulBackwardNDTests
 {
     [Fact]
+    public void MatMul_ProductionProjectionInputVjpMatchesCentralDifferences()
+    {
+        const int rows = 4;
+        const int features = 256;
+        var input = CreateDeterministic(new[] { rows, features }, 31, 0.4f);
+        var weight = CreateDeterministic(new[] { features, features }, 32, 0.08f);
+        var projection = CreateDeterministic(new[] { rows, features }, 33, 0.8f);
+        var engine = new CpuEngine();
+        Tensor<float> gradient;
+        using (var tape = new GradientTape<float>())
+        {
+            var output = engine.TensorMatMul(input, weight);
+            var loss = engine.ReduceSum(
+                engine.TensorMultiply(output, projection), new[] { 0, 1 }, false);
+            gradient = tape.ComputeGradients(loss, new[] { input })[input];
+        }
+
+        const float epsilon = 1e-3f;
+        for (int sample = 0; sample < 12; sample++)
+        {
+            int index = sample * (input.Length / 12);
+            float original = input[index];
+            input[index] = original + epsilon;
+            double plus = Dot(engine.TensorMatMul(input, weight), projection);
+            input[index] = original - epsilon;
+            double minus = Dot(engine.TensorMatMul(input, weight), projection);
+            input[index] = original;
+
+            double numeric = (plus - minus) / (2 * epsilon);
+            double analytic = gradient[index];
+            double scale = Math.Max(Math.Max(Math.Abs(numeric), Math.Abs(analytic)), 1.0);
+            Assert.True(
+                Math.Abs(numeric - analytic) / scale < 5e-2,
+                $"input[{index}]: analytic={analytic:R}, numeric={numeric:R}");
+        }
+    }
+
+    [Fact]
     public void MatMul3D_Backward_ProducesGradients()
     {
         var engine = new CpuEngine();
@@ -150,5 +188,23 @@ public class MatMulBackwardNDTests
         var data = new float[length];
         for (int i = 0; i < data.Length; i++) data[i] = (float)(rng.NextDouble() * 2 - 1);
         return new Tensor<float>(data, shape);
+    }
+
+    private static Tensor<float> CreateDeterministic(int[] shape, int seed, float scale)
+    {
+        int length = 1;
+        foreach (int size in shape) length *= size;
+        var values = new float[length];
+        for (int i = 0; i < length; i++)
+            values[i] = (float)(Math.Sin(seed * 0.43 + i * 0.71) * scale);
+        return new Tensor<float>(values, shape);
+    }
+
+    private static double Dot(Tensor<float> tensor, Tensor<float> projection)
+    {
+        double sum = 0;
+        for (int i = 0; i < tensor.Length; i++)
+            sum += tensor[i] * projection[i];
+        return sum;
     }
 }

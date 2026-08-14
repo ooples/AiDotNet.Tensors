@@ -100,6 +100,281 @@ public static class PtxParityRegistry
             "CudaBackend.MaskedFillBackward",
             "Backend_SoftmaxBackwardReductionAndMasking_ThreeWayParity compares incumbent CUDA and direct PTX " +
             "bit-for-bit against the masked-gradient contract."),
+        new PtxParitySpec("PtxFusedComplexUnaryF32Kernel", PtxParityStatus.Deferred,
+            "complex conjugate and magnitude, fp32 (#850) - CudaBackend.ComplexConjugate, CudaBackend.ComplexMagnitude",
+            "one module per operator. Conjugate is a sign-bit flip, so its spec can be bit-exact and " +
+            "must include NaN payloads and both signed zeros. Magnitude can be bit-exact too, but only " +
+            "because the emitter deliberately leaves the multiply-add UNFUSED: an fma would be more " +
+            "accurate than sqrtf(re*re + im*im) and would therefore disagree with the reference, so " +
+            "the spec must assert equality rather than a tolerance to keep that property honest."),
+
+        new PtxParitySpec("PtxFusedComplexMultiplyF32Kernel", PtxParityStatus.Deferred,
+            "interleaved-complex multiply, fp32 (#850)",
+            "structurally ready for a three-way spec — it is the first direct-PTX kernel with both a " +
+            "public op route (CudaBackend.ComplexMultiply) and a call-time experiment override — but " +
+            "the kernel is admitted only on exact SM86, and its issue (#850) explicitly holds GPU " +
+            "correctness back to the admitted release machine. Converts to ThreeWayParity when the " +
+            "fp64-oracle run over the four exact pair counts lands; until then the route stays disabled " +
+            "and every shape unpromoted."),
+
+        new PtxParitySpec("PtxSplitComplexUnaryF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex magnitude and magnitude-squared, fp32 (#850) - CudaBackend.SplitComplexMagnitude, CudaBackend.SplitComplexMagnitudeSquared",
+            "one module per operator over the four exact element counts. Both can be bit-exact because " +
+            "the emitter leaves the multiply-add UNFUSED to match sqrtf(re*re + im*im) / the reference " +
+            "power sum; an fma would be more accurate and would disagree, so the spec must assert " +
+            "equality rather than a tolerance. Converts to ThreeWayParity when the SM86 fp64-oracle run " +
+            "lands; until then the shapes stay unpromoted and fail closed."),
+
+        new PtxParitySpec("PtxSplitComplexBinaryF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex multiply, add, and cross-spectral, fp32 (#850) - CudaBackend.SplitComplexMultiply, CudaBackend.SplitComplexAdd, CudaBackend.SplitComplexCrossSpectral",
+            "one module per operator over the four exact element counts. Multiply forms ar*br-ai*bi and " +
+            "ar*bi+ai*br, and cross-spectral (a*conj(b)) forms xr*yr+xi*yi and xi*yr-xr*yi, both with the " +
+            "same multiply-then-fma contraction the interleaved multiply kernel uses (the reference's " +
+            "default fused evaluation); add is two add.rn lanes. Converts to ThreeWayParity when the " +
+            "SM86 fp64-oracle run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxSplitComplexConjugateF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex conjugate, fp32 (#850) - CudaBackend.SplitComplexConjugate",
+            "one module over the four exact element counts. The real lane is copied and the imaginary " +
+            "lane is a neg.f32 sign-bit flip, so the spec is bit-exact and must include NaN payloads and " +
+            "both signed zeros. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted."),
+
+        new PtxParitySpec("PtxComplexInterleaveF32Kernel", PtxParityStatus.Deferred,
+            "complex interleave and deinterleave layout bridges, fp32 (#850) - CudaBackend.InterleaveComplex, CudaBackend.DeinterleaveComplex",
+            "one module per direction over the four exact element counts. Both directions are pure data " +
+            "movement (a v2 transaction on the interleaved side, two scalar transactions on the split " +
+            "side), so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
+            "ThreeWayParity when the SM86 run lands; until then the shapes stay unpromoted and fail closed."),
+
+        new PtxParitySpec("PtxSplitComplexScaleF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex real-scalar scale, fp32 (#850) - CudaBackend.SplitComplexScale",
+            "one module over the four exact element counts; the scalar is a per-launch .param .f32. Each " +
+            "lane is a single mul.rn, so the spec is bit-exact with the reference x*scalar. Converts to " +
+            "ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxSplitComplexPhaseF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer complex phase, fp32 (#850) - CudaBackend.SplitComplexPhase",
+            "one module over the four exact element counts. PTX has no atan2 primitive, so the angle is a " +
+            "minimax atan (~1e-4) plus quadrant folding; unlike the other split operators its spec is " +
+            "TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
+            "run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxSplitComplexFromPolarF32Kernel", PtxParityStatus.Deferred,
+            "split-buffer polar-to-Cartesian, fp32 (#850) - CudaBackend.SplitComplexFromPolar",
+            "one module over the four exact element counts using cos.approx/sin.approx, so its spec is " +
+            "TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
+            "run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxApplyMelFilterbankF32Kernel", PtxParityStatus.Deferred,
+            "mel filterbank application, fp32 (#850) - CudaBackend.ApplyMelFilterbank",
+            "thread-per-(frame,mel) fma reduction over the frequency axis, matching the reference's " +
+            "fused sum. The spec is a fp64-oracle comparison over exact (frames,freqs,mels) shapes on " +
+            "SM86; converts to ThreeWayParity when that run lands. Until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxBitReversePermutationF32Kernel", PtxParityStatus.Deferred,
+            "FFT bit-reversal permutation, fp32 (#850) - CudaBackend.FFT (stage 1 of radix-2 DIT)",
+            "one module per power-of-two length; the log2(n)-bit-reversed index is a single brev.b32 " +
+            "shifted right by 32-log2(n), and the lower thread of each pair performs the in-place swap. " +
+            "It is pure data movement, so the spec is bit-exact including NaN payloads and signed zeros. " +
+            "Converts to ThreeWayParity when the SM86 fp64-oracle FFT run lands; until then unpromoted."),
+        new PtxParitySpec("PtxFftButterflyF32Kernel", PtxParityStatus.Deferred,
+            "FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.FFT (stage 2 of radix-2 DIT)",
+            "one module per (length, stage stride); each thread owns one butterfly wing and applies a " +
+            "cos.approx/sin.approx twiddle, so - unlike the pure-movement bit-reverse stage - its spec is " +
+            "TOLERANCE-based, not bit-exact. The full transform launches this stage log2(n) times with " +
+            "doubling strides after the bit-reverse pass. Converts to ThreeWayParity (with tolerance) when " +
+            "the SM86 fp64-oracle FFT run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxRfftPostprocessF32Kernel", PtxParityStatus.Deferred,
+            "RFFT positive-frequency extraction, fp32 (#850) - CudaBackend.RFFT",
+            "one module per power-of-two length; copies the first n/2+1 bins of the full complex spectrum " +
+            "into the packed real-FFT output. It is pure data movement, so the spec is bit-exact including " +
+            "NaN payloads and signed zeros; a single guard drops lanes past the (non-power-of-two) output " +
+            "length. Converts to ThreeWayParity when the SM86 fp64-oracle RFFT run lands; until then unpromoted."),
+        new PtxParitySpec("PtxIrfftPreprocessF32Kernel", PtxParityStatus.Deferred,
+            "IRFFT Hermitian reconstruction, fp32 (#850) - CudaBackend.IRFFT (stage 1)",
+            "one module per power-of-two length; the lower half is copied and the upper half is filled by " +
+            "conjugate symmetry (fullReal[i]=inReal[n-i], fullImag[i]=-inImag[n-i]) via a neg.f32 sign-bit " +
+            "flip, so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
+            "ThreeWayParity when the SM86 fp64-oracle IRFFT run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxScaleInverseF32Kernel", PtxParityStatus.Deferred,
+            "inverse-FFT normalization, fp32 (#850) - CudaBackend.IRFFT (final scale)",
+            "one module per element count; multiplies both split lanes in place by a per-launch .param .f32 " +
+            "reciprocal transform length (1/n). Each lane is a single mul.rn, so the spec is bit-exact " +
+            "against x*scale. Also normalizes batched inverse transforms (batch*n elements scaled by 1/n). " +
+            "Converts to ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxBatchedBitReverseF32Kernel", PtxParityStatus.Deferred,
+            "batched FFT bit-reversal permutation, fp32 (#850) - CudaBackend.BatchedFFT (stage 1)",
+            "one module per (length, batch); the batch index is gridDim.y and offsets into each row at b*n, " +
+            "then the same brev.b32 guarded swap the single-transform kernel uses. It is pure data movement, " +
+            "so the spec is bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity " +
+            "when the SM86 fp64-oracle batched-FFT run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxBatchedFftButterflyF32Kernel", PtxParityStatus.Deferred,
+            "batched FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.BatchedFFT (stage 2)",
+            "one module per (length, batch, stage stride); the batch index is gridDim.y (baseOffset=b*n) and " +
+            "each thread applies a cos.approx/sin.approx twiddle to one wing, so its spec is TOLERANCE-based, " +
+            "not bit-exact. A batched transform launches this stage log2(n) times with doubling strides after " +
+            "the batched bit-reverse pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+
+        new PtxParitySpec("PtxFftColsBitReverseF32Kernel", PtxParityStatus.Deferred,
+            "column FFT bit-reversal, fp32 (#850) - CudaBackend.FFT2D (column pass, stage 1)",
+            "one module per (height,width); permutes each column of a row-major matrix in place along the " +
+            "column stride (width) via a brev.b32 guarded swap on the row index. The 2D FFT's row pass reuses " +
+            "the contiguous batched kernels; this is the strided column pass. It is pure data movement, so " +
+            "the spec is bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity when " +
+            "the SM86 fp64-oracle FFT2D run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxFftColsButterflyF32Kernel", PtxParityStatus.Deferred,
+            "column FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.FFT2D (column pass, stage 2)",
+            "one module per (height,width,stage stride); transforms each column along the column stride " +
+            "(width) with a cos.approx/sin.approx twiddle, so its spec is TOLERANCE-based, not bit-exact. A 2D " +
+            "FFT launches this stage log2(height) times with doubling strides after the column bit-reverse " +
+            "pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+
+        new PtxParitySpec("PtxBatchedFftColsBitReverseF32Kernel", PtxParityStatus.Deferred,
+            "batched column FFT bit-reversal, fp32 (#850) - CudaBackend.BatchedFFT2D (column pass, stage 1)",
+            "one module per (height,width,images); adds an image dimension (gridDim.y, imgOffset=img*height*width) " +
+            "to the strided column bit-reverse so columns never cross image boundaries. The batched 2D FFT's row " +
+            "pass is one contiguous batched FFT over all images*height rows; this is the per-image column pass. It " +
+            "is pure data movement, so the spec is bit-exact including NaN payloads and signed zeros. Converts to " +
+            "ThreeWayParity when the SM86 fp64-oracle batched-FFT2D run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxBatchedFftColsButterflyF32Kernel", PtxParityStatus.Deferred,
+            "batched column FFT radix-2 butterfly stage, fp32 (#850) - CudaBackend.BatchedFFT2D (column pass, stage 2)",
+            "one module per (height,width,images,stage stride); adds the image offset (gridDim.y) to the strided " +
+            "column butterfly. Each thread applies a cos.approx/sin.approx twiddle, so its spec is TOLERANCE-based, " +
+            "not bit-exact. A batched 2D FFT launches this stage log2(height) times with doubling strides after the " +
+            "batched column bit-reverse pass. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+
+        new PtxParitySpec("PtxOverlapAddF32Kernel", PtxParityStatus.Deferred,
+            "ISTFT overlap-add, fp32 (#850) - CudaBackend.IstftFromSpectrum (reconstruction)",
+            "one module per (numFrames,nFft,hopLength,outputLength); each thread owns one output sample and " +
+            "loops over the frames, accumulating frames[frame*nFft+localIdx]*window[localIdx] with fma.rn for " +
+            "every frame whose support covers the sample. The fma matches the reference's fused sum, so its spec " +
+            "is TOLERANCE-based against the fp64 oracle. Converts to ThreeWayParity (with tolerance) when the " +
+            "SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxWindowSumSquaresF32Kernel", PtxParityStatus.Deferred,
+            "ISTFT window normalization, fp32 (#850) - CudaBackend.IstftFromSpectrum (normalizer)",
+            "one module per (nFft,hopLength,outputLength); each thread owns one output sample and loops over the " +
+            "derived numFrames=(outputLength-nFft)/hop+1 frames, accumulating window[localIdx]^2 with fma.rn for " +
+            "every covering frame. The fma matches the reference's fused sum, so its spec is TOLERANCE-based " +
+            "against the fp64 oracle. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+
+        new PtxParitySpec("PtxApplyWindowF32Kernel", PtxParityStatus.Deferred,
+            "window application, fp32 (#850) - CudaBackend.ApplyWindow",
+            "one module per element count; output[i]=input[i]*window[i] with a single mul.rn, so the spec is " +
+            "bit-exact against the reference. Converts to ThreeWayParity when the SM86 run lands; until then " +
+            "unpromoted and fail-closed."),
+        new PtxParitySpec("PtxPowerToDbF32Kernel", PtxParityStatus.Deferred,
+            "power-to-decibel conversion, fp32 (#850) - CudaBackend.PowerToDb",
+            "one module per element count; PTX has no log10, so the base-10 log is lg2.approx scaled by " +
+            "10*log10(2) with refValue/minDb per-launch .param .f32. Its spec is TOLERANCE-based, not bit-exact. " +
+            "Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+        new PtxParitySpec("PtxDbToPowerF32Kernel", PtxParityStatus.Deferred,
+            "decibel-to-power conversion, fp32 (#850) - CudaBackend.DbToPower",
+            "one module per element count; PTX has no pow, so pow(10,db/10) is ex2.approx of db*log2(10)/10 with " +
+            "refValue per-launch .param .f32. Its spec is TOLERANCE-based, not bit-exact. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxStftMagPhaseF32Kernel", PtxParityStatus.Deferred,
+            "direct windowed STFT magnitude/phase, fp32 (#850) - CudaBackend.StftMagPhase",
+            "one module per (batch,Lp,nFft,hop,numFrames,numFreqs); each thread evaluates a windowed length-nFft " +
+            "DFT for one output bin with cos.approx/sin.approx twiddles and fma accumulation, then emits " +
+            "sqrt(re^2+im^2) and a minimax atan2 phase. Its spec is TOLERANCE-based, not bit-exact. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 fp64-oracle run lands; until then unpromoted."),
+        new PtxParitySpec("PtxBuildSpectrumF32Kernel", PtxParityStatus.Deferred,
+            "magnitude/phase to Hermitian spectrum, fp32 (#850) - CudaBackend.BuildSpectrum",
+            "one module per (batch,numFreqs,numFrames,nFft); each thread zeroes the nFft bins, fills the first " +
+            "numFreqs from cos.approx/sin.approx polar reconstruction, then mirrors by conjugate symmetry. Its " +
+            "spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 " +
+            "run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxPhaseVocoderF32Kernel", PtxParityStatus.Deferred,
+            "phase-vocoder time scaling, fp32 (#850) - CudaBackend.PhaseVocoder",
+            "one module per (leading,nFramesV,nFreqV,outFrames); each thread resamples one frequency channel " +
+            "along time by a rate .param .f32, lerping the magnitude and accumulating the cvt.rni-wrapped phase " +
+            "advance. Its spec is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) " +
+            "when the SM86 run lands; until then unpromoted and fail-closed."),
+
+        new PtxParitySpec("PtxAmplitudeToDbF32Kernel", PtxParityStatus.Deferred,
+            "amplitude-to-decibel conversion, fp32 (#850) - CudaBackend.AmplitudeToDb",
+            "one module per (length, clipTopDb); the log step of a log-mel/log-magnitude spectrogram. PTX has " +
+            "no log10, so db is lg2.approx(max(input,minAmp)) scaled by 20*log10(2), optionally floored at " +
+            "topDbFloor. minAmp/topDbFloor are .param .f32 and clipTopDb is baked. Its spec is TOLERANCE-based, " +
+            "not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+        new PtxParitySpec("PtxMfccLog1pF32Kernel", PtxParityStatus.Deferred,
+            "MFCC log1p compression, fp32 (#850) - CudaBackend.MfccLog1p",
+            "one module per element count; output=log1p(input)=ln(1+input) via lg2.approx(1+x) scaled by " +
+            "ln(2). Its spec is TOLERANCE-based, not bit-exact, and the tolerance is ABSOLUTE: relative error is " +
+            "unbounded as x approaches zero. Converts to ThreeWayParity (with tolerance) " +
+            "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxNormalizeRowsFusedF32Kernel", PtxParityStatus.Deferred,
+            "fused per-row L2 normalization, fp32 (#850) - CudaBackend.NormalizeRowsFused",
+            "one module per (rows,cols); one 256-thread block per row grid-strides the columns to a fma " +
+            "sum-of-squares, tree-reduces it in static shared memory under bar.sync barriers, and scales the " +
+            "row by rsqrt.approx of the total (zero-norm rows pass through as zero). The rsqrt.approx makes its " +
+            "spec TOLERANCE-based. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+        new PtxParitySpec("PtxCavityBounceInplaceF32Kernel", PtxParityStatus.Deferred,
+            "cavity-bounce post-IFFT nonlinearity, fp32 (#850) - CudaBackend.CavityBounceInplace",
+            "one module per element count; the fused post-IFFT step workReal=tanh(clamp(real*invN,-20,20)), " +
+            "workImag=0, with invN a per-launch .param .f32. The tanh.approx makes its spec TOLERANCE-based. " +
+            "Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+        new PtxParitySpec("PtxWidebandLogBinPoolF32Kernel", PtxParityStatus.Deferred,
+            "wideband logarithmic magnitude bin pooling, fp32 (#850) - CudaBackend.WidebandLogBinPool",
+            "one module per (totalSegBatch,fftSize,numBins,usable); each thread averages magBuf over a " +
+            "quadratic log-spaced bin range and writes log1p(avg). The integer floor bin edges and " +
+            "lg2.approx log make its spec TOLERANCE-based. Converts to ThreeWayParity (with tolerance) when " +
+            "the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxPacPhaseBinMiF32Kernel", PtxParityStatus.Deferred,
+            "phase-amplitude coupling modulation index, fp32 (#850) - CudaBackend.PacPhaseBinMi",
+            "one module per (batch,numSamples,numGammaBands,gammaIdx); one 18-thread block per batch row bins " +
+            "gamma amplitude by theta phase (each thread owns one bin, order-fixed deterministic scan into " +
+            "static shared memory), then thread 0 reduces to the Tort modulation index (normalized KL-divergence " +
+            "from uniform) using lg2.approx for the natural log. Its spec is TOLERANCE-based against the fp64 " +
+            "oracle. Converts to ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+        new PtxParitySpec("PtxBispectrumGatherF32Kernel", PtxParityStatus.Deferred,
+            "third-order spectral cumulant (bispectrum), fp32 (#850) - CudaBackend.BispectrumGather",
+            "one module per (maxF1,maxF2,specLength); each thread forms B(f1,f2)=X(f1)*X(f2)*conj(X(f1+f2)) " +
+            "as a triple complex product with the multiply-then-fma contraction (nvcc's default fused form), " +
+            "so its spec is TOLERANCE-based against the fp64 oracle. Converts to ThreeWayParity (with tolerance) " +
+            "when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxTrispectrumGatherF32Kernel", PtxParityStatus.Deferred,
+            "fourth-order spectral cumulant (trispectrum), fp32 (#850) - CudaBackend.TrispectrumGather",
+            "one module per (maxF1,maxF2,maxF3,specLength); each thread forms " +
+            "T(f1,f2,f3)=X(f1)*X(f2)*X(f3)*conj(X(f1+f2+f3)) as a quadruple complex product with the " +
+            "multiply-then-fma contraction, so its spec is TOLERANCE-based against the fp64 oracle. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxAnalyticSignalMaskF32Kernel", PtxParityStatus.Deferred,
+            "analytic-signal (Hilbert) frequency mask, fp32 (#850) - CudaBackend.AnalyticSignalMask",
+            "one module per (batch,fftSize,binLow,binHigh); the frequency-domain Hilbert step, multiplying the " +
+            "split spectrum by a per-bin gain (0 negative / 2 positive / 1 DC and Nyquist) zeroed outside the " +
+            "pass band. The gains are exact powers of two applied with one mul per lane, so the spec is " +
+            "bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity when the SM86 run lands."),
+        new PtxParitySpec("PtxIstftNormalizeF32Kernel", PtxParityStatus.Deferred,
+            "ISTFT window-sum normalization, fp32 (#850) - CudaBackend.IstftNormalize",
+            "one module per element count; the final ISTFT stage dividing result by windowSum in place, guarded " +
+            "against tiny denominators with a div.rn matching the reference and a predicated selp. Its spec is " +
+            "bit-exact. Converts to ThreeWayParity when the SM86 run lands; until then unpromoted and fail-closed."),
+        new PtxParitySpec("PtxAudioResampleF32Kernel", PtxParityStatus.Deferred,
+            "polyphase Hann-windowed sinc resampling, fp32 (#850) - IEngine.Resample",
+            "one module per (leading,inLen,outLen,up,down,halfWidth); each thread resamples one output sample " +
+            "by accumulating sinc((idx-srcIdx)*cutoff)*hann(k)*input over the tap window and normalizing by the " +
+            "window sum. Each sin/cos is argument-reduced to [-pi,pi] before sin.approx/cos.approx, so its spec " +
+            "is TOLERANCE-based, not bit-exact. Converts to ThreeWayParity (with tolerance) when the SM86 run lands."),
+        new PtxParitySpec("PtxFftRollF32Kernel", PtxParityStatus.Deferred,
+            "batched contiguous fft roll, fp32 (#850) - Fft.FftShift / Fft.IFftShift",
+            "one module per (dim,shift,batch); output[b,i]=input[b,(i-shift) mod dim] along the last axis. " +
+            "fftshift bakes shift=floor(dim/2), ifftshift bakes ceil(dim/2); the same kernel serves both " +
+            "directions and both the real and complex-interleaved axes. It is pure data movement, so the spec " +
+            "is bit-exact including NaN payloads and signed zeros. Converts to ThreeWayParity when the SM86 run lands."),
+        new PtxParitySpec("PtxFftFreqF32Kernel", PtxParityStatus.Deferred,
+            "fft sample-frequency generation, fp32 (#850) - Fft.FftFreq / Fft.RFftFreq",
+            "one module per (n, op); Full writes the n signed DFT bins [0..split-1, split-n..-1]*scale and " +
+            "Real writes the n/2+1 non-negative bins [0..n/2]*scale, with scale=1/(d*n) a per-launch .param " +
+            ".f32. Each output is an integer index cast to fp32 and scaled, while Fft.FftFreq/RFftFreq accumulate " +
+            "the bin in double, so the spec is TOLERANCE-based rather than bit-exact. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted."),
+        new PtxParitySpec("PtxMelFilterbankApplyF32Kernel", PtxParityStatus.Deferred,
+            "segmented mel filterbank application, fp32 (#850) - CudaBackend.MelFilterbankApply",
+            "one module per (totalSegBatch,specBins,melBins); each thread owns one (seg,mel) output and reduces " +
+            "over the spectral bins with fma.rn, guarded past totalSegBatch*melBins. The fma matches the " +
+            "reference's fused sum, so its spec is TOLERANCE-based against the fp64 oracle. Converts to " +
+            "ThreeWayParity (with tolerance) when the SM86 run lands; until then unpromoted and fail-closed."),
         new PtxParitySpec("PtxMaskedSoftmaxKernel", PtxParityStatus.Deferred,
             "driver-only fused masked-fill + softmax candidate",
             "DriverOnlyMaskedSoftmax_MatchesComposedOracle checks the direct-PTX result against the stable " +
@@ -263,16 +538,112 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxInstantNgpHashEncodeKernel", PtxParityStatus.Deferred, "instant-ngp hash encode (#854)", ScientificNote),
         new PtxParitySpec("PtxInstantNgpHashEncodeBackwardKernel", PtxParityStatus.Deferred, "instant-ngp hash encode backward (#854)", ScientificNote),
         new PtxParitySpec("PtxMeshLaplacianKernel", PtxParityStatus.Deferred, "uniform mesh laplacian (#854)", ScientificNote),
+        // Issue #841 convolution golden-slice cells. Each is an exact-shape experimental
+        // SM86 emitter, GPU-correctness verified against a high-precision CPU oracle
+        // (DirectPtxConvolutionTests DriverOnly* facts). Deferred — NOT promoted: the
+        // strongest-cuDNN/PyTorch promotion benchmark (3 clean processes, >=1.10x median,
+        // p95 <=+10%, Nsight spill evidence) and the toggle-based CUDA-vs-PTX-vs-oracle
+        // three-way spec are pending an idle-GPU evidence window (see
+        // docs/research/2026-07-22-direct-ptx-convolution-blueprint.md). Winning cells
+        // convert to ThreeWayParity with runnable specs as the evidence campaign lands.
         new PtxParitySpec("PtxFusedConv2DNchwK1Kernel", PtxParityStatus.Deferred,
-            "fused Conv2D + bias + ReLU, exact N1/C64/H16/W16/K64 1x1 fp32 (#841) — " +
-            "CudaBackend.TryDirectPtxFusedConv2DBiasRelu",
-            "the first #841 convolution specialization is reachable only through the internal " +
-            "TryDirectPtxFusedConv2DBiasRelu experiment gate (disabled by default), so a toggle-based " +
-            "gate-off CUDA==CPU leg has nothing to compare against for the identical baked contract yet. " +
-            "It also stays unpromoted until the #841 resource-and-performance proof is attached: a " +
-            "three-independent-run apples-to-apples benchmark clearing the >=1.10x median / P95<=+10% gate " +
-            "against the strongest eligible cuDNN/PyTorch competitor, plus Nsight zero-spill SASS evidence. " +
-            "Keep deferred until that three-way matrix and the competitive gates exist."),
+            "conv2d 1x1 + bias + ReLU (foundation cell)",
+            "golden slice N1/C64/H16/W16/K64; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DNchwK1BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 1x1 backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DNchwK1BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 1x1 backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DBackwardBiasF32Kernel", PtxParityStatus.Deferred,
+            "conv2d backward-bias", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DFp16K1NchwF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 1x1 FP16 storage", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DNchw3x3ForwardF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 3x3 forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DNchw3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 3x3 backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv2DNchw3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 3x3 backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxFusedConv2DNchw3x3BiasReluF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 3x3 + bias + ReLU (fused)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv1DNclForwardF32Kernel", PtxParityStatus.Deferred,
+            "conv1d forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv1DNclBackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "conv1d backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv1DNclBackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "conv1d backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv3DNcdhw3x3x3ForwardF32Kernel", PtxParityStatus.Deferred,
+            "conv3d 3x3x3 forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv3DNcdhw3x3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "conv3d 3x3x3 backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConv3DNcdhw3x3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "conv3d 3x3x3 backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel", PtxParityStatus.Deferred,
+            "conv3d 3x3x3 + bias + ReLU (fused)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConvTranspose2DNchw3x3ForwardF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose2d 3x3 forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConvTranspose2DNchw3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose2d 3x3 backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConvTranspose2DNchw3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose2d 3x3 backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxFusedConvTranspose2DNchw3x3BiasReluF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose2d 3x3 + bias + ReLU (fused)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConvTranspose3DNcdhw3x3x3ForwardF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose3d 3x3x3 forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConvTranspose3DNcdhw3x3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose3d 3x3x3 backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxConvTranspose3DNcdhw3x3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "convtranspose3d 3x3x3 backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDepthwiseConv2D3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "depthwise conv2d 3x3 backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDepthwiseConv2D3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "depthwise conv2d 3x3 backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxFusedDepthwiseConv2D3x3F32Kernel", PtxParityStatus.Deferred,
+            "depthwise conv2d 3x3 fused forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDepthwiseConv1DNcl3ForwardF32Kernel", PtxParityStatus.Deferred,
+            "depthwise conv1d forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDepthwiseConv1DNcl3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "depthwise conv1d backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDepthwiseConv1DNcl3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "depthwise conv1d backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxLocallyConnectedConv2DNchw3x3F32Kernel", PtxParityStatus.Deferred,
+            "locally-connected conv2d forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxLocallyConnectedConv2DNchw3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "locally-connected conv2d backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "locally-connected conv2d backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel", PtxParityStatus.Deferred,
+            "locally-connected conv2d backward-bias", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DNchw3x3F32Kernel", PtxParityStatus.Deferred,
+            "deformable conv2d (DCNv2) forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DNchw3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "deformable conv2d backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel", PtxParityStatus.Deferred,
+            "deformable conv2d backward-mask", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DNchw3x3BackwardOffsetF32Kernel", PtxParityStatus.Deferred,
+            "deformable conv2d backward-offset", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DNchw3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "deformable conv2d backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DGroupedNchw3x3F32Kernel", PtxParityStatus.Deferred,
+            "grouped deformable conv2d forward", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DGroupedNchw3x3BackwardWeightF32Kernel", PtxParityStatus.Deferred,
+            "grouped deformable conv2d backward-weight", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DGroupedNchw3x3BackwardMaskF32Kernel", PtxParityStatus.Deferred,
+            "grouped deformable conv2d backward-mask", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel", PtxParityStatus.Deferred,
+            "grouped deformable conv2d backward-offset", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel", PtxParityStatus.Deferred,
+            "grouped deformable conv2d backward-input", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxUnfoldIm2ColNchw3x3F32Kernel", PtxParityStatus.Deferred,
+            "unfold / im2col (FP32)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxIm2colKNFp16Nchw3x3Kernel", PtxParityStatus.Deferred,
+            "im2col FP32->FP16 (KxN)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+        new PtxParitySpec("PtxUnfoldKNFp16FromFp16Nchw3x3Kernel", PtxParityStatus.Deferred,
+            "unfold FP16->FP16 (KxN)", "golden slice; competitive benchmark + three-way spec pending idle-GPU evidence window."),
+
+        // ResNet-class promotion-track cells (realistic compute-bound shapes).
+        new PtxParitySpec("PtxConv2DNchwK1ResnetC64H56ForwardF32Kernel", PtxParityStatus.Deferred,
+            "conv2d 1x1 + bias + ReLU ResNet-class N32/C64/H56/W56/K64",
+            "v1 thread-per-output baseline; shared-mem tiled-GEMM optimization + strongest-cuDNN/cuBLASLt promotion benchmark pending idle-GPU window (see blueprint ResNet campaign)."),
 
         new PtxParitySpec("PtxWinogradF23FusedRegBlockedKernel", PtxParityStatus.Deferred,
             "Winograd F(2,3) register-blocked fused GEMM + output transform (#841 3x3, option A)",
