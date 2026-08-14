@@ -8487,6 +8487,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Issue #841: the direct PTX path owns the complete depthwise 3x3
+            // stride-1 pad-1 dataflow for one exact resident FP32 ABI. Every
+            // other shape/semantic contract continues through the established
+            // depthwise kernel below.
+#if NET5_0_OR_GREATER
+            if (typeof(T) == typeof(float) &&
+                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                directCuda.IsDirectPtxConvolutionEnabled)
+            {
+                var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
+                    batch, channels, inHeight, inWidth,
+                    channels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW,
+                    padH, padW, 1, 1);
+                if (directCuda.TryDirectPtxDepthwiseConv2D3x3(
+                    inputBuffer.Buffer, kernelBuffer.Buffer,
+                    outputBuffer.Buffer, directShape))
+                {
+                    var directResult = DeferTensorResult<T>(
+                        backend, outputBuffer.Buffer,
+                        batch * channels * outHeight * outWidth,
+                        new[] { batch, channels, outHeight, outWidth });
+                    outputBuffer.RelinquishOwnership();
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+                    return directResult;
+                }
+            }
+#endif
+
             backend.DepthwiseConv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
                 batch, channels, inHeight, inWidth,
                 outHeight, outWidth,
@@ -10055,6 +10085,154 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
         }
+    }
+
+    // Grouped complex diagonal SSM scan. GPU inference uses a resident fused kernel; when the tape
+    // is active, CpuEngine records the single analytic BPTT node.
+    public override Tensor<T> ComplexDiagonalSsmScanForward<T>(
+        Tensor<T> input, Tensor<T> transitionReal, Tensor<T> transitionImag,
+        Tensor<T> inputMapReal, Tensor<T> inputMapImag,
+        Tensor<T> outputMapReal, Tensor<T> outputMapImag, Tensor<T> skip)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            input.Rank != 4 || transitionReal.Rank != 2)
+            return base.ComplexDiagonalSsmScanForward(
+                input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip);
+
+        int batch = input.Shape._dims[0];
+        int time = input.Shape._dims[1];
+        int groups = input.Shape._dims[2];
+        int width = input.Shape._dims[3];
+        int state = transitionReal.Shape._dims[1];
+        if (state > 256 || width > 256)
+            throw new NotSupportedException(
+                $"The GPU complex diagonal SSM scan supports width/state up to 256; got width={width}, state={state}.");
+        if (transitionReal.Shape._dims[0] != groups || transitionImag.Rank != 2 ||
+            transitionImag.Shape._dims[0] != groups || transitionImag.Shape._dims[1] != state ||
+            inputMapReal.Rank != 3 || inputMapReal.Shape._dims[0] != groups || inputMapReal.Shape._dims[1] != state || inputMapReal.Shape._dims[2] != width ||
+            inputMapImag.Rank != 3 || inputMapImag.Shape._dims[0] != groups || inputMapImag.Shape._dims[1] != state || inputMapImag.Shape._dims[2] != width ||
+            outputMapReal.Rank != 3 || outputMapReal.Shape._dims[0] != groups || outputMapReal.Shape._dims[1] != width || outputMapReal.Shape._dims[2] != state ||
+            outputMapImag.Rank != 3 || outputMapImag.Shape._dims[0] != groups || outputMapImag.Shape._dims[1] != width || outputMapImag.Shape._dims[2] != state ||
+            skip.Rank != 2 || skip.Shape._dims[0] != groups || skip.Shape._dims[1] != width)
+            return base.ComplexDiagonalSsmScanForward(
+                input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip);
+
+        using var x = GetOrAllocateBuffer(backend, input);
+        using var ar = GetOrAllocateBuffer(backend, transitionReal);
+        using var ai = GetOrAllocateBuffer(backend, transitionImag);
+        using var br = GetOrAllocateBuffer(backend, inputMapReal);
+        using var bi = GetOrAllocateBuffer(backend, inputMapImag);
+        using var cr = GetOrAllocateBuffer(backend, outputMapReal);
+        using var ci = GetOrAllocateBuffer(backend, outputMapImag);
+        using var d = GetOrAllocateBuffer(backend, skip);
+        using var y = AllocateOutputBuffer(backend, batch * time * groups * width);
+        backend.ComplexDiagonalSsmScanForward(
+            x.Buffer, ar.Buffer, ai.Buffer, br.Buffer, bi.Buffer, cr.Buffer, ci.Buffer, d.Buffer, y.Buffer,
+            batch, time, groups, width, state);
+        var result = DeferTensorResult<T>(backend, y.Buffer, batch * time * groups * width,
+            new[] { batch, time, groups, width });
+        y.RelinquishOwnership();
+        return result;
+    }
+
+    // Mesa online least-squares scan. Forward stays resident on the selected GPU
+    // backend under an active tape; the recorded node reuses CpuEngine's analytic
+    // reverse pass until a native GPU backward kernel is available.
+    public override Tensor<T> MesaScanForward<T>(
+        Tensor<T> q, Tensor<T> k, Tensor<T> v, Tensor<T> initialWeights,
+        T regularization, int numHeads)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            q.Rank != 3 || numHeads <= 0)
+            return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
+
+        int batch = q.Shape._dims[0];
+        int time = q.Shape._dims[1];
+        int model = q.Shape._dims[2];
+        if (batch <= 0 || time <= 0 || model <= 0 || model % numHeads != 0 ||
+            k.Rank != 3 || v.Rank != 3 || !q.Shape.Equals(k.Shape) || !q.Shape.Equals(v.Shape))
+            return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
+
+        int headDim = model / numHeads;
+        if (headDim > 32 || initialWeights.Rank != 3 ||
+            initialWeights.Shape._dims[0] != numHeads ||
+            initialWeights.Shape._dims[1] != headDim || initialWeights.Shape._dims[2] != headDim)
+            return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
+
+        using var qBuffer = GetOrAllocateBuffer(backend, q);
+        using var kBuffer = GetOrAllocateBuffer(backend, k);
+        using var vBuffer = GetOrAllocateBuffer(backend, v);
+        using var w0Buffer = GetOrAllocateBuffer(backend, initialWeights);
+        // regularization crosses the ABI as a one-float device buffer, which is a
+        // deliberate contract shared by all six backend kernels (see
+        // IDirectGpuBackend.MesaScanForward) rather than something to narrow to a
+        // scalar here. The buffer is still required, but the Tensor<T> wrapper that
+        // used to be built around it on every call is not.
+        using var regularizationBuffer = GetOrAllocateBuffer(backend, new[] { regularization });
+        using var outputBuffer = AllocateOutputBuffer(backend, batch * time * model);
+        int matrixScratch = batch * numHeads * headDim * headDim;
+        using var workWeights = AllocateOutputBuffer(backend, matrixScratch);
+        using var covariance = AllocateOutputBuffer(backend, matrixScratch);
+
+        backend.MesaScanForward(
+            qBuffer.Buffer, kBuffer.Buffer, vBuffer.Buffer, w0Buffer.Buffer,
+            regularizationBuffer.Buffer, outputBuffer.Buffer, workWeights.Buffer, covariance.Buffer,
+            batch, time, model, numHeads, headDim);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, batch * time * model,
+            new[] { batch, time, model });
+        outputBuffer.RelinquishOwnership();
+        Autodiff.DifferentiableOps.RecordIfActive<T>(
+            "MesaScanForward", result,
+            new[] { q, k, v, initialWeights },
+            MesaScanBackward<T>,
+            savedState: new object[] { regularization!, numHeads });
+        return result;
+    }
+
+    public override Tensor<T> RoutedDiagonalSsmScanForward<T>(
+        Tensor<T> input, Tensor<T> activeMask, Tensor<T> transition,
+        Tensor<T> inputMap, Tensor<T> outputMap, Tensor<T> skip)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            input.Rank != 3 || activeMask.Rank != 3 || transition.Rank != 2)
+            return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
+        int batch = input.Shape._dims[0];
+        int time = input.Shape._dims[1];
+        int model = input.Shape._dims[2];
+        int experts = activeMask.Shape._dims[2];
+        int state = transition.Shape._dims[1];
+        if (batch <= 0 || time <= 0 || model <= 0 || experts <= 0 || state <= 0 || state > 64 ||
+            activeMask.Shape._dims[0] != batch || activeMask.Shape._dims[1] != time ||
+            transition.Shape._dims[0] != experts ||
+            inputMap.Rank != 3 || inputMap.Shape._dims[0] != experts ||
+            inputMap.Shape._dims[1] != state || inputMap.Shape._dims[2] != model ||
+            outputMap.Rank != 3 || outputMap.Shape._dims[0] != experts ||
+            outputMap.Shape._dims[1] != model || outputMap.Shape._dims[2] != state ||
+            skip.Rank != 2 || skip.Shape._dims[0] != experts || skip.Shape._dims[1] != model)
+            return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
+
+        using var x = GetOrAllocateBuffer(backend, input);
+        using var m = GetOrAllocateBuffer(backend, activeMask);
+        using var a = GetOrAllocateBuffer(backend, transition);
+        using var ib = GetOrAllocateBuffer(backend, inputMap);
+        using var oc = GetOrAllocateBuffer(backend, outputMap);
+        using var d = GetOrAllocateBuffer(backend, skip);
+        using var y = AllocateOutputBuffer(backend, batch * time * experts * model);
+        using var h = AllocateOutputBuffer(backend, batch * experts * state);
+        backend.RoutedDiagonalSsmScanForward(
+            x.Buffer, m.Buffer, a.Buffer, ib.Buffer, oc.Buffer, d.Buffer, y.Buffer, h.Buffer,
+            batch, time, model, experts, state);
+        var result = DeferTensorResult<T>(
+            backend, y.Buffer, batch * time * experts * model,
+            new[] { batch, time, experts, model });
+        y.RelinquishOwnership();
+        Autodiff.DifferentiableOps.RecordIfActive(
+            "RoutedDiagonalSsmScanForward", result,
+            new[] { input, activeMask, transition, inputMap, outputMap, skip },
+            RoutedDiagonalSsmBackward<T>);
+        return result;
     }
 
     // Fused Mamba-2 SSD scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.

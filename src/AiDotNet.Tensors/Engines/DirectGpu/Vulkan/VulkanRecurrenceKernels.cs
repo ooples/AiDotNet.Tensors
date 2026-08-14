@@ -170,6 +170,62 @@ void main() {
     }
 }";
 
+    public static string ComplexDiagonalSsmScan => Header + @"
+layout(set=0,binding=0) readonly buffer Xb { float X[]; };
+layout(set=0,binding=1) readonly buffer Arb { float Ar[]; };
+layout(set=0,binding=2) readonly buffer Aib { float Ai[]; };
+layout(set=0,binding=3) readonly buffer Brb { float Br[]; };
+layout(set=0,binding=4) readonly buffer Bib { float Bi[]; };
+layout(set=0,binding=5) readonly buffer Crb { float Cr[]; };
+layout(set=0,binding=6) readonly buffer Cib { float Ci[]; };
+layout(set=0,binding=7) readonly buffer Db { float D[]; };
+layout(set=0,binding=8) writeonly buffer Ob { float outp[]; };
+layout(push_constant) uniform PC { uint batch; uint time; uint groups; uint width; uint state; };
+void main() {
+    int gid=int(gl_GlobalInvocationID.x), G=int(groups), T=int(time), W=int(width), S=int(state);
+    if (gid>=int(batch)*G) return; int b=gid/G, g=gid%G; float hr[256]; float hi[256];
+    for(int n=0;n<S;n++){hr[n]=0.0;hi[n]=0.0;}
+    for(int t=0;t<T;t++) { int xb=((b*T+t)*G+g)*W;
+        for(int n=0;n<S;n++){int a=g*S+n,bm=(g*S+n)*W;float orr=hr[n],oi=hi[n];float nr=Ar[a]*orr-Ai[a]*oi,ni=Ar[a]*oi+Ai[a]*orr;
+            for(int w=0;w<W;w++){float xv=X[xb+w];nr+=Br[bm+w]*xv;ni+=Bi[bm+w]*xv;}hr[n]=nr;hi[n]=ni;}
+        for(int w=0;w<W;w++){int cm=(g*W+w)*S;float y=D[g*W+w]*X[xb+w];for(int n=0;n<S;n++)y+=Cr[cm+n]*hr[n]-Ci[cm+n]*hi[n];outp[xb+w]=y;}
+    }
+}";
+
+    public static string MesaScan => Header + @"
+layout(set=0,binding=0) readonly buffer Qb{float Q[];};
+layout(set=0,binding=1) readonly buffer Kb{float K[];};
+layout(set=0,binding=2) readonly buffer Vb{float V[];};
+layout(set=0,binding=3) readonly buffer W0b{float W0[];};
+layout(set=0,binding=4) readonly buffer Rb{float regularization[];};
+layout(set=0,binding=5) buffer Ob{float outputValue[];};
+layout(set=0,binding=6) buffer Wb{float workW[];};
+layout(set=0,binding=7) buffer Pb{float covariance[];};
+layout(push_constant) uniform PC{uint batch;uint time;uint model;uint heads;uint headDim;};
+void main(){int bh=int(gl_GlobalInvocationID.x),D=int(headDim);if(bh>=int(batch*heads)||D>32)return;
+ int b=bh/int(heads),h=bh%int(heads),matrix=D*D,base=bh*matrix,w0Base=h*matrix;float invLambda=1.0/regularization[0];
+ for(int i=0;i<matrix;i++){workW[base+i]=W0[w0Base+i];covariance[base+i]=0.0;}for(int i=0;i<D;i++)covariance[base+i*D+i]=invLambda;
+ float pk[32],error[32],row[32];for(int t=0;t<int(time);t++){int vb=(b*int(time)+t)*int(model)+h*D;
+  for(int i=0;i<D;i++){float s=0.0;for(int j=0;j<D;j++)s+=covariance[base+i*D+j]*K[vb+j];pk[i]=s;}float denom=1.0;for(int i=0;i<D;i++)denom+=K[vb+i]*pk[i];
+  for(int i=0;i<D;i++)for(int j=0;j<D;j++)covariance[base+i*D+j]-=pk[i]*pk[j]/denom;
+  for(int i=0;i<D;i++){float s=0.0;for(int j=0;j<D;j++)s+=workW[base+i*D+j]*K[vb+j];error[i]=s-V[vb+i];}
+  for(int j=0;j<D;j++){float s=0.0;for(int i=0;i<D;i++)s+=K[vb+i]*covariance[base+i*D+j];row[j]=s;}
+  for(int i=0;i<D;i++)for(int j=0;j<D;j++)workW[base+i*D+j]-=error[i]*row[j];
+  for(int i=0;i<D;i++){float s=0.0;for(int j=0;j<D;j++)s+=workW[base+i*D+j]*Q[vb+j];outputValue[vb+i]=s;}
+ }}";
+
+    public static string RoutedDiagonalSsmScan => Header + @"
+layout(set=0,binding=0) readonly buffer Xb{float X[];};layout(set=0,binding=1) readonly buffer Mb{float mask[];};
+layout(set=0,binding=2) readonly buffer Ab{float A[];};layout(set=0,binding=3) readonly buffer Bb{float B[];};
+layout(set=0,binding=4) readonly buffer Cb{float C[];};layout(set=0,binding=5) readonly buffer Db{float D[];};
+layout(set=0,binding=6) buffer Ob{float outputValue[];};layout(set=0,binding=7) buffer Hb{float hState[];};
+layout(push_constant) uniform PC{uint batch;uint time;uint model;uint experts;uint state;};
+void main(){int be=int(gl_GlobalInvocationID.x);if(be>=int(batch*experts))return;int b=be/int(experts),e=be%int(experts),hb=be*int(state);
+ for(int s=0;s<int(state);s++)hState[hb+s]=0.0;for(int t=0;t<int(time);t++){int xb=(b*int(time)+t)*int(model),mi=(b*int(time)+t)*int(experts)+e;float active=mask[mi];
+  for(int s=0;s<int(state);s++){float next=A[e*int(state)+s]*hState[hb+s];int bb=(e*int(state)+s)*int(model);for(int d=0;d<int(model);d++)next+=B[bb+d]*X[xb+d];hState[hb+s]=active*next;}
+  int yb=((b*int(time)+t)*int(experts)+e)*int(model);for(int d=0;d<int(model);d++){float y=D[e*int(model)+d]*X[xb+d];int cb=(e*int(model)+d)*int(state);for(int s=0;s<int(state);s++)y+=C[cb+s]*hState[hb+s];outputValue[yb+d]=active*y;}}
+}";
+
     public static string Mamba2Ssd => Header + @"
 layout(set=0,binding=0) readonly buffer Xb { float X[]; };
 layout(set=0,binding=1) readonly buffer Dtb { float delta[]; };

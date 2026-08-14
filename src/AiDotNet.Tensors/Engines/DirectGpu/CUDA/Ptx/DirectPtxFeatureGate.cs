@@ -21,6 +21,7 @@ internal static class DirectPtxFeatureGate
     internal const string CastFp16EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP16";
     internal const string CastFp32EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP32";
     internal const string Transpose2DEnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRANSPOSE2D";
+    internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string Cholesky4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CHOLESKY_4X4";
     internal const string LuFactor4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LU_FACTOR_4X4";
@@ -67,6 +68,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentCastFp16Enabled = ReadEnabled(CastFp16EnvironmentVariable);
     private static readonly bool EnvironmentCastFp32Enabled = ReadEnabled(CastFp32EnvironmentVariable);
     private static readonly bool EnvironmentTranspose2DEnabled = ReadEnabled(Transpose2DEnvironmentVariable);
+    private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentVisionBoxIouEnabled = ReadEnabled(VisionBoxIouEnvironmentVariable);
     private static readonly bool EnvironmentVisionEnabled = ReadEnabled(VisionEnvironmentVariable);
@@ -114,6 +116,28 @@ internal static class DirectPtxFeatureGate
     {
         get => _visionGateOverride;
         set => _visionGateOverride = value;
+    }
+
+    [ThreadStatic]
+    private static bool s_complexMultiplyExperimentOverride;
+    [ThreadStatic]
+    private static bool? s_complexMultiplyGateOverride;
+
+    /// <summary>Thread-local benchmark access to unpromoted complex-multiply cells.</summary>
+    internal static bool ComplexMultiplyExperimentOverride
+    {
+        get => s_complexMultiplyExperimentOverride;
+        set => s_complexMultiplyExperimentOverride = value;
+    }
+
+    /// <summary>
+    /// Thread-local benchmark/test selection of the candidate or established
+    /// route. Null restores process-start feature configuration.
+    /// </summary>
+    internal static bool? ComplexMultiplyGateOverride
+    {
+        get => s_complexMultiplyGateOverride;
+        set => s_complexMultiplyGateOverride = value;
     }
 
     [ThreadStatic] private static bool? s_cholesky4x4ExperimentOverride;
@@ -166,6 +190,8 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsTranspose2DEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentTranspose2DEnabled);
+    internal static bool IsComplexMultiplyEnabled => ComplexMultiplyGateOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentComplexMultiplyEnabled);
 
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
@@ -348,7 +374,9 @@ internal enum DirectPtxPhysicalLayout
     /// <summary>Dense row-major [batch, sequence, feature].</summary>
     BatchSequenceFeature,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
-    Oihw
+    Oihw,
+    /// <summary>Dense input/output/spatial transposed-convolution weights [input, output, height, width].</summary>
+    Iohw
 }
 
 /// <summary>

@@ -174,6 +174,70 @@ struct P { batch: i32, seqLen: i32, innerDim: i32, stateDim: i32 };
     }
 }";
 
+    public const string ComplexDiagonalSsmScan = @"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> Ar: array<f32>;
+@group(0) @binding(2) var<storage, read> Ai: array<f32>;
+@group(0) @binding(3) var<storage, read> Br: array<f32>;
+@group(0) @binding(4) var<storage, read> Bi: array<f32>;
+@group(0) @binding(5) var<storage, read> Cr: array<f32>;
+@group(0) @binding(6) var<storage, read> Ci: array<f32>;
+@group(0) @binding(7) var<storage, read> D: array<f32>;
+@group(0) @binding(8) var<storage, read_write> outp: array<f32>;
+struct P { batch:i32, time:i32, groups:i32, width:i32, state:i32 };
+@group(0) @binding(9) var<uniform> p:P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>) {
+    let gid=i32(id.x); let G=p.groups; let T=p.time; let W=p.width; let S=p.state;
+    if(gid>=p.batch*G){return;} let b=gid/G; let g=gid%G; var hr:array<f32,256>;var hi:array<f32,256>;
+    for(var n:i32=0;n<S;n=n+1){hr[n]=0.0;hi[n]=0.0;}
+    for(var t:i32=0;t<T;t=t+1){let xb=((b*T+t)*G+g)*W;
+        for(var n:i32=0;n<S;n=n+1){let a=g*S+n;let bm=(g*S+n)*W;let orr=hr[n];let oi=hi[n];var nr=Ar[a]*orr-Ai[a]*oi;var ni=Ar[a]*oi+Ai[a]*orr;
+            for(var w:i32=0;w<W;w=w+1){let xv=X[xb+w];nr=nr+Br[bm+w]*xv;ni=ni+Bi[bm+w]*xv;}hr[n]=nr;hi[n]=ni;}
+        for(var w:i32=0;w<W;w=w+1){let cm=(g*W+w)*S;var y=D[g*W+w]*X[xb+w];for(var n:i32=0;n<S;n=n+1){y=y+Cr[cm+n]*hr[n]-Ci[cm+n]*hi[n];}outp[xb+w]=y;}
+    }
+}";
+
+    public const string MesaScan = @"
+@group(0) @binding(0) var<storage,read> Q:array<f32>;
+@group(0) @binding(1) var<storage,read> K:array<f32>;
+@group(0) @binding(2) var<storage,read> V:array<f32>;
+@group(0) @binding(3) var<storage,read> W0:array<f32>;
+@group(0) @binding(4) var<storage,read> regularization:array<f32>;
+@group(0) @binding(5) var<storage,read_write> output:array<f32>;
+@group(0) @binding(6) var<storage,read_write> workW:array<f32>;
+@group(0) @binding(7) var<storage,read_write> covariance:array<f32>;
+struct P { batch:i32,time:i32,model:i32,heads:i32,headDim:i32 };
+@group(0) @binding(8) var<uniform> p:P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>){
+ let bh=i32(id.x);let D=p.headDim;if(bh>=p.batch*p.heads||D>32){return;}
+ let b=bh/p.heads;let h=bh%p.heads;let matrix=D*D;let base=bh*matrix;let w0Base=h*matrix;
+ let invLambda=1.0/regularization[0];
+ for(var i:i32=0;i<matrix;i=i+1){workW[base+i]=W0[w0Base+i];covariance[base+i]=0.0;}
+ for(var i:i32=0;i<D;i=i+1){covariance[base+i*D+i]=invLambda;}
+ var pk:array<f32,32>;var error:array<f32,32>;var row:array<f32,32>;
+ for(var t:i32=0;t<p.time;t=t+1){let vb=(b*p.time+t)*p.model+h*D;
+  for(var i:i32=0;i<D;i=i+1){var s:f32=0.0;for(var j:i32=0;j<D;j=j+1){s=s+covariance[base+i*D+j]*K[vb+j];}pk[i]=s;}
+  var denom:f32=1.0;for(var i:i32=0;i<D;i=i+1){denom=denom+K[vb+i]*pk[i];}
+  for(var i:i32=0;i<D;i=i+1){for(var j:i32=0;j<D;j=j+1){covariance[base+i*D+j]=covariance[base+i*D+j]-pk[i]*pk[j]/denom;}}
+  for(var i:i32=0;i<D;i=i+1){var s:f32=0.0;for(var j:i32=0;j<D;j=j+1){s=s+workW[base+i*D+j]*K[vb+j];}error[i]=s-V[vb+i];}
+  for(var j:i32=0;j<D;j=j+1){var s:f32=0.0;for(var i:i32=0;i<D;i=i+1){s=s+K[vb+i]*covariance[base+i*D+j];}row[j]=s;}
+  for(var i:i32=0;i<D;i=i+1){for(var j:i32=0;j<D;j=j+1){workW[base+i*D+j]=workW[base+i*D+j]-error[i]*row[j];}}
+  for(var i:i32=0;i<D;i=i+1){var s:f32=0.0;for(var j:i32=0;j<D;j=j+1){s=s+workW[base+i*D+j]*Q[vb+j];}output[vb+i]=s;}
+ }
+}";
+
+    public const string RoutedDiagonalSsmScan = @"
+@group(0) @binding(0) var<storage,read> X:array<f32>;@group(0) @binding(1) var<storage,read> mask:array<f32>;
+@group(0) @binding(2) var<storage,read> A:array<f32>;@group(0) @binding(3) var<storage,read> B:array<f32>;
+@group(0) @binding(4) var<storage,read> C:array<f32>;@group(0) @binding(5) var<storage,read> D:array<f32>;
+@group(0) @binding(6) var<storage,read_write> output:array<f32>;@group(0) @binding(7) var<storage,read_write> hState:array<f32>;
+struct P{batch:i32,time:i32,model:i32,experts:i32,state:i32};@group(0) @binding(8) var<uniform> p:P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>){let be=i32(id.x);if(be>=p.batch*p.experts){return;}let b=be/p.experts;let e=be%p.experts;let hb=be*p.state;
+ for(var s:i32=0;s<p.state;s=s+1){hState[hb+s]=0.0;}for(var t:i32=0;t<p.time;t=t+1){let xb=(b*p.time+t)*p.model;let mi=(b*p.time+t)*p.experts+e;let active=mask[mi];
+  for(var s:i32=0;s<p.state;s=s+1){var next=A[e*p.state+s]*hState[hb+s];let bb=(e*p.state+s)*p.model;for(var d:i32=0;d<p.model;d=d+1){next=next+B[bb+d]*X[xb+d];}hState[hb+s]=active*next;}
+  let yb=((b*p.time+t)*p.experts+e)*p.model;for(var d:i32=0;d<p.model;d=d+1){var y=D[e*p.model+d]*X[xb+d];let cb=(e*p.model+d)*p.state;for(var s:i32=0;s<p.state;s=s+1){y=y+C[cb+s]*hState[hb+s];}output[yb+d]=active*y;}}
+}";
+
     public const string Mamba2Ssd = @"
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> delta: array<f32>;
