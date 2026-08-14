@@ -1650,7 +1650,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private void MaterializeStepLoss()
     {
-        var lossKey = _lossOutput.DataVector.GetBackingArrayUnsafe();
+        var lossKey = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
         if (lossKey is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
         Helpers.DeferredArrayMaterializer.TryMaterialize(_lossOutput.DataVector);
@@ -1669,7 +1669,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void AddActivationCacheKeys(HashSet<object> keys, Tensor<T>? tensor)
     {
         if (tensor is null) return;
-        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        var backing = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (backing is not null)
             keys.Add(backing);
         keys.Add(tensor.DataVector);

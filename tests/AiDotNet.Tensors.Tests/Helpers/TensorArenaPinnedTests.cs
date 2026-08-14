@@ -6,6 +6,7 @@
 // later Rent return the same backing array as the weight tensor and
 // downstream writes would corrupt the weight in place.
 
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -30,6 +31,33 @@ public sealed class TensorArenaPinnedTestsCollection { }
 [Collection(nameof(TensorArenaPinnedTests))]
 public class TensorArenaPinnedTests
 {
+    /// <summary>
+    /// Engine-created parameters are first rented as ordinary operation outputs and are only
+    /// known to be long-lived when the owning layer registers them. Registration must promote
+    /// both the tensor wrapper and its backing array out of the resettable scratch tier.
+    /// Otherwise a later same-size operation can receive and reshape the parameter object itself.
+    /// </summary>
+    [Fact]
+    public void RegisterPersistentTensor_PromotesExistingScratchTensor()
+    {
+        using var arena = TensorArena.Create();
+        var engine = new CpuEngine();
+
+        var parameter = TensorAllocator.RentUninitialized<float>(new[] { 2, 3 });
+        parameter.AsWritableSpan().Fill(17f);
+
+        engine.RegisterPersistentTensor(parameter, PersistentTensorRole.Weights);
+        Assert.Equal(1, arena.PinnedArrayCount);
+
+        arena.Reset();
+        var scratch = TensorAllocator.RentUninitialized<float>(new[] { 3, 2 });
+        scratch.AsWritableSpan().Fill(-4f);
+
+        Assert.NotSame(parameter, scratch);
+        Assert.Equal(new[] { 2, 3 }, parameter.Shape.ToArray());
+        Assert.All(parameter.ToArray(), value => Assert.Equal(17f, value));
+    }
+
     /// <summary>
     /// Pinned allocations must persist across Reset() — the backing array
     /// stays valid and its contents survive. Without this, every Train
