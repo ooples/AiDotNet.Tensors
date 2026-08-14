@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'solvers-4x4', 'complex-multiply')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -42,6 +42,7 @@ $switch = switch ($Target) {
     'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
     'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
     'w8a8-linear' { '--direct-ptx-profile-w8a8-linear' }
+    'complex-multiply' { '--direct-ptx-profile-complex-multiply' }
     'solvers-4x4' { '--direct-ptx-profile-solvers-4x4' }
     'rng-dropout' { '--direct-ptx-profile-rng-dropout' }
     'rng-stochastic' { '--direct-ptx-profile-rng-stochastic' }
@@ -56,6 +57,7 @@ $kernel = switch ($Target) {
     'paged-prefill' { 'regex:aidotnet_paged_prefill_d64' }
     'solvers-4x4' { 'regex:aidotnet_register_(cholesky|lu_factor|qr_reduced|eigh_(upper|lower)|svd_reduced|lu_solve_vector|ldl_factor_lower|ldl_solve_lower_vector|solve_vector|triangular_solve_(lower|upper)_vector|cholesky_backward_lower|solve_backward_vector)_4x4_f32' }
     'attention-backward' { 'regex:aidotnet_attention_backward_(delta|dq|dkv)_d64' }
+    'complex-multiply' { 'regex:aidotnet_fused_complex_multiply_f32' }
     'flash-attention-backward' { 'regex:aidotnet_flash_attention_backward_(dq|dkv)_d64' }
     'rng-dropout' { 'regex:aidotnet_philox_dropout_f32' }
     'rng-stochastic' { 'regex:aidotnet_(philox_dropout|philox_uniform|philox_normal|philox_bernoulli_mask|philox_drop_threshold_mask|dropout_backward|philox_gumbel_softmax32|philox_importance_sampling64|bias_philox_dropout256|fused_ddim_step|philox_categorical32|gumbel_softmax_backward32|philox_rrelu|rrelu|rrelu_backward)_f32' }
@@ -73,6 +75,7 @@ $expectedLaunches = switch ($Target) {
     'solvers-4x4' { 56 }
     'residual-rmsnorm' { 4 }
     'decode' { 2 }
+    'complex-multiply' { 4 }
     'paged-prefill' { 1 }
     'attention-backward' { 3 }
     'rng-dropout' { 3 }
