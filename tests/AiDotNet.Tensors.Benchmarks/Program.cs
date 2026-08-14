@@ -13,6 +13,44 @@ class Program
 
     static void Main(string[] args)
     {
+        // GPU-free cubin generation and verification for the spectral family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-spectral-cubins")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-spectral-sass")
+        {
+            Environment.ExitCode = DirectPtxSpectralCubinTool.AuditSass(args);
+            return;
+        }
+
+        // GPU-free cubin generation and verification for the online-attention family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
+        {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
+            return;
+        }
+
         // GPU-free cubin generation and verification for the online-attention family.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
@@ -149,6 +187,13 @@ class Program
             DirectPtxRngStochasticExperiment.Run(runs, includeExternal, family, operation);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-complex-multiply")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool oracleOnly = args.Contains("--oracle-only", StringComparer.Ordinal);
+            DirectPtxComplexMultiplyExperiment.Run(runs, oracleOnly);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-residual-rmsnorm")
         {
             DirectPtxResidualRmsNormExperiment.Run();
@@ -224,6 +269,12 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-competitor")
         {
             KernelCompetitorTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-championship")
+        {
+            KernelChampionshipTool.Run(args.Skip(1).ToArray());
             return;
         }
 
@@ -341,6 +392,12 @@ class Program
             DirectPtxConvolutionExperiment.Run(includeExternal);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-convolution-resnet")
+        {
+            bool includeExternal = !args.Contains("--no-external", StringComparer.Ordinal);
+            DirectPtxConvolutionResnetExperiment.Run(includeExternal);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--export-direct-ptx-convolution-cubins")
         {
             string outputDirectory = args.Length > 1
@@ -424,6 +481,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-rng-stochastic")
         {
             DirectPtxProfileTarget.RunRngStochastic();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-complex-multiply")
+        {
+            DirectPtxProfileTarget.RunComplexMultiply();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-convolution")
@@ -1384,6 +1446,7 @@ class Program
         Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
         Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
+        Console.WriteLine("  --direct-ptx-convolution-resnet [--no-external]: ResNet-class convolution promotion matrix");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
         Console.WriteLine("  --verify-direct-ptx-convolution-cubins [directory]: re-emit PTX and fail closed on stale committed cubin identity");
         Console.WriteLine("  --audit-direct-ptx-convolution-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
@@ -1401,6 +1464,7 @@ class Program
         Console.WriteLine("  --kernel-oracle: generated-family performance vs spec-derived ceilings");
         Console.WriteLine("       add --catalog to diagnose tuned catalog rows against competitor and counters");
         Console.WriteLine("  --kernel-oracle-incumbents: shipped CUDA kernels vs spec-derived ceilings");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --kernel-competitor: versioned PyTorch/cuDNN release evidence lane");
         Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --kernel-identity: print the four-fingerprint autotune identity per catalog kernel");

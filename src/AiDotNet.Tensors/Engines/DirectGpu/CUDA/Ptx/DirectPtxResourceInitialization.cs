@@ -26,12 +26,25 @@ internal static class DirectPtxResourceInitialization
         }
         catch
         {
-            // A cleanup failure must not replace the validation/JIT/lookup exception that
-            // explains why construction failed. DirectPtxModule.Dispose normally succeeds;
-            // this guard preserves the primary failure if the driver is already unhealthy.
-            try { resource.Dispose(); }
-            catch { }
+            DisposeWithoutMaskingFailure(resource);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Releases a partially initialized resource on a construction failure path.
+    /// </summary>
+    /// <remarks>
+    /// A cleanup failure must not replace the validation/JIT/lookup exception that
+    /// explains why construction failed. DirectPtxModule.Dispose normally succeeds;
+    /// this guard preserves the primary failure if the driver is already unhealthy.
+    /// Constructors that own their module directly call this from their catch block,
+    /// so the policy has exactly one implementation.
+    /// </remarks>
+    internal static void DisposeWithoutMaskingFailure(IDisposable resource)
+    {
+        if (resource is null) return;
+        try { resource.Dispose(); }
+        catch { }
     }
 }
