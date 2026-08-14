@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -13,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// handling, and — the key training-safety property — that STOCHASTIC rounding
 /// is unbiased (the decoded mean of many quantizations equals the original).
 /// </summary>
+[Collection("BlasManaged-Pool-Serial")]
 public class StreamingStoreCodecTests
 {
     private struct Rng
@@ -200,6 +202,42 @@ public class StreamingStoreCodecTests
         Assert.True(Math.Sqrt(sum2 / ref2) < 0.02, "fp64→int8 RMS error ~1%");
     }
 
+    [Theory]
+    [InlineData(56, 17)]
+    [InlineData(56, 200)]
+    public void Int8_TransposedEncoders_AreByteEquivalentToMaterializedTranspose(
+        int sourceRows, int sourceColumns)
+    {
+        var sourceFloat = new float[sourceRows * sourceColumns];
+        var sourceDouble = new double[sourceFloat.Length];
+        for (int i = 0; i < sourceFloat.Length; i++)
+        {
+            sourceFloat[i] = (float)(Math.Sin(i * 0.17) * (1 + i % 11));
+            sourceDouble[i] = Math.Cos(i * 0.11) * (1 + i % 7);
+        }
+
+        var transposedFloat = new float[sourceFloat.Length];
+        var transposedDouble = new double[sourceDouble.Length];
+        for (int row = 0; row < sourceRows; row++)
+        for (int column = 0; column < sourceColumns; column++)
+        {
+            transposedFloat[column * sourceRows + row] = sourceFloat[row * sourceColumns + column];
+            transposedDouble[column * sourceRows + row] = sourceDouble[row * sourceColumns + column];
+        }
+
+        var expectedFloat = new byte[StreamingStoreCodec.Int8BufferBytes(sourceFloat.Length, sourceColumns)];
+        var actualFloat = new byte[expectedFloat.Length];
+        StreamingStoreCodec.EncodeInt8Float(transposedFloat, expectedFloat, sourceColumns);
+        StreamingStoreCodec.EncodeInt8TransposedFloat(sourceFloat, actualFloat, sourceRows, sourceColumns);
+        Assert.Equal(expectedFloat, actualFloat);
+
+        var expectedDouble = new byte[StreamingStoreCodec.Int8BufferBytes(sourceDouble.Length, sourceColumns)];
+        var actualDouble = new byte[expectedDouble.Length];
+        StreamingStoreCodec.EncodeInt8Double(transposedDouble, expectedDouble, sourceColumns);
+        StreamingStoreCodec.EncodeInt8TransposedDouble(sourceDouble, actualDouble, sourceRows, sourceColumns);
+        Assert.Equal(expectedDouble, actualDouble);
+    }
+
     [Fact]
     public void Int4_RoundTrip_8xSmaller_WithinGroupPrecision()
     {
@@ -286,6 +324,114 @@ public class StreamingStoreCodecTests
         double sum2 = 0, ref2 = 0;
         for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += src[i] * src[i]; }
         Assert.True(Math.Sqrt(sum2 / ref2) < 0.18, "fp64→int4 group-quant RMS error ~12-15%");
+    }
+
+    [Theory]
+    [InlineData(56, 17, 8)]   // tiled fast path, one column tile
+    [InlineData(56, 200, 8)]  // tiled fast path, multiple parallel column tiles
+    [InlineData(56, 17, 7)]   // odd groups use the sequential nibble-safe fallback
+    [InlineData(56, 17, 16)]  // even, non-dividing rows: parallel per-group fallback
+    [InlineData(56, 17, 9)]   // odd with a partial final group
+    public void Int4_TransposedEncoders_AreByteEquivalentToMaterializedTranspose(
+        int sourceRows, int sourceColumns, int groupSize)
+    {
+        var sourceFloat = new float[sourceRows * sourceColumns];
+        var sourceDouble = new double[sourceFloat.Length];
+        for (int i = 0; i < sourceFloat.Length; i++)
+        {
+            sourceFloat[i] = (float)(Math.Sin(i * 0.17) * (1 + i % 11));
+            sourceDouble[i] = Math.Cos(i * 0.11) * (1 + i % 7);
+        }
+
+        var transposedFloat = new float[sourceFloat.Length];
+        var transposedDouble = new double[sourceDouble.Length];
+        for (int row = 0; row < sourceRows; row++)
+        for (int column = 0; column < sourceColumns; column++)
+        {
+            transposedFloat[column * sourceRows + row] = sourceFloat[row * sourceColumns + column];
+            transposedDouble[column * sourceRows + row] = sourceDouble[row * sourceColumns + column];
+        }
+
+        var expectedFloat = new byte[StreamingStoreCodec.Int4BufferBytes(sourceFloat.Length, groupSize)];
+        var actualFloat = new byte[expectedFloat.Length];
+        StreamingStoreCodec.EncodeInt4Float(transposedFloat, expectedFloat, groupSize);
+        StreamingStoreCodec.EncodeInt4TransposedFloat(
+            sourceFloat, actualFloat, sourceRows, sourceColumns, groupSize);
+        Assert.Equal(expectedFloat, actualFloat);
+
+        var expectedDouble = new byte[StreamingStoreCodec.Int4BufferBytes(sourceDouble.Length, groupSize)];
+        var actualDouble = new byte[expectedDouble.Length];
+        StreamingStoreCodec.EncodeInt4Double(transposedDouble, expectedDouble, groupSize);
+        StreamingStoreCodec.EncodeInt4TransposedDouble(
+            sourceDouble, actualDouble, sourceRows, sourceColumns, groupSize);
+        Assert.Equal(expectedDouble, actualDouble);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TransposedQuantizedEncoders_PreserveArgumentExceptionAcrossParallelBackends(
+        bool useCooperativePool)
+    {
+        const int sourceRows = 256, sourceColumns = 512, groupSize = 16;
+        int count = sourceRows * sourceColumns;
+        var sourceFloat = new float[count];
+        var sourceDouble = new double[count];
+        sourceFloat[200] = float.NaN;
+        sourceDouble[200] = double.PositiveInfinity;
+
+        bool previous = CpuParallelSettings.UseCooperativePool;
+        try
+        {
+            CpuParallelSettings.UseCooperativePool = useCooperativePool;
+
+            var int8Float = new byte[StreamingStoreCodec.Int8BufferBytes(count, sourceColumns)];
+            var int8Double = new byte[int8Float.Length];
+            var int4Float = new byte[StreamingStoreCodec.Int4BufferBytes(count, groupSize)];
+            var int4Double = new byte[int4Float.Length];
+
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt8TransposedFloat(
+                    sourceFloat, int8Float, sourceRows, sourceColumns)).Message);
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt8TransposedDouble(
+                    sourceDouble, int8Double, sourceRows, sourceColumns)).Message);
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt4TransposedFloat(
+                    sourceFloat, int4Float, sourceRows, sourceColumns, groupSize)).Message);
+            Assert.Contains("index 200", Assert.Throws<ArgumentException>(() =>
+                StreamingStoreCodec.EncodeInt4TransposedDouble(
+                    sourceDouble, int4Double, sourceRows, sourceColumns, groupSize)).Message);
+        }
+        finally
+        {
+            CpuParallelSettings.UseCooperativePool = previous;
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LightweightParallel_PreservesActionAggregateExceptionAcrossBackends(
+        bool useCooperativePool)
+    {
+        bool previous = CpuParallelSettings.UseCooperativePool;
+        try
+        {
+            CpuParallelSettings.UseCooperativePool = useCooperativePool;
+            var exception = Assert.Throws<AggregateException>(() =>
+                CpuParallelSettings.LightweightParallel(
+                    8, 128 * 1024,
+                    _ => throw new AggregateException(new InvalidOperationException("action failure"))));
+
+            var inner = Assert.Single(exception.InnerExceptions);
+            Assert.IsType<InvalidOperationException>(inner);
+            Assert.Equal("action failure", inner.Message);
+        }
+        finally
+        {
+            CpuParallelSettings.UseCooperativePool = previous;
+        }
     }
 
     [Theory]
