@@ -39864,13 +39864,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <inheritdoc/>
     /// <remarks>
-    /// On CPU, this is a no-op. Persistent tensor management only provides benefits
-    /// on GPU where data transfer between host and device is expensive.
+    /// On CPU, registration protects arena-rented model state from scratch reuse. GPU engines
+    /// inherit that lifetime guarantee before adding their device-residency bookkeeping.
     /// </remarks>
     public virtual void RegisterPersistentTensor<T>(Tensor<T> tensor, PersistentTensorRole role)
     {
-        // No-op on CPU: persistence only benefits GPU by avoiding repeated transfers
-        // The tensor is already in CPU memory, so there's nothing to cache
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        TensorArena.Current?.PinExistingTensor(tensor);
     }
 
     /// <inheritdoc/>
