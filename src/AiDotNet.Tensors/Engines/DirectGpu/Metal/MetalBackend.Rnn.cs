@@ -104,6 +104,44 @@ public partial class MetalBackend
             new[] { M(x), M(delta), M(aLog), M(bParam), M(cParam), M(dParam), M(output) },
             new[] { batch, seqLen, innerDim, stateDim });
 
+    public void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state)
+    {
+        if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM width/state must be in [1,256].");
+        DispatchRecurrence("complex_diagonal_ssm_scan_forward", batch * groups,
+            new[] { M(input), M(transitionReal), M(transitionImag), M(inputMapReal), M(inputMapImag),
+                M(outputMapReal), M(outputMapImag), M(skip), M(output) },
+            new[] { batch, time, groups, width, state });
+    }
+
+    public void MesaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+        IGpuBuffer regularization, IGpuBuffer output,
+        IGpuBuffer workWeights, IGpuBuffer covariance,
+        int batch, int time, int model, int heads, int headDim)
+    {
+        if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
+            model != heads * headDim || headDim > 32)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+        DispatchRecurrence("mesa_scan_forward", batch * heads,
+            new[] { M(q), M(k), M(v), M(initialWeights), M(regularization), M(output), M(workWeights), M(covariance) },
+            new[] { batch, time, model, heads, headDim });
+    }
+
+    public void RoutedDiagonalSsmScanForward(
+        IGpuBuffer input,IGpuBuffer activeMask,IGpuBuffer transition,IGpuBuffer inputMap,IGpuBuffer outputMap,IGpuBuffer skip,
+        IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
+    {
+        if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
+        DispatchRecurrence("routed_diagonal_ssm_scan_forward",batch*experts,
+            new[]{M(input),M(activeMask),M(transition),M(inputMap),M(outputMap),M(skip),M(output),M(stateScratch)},
+            new[]{batch,time,model,experts,state});
+    }
+
     public void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
