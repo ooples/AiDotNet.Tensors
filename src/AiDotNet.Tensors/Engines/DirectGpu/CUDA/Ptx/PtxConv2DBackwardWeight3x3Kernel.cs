@@ -98,24 +98,15 @@ internal sealed class PtxConv2DBackwardWeight3x3Kernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView gradOutput, DirectPtxTensorView gradWeight)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(gradOutput, Blueprint.Tensors[1], nameof(gradOutput));
-        Require(gradWeight, Blueprint.Tensors[2], nameof(gradWeight));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(gradOutput, Blueprint.Tensors[1], nameof(gradOutput));
+        DirectPtxAbiGuard.Require(gradWeight, Blueprint.Tensors[2], nameof(gradWeight));
         IntPtr iPtr = input.Pointer, gPtr = gradOutput.Pointer, wPtr = gradWeight.Pointer;
         void** arguments = stackalloc void*[3];
         arguments[0] = &iPtr; arguments[1] = &gPtr; arguments[2] = &wPtr;
         _module.Launch(_function, (uint)(OutputChannels * InputChannels), 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes ||
-            view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, int n, int k, int c, int h, int w)
     {

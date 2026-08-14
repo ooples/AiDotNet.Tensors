@@ -97,9 +97,9 @@ internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView input, DirectPtxTensorView weights, DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(weights, Blueprint.Tensors[1], nameof(weights));
-        Require(output, Blueprint.Tensors[2], nameof(output));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[0], nameof(input));
+        DirectPtxAbiGuard.Require(weights, Blueprint.Tensors[1], nameof(weights));
+        DirectPtxAbiGuard.Require(output, Blueprint.Tensors[2], nameof(output));
         IntPtr iPtr = input.Pointer, wPtr = weights.Pointer, oPtr = output.Pointer;
         void** arguments = stackalloc void*[3];
         arguments[0] = &iPtr; arguments[1] = &wPtr; arguments[2] = &oPtr;
@@ -107,13 +107,6 @@ internal sealed class PtxDepthwiseConv1DForwardKernel : IDisposable
         _module.Launch(_function, blocks, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType || view.Layout != contract.Layout ||
-            view.LogicalExtent != contract.LogicalExtent || view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes || view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, DepthwiseConv1DShape shape)
     {
@@ -272,9 +265,9 @@ internal sealed class PtxDepthwiseConv1DBackwardInputKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView gradOutput, DirectPtxTensorView weights, DirectPtxTensorView gradInput)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(weights, Blueprint.Tensors[1], nameof(weights));
-        Require(gradInput, Blueprint.Tensors[2], nameof(gradInput));
+        DirectPtxAbiGuard.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbiGuard.Require(weights, Blueprint.Tensors[1], nameof(weights));
+        DirectPtxAbiGuard.Require(gradInput, Blueprint.Tensors[2], nameof(gradInput));
         IntPtr gPtr = gradOutput.Pointer, wPtr = weights.Pointer, xPtr = gradInput.Pointer;
         void** arguments = stackalloc void*[3];
         arguments[0] = &gPtr; arguments[1] = &wPtr; arguments[2] = &xPtr;
@@ -282,13 +275,6 @@ internal sealed class PtxDepthwiseConv1DBackwardInputKernel : IDisposable
         _module.Launch(_function, blocks, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType || view.Layout != contract.Layout ||
-            view.LogicalExtent != contract.LogicalExtent || view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes || view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, DepthwiseConv1DShape shape)
     {
@@ -450,9 +436,9 @@ internal sealed class PtxDepthwiseConv1DBackwardWeightKernel : IDisposable
 
     internal unsafe void Launch(DirectPtxTensorView gradOutput, DirectPtxTensorView input, DirectPtxTensorView gradWeights)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(input, Blueprint.Tensors[1], nameof(input));
-        Require(gradWeights, Blueprint.Tensors[2], nameof(gradWeights));
+        DirectPtxAbiGuard.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        DirectPtxAbiGuard.Require(input, Blueprint.Tensors[1], nameof(input));
+        DirectPtxAbiGuard.Require(gradWeights, Blueprint.Tensors[2], nameof(gradWeights));
         IntPtr gPtr = gradOutput.Pointer, iPtr = input.Pointer, wPtr = gradWeights.Pointer;
         void** arguments = stackalloc void*[3];
         arguments[0] = &gPtr; arguments[1] = &iPtr; arguments[2] = &wPtr;
@@ -460,13 +446,6 @@ internal sealed class PtxDepthwiseConv1DBackwardWeightKernel : IDisposable
         _module.Launch(_function, blocks, 1, 1, BlockThreads, 1, 1, 0, arguments);
     }
 
-    private static void Require(DirectPtxTensorView view, DirectPtxTensorContract contract, string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType || view.Layout != contract.Layout ||
-            view.LogicalExtent != contract.LogicalExtent || view.PhysicalExtent != contract.PhysicalExtent ||
-            view.ByteLength != contract.RequiredBytes || view.AllocationByteLength != contract.RequiredBytes)
-            throw new ArgumentException($"{parameter} does not satisfy exact physical ABI '{contract.Name}'.", parameter);
-    }
 
     internal static string EmitPtx(int major, int minor, DepthwiseConv1DShape shape)
     {

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.125.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.124.0...v0.125.0) (2026-08-13)
+
+
+### Features
+
+* **engine:** add fused complex diagonal SSM scan ([#940](https://github.com/ooples/AiDotNet.Tensors/issues/940)) ([f319b03](https://github.com/ooples/AiDotNet.Tensors/commit/f319b032d9d9cd25f7bf60166081846d1a20ce8c))
+* **engine:** fuse Mesa and routed SSM scans ([#944](https://github.com/ooples/AiDotNet.Tensors/issues/944)) ([05b33d5](https://github.com/ooples/AiDotNet.Tensors/commit/05b33d593f35c7b585c7f5057faa425227319514))
+* **ptx:** add spectral complex multiply golden slice ([#879](https://github.com/ooples/AiDotNet.Tensors/issues/879)) ([9ac21c5](https://github.com/ooples/AiDotNet.Tensors/commit/9ac21c5e1609f0e7904bfa7fe4ea1c20883fbc8a))
+
 ## [0.124.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.123.0...v0.124.0) (2026-08-13)
 
 
