@@ -1479,6 +1479,26 @@ public class GradientCorrectnessTests : IDisposable
     }
 
     [Fact]
+    public void ConstantPad_AsymmetricRank3Gradient_MatchesNumerical()
+    {
+        // Padding is listed last-axis first. Different before/after values on each axis
+        // prevent an axis-order reversal in the backward from hiding behind symmetry.
+        var x = MakeFilled([2, 2, 3], start: 0.25f, step: 0.125f);
+        // VerifyGradient sums the output, so padding alone makes every upstream
+        // gradient 1 and the loss cannot tell one output coordinate from another -
+        // the previous incorrect axis mapping also reads valid padded elements and
+        // would still pass. Weighting each padded coordinate uniquely is what makes
+        // this a regression test for the axis order. [2,2,3] padded last-axis-first
+        // by [1,2, 2,0, 0,1] is [2+0+1, 2+2+0, 3+1+2] = [3,4,6].
+        var weights = MakeFilled([3, 4, 6], start: 0.5f, step: 0.25f);
+        VerifyGradient(
+            inp => _engine.TensorMultiply(
+                _engine.TensorConstantPad(inp, new[] { 1, 2, 2, 0, 0, 1 }, 0f), weights),
+            x,
+            "ConstantPad_AsymmetricRank3");
+    }
+
+    [Fact]
     public void IndexSelect_Gradient_MatchesNumerical()
     {
         // 2D tensor, select rows 0 and 2 along axis 0
