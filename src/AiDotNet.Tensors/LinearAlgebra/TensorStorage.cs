@@ -250,6 +250,11 @@ internal sealed class TensorStorage<T>
     internal bool TryGetBackingArraySegment(out T[]? array, out int offset)
         => _data.TryGetBackingArraySegment(out array, out offset);
 
+    /// <summary>Read-only backing lookup that does not request a mutable vector escape.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
+        => _data.TryGetBackingArraySegmentForReadOnlyAccess(out array, out offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ThrowIfReadOnlyMapped()
     {

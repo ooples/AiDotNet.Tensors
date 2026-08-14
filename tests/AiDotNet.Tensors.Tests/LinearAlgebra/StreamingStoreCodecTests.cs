@@ -410,6 +410,31 @@ public class StreamingStoreCodecTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LightweightParallel_PreservesActionAggregateExceptionAcrossBackends(
+        bool useCooperativePool)
+    {
+        bool previous = CpuParallelSettings.UseCooperativePool;
+        try
+        {
+            CpuParallelSettings.UseCooperativePool = useCooperativePool;
+            var exception = Assert.Throws<AggregateException>(() =>
+                CpuParallelSettings.LightweightParallel(
+                    8, 128 * 1024,
+                    _ => throw new AggregateException(new InvalidOperationException("action failure"))));
+
+            var inner = Assert.Single(exception.InnerExceptions);
+            Assert.IsType<InvalidOperationException>(inner);
+            Assert.Equal("action failure", inner.Message);
+        }
+        finally
+        {
+            CpuParallelSettings.UseCooperativePool = previous;
+        }
+    }
+
+    [Theory]
     [InlineData(1)]
     [InlineData(7)]
     [InlineData(8)]

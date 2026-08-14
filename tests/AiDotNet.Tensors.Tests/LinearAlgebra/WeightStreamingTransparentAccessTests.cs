@@ -167,6 +167,20 @@ public class WeightStreamingTransparentAccessTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => _ = t.Memory);
         Assert.Throws<InvalidOperationException>(() => t.DataVector.AsWritableSpan());
 
+        // Materialize a floating-point owner, then attempt both raw-array escape paths. Each
+        // closure would mutate the backing storage if the DataVector guard were bypassed.
+        _ = t[0, 0];
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            var backing = t.DataVector.GetBackingArrayUnsafe();
+            backing![0] = 99f;
+        });
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            if (t.DataVector.TryGetBackingArraySegment(out var backing, out int offset))
+                backing![offset] = 99f;
+        });
+
         // The rejected write must leave the canonical store readable rather than accepting a
         // mutation that disappears on the next page-out/page-in cycle.
         Assert.NotEqual(99f, t[0, 1]);

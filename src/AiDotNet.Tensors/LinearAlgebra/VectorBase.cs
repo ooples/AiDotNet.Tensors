@@ -378,7 +378,19 @@ public abstract class VectorBase<T>
     /// </summary>
     internal T[]? GetBackingArrayUnsafe()
     {
-        return TryGetBackingArraySegment(out var array, out int offset) && offset == 0
+        _beforeWrite?.Invoke();
+        return TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int offset) && offset == 0
+            ? array
+            : null;
+    }
+
+    /// <summary>
+    /// Gets the backing array for identity/cache lookup without granting mutation through a
+    /// tensor's guarded <c>DataVector</c> surface. Callers must treat the result as read-only.
+    /// </summary>
+    internal T[]? GetBackingArrayForReadOnlyAccess()
+    {
+        return TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int offset) && offset == 0
             ? array
             : null;
     }
@@ -394,6 +406,16 @@ public abstract class VectorBase<T>
     /// historically caused compiled kernels to bind a copied snapshot.
     /// </remarks>
     internal bool TryGetBackingArraySegment(out T[]? array, out int offset)
+    {
+        _beforeWrite?.Invoke();
+        return TryGetBackingArraySegmentForReadOnlyAccess(out array, out offset);
+    }
+
+    /// <summary>
+    /// Read-only owner-mediated counterpart used by tensor cache and strided-read paths. The
+    /// returned managed array must never be mutated by the caller.
+    /// </summary>
+    internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
     {
         if (_cachedArray is not null)
         {

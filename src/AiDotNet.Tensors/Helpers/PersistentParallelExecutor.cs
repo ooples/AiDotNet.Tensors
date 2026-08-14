@@ -414,7 +414,10 @@ internal sealed class PersistentParallelExecutor
                 // depend on the operational A/B switch. Preserve the raw exception contract when
                 // every worker reported the same exception family; retain AggregateException for
                 // genuinely heterogeneous concurrent failures.
-                var failures = aggregate.Flatten().InnerExceptions;
+                // Inspect the outer Parallel.For wrapper only. Flattening would destroy an
+                // AggregateException intentionally thrown by the action and expose its leaf,
+                // while the cooperative backend rethrows that action AggregateException intact.
+                var failures = aggregate.InnerExceptions;
                 if (failures.Count > 0)
                 {
                     Type failureType = failures[0].GetType();

@@ -99,6 +99,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     /// <summary>
+    /// Returns the CPU backing array solely for cache identity and deferred-materialization state
+    /// checks. Unlike <see cref="DataVector"/>, this owner-mediated path does not advertise mutable
+    /// vector access; callers must treat the returned array as read-only.
+    /// </summary>
+    internal T[]? GetBackingArrayForCacheLookupUnsafe()
+        => _data.GetBackingArrayForReadOnlyAccess();
+
+    /// <summary>
     /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
     /// only between materializing an int8-stored weight for inference and dropping it. The engine
     /// matmul fast path reads this directly (feeds the int8 GEMM, no dequant); any fp32 access
@@ -2250,7 +2258,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // before the caller touches the buffer.
         if (_device != TensorDevice.CPU)
             return null;
-        return _storage.TryGetBackingArraySegment(out var array, out int baseOffset)
+        return _storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset)
             && baseOffset == 0
             ? array
             : null;
@@ -2332,7 +2340,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             storageOffset = 0;
             return null;
         }
-        if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
+        if (_storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset))
         {
             storageOffset = checked(baseOffset + _storageOffset);
             return array;

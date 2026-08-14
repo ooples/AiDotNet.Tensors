@@ -20018,15 +20018,23 @@ public partial class CpuEngine : ITensorLevelEngine
             Math.Max(1L, Conv3DIm2ColWorkspaceBytes / bytesPerTileRow));
         int columnCapacity = checked(tileCapacity * columnsPerRow);
         int flatCapacity = checked(tileCapacity * outChannels);
-        var columns = System.Buffers.ArrayPool<T>.Shared.Rent(columnCapacity);
-        var flatOutput = System.Buffers.ArrayPool<T>.Shared.Rent(flatCapacity);
-        var inputData = input.GetReadOnlyDataArray();
-        var kernelData = kernel.GetReadOnlyDataArray();
-        result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
-        var outputData = result.GetDataArray();
+        T[]? columns = null;
+        T[]? flatOutput = null;
+        Tensor<T>? allocatedResult = null;
         int spatial = outputDepth * outputHeight * outputWidth;
         try
         {
+            // Protect the complete acquisition sequence. A later rent, input materialization,
+            // result allocation, or writable-array acquisition may throw independently.
+            columns = System.Buffers.ArrayPool<T>.Shared.Rent(columnCapacity);
+            flatOutput = System.Buffers.ArrayPool<T>.Shared.Rent(flatCapacity);
+            var inputData = input.GetReadOnlyDataArray();
+            var kernelData = kernel.GetReadOnlyDataArray();
+            allocatedResult = TensorAllocator.Rent<T>(
+                [batch, outChannels, outputDepth, outputHeight, outputWidth]);
+            var outputData = allocatedResult.GetDataArray();
+            result = allocatedResult;
+
             for (int rowStart = 0; rowStart < rows; rowStart += tileCapacity)
             {
                 int tileRows = Math.Min(tileCapacity, rows - rowStart);
@@ -20059,7 +20067,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 if (!multiplied)
                 {
-                    result.Dispose();
+                    allocatedResult.Dispose();
+                    allocatedResult = null;
                     result = null!;
                     return false;
                 }
@@ -20083,14 +20092,16 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         catch
         {
-            result.Dispose();
+            allocatedResult?.Dispose();
             result = null!;
             throw;
         }
         finally
         {
-            System.Buffers.ArrayPool<T>.Shared.Return(columns);
-            System.Buffers.ArrayPool<T>.Shared.Return(flatOutput);
+            if (columns is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(columns);
+            if (flatOutput is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(flatOutput);
         }
     }
 
