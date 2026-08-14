@@ -354,7 +354,9 @@ internal enum DirectPtxPhysicalLayout
     /// <summary>Dense row-major [batch, sequence, feature].</summary>
     BatchSequenceFeature,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
-    Oihw
+    Oihw,
+    /// <summary>Dense input/output/spatial transposed-convolution weights [input, output, height, width].</summary>
+    Iohw
 }
 
 /// <summary>
