@@ -314,7 +314,7 @@ public sealed class StreamingTensorPool : IDisposable
             // The new bytes have NOT been written to the backing file, so force the
             // next eviction to (re-)write them rather than dropping the resident copy
             // as if the file already held it. Also reset the compressed/uncompressed
-            // metadata: the caller supplies the canonical (native-encoded) bytes, so a
+            // metadata: the caller supplies canonical native or lossless bytes, so a
             // prior compressed page-out's sizes no longer describe this content.
             entry.BackingFileCurrent = false;
             entry.IsCompressed = false;

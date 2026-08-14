@@ -36,9 +36,9 @@ internal static class StreamingEncoding
     /// quantized write-back is native-only); otherwise explicit opt-in.</summary>
     internal const byte Int8 = 2;
 
-    /// <summary>Lossless: SIMD byte-plane shuffle + Deflate (variable size). Exact
-    /// restore, ~1.18× on typical fp weights. The <c>Auto</c> default in training
-    /// (bit-exact masters); otherwise explicit opt-in.</summary>
+    /// <summary>Lossless: SIMD byte-plane shuffle + LZ4 (variable size). Exact
+    /// restore and exact re-encoding after mutation, ~1.18× on typical fp weights.
+    /// The <c>Auto</c> default in training (bit-exact masters); otherwise explicit opt-in.</summary>
     internal const byte Lossless = 3;
 
     /// <summary>int4: AWQ/GPTQ-style GROUP-symmetric quantization — [int32 count][int32
