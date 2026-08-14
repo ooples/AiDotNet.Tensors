@@ -20,6 +20,7 @@ internal static class DirectPtxFeatureGate
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
+    internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
     internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
@@ -68,6 +69,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentRngDropoutEnabled = ReadEnabled(RngDropoutEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
     private static readonly bool EnvironmentMixedPrecisionLinearEnabled = ReadEnabled(MixedPrecisionLinearEnvironmentVariable);
@@ -112,6 +114,28 @@ internal static class DirectPtxFeatureGate
     {
         get => _visionGateOverride;
         set => _visionGateOverride = value;
+    }
+
+    [ThreadStatic]
+    private static bool s_complexMultiplyExperimentOverride;
+    [ThreadStatic]
+    private static bool? s_complexMultiplyGateOverride;
+
+    /// <summary>Thread-local benchmark access to unpromoted complex-multiply cells.</summary>
+    internal static bool ComplexMultiplyExperimentOverride
+    {
+        get => s_complexMultiplyExperimentOverride;
+        set => s_complexMultiplyExperimentOverride = value;
+    }
+
+    /// <summary>
+    /// Thread-local benchmark/test selection of the candidate or established
+    /// route. Null restores process-start feature configuration.
+    /// </summary>
+    internal static bool? ComplexMultiplyGateOverride
+    {
+        get => s_complexMultiplyGateOverride;
+        set => s_complexMultiplyGateOverride = value;
     }
 
     [ThreadStatic] private static bool? s_cholesky4x4ExperimentOverride;
@@ -161,6 +185,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashAttentionBackwardEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashAttentionBackwardEnabled);
+
+    internal static bool IsComplexMultiplyEnabled => ComplexMultiplyGateOverride ?? TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentComplexMultiplyEnabled);
 
     internal static bool IsQkvRopeCacheEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentQkvRopeCacheEnabled);
@@ -351,7 +378,9 @@ internal enum DirectPtxPhysicalLayout
     /// <summary>Dense row-major [batch, sequence, feature].</summary>
     BatchSequenceFeature,
     /// <summary>Dense output/input/spatial convolution weights [output, input, height, width].</summary>
-    Oihw
+    Oihw,
+    /// <summary>Dense input/output/spatial transposed-convolution weights [input, output, height, width].</summary>
+    Iohw
 }
 
 /// <summary>

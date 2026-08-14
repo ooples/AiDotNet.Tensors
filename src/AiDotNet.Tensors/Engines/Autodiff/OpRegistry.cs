@@ -172,6 +172,9 @@ internal static class OpRegistry
         // backward, replacing the per-timestep tape micro-ops. All differentiable.
         "Rwkv4WkvForward",
         "MambaSelectiveScanForward",
+        "ComplexDiagonalSsmScanForward",
+        "MesaScanForward",
+        "RoutedDiagonalSsmScanForward",
         "RgLruScanForward",
         "GlaScanForward",
         "GatedDeltaNetScanForward",

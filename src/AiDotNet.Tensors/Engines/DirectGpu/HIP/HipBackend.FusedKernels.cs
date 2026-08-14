@@ -699,6 +699,55 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
+    public unsafe void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state)
+    {
+        if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM dimensions must be in [1,256] for width/state.");
+        if (!_kernelCache.TryGetValue("complex_diagonal_ssm_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: complex_diagonal_ssm_scan_forward");
+        IntPtr px=input.Handle, par=transitionReal.Handle, pai=transitionImag.Handle, pbr=inputMapReal.Handle,
+            pbi=inputMapImag.Handle, pcr=outputMapReal.Handle, pci=outputMapImag.Handle, pd=skip.Handle, po=output.Handle;
+        void** args = stackalloc void*[14];
+        args[0]=&px; args[1]=&par; args[2]=&pai; args[3]=&pbr; args[4]=&pbi; args[5]=&pcr; args[6]=&pci; args[7]=&pd; args[8]=&po;
+        args[9]=&batch; args[10]=&time; args[11]=&groups; args[12]=&width; args[13]=&state;
+        LaunchKernel(kernel, (uint)(batch * groups), 256, args);
+    }
+
+    public unsafe void MesaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+        IGpuBuffer regularization, IGpuBuffer output,
+        IGpuBuffer workWeights, IGpuBuffer covariance,
+        int batch, int time, int model, int heads, int headDim)
+    {
+        if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
+            model != heads * headDim || headDim > 32)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+        if (!_kernelCache.TryGetValue("mesa_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: mesa_scan_forward");
+        IntPtr pq=q.Handle, pk=k.Handle, pv=v.Handle, pw=initialWeights.Handle, pr=regularization.Handle,
+            po=output.Handle, pww=workWeights.Handle, pc=covariance.Handle;
+        void** args=stackalloc void*[13];
+        args[0]=&pq; args[1]=&pk; args[2]=&pv; args[3]=&pw; args[4]=&pr; args[5]=&po; args[6]=&pww; args[7]=&pc;
+        args[8]=&batch; args[9]=&time; args[10]=&model; args[11]=&heads; args[12]=&headDim;
+        uint total=(uint)(batch*heads);
+        LaunchKernel(kernel, (total+(uint)DefaultBlockSize-1)/(uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    public unsafe void RoutedDiagonalSsmScanForward(
+        IGpuBuffer input,IGpuBuffer activeMask,IGpuBuffer transition,IGpuBuffer inputMap,IGpuBuffer outputMap,IGpuBuffer skip,
+        IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
+    {
+        if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
+        if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new InvalidOperationException("HIP kernel not found: routed_diagonal_ssm_scan_forward");
+        IntPtr px=input.Handle,pm=activeMask.Handle,pa=transition.Handle,pb=inputMap.Handle,pc=outputMap.Handle,pd=skip.Handle,po=output.Handle,ph=stateScratch.Handle;
+        void** args=stackalloc void*[13];args[0]=&px;args[1]=&pm;args[2]=&pa;args[3]=&pb;args[4]=&pc;args[5]=&pd;args[6]=&po;args[7]=&ph;args[8]=&batch;args[9]=&time;args[10]=&model;args[11]=&experts;args[12]=&state;
+        uint total=(uint)(batch*experts);LaunchKernel(kernel,(total+(uint)DefaultBlockSize-1)/(uint)DefaultBlockSize,(uint)DefaultBlockSize,args);
+    }
+
     // ── Fused Mamba-2 SSD scan forward (#1464) ─────────────────────────────────────────────
     public unsafe void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
