@@ -281,13 +281,13 @@ public sealed class MixedPrecisionCompiledPlan
                         protect!.Clear();
                         foreach (var g in fp32.Values)
                         {
-                            var a = g.DataVector.GetBackingArrayUnsafe();
+                            var a = g.GetBackingArrayForCacheLookupUnsafe();
                             if (a is not null) protect.Add(a);
                             protect.Add(g.DataVector);
                         }
                         foreach (var g in fp16.Values)
                         {
-                            var a = g.DataVector.GetBackingArrayUnsafe();
+                            var a = g.GetBackingArrayForCacheLookupUnsafe();
                             if (a is not null) protect.Add(a);
                             protect.Add(g.DataVector);
                         }

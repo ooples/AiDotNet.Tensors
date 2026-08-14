@@ -73,6 +73,37 @@ public sealed class Conv2DDegenerateSpatialGradientTests : IDisposable
     }
 
     [Fact]
+    public async Task FusedConv2D_SevenBySevenStrideFourPaddingThree_MatchesFiniteDifferences()
+    {
+        await Task.Yield();
+
+        // Mirrors the stem used by the point-cloud segmentation families in AiDotNet.
+        // A weighted (non-uniform) scalar objective exercises every output coordinate;
+        // ReduceSum alone can hide stride/padding indexing defects behind equal upstream grads.
+        var input = CreateSequence([1, 3, 8, 8], 0.05f, 0.001f);
+        var kernel = CreateSequence([4, 3, 7, 7], -0.02f, 0.00005f);
+        var bias = CreateTensor([4], 0.30f, 0.35f, 0.40f, 0.45f);
+
+        Tensor<float> Forward() => _engine.FusedConv2D(
+            input,
+            kernel,
+            bias,
+            strideH: 4,
+            strideW: 4,
+            padH: 3,
+            padW: 3,
+            dilationH: 1,
+            dilationW: 1,
+            FusedActivationType.ReLU);
+
+        var weights = CreateSequence([1, 4, 2, 2], 0.2f, 0.03f);
+        AssertGradientsMatch(
+            () => _engine.TensorMultiply(Forward(), weights),
+            kernel,
+            bias);
+    }
+
+    [Fact]
     public async Task Conv2DBackwardInput_PaddedThreeByThreeOverOneByOne_MatchesReference()
     {
         await Task.Yield();
