@@ -1827,12 +1827,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     {
         get
         {
+            // Multi-dimensional indexing is a value read just like GetFlat / AsSpan. A
+            // streaming weight may have retained its logical shape while its resident
+            // storage was dropped, so rehydrate before indexing the backing vector.
+            // Without this gate, t[i, j] reads an empty Vector even though t[i] works.
+            EnsureMaterialized();
             ThrowIfSparse();
             ValidateIndices(indices);
             return _data[GetFlatIndex(indices)];
         }
         set
         {
+            // Preserve every value other than the element being replaced when a streamed
+            // tensor is currently paged out. EnsureOwnedForWrite handles COW ownership,
+            // but it cannot restore the canonical bytes from the streaming pool.
+            EnsureMaterialized();
             ThrowIfSparse();
             ValidateIndices(indices);
             EnsureOwnedForWrite();

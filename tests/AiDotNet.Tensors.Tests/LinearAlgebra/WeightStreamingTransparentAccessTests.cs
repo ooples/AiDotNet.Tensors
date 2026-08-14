@@ -104,6 +104,40 @@ public class WeightStreamingTransparentAccessTests : IDisposable
     }
 
     [Fact]
+    public void MultiDimensionalIndexer_OnDroppedStreamingWeight_AutoRehydrates()
+    {
+        float[] expected = { 10f, 20f, 30f, 40f, 50f, 60f };
+        var t = new Tensor<float>(expected, new[] { 2, 3 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        // DenseLayer's adaptive resize copies weights through t[input, output]. The
+        // multi-index accessor must provide the same transparent streaming contract as
+        // flat indexing rather than reading the dropped, zero-length backing Vector.
+        Assert.Equal(30f, t[0, 2]);
+        Assert.Equal(50f, t[1, 1]);
+        Assert.Equal(expected.Length, t.DataVector.Length);
+    }
+
+    [Fact]
+    public void MultiDimensionalIndexerWrite_OnDroppedStreamingWeight_PreservesOtherValues()
+    {
+        float[] expected = { 1f, 2f, 3f, 4f };
+        var t = new Tensor<float>(expected, new[] { 2, 2 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        t[1, 0] = 99f;
+
+        Assert.Equal(1f, t[0, 0]);
+        Assert.Equal(2f, t[0, 1]);
+        Assert.Equal(99f, t[1, 0]);
+        Assert.Equal(4f, t[1, 1]);
+    }
+
+    [Fact]
     public void ToArray_OnDroppedStreamingWeight_AutoRehydrates()
     {
         // ToArray() routes through EnsureMaterialized too, and GetDataArray's
