@@ -841,6 +841,43 @@ public sealed unsafe partial class VulkanBackend
         => GlslNaryOp(VulkanRecurrenceKernels.MambaScan, new[] { x, delta, aLog, bParam, cParam, dParam, output },
             batch * innerDim, new[] { (uint)batch, (uint)seqLen, (uint)innerDim, (uint)stateDim });
 
+    public void ComplexDiagonalSsmScanForward(
+        IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
+        IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
+        IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
+        IGpuBuffer output, int batch, int time, int groups, int width, int state)
+    {
+        if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM width/state must be in [1,256].");
+        GlslNaryOp(VulkanRecurrenceKernels.ComplexDiagonalSsmScan,
+            new[] { input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                outputMapReal, outputMapImag, skip, output }, batch * groups,
+            new[] { (uint)batch, (uint)time, (uint)groups, (uint)width, (uint)state });
+    }
+
+    public void MesaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer initialWeights,
+        IGpuBuffer regularization, IGpuBuffer output,
+        IGpuBuffer workWeights, IGpuBuffer covariance,
+        int batch, int time, int model, int heads, int headDim)
+    {
+        if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
+            model != heads * headDim || headDim > 32)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
+        GlslNaryOp(VulkanRecurrenceKernels.MesaScan,
+            new[] { q, k, v, initialWeights, regularization, output, workWeights, covariance },
+            batch * heads, new[] { (uint)batch, (uint)time, (uint)model, (uint)heads, (uint)headDim });
+    }
+
+    public void RoutedDiagonalSsmScanForward(
+        IGpuBuffer input,IGpuBuffer activeMask,IGpuBuffer transition,IGpuBuffer inputMap,IGpuBuffer outputMap,IGpuBuffer skip,
+        IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
+    {
+        if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
+        GlslNaryOp(VulkanRecurrenceKernels.RoutedDiagonalSsmScan,new[]{input,activeMask,transition,inputMap,outputMap,skip,output,stateScratch},
+            batch*experts,new[]{(uint)batch,(uint)time,(uint)model,(uint)experts,(uint)state});
+    }
+
     public void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)

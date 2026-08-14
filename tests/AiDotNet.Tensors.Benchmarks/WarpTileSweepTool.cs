@@ -388,6 +388,9 @@ internal static class WarpTileSweepTool
 
     private static IEnumerable<(string, CodegenKernelSpec, int, int, int)> Shapes()
     {
+        yield return ("512^3", MatMul("sweep_512", 512, 512, 512), 512, 512, 512);
+        yield return ("1024^3", MatMul("sweep_1024", 1024, 1024, 1024), 1024, 1024, 1024);
+        yield return ("2048^3", MatMul("sweep_2048", 2048, 2048, 2048), 2048, 2048, 2048);
         // 256^3 exists so at least ONE shape is checked against the fp64 ORACLE rather than
         // against another GPU lowering. The oracle branch requires M*N*K <= 64Mi, and every other
         // shape here is at least 512^3 = 128Mi, so without this the 2x2 tile was assigned
@@ -396,9 +399,6 @@ internal static class WarpTileSweepTool
         // lowerings could be timed and reported as verified. 256 is divisible by 128, so every
         // rung of the warp-tile ladder (including 4x4, which needs M % 128 == 0) can stage it.
         yield return ("256^3", MatMul("sweep_256", 256, 256, 256), 256, 256, 256);
-        yield return ("512^3", MatMul("sweep_512", 512, 512, 512), 512, 512, 512);
-        yield return ("1024^3", MatMul("sweep_1024", 1024, 1024, 1024), 1024, 1024, 1024);
-        yield return ("2048^3", MatMul("sweep_2048", 2048, 2048, 2048), 2048, 2048, 2048);
         yield return ("4096^3", MatMul("sweep_4096", 4096, 4096, 4096), 4096, 4096, 4096);
     }
     private static double CompareAgainstReference(

@@ -27,6 +27,11 @@ p14: every applicable, numerically-correct promotable candidate must produce a s
 timing window, and material foreign host CPU load refuses the suite. An incomplete run
 preserves the last identity-valid artifact rather than replacing it with a modelled fallback.
 
+Protocol p14 also makes completeness an admission requirement: every applicable,
+numerically-correct promotable candidate must produce a stable paired timing window, and
+material foreign host CPU load refuses the suite. An incomplete run preserves the last
+identity-valid artifact rather than replacing it with a modelled fallback.
+
 ## The limiter gate, measured
 
 `--kernel-limiter` profiles each kernel with Nsight Compute and records which unit is
