@@ -127,13 +127,16 @@ public partial class CpuEngine
         int G = gateRows;                 // 4 * hidden
         int totalRows = batch * seqLen;
 
-        var inSpan = input.AsSpan();      // [batch, seqLen, inFeatures], row = b*seqLen + t
-        var wIhSpan = wIh.AsSpan();       // [G, inFeatures]
-        var wHhSpan = wHh.AsSpan();       // [G, hidden]
-        float[]? bIhArr = bIh?.ToArray();
-        float[]? bHhArr = bHh?.ToArray();
-        float[]? h0Arr = h0?.ToArray();
-        float[]? c0Arr = c0?.ToArray();
+        // A fused op may receive stride-only views from a preceding permute.
+        // GetFlattenedData is zero-copy for packed tensors and materializes only
+        // a view, while the tape continues to record the original tensor identity.
+        var inSpan = input.GetFlattenedData().AsSpan(); // [batch, seqLen, inFeatures]
+        var wIhSpan = wIh.GetFlattenedData().AsSpan();  // [G, inFeatures]
+        var wHhSpan = wHh.GetFlattenedData().AsSpan();  // [G, hidden]
+        float[]? bIhArr = bIh?.GetFlattenedData();
+        float[]? bHhArr = bHh?.GetFlattenedData();
+        float[]? h0Arr = h0?.GetFlattenedData();
+        float[]? c0Arr = c0?.GetFlattenedData();
 
         // Saved state (captured by the backward closure → persists past this call).
         //   gates:   [b, t] post-activation i|f|g|o, row (b*seqLen+t)*G
@@ -374,8 +377,10 @@ public partial class CpuEngine
         var input = inp[0];
         var wIh = inp[1];
         var wHh = inp[2];
-        var wHhSpan = wHh.AsSpan();          // [G, hidden]
-        var gradOutSpan = gradOutput.AsSpan();
+        var wHhSpan = wHh.GetFlattenedData().AsSpan(); // [G, hidden]
+        var wIhSpan = wIh.GetFlattenedData().AsSpan(); // [G, inFeatures]
+        var inputSpan = input.GetFlattenedData().AsSpan();
+        var gradOutSpan = gradOutput.GetFlattenedData().AsSpan();
 
         // Pool the backward scratch (it otherwise allocates several MB/step — dgatesAll and
         // hPrevAll dominate — churning Gen0 GC during training). Returned at method end.
@@ -452,14 +457,14 @@ public partial class CpuEngine
         // gradInput = dgatesAll @ wIh  → [totalRows, inFeatures]
         var gradInput = new Tensor<float>(new[] { batch, seqLen, inFeatures });
         GemmBig(dgatesAll.AsSpan(0, totalRows * G), G, false,
-                wIh.AsSpan().Slice(0, G * inFeatures), inFeatures, false,
+                wIhSpan.Slice(0, G * inFeatures), inFeatures, false,
                 gradInput.AsWritableSpan(), totalRows, G, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
 
         // gradWIh = dgatesAll^T @ input2d  → [G, inFeatures]
         var gradWIh = new Tensor<float>(new[] { G, inFeatures });
         GemmBig(dgatesAll.AsSpan(0, totalRows * G), G, true,
-                input.AsSpan(), inFeatures, false,
+                inputSpan, inFeatures, false,
                 gradWIh.AsWritableSpan(), G, totalRows, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
 
@@ -566,13 +571,13 @@ public partial class CpuEngine
         int G = gateRows;
         int totalRows = batch * seqLen;
 
-        var inSpan = input.AsSpan();
-        var wIhSpan = wIh.AsSpan();
-        var wHhSpan = wHh.AsSpan();
-        double[]? bIhArr = bIh?.ToArray();
-        double[]? bHhArr = bHh?.ToArray();
-        double[]? h0Arr = h0?.ToArray();
-        double[]? c0Arr = c0?.ToArray();
+        var inSpan = input.GetFlattenedData().AsSpan();
+        var wIhSpan = wIh.GetFlattenedData().AsSpan();
+        var wHhSpan = wHh.GetFlattenedData().AsSpan();
+        double[]? bIhArr = bIh?.GetFlattenedData();
+        double[]? bHhArr = bHh?.GetFlattenedData();
+        double[]? h0Arr = h0?.GetFlattenedData();
+        double[]? c0Arr = c0?.GetFlattenedData();
 
         // Saved state (captured by the backward closure). Layout matches the float path.
         var gates = new double[totalRows * G];
@@ -768,7 +773,10 @@ public partial class CpuEngine
         var input = inp[0];
         var wIh = inp[1];
         var wHh = inp[2];
-        var gradOutSpan = gradOutput.AsSpan();
+        var wHhSpan = wHh.GetFlattenedData().AsSpan();
+        var wIhSpan = wIh.GetFlattenedData().AsSpan();
+        var inputSpan = input.GetFlattenedData().AsSpan();
+        var gradOutSpan = gradOutput.GetFlattenedData().AsSpan();
 
         var pool = System.Buffers.ArrayPool<double>.Shared;
         var dgatesAll = pool.Rent(totalRows * G);
@@ -827,7 +835,7 @@ public partial class CpuEngine
             // dh_prev = dgates_t @ wHh → [batch, hidden]; carried to t-1. BlasManaged double
             // microkernel (NOT the generic MultiplyBlocked — ~128x slower at this per-step shape).
             GemmBigD(dgatesT.AsSpan(0, batch * G), G, false,
-                     wHh.AsSpan().Slice(0, G * hidden), hidden, false,
+                     wHhSpan.Slice(0, G * hidden), hidden, false,
                      dhPrev.AsSpan(0, batch * hidden), batch, G, hidden);
             Array.Copy(dhPrev, dhNext, batch * hidden);
         }
@@ -835,14 +843,14 @@ public partial class CpuEngine
         // gradInput = dgatesAll @ wIh → [totalRows, inFeatures]
         var gradInput = new Tensor<double>(new[] { batch, seqLen, inFeatures });
         GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, false,
-                 wIh.AsSpan().Slice(0, G * inFeatures), inFeatures, false,
+                 wIhSpan.Slice(0, G * inFeatures), inFeatures, false,
                  gradInput.AsWritableSpan(), totalRows, G, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
 
         // gradWIh = dgatesAll^T @ input2d → [G, inFeatures]
         var gradWIh = new Tensor<double>(new[] { G, inFeatures });
         GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, true,
-                 input.AsSpan(), inFeatures, false,
+                 inputSpan, inFeatures, false,
                  gradWIh.AsWritableSpan(), G, totalRows, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
 

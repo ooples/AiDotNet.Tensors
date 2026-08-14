@@ -110,6 +110,144 @@ public class StreamingInt8MatMulRoutingTests
         }
     }
 
+    [Fact]
+    public void Int8Weight_ThroughTensorMatMul2DAndBatched_StaysQuantized()
+    {
+        const int inDim = 64, outDim = 48, rows = 6;
+        var engine = new CpuEngine();
+        var rng = new Rng(8108);
+        var wData = new float[inDim * outDim];
+        var xData = new float[rows * inDim];
+        for (int i = 0; i < wData.Length; i++) wData[i] = rng.Next(0.1);
+        for (int i = 0; i < xData.Length; i++) xData[i] = rng.Next(1.0);
+
+        var deq = DequantizePerOutput(wData, inDim, outDim);
+        var referenceWeight = new Tensor<float>(deq, new[] { inDim, outDim });
+        var x2 = new Tensor<float>(xData, new[] { rows, inDim });
+        var x3 = new Tensor<float>(xData, new[] { 2, rows / 2, inDim });
+        var expected2 = engine.TensorMatMul(x2, referenceWeight);
+        var expected3 = engine.TensorMatMul(x3, referenceWeight);
+
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8mm-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Int8,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var streamed = new Tensor<float>(wData, new[] { inDim, outDim })
+            {
+                Lifetime = WeightLifetime.Streaming,
+            };
+            WeightRegistry.RegisterWeight(streamed);
+
+            var actual2 = engine.TensorMatMul(x2, streamed);
+            Assert.NotNull(streamed.StreamingInt8);
+            Assert.Equal(0, streamed.DataVector.Length);
+            AssertRelativeClose(actual2, expected2, 0.01);
+
+            var actual3 = engine.TensorMatMul(x3, streamed);
+            Assert.NotNull(streamed.StreamingInt8);
+            Assert.Equal(0, streamed.DataVector.Length);
+            AssertRelativeClose(actual3, expected3, 0.01);
+        }
+        finally
+        {
+            WeightRegistry.SetStreamingExecutionTraining(null);
+            WeightRegistry.Reset();
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Int8Weights_ThroughMultiHeadAttention_StayQuantized()
+    {
+        const int batch = 2, seq = 3, dModel = 32, heads = 4;
+        var engine = new CpuEngine();
+        var rng = new Rng(8808);
+        var inputData = new float[batch * seq * dModel];
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = rng.Next(0.4);
+        var input = new Tensor<float>(inputData, new[] { batch, seq, dModel });
+
+        float[] NewWeight()
+        {
+            var data = new float[dModel * dModel];
+            for (int i = 0; i < data.Length; i++) data[i] = rng.Next(0.08);
+            return data;
+        }
+
+        var qData = NewWeight();
+        var kData = NewWeight();
+        var vData = NewWeight();
+        var oData = NewWeight();
+        var expected = engine.MultiHeadAttentionForward(
+            input,
+            new Tensor<float>(DequantizePerOutput(qData, dModel, dModel), new[] { dModel, dModel }),
+            new Tensor<float>(DequantizePerOutput(kData, dModel, dModel), new[] { dModel, dModel }),
+            new Tensor<float>(DequantizePerOutput(vData, dModel, dModel), new[] { dModel, dModel }),
+            new Tensor<float>(DequantizePerOutput(oData, dModel, dModel), new[] { dModel, dModel }),
+            heads);
+
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8mha-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 4L * 1024 * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Int8,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            Tensor<float> Stream(float[] data)
+            {
+                var weight = new Tensor<float>(data, new[] { dModel, dModel })
+                {
+                    Lifetime = WeightLifetime.Streaming,
+                };
+                WeightRegistry.RegisterWeight(weight);
+                return weight;
+            }
+
+            var q = Stream(qData);
+            var k = Stream(kData);
+            var v = Stream(vData);
+            var o = Stream(oData);
+            var actual = engine.MultiHeadAttentionForward(input, q, k, v, o, heads);
+
+            foreach (var weight in new[] { q, k, v, o })
+            {
+                Assert.NotNull(weight.StreamingInt8);
+                Assert.Equal(0, weight.DataVector.Length);
+            }
+            AssertRelativeClose(actual, expected, 0.015);
+        }
+        finally
+        {
+            WeightRegistry.SetStreamingExecutionTraining(null);
+            WeightRegistry.Reset();
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    private static void AssertRelativeClose(Tensor<float> actual, Tensor<float> expected, double tolerance)
+    {
+        var a = actual.AsSpan();
+        var e = expected.AsSpan();
+        Assert.Equal(e.Length, a.Length);
+        double errorSquared = 0.0, expectedSquared = 0.0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            double error = a[i] - e[i];
+            errorSquared += error * error;
+            expectedSquared += (double)e[i] * e[i];
+        }
+        double relative = Math.Sqrt(errorSquared / Math.Max(1e-30, expectedSquared));
+        Assert.True(relative < tolerance, $"relative RMS error {relative:E3} exceeded {tolerance:E3}");
+    }
+
     /// <summary>
     /// The RAM-aware <see cref="StreamingStoreDtype.Auto"/> path (not the explicit Int8 opt-in):
     /// a large inference weight, under a footprint+cap where bf16 would overflow the resident cap

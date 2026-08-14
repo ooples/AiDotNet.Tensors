@@ -37,7 +37,7 @@ public sealed class CompiledTrainingPlanCleanupTests
     {
         var loss = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
         var plan = CreatePlan(loss, Array.Empty<Tensor<float>>(), new Tensor<float>(new[] { 1 }), null);
-        var backing = loss.DataVector.GetBackingArrayUnsafe()
+        var backing = loss.GetBackingArrayForCacheLookupUnsafe()
             ?? throw new InvalidOperationException("Expected CPU tensor to expose a backing array.");
         int backingCalls = 0;
         int vectorCalls = 0;
@@ -61,9 +61,9 @@ public sealed class CompiledTrainingPlanCleanupTests
     private static void AssertContainsTensorKeys(HashSet<object> protect, Tensor<float> tensor)
     {
         Assert.Contains(tensor.DataVector, protect);
-        var backing = tensor.DataVector.GetBackingArrayUnsafe();
-        if (backing is not null)
-            Assert.Contains(backing, protect);
+        var backing = tensor.GetBackingArrayForCacheLookupUnsafe()
+            ?? throw new InvalidOperationException("Expected CPU tensor to expose a backing array.");
+        Assert.Contains(backing, protect);
     }
 
     private static CompiledTrainingPlan<float> CreatePlan(

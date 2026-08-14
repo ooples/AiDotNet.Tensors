@@ -125,4 +125,33 @@ public class LstmFusedBackwardGradientTests
         CheckFiniteDiff("wIh", eng, wIh, grads[wIh], L, wIh);
         CheckFiniteDiff("wHh", eng, wHh, grads[wHh], L, wHh);
     }
+
+    [Fact]
+    public void GradientTape_NonContiguousSequenceView_PropagatesToOriginalTensor()
+    {
+        var eng = new CpuEngine();
+        var rng = new Random(2027);
+        const int batch = 2, seq = 3, inF = 4, hidden = 3;
+        int gates = 4 * hidden;
+
+        var channelsFirst = Rand(new[] { batch, inF, seq }, rng);
+        var wIh = Rand(new[] { gates, inF }, rng);
+        var wHh = Rand(new[] { gates, hidden }, rng);
+
+        Dictionary<Tensor<float>, Tensor<float>> grads;
+        using (var tape = new GradientTape<float>())
+        {
+            var sequenceView = eng.TensorPermute(channelsFirst, new[] { 0, 2, 1 });
+            Assert.False(sequenceView.IsContiguous);
+            var output = eng.LstmSequenceForward(
+                sequenceView, null, null, wIh, wHh, null, null, returnSequences: true);
+            var loss = eng.ReduceSum(output, null);
+            grads = tape.ComputeGradients(loss, new[] { channelsFirst, wIh, wHh });
+        }
+
+        Assert.True(grads.ContainsKey(channelsFirst));
+        Assert.Equal(channelsFirst.Length, grads[channelsFirst].Length);
+        foreach (float value in grads[channelsFirst].Contiguous().AsSpan())
+            Assert.True(!float.IsNaN(value) && !float.IsInfinity(value));
+    }
 }

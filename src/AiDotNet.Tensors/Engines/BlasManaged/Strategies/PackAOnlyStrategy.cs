@@ -215,6 +215,15 @@ internal static class PackAOnlyStrategy
         in BlasOptions<T> options) where T : unmanaged
     {
         int elemSize = Unsafe.SizeOf<T>();
+        // Every packed-A stripe contains exactly mr rows. Autotuning is allowed to choose an mc
+        // that is not a multiple of the active microkernel tile (for example mc=190, mr=6).
+        // Iterating those raw mc-sized panels leaves a partial stripe at the end of every interior
+        // panel; DispatchStridedMicrokernel then slices effectiveKc*mr elements from a shorter
+        // buffer and throws during otherwise-valid GEMM/backward workloads. Round the live block
+        // down once and advance by that aligned extent. The outer Run method already gives us an
+        // mr-aligned interior, so the final block remains full-stripe too.
+        int alignedMc = mc - mc % mr;
+        if (alignedMc <= 0) alignedMc = mr;
         int packABytes = mc * kc * elemSize;
 
         var carver = new WorkspaceCarver(options.Workspace);
@@ -231,6 +240,7 @@ internal static class PackAOnlyStrategy
         // consumer running a different active mr would read them at the wrong
         // stride (see WeightPackHandle.PackMr). Mismatch -> live pack below.
         bool multiPanelA = options.PackedA != null
+            && alignedMc == mc
             && WeightPackCache.IsCacheCurrent(options.PackedA)
             && options.PackedA.PackMr == mr
             && options.PackedA.TilingMatches(mc, kc)
@@ -242,10 +252,10 @@ internal static class PackAOnlyStrategy
             int effectiveKc = Math.Min(kc, k - pc);
             int pcIdx = pc / kc;
 
-            for (int ic = 0; ic < m; ic += mc)
+            for (int ic = 0; ic < m; ic += alignedMc)
             {
-                int effectiveMc = Math.Min(mc, m - ic);
-                int icIdx = ic / mc;
+                int effectiveMc = Math.Min(alignedMc, m - ic);
+                int icIdx = ic / alignedMc;
 
                 int effectivePackABytes = effectiveMc * effectiveKc * elemSize;
                 bool packAFromPrePack = false;
@@ -260,7 +270,9 @@ internal static class PackAOnlyStrategy
                         packAFromPrePack = true;
                     }
                 }
-                else if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
+                else if (options.PackedA != null
+                    && options.PackedA.MultiPanelStride <= 0
+                    && WeightPackCache.IsCacheCurrent(options.PackedA)
                     && options.PackedA.PackMr == mr
                     && options.PackedA.PackedBuffer.Length >= effectivePackABytes)
                 {

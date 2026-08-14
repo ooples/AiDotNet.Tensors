@@ -46,6 +46,11 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public partial class CpuEngine : ITensorLevelEngine
 {
+    // Conv3D's im2col expansion can be tens of times larger than the input. Keep the combined
+    // columns + GEMM-output scratch below a fixed process-friendly ceiling and stream larger
+    // volumes through row tiles instead of risking multi-gigabyte allocations.
+    private const long Conv3DIm2ColWorkspaceBytes = 256L * 1024 * 1024;
+
     private static int _randomNormalSeedCounter = Environment.TickCount;
     private const int TensorMatMulGemvParallelThreshold = 128 * 1024;
     private const double CapsuleSquashEpsilon = 1e-8;
@@ -12892,6 +12897,17 @@ public partial class CpuEngine : ITensorLevelEngine
         // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, p });
 
+#if NET5_0_OR_GREATER
+        // A streamed inference weight is stored in the quantized kernel layout [P,N]
+        // even though its logical tensor shape remains [N,P]. Consume that representation
+        // directly before any Data/AsSpan access can lazily create a full fp32 copy. This
+        // makes the no-upcast contract apply to ordinary TensorMatMul, not only FusedLinear.
+        if (TryTensorMatMulStreamingWeight(a, b, result, m, n, p))
+        {
+            return result;
+        }
+#endif
+
         if (p == 1 && TryTensorMatMulGemv(a, b, result, m, n))
         {
             return result;
@@ -13036,6 +13052,45 @@ public partial class CpuEngine : ITensorLevelEngine
 
         return result;
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Executes <c>A[rows,K] * B[K,N]</c> directly from B's no-upcast int8/int4
+    /// streaming representation. Returns false for normal, non-float, or training
+    /// weights without touching their data.
+    /// </summary>
+    private static bool TryTensorMatMulStreamingWeight<T>(
+        Tensor<T> a, Tensor<T> b, Tensor<T> result, int rows, int k, int outputColumns)
+    {
+        if (typeof(T) != typeof(float) || !a.IsContiguous || !b.IsContiguous)
+        {
+            return false;
+        }
+
+        var q8 = b.GetMaterializedStreamingInt8();
+        if (q8 is not null && q8.Rows == outputColumns && q8.K == k)
+        {
+            var input = (float[])(object)a.GetReadOnlyDataArray();
+            var output = (float[])(object)result.GetDataArray();
+            Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
+                input, q8.Data, q8.Scales, output, rows, k, outputColumns);
+            return true;
+        }
+
+        var q4 = b.GetMaterializedStreamingInt4();
+        if (q4 is not null && q4.Rows == outputColumns && q4.K == k)
+        {
+            var input = (float[])(object)a.GetReadOnlyDataArray();
+            var output = (float[])(object)result.GetDataArray();
+            Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
+                input, q4.Data, q4.GroupScales, q4.GroupSize,
+                output, rows, k, outputColumns);
+            return true;
+        }
+
+        return false;
+    }
+#endif
 
     /// <summary>
     /// Sub-E (#373): inference fast path that consumes a pre-packed weight handle
@@ -13259,6 +13314,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
+
+#if NET5_0_OR_GREATER
+        // All batch slices are contiguous in A, so the broadcast ND x 2D operation is
+        // one [batchSize*M,K] projection. Route streamed weights before bData/Data is
+        // requested; those accessors intentionally dequantize as a generic fallback.
+        if (TryTensorMatMulStreamingWeight(a, b, result, batchSize * m, n, p))
+        {
+            return result;
+        }
+#endif
 
         var aData = a.GetReadOnlyDataArray();
         var bData = b.GetReadOnlyDataArray();
@@ -19818,9 +19883,32 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Check kernel size, stride, padding, and dilation parameters for input size {depth}x{height}x{width}.");
         }
 
+        // Float/double Conv3D is a matrix multiplication after im2col. The former direct
+        // implementation below performs seven scalar loops for every output element; on a
+        // paper-scale 3D U-Net that made each 32^3 inference take ~34 seconds. Build the
+        // receptive-field rows once and contract them with all output kernels in one BLAS GEMM.
+        // This remains the CpuEngine implementation of the existing cross-backend IEngine op;
+        // GPU backends keep their resident Conv3D kernels and model/layer code stays unchanged.
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && TryConv3DIm2ColGemm(
+                input, kernel,
+                batch, inChannels, depth, height, width,
+                outChannels, kernelDepth, kernelHeight, kernelWidth,
+                outputDepth, outputHeight, outputWidth,
+                strideD, strideH, strideW,
+                padD, padH, padW,
+                dilationD, dilationH, dilationW,
+                out var gemmResult))
+        {
+            DifferentiableOps.RecordBinary("Conv3D", gemmResult, input, kernel, BackwardFunctions<T>.Conv3DBackward,
+                new object[] { stride, padding, dilation });
+            AutoTracer.RecordOp("Conv3D", gemmResult, eng => eng.Conv3D(input, kernel, stride, padding, dilation));
+            return gemmResult;
+        }
+
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
         var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
@@ -19873,6 +19961,148 @@ public partial class CpuEngine : ITensorLevelEngine
             new object[] { stride, padding, dilation });
         AutoTracer.RecordOp("Conv3D", result, eng => eng.Conv3D(input, kernel, stride, padding, dilation));
         return result;
+    }
+
+    private static bool TryConv3DIm2ColGemm<T>(
+        Tensor<T> input,
+        Tensor<T> kernel,
+        int batch,
+        int inChannels,
+        int depth,
+        int height,
+        int width,
+        int outChannels,
+        int kernelDepth,
+        int kernelHeight,
+        int kernelWidth,
+        int outputDepth,
+        int outputHeight,
+        int outputWidth,
+        int strideDepth,
+        int strideHeight,
+        int strideWidth,
+        int padDepth,
+        int padHeight,
+        int padWidth,
+        int dilationDepth,
+        int dilationHeight,
+        int dilationWidth,
+        out Tensor<T> result)
+    {
+        result = null!;
+
+        long rowsLong = (long)batch * outputDepth * outputHeight * outputWidth;
+        long columnsLong = (long)inChannels * kernelDepth * kernelHeight * kernelWidth;
+        long columnElementsLong = rowsLong * columnsLong;
+        long flatOutputElementsLong = rowsLong * outChannels;
+        if (rowsLong <= 0 || columnsLong <= 0
+            || rowsLong > int.MaxValue || columnsLong > int.MaxValue
+            || columnElementsLong > int.MaxValue || flatOutputElementsLong > int.MaxValue)
+        {
+            return false;
+        }
+
+        int elementSize;
+        if (typeof(T) == typeof(float)) elementSize = sizeof(float);
+        else if (typeof(T) == typeof(double)) elementSize = sizeof(double);
+        else return false;
+
+        int rows = (int)rowsLong;
+        int columnsPerRow = (int)columnsLong;
+        long elementsPerTileRow = columnsLong + outChannels;
+        long bytesPerTileRow = checked(elementsPerTileRow * elementSize);
+        if (bytesPerTileRow > Conv3DIm2ColWorkspaceBytes)
+            return false;
+
+        int tileCapacity = (int)Math.Min(rowsLong,
+            Math.Max(1L, Conv3DIm2ColWorkspaceBytes / bytesPerTileRow));
+        int columnCapacity = checked(tileCapacity * columnsPerRow);
+        int flatCapacity = checked(tileCapacity * outChannels);
+        T[]? columns = null;
+        T[]? flatOutput = null;
+        Tensor<T>? allocatedResult = null;
+        int spatial = outputDepth * outputHeight * outputWidth;
+        try
+        {
+            // Protect the complete acquisition sequence. A later rent, input materialization,
+            // result allocation, or writable-array acquisition may throw independently.
+            columns = System.Buffers.ArrayPool<T>.Shared.Rent(columnCapacity);
+            flatOutput = System.Buffers.ArrayPool<T>.Shared.Rent(flatCapacity);
+            var inputData = input.GetReadOnlyDataArray();
+            var kernelData = kernel.GetReadOnlyDataArray();
+            allocatedResult = TensorAllocator.Rent<T>(
+                [batch, outChannels, outputDepth, outputHeight, outputWidth]);
+            var outputData = allocatedResult.GetDataArray();
+            result = allocatedResult;
+
+            for (int rowStart = 0; rowStart < rows; rowStart += tileCapacity)
+            {
+                int tileRows = Math.Min(tileCapacity, rows - rowStart);
+                Helpers.CpuIm2Col3DHelper.BuildColumnsRange(
+                    inputData, columns, rowStart, tileRows,
+                    batch, inChannels, depth, height, width,
+                    kernelDepth, kernelHeight, kernelWidth,
+                    outputDepth, outputHeight, outputWidth,
+                    strideDepth, strideHeight, strideWidth,
+                    padDepth, padHeight, padWidth,
+                    dilationDepth, dilationHeight, dilationWidth);
+
+                bool multiplied;
+                if (typeof(T) == typeof(float))
+                {
+                    multiplied = Helpers.BlasProvider.TryGemmEx(
+                        tileRows, outChannels, columnsPerRow,
+                        (float[])(object)columns, 0, columnsPerRow, false,
+                        (float[])(object)kernelData, 0, columnsPerRow, true,
+                        (float[])(object)flatOutput, 0, outChannels);
+                }
+                else
+                {
+                    multiplied = Helpers.BlasProvider.TryGemmEx(
+                        tileRows, outChannels, columnsPerRow,
+                        (double[])(object)columns, 0, columnsPerRow, false,
+                        (double[])(object)kernelData, 0, columnsPerRow, true,
+                        (double[])(object)flatOutput, 0, outChannels);
+                }
+
+                if (!multiplied)
+                {
+                    allocatedResult.Dispose();
+                    allocatedResult = null;
+                    result = null!;
+                    return false;
+                }
+
+                // GEMM emits [tileRows, OC] in NDHWC row order. Scatter the tile directly into
+                // Conv3D's NCDHW result so no full-size flat output temporary is needed.
+                int currentRowStart = rowStart;
+                CpuParallelSettings.ParallelForOrSerial(0, tileRows,
+                    (long)tileRows * outChannels, localRow =>
+                {
+                    int globalRow = currentRowStart + localRow;
+                    int b = globalRow / spatial;
+                    int position = globalRow - b * spatial;
+                    int flatBase = localRow * outChannels;
+                    for (int oc = 0; oc < outChannels; oc++)
+                        outputData[(b * outChannels + oc) * spatial + position] = flatOutput[flatBase + oc];
+                });
+            }
+
+            return true;
+        }
+        catch
+        {
+            allocatedResult?.Dispose();
+            result = null!;
+            throw;
+        }
+        finally
+        {
+            if (columns is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(columns);
+            if (flatOutput is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(flatOutput);
+        }
     }
 
     /// <inheritdoc/>
@@ -33549,11 +33779,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         // held-out). Refresh the shared idxSnap from the live indices tensor so BOTH this
                         // forward gather AND the matching backward (which holds the same idxSnap array) use the
                         // current step's tokens. Covered by EmbeddingIndicesMustRefreshAcrossStep_NotFrozenAtCompileTime.
-                        var liveRaw = capturedIndices.GetDataArray();
+                        var liveRaw = capturedIndices.GetReadOnlyDataArray();
                         for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveRaw[i]);
                         // Replay forward: re-execute the row-gather into
                         // the pre-allocated output buffer.
-                        var embDataLocal = capturedEmb.GetDataArray();
+                        // Embedding tables are input operands. Inference may keep them in a
+                        // quantized streaming store, whose writable accessors intentionally
+                        // reject mutation; asking for write intent here made a pure gather fail
+                        // after its first eviction. Keep only the destination writable.
+                        var embDataLocal = capturedEmb.GetReadOnlyDataArray();
                         var outDataLocal = output.GetDataArray();
                         for (int i = 0; i < n; i++)
                         {
@@ -33574,9 +33808,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<TValue>(outputShape);
-        var embData = embeddings.GetDataArray();
+        var embData = embeddings.GetReadOnlyDataArray();
         var resultData = result.GetDataArray();
-        var idxData = indices.GetDataArray();
+        var idxData = indices.GetReadOnlyDataArray();
 
         // For each index, copy the entire embedding row. Promote to long
         // for the bounds check so a TIndex=long input with an index that
@@ -33666,8 +33900,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         // via banker's rounding (matches Convert.ToInt32(double)
                         // semantics used by the eager path so any code that flips
                         // between fused and eager produces identical lookups).
-                        var idxData = capturedFloatIdx.GetDataArray();
-                        var embData = capturedEmb.GetDataArray();
+                        var idxData = capturedFloatIdx.GetReadOnlyDataArray();
+                        var embData = capturedEmb.GetReadOnlyDataArray();
                         var outData = output.GetDataArray();
                         for (int i = 0; i < n; i++)
                         {
@@ -33690,7 +33924,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // so eager-path callers transparently get all the work done by the
         // tape-registration + GPU paths in TensorEmbeddingLookup.
         var intIndices = new Tensor<int>(floatIndices._shape);
-        var floatData = floatIndices.GetDataArray();
+        var floatData = floatIndices.GetReadOnlyDataArray();
         var intData = intIndices.GetDataArray();
         var nopsEager = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < numIndices; i++)
@@ -33713,7 +33947,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         int n = indices.Length;
         var snap = new long[n];
-        var raw = indices.GetDataArray();
+        var raw = indices.GetReadOnlyDataArray();
         for (int i = 0; i < n; i++) snap[i] = Convert.ToInt64(raw[i]);
         return snap;
     }
@@ -33733,8 +33967,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradEmbeddings = new Tensor<TValue>(new[] { vocabSize, embeddingDim });
         var gradEmbData = gradEmbeddings.GetDataArray();
 
-        var gradData = gradOutput.GetDataArray();
-        var idxData = indices.GetDataArray();
+        var gradData = gradOutput.GetReadOnlyDataArray();
+        var idxData = indices.GetReadOnlyDataArray();
         int numIndices = indices.Length;
 
         // Scatter-add: for each index, accumulate gradients to the embedding row.
@@ -35108,7 +35342,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         var tensor = new Tensor<T>(shape);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(tensor.DataVector.AsWritableSpan());
+        rng.FillUniform(tensor.AsWritableSpan());
         return tensor;
     }
 
@@ -38626,7 +38860,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var inA = (float[])(object)input.GetReadOnlyDataArray();
                     var outA = (float[])(object)int8Result.GetDataArray();
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
-                        inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
+                        inA, q8.Data, q8.Scales, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
                         var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
@@ -38926,7 +39160,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var inA = (float[])(object)input.GetReadOnlyDataArray();
                     var outA = (float[])(object)destination.GetDataArray();
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
-                        inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
+                        inA, q8.Data, q8.Scales, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
                         var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
@@ -39630,13 +39864,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <inheritdoc/>
     /// <remarks>
-    /// On CPU, this is a no-op. Persistent tensor management only provides benefits
-    /// on GPU where data transfer between host and device is expensive.
+    /// On CPU, registration protects arena-rented model state from scratch reuse. GPU engines
+    /// inherit that lifetime guarantee before adding their device-residency bookkeeping.
     /// </remarks>
     public virtual void RegisterPersistentTensor<T>(Tensor<T> tensor, PersistentTensorRole role)
     {
-        // No-op on CPU: persistence only benefits GPU by avoiding repeated transfers
-        // The tensor is already in CPU memory, so there's nothing to cache
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        TensorArena.Current?.PinExistingTensor(tensor);
     }
 
     /// <inheritdoc/>
@@ -46371,7 +46605,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Zero allocations, zero copy passes — SIMD kernel reads/writes the tensor memory directly.
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
             ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
             var srcD = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
@@ -46385,7 +46619,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
             ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
             var srcF = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
@@ -46401,7 +46635,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // net471 fallback: no MemoryMarshal.CreateSpan. Use temp buffer path.
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             var srcD = new double[n];
             var dstD = new double[n];
             for (int i = 0; i < n; i++)
@@ -46418,7 +46652,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int n = rows * cols;
             var srcData = input.DataVector.AsSpan();
-            var dstData = result.DataVector.AsWritableSpan();
+            var dstData = result.AsWritableSpan();
             var srcF = new float[n];
             var dstF = new float[n];
             for (int i = 0; i < n; i++)
@@ -46598,7 +46832,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
             }
             Engines.Simd.SimdKernels.Tanh(srcD, dstD);
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
             return result;
@@ -46614,7 +46848,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
             }
             Engines.Simd.SimdKernels.Tanh(srcF, dstF);
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
@@ -46648,7 +46882,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 fixed (float* ip = srcF) fixed (float* op = dstF)
                     Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
             }
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
@@ -46668,7 +46902,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 fixed (double* ip = srcD) fixed (double* op = dstD)
                     Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
             }
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
             return result;
@@ -46703,7 +46937,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var iSpan = imag.DataVector.AsSpan();
             var rSpan = real.DataVector.AsSpan();
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
             {
                 ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
@@ -46719,7 +46953,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var iSpan = imag.DataVector.AsSpan();
             var rSpan = real.DataVector.AsSpan();
-            var dstSpan = result.DataVector.AsWritableSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < n; i++)
             {
                 ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
