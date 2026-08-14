@@ -349,7 +349,7 @@ public sealed class TapeStepContext<T>
                 throw new InvalidOperationException(
                     $"SetFlatParameters requires contiguous parameter tensors. " +
                     $"Call Contiguous() on non-contiguous parameters before using flat access.");
-            var dst = p.DataVector.AsWritableSpan().Slice(p._storageOffset, p.Length);
+            var dst = p.AsWritableSpan();
             src.Slice(offset, p.Length).CopyTo(dst);
             offset += p.Length;
         }
