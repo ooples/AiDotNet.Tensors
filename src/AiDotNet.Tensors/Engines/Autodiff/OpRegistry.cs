@@ -69,7 +69,7 @@ internal static class OpRegistry
         "Embedding", "Dropout",
         // Interleaved RoPE: orthogonal rotation, records with ApplyRoPEInterleavedBackward (inverse rotation).
         "ApplyRoPEInterleaved",
-        "GridSample", "Unfold", "Fold",
+        "GridSample", "Unfold", "Fold", "PartialCorrelationVolume", "ForwardSplat",
 
         // Spatial
         "Upsample", "Upsample3D", "PixelShuffle", "Crop", "Pad",

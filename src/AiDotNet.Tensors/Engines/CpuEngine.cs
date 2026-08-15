@@ -27004,6 +27004,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capT = numOpsLocal.FromDouble(softcap);
                 scaled = TensorMultiplyScalar(Tanh(TensorMultiplyScalar(scaled, invCap)), capT);
             }
+            if (mask is not null)
+            {
+                int batchLocal = query._shape[0];
+                int headsLocal = query._shape[1];
+                int seqQLocal = query._shape[2];
+                int seqKLocal = key._shape[2];
+                if (mask.Rank != 4 || mask._shape[0] != batchLocal ||
+                    mask._shape[1] != headsLocal || mask._shape[2] != seqQLocal ||
+                    mask._shape[3] != seqKLocal)
+                {
+                    throw new ArgumentException(
+                        "Attention mask must have shape [batch, heads, querySequence, keySequence].",
+                        nameof(mask));
+                }
+
+                // SDPA defines true as an allowed edge, while TensorMaskedFill fills true
+                // positions. Invert once at trace time; the mask is non-trainable graph state.
+                var maskData = mask.GetFlattenedData();
+                var blockedData = new bool[maskData.Length];
+                for (int i = 0; i < maskData.Length; i++) blockedData[i] = !maskData[i];
+                var blocked = new Tensor<bool>(blockedData, mask._shape);
+                scaled = TensorMaskedFill(
+                    scaled, blocked, numOpsLocal.FromDouble(double.NegativeInfinity));
+            }
             // softmax over last axis (S_k) — Softmax records its own lazy node
             // and the backward kernel handles the per-row Jacobian.
             attentionWeights = Softmax(scaled);

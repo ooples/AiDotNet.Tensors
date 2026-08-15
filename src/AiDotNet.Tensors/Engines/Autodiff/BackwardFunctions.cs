@@ -1620,6 +1620,21 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradV, engine);
     }
 
+    /// <summary>Average forward-splat backward for source values and pixel flow.</summary>
+    internal static void ForwardSplatBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        bool normalize = (bool)savedState[0];
+        double epsilon = (double)savedState[1];
+        var gradInput = engine.ForwardSplatBackwardInput(
+            gradOutput, inputs[0], inputs[1], normalize, epsilon);
+        var gradFlow = engine.ForwardSplatBackwardFlow(
+            gradOutput, inputs[0], inputs[1], output, normalize, epsilon);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradFlow, engine);
+    }
+
     /// <summary>
     /// DeformableConv2D backward (DCN v1 / mask=null): routes gradient to
     /// input, kernel, offset. Engine has separate Input/Kernel/Offset

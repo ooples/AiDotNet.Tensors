@@ -5956,6 +5956,30 @@ public interface IEngine
     Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid);
 
     /// <summary>
+    /// Builds a local all-pairs correlation volume for two NCHW feature maps.
+    /// Output channel order is row-major over offsets [-radius,+radius]².
+    /// </summary>
+    Tensor<T> PartialCorrelationVolume<T>(Tensor<T> first, Tensor<T> second, int radius = 4);
+
+    /// <summary>
+    /// Differentiably forward-warps an NCHW tensor using an NCHW two-channel pixel flow.
+    /// Bilinear contributions are accumulated at destination pixels; normalized mode divides
+    /// by accumulated weights and implements the average soft-splat used by UPR-Net.
+    /// </summary>
+    Tensor<T> ForwardSplat<T>(
+        Tensor<T> input, Tensor<T> flow, bool normalize = true, double epsilon = 1e-7);
+
+    /// <summary>Gradient of <see cref="ForwardSplat{T}"/> with respect to its input.</summary>
+    Tensor<T> ForwardSplatBackwardInput<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
+        bool normalize = true, double epsilon = 1e-7);
+
+    /// <summary>Gradient of <see cref="ForwardSplat{T}"/> with respect to its flow.</summary>
+    Tensor<T> ForwardSplatBackwardFlow<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
+        bool normalize = true, double epsilon = 1e-7);
+
+    /// <summary>
     /// Extracts sliding local blocks (patches) from a batched input tensor.
     /// Similar to PyTorch's torch.nn.functional.unfold (im2col).
     /// Input shape: [batch, channels, height, width]
