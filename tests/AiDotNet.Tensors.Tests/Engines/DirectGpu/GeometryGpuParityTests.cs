@@ -127,4 +127,55 @@ public class GeometryGpuParityTests : IDisposable
         var c = _cpu.AffineGrid3D(theta, 2, 3, 3, alignCorners: false);
         AssertClose(g, c);
     }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardSplat_GpuMatchesCpu(bool normalize)
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(6, 1, 2, 4, 5);
+        var flow = Rand4D(7, 1, 2, 4, 5, range: 0.35f);
+
+        var gpu = _gpu!.ForwardSplat(input, flow, normalize);
+        var cpu = _cpu.ForwardSplat(input, flow, normalize);
+
+        AssertClose(gpu, cpu, 2e-3f);
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardSplatBackwardInput_GpuMatchesCpu(bool normalize)
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(8, 1, 2, 4, 5);
+        var flow = Rand4D(9, 1, 2, 4, 5, range: 0.35f);
+        var gradOutput = Rand4D(10, 1, 2, 4, 5);
+
+        var gpu = _gpu!.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
+        var cpu = _cpu.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
+
+        AssertClose(gpu, cpu, 2e-3f);
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardSplatBackwardFlow_GpuMatchesCpu(bool normalize)
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(11, 1, 2, 4, 5);
+        var flow = Rand4D(12, 1, 2, 4, 5, range: 0.35f);
+        var gradOutput = Rand4D(13, 1, 2, 4, 5);
+        var gpuOutput = _gpu!.ForwardSplat(input, flow, normalize);
+        var cpuOutput = _cpu.ForwardSplat(input, flow, normalize);
+
+        var gpu = _gpu.ForwardSplatBackwardFlow(
+            gradOutput, input, flow, gpuOutput, normalize);
+        var cpu = _cpu.ForwardSplatBackwardFlow(
+            gradOutput, input, flow, cpuOutput, normalize);
+
+        AssertClose(gpu, cpu, 3e-3f);
+    }
 }

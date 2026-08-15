@@ -113,7 +113,13 @@ public partial class DirectGpuTensorEngine
             // The grid stores normalized coordinates. Convert dL/d(grid) to dL/d(pixel flow).
             var pixelScale = CreateAxisTensor<T>(
                 2.0 / input.Shape[3], 2.0 / input.Shape[2]);
-            return TensorBroadcastMultiply(flowGradient, pixelScale);
+            var scaledGradient = TensorBroadcastMultiply(flowGradient, pixelScale);
+
+            // GridSampleBackwardGrid follows the grid contract and returns NHWC coordinates.
+            // ForwardSplat's public flow contract is NCHW, so restore that layout before
+            // returning the gradient to the tape. Keeping NHWC here silently attached the
+            // wrong shape to every GPU-trained flow tensor.
+            return TensorPermute(scaledGradient, [0, 3, 1, 2]).Contiguous();
         }
     }
 

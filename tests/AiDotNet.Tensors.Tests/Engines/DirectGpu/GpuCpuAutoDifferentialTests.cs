@@ -483,6 +483,11 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "PsRoIAlign(Tensor<T>,Tensor<T>,Int32,Int32,Int32,Single,Int32)",
         "PsRoIPool(Tensor<T>,Tensor<T>,Int32,Int32,Int32,Single)",
         "AffineGrid3D(Tensor<T>,Int32,Int32,Int32,Boolean)",
+        // Video forward-warp forward/backward parity is exercised for normalized and
+        // unnormalized splats in GeometryGpuParityTests.
+        "ForwardSplat(Tensor<T>,Tensor<T>,Boolean)",
+        "ForwardSplatBackwardInput(Tensor<T>,Tensor<T>,Tensor<T>,Boolean)",
+        "ForwardSplatBackwardFlow(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Boolean)",
         // backward ops — grad/input/mean/var tensors have mutually-reduced shapes
         "StdBackward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[])",
         "VarBackward(Tensor<T>,Tensor<T>,Tensor<T>,Int32[])",
