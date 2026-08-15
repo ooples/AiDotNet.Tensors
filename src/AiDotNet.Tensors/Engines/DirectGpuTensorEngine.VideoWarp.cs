@@ -17,9 +17,11 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> PartialCorrelationVolume<T>(
         Tensor<T> first, Tensor<T> second, int radius = 4)
     {
-        // CpuEngine's implementation is a pure composition of virtual Unfold, Reshape,
-        // TensorMultiply, and ReduceMean calls. On this instance those dispatch to the resident
-        // GPU implementations, while their normal tape nodes provide the exact gradient.
+        // CpuEngine's bounded implementation composes virtual Pad, TensorSlice, TensorMultiply,
+        // ReduceMean, and TensorConcatenate calls under NoGrad, then records one custom backward.
+        // On this instance every primitive remains GPU-resident on CUDA, HIP, Metal, OpenCL,
+        // Vulkan, and WebGPU; disabling nested tape recording also prevents ReduceMean's
+        // tape-active compatibility fallback from downloading the correlation volume to CPU.
         return base.PartialCorrelationVolume(first, second, radius);
     }
 
@@ -28,7 +30,15 @@ public partial class DirectGpuTensorEngine
         Tensor<T> input, Tensor<T> flow, bool normalize = true)
     {
         ValidateForwardSplat(input, flow);
-        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out _))
+        var placementBackend = PlacementBackend;
+        if (typeof(T) == typeof(float) && placementBackend is not null && Compilation.GraphMode.IsActive)
+        {
+            throw new NotSupportedException(
+                $"Compiled ForwardSplat is not available on the direct GPU backend " +
+                $"'{placementBackend.BackendName}'. CPU fallback is disabled during GPU graph " +
+                "capture because it would silently transfer the training path off device.");
+        }
+        if (typeof(T) != typeof(float) || !TryGetBackend(out _))
             return base.ForwardSplat(input, flow, normalize);
 
         Tensor<T> result;
@@ -47,11 +57,20 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> ForwardSplatBackwardInput<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
         bool normalize = true)
+        => ForwardSplatBackwardInputWithWeights(
+            gradOutput, input, flow, normalize, normalizationWeights: null);
+
+    /// <inheritdoc />
+    internal override Tensor<T> ForwardSplatBackwardInputWithWeights<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
+        bool normalize, Tensor<T>? normalizationWeights)
     {
         ValidateForwardSplat(input, flow);
         ValidateSameShape(gradOutput, input, nameof(gradOutput));
+        ValidateNormalizationWeights(normalizationWeights, input);
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
-            return base.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
+            return base.ForwardSplatBackwardInputWithWeights(
+                gradOutput, input, flow, normalize, normalizationWeights);
 
         using (GradientTape<T>.NoGrad())
         {
@@ -59,7 +78,7 @@ public partial class DirectGpuTensorEngine
             Tensor<T> sampledGradient = gradOutput;
             if (normalize)
             {
-                var denominator = BuildForwardSplatDenominator(flow, grid);
+                var denominator = normalizationWeights ?? BuildForwardSplatDenominator(flow, grid);
                 sampledGradient = TensorBroadcastDivide(gradOutput, denominator);
             }
 
@@ -73,12 +92,21 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> ForwardSplatBackwardFlow<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
         bool normalize = true)
+        => ForwardSplatBackwardFlowWithWeights(
+            gradOutput, input, flow, output, normalize, normalizationWeights: null);
+
+    /// <inheritdoc />
+    internal override Tensor<T> ForwardSplatBackwardFlowWithWeights<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
+        bool normalize, Tensor<T>? normalizationWeights)
     {
         ValidateForwardSplat(input, flow);
         ValidateSameShape(gradOutput, input, nameof(gradOutput));
-        ValidateSameShape(output, input, nameof(output));
+        if (normalize) ValidateSameShape(output, input, nameof(output));
+        ValidateNormalizationWeights(normalizationWeights, input);
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
-            return base.ForwardSplatBackwardFlow(gradOutput, input, flow, output, normalize);
+            return base.ForwardSplatBackwardFlowWithWeights(
+                gradOutput, input, flow, output, normalize, normalizationWeights);
 
         using (GradientTape<T>.NoGrad())
         {
@@ -86,7 +114,7 @@ public partial class DirectGpuTensorEngine
             Tensor<T> destinationGradient = gradOutput;
             if (normalize)
             {
-                var denominator = BuildForwardSplatDenominator(flow, grid);
+                var denominator = normalizationWeights ?? BuildForwardSplatDenominator(flow, grid);
                 destinationGradient = TensorBroadcastDivide(gradOutput, denominator);
             }
 
@@ -100,7 +128,7 @@ public partial class DirectGpuTensorEngine
             if (normalize)
             {
                 // Quotient rule: subtract d grid_sample(sum_c(G_c * output_c), p_i)/dp_i.
-                var weightedOutput = TensorMultiply(destinationGradient, output);
+                var weightedOutput = TensorMultiply(destinationGradient, output!);
                 var correctionField = ReduceSum(weightedOutput, [1], keepDims: true);
                 var ones = CreateFilledTensor<T>(
                     [input.Shape[0], 1, input.Shape[2], input.Shape[3]], 1.0);
@@ -120,6 +148,20 @@ public partial class DirectGpuTensorEngine
             // returning the gradient to the tape. Keeping NHWC here silently attached the
             // wrong shape to every GPU-trained flow tensor.
             return TensorPermute(scaledGradient, [0, 3, 1, 2]).Contiguous();
+        }
+    }
+
+    /// <inheritdoc />
+    internal override Tensor<T> GetForwardSplatNormalizationWeights<T>(Tensor<T> flow)
+    {
+        ValidateForwardSplatFlow(flow);
+        if (typeof(T) != typeof(float) || !TryGetBackend(out _))
+            return base.GetForwardSplatNormalizationWeights(flow);
+
+        using (GradientTape<T>.NoGrad())
+        {
+            var grid = BuildForwardSplatGrid(flow);
+            return BuildForwardSplatDenominator(flow, grid);
         }
     }
 
@@ -192,11 +234,34 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException("ForwardSplat spatial dimensions must be positive.", nameof(input));
     }
 
-    private static void ValidateSameShape<T>(Tensor<T> actual, Tensor<T> expected, string parameterName)
+    private static void ValidateForwardSplatFlow<T>(Tensor<T> flow)
     {
-        if (actual is null) throw new ArgumentNullException(nameof(actual));
+        if (flow is null) throw new ArgumentNullException(nameof(flow));
+        if (flow.Rank != 4 || flow.Shape[1] != 2 || flow.Shape[2] <= 0 || flow.Shape[3] <= 0)
+            throw new ArgumentException("ForwardSplat flow must have shape [B,2,H,W].", nameof(flow));
+    }
+
+    private static void ValidateSameShape<T>(Tensor<T>? actual, Tensor<T> expected, string parameterName)
+    {
+        if (actual is null) throw new ArgumentNullException(parameterName);
         if (expected is null) throw new ArgumentNullException(nameof(expected));
         if (actual.Shape != expected.Shape)
             throw new ArgumentException("Tensor shape must match the input shape.", parameterName);
+    }
+
+    private static void ValidateNormalizationWeights<T>(
+        Tensor<T>? normalizationWeights, Tensor<T> input)
+    {
+        if (normalizationWeights is null) return;
+        if (normalizationWeights.Rank != 4 ||
+            normalizationWeights.Shape[0] != input.Shape[0] ||
+            normalizationWeights.Shape[1] != 1 ||
+            normalizationWeights.Shape[2] != input.Shape[2] ||
+            normalizationWeights.Shape[3] != input.Shape[3])
+        {
+            throw new ArgumentException(
+                "normalizationWeights must have shape [B,1,H,W] matching input.",
+                nameof(normalizationWeights));
+        }
     }
 }

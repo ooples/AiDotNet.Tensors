@@ -1620,16 +1620,105 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradV, engine);
     }
 
+    /// <summary>Backward for the bounded local correlation volume.</summary>
+    internal static void PartialCorrelationVolumeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        const string op = nameof(PartialCorrelationVolumeBackward);
+        RequireSavedState(op, savedState, 1);
+        int radius = SavedInt(op, savedState, 0, "radius");
+        var first = inputs[0];
+        var second = inputs[1];
+        int batch = first.Shape[0], channels = first.Shape[1];
+        int height = first.Shape[2], width = first.Shape[3];
+        int diameter = radius * 2 + 1;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T channelCount = numOps.FromDouble(channels);
+
+        Tensor<T>? gradFirst = null;
+        Tensor<T>? gradSecond = null;
+        using (GradientTape<T>.NoGrad())
+        {
+            var paddedSecond = engine.Pad(
+                second, radius, radius, radius, radius, numOps.Zero);
+            int offset = 0;
+            for (int offsetY = 0; offsetY < diameter; offsetY++)
+            for (int offsetX = 0; offsetX < diameter; offsetX++, offset++)
+            {
+                var gradPlane = engine.TensorSlice(
+                    gradOutput,
+                    [0, offset, 0, 0],
+                    [batch, 1, height, width]);
+                var expandedGradient = engine.TensorBroadcastTo(
+                    gradPlane, [batch, channels, height, width]);
+                expandedGradient = engine.TensorDivideScalar(expandedGradient, channelCount);
+
+                var shiftedSecond = engine.TensorSlice(
+                    paddedSecond,
+                    [0, 0, offsetY, offsetX],
+                    [batch, channels, height, width]);
+                var firstContribution = engine.TensorMultiply(expandedGradient, shiftedSecond);
+                gradFirst = gradFirst is null
+                    ? firstContribution
+                    : engine.TensorAdd(gradFirst, firstContribution);
+
+                var unshiftedContribution = engine.TensorMultiply(expandedGradient, first);
+                int displacementY = offsetY - radius;
+                int displacementX = offsetX - radius;
+                int padTop = Math.Max(displacementY, 0);
+                int padBottom = Math.Max(-displacementY, 0);
+                int padLeft = Math.Max(displacementX, 0);
+                int padRight = Math.Max(-displacementX, 0);
+                var paddedContribution = engine.Pad(
+                    unshiftedContribution,
+                    padTop, padBottom, padLeft, padRight, numOps.Zero);
+                var secondContribution = engine.TensorSlice(
+                    paddedContribution,
+                    [0, 0, Math.Max(-displacementY, 0), Math.Max(-displacementX, 0)],
+                    [batch, channels, height, width]);
+                gradSecond = gradSecond is null
+                    ? secondContribution
+                    : engine.TensorAdd(gradSecond, secondContribution);
+            }
+        }
+
+        if (gradFirst is not null)
+            DifferentiableOps.AccumulateGrad(grads, first, gradFirst, engine);
+        if (gradSecond is not null)
+            DifferentiableOps.AccumulateGrad(grads, second, gradSecond, engine);
+    }
+
     /// <summary>Average forward-splat backward for source values and pixel flow.</summary>
     internal static void ForwardSplatBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        bool normalize = (bool)savedState[0];
-        var gradInput = engine.ForwardSplatBackwardInput(
-            gradOutput, inputs[0], inputs[1], normalize);
-        var gradFlow = engine.ForwardSplatBackwardFlow(
-            gradOutput, inputs[0], inputs[1], output, normalize);
+        const string op = nameof(ForwardSplatBackward);
+        RequireSavedState(op, savedState, 1);
+        bool normalize = SavedBool(op, savedState, 0, "normalize");
+
+        Tensor<T> gradInput;
+        Tensor<T> gradFlow;
+        if (engine is IForwardSplatBackwardEngine optimized)
+        {
+            // The normalization field depends only on flow and is identical for both adjoints.
+            // Compute it once instead of launching the full splat-weight pass twice.
+            Tensor<T>? normalizationWeights = normalize
+                ? optimized.GetForwardSplatNormalizationWeights(inputs[1])
+                : null;
+            gradInput = optimized.ForwardSplatBackwardInputWithWeights(
+                gradOutput, inputs[0], inputs[1], normalize, normalizationWeights);
+            gradFlow = optimized.ForwardSplatBackwardFlowWithWeights(
+                gradOutput, inputs[0], inputs[1], output, normalize, normalizationWeights);
+        }
+        else
+        {
+            gradInput = engine.ForwardSplatBackwardInput(
+                gradOutput, inputs[0], inputs[1], normalize);
+            gradFlow = engine.ForwardSplatBackwardFlow(
+                gradOutput, inputs[0], inputs[1], output, normalize);
+        }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradFlow, engine);
     }

@@ -511,6 +511,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--video-warp")
+        {
+            BenchmarkRunner.Run<VideoWarpBenchmarks>(BenchConfig);
+            return;
+        }
+
         // #209 close-parity: A/B test the Conv3x3Stride1 variants
         // (per-channel, 2-oc-blocked, 4-oc-blocked) on shared shapes
         // in the same process. Faster turnaround than full BDN.
@@ -1527,6 +1533,7 @@ class Program
         Console.WriteLine("A/B microkernel + dispatch benchmarks:");
         Console.WriteLine("  --ab-parallel          : head-to-head of CPU parallel-dispatch primitives (Parallel.For vs LightweightParallel)");
         Console.WriteLine("  --ab-parallel-cpu      : idle-CPU / warm-window simulation for LightweightParallel (AIDOTNET_PPE_WARMWINDOW_US)");
+        Console.WriteLine("  --video-warp           : forward-splat flat-storage/batch-parallel benchmark vs former indexer path");
         Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
         Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
         Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");

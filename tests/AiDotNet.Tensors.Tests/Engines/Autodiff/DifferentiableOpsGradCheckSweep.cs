@@ -215,7 +215,9 @@ public class DifferentiableOpsGradCheckSweep
         [
             SafeTensor([1, 2, 3, 3], r),
             SafeTensor([1, 2, 3, 3], r),
-            true
+            // Exercise the unnormalized branch here; VideoWarpOperationsTests performs
+            // full input-and-flow finite differences for both false and true.
+            false
         ],
         ["AffineGrid"] = r => [SafeTensor([1, 2, 3], r), 3, 3],
         ["AffineGrid3D"] = r => [SafeTensor([1, 3, 4], r), 2, 2, 2, false],

@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -128,6 +129,42 @@ public class GeometryGpuParityTests : IDisposable
         AssertClose(g, c);
     }
 
+    [SkippableFact]
+    public void PartialCorrelationVolume_GpuForwardAndBackwardMatchCpu()
+    {
+        SkipIfUnavailable();
+        var gpuFirst = Rand4D(14, 1, 2, 4, 5);
+        var gpuSecond = Rand4D(15, 1, 2, 4, 5);
+        var cpuFirst = new Tensor<float>(gpuFirst.GetDataArray(), gpuFirst.Shape.ToArray());
+        var cpuSecond = new Tensor<float>(gpuSecond.GetDataArray(), gpuSecond.Shape.ToArray());
+        Tensor<float> gpuOutput;
+        Dictionary<Tensor<float>, Tensor<float>> gpuGradients;
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+        {
+            gpuOutput = _gpu!.PartialCorrelationVolume(gpuFirst, gpuSecond, radius: 1);
+            var loss = _gpu.ReduceSum(gpuOutput, null);
+            gpuGradients = tape.ComputeGradients(loss, [gpuFirst, gpuSecond]);
+        }
+        Assert.True(gpuOutput.IsGpuResident, "Correlation output must remain GPU-resident.");
+        Assert.True(gpuGradients[gpuFirst].IsGpuResident,
+            "First correlation gradient must remain GPU-resident.");
+        Assert.True(gpuGradients[gpuSecond].IsGpuResident,
+            "Second correlation gradient must remain GPU-resident.");
+
+        Tensor<float> cpuOutput;
+        Dictionary<Tensor<float>, Tensor<float>> cpuGradients;
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+        {
+            cpuOutput = _cpu.PartialCorrelationVolume(cpuFirst, cpuSecond, radius: 1);
+            var loss = _cpu.ReduceSum(cpuOutput, null);
+            cpuGradients = tape.ComputeGradients(loss, [cpuFirst, cpuSecond]);
+        }
+
+        AssertClose(gpuOutput, cpuOutput, 2e-3f);
+        AssertClose(gpuGradients[gpuFirst], cpuGradients[cpuFirst], 3e-3f);
+        AssertClose(gpuGradients[gpuSecond], cpuGradients[cpuSecond], 3e-3f);
+    }
+
     [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
@@ -141,6 +178,22 @@ public class GeometryGpuParityTests : IDisposable
         var cpu = _cpu.ForwardSplat(input, flow, normalize);
 
         AssertClose(gpu, cpu, 2e-3f);
+    }
+
+    [SkippableFact]
+    public void ForwardSplat_GpuGraphModeRejectsCpuFallback()
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(16, 1, 2, 4, 5);
+        var flow = Rand4D(17, 1, 2, 4, 5, range: 0.35f);
+        using var cache = new CompiledModelCache<float>();
+        Func<Tensor<float>> forward = () => _gpu!.ForwardSplat(input, flow);
+
+        var error = Assert.Throws<NotSupportedException>(() =>
+            cache.GetOrCompileInference([input, flow], forward));
+
+        Assert.Contains("ForwardSplat", error.Message, StringComparison.Ordinal);
+        Assert.Contains("graph capture", error.Message, StringComparison.Ordinal);
     }
 
     [SkippableTheory]
@@ -177,5 +230,31 @@ public class GeometryGpuParityTests : IDisposable
             gradOutput, input, flow, cpuOutput, normalize);
 
         AssertClose(gpu, cpu, 3e-3f);
+    }
+
+    [SkippableFact]
+    public void ForwardSplatBackwardFlow_GpuValidationNamesArgumentsByMode()
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(18, 1, 2, 4, 5);
+        var flow = Rand4D(19, 1, 2, 4, 5, range: 0.35f);
+        var gradOutput = Rand4D(20, 1, 2, 4, 5);
+        var wrongShape = Rand4D(21, 1, 2, 2, 2);
+
+        var gradError = Assert.Throws<ArgumentException>(() =>
+            _gpu!.ForwardSplatBackwardFlow(wrongShape, input, flow, input));
+        Assert.Equal("gradOutput", gradError.ParamName);
+
+        var outputError = Assert.Throws<ArgumentException>(() =>
+            _gpu!.ForwardSplatBackwardFlow(gradOutput, input, flow, wrongShape));
+        Assert.Equal("output", outputError.ParamName);
+
+        var nullOutputError = Assert.Throws<ArgumentNullException>(() =>
+            _gpu!.ForwardSplatBackwardFlow(gradOutput, input, flow, null!));
+        Assert.Equal("output", nullOutputError.ParamName);
+
+        var unnormalized = _gpu!.ForwardSplatBackwardFlow(
+            gradOutput, input, flow, null!, normalize: false);
+        Assert.Equal(flow.Shape.ToArray(), unnormalized.Shape.ToArray());
     }
 }
