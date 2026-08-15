@@ -151,9 +151,34 @@ internal sealed class LazyGraphCompiler
                 }
             }
 
-            // Kahn's algorithm with priority: prefer nodes that feed into
-            // operations that are closest to being ready (lowest remaining in-degree)
-            var ready = new List<ILazyNode>();
+            // Kahn's algorithm with a stable priority queue. The old implementation scanned the
+            // entire ready list for every emitted node. Wide autodiff graphs can have tens of
+            // thousands of simultaneously-ready parameter/gradient producers, turning compilation
+            // into O(V^2) work (SegMamba spent 7.9 of 9.3 seconds in this pass alone).
+            //
+            // The first consumer's original topological position is a stable locality score: among
+            // ready producers, emit the one needed by the earliest downstream operation. This keeps
+            // producers close to consumers without a mutable priority or a full ready-list rescan.
+            var originalOrder = new Dictionary<ILazyNode, int>(nodes.Count);
+            for (int i = 0; i < nodes.Count; i++)
+                originalOrder[nodes[i]] = i;
+
+            int GetLocalityScore(ILazyNode node)
+            {
+                var nodeDependents = dependents[node];
+                return nodeDependents.Count == 0
+                    ? int.MaxValue
+                    : originalOrder[nodeDependents[0]];
+            }
+
+            var ready = new SortedSet<ILazyNode>(Comparer<ILazyNode>.Create((left, right) =>
+            {
+                if (ReferenceEquals(left, right)) return 0;
+                int score = GetLocalityScore(left).CompareTo(GetLocalityScore(right));
+                return score != 0
+                    ? score
+                    : originalOrder[left].CompareTo(originalOrder[right]);
+            }));
             foreach (var node in nodes)
             {
                 if (inDegree[node] == 0)
@@ -163,24 +188,8 @@ internal sealed class LazyGraphCompiler
             var result = new List<ILazyNode>(nodes.Count);
             while (ready.Count > 0)
             {
-                // Pick the ready node whose first dependent has the lowest remaining in-degree
-                // (heuristic: schedule producers right before their consumer becomes ready)
-                int bestIdx = 0;
-                int bestScore = int.MaxValue;
-                for (int i = 0; i < ready.Count; i++)
-                {
-                    var deps = dependents[ready[i]];
-                    int score = deps.Count > 0 ? inDegree[deps[0]] : int.MaxValue;
-                    if (score < bestScore)
-                    {
-                        bestScore = score;
-                        bestIdx = i;
-                    }
-                }
-
-                var chosen = ready[bestIdx];
-                ready[bestIdx] = ready[ready.Count - 1];
-                ready.RemoveAt(ready.Count - 1);
+                var chosen = ready.Min!;
+                ready.Remove(chosen);
                 result.Add(chosen);
 
                 foreach (var dep in dependents[chosen])

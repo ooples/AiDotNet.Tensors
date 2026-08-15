@@ -549,6 +549,18 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
+        bool needsWeightGradient = DifferentiableOps.IsGradientRequired(inputs[1]);
+        if (!needsInputGradient && !needsWeightGradient) return;
+
+        // Requested-source training commonly crosses a frozen linear projection to reach an
+        // earlier activation. The historical kernels still formed BOTH full GEMMs and merely let
+        // AccumulateGrad discard the frozen weight result. At foundation scale that materialized
+        // tens of GiB of gradients which could never be returned. Run only the requested GEMM.
+        if (needsInputGradient != needsWeightGradient
+            && TrySelectiveLinearBackward(gradOutput, inputs, engine, grads))
+            return;
+
         // Float32 + 2D fast paths (SimdGemm and BLAS): compute transposed GEMMs
         // into pooled buffers, then accumulate. Both bypass engine recording
         // (the kernels write directly to managed arrays without going through
@@ -2490,7 +2502,6 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
         int dim = (int)savedState[0];
         int start = (int)savedState[1];
         int length = (int)savedState[2];
@@ -2502,17 +2513,19 @@ internal static class BackwardFunctions<T>
         for (int i = 0; i < dim; i++) outerSize *= inShape[i];
         for (int i = dim + 1; i < inShape.Length; i++) innerSize *= inShape[i];
 
+        // A narrow slice is contiguous within each outer-axis slab. Copy one complete slab instead
+        // of indexing every scalar through three managed loops. SegMamba creates thousands of these
+        // nodes; the scalar version dominated its backward pass despite moving contiguous data.
+        int copyLength = checked(length * innerSize);
+        var source = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        ReadOnlySpan<T> sourceSpan = source.AsSpan();
+        Span<T> destinationSpan = inputGrad.AsWritableSpan();
         for (int outer = 0; outer < outerSize; outer++)
-        for (int d = 0; d < length; d++)
-        for (int inner = 0; inner < innerSize; inner++)
         {
-            int srcFlat = (outer * dimSize + (start + d)) * innerSize + inner;
-            int gradFlat = (outer * length + d) * innerSize + inner;
-            if (srcFlat < 0 || srcFlat >= inputGrad.Length)
-                throw new InvalidOperationException($"NarrowBackward: source index {srcFlat} out of range [0, {inputGrad.Length}).");
-            if (gradFlat < 0 || gradFlat >= gradOutput.Length)
-                throw new InvalidOperationException($"NarrowBackward: gradient index {gradFlat} out of range [0, {gradOutput.Length}).");
-            inputGrad[srcFlat] = gradOutput[gradFlat];
+            int destinationOffset = checked((outer * dimSize + start) * innerSize);
+            int sourceOffset = checked(outer * copyLength);
+            sourceSpan.Slice(sourceOffset, copyLength)
+                .CopyTo(destinationSpan.Slice(destinationOffset, copyLength));
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
@@ -5835,6 +5848,18 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
+        bool needsWeightGradient = DifferentiableOps.IsGradientRequired(inputs[1]);
+        bool needsBiasGradient = inputs.Length > 2 && DifferentiableOps.IsGradientRequired(inputs[2]);
+        if (!needsInputGradient && !needsWeightGradient && !needsBiasGradient) return;
+
+        int requiredGradientCount = (needsInputGradient ? 1 : 0)
+            + (needsWeightGradient ? 1 : 0)
+            + (needsBiasGradient ? 1 : 0);
+        if (requiredGradientCount < inputs.Length
+            && TrySelectiveLinearBackward(gradOutput, inputs, engine, grads))
+            return;
+
         // Float32 + 2D fast paths: transposed GEMMs + inline bias sum, no transpose allocation.
         // Same parallel-SimdGemm preference as MatMulBackward to avoid getting
         // single-thread-trapped on installs whose BLAS provider lacks internal
@@ -6085,6 +6110,126 @@ internal static class BackwardFunctions<T>
             var biasGrad = SumToShape(gradOutput, inputs[2]._shape, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
         }
+    }
+
+    /// <summary>
+    /// Computes only requested gradients for the common contiguous ND-by-2D linear projection.
+    /// </summary>
+    private static bool TrySelectiveLinearBackward(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (engine.SupportsGpu || inputs.Length < 2 || inputs[0].Rank < 2 || inputs[1].Rank != 2
+            || !inputs[0].IsContiguous || !inputs[1].IsContiguous || !gradOutput.IsContiguous)
+            return false;
+
+        int rows = 1;
+        for (int d = 0; d < inputs[0].Rank - 1; d++) rows = checked(rows * inputs[0]._shape[d]);
+        int inputFeatures = inputs[0]._shape[inputs[0].Rank - 1];
+        int outputFeatures = inputs[1]._shape[1];
+        if (inputs[1]._shape[0] != inputFeatures
+            || gradOutput.Length != checked(rows * outputFeatures))
+            return false;
+
+        bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
+        bool needsWeightGradient = DifferentiableOps.IsGradientRequired(inputs[1]);
+        bool needsBiasGradient = inputs.Length > 2 && DifferentiableOps.IsGradientRequired(inputs[2]);
+
+        if (typeof(T) == typeof(float))
+        {
+            var grad = (float[])(object)gradOutput.GetDataArray();
+            var input = (float[])(object)inputs[0].GetDataArray();
+            var weight = (float[])(object)inputs[1].GetDataArray();
+            var options = new Engines.BlasManaged.BlasOptions<float>
+            {
+                PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune
+            };
+
+            if (needsInputGradient)
+            {
+                var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                var data = (float[])(object)result.GetDataArray();
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    grad, outputFeatures, false, weight, outputFeatures, true,
+                    data.AsSpan(0, rows * inputFeatures), inputFeatures,
+                    rows, inputFeatures, outputFeatures, options);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], result, engine);
+            }
+            if (needsWeightGradient)
+            {
+                var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                var data = (float[])(object)result.GetDataArray();
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    input, inputFeatures, true, grad, outputFeatures, false,
+                    data.AsSpan(0, inputFeatures * outputFeatures), outputFeatures,
+                    inputFeatures, outputFeatures, rows, options);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], result, engine);
+            }
+            if (needsBiasGradient)
+            {
+                var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+                var data = (float[])(object)result.GetDataArray();
+                Array.Clear(data, 0, result.Length);
+                for (int row = 0; row < rows; row++)
+                {
+                    int offset = row * outputFeatures;
+                    for (int column = 0; column < outputFeatures; column++)
+                        data[column] += grad[offset + column];
+                }
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], result, engine);
+            }
+            return true;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            var grad = (double[])(object)gradOutput.GetDataArray();
+            var input = (double[])(object)inputs[0].GetDataArray();
+            var weight = (double[])(object)inputs[1].GetDataArray();
+            var options = new Engines.BlasManaged.BlasOptions<double>
+            {
+                PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune
+            };
+
+            if (needsInputGradient)
+            {
+                var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                var data = (double[])(object)result.GetDataArray();
+                Engines.BlasManaged.BlasManaged.Gemm<double>(
+                    grad, outputFeatures, false, weight, outputFeatures, true,
+                    data.AsSpan(0, rows * inputFeatures), inputFeatures,
+                    rows, inputFeatures, outputFeatures, options);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], result, engine);
+            }
+            if (needsWeightGradient)
+            {
+                var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                var data = (double[])(object)result.GetDataArray();
+                Engines.BlasManaged.BlasManaged.Gemm<double>(
+                    input, inputFeatures, true, grad, outputFeatures, false,
+                    data.AsSpan(0, inputFeatures * outputFeatures), outputFeatures,
+                    inputFeatures, outputFeatures, rows, options);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], result, engine);
+            }
+            if (needsBiasGradient)
+            {
+                var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+                var data = (double[])(object)result.GetDataArray();
+                Array.Clear(data, 0, result.Length);
+                for (int row = 0; row < rows; row++)
+                {
+                    int offset = row * outputFeatures;
+                    for (int column = 0; column < outputFeatures; column++)
+                        data[column] += grad[offset + column];
+                }
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], result, engine);
+            }
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
