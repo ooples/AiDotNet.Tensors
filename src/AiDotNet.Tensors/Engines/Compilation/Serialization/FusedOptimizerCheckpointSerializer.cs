@@ -22,6 +22,11 @@ internal static class FusedOptimizerCheckpointSerializer
         WriteExtras(writer, checkpoint.Extras);
         WriteLrSchedules(writer, checkpoint.Schedules);
         WriteIntArray(writer, checkpoint.ParamToGroup);
+        // Per-group optimizer types and weight decays. Null (uniform) is encoded as a -1 length so it stays
+        // distinguishable from an empty array, and so a restore cannot silently rebuild a heterogeneous plan
+        // as a uniform one — every group quietly switched to the fallback optimizer, mid-run, with no error.
+        WriteOptimizerTypeArray(writer, checkpoint.GroupOptimizerTypes);
+        WriteFloatArray(writer, checkpoint.GroupWeightDecays);
         WriteScalars(writer, checkpoint.Scalars);
 
         writer.Write(checkpoint.Parameters.Length);
@@ -48,6 +53,8 @@ internal static class FusedOptimizerCheckpointSerializer
             Extras = ReadExtras(reader),
             Schedules = ReadLrSchedules(reader),
             ParamToGroup = ReadIntArray(reader),
+            GroupOptimizerTypes = ReadOptimizerTypeArray(reader),
+            GroupWeightDecays = ReadFloatArray(reader),
             Scalars = ReadScalars(reader),
         };
 
@@ -243,6 +250,22 @@ internal static class FusedOptimizerCheckpointSerializer
         if (length < 0) return null;
         var values = new int[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadInt32();
+        return values;
+    }
+
+    private static void WriteOptimizerTypeArray(BinaryWriter writer, OptimizerType[]? values)
+    {
+        if (values is null) { writer.Write(-1); return; }
+        writer.Write(values.Length);
+        for (int i = 0; i < values.Length; i++) writer.Write((int)values[i]);
+    }
+
+    private static OptimizerType[]? ReadOptimizerTypeArray(BinaryReader reader)
+    {
+        int length = ReadArrayLength(reader, "OptimizerType[]", sizeof(int));
+        if (length < 0) return null;
+        var values = new OptimizerType[length];
+        for (int i = 0; i < length; i++) values[i] = (OptimizerType)reader.ReadInt32();
         return values;
     }
 
