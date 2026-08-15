@@ -2536,6 +2536,18 @@ public sealed class FusedOptimizerExtras
     public float SfBeta { get; init; } = 0.9f;
 
     /// <summary>
+    /// L-BFGS history size m: how many (s, y) curvature pairs are retained. Default 10.
+    /// </summary>
+    /// <remarks>
+    /// This is the memory/quality knob and the reason L-BFGS exists at all — full BFGS stores a dense n-by-n
+    /// inverse Hessian, which is impossible at network scale, while L-BFGS reconstructs its action from the
+    /// last m curvature pairs. Cost is 2*m float vectors the size of the whole parameter set, so m = 10 on a
+    /// 10M-parameter model is 800 MB of optimizer state. Nocedal and Wright recommend m in [3, 20]; larger
+    /// values buy diminishing curvature accuracy for strictly linear memory growth.
+    /// </remarks>
+    public int LbfgsMemorySize { get; init; } = 10;
+
+    /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or
     /// divergent fused-optimizer math, throwing <see cref="ArgumentOutOfRangeException"/>
     /// at configuration time rather than silently corrupting a training run.

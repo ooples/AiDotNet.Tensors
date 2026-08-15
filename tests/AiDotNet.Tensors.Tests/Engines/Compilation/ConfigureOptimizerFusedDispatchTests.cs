@@ -48,6 +48,8 @@ public class ConfigureOptimizerFusedDispatchTests
         OptimizerType.FTRL,
         OptimizerType.ASGD,
         OptimizerType.Rprop,
+        // Wired via the global-reduction path (two-loop recursion), not a per-element kernel.
+        OptimizerType.LBFGS,
     };
 
     public static TheoryData<OptimizerType> GpuPlanSupportedOptimizers => new()
@@ -176,7 +178,6 @@ public class ConfigureOptimizerFusedDispatchTests
     /// </summary>
     [Theory]
     [InlineData(OptimizerType.SparseAdam)]
-    [InlineData(OptimizerType.LBFGS)]
     public void ConfigureOptimizer_UnwiredOptimizer_Throws(OptimizerType opt)
     {
         var engine = new CpuEngine();

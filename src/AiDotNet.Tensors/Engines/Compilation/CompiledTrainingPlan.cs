@@ -768,6 +768,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public FusedOptimizerRuntimeScalars Scalars = new FusedOptimizerRuntimeScalars();
         public float[][]? MFloat;
         public float[][]? VFloat;
+
+        // ── L-BFGS curvature history ──────────────────────────────────────────────────────────────
+        // Stored FLAT (one array of length sum(lengths)) rather than per-parameter, because every
+        // consumer is a whole-vector operation: the two-loop recursion is 2m global dot products and
+        // 2m axpys over the concatenated parameter vector. Keeping it flat makes each of those a single
+        // contiguous pass instead of a nested walk over ragged per-parameter buffers.
+        public float[][]? LbfgsS;          // LbfgsS[slot] — s_k = x_{k+1} - x_k
+        public float[][]? LbfgsY;          // LbfgsY[slot] — y_k = g_{k+1} - g_k
+        public float[]? LbfgsRho;          // 1 / (y_k . s_k), one per slot
+        public float[]? LbfgsPrevParam;    // x_k, to form the next s
+        public float[]? LbfgsPrevGrad;     // g_k, to form the next y
+        public float[]? LbfgsQ;            // recursion scratch (q, then r)
+        public float[]? LbfgsAlpha;        // alpha_i carried from the backward loop into the forward one
+        public int LbfgsCount;             // pairs currently stored (grows to m, then stays)
+        public int LbfgsHead;              // ring cursor: slot the NEXT pair is written to
+        public bool LbfgsHasPrev;          // false until the first step has recorded x_k, g_k
+        // gamma = (s.y)/(y.y) from the NEWEST accepted pair, scaling the initial inverse-Hessian estimate.
+        // Cached from the pair that produced it rather than recomputed, since both dots are already
+        // available at the moment the pair is accepted.
+        public float LbfgsGammaNum;
+        public float LbfgsGammaDen;
         public float[][]? VMaxFloat;
         public double[][]? MDouble;
         public double[][]? VDouble;
@@ -1806,11 +1827,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // parameters — a per-group schedule is meaningless for them, so they are only
         // supported through the ungrouped ConfigureOptimizer.
         if (optimizerType is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
-            or OptimizerType.ScheduleFreeSGD)
+            or OptimizerType.ScheduleFreeSGD or OptimizerType.LBFGS)
             throw new NotSupportedException(
                 $"{optimizerType} maintains a single global learning-rate/distance/weight-sum scalar " +
-                "(or a per-step parameter transform) and is not supported with per-group schedules; " +
-                "use the ungrouped ConfigureOptimizer.");
+                "(or a per-step parameter transform, or a curvature history spanning every parameter) " +
+                "and is not supported with per-group schedules; use the ungrouped ConfigureOptimizer.");
         var ex = extras ?? new FusedOptimizerExtras();
         ex.Validate();
         if (typeof(T) == typeof(float))
@@ -1885,6 +1906,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.ASGD
             or OptimizerType.Rprop
             or OptimizerType.ProximalL1
+            or OptimizerType.LBFGS
             or OptimizerType.HypergradientSGD
             or OptimizerType.DAdaptationSGD
             or OptimizerType.ScheduleFreeSGD;
@@ -2279,6 +2301,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             DAdaptationEstimate = extras.D0,
         };
         float exHyperLr = extras.HyperLr;
+        int exLbfgsMemory = Math.Max(1, extras.LbfgsMemorySize);
+        // L-BFGS operates on the flat concatenation of every parameter; size that once here. The buffers
+        // themselves are attached to the runtime state further down, once it exists.
+        int lbfgsTotal = 0;
+        if (optimizerType == OptimizerType.LBFGS)
+            for (int p = 0; p < paramCount; p++) lbfgsTotal += lengths[p];
         float exGrowth = extras.DGrowthRate;
 
         // Schedule-Free SGD (#499): z (SGD trajectory) and x (eval/average)
@@ -2346,6 +2374,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             GpuMomentStorage = gpuMomentStorage,
         };
 
+        // Attach the L-BFGS curvature history now the state object exists. Kept on the state (rather than as
+        // captured locals) so the counters are reachable for checkpointing and so a reconfigure resets them.
+        var lbfgsState = _optimizerRuntimeState;
+        if (optimizerType == OptimizerType.LBFGS)
+        {
+            lbfgsState.LbfgsS = new float[exLbfgsMemory][];
+            lbfgsState.LbfgsY = new float[exLbfgsMemory][];
+            for (int k = 0; k < exLbfgsMemory; k++)
+            {
+                lbfgsState.LbfgsS[k] = new float[lbfgsTotal];
+                lbfgsState.LbfgsY[k] = new float[lbfgsTotal];
+            }
+            lbfgsState.LbfgsRho = new float[exLbfgsMemory];
+            lbfgsState.LbfgsAlpha = new float[exLbfgsMemory];
+            lbfgsState.LbfgsPrevParam = new float[lbfgsTotal];
+            lbfgsState.LbfgsPrevGrad = new float[lbfgsTotal];
+            lbfgsState.LbfgsQ = new float[lbfgsTotal];
+            lbfgsState.LbfgsCount = 0;
+            lbfgsState.LbfgsHead = 0;
+            lbfgsState.LbfgsHasPrev = false;
+        }
+
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -2365,6 +2415,136 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
             float lr = (float)lrSchedule.GetLr(_optimizerStep);
+            if (optType == OptimizerType.LBFGS)
+            {
+                // L-BFGS two-loop recursion (Nocedal 1980; Nocedal & Wright, Numerical Optimization,
+                // Algorithm 7.4). This is NOT expressible as a per-element kernel: every one of the 2m+2
+                // inner products couples all parameters, so the step runs as an alternating sequence of
+                // global reductions and whole-vector axpys — the same two-phase shape HypergradientSGD and
+                // DAdaptationSGD already use here, just repeated 2m times instead of once.
+                //
+                // Working entirely on the flat concatenation of all parameters keeps each of those a single
+                // contiguous pass. Gather in, recurse, scatter out.
+                var st = lbfgsState;
+                float[] q = st.LbfgsQ!, prevX = st.LbfgsPrevParam!, prevG = st.LbfgsPrevGrad!;
+                float[][] S = st.LbfgsS!, Y = st.LbfgsY!;
+                float[] rho = st.LbfgsRho!, alpha = st.LbfgsAlpha!;
+                int mem = S.Length;
+
+                // Gather the flat gradient into q, and the flat parameters into the scratch we will need
+                // for the curvature pair.
+                int off = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    int len2 = lengths[p];
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) { off += len2; continue; }
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
+                        for (int i = 0; i < len2; i++) q[off + i] = pGrad[i];
+                    off += len2;
+                }
+
+                // Record the curvature pair (s, y) from the PREVIOUS step, now that we have x_k and g_k.
+                // s_{k-1} = x_k - x_{k-1}, y_{k-1} = g_k - g_{k-1}.
+                if (st.LbfgsHasPrev)
+                {
+                    int o2 = 0;
+                    double sy = 0, yy = 0;
+                    var sSlot = S[st.LbfgsHead];
+                    var ySlot = Y[st.LbfgsHead];
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        int len2 = lengths[p];
+                        if (paramArrays[p].Length == 0) { o2 += len2; continue; }
+                        fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
+                            for (int i = 0; i < len2; i++)
+                            {
+                                float sv = pParam[i] - prevX[o2 + i];
+                                float yv = q[o2 + i] - prevG[o2 + i];
+                                sSlot[o2 + i] = sv;
+                                ySlot[o2 + i] = yv;
+                                sy += (double)sv * yv;
+                                yy += (double)yv * yv;
+                            }
+                        o2 += len2;
+                    }
+
+                    // Curvature condition. Accepting a pair with s.y <= 0 would make the implicit inverse
+                    // Hessian indefinite and the resulting direction can point uphill — the standard guard,
+                    // and the reason L-BFGS stays stable on non-convex objectives.
+                    if (sy > 1e-10)
+                    {
+                        rho[st.LbfgsHead] = (float)(1.0 / sy);
+                        st.LbfgsHead = (st.LbfgsHead + 1) % mem;
+                        if (st.LbfgsCount < mem) st.LbfgsCount++;
+                        st.LbfgsGammaNum = (float)sy;
+                        st.LbfgsGammaDen = (float)yy;
+                    }
+                }
+
+                // Save x_k, g_k for the next step's pair before the update overwrites x.
+                {
+                    int o3 = 0;
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        int len2 = lengths[p];
+                        if (paramArrays[p].Length == 0) { o3 += len2; continue; }
+                        fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
+                            for (int i = 0; i < len2; i++) prevX[o3 + i] = pParam[i];
+                        o3 += len2;
+                    }
+                    Array.Copy(q, prevG, lbfgsTotal);
+                    st.LbfgsHasPrev = true;
+                }
+
+                // Backward loop: newest pair first. alpha_i = rho_i * (s_i . q); q -= alpha_i * y_i.
+                int count = st.LbfgsCount;
+                for (int j = 0; j < count; j++)
+                {
+                    int slot = ((st.LbfgsHead - 1 - j) % mem + mem) % mem;
+                    var sS = S[slot];
+                    var yS = Y[slot];
+                    double dot = 0;
+                    for (int i = 0; i < lbfgsTotal; i++) dot += (double)sS[i] * q[i];
+                    float a = rho[slot] * (float)dot;
+                    alpha[slot] = a;
+                    for (int i = 0; i < lbfgsTotal; i++) q[i] -= a * yS[i];
+                }
+
+                // Initial inverse-Hessian scaling gamma = (s.y)/(y.y) from the newest pair. Without it the
+                // first iterations take a raw gradient-sized step and L-BFGS loses most of its advantage.
+                float gamma = (count > 0 && st.LbfgsGammaDen > 0f) ? st.LbfgsGammaNum / st.LbfgsGammaDen : 1f;
+                for (int i = 0; i < lbfgsTotal; i++) q[i] *= gamma;
+
+                // Forward loop: oldest pair first. beta = rho_i * (y_i . r); r += s_i * (alpha_i - beta).
+                for (int j = count - 1; j >= 0; j--)
+                {
+                    int slot = ((st.LbfgsHead - 1 - j) % mem + mem) % mem;
+                    var sS = S[slot];
+                    var yS = Y[slot];
+                    double dot = 0;
+                    for (int i = 0; i < lbfgsTotal; i++) dot += (double)yS[i] * q[i];
+                    float b = rho[slot] * (float)dot;
+                    float diff = alpha[slot] - b;
+                    for (int i = 0; i < lbfgsTotal; i++) q[i] += diff * sS[i];
+                }
+
+                // q now holds H*g, the quasi-Newton direction (before negation). No line search here: the
+                // tape yields one gradient per step and re-evaluating the loss at trial points would mean
+                // extra forward passes the caller did not ask for, so the schedule's lr is the step length.
+                // gamma already scales the direction sensibly, which is why lr = 1 is a reasonable default.
+                int o4 = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    int len2 = lengths[p];
+                    if (paramArrays[p].Length == 0) { o4 += len2; continue; }
+                    fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
+                        for (int i = 0; i < len2; i++) pParam[i] -= lr * q[o4 + i];
+                    o4 += len2;
+                    MarkHostWeightMutated(p);
+                }
+                return;
+            }
+
 
             if (optType == OptimizerType.HypergradientSGD)
             {
