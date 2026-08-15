@@ -2548,6 +2548,18 @@ public sealed class FusedOptimizerExtras
     public int LbfgsMemorySize { get; init; } = 10;
 
     /// <summary>
+    /// Trust-region radius used by the Cauchy-point step. Default 1.
+    /// </summary>
+    /// <remarks>
+    /// Held FIXED across fused steps. Classical trust region rescales the radius from the ratio of actual to
+    /// predicted reduction, which needs the loss at the trial point; the fused step has one gradient and no
+    /// loss evaluation, so the radius is whatever the caller set. Callers that adapt it do so between
+    /// configurations, which is also where AiDotNet's TrustRegionOptimizer updates it (per epoch, in
+    /// UpdateAdaptiveParameters, not per step).
+    /// </remarks>
+    public float TrustRegionRadius { get; init; } = 1f;
+
+    /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or
     /// divergent fused-optimizer math, throwing <see cref="ArgumentOutOfRangeException"/>
     /// at configuration time rather than silently corrupting a training run.
@@ -2628,5 +2640,15 @@ public enum OptimizerType
     /// is the entire reason to choose the method. A subgradient step cannot do that — it oscillates around
     /// zero at a scale set by the learning rate.
     /// </remarks>
-    ProximalL1 = 22
+    ProximalL1 = 22,
+
+    /// <summary>Trust-region Cauchy-point step with B = I:
+    /// <c>alpha = min(radius/||g||, lr); param -= alpha*g</c>.
+    /// Radius travels in <see cref="FusedOptimizerExtras.TrustRegionRadius"/>.</summary>
+    /// <remarks>
+    /// A global reduction (||g|| couples every parameter) followed by an elementwise step — the same
+    /// two-phase shape HypergradientSGD uses. The radius is fixed per configuration: adapting it requires
+    /// the loss at the trial point, which a fused step has no way to obtain.
+    /// </remarks>
+    TrustRegion = 23
 }

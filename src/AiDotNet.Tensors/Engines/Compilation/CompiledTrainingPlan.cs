@@ -1827,7 +1827,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // parameters — a per-group schedule is meaningless for them, so they are only
         // supported through the ungrouped ConfigureOptimizer.
         if (optimizerType is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
-            or OptimizerType.ScheduleFreeSGD or OptimizerType.LBFGS)
+            or OptimizerType.ScheduleFreeSGD or OptimizerType.LBFGS or OptimizerType.TrustRegion)
             throw new NotSupportedException(
                 $"{optimizerType} maintains a single global learning-rate/distance/weight-sum scalar " +
                 "(or a per-step parameter transform, or a curvature history spanning every parameter) " +
@@ -1907,6 +1907,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.Rprop
             or OptimizerType.ProximalL1
             or OptimizerType.LBFGS
+            or OptimizerType.TrustRegion
             or OptimizerType.HypergradientSGD
             or OptimizerType.DAdaptationSGD
             or OptimizerType.ScheduleFreeSGD;
@@ -2300,6 +2301,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             DAdaptationEstimate = extras.D0,
         };
+        float exTrustRadius = extras.TrustRegionRadius;
         float exHyperLr = extras.HyperLr;
         int exLbfgsMemory = Math.Max(1, extras.LbfgsMemorySize);
         // L-BFGS operates on the flat concatenation of every parameter; size that once here. The buffers
@@ -2544,6 +2546,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 return;
             }
+            if (optType == OptimizerType.TrustRegion)
+            {
+                // Trust-region Cauchy point with B = I (Nocedal & Wright, Algorithm 4.1 / eq. 4.11):
+                //   alpha = min(radius / ||g||, lr);  x -= alpha * g
+                // ||g|| couples every parameter, so this is a global reduction followed by an elementwise
+                // step — exactly the shape HypergradientSGD uses, which is why it fits the plan despite not
+                // being a per-element kernel.
+                //
+                // The radius is NOT adapted here. Classical trust region rescales it from the ratio of actual
+                // to predicted reduction, and the actual reduction needs the loss at the trial point; a fused
+                // step has one gradient and no loss evaluation. Callers adapt it between configurations,
+                // which is where AiDotNet's TrustRegionOptimizer already does it (per epoch).
+                double norm2 = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
+                        for (int i = 0; i < len2; i++) norm2 += (double)pGrad[i] * pGrad[i];
+                }
+                double gradNorm = Math.Sqrt(norm2);
+
+                // A vanishing gradient means there is no descent direction and radius/||g|| would blow up.
+                // Take no step rather than an unbounded one.
+                if (gradNorm > 1e-10)
+                {
+                    float alphaTr = (float)Math.Min(exTrustRadius / gradNorm, lr);
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                        int len2 = lengths[p];
+                        fixed (float* pParam = &paramArrays[p][paramOffsets[p]],
+                               pGrad = &gradArrays[p][gradOffsets[p]])
+                            for (int i = 0; i < len2; i++) pParam[i] -= alphaTr * pGrad[i];
+                        MarkHostWeightMutated(p);
+                    }
+                }
+                return;
+            }
+
 
 
             if (optType == OptimizerType.HypergradientSGD)

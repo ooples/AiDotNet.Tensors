@@ -48,8 +48,9 @@ public class ConfigureOptimizerFusedDispatchTests
         OptimizerType.FTRL,
         OptimizerType.ASGD,
         OptimizerType.Rprop,
-        // Wired via the global-reduction path (two-loop recursion), not a per-element kernel.
+        // Wired via the global-reduction path, not per-element kernels.
         OptimizerType.LBFGS,
+        OptimizerType.TrustRegion,
     };
 
     public static TheoryData<OptimizerType> GpuPlanSupportedOptimizers => new()
