@@ -25,33 +25,33 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc />
     public override Tensor<T> ForwardSplat<T>(
-        Tensor<T> input, Tensor<T> flow, bool normalize = true, double epsilon = 1e-7)
+        Tensor<T> input, Tensor<T> flow, bool normalize = true)
     {
-        ValidateForwardSplat(input, flow, epsilon);
+        ValidateForwardSplat(input, flow);
         if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out _))
-            return base.ForwardSplat(input, flow, normalize, epsilon);
+            return base.ForwardSplat(input, flow, normalize);
 
         Tensor<T> result;
         using (GradientTape<T>.NoGrad())
-            result = ForwardSplatGpu(input, flow, normalize, epsilon);
+            result = ForwardSplatGpu(input, flow, normalize);
 
         // The composed implementation deliberately runs under NoGrad so the public operation owns
         // one stable tape node rather than leaking its grid-sample implementation details.
         DifferentiableOps.RecordIfActive(
             "ForwardSplat", result, [input, flow],
-            BackwardFunctions<T>.ForwardSplatBackward, [normalize, epsilon]);
+            BackwardFunctions<T>.ForwardSplatBackward, [normalize]);
         return result;
     }
 
     /// <inheritdoc />
     public override Tensor<T> ForwardSplatBackwardInput<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
-        bool normalize = true, double epsilon = 1e-7)
+        bool normalize = true)
     {
-        ValidateForwardSplat(input, flow, epsilon);
+        ValidateForwardSplat(input, flow);
         ValidateSameShape(gradOutput, input, nameof(gradOutput));
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
-            return base.ForwardSplatBackwardInput(gradOutput, input, flow, normalize, epsilon);
+            return base.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
 
         using (GradientTape<T>.NoGrad())
         {
@@ -59,7 +59,7 @@ public partial class DirectGpuTensorEngine
             Tensor<T> sampledGradient = gradOutput;
             if (normalize)
             {
-                var denominator = BuildForwardSplatDenominator(flow, grid, epsilon);
+                var denominator = BuildForwardSplatDenominator(flow, grid);
                 sampledGradient = TensorBroadcastDivide(gradOutput, denominator);
             }
 
@@ -72,13 +72,13 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc />
     public override Tensor<T> ForwardSplatBackwardFlow<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
-        bool normalize = true, double epsilon = 1e-7)
+        bool normalize = true)
     {
-        ValidateForwardSplat(input, flow, epsilon);
+        ValidateForwardSplat(input, flow);
         ValidateSameShape(gradOutput, input, nameof(gradOutput));
         ValidateSameShape(output, input, nameof(output));
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
-            return base.ForwardSplatBackwardFlow(gradOutput, input, flow, output, normalize, epsilon);
+            return base.ForwardSplatBackwardFlow(gradOutput, input, flow, output, normalize);
 
         using (GradientTape<T>.NoGrad())
         {
@@ -86,7 +86,7 @@ public partial class DirectGpuTensorEngine
             Tensor<T> destinationGradient = gradOutput;
             if (normalize)
             {
-                var denominator = BuildForwardSplatDenominator(flow, grid, epsilon);
+                var denominator = BuildForwardSplatDenominator(flow, grid);
                 destinationGradient = TensorBroadcastDivide(gradOutput, denominator);
             }
 
@@ -118,7 +118,7 @@ public partial class DirectGpuTensorEngine
     }
 
     private Tensor<T> ForwardSplatGpu<T>(
-        Tensor<T> input, Tensor<T> flow, bool normalize, double epsilon)
+        Tensor<T> input, Tensor<T> flow, bool normalize)
     {
         var grid = BuildForwardSplatGrid(flow);
         var accumulated = GridSampleBackwardInput(
@@ -126,19 +126,20 @@ public partial class DirectGpuTensorEngine
             GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false);
         if (!normalize) return accumulated;
 
-        var denominator = BuildForwardSplatDenominator(flow, grid, epsilon);
+        var denominator = BuildForwardSplatDenominator(flow, grid);
         return TensorBroadcastDivide(accumulated, denominator);
     }
 
     private Tensor<T> BuildForwardSplatDenominator<T>(
-        Tensor<T> flow, Tensor<T> grid, double epsilon)
+        Tensor<T> flow, Tensor<T> grid)
     {
         var ones = CreateFilledTensor<T>(
             [flow.Shape[0], 1, flow.Shape[2], flow.Shape[3]], 1.0);
         var weights = GridSampleBackwardInput(
             ones, grid, ones.Shape.ToArray(),
             GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false);
-        return TensorAddScalar(weights, MathHelper.GetNumericOperations<T>().FromDouble(epsilon));
+        var ops = MathHelper.GetNumericOperations<T>();
+        return TensorWhere(TensorGreaterThan(weights, ops.Zero), weights, ones);
     }
 
     private Tensor<T> BuildForwardSplatGrid<T>(Tensor<T> flow)
@@ -174,7 +175,7 @@ public partial class DirectGpuTensorEngine
         return tensor;
     }
 
-    private static void ValidateForwardSplat<T>(Tensor<T> input, Tensor<T> flow, double epsilon)
+    private static void ValidateForwardSplat<T>(Tensor<T> input, Tensor<T> flow)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (flow is null) throw new ArgumentNullException(nameof(flow));
@@ -183,8 +184,6 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException("ForwardSplat requires input [B,C,H,W] and flow [B,2,H,W].");
         if (input.Shape[2] <= 0 || input.Shape[3] <= 0)
             throw new ArgumentException("ForwardSplat spatial dimensions must be positive.", nameof(input));
-        if (epsilon <= 0 || double.IsNaN(epsilon))
-            throw new ArgumentOutOfRangeException(nameof(epsilon));
     }
 
     private static void ValidateSameShape<T>(Tensor<T> actual, Tensor<T> expected, string parameterName)

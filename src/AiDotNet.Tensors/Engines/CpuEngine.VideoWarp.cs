@@ -35,9 +35,9 @@ public partial class CpuEngine
 
     /// <inheritdoc />
     public virtual Tensor<T> ForwardSplat<T>(
-        Tensor<T> input, Tensor<T> flow, bool normalize = true, double epsilon = 1e-7)
+        Tensor<T> input, Tensor<T> flow, bool normalize = true)
     {
-        ValidateSplatInputs(input, flow, epsilon);
+        ValidateSplatInputs(input, flow);
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope)
         {
@@ -51,11 +51,11 @@ public partial class CpuEngine
                 input.Shape.ToArray(),
                 (engine, output) =>
                 {
-                    var replay = engine.ForwardSplat(capturedInput, capturedFlow, normalize, epsilon);
+                    var replay = engine.ForwardSplat(capturedInput, capturedFlow, normalize);
                     DirectGpuTensorEngine.CopyResultInto(engine, replay, output);
                 },
                 BackwardFunctions<T>.ForwardSplatBackward,
-                [normalize, epsilon]);
+                [normalize]);
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -102,8 +102,8 @@ public partial class CpuEngine
             for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++)
             {
-                T denominator = numOps.FromDouble(
-                    weights[(b * height + y) * width + x] + epsilon);
+                double weight = weights[(b * height + y) * width + x];
+                T denominator = numOps.FromDouble(weight == 0.0 ? 1.0 : weight);
                 for (int channel = 0; channel < channels; channel++)
                     result[b, channel, y, x] = numOps.Divide(accum[b, channel, y, x], denominator);
             }
@@ -111,16 +111,16 @@ public partial class CpuEngine
 
         DifferentiableOps.RecordIfActive(
             "ForwardSplat", result, [input, flow],
-            BackwardFunctions<T>.ForwardSplatBackward, [normalize, epsilon]);
+            BackwardFunctions<T>.ForwardSplatBackward, [normalize]);
         return result;
     }
 
     /// <inheritdoc />
     public virtual Tensor<T> ForwardSplatBackwardInput<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
-        bool normalize = true, double epsilon = 1e-7)
+        bool normalize = true)
     {
-        ValidateSplatInputs(input, flow, epsilon);
+        ValidateSplatInputs(input, flow);
         if (gradOutput.Shape != input.Shape)
             throw new ArgumentException("gradOutput shape must match input shape.", nameof(gradOutput));
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -137,7 +137,8 @@ public partial class CpuEngine
             void Add(int dx, int dy, double weight)
             {
                 if ((uint)dx >= (uint)width || (uint)dy >= (uint)height || weight == 0) return;
-                double divisor = normalize ? denominators[(b * height + dy) * width + dx] + epsilon : 1.0;
+                double weightSum = denominators[(b * height + dy) * width + dx];
+                double divisor = normalize && weightSum != 0.0 ? weightSum : 1.0;
                 T factor = numOps.FromDouble(weight / divisor);
                 for (int c = 0; c < channels; c++)
                     gradient[b, c, y, x] = numOps.Add(
@@ -150,9 +151,9 @@ public partial class CpuEngine
     /// <inheritdoc />
     public virtual Tensor<T> ForwardSplatBackwardFlow<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
-        bool normalize = true, double epsilon = 1e-7)
+        bool normalize = true)
     {
-        ValidateSplatInputs(input, flow, epsilon);
+        ValidateSplatInputs(input, flow);
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input.Shape[0], channels = input.Shape[1], height = input.Shape[2], width = input.Shape[3];
         double[] denominators = ComputeSplatWeights(flow, height, width, numOps);
@@ -169,7 +170,8 @@ public partial class CpuEngine
             void Add(int dx, int dy, double derivativeX, double derivativeY)
             {
                 if ((uint)dx >= (uint)width || (uint)dy >= (uint)height) return;
-                double divisor = normalize ? denominators[(b * height + dy) * width + dx] + epsilon : 1.0;
+                double weightSum = denominators[(b * height + dy) * width + dx];
+                double divisor = normalize && weightSum != 0.0 ? weightSum : 1.0;
                 double contribution = 0.0;
                 for (int c = 0; c < channels; c++)
                 {
@@ -194,12 +196,11 @@ public partial class CpuEngine
             throw new ArgumentException("Correlation inputs must have equal [B,C,H,W] shapes.");
     }
 
-    private static void ValidateSplatInputs<T>(Tensor<T> input, Tensor<T> flow, double epsilon)
+    private static void ValidateSplatInputs<T>(Tensor<T> input, Tensor<T> flow)
     {
         if (input.Rank != 4 || flow.Rank != 4 || flow.Shape[0] != input.Shape[0] ||
             flow.Shape[1] != 2 || flow.Shape[2] != input.Shape[2] || flow.Shape[3] != input.Shape[3])
             throw new ArgumentException("ForwardSplat requires input [B,C,H,W] and flow [B,2,H,W].");
-        if (epsilon <= 0 || double.IsNaN(epsilon)) throw new ArgumentOutOfRangeException(nameof(epsilon));
     }
 
     private static double[] ComputeSplatWeights<T>(

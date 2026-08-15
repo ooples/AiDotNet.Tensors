@@ -1626,11 +1626,10 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         bool normalize = (bool)savedState[0];
-        double epsilon = (double)savedState[1];
         var gradInput = engine.ForwardSplatBackwardInput(
-            gradOutput, inputs[0], inputs[1], normalize, epsilon);
+            gradOutput, inputs[0], inputs[1], normalize);
         var gradFlow = engine.ForwardSplatBackwardFlow(
-            gradOutput, inputs[0], inputs[1], output, normalize, epsilon);
+            gradOutput, inputs[0], inputs[1], output, normalize);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradFlow, engine);
     }

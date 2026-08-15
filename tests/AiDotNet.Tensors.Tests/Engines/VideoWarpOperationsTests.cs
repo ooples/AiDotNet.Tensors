@@ -45,6 +45,18 @@ public sealed class VideoWarpOperationsTests
     }
 
     [Fact]
+    public void ForwardSplat_AverageMatchesReleasedZeroWeightFallbackExactly()
+    {
+        var input = new Tensor<float>([2f, 6f], [1, 1, 1, 2]);
+        var flow = new Tensor<float>([1f, 0f, 0f, 0f], [1, 2, 1, 2]);
+
+        var result = _engine.ForwardSplat(input, flow);
+
+        Assert.Equal(0f, result[0, 0, 0, 0]);
+        Assert.Equal(4f, result[0, 0, 0, 1]);
+    }
+
+    [Fact]
     public void ForwardSplat_BackwardInputAndFlow_MatchFiniteDifferences()
     {
         var inputData = new[] { 0.2f, -0.4f, 0.7f, 1.1f, -0.3f, 0.5f, 0.9f, -0.8f, 0.6f };

@@ -5967,17 +5967,17 @@ public interface IEngine
     /// by accumulated weights and implements the average soft-splat used by UPR-Net.
     /// </summary>
     Tensor<T> ForwardSplat<T>(
-        Tensor<T> input, Tensor<T> flow, bool normalize = true, double epsilon = 1e-7);
+        Tensor<T> input, Tensor<T> flow, bool normalize = true);
 
     /// <summary>Gradient of <see cref="ForwardSplat{T}"/> with respect to its input.</summary>
     Tensor<T> ForwardSplatBackwardInput<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
-        bool normalize = true, double epsilon = 1e-7);
+        bool normalize = true);
 
     /// <summary>Gradient of <see cref="ForwardSplat{T}"/> with respect to its flow.</summary>
     Tensor<T> ForwardSplatBackwardFlow<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
-        bool normalize = true, double epsilon = 1e-7);
+        bool normalize = true);
 
     /// <summary>
     /// Extracts sliding local blocks (patches) from a batched input tensor.
