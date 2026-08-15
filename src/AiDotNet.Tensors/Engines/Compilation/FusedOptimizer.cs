@@ -2068,6 +2068,53 @@ internal static class FusedOptimizer
 
     /// <summary>Rprop: Resilient backpropagation.
     /// Per-element step sizes adapt based on sign-changes of consecutive gradients.
+    /// <summary>AVX2 Proximal Gradient Descent with an L1 proximal operator (ISTA).
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.</summary>
+    /// <remarks>
+    /// The soft-threshold is the whole method. Folding the L1 penalty into the gradient instead would only
+    /// shrink coordinates toward zero and leave them oscillating around it at a scale set by lr; the prox
+    /// sets them to EXACTLY zero, which is what makes the solution genuinely sparse.
+    ///
+    /// Branchless in the SIMD body: the sign is recovered by masking off the sign bit and re-applying it,
+    /// so no per-element compare/branch is needed and the shrink is a single max against zero.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void ProximalL1UpdateSimd(
+        float* param, float* grad, int length, float lr, float l1Strength)
+    {
+        float threshold = lr * l1Strength;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vNegLr = Vector256.Create(-lr);
+            var vThreshold = Vector256.Create(threshold);
+            var vZero = Vector256<float>.Zero;
+            // Mask with the sign bit cleared: AND extracts |x|, ANDNOT extracts the sign.
+            var vAbsMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+            var vSignMask = Vector256.Create(unchecked((int)0x80000000)).AsSingle();
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                // z = param - lr*grad
+                var z = Fma.MultiplyAdd(vNegLr, Avx.LoadVector256(grad + i), Avx.LoadVector256(param + i));
+                var magnitude = Avx.And(z, vAbsMask);
+                var sign = Avx.And(z, vSignMask);
+                // max(|z| - lr*l1, 0), sign re-applied.
+                var shrunk = Avx.Max(Avx.Subtract(magnitude, vThreshold), vZero);
+                Avx.Store(param + i, Avx.Or(shrunk, sign));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float z = param[i] - lr * grad[i];
+            float magnitude = MathF.Abs(z) - threshold;
+            param[i] = magnitude <= 0f ? 0f : (z > 0f ? magnitude : -magnitude);
+        }
+    }
+
+
     /// Reference: Riedmiller &amp; Braun, 1993.</summary>
     internal static unsafe void RpropUpdate(
         float* param, float* grad, float* prevGrad, float* stepSize, int length,
@@ -2558,5 +2605,16 @@ public enum OptimizerType
     /// <summary>Schedule-Free SGD: scheduler-free, weighted-average evaluation (Defazio et al., 2024)</summary>
     ScheduleFreeSGD = 20,
     /// <summary>D-Adaptation SGD: learning-rate-free SGD (Defazio &amp; Mishchenko, 2023)</summary>
-    DAdaptationSGD = 21
+    DAdaptationSGD = 21,
+
+    /// <summary>Proximal gradient descent with an L1 proximal operator (ISTA):
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.
+    /// The L1 strength travels in <see cref="FusedOptimizerExtras.L1"/>.</summary>
+    /// <remarks>
+    /// The soft-threshold is what makes this proximal gradient descent rather than SGD with an L1 penalty
+    /// added to the gradient: it drives coordinates to EXACTLY zero instead of merely shrinking them, which
+    /// is the entire reason to choose the method. A subgradient step cannot do that — it oscillates around
+    /// zero at a scale set by the learning rate.
+    /// </remarks>
+    ProximalL1 = 22
 }

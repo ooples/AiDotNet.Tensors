@@ -1884,6 +1884,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.FTRL
             or OptimizerType.ASGD
             or OptimizerType.Rprop
+            or OptimizerType.ProximalL1
             or OptimizerType.HypergradientSGD
             or OptimizerType.DAdaptationSGD
             or OptimizerType.ScheduleFreeSGD;
@@ -2868,6 +2869,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             FusedOptimizer.RpropUpdate(pParam, pGrad, pM, pV, len,
                                 extras.RpropEtaPlus, extras.RpropEtaMinus, extras.RpropStepMin, extras.RpropStepMax);
                             break;
+                        case OptimizerType.ProximalL1:
+                            // Stateless: the prox reads only param and grad. L1 strength from extras.
+                            FusedOptimizer.ProximalL1UpdateSimd(pParam, pGrad, len, lr, extras.L1);
+                            break;
                         default:
                             throw new NotSupportedException(
                                 $"Optimizer type {optType} is not yet supported by ConfigureOptimizer. " +
@@ -3447,6 +3452,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 for (int i = 0; i < len; i++) pV[i] = extras.RpropInitialStep;
                             FusedOptimizer.RpropUpdate(pParam, pGrad, pM, pV, len,
                                 extras.RpropEtaPlus, extras.RpropEtaMinus, extras.RpropStepMin, extras.RpropStepMax);
+                            break;
+                        case OptimizerType.ProximalL1:
+                            // Stateless: the prox reads only param and grad. L1 strength from extras.
+                            FusedOptimizer.ProximalL1UpdateSimd(pParam, pGrad, len, lr, extras.L1);
                             break;
                         default:
                             throw new NotSupportedException(
