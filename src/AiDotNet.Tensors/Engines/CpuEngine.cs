@@ -27259,25 +27259,28 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<bool>? mask = null;
         if (isCausal)
         {
-            // The SDPA reads mask[b, h, i, j] with explicit head/batch indices, so materialize the full shape
-            // (the same causal plane is shared across batch and heads). true = key visible to this query.
-            // The mask depends only on (batch, qHeads, seqQ, seqK), so cache it by shape: steady-state prefill
-            // (constant shape) reuses one immutable tensor instead of allocating + filling batch·qHeads·seqQ·seqK
-            // bools every forward. Decode grows seqK by one each step, so those shapes are distinct (bounded set).
-            int batch = query._shape[0];
+            // The causal plane is identical for every batch and head, so it is built once at
+            // [1, 1, seqQ, seqK] and broadcast by the SDPA kernel. This used to be materialized at
+            // the full [batch, qHeads, seqQ, seqK] because the generic SDPA workers indexed
+            // mask[b, h, i, j] directly and would have run off the end of a size-1 axis; they now
+            // broadcast, so the batch·qHeads duplication is pure waste -- for batch 8 / 32 heads /
+            // 2048 keys that is 256 copies of the same plane, ~1 GB of bool instead of ~4 MB.
+            //
+            // true = key visible to this query. Cached by shape: steady-state prefill (constant
+            // shape) reuses one immutable tensor, and decode grows seqK by one each step, so those
+            // shapes are distinct but bounded. The cache key no longer carries batch or heads,
+            // which also means every batch size shares one entry.
             int seqQ = query._shape[2];
             int seqK = k._shape[2];
-            mask = _gqaCausalMaskCache.GetOrAdd((batch, qHeads, seqQ, seqK), static key =>
+            mask = _gqaCausalMaskCache.GetOrAdd((1, 1, seqQ, seqK), static key =>
             {
                 var (b0, h0, sq, sk) = key;
                 int offset = sk - sq; // KV-cache offset: query i is at absolute key position i + offset.
                 var maskData = new bool[b0 * h0 * sq * sk];
                 int idx = 0;
-                for (int b = 0; b < b0; b++)
-                    for (int h = 0; h < h0; h++)
-                        for (int i = 0; i < sq; i++)
-                            for (int j = 0; j < sk; j++)
-                                maskData[idx++] = j <= i + offset;
+                for (int i = 0; i < sq; i++)
+                    for (int j = 0; j < sk; j++)
+                        maskData[idx++] = j <= i + offset;
                 return new Tensor<bool>(maskData, new[] { b0, h0, sq, sk });
             });
         }
@@ -27285,9 +27288,9 @@ public partial class CpuEngine : ITensorLevelEngine
         return ScaledDotProductAttention(query, k, v, mask, scale, out _, softcap);
     }
 
-    // Causal mask is a pure function of (batch, qHeads, seqQ, seqK); cache the materialized tensor so
-    // steady-state same-shape forwards reuse it instead of re-allocating. The cached tensors are treated
-    // as read-only by the SDPA kernel.
+    // Causal mask is a pure function of (seqQ, seqK) -- it does not vary by batch or head -- so it is
+    // cached at [1, 1, seqQ, seqK] and broadcast. Steady-state same-shape forwards reuse one entry
+    // instead of re-allocating. The cached tensors are treated as read-only by the SDPA kernel.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int, int, int), Tensor<bool>>
         _gqaCausalMaskCache = new();
 
@@ -27538,6 +27541,19 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int b = bh / heads;
             int h = bh % heads;
+
+            // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
+            // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
+            // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
+            // of indexing past its bounds. The MHA fast paths already did this; these generic
+            // SDPA workers did not, which is why the GQA causal path had to materialize a full
+            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            int mskB = mask is null ? 1 : mask.Shape[0];
+            int mskH = mask is null ? 1 : mask.Shape[1];
+            int mskQ = mask is null ? 1 : mask.Shape[2];
+            int mskK = mask is null ? 1 : mask.Shape[3];
+            int mskb = BroadcastMaskIndex(b, mskB);
+            int mskh = BroadcastMaskIndex(h, mskH);
             int offset = (b * heads + h) * seqQ * seqK;
 
             for (int i = 0; i < seqQ; i++)
@@ -27547,7 +27563,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int j = 0; j < seqK; j++)
                 {
                     int idx = offset + i * seqK + j;
-                    if (mask != null && !mask[b, h, i, j])
+                    if (mask != null && !mask[mskb, mskh, BroadcastMaskIndex(i, mskQ), BroadcastMaskIndex(j, mskK)])
                     {
                         scoresData[idx] = negInf;
                     }
@@ -27666,6 +27682,19 @@ public partial class CpuEngine : ITensorLevelEngine
             int b = bh / heads;
             int h = bh % heads;
 
+            // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
+            // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
+            // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
+            // of indexing past its bounds. The MHA fast paths already did this; these generic
+            // SDPA workers did not, which is why the GQA causal path had to materialize a full
+            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            int mskB = mask is null ? 1 : mask.Shape[0];
+            int mskH = mask is null ? 1 : mask.Shape[1];
+            int mskQ = mask is null ? 1 : mask.Shape[2];
+            int mskK = mask is null ? 1 : mask.Shape[3];
+            int mskb = BroadcastMaskIndex(b, mskB);
+            int mskh = BroadcastMaskIndex(h, mskH);
+
             int qOff = bh * seqQ * d_k;
             int kOff = bh * seqK * d_k;
             int sOff = bh * seqQ * seqK;
@@ -27723,7 +27752,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     float v = scoresData[rowOff + j] * scaleF;
                     // Attention-logit soft-cap (Gemma-2): applied to the scaled logit before masking/softmax.
                     if (useSoftcap) v = capF * MathF.Tanh(v * invCapF);
-                    if (mask != null && !mask[b, h, i, j]) v = negInfF;
+                    if (mask != null && !mask[mskb, mskh, BroadcastMaskIndex(i, mskQ), BroadcastMaskIndex(j, mskK)]) v = negInfF;
                     if (v > maxVal) maxVal = v;
                     scoresData[rowOff + j] = v;
                 }
@@ -27851,6 +27880,19 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int b = bh / heads;
             int h = bh % heads;
+
+            // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
+            // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
+            // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
+            // of indexing past its bounds. The MHA fast paths already did this; these generic
+            // SDPA workers did not, which is why the GQA causal path had to materialize a full
+            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            int mskB = mask is null ? 1 : mask.Shape[0];
+            int mskH = mask is null ? 1 : mask.Shape[1];
+            int mskQ = mask is null ? 1 : mask.Shape[2];
+            int mskK = mask is null ? 1 : mask.Shape[3];
+            int mskb = BroadcastMaskIndex(b, mskB);
+            int mskh = BroadcastMaskIndex(h, mskH);
             // Per-head storage offsets via the operands' (possibly permuted) strides.
             int qOff = qBase + b * qBatchStride + h * qHeadStride;
             int kOff = kBase + b * kBatchStride + h * kHeadStride;
@@ -27917,7 +27959,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int j = 0; j < seqK; j++)
                 {
                     float val = scratch[rowOff + j] * scaleF;
-                    if (mask != null && !mask[b, h, i, j]) val = negInfF;
+                    if (mask != null && !mask[mskb, mskh, BroadcastMaskIndex(i, mskQ), BroadcastMaskIndex(j, mskK)]) val = negInfF;
                     if (val > maxVal) maxVal = val;
                     scratch[rowOff + j] = val;
                 }
@@ -28026,6 +28068,19 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int b = bh / heads;
                 int h = bh % heads;
+
+                // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
+                // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
+                // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
+                // of indexing past its bounds. The MHA fast paths already did this; these generic
+                // SDPA workers did not, which is why the GQA causal path had to materialize a full
+                // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+                int mskB = mask is null ? 1 : mask.Shape[0];
+                int mskH = mask is null ? 1 : mask.Shape[1];
+                int mskQ = mask is null ? 1 : mask.Shape[2];
+                int mskK = mask is null ? 1 : mask.Shape[3];
+                int mskb = BroadcastMaskIndex(b, mskB);
+                int mskh = BroadcastMaskIndex(h, mskH);
                 int qOff = bh * seqQ * d_k;
                 int kOff = bh * seqK * d_k;
                 int sOff = bh * seqQ * seqK;
@@ -28064,7 +28119,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         double v = scoresData[rowOff + j] * scaleValue;
                         // Attention-logit soft-cap (Gemma-2): applied to the scaled logit before masking/softmax.
                         if (softcap > 0.0) v = softcap * Math.Tanh(v / softcap);
-                        if (mask != null && !mask[b, h, i, j]) v = negInfD;
+                        if (mask != null && !mask[mskb, mskh, BroadcastMaskIndex(i, mskQ), BroadcastMaskIndex(j, mskK)]) v = negInfD;
                         if (v > maxVal) maxVal = v;
                         scoresData[rowOff + j] = v;
                     }
