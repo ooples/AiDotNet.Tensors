@@ -14,6 +14,54 @@ namespace AiDotNet.Tensors.Engines;
 public partial class DirectGpuTensorEngine
 {
     /// <inheritdoc />
+    public override Tensor<T> PartialCorrelationVolume<T>(
+        Tensor<T> first, Tensor<T> second, int radius = 4)
+    {
+        if (first is null) throw new ArgumentNullException(nameof(first));
+        if (second is null) throw new ArgumentNullException(nameof(second));
+        if (first.Rank != 4 || second.Rank != 4 || first.Shape != second.Shape)
+            throw new ArgumentException("Correlation inputs must have equal [B,C,H,W] shapes.");
+        if (radius < 0) throw new ArgumentOutOfRangeException(nameof(radius));
+        if (typeof(T) != typeof(float) || !TryGetBackend(out _))
+            return base.PartialCorrelationVolume(first, second, radius);
+        GradientTape<T>.Current?.BindEngineIfUnset(this);
+
+        int batch = first.Shape[0];
+        int channels = first.Shape[1];
+        int height = first.Shape[2];
+        int width = first.Shape[3];
+        int diameter = radius * 2 + 1;
+        var planes = new Tensor<T>[diameter * diameter];
+
+        Tensor<T> result;
+        using (GradientTape<T>.NoGrad())
+        {
+            // These are all direct-GPU resident primitives. Keeping the operation in the shared
+            // engine gives CUDA, HIP, Metal, OpenCL, Vulkan, and WebGPU identical displacement
+            // ordering without six backend-specific correlation kernels or a host readback.
+            var paddedSecond = Pad(
+                second, radius, radius, radius, radius,
+                MathHelper.GetNumericOperations<T>().Zero);
+            int offset = 0;
+            for (int offsetY = 0; offsetY < diameter; offsetY++)
+            for (int offsetX = 0; offsetX < diameter; offsetX++)
+            {
+                var shifted = TensorSlice(
+                    paddedSecond,
+                    [0, 0, offsetY, offsetX],
+                    [batch, channels, height, width]);
+                planes[offset++] = ReduceMean(
+                    TensorMultiply(first, shifted), [1], keepDims: true);
+            }
+            result = TensorConcatenate(planes, axis: 1);
+        }
+
+        DifferentiableOps.RecordIfActive(
+            "PartialCorrelationVolume", result, [first, second],
+            BackwardFunctions<T>.PartialCorrelationVolumeBackward, [radius]);
+        return result;
+    }
+
     /// <inheritdoc />
     public override Tensor<T> ForwardSplat<T>(
         Tensor<T> input, Tensor<T> flow, bool normalize = true)
@@ -29,6 +77,7 @@ public partial class DirectGpuTensorEngine
         }
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
             return base.ForwardSplat(input, flow, normalize);
+        GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         Tensor<T> result;
         using (GradientTape<T>.NoGrad())
