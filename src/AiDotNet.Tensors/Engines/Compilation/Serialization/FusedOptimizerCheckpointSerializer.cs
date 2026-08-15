@@ -83,6 +83,11 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(extras.D0);
         writer.Write(extras.DGrowthRate);
         writer.Write(extras.SfBeta);
+        // Appended in the same PR that introduced them. Both change WHICH ALGORITHM runs rather than only its
+        // constants — Nesterov vs classical momentum, and FTRL's per-coordinate learning-rate denominator — so
+        // omitting them here would let a checkpoint round trip into a quietly different optimizer.
+        writer.Write(extras.Nesterov);
+        writer.Write(extras.FtrlBeta);
     }
 
     private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
@@ -105,6 +110,8 @@ internal static class FusedOptimizerCheckpointSerializer
             D0 = reader.ReadSingle(),
             DGrowthRate = reader.ReadSingle(),
             SfBeta = reader.ReadSingle(),
+            Nesterov = reader.ReadBoolean(),
+            FtrlBeta = reader.ReadSingle(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

@@ -4156,6 +4156,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             D0 = extras.D0,
             DGrowthRate = extras.DGrowthRate,
             SfBeta = extras.SfBeta,
+            // Must be copied like every other field. This clone is what the runtime state — and therefore the
+            // checkpoint — records, so dropping these two here made a Nesterov or non-zero-beta FTRL plan
+            // report itself as classical/beta-0, and restore as a different algorithm than it ran.
+            Nesterov = extras.Nesterov,
+            FtrlBeta = extras.FtrlBeta,
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)
