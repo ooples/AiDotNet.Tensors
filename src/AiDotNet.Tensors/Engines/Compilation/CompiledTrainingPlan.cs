@@ -1706,8 +1706,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // optimizers without a GPU backend kernel.
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
-        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
         var ex = extras ?? new FusedOptimizerExtras();
+        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams, ex.Nesterov);
         ex.Validate();
         if (typeof(T) == typeof(float))
         {
@@ -1796,7 +1796,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // optimizers without a GPU backend kernel.
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
-        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
+        ValidatePlanOptimizerSupport(
+            optimizerType, typeof(T) == typeof(float), hasGpuParams, extras?.Nesterov ?? false);
         // Drop any Schedule-Free pre-forward hook left over from a prior ungrouped
         // ConfigureOptimizer(ScheduleFreeSGD); a grouped optimizer never sets one,
         // and Step() unconditionally invokes it — leaving it active would rewrite
@@ -1830,8 +1831,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// support more optimizer math than every compiled-plan/device combination
     /// can safely replay, so this keeps configure-time acceptance aligned with
     /// the available closures and backend contracts.</summary>
-    private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType, bool isFloat, bool hasGpuParams)
+    private static void ValidatePlanOptimizerSupport(
+        OptimizerType optimizerType, bool isFloat, bool hasGpuParams, bool nesterov = false)
     {
+        // The GPU SgdMomentum kernel implements CLASSICAL momentum only, so a Nesterov request on a
+        // GPU-resident plan cannot be honored. Reject it HERE, at configure time, rather than from
+        // inside the per-parameter update closure: that closure runs on the first Step(), and on a
+        // mixed CPU/GPU plan it would already have mutated (and MarkHostWeightMutated'd) every CPU
+        // parameter before reaching the first GPU one, leaving a half-applied step. Failing at
+        // configuration matches FusedOptimizerExtras.Validate()'s contract.
+        if (hasGpuParams && nesterov && optimizerType is OptimizerType.SGDMomentum)
+        {
+            throw new NotSupportedException(
+                "Nesterov momentum is not implemented by the GPU fused optimizer kernel. " +
+                "Run this model on the CPU engine, which supports it, or use classical " +
+                "momentum. Refusing rather than silently applying classical momentum.");
+        }
+
         // Device-aware gate (CodeRabbit, PR #501): reject unsupported GPU
         // combinations before _optimizerUpdate is published so a mixed CPU/GPU
         // plan cannot partially update CPU parameters and then throw on the
@@ -2669,16 +2685,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     lr, b1, b2, wd, len);
                                 break;
                             case OptimizerType.SGDMomentum:
-                                // The GPU kernel implements CLASSICAL momentum only. Running it for a
-                                // Nesterov request would quietly train a different algorithm, which is
-                                // the exact failure this flag was added to remove — so refuse instead.
-                                if (extras.Nesterov)
-                                {
-                                    throw new NotSupportedException(
-                                        "Nesterov momentum is not implemented by the GPU fused optimizer kernel. " +
-                                        "Run this model on the CPU engine, which supports it, or use classical " +
-                                        "momentum. Refusing rather than silently applying classical momentum.");
-                                }
+                                // The GPU kernel implements CLASSICAL momentum only. A Nesterov request
+                                // on a GPU-resident plan is rejected eagerly by
+                                // ValidatePlanOptimizerSupport, so reaching here means classical momentum
+                                // is what the caller asked for.
                                 gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
                                     lr, b1, wd, len);
                                 break;
@@ -3301,16 +3311,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     lr, b1, b2, wd, len);
                                 break;
                             case OptimizerType.SGDMomentum:
-                                // The GPU kernel implements CLASSICAL momentum only. Running it for a
-                                // Nesterov request would quietly train a different algorithm, which is
-                                // the exact failure this flag was added to remove — so refuse instead.
-                                if (extras.Nesterov)
-                                {
-                                    throw new NotSupportedException(
-                                        "Nesterov momentum is not implemented by the GPU fused optimizer kernel. " +
-                                        "Run this model on the CPU engine, which supports it, or use classical " +
-                                        "momentum. Refusing rather than silently applying classical momentum.");
-                                }
+                                // The GPU kernel implements CLASSICAL momentum only. A Nesterov request
+                                // on a GPU-resident plan is rejected eagerly by
+                                // ValidatePlanOptimizerSupport, so reaching here means classical momentum
+                                // is what the caller asked for.
                                 gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
                                     lr, b1, wd, len);
                                 break;

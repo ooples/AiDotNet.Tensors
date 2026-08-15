@@ -17,12 +17,25 @@ public class SgdMomentumNesterovTests
     private const float Momentum = 0.9f;
 
     /// <summary>
+    /// Deliberately NOT multiples of 8.
+    /// </summary>
+    /// <remarks>
+    /// <c>SgdMomentumUpdateSimd</c> and <c>FTRLUpdateSimd</c> both compute <c>simdLen = length &amp; ~7</c> and
+    /// handle the remainder in a separate hand-written scalar loop. At a length of 64 or 32 that remainder is
+    /// empty on AVX2 hardware, so the scalar branch — a second, independent implementation of the same
+    /// Nesterov/beta math — would never execute and these assertions would cover only half the kernel. 67 and 37
+    /// leave tails of 3 and 5 elements respectively.
+    /// </remarks>
+    private const int VectorLength = 67;
+    private const int FtrlVectorLength = 37;
+
+    /// <summary>
     /// Classical momentum: v = mu*v + g; param -= lr*v.
     /// </summary>
     [Fact]
     public unsafe void SgdMomentum_Classical_MatchesScalarReference()
     {
-        const int n = 64;
+        const int n = VectorLength;
         var (paramSimd, grad, velocitySimd) = MakeInputs(n, seed: 7);
         var paramRef = (float[])paramSimd.Clone();
         var velocityRef = (float[])velocitySimd.Clone();
@@ -52,7 +65,7 @@ public class SgdMomentumNesterovTests
     [Fact]
     public unsafe void SgdMomentum_Nesterov_MatchesScalarReference()
     {
-        const int n = 64;
+        const int n = VectorLength;
         var (paramSimd, grad, velocitySimd) = MakeInputs(n, seed: 11);
         var paramRef = (float[])paramSimd.Clone();
         var velocityRef = (float[])velocitySimd.Clone();
@@ -81,7 +94,7 @@ public class SgdMomentumNesterovTests
     [Fact]
     public unsafe void SgdMomentum_NesterovAndClassical_Differ()
     {
-        const int n = 64;
+        const int n = VectorLength;
         var (paramClassical, grad, velocityClassical) = MakeInputs(n, seed: 23);
         var paramNesterov = (float[])paramClassical.Clone();
         var velocityNesterov = (float[])velocityClassical.Clone();
@@ -122,7 +135,7 @@ public class SgdMomentumNesterovTests
     [Fact]
     public unsafe void Ftrl_BetaZero_IsIdenticalToTheDefaultOverload()
     {
-        const int n = 32;
+        const int n = FtrlVectorLength;
         var (paramA, grad, _) = MakeInputs(n, seed: 31);
         var paramB = (float[])paramA.Clone();
         var zA = new float[n]; var nA = new float[n];
@@ -144,7 +157,7 @@ public class SgdMomentumNesterovTests
     [Fact]
     public unsafe void Ftrl_NonZeroBeta_ChangesTheResult()
     {
-        const int n = 32;
+        const int n = FtrlVectorLength;
         var (paramZero, grad, _) = MakeInputs(n, seed: 37);
         var paramOne = (float[])paramZero.Clone();
         var z0 = new float[n]; var n0 = new float[n];
