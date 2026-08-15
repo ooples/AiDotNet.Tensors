@@ -533,6 +533,12 @@ public partial class CpuEngine
     //    scalar Math.Exp activations; the big GEMMs (Wx / dInput / dWih / dWhh) go through the generic
     //    parallel BlasManaged.Gemm<double>, the tiny per-step recurrent GEMMs stay sequential. ──────
 
+    /// <summary>The large, parallel double GEMM used by the fused LSTM backward pass.</summary>
+    /// <remarks>
+    /// Named to contrast with the tiny per-step recurrent GEMMs, which stay sequential: those are
+    /// too small to pay for a parallel dispatch and would oversubscribe the pool inside the
+    /// timestep loop.
+    /// </remarks>
     private static void GemmBigD(System.ReadOnlySpan<double> a, int lda, bool transA,
                                  System.ReadOnlySpan<double> b, int ldb, bool transB,
                                  System.Span<double> c, int m, int k, int n)
@@ -541,17 +547,33 @@ public partial class CpuEngine
             new BlasManaged.BlasOptions<double> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
     }
 
+    /// <summary>In-place logistic sigmoid over a double span, at full precision.</summary>
+    /// <remarks>"Exact" distinguishes this from the approximated vectorized variants: the backward
+    /// pass reuses these activations to form gradients, so an approximation error here is amplified
+    /// through the whole BPTT chain.</remarks>
     private static void SigmoidExactInPlaceD(double[] buf, int off, int len)
     {
         for (int i = off; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
     }
 
+    /// <summary>In-place hyperbolic tangent over a double span, at full precision.</summary>
+    /// <remarks>Uses the overflow-safe 2/(1+e^-2x) - 1 form, so a large magnitude saturates to
+    /// +/-1 rather than producing NaN.</remarks>
     private static void TanhExactInPlaceD(double[] buf, int off, int len)
     {
         // tanh(x) = 2/(1+exp(-2x)) - 1 (overflow-safe; large |x| → ±1, never NaN).
         for (int i = off; i < off + len; i++) buf[i] = 2.0 / (1.0 + Math.Exp(-2.0 * buf[i])) - 1.0;
     }
 
+    /// <summary>
+    /// Fused double LSTM forward that also records the activations its backward pass needs.
+    /// </summary>
+    /// <remarks>
+    /// Separate from the inference forward because training has to retain per-timestep gate
+    /// activations for BPTT, which inference discards. <paramref name="wantState"/> is rejected
+    /// under an active gradient tape: the fused node records a backward edge only for the sequence
+    /// output, so a returned final hidden/cell would silently carry no gradient.
+    /// </remarks>
     private Tensor<double> LstmSequenceForwardDoubleTrain(
         Tensor<double> input, Tensor<double>? h0, Tensor<double>? c0,
         Tensor<double> wIh, Tensor<double> wHh, Tensor<double>? bIh, Tensor<double>? bHh,
