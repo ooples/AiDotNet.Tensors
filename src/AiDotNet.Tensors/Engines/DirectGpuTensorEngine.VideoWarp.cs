@@ -176,8 +176,8 @@ public partial class DirectGpuTensorEngine
 
     private static void ValidateForwardSplat<T>(Tensor<T> input, Tensor<T> flow, double epsilon)
     {
-        ArgumentNullException.ThrowIfNull(input);
-        ArgumentNullException.ThrowIfNull(flow);
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (flow is null) throw new ArgumentNullException(nameof(flow));
         if (input.Rank != 4 || flow.Rank != 4 || flow.Shape[0] != input.Shape[0] ||
             flow.Shape[1] != 2 || flow.Shape[2] != input.Shape[2] || flow.Shape[3] != input.Shape[3])
             throw new ArgumentException("ForwardSplat requires input [B,C,H,W] and flow [B,2,H,W].");
@@ -189,7 +189,8 @@ public partial class DirectGpuTensorEngine
 
     private static void ValidateSameShape<T>(Tensor<T> actual, Tensor<T> expected, string parameterName)
     {
-        ArgumentNullException.ThrowIfNull(actual);
+        if (actual is null) throw new ArgumentNullException(nameof(actual));
+        if (expected is null) throw new ArgumentNullException(nameof(expected));
         if (actual.Shape != expected.Shape)
             throw new ArgumentException("Tensor shape must match the input shape.", parameterName);
     }
