@@ -186,6 +186,52 @@ internal static class DifferentiableOps
     internal static bool _isBackwardCreateGraph;
 
     /// <summary>
+    /// Requested-source reachability for the current backward pass. A null set preserves the
+    /// historical unfiltered behavior; a non-null set contains exactly the tensors whose
+    /// gradients can reach one of the caller's requested sources.
+    /// </summary>
+    private static class GradientRelevance<T>
+    {
+        [ThreadStatic]
+        internal static HashSet<Tensor<T>>? Current;
+    }
+
+    /// <summary>Installs a requested-source gradient filter for one nested backward scope.</summary>
+    internal static GradientRelevanceScope<T> PushGradientRelevance<T>(
+        HashSet<Tensor<T>>? relevantTensors)
+    {
+        var previous = GradientRelevance<T>.Current;
+        GradientRelevance<T>.Current = relevantTensors;
+        return new GradientRelevanceScope<T>(previous);
+    }
+
+    /// <summary>
+    /// Returns whether backward work for <paramref name="tensor"/> can contribute to a requested
+    /// source. With no explicit source filter every gradient remains required.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsGradientRequired<T>(Tensor<T> tensor)
+    {
+        var relevant = GradientRelevance<T>.Current;
+        return relevant is null || relevant.Contains(tensor);
+    }
+
+    internal readonly struct GradientRelevanceScope<T> : IDisposable
+    {
+        private readonly HashSet<Tensor<T>>? _previous;
+
+        internal GradientRelevanceScope(HashSet<Tensor<T>>? previous)
+        {
+            _previous = previous;
+        }
+
+        public void Dispose()
+        {
+            GradientRelevance<T>.Current = _previous;
+        }
+    }
+
+    /// <summary>
     /// Returns true if a gradient tape is active and not suppressed.
     /// Use this to guard savedState allocation: only create new object[]
     /// when IsRecording is true, avoiding unnecessary GC pressure during inference.
@@ -552,6 +598,13 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
+        // Requested-source pruning: do not retain or propagate gradients that cannot reach a
+        // requested source. GradientTape installs the reachability set before every backward
+        // implementation (compiled chain, GradFn graph, and tape walk), so this also terminates
+        // traversal at the first frozen boundary instead of computing the entire upstream graph
+        // and discarding it only when the final dictionary is filtered.
+        if (!IsGradientRequired(tensor)) return;
+
         // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
         // in-place ops on aliased activations (that hijack threw CUDA-700). No-op for non-DirectGpu engines.
