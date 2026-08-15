@@ -1728,6 +1728,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
+        ValidateWeightDecayCompatibility(optimizerType, weightDecay);
         var ex = extras ?? new FusedOptimizerExtras();
         ex.Validate();
         if (typeof(T) == typeof(float))
@@ -1818,6 +1819,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
+        ValidateWeightDecayCompatibility(optimizerType, weightDecay);
         // Drop any Schedule-Free pre-forward hook left over from a prior ungrouped
         // ConfigureOptimizer(ScheduleFreeSGD); a grouped optimizer never sets one,
         // and Step() unconditionally invokes it — leaving it active would rewrite
@@ -1845,6 +1847,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
+    }
+
+    private static void ValidateWeightDecayCompatibility(
+        OptimizerType optimizerType,
+        float weightDecay)
+    {
+        if (optimizerType == OptimizerType.ProximalL1 && weightDecay != 0f)
+            throw new NotSupportedException(
+                "ProximalL1 does not support weightDecay; use extras.L1 for the L1 proximal strength.");
     }
 
     /// <summary>Gate at the plan-level dispatch surface. The fused kernels

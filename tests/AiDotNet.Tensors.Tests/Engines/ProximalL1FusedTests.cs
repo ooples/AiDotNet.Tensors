@@ -180,4 +180,82 @@ public class ProximalL1FusedTests
         Assert.True(zeros > 0,
             "no coordinate reached exactly zero after 5 proximal steps — the prox is not reaching the kernel.");
     }
+
+    /// <summary>
+    /// The grouped plan has a separate optimizer closure and must preserve the same proximal
+    /// sparsity contract as the ungrouped path.
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizerGrouped_ProximalL1_DispatchesAndProducesSparsity()
+    {
+        var engine = new CpuEngine();
+        const int n = 32;
+        var weight = new Tensor<float>(new[] { n });
+        for (int i = 0; i < n; i++) weight[i] = 0.01f * ((i % 5) - 2);
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var sq = engine.TensorMultiply(weight, weight);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizerGrouped(
+                OptimizerType.ProximalL1,
+                new[] { LrSchedule.Constant(0.05) },
+                new[] { 0 },
+                beta1: 0f, beta2: 0f, eps: 0f, weightDecay: 0f,
+                extras: new FusedOptimizerExtras { L1 = 1.0f });
+            for (int s = 0; s < 5; s++) plan.Step();
+        }
+
+        var post = weight.GetDataArray();
+        int zeros = 0;
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(!float.IsNaN(post[i]) && !float.IsInfinity(post[i]),
+                $"Grouped ProximalL1 produced a non-finite parameter at {i}.");
+            if (post[i] == 0f) zeros++;
+        }
+
+        Assert.True(zeros > 0,
+            "no coordinate reached exactly zero through the grouped ProximalL1 dispatch.");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ConfigureOptimizer_ProximalL1_RejectsUnsupportedWeightDecay(bool grouped)
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 8 });
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(weight, weight), null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+
+        using (plan)
+        {
+            NotSupportedException error = grouped
+                ? Assert.Throws<NotSupportedException>(() => plan.ConfigureOptimizerGrouped(
+                    OptimizerType.ProximalL1,
+                    new[] { LrSchedule.Constant(0.05) },
+                    new[] { 0 },
+                    weightDecay: 0.01f,
+                    extras: new FusedOptimizerExtras { L1 = 1.0f }))
+                : Assert.Throws<NotSupportedException>(() => plan.ConfigureOptimizer(
+                    OptimizerType.ProximalL1,
+                    LrSchedule.Constant(0.05),
+                    weightDecay: 0.01f,
+                    extras: new FusedOptimizerExtras { L1 = 1.0f }));
+
+            Assert.Contains("does not support weightDecay", error.Message);
+        }
+    }
 }

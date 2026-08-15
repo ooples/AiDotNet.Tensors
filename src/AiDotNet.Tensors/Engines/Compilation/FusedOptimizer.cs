@@ -2066,10 +2066,10 @@ internal static class FusedOptimizer
         _ = alpha; // alpha is consumed by external schedule when lr is computed
     }
 
-    /// <summary>Rprop: Resilient backpropagation.
-    /// Per-element step sizes adapt based on sign-changes of consecutive gradients.
-    /// <summary>AVX2 Proximal Gradient Descent with an L1 proximal operator (ISTA).
-    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.</summary>
+    /// <summary>
+    /// AVX2 Proximal Gradient Descent with an L1 proximal operator (ISTA).
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.
+    /// </summary>
     /// <remarks>
     /// The soft-threshold is the whole method. Folding the L1 penalty into the gradient instead would only
     /// shrink coordinates toward zero and leave them oscillating around it at a scale set by lr; the prox
@@ -2115,7 +2115,11 @@ internal static class FusedOptimizer
     }
 
 
-    /// Reference: Riedmiller &amp; Braun, 1993.</summary>
+    /// <summary>
+    /// Rprop: Resilient backpropagation. Per-element step sizes adapt based on
+    /// sign changes of consecutive gradients.
+    /// Reference: Riedmiller &amp; Braun, 1993.
+    /// </summary>
     internal static unsafe void RpropUpdate(
         float* param, float* grad, float* prevGrad, float* stepSize, int length,
         float etaPlus, float etaMinus, float stepMin, float stepMax)
