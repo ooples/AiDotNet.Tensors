@@ -1700,7 +1700,7 @@ internal static class BackwardFunctions<T>
 
         Tensor<T> gradInput;
         Tensor<T> gradFlow;
-        if (engine is IForwardSplatBackwardEngine optimized)
+        if (engine is CpuEngine optimized)
         {
             // The normalization field depends only on flow and is identical for both adjoints.
             // Compute it once instead of launching the full splat-weight pass twice.

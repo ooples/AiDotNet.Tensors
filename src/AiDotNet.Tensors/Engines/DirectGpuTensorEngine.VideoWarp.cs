@@ -14,28 +14,17 @@ namespace AiDotNet.Tensors.Engines;
 public partial class DirectGpuTensorEngine
 {
     /// <inheritdoc />
-    public override Tensor<T> PartialCorrelationVolume<T>(
-        Tensor<T> first, Tensor<T> second, int radius = 4)
-    {
-        // CpuEngine's bounded implementation composes virtual Pad, TensorSlice, TensorMultiply,
-        // ReduceMean, and TensorConcatenate calls under NoGrad, then records one custom backward.
-        // On this instance every primitive remains GPU-resident on CUDA, HIP, Metal, OpenCL,
-        // Vulkan, and WebGPU; disabling nested tape recording also prevents ReduceMean's
-        // tape-active compatibility fallback from downloading the correlation volume to CPU.
-        return base.PartialCorrelationVolume(first, second, radius);
-    }
-
     /// <inheritdoc />
     public override Tensor<T> ForwardSplat<T>(
         Tensor<T> input, Tensor<T> flow, bool normalize = true)
     {
         ValidateForwardSplat(input, flow);
-        var placementBackend = PlacementBackend;
-        if (typeof(T) == typeof(float) && placementBackend is not null && Compilation.GraphMode.IsActive)
+        if (typeof(T) == typeof(float) && IsGpuAvailable && Compilation.GraphMode.IsActive)
         {
+            string backendName = PlacementBackend?.BackendName ?? Name;
             throw new NotSupportedException(
                 $"Compiled ForwardSplat is not available on the direct GPU backend " +
-                $"'{placementBackend.BackendName}'. CPU fallback is disabled during GPU graph " +
+                $"'{backendName}'. CPU fallback is disabled during GPU graph " +
                 "capture because it would silently transfer the training path off device.");
         }
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
@@ -154,7 +143,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc />
     internal override Tensor<T> GetForwardSplatNormalizationWeights<T>(Tensor<T> flow)
     {
-        ValidateForwardSplatFlow(flow);
+        ValidateSplatFlow(flow);
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
             return base.GetForwardSplatNormalizationWeights(flow);
 
@@ -234,13 +223,6 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException("ForwardSplat spatial dimensions must be positive.", nameof(input));
     }
 
-    private static void ValidateForwardSplatFlow<T>(Tensor<T> flow)
-    {
-        if (flow is null) throw new ArgumentNullException(nameof(flow));
-        if (flow.Rank != 4 || flow.Shape[1] != 2 || flow.Shape[2] <= 0 || flow.Shape[3] <= 0)
-            throw new ArgumentException("ForwardSplat flow must have shape [B,2,H,W].", nameof(flow));
-    }
-
     private static void ValidateSameShape<T>(Tensor<T>? actual, Tensor<T> expected, string parameterName)
     {
         if (actual is null) throw new ArgumentNullException(parameterName);
@@ -249,19 +231,4 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException("Tensor shape must match the input shape.", parameterName);
     }
 
-    private static void ValidateNormalizationWeights<T>(
-        Tensor<T>? normalizationWeights, Tensor<T> input)
-    {
-        if (normalizationWeights is null) return;
-        if (normalizationWeights.Rank != 4 ||
-            normalizationWeights.Shape[0] != input.Shape[0] ||
-            normalizationWeights.Shape[1] != 1 ||
-            normalizationWeights.Shape[2] != input.Shape[2] ||
-            normalizationWeights.Shape[3] != input.Shape[3])
-        {
-            throw new ArgumentException(
-                "normalizationWeights must have shape [B,1,H,W] matching input.",
-                nameof(normalizationWeights));
-        }
-    }
 }

@@ -71,6 +71,14 @@ public class GeometryGpuParityTests : IDisposable
         }
     }
 
+    private static void AssertNonDegenerate(Tensor<float> tensor, string name)
+    {
+        foreach (float value in tensor.AsSpan())
+            if (Math.Abs(value) > 1e-6f) return;
+        throw new Xunit.Sdk.XunitException(
+            $"{name} is entirely zero; parity would pass vacuously.");
+    }
+
     [SkippableTheory]
     [InlineData(InterpolateMode.Nearest, false)]
     [InlineData(InterpolateMode.Bilinear, false)]
@@ -163,6 +171,9 @@ public class GeometryGpuParityTests : IDisposable
         AssertClose(gpuOutput, cpuOutput, 2e-3f);
         AssertClose(gpuGradients[gpuFirst], cpuGradients[cpuFirst], 3e-3f);
         AssertClose(gpuGradients[gpuSecond], cpuGradients[cpuSecond], 3e-3f);
+        AssertNonDegenerate(cpuOutput, nameof(cpuOutput));
+        AssertNonDegenerate(cpuGradients[cpuFirst], "first gradient");
+        AssertNonDegenerate(cpuGradients[cpuSecond], "second gradient");
     }
 
     [SkippableTheory]

@@ -6,25 +6,8 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
 
-/// <summary>
-/// Internal fused backward surface for sharing a forward-splat normalization field across both
-/// adjoints without expanding the public <see cref="IEngine"/> contract.
-/// </summary>
-internal interface IForwardSplatBackwardEngine
-{
-    Tensor<T> GetForwardSplatNormalizationWeights<T>(Tensor<T> flow);
-
-    Tensor<T> ForwardSplatBackwardInputWithWeights<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
-        bool normalize, Tensor<T>? normalizationWeights);
-
-    Tensor<T> ForwardSplatBackwardFlowWithWeights<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
-        bool normalize, Tensor<T>? normalizationWeights);
-}
-
 /// <summary>Portable video-warping primitives shared by CPU and all direct GPU backends.</summary>
-public partial class CpuEngine : IForwardSplatBackwardEngine
+public partial class CpuEngine
 {
     /// <inheritdoc />
     public virtual Tensor<T> PartialCorrelationVolume<T>(
@@ -310,21 +293,6 @@ public partial class CpuEngine : IForwardSplatBackwardEngine
         return gradient;
     }
 
-    Tensor<T> IForwardSplatBackwardEngine.GetForwardSplatNormalizationWeights<T>(Tensor<T> flow)
-        => GetForwardSplatNormalizationWeights(flow);
-
-    Tensor<T> IForwardSplatBackwardEngine.ForwardSplatBackwardInputWithWeights<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
-        bool normalize, Tensor<T>? normalizationWeights)
-        => ForwardSplatBackwardInputWithWeights(
-            gradOutput, input, flow, normalize, normalizationWeights);
-
-    Tensor<T> IForwardSplatBackwardEngine.ForwardSplatBackwardFlowWithWeights<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
-        bool normalize, Tensor<T>? normalizationWeights)
-        => ForwardSplatBackwardFlowWithWeights(
-            gradOutput, input, flow, output, normalize, normalizationWeights);
-
     /// <summary>
     /// Computes the safe [B,1,H,W] normalization field once for both splat adjoints. Empty
     /// destination pixels use one, matching the released average-soft-splat zero fallback.
@@ -387,14 +355,14 @@ public partial class CpuEngine : IForwardSplatBackwardEngine
             throw new ArgumentException("ForwardSplat requires input [B,C,H,W] and flow [B,2,H,W].");
     }
 
-    private static void ValidateSplatFlow<T>(Tensor<T> flow)
+    protected static void ValidateSplatFlow<T>(Tensor<T> flow)
     {
         if (flow is null) throw new ArgumentNullException(nameof(flow));
         if (flow.Rank != 4 || flow.Shape[1] != 2 || flow.Shape[2] <= 0 || flow.Shape[3] <= 0)
             throw new ArgumentException("ForwardSplat flow must have shape [B,2,H,W].", nameof(flow));
     }
 
-    private static void ValidateNormalizationWeights<T>(
+    protected static void ValidateNormalizationWeights<T>(
         Tensor<T>? normalizationWeights, Tensor<T> input)
     {
         if (normalizationWeights is null) return;
