@@ -219,6 +219,8 @@ internal sealed class CompiledDelegateChain<T>
         for (int i = 0; i < _count; i++)
         {
             ref var step = ref _steps[i];
+            if (!DifferentiableOps.IsGradientRequired(step.Output))
+                continue;
             if (!grads.TryGetValue(step.Output, out var gradOutput))
                 continue;
 

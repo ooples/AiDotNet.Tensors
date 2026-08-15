@@ -17697,10 +17697,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         if (!TryGetBackend(out var backend))
             return null;
-        var residentA = ResolveResidentBufferNoUpload(backend, a, a.Length);
-        var residentB = ResolveResidentBufferNoUpload(backend, b, b.Length);
-        if (residentA is null || residentB is null)
+        // Outside a resident/capture step, a direct buffer is usable only when it is the
+        // current tensor version and its cache owner is still live. ResolveResidentBufferNoUpload
+        // deliberately omits this gate for capture-time metadata views, so using it here could
+        // execute eager arithmetic against a stale pre-mutation buffer.
+        if (a._gpuBuffer is null || !ReferenceEquals(a._gpuBackend, backend)
+            || a._gpuBufferVersion != a.Version || !IsCachedGpuBufferLive(a, backend)
+            || a._gpuBuffer.Handle == System.IntPtr.Zero || a._gpuBuffer.Size < a.Length
+            || b._gpuBuffer is null || !ReferenceEquals(b._gpuBackend, backend)
+            || b._gpuBufferVersion != b.Version || !IsCachedGpuBufferLive(b, backend)
+            || b._gpuBuffer.Handle == System.IntPtr.Zero || b._gpuBuffer.Size < b.Length)
             return null;
+        var residentA = a._gpuBuffer;
+        var residentB = b._gpuBuffer;
         IGpuBuffer? output = null;
         try
         {

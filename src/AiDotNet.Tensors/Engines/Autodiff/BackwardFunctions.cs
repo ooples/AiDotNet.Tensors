@@ -6130,7 +6130,8 @@ internal static class BackwardFunctions<T>
         int inputFeatures = inputs[0]._shape[inputs[0].Rank - 1];
         int outputFeatures = inputs[1]._shape[1];
         if (inputs[1]._shape[0] != inputFeatures
-            || gradOutput.Length != checked(rows * outputFeatures))
+            || gradOutput.Length != checked(rows * outputFeatures)
+            || inputs.Length > 2 && inputs[2].Length != outputFeatures)
             return false;
 
         bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
@@ -6150,7 +6151,10 @@ internal static class BackwardFunctions<T>
             if (needsInputGradient)
             {
                 var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                var data = (float[])(object)result.GetDataArray();
+                var data = (float[])(object)(
+                    result.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "Selective linear backward requires writable contiguous CPU storage."));
                 Engines.BlasManaged.BlasManaged.Gemm<float>(
                     grad, outputFeatures, false, weight, outputFeatures, true,
                     data.AsSpan(0, rows * inputFeatures), inputFeatures,
@@ -6160,7 +6164,10 @@ internal static class BackwardFunctions<T>
             if (needsWeightGradient)
             {
                 var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                var data = (float[])(object)result.GetDataArray();
+                var data = (float[])(object)(
+                    result.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "Selective linear backward requires writable contiguous CPU storage."));
                 Engines.BlasManaged.BlasManaged.Gemm<float>(
                     input, inputFeatures, true, grad, outputFeatures, false,
                     data.AsSpan(0, inputFeatures * outputFeatures), outputFeatures,
@@ -6170,7 +6177,10 @@ internal static class BackwardFunctions<T>
             if (needsBiasGradient)
             {
                 var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var data = (float[])(object)result.GetDataArray();
+                var data = (float[])(object)(
+                    result.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "Selective linear backward requires writable contiguous CPU storage."));
                 Array.Clear(data, 0, result.Length);
                 for (int row = 0; row < rows; row++)
                 {
@@ -6196,7 +6206,10 @@ internal static class BackwardFunctions<T>
             if (needsInputGradient)
             {
                 var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                var data = (double[])(object)result.GetDataArray();
+                var data = (double[])(object)(
+                    result.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "Selective linear backward requires writable contiguous CPU storage."));
                 Engines.BlasManaged.BlasManaged.Gemm<double>(
                     grad, outputFeatures, false, weight, outputFeatures, true,
                     data.AsSpan(0, rows * inputFeatures), inputFeatures,
@@ -6206,7 +6219,10 @@ internal static class BackwardFunctions<T>
             if (needsWeightGradient)
             {
                 var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                var data = (double[])(object)result.GetDataArray();
+                var data = (double[])(object)(
+                    result.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "Selective linear backward requires writable contiguous CPU storage."));
                 Engines.BlasManaged.BlasManaged.Gemm<double>(
                     input, inputFeatures, true, grad, outputFeatures, false,
                     data.AsSpan(0, inputFeatures * outputFeatures), outputFeatures,
@@ -6216,7 +6232,10 @@ internal static class BackwardFunctions<T>
             if (needsBiasGradient)
             {
                 var result = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-                var data = (double[])(object)result.GetDataArray();
+                var data = (double[])(object)(
+                    result.GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? throw new InvalidOperationException(
+                        "Selective linear backward requires writable contiguous CPU storage."));
                 Array.Clear(data, 0, result.Length);
                 for (int row = 0; row < rows; row++)
                 {

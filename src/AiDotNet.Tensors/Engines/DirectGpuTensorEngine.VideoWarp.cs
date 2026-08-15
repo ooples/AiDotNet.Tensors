@@ -39,7 +39,7 @@ public partial class DirectGpuTensorEngine
             // These are all direct-GPU resident primitives. Keeping the operation in the shared
             // engine gives CUDA, HIP, Metal, OpenCL, Vulkan, and WebGPU identical displacement
             // ordering without six backend-specific correlation kernels or a host readback.
-            var paddedSecond = Pad(
+            var paddedSecond = ((IEngine)this).Pad(
                 second, radius, radius, radius, radius,
                 MathHelper.GetNumericOperations<T>().Zero);
             int offset = 0;

@@ -458,6 +458,34 @@ public class GradientCorrectnessTests : IDisposable
         }
     }
 
+    [Fact]
+    public void Checkpoint_NonContiguousSegmentBoundary_MatchesEagerValuesAndGradients()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.2f);
+        var weights = MakeFilled([3, 2], 0.1f, 0.05f);
+        Func<Tensor<float>, Tensor<float>> transpose = input =>
+            _engine.TensorPermute(input, [1, 0]);
+
+        (Tensor<float> Output, Tensor<float> Gradient) Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            var output = checkpoint
+                ? GradientCheckpointing<float>.Checkpoint([transpose], x, segmentSize: 1)
+                : transpose(x);
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(output, weights));
+            var gradients = tape.ComputeGradients(loss, [x]);
+            return (output, gradients[x]);
+        }
+
+        var eager = Run(checkpoint: false);
+        var checkpointed = Run(checkpoint: true);
+        Assert.Equal(eager.Output.Shape, checkpointed.Output.Shape);
+        for (int i = 0; i < eager.Output.Length; i++)
+            Assert.Equal(eager.Output[i], checkpointed.Output[i], 5);
+        for (int i = 0; i < eager.Gradient.Length; i++)
+            Assert.Equal(eager.Gradient[i], checkpointed.Gradient[i], 5);
+    }
+
     /// <summary>
     /// A checkpointed segment that uses a WEIGHT (matmul) must produce a weight gradient identical to
     /// the eager (non-checkpointed) run — not just the input gradient. Activation checkpointing is a

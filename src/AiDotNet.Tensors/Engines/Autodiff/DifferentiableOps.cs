@@ -549,6 +549,11 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
+        // This overload explicitly transfers disposal responsibility back to its caller.
+        // An irrelevant contribution was never donated to an accumulator, so the caller may
+        // immediately return its scratch buffer instead of leaking the rental.
+        if (!IsGradientRequired(tensor)) return true;
+
         bool needsOutOfPlace = _isBackwardCreateGraph;
         bool wasAlreadyOwned = !needsOutOfPlace && IsAccumulatorBufferOwned(grad);
         int idx = tensor._gradIndex;
@@ -598,12 +603,13 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
-        // Requested-source pruning: do not retain or propagate gradients that cannot reach a
-        // requested source. GradientTape installs the reachability set before every backward
-        // implementation (compiled chain, GradFn graph, and tape walk), so this also terminates
-        // traversal at the first frozen boundary instead of computing the entire upstream graph
-        // and discarding it only when the final dictionary is filtered.
-        if (!IsGradientRequired(tensor)) return;
+        // Requested-source traversal is pruned by the tape/compiled execution loops, and the
+        // expensive multi-input backward functions query IsGradientRequired before allocating.
+        // Do not drop an arbitrary contribution here: many older backward functions rent a
+        // buffer before calling AccumulateGrad, while others pass a borrowed gradOutput reused
+        // by a later input. Silently returning from this donation point either leaked the rental
+        // or made generic reclamation unsafe. Storing the contribution preserves ownership until
+        // the normal filtered-gradient cleanup; AccumulateGradPoolable handles disposable scratch.
 
         // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward

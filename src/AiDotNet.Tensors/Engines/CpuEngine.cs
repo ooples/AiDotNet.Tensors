@@ -20554,19 +20554,22 @@ public partial class CpuEngine : ITensorLevelEngine
         out Tensor<T> result)
     {
         result = null!;
-        long rowsLong = (long)batch * outputDepth * outputHeight * outputWidth;
-        long columnsPerRowLong = (long)inChannels * kernelDepth * kernelHeight * kernelWidth;
-        long gradOutputElementsLong = rowsLong * outChannels;
-        long columnElementsLong = rowsLong * columnsPerRowLong;
         int elementSize = typeof(T) == typeof(float) ? sizeof(float) : sizeof(double);
-        long workspaceBytes = checked((gradOutputElementsLong + columnElementsLong) * elementSize);
-        if (rowsLong <= 0 || columnsPerRowLong <= 0
-            || rowsLong > int.MaxValue || columnsPerRowLong > int.MaxValue
-            || gradOutputElementsLong > int.MaxValue || columnElementsLong > int.MaxValue
-            || workspaceBytes > Conv3DIm2ColWorkspaceBytes)
+        long maxElements = Math.Min(int.MaxValue, Conv3DIm2ColWorkspaceBytes / elementSize);
+        if (outChannels <= 0
+            || !TryBoundedPositiveProduct4(
+                batch, outputDepth, outputHeight, outputWidth, maxElements, out long rowsLong)
+            || !TryBoundedPositiveProduct4(
+                inChannels, kernelDepth, kernelHeight, kernelWidth,
+                maxElements, out long columnsPerRowLong)
+            || rowsLong > maxElements / outChannels)
         {
             return false;
         }
+        long gradOutputElementsLong = rowsLong * outChannels;
+        long remainingElements = maxElements - gradOutputElementsLong;
+        if (rowsLong > remainingElements / columnsPerRowLong) return false;
+        long columnElementsLong = rowsLong * columnsPerRowLong;
 
         int rows = (int)rowsLong;
         int columnsPerRow = (int)columnsPerRowLong;
@@ -20649,22 +20652,25 @@ public partial class CpuEngine : ITensorLevelEngine
         out Tensor<T> result)
     {
         result = null!;
-        long rowsLong = (long)batch * outputDepth * outputHeight * outputWidth;
-        long columnsPerRowLong = (long)inChannels * kernelDepth * kernelHeight * kernelWidth;
-        long gradOutputElementsLong = rowsLong * outChannels;
-        long columnElementsLong = rowsLong * columnsPerRowLong;
-        long transposedKernelElementsLong = columnsPerRowLong * outChannels;
         int elementSize = typeof(T) == typeof(float) ? sizeof(float) : sizeof(double);
-        long workspaceBytes = checked(
-            (gradOutputElementsLong + columnElementsLong + transposedKernelElementsLong) * elementSize);
-        if (rowsLong <= 0 || columnsPerRowLong <= 0
-            || rowsLong > int.MaxValue || columnsPerRowLong > int.MaxValue
-            || gradOutputElementsLong > int.MaxValue || columnElementsLong > int.MaxValue
-            || transposedKernelElementsLong > int.MaxValue
-            || workspaceBytes > Conv3DIm2ColWorkspaceBytes)
+        long maxElements = Math.Min(int.MaxValue, Conv3DIm2ColWorkspaceBytes / elementSize);
+        if (outChannels <= 0
+            || !TryBoundedPositiveProduct4(
+                batch, outputDepth, outputHeight, outputWidth, maxElements, out long rowsLong)
+            || !TryBoundedPositiveProduct4(
+                inChannels, kernelDepth, kernelHeight, kernelWidth,
+                maxElements, out long columnsPerRowLong)
+            || rowsLong > maxElements / outChannels)
         {
             return false;
         }
+        long gradOutputElementsLong = rowsLong * outChannels;
+        long remainingElements = maxElements - gradOutputElementsLong;
+        if (rowsLong > remainingElements / columnsPerRowLong) return false;
+        long columnElementsLong = rowsLong * columnsPerRowLong;
+        remainingElements -= columnElementsLong;
+        if (columnsPerRowLong > remainingElements / outChannels) return false;
+        long transposedKernelElementsLong = columnsPerRowLong * outChannels;
 
         int rows = (int)rowsLong;
         int columnsPerRow = (int)columnsPerRowLong;
@@ -20729,6 +20735,29 @@ public partial class CpuEngine : ITensorLevelEngine
             if (transposedGradKernel is not null)
                 System.Buffers.ArrayPool<T>.Shared.Return(transposedGradKernel);
         }
+    }
+
+    private static bool TryBoundedPositiveProduct4(
+        int first,
+        int second,
+        int third,
+        int fourth,
+        long limit,
+        out long product)
+    {
+        product = 1;
+        if (first <= 0 || second <= 0 || third <= 0 || fourth <= 0 || limit <= 0)
+            return false;
+
+        if (product > limit / first) return false;
+        product *= first;
+        if (product > limit / second) return false;
+        product *= second;
+        if (product > limit / third) return false;
+        product *= third;
+        if (product > limit / fourth) return false;
+        product *= fourth;
+        return true;
     }
 
     private static void PackConv3DOutputRows<T>(

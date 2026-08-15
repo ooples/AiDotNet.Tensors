@@ -94,7 +94,7 @@ public static class GradientCheckpointing<T>
                 // activation instead of letting the caller's outer training arena retain the
                 // no-grad scratch until the end of the whole model step. A nested arena does not
                 // return its buffers to the shared pool because layers may cache internal tensors.
-                segmentOutput = new Tensor<T>(segmentOutput.AsSpan().ToArray(), segmentOutput.Shape.ToArray());
+                segmentOutput = CloneCheckpointBoundary(segmentOutput);
             }
 
             // Record a single "checkpoint" op that recomputes during backward. A selective
@@ -228,13 +228,13 @@ public static class GradientCheckpointing<T>
                         {
                             if (ReferenceEquals(kvp.Key, gradOutput) || kvp.Value is null) continue;
                             var key = ReferenceEquals(kvp.Key, reInputDetached) ? reInput : kvp.Key;
-                            var copied = new Tensor<T>(kvp.Value.AsSpan().ToArray(), kvp.Value.Shape.ToArray());
+                            var copied = CloneCheckpointBoundary(kvp.Value);
                             detachedGradients.Add((key, copied));
                         }
 
                         if (detachedGradients.Count == 0 && ReferenceEquals(reOutput, reInputDetached))
                         {
-                            var copied = new Tensor<T>(gradOutput.AsSpan().ToArray(), gradOutput.Shape.ToArray());
+                            var copied = CloneCheckpointBoundary(gradOutput);
                             detachedGradients.Add((reInput, copied));
                         }
                     }
@@ -260,6 +260,17 @@ public static class GradientCheckpointing<T>
         }
 
         return current2;
+    }
+
+    /// <summary>
+    /// Copies a checkpoint boundary into ordinary owned storage. Segment outputs and VJPs may
+    /// be transpose/permute views, whose logical order cannot be exposed through AsSpan until
+    /// the view is materialized.
+    /// </summary>
+    private static Tensor<T> CloneCheckpointBoundary(Tensor<T> source)
+    {
+        var contiguous = source.IsContiguous ? source : source.Contiguous();
+        return new Tensor<T>(contiguous.AsSpan().ToArray(), source.Shape.ToArray());
     }
 
     private static bool ShapesEqual(int[] a, int[] b)
