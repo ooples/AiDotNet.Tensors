@@ -112,11 +112,11 @@ public sealed class VideoWarpOperationsTests
         var random = new Random(1789);
         var input = new Tensor<float>(
             Enumerable.Range(0, batch * channels * height * width)
-                .Select(_ => random.NextSingle() * 2f - 1f).ToArray(),
+                .Select(_ => (float)random.NextDouble() * 2f - 1f).ToArray(),
             [batch, channels, height, width]);
         var flow = new Tensor<float>(
             Enumerable.Range(0, batch * 2 * height * width)
-                .Select(_ => random.NextSingle() * 1.5f - 0.75f).ToArray(),
+                .Select(_ => (float)random.NextDouble() * 1.5f - 0.75f).ToArray(),
             [batch, 2, height, width]);
         int savedParallelism = CpuParallelSettings.MaxDegreeOfParallelism;
 
