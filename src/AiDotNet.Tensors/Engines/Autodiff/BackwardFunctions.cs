@@ -992,6 +992,10 @@ internal static class BackwardFunctions<T>
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
+        bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
+        bool needsKernelGradient = DifferentiableOps.IsGradientRequired(inputs[1]);
+
+        if (!needsInputGradient && !needsKernelGradient) return;
 
         // #1662 lever #4: route the conv backward OUTPUT gradients through the per-step arena
         // (AutoTensorCache -> TensorAllocator -> TensorArena) instead of the raw `new float[]`
@@ -1000,26 +1004,38 @@ internal static class BackwardFunctions<T>
         // 98-99.9% for matmul/attention backward). The *Into variants fill a rented buffer and
         // zero it first (accumulate:false -> Array.Clear), so renting uninitialized memory is
         // safe. CPU-only; the GPU engine keeps the allocating path.
-        Tensor<T> gradInput, gradKernel;
         if (engine is CpuEngine cpu)
         {
-            gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-            gradKernel = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            cpu.Conv2DBackwardInputInto(
-                gradInput, gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation, accumulate: false);
-            cpu.Conv2DBackwardKernelInto(
-                gradKernel, gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation, accumulate: false);
+            if (needsInputGradient)
+            {
+                var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                cpu.Conv2DBackwardInputInto(
+                    gradInput, gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation, accumulate: false);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+            }
+            if (needsKernelGradient)
+            {
+                var gradKernel = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                cpu.Conv2DBackwardKernelInto(
+                    gradKernel, gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation, accumulate: false);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+            }
         }
         else
         {
-            gradInput = engine.Conv2DBackwardInput(
-                gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
-            gradKernel = engine.Conv2DBackwardKernel(
-                gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation);
+            if (needsInputGradient)
+            {
+                var gradInput = engine.Conv2DBackwardInput(
+                    gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+            }
+            if (needsKernelGradient)
+            {
+                var gradKernel = engine.Conv2DBackwardKernel(
+                    gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+            }
         }
-
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
     }
 
     /// <summary>Conv1D backward: reshapes 3D inputs to 4D, delegates to Conv2DBackward logic, reshapes back</summary>
@@ -1066,13 +1082,18 @@ internal static class BackwardFunctions<T>
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
 
-        var gradInput = engine.Conv3DBackwardInput(
-            gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
-        var gradKernel = engine.Conv3DBackwardKernel(
-            gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation);
-
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+        if (DifferentiableOps.IsGradientRequired(inputs[0]))
+        {
+            var gradInput = engine.Conv3DBackwardInput(
+                gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        }
+        if (DifferentiableOps.IsGradientRequired(inputs[1]))
+        {
+            var gradKernel = engine.Conv3DBackwardKernel(
+                gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
+        }
     }
 
     /// <summary>GridSample backward: uses engine.GridSampleBackwardInput and GridSampleBackwardGrid</summary>

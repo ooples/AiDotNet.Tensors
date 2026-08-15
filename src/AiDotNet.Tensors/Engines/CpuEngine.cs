@@ -20148,6 +20148,27 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[3];
         int outputWidth = gradOutput._shape[4];
 
+        // Conv3D forward already lowers primitive floating-point tensors to im2col + GEMM.
+        // Use the corresponding matrix identity for dInput as well:
+        //   dColumns[rows, C*KD*KH*KW] = dOutput[rows, OC] * kernel[OC, C*KD*KH*KW]
+        // followed by a race-free col2im scatter over independent (batch, input-channel) slices.
+        // The previous implementation evaluated that contraction through seven scalar loops and was
+        // the dominant hot path in paper-scale video-diffusion training. Keep the bounded-workspace
+        // guard and the generic loop below as the fallback for oversized or non-primitive tensors.
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && TryConv3DBackwardInputGemm(
+                gradOutput, kernel, inputShape,
+                batch, inChannels, depth, height, width,
+                outChannels, kernelDepth, kernelHeight, kernelWidth,
+                outputDepth, outputHeight, outputWidth,
+                strideD, strideH, strideW,
+                padD, padH, padW,
+                dilationD, dilationH, dilationW,
+                out var gemmGradInput))
+        {
+            return gemmGradInput;
+        }
+
         var gradInputData = new T[batch * inChannels * depth * height * width];
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
@@ -20340,6 +20361,24 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[3];
         int outputWidth = gradOutput._shape[4];
 
+        // dKernel is another im2col contraction:
+        //   dKernel^T[K, OC] = columns^T[K, rows] * dOutput[rows, OC].
+        // This shares the exact receptive-field lowering used by Conv3D forward, so stride,
+        // padding, and dilation semantics cannot drift between the forward and backward paths.
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && TryConv3DBackwardKernelGemm(
+                gradOutput, input, kernelShape,
+                batch, inChannels, depth, height, width,
+                outChannels, kernelDepth, kernelHeight, kernelWidth,
+                outputDepth, outputHeight, outputWidth,
+                strideD, strideH, strideW,
+                padD, padH, padW,
+                dilationD, dilationH, dilationW,
+                out var gemmGradKernel))
+        {
+            return gemmGradKernel;
+        }
+
         var gradKernelData = new T[outChannels * inChannels * kernelDepth * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -20485,6 +20524,338 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         return TensorAllocator.Rent<T>(kernelShape, gradKernelData);
+    }
+
+    private static bool TryConv3DBackwardInputGemm<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> kernel,
+        int[] inputShape,
+        int batch,
+        int inChannels,
+        int depth,
+        int height,
+        int width,
+        int outChannels,
+        int kernelDepth,
+        int kernelHeight,
+        int kernelWidth,
+        int outputDepth,
+        int outputHeight,
+        int outputWidth,
+        int strideDepth,
+        int strideHeight,
+        int strideWidth,
+        int padDepth,
+        int padHeight,
+        int padWidth,
+        int dilationDepth,
+        int dilationHeight,
+        int dilationWidth,
+        out Tensor<T> result)
+    {
+        result = null!;
+        long rowsLong = (long)batch * outputDepth * outputHeight * outputWidth;
+        long columnsPerRowLong = (long)inChannels * kernelDepth * kernelHeight * kernelWidth;
+        long gradOutputElementsLong = rowsLong * outChannels;
+        long columnElementsLong = rowsLong * columnsPerRowLong;
+        int elementSize = typeof(T) == typeof(float) ? sizeof(float) : sizeof(double);
+        long workspaceBytes = checked((gradOutputElementsLong + columnElementsLong) * elementSize);
+        if (rowsLong <= 0 || columnsPerRowLong <= 0
+            || rowsLong > int.MaxValue || columnsPerRowLong > int.MaxValue
+            || gradOutputElementsLong > int.MaxValue || columnElementsLong > int.MaxValue
+            || workspaceBytes > Conv3DIm2ColWorkspaceBytes)
+        {
+            return false;
+        }
+
+        int rows = (int)rowsLong;
+        int columnsPerRow = (int)columnsPerRowLong;
+        int spatial = checked(outputDepth * outputHeight * outputWidth);
+        T[]? flatGradOutput = null;
+        T[]? gradColumns = null;
+        try
+        {
+            flatGradOutput = System.Buffers.ArrayPool<T>.Shared.Rent((int)gradOutputElementsLong);
+            gradColumns = System.Buffers.ArrayPool<T>.Shared.Rent((int)columnElementsLong);
+            var gradOutputData = gradOutput.GetReadOnlyDataArray();
+            var kernelData = kernel.GetReadOnlyDataArray();
+            PackConv3DOutputRows(gradOutputData, flatGradOutput, batch, outChannels, spatial);
+
+            bool multiplied;
+            if (typeof(T) == typeof(float))
+            {
+                multiplied = Helpers.BlasProvider.TryGemmEx(
+                    rows, columnsPerRow, outChannels,
+                    (float[])(object)flatGradOutput, 0, outChannels, false,
+                    (float[])(object)kernelData, 0, columnsPerRow, false,
+                    (float[])(object)gradColumns, 0, columnsPerRow);
+            }
+            else
+            {
+                multiplied = Helpers.BlasProvider.TryGemmEx(
+                    rows, columnsPerRow, outChannels,
+                    (double[])(object)flatGradOutput, 0, outChannels, false,
+                    (double[])(object)kernelData, 0, columnsPerRow, false,
+                    (double[])(object)gradColumns, 0, columnsPerRow);
+            }
+            if (!multiplied) return false;
+
+            var gradInputData = new T[checked(batch * inChannels * depth * height * width)];
+            ScatterConv3DColumnsToInput(
+                gradColumns, gradInputData,
+                batch, inChannels, depth, height, width,
+                kernelDepth, kernelHeight, kernelWidth,
+                outputDepth, outputHeight, outputWidth,
+                strideDepth, strideHeight, strideWidth,
+                padDepth, padHeight, padWidth,
+                dilationDepth, dilationHeight, dilationWidth);
+            result = TensorAllocator.Rent<T>(inputShape, gradInputData);
+            return true;
+        }
+        finally
+        {
+            if (flatGradOutput is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(flatGradOutput);
+            if (gradColumns is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(gradColumns);
+        }
+    }
+
+    private static bool TryConv3DBackwardKernelGemm<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
+        int[] kernelShape,
+        int batch,
+        int inChannels,
+        int depth,
+        int height,
+        int width,
+        int outChannels,
+        int kernelDepth,
+        int kernelHeight,
+        int kernelWidth,
+        int outputDepth,
+        int outputHeight,
+        int outputWidth,
+        int strideDepth,
+        int strideHeight,
+        int strideWidth,
+        int padDepth,
+        int padHeight,
+        int padWidth,
+        int dilationDepth,
+        int dilationHeight,
+        int dilationWidth,
+        out Tensor<T> result)
+    {
+        result = null!;
+        long rowsLong = (long)batch * outputDepth * outputHeight * outputWidth;
+        long columnsPerRowLong = (long)inChannels * kernelDepth * kernelHeight * kernelWidth;
+        long gradOutputElementsLong = rowsLong * outChannels;
+        long columnElementsLong = rowsLong * columnsPerRowLong;
+        long transposedKernelElementsLong = columnsPerRowLong * outChannels;
+        int elementSize = typeof(T) == typeof(float) ? sizeof(float) : sizeof(double);
+        long workspaceBytes = checked(
+            (gradOutputElementsLong + columnElementsLong + transposedKernelElementsLong) * elementSize);
+        if (rowsLong <= 0 || columnsPerRowLong <= 0
+            || rowsLong > int.MaxValue || columnsPerRowLong > int.MaxValue
+            || gradOutputElementsLong > int.MaxValue || columnElementsLong > int.MaxValue
+            || transposedKernelElementsLong > int.MaxValue
+            || workspaceBytes > Conv3DIm2ColWorkspaceBytes)
+        {
+            return false;
+        }
+
+        int rows = (int)rowsLong;
+        int columnsPerRow = (int)columnsPerRowLong;
+        int spatial = checked(outputDepth * outputHeight * outputWidth);
+        T[]? columns = null;
+        T[]? flatGradOutput = null;
+        T[]? transposedGradKernel = null;
+        try
+        {
+            columns = System.Buffers.ArrayPool<T>.Shared.Rent((int)columnElementsLong);
+            flatGradOutput = System.Buffers.ArrayPool<T>.Shared.Rent((int)gradOutputElementsLong);
+            transposedGradKernel = System.Buffers.ArrayPool<T>.Shared.Rent((int)transposedKernelElementsLong);
+            var inputData = input.GetReadOnlyDataArray();
+            var gradOutputData = gradOutput.GetReadOnlyDataArray();
+            Helpers.CpuIm2Col3DHelper.BuildColumns(
+                inputData, columns,
+                batch, inChannels, depth, height, width,
+                kernelDepth, kernelHeight, kernelWidth,
+                outputDepth, outputHeight, outputWidth,
+                strideDepth, strideHeight, strideWidth,
+                padDepth, padHeight, padWidth,
+                dilationDepth, dilationHeight, dilationWidth);
+            PackConv3DOutputRows(gradOutputData, flatGradOutput, batch, outChannels, spatial);
+
+            bool multiplied;
+            if (typeof(T) == typeof(float))
+            {
+                multiplied = Helpers.BlasProvider.TryGemmEx(
+                    columnsPerRow, outChannels, rows,
+                    (float[])(object)columns, 0, columnsPerRow, true,
+                    (float[])(object)flatGradOutput, 0, outChannels, false,
+                    (float[])(object)transposedGradKernel, 0, outChannels);
+            }
+            else
+            {
+                multiplied = Helpers.BlasProvider.TryGemmEx(
+                    columnsPerRow, outChannels, rows,
+                    (double[])(object)columns, 0, columnsPerRow, true,
+                    (double[])(object)flatGradOutput, 0, outChannels, false,
+                    (double[])(object)transposedGradKernel, 0, outChannels);
+            }
+            if (!multiplied) return false;
+
+            var gradKernelData = new T[checked(outChannels * columnsPerRow)];
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels,
+                (long)outChannels * columnsPerRow, oc =>
+            {
+                int destinationBase = oc * columnsPerRow;
+                for (int column = 0; column < columnsPerRow; column++)
+                    gradKernelData[destinationBase + column] =
+                        transposedGradKernel[column * outChannels + oc];
+            }, deterministicSafe: true);
+            result = TensorAllocator.Rent<T>(kernelShape, gradKernelData);
+            return true;
+        }
+        finally
+        {
+            if (columns is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(columns);
+            if (flatGradOutput is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(flatGradOutput);
+            if (transposedGradKernel is not null)
+                System.Buffers.ArrayPool<T>.Shared.Return(transposedGradKernel);
+        }
+    }
+
+    private static void PackConv3DOutputRows<T>(
+        T[] source,
+        T[] destination,
+        int batch,
+        int channels,
+        int spatial)
+    {
+        int rows = checked(batch * spatial);
+        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * channels, row =>
+        {
+            int b = row / spatial;
+            int position = row - b * spatial;
+            int destinationBase = row * channels;
+            for (int channel = 0; channel < channels; channel++)
+                destination[destinationBase + channel] = source[(b * channels + channel) * spatial + position];
+        }, deterministicSafe: true);
+    }
+
+    private static void ScatterConv3DColumnsToInput<T>(
+        T[] columns,
+        T[] gradInput,
+        int batch,
+        int channels,
+        int depth,
+        int height,
+        int width,
+        int kernelDepth,
+        int kernelHeight,
+        int kernelWidth,
+        int outputDepth,
+        int outputHeight,
+        int outputWidth,
+        int strideDepth,
+        int strideHeight,
+        int strideWidth,
+        int padDepth,
+        int padHeight,
+        int padWidth,
+        int dilationDepth,
+        int dilationHeight,
+        int dilationWidth)
+    {
+        int columnsPerRow = checked(channels * kernelDepth * kernelHeight * kernelWidth);
+        int kernelPlane = checked(kernelHeight * kernelWidth);
+        int kernelVolume = checked(kernelDepth * kernelPlane);
+        int outputPlane = checked(outputHeight * outputWidth);
+        int outputSpatial = checked(outputDepth * outputPlane);
+        int inputPlane = checked(height * width);
+        int inputSpatial = checked(depth * inputPlane);
+
+        if (typeof(T) == typeof(float))
+        {
+            var source = (float[])(object)columns;
+            var destination = (float[])(object)gradInput;
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels,
+                (long)batch * channels * outputSpatial * kernelVolume, index =>
+            {
+                int b = index / channels;
+                int channel = index - b * channels;
+                int destinationChannelBase = (b * channels + channel) * inputSpatial;
+                int columnChannelOffset = channel * kernelVolume;
+                for (int od = 0; od < outputDepth; od++)
+                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    int row = b * outputSpatial + od * outputPlane + oh * outputWidth + ow;
+                    int columnBase = row * columnsPerRow + columnChannelOffset;
+                    for (int kd = 0; kd < kernelDepth; kd++)
+                    {
+                        int id = od * strideDepth + kd * dilationDepth - padDepth;
+                        if ((uint)id >= (uint)depth) continue;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            int ih = oh * strideHeight + kh * dilationHeight - padHeight;
+                            if ((uint)ih >= (uint)height) continue;
+                            int inputRowBase = destinationChannelBase + id * inputPlane + ih * width;
+                            int kernelRowBase = columnBase + kd * kernelPlane + kh * kernelWidth;
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int iw = ow * strideWidth + kw * dilationWidth - padWidth;
+                                if ((uint)iw < (uint)width)
+                                    destination[inputRowBase + iw] += source[kernelRowBase + kw];
+                            }
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        var sourceDouble = (double[])(object)columns;
+        var destinationDouble = (double[])(object)gradInput;
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels,
+            (long)batch * channels * outputSpatial * kernelVolume, index =>
+        {
+            int b = index / channels;
+            int channel = index - b * channels;
+            int destinationChannelBase = (b * channels + channel) * inputSpatial;
+            int columnChannelOffset = channel * kernelVolume;
+            for (int od = 0; od < outputDepth; od++)
+            for (int oh = 0; oh < outputHeight; oh++)
+            for (int ow = 0; ow < outputWidth; ow++)
+            {
+                int row = b * outputSpatial + od * outputPlane + oh * outputWidth + ow;
+                int columnBase = row * columnsPerRow + columnChannelOffset;
+                for (int kd = 0; kd < kernelDepth; kd++)
+                {
+                    int id = od * strideDepth + kd * dilationDepth - padDepth;
+                    if ((uint)id >= (uint)depth) continue;
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    {
+                        int ih = oh * strideHeight + kh * dilationHeight - padHeight;
+                        if ((uint)ih >= (uint)height) continue;
+                        int inputRowBase = destinationChannelBase + id * inputPlane + ih * width;
+                        int kernelRowBase = columnBase + kd * kernelPlane + kh * kernelWidth;
+                        for (int kw = 0; kw < kernelWidth; kw++)
+                        {
+                            int iw = ow * strideWidth + kw * dilationWidth - padWidth;
+                            if ((uint)iw < (uint)width)
+                                destinationDouble[inputRowBase + iw] += sourceDouble[kernelRowBase + kw];
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// <inheritdoc/>

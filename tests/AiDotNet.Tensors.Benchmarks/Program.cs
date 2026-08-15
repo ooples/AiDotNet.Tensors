@@ -1331,6 +1331,14 @@ class Program
             return;
         }
 
+        // Conv3D backward at four-frame video-diffusion temporal-block shapes.
+        // This is the regression surface for the im2col/GEMM dInput and dKernel paths.
+        if (args[0] == "--conv3d-backward")
+        {
+            BenchmarkRunner.Run<Conv3DBackwardBenchmarks>(BenchConfig);
+            return;
+        }
+
         // FP64 primitive ops (BatchNorm, LayerNorm, Softmax, activations,
         // pools). Stage 0 baseline for Stage 4 SIMD ports of currently-scalar
         // FP64 primitives. (~10-20min).
@@ -1526,6 +1534,7 @@ class Program
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-matmul-double : FP64 GEMM at DiT-XL + cluster-#6 shapes; Stage 0 baseline (docs/mkl-replacement/PLAN.md)");
         Console.WriteLine("  --conv2d-backward-double : FP64 Conv2DBackward dW+dX across cluster-#6 shapes; Stage 0 baseline");
+        Console.WriteLine("  --conv3d-backward : FP32 Conv3D dInput+dKernel at video-diffusion temporal-block shapes");
         Console.WriteLine("  --fp64-primitives   : FP64 BN/LN/Softmax/activations/pools; Stage 0 baseline for Stage 4");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
