@@ -206,6 +206,23 @@ internal sealed class FusedOptimizerCheckpoint
     public FusedOptimizerExtras Extras { get; set; } = new FusedOptimizerExtras();
     public FusedLrScheduleCheckpoint[] Schedules { get; set; } = System.Array.Empty<FusedLrScheduleCheckpoint>();
     public int[]? ParamToGroup { get; set; }
+
+    /// <summary>
+    /// Per-group optimizer types, or null when every group runs <see cref="OptimizerType"/>.
+    /// </summary>
+    /// <remarks>
+    /// Nullable so checkpoints written before per-group optimizers existed still load: absent means uniform,
+    /// which is exactly what those older plans were. Restoring WITHOUT this would silently rebuild a
+    /// heterogeneous plan as a uniform one — every group quietly switched to the fallback optimizer, mid-run,
+    /// with no error.
+    /// </remarks>
+    public OptimizerType[]? GroupOptimizerTypes { get; set; }
+
+    /// <summary>
+    /// Per-group weight decay, or null when every group uses <see cref="WeightDecay"/>.
+    /// </summary>
+    public float[]? GroupWeightDecays { get; set; }
+
     public FusedOptimizerScalarCheckpoint Scalars { get; set; } = new FusedOptimizerScalarCheckpoint();
     public FusedOptimizerParameterCheckpoint[] Parameters { get; set; } = System.Array.Empty<FusedOptimizerParameterCheckpoint>();
 }
