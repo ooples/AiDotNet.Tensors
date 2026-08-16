@@ -3165,7 +3165,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.LARS:
                             // velocity=pM; layer-wise trust ratio consumes wd + trust coefficient.
                             FusedOptimizer.LARSUpdateSimd(pParam, pGrad, pM, len,
-                                lr, extras.Momentum, wd, extras.TrustCoefficient);
+                                lr, extras.Momentum, wd, extras.TrustCoefficient, epsVal);
                             break;
                         case OptimizerType.FTRL:
                             // z=pV, n=pVMax; FTRL applies its own L1/L2 regularization.
@@ -3782,7 +3782,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.LARS:
                             FusedOptimizer.LARSUpdateSimd(pParam, pGrad, pM, len,
-                                lr, extras.Momentum, wd, extras.TrustCoefficient);
+                                lr, extras.Momentum, wd, extras.TrustCoefficient, epsVal);
                             break;
                         case OptimizerType.FTRL:
                             FusedOptimizer.FTRLUpdateSimd(pParam, pGrad, pV, pVMax, len,
