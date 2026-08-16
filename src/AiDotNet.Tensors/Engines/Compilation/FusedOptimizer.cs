@@ -2650,5 +2650,19 @@ public enum OptimizerType
     /// two-phase shape HypergradientSGD uses. The radius is fixed per configuration: adapting it requires
     /// the loss at the trial point, which a fused step has no way to obtain.
     /// </remarks>
-    TrustRegion = 23
+    TrustRegion = 23,
+
+    /// <summary>Fletcher-Reeves conjugate gradient:
+    /// <c>beta = (g.g)/(g_prev.g_prev); d = -g + beta*d_prev; x += lr*d</c>,
+    /// with a Powell restart to steepest descent whenever <c>d.g &gt;= 0</c>.</summary>
+    /// <remarks>
+    /// Structurally SGD-with-momentum where the momentum coefficient is RECOMPUTED every step from a global
+    /// reduction, which is exactly why it cannot reuse the SGDMomentum kernel: that one bakes beta1 in when
+    /// the plan is built. Two reductions per step (g.g for beta, d.g for the restart test) followed by an
+    /// elementwise update - the same two-phase shape HypergradientSGD uses.
+    ///
+    /// No line search: the step length is the schedule's lr. Classical CG line-searches along d, which needs
+    /// loss evaluations the fused step has no way to obtain.
+    /// </remarks>
+    ConjugateGradient = 24
 }
