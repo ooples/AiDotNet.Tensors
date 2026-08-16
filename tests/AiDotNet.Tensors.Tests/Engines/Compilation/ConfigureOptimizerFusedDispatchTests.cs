@@ -48,6 +48,10 @@ public class ConfigureOptimizerFusedDispatchTests
         OptimizerType.FTRL,
         OptimizerType.ASGD,
         OptimizerType.Rprop,
+        // Wired via the global-reduction path, not per-element kernels.
+        OptimizerType.LBFGS,
+        OptimizerType.TrustRegion,
+        OptimizerType.ConjugateGradient,
     };
 
     public static TheoryData<OptimizerType> GpuPlanSupportedOptimizers => new()
@@ -203,15 +207,13 @@ public class ConfigureOptimizerFusedDispatchTests
     /// Optimizers that need an execution model the fused plan can't provide are
     /// intentionally NOT wired and must be rejected at configure time, so models
     /// using them fall back to the eager tape cleanly:
-    ///  • SparseAdam — sparse-gradient index lists (the plan operates on dense grads),
-    ///  • LBFGS — closure line-search (multiple loss evaluations per step).
-    /// (HypergradientSGD and DAdaptationSGD are wired via the two-phase
-    /// global-reduction path; ScheduleFreeSGD is wired via the pre-forward
-    /// parameter-transform hook — see the dedicated tests below.)
+    ///  • SparseAdam — sparse-gradient index lists (the plan operates on dense grads).
+    /// (HypergradientSGD, DAdaptationSGD, LBFGS, TrustRegion and ConjugateGradient are all wired via the
+    /// two-phase global-reduction path — none of them is a per-element kernel, which the plan never
+    /// required; ScheduleFreeSGD is wired via the pre-forward parameter-transform hook.)
     /// </summary>
     [Theory]
     [InlineData(OptimizerType.SparseAdam)]
-    [InlineData(OptimizerType.LBFGS)]
     public void ConfigureOptimizer_UnwiredOptimizer_Throws(OptimizerType opt)
     {
         var engine = new CpuEngine();

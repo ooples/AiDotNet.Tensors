@@ -251,6 +251,13 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--direct-ptx-cast-fp16")
+        {
+            DirectPtxCastFp16Experiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int castRuns) ? castRuns : 1);
+            return;
+        }
+
         // GPU-free cubin generation, verification and SASS audit for the optimizer family.
         // Without these the artifact pipeline had no way to invoke DirectPtxOptimizerCubinTool
         // through the benchmark executable, which is how every other family is driven.

@@ -161,6 +161,7 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(scalars.DAdaptationEstimate);
         writer.Write(scalars.DAdaptationRAccum);
         writer.Write(scalars.ScheduleFreeWeightSum);
+        writer.Write(scalars.ConjugateGradientPrevGradNorm2);
     }
 
     private static FusedOptimizerScalarCheckpoint ReadScalars(BinaryReader reader)
@@ -170,6 +171,7 @@ internal static class FusedOptimizerCheckpointSerializer
             DAdaptationEstimate = reader.ReadSingle(),
             DAdaptationRAccum = reader.ReadSingle(),
             ScheduleFreeWeightSum = reader.ReadSingle(),
+            ConjugateGradientPrevGradNorm2 = reader.ReadSingle(),
         };
 
     private static void WriteParameter(BinaryWriter writer, FusedOptimizerParameterCheckpoint p)
