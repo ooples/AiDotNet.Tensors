@@ -126,6 +126,26 @@ public class GpuCpuConsistencyTests
     }
 
     [SkippableFact]
+    public void EagerResidentBinary_ReuploadsVersionBumpedInput()
+    {
+        SkipIfNoDirectGpu();
+        using var gpu = new DirectGpuTensorEngine();
+        var left = new Tensor<float>([1f, 2f, 3f, 4f], [4]);
+        var right = new Tensor<float>([2f, 2f, 2f, 2f], [4]);
+
+        var warm = gpu.TensorAdd(left, right).ToArray();
+        Assert.Equal(3f, warm[0], 5);
+
+        // SetFlat bumps Version while leaving the previous resident pointer attached. The eager
+        // resident shortcut must reject that stale snapshot and let the normal upload path refresh it.
+        left[0] = 10f;
+        var refreshed = gpu.TensorAdd(left, right).ToArray();
+
+        Assert.Equal(12f, refreshed[0], 5);
+        Assert.Equal(4f, refreshed[1], 5);
+    }
+
+    [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
         SkipIfNoDirectGpu();

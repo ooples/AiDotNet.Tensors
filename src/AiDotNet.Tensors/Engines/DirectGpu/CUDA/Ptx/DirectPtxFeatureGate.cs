@@ -18,6 +18,7 @@ internal static class DirectPtxFeatureGate
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
+    internal const string SgdMomentumEnvironmentVariable = "AIDOTNET_DIRECT_PTX_SGD_MOMENTUM";
     internal const string GlobalAvgPoolEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GLOBAL_AVGPOOL";
     internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
@@ -65,6 +66,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentRngDropoutEnabled = ReadEnabled(RngDropoutEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentSgdMomentumEnabled = ReadEnabled(SgdMomentumEnvironmentVariable);
     private static readonly bool EnvironmentGlobalAvgPoolEnabled = ReadEnabled(GlobalAvgPoolEnvironmentVariable);
     private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
@@ -81,6 +83,24 @@ internal static class DirectPtxFeatureGate
     internal static bool? TestOverride { get; set; }
     /// <summary>Benchmark-only access to gather cells that have not passed promotion.</summary>
     internal static bool GatherExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_sgdMomentumExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to SGD-momentum cells that have not passed promotion. Thread-local
+    /// state prevents parallel tests or benchmarks from enabling an experimental route in an
+    /// unrelated dispatcher, matching the global-average-pool and complex-multiply overrides.
+    /// </summary>
+    /// <remarks>
+    /// As a process-global static this defeated the fail-closed guarantee: while one test held it
+    /// set, every other thread could dispatch the unpromoted SGD route, which also made concurrent
+    /// results order-dependent.
+    /// </remarks>
+    internal static bool SgdMomentumExperimentOverride
+    {
+        get => s_sgdMomentumExperimentOverride;
+        set => s_sgdMomentumExperimentOverride = value;
+    }
     [ThreadStatic]
     private static bool s_globalAvgPoolExperimentOverride;
 
@@ -192,6 +212,8 @@ internal static class DirectPtxFeatureGate
     internal static bool IsFlashAttentionBackwardEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashAttentionBackwardEnabled);
 
+    internal static bool IsSgdMomentumEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSgdMomentumEnabled);
     internal static bool IsGlobalAvgPoolEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentGlobalAvgPoolEnabled);
     internal static bool IsComplexMultiplyEnabled => ComplexMultiplyGateOverride ?? TestOverride ??
