@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.127.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.126.0...v0.127.0) (2026-08-16)
+
+
+### Features
+
+* add differentiable UPRNet warp operations ([#951](https://github.com/ooples/AiDotNet.Tensors/issues/951)) ([34c2e86](https://github.com/ooples/AiDotNet.Tensors/commit/34c2e86dda435ada1fd131641328527b617454cd))
+* **fused:** reach the last two unfused optimizer families — ProximalL1 and L-BFGS ([#953](https://github.com/ooples/AiDotNet.Tensors/issues/953)) ([dbbb562](https://github.com/ooples/AiDotNet.Tensors/commit/dbbb56263eb2449d1237ccdaf9d7c99312a1bd6b))
+* **fused:** surface the nesterov flag and FTRL's beta term ([#949](https://github.com/ooples/AiDotNet.Tensors/issues/949)) ([92a793d](https://github.com/ooples/AiDotNet.Tensors/commit/92a793d936158f31577c2c7435a3d792e40e2dd9))
+* **ptx:** fused SGD-momentum optimizer blueprint ([#848](https://github.com/ooples/AiDotNet.Tensors/issues/848)) ([#874](https://github.com/ooples/AiDotNet.Tensors/issues/874)) ([88c5d58](https://github.com/ooples/AiDotNet.Tensors/commit/88c5d58cf179c532b3ccd3c39321dbed9fe3e98c))
+
+
+### Bug Fixes
+
+* **sdpa:** broadcast the attention mask in the generic workers ([#674](https://github.com/ooples/AiDotNet.Tensors/issues/674) review) ([#947](https://github.com/ooples/AiDotNet.Tensors/issues/947)) ([7a3f802](https://github.com/ooples/AiDotNet.Tensors/commit/7a3f8026b85bcc258d7512b146303e8fdd7e2ca3))
+
+
+### Performance
+
+* **compilation:** bound lazy graph reordering cost ([#948](https://github.com/ooples/AiDotNet.Tensors/issues/948)) ([217786a](https://github.com/ooples/AiDotNet.Tensors/commit/217786a92aa261157ebd8a01f2f5e1a52bda6d64))
+
 ## [0.126.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.125.0...v0.126.0) (2026-08-14)
 
 

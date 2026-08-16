@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -750,6 +750,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public float DAdaptationEstimate;
         public float DAdaptationRAccum;
         public float ScheduleFreeWeightSum;
+        // Fletcher-Reeves: ||g_{k-1}||^2, the denominator of the next beta. Cached rather than recomputed
+        // because the numerator of step k is the denominator of step k+1 - one reduction, used twice.
+        public float CgPrevGradNorm2;
     }
 
     private sealed class FusedOptimizerRuntimeState
@@ -781,6 +784,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public FusedOptimizerRuntimeScalars Scalars = new FusedOptimizerRuntimeScalars();
         public float[][]? MFloat;
         public float[][]? VFloat;
+
+        // ── L-BFGS curvature history ──────────────────────────────────────────────────────────────
+        // Stored FLAT (one array of length sum(lengths)) rather than per-parameter, because every
+        // consumer is a whole-vector operation: the two-loop recursion is 2m global dot products and
+        // 2m axpys over the concatenated parameter vector. Keeping it flat makes each of those a single
+        // contiguous pass instead of a nested walk over ragged per-parameter buffers.
+        public float[][]? LbfgsS;          // LbfgsS[slot] — s_k = x_{k+1} - x_k
+        public float[][]? LbfgsY;          // LbfgsY[slot] — y_k = g_{k+1} - g_k
+        public float[]? LbfgsRho;          // 1 / (y_k . s_k), one per slot
+        public float[]? LbfgsPrevParam;    // x_k, to form the next s
+        public float[]? LbfgsPrevGrad;     // g_k, to form the next y
+        public float[]? LbfgsQ;            // recursion scratch (q, then r)
+        public float[]? LbfgsAlpha;        // alpha_i carried from the backward loop into the forward one
+        public int LbfgsCount;             // pairs currently stored (grows to m, then stays)
+        public int LbfgsHead;              // ring cursor: slot the NEXT pair is written to
+        public bool LbfgsHasPrev;          // false until the first step has recorded x_k, g_k
+        // gamma = (s.y)/(y.y) from the NEWEST accepted pair, scaling the initial inverse-Hessian estimate.
+        // Cached from the pair that produced it rather than recomputed, since both dots are already
+        // available at the moment the pair is accepted.
+        public float LbfgsGammaNum;
+        public float LbfgsGammaDen;
         public float[][]? VMaxFloat;
         public double[][]? MDouble;
         public double[][]? VDouble;
@@ -1721,6 +1745,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
         var ex = extras ?? new FusedOptimizerExtras();
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams, ex.Nesterov);
+        ValidateWeightDecayCompatibility(optimizerType, weightDecay);
         ex.Validate();
         if (typeof(T) == typeof(float))
         {
@@ -1830,25 +1855,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // earlier parameters had already been updated.
         bool isFloatPlan = typeof(T) == typeof(float);
         bool nesterov = extras?.Nesterov ?? false;
-        if (groupOptimizerTypes is null)
-        {
-            ValidatePlanOptimizerSupport(optimizerType, isFloatPlan, hasGpuParams, nesterov);
-        }
-        else
-        {
-            if (groupOptimizerTypes.Count != groupSchedules.Count)
-                throw new ArgumentException(
-                    $"groupOptimizerTypes.Count ({groupOptimizerTypes.Count}) must equal groupSchedules.Count " +
-                    $"({groupSchedules.Count}) — every group needs exactly one optimizer.",
-                    nameof(groupOptimizerTypes));
-            for (int g = 0; g < groupOptimizerTypes.Count; g++)
-                ValidatePlanOptimizerSupport(groupOptimizerTypes[g], isFloatPlan, hasGpuParams, nesterov);
-        }
+        if (groupOptimizerTypes is not null && groupOptimizerTypes.Count != groupSchedules.Count)
+            throw new ArgumentException(
+                $"groupOptimizerTypes.Count ({groupOptimizerTypes.Count}) must equal groupSchedules.Count " +
+                $"({groupSchedules.Count}) — every group needs exactly one optimizer.",
+                nameof(groupOptimizerTypes));
         if (groupWeightDecays is not null && groupWeightDecays.Count != groupSchedules.Count)
             throw new ArgumentException(
                 $"groupWeightDecays.Count ({groupWeightDecays.Count}) must equal groupSchedules.Count " +
                 $"({groupSchedules.Count}).",
                 nameof(groupWeightDecays));
+
+        for (int g = 0; g < groupSchedules.Count; g++)
+        {
+            OptimizerType groupType = groupOptimizerTypes?[g] ?? optimizerType;
+            float groupWeightDecay = groupWeightDecays?[g] ?? weightDecay;
+            ValidatePlanOptimizerSupport(groupType, isFloatPlan, hasGpuParams, nesterov);
+            ValidateWeightDecayCompatibility(groupType, groupWeightDecay);
+        }
         // Drop any Schedule-Free pre-forward hook left over from a prior ungrouped
         // ConfigureOptimizer(ScheduleFreeSGD); a grouped optimizer never sets one,
         // and Step() unconditionally invokes it — leaving it active would rewrite
@@ -1858,14 +1882,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // parameters — a per-group schedule is meaningless for them, so they are only
         // supported through the ungrouped ConfigureOptimizer. Checked for every group's
         // type, not just the fallback, or a per-group configuration could smuggle one in.
-        for (int g = -1; g < (groupOptimizerTypes?.Count ?? 0); g++)
+        for (int g = 0; g < groupSchedules.Count; g++)
         {
-            var candidate = g < 0 ? optimizerType : groupOptimizerTypes![g];
+            var candidate = groupOptimizerTypes?[g] ?? optimizerType;
             if (candidate is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
-                or OptimizerType.ScheduleFreeSGD)
+                or OptimizerType.ScheduleFreeSGD or OptimizerType.LBFGS or OptimizerType.TrustRegion
+                or OptimizerType.ConjugateGradient)
                 throw new NotSupportedException(
-                    $"{candidate} maintains a single global learning-rate/distance/weight-sum scalar " +
-                    "(or a per-step parameter transform) and is not supported with per-group schedules; " +
+                    $"{candidate} maintains global optimizer state across the complete parameter set " +
+                    "(a learning-rate/distance/radius scalar, parameter transform, or curvature history) " +
+                    "and is not supported with per-group schedules; " +
                     "use the ungrouped ConfigureOptimizer.");
         }
         var ex = extras ?? new FusedOptimizerExtras();
@@ -1891,6 +1917,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
+    }
+
+    private static void ValidateWeightDecayCompatibility(
+        OptimizerType optimizerType,
+        float weightDecay)
+    {
+        if (optimizerType == OptimizerType.ProximalL1 && weightDecay != 0f)
+            throw new NotSupportedException(
+                "ProximalL1 does not support weightDecay; use extras.L1 for the L1 proximal strength.");
     }
 
     /// <summary>Gate at the plan-level dispatch surface. The fused kernels
@@ -1966,6 +2001,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.FTRL
             or OptimizerType.ASGD
             or OptimizerType.Rprop
+            or OptimizerType.ProximalL1
+            or OptimizerType.LBFGS
+            or OptimizerType.TrustRegion
+            or OptimizerType.ConjugateGradient
             or OptimizerType.HypergradientSGD
             or OptimizerType.DAdaptationSGD
             or OptimizerType.ScheduleFreeSGD;
@@ -1981,7 +2020,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 $"Optimizer type {optimizerType} is not yet supported by CompiledTrainingPlan's " +
                 "fused-update closures. float: SGD/Adam/AdamW/AMSGrad/Nadam/RAdam/LAMB/RMSprop/" +
                 "Adagrad/Lion/SGDMomentum/AdaMax/AdaDelta/LARS/FTRL/ASGD/Rprop/" +
-                "HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD; double: SGD/Adam/AdamW/AMSGrad." + suffix);
+                "ProximalL1/LBFGS/TrustRegion/HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD; " +
+                "double: SGD/Adam/AdamW/AMSGrad." + suffix);
         }
     }
 
@@ -2163,6 +2203,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
                 or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ConjugateGradient          // m[p] = d, the conjugate direction
                 or OptimizerType.ScheduleFreeSGD;   // m[p] = z (SGD trajectory)
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
@@ -2359,7 +2400,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             DAdaptationEstimate = extras.D0,
         };
+        float exTrustRadius = extras.TrustRegionRadius;
         float exHyperLr = extras.HyperLr;
+        int exLbfgsMemory = Math.Max(1, extras.LbfgsMemorySize);
+        // L-BFGS operates on the flat concatenation of every parameter; size that once here. The buffers
+        // themselves are attached to the runtime state further down, once it exists.
+        int lbfgsTotal = 0;
+        if (optimizerType == OptimizerType.LBFGS)
+            for (int p = 0; p < paramCount; p++) lbfgsTotal += lengths[p];
         float exGrowth = extras.DGrowthRate;
 
         // Schedule-Free SGD (#499): z (SGD trajectory) and x (eval/average)
@@ -2427,6 +2475,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             GpuMomentStorage = gpuMomentStorage,
         };
 
+        // Attach the L-BFGS curvature history now the state object exists. Kept on the state (rather than as
+        // captured locals) so the counters are reachable for checkpointing and so a reconfigure resets them.
+        var lbfgsState = _optimizerRuntimeState;
+        if (optimizerType == OptimizerType.LBFGS)
+        {
+            lbfgsState.LbfgsS = new float[exLbfgsMemory][];
+            lbfgsState.LbfgsY = new float[exLbfgsMemory][];
+            for (int k = 0; k < exLbfgsMemory; k++)
+            {
+                lbfgsState.LbfgsS[k] = new float[lbfgsTotal];
+                lbfgsState.LbfgsY[k] = new float[lbfgsTotal];
+            }
+            lbfgsState.LbfgsRho = new float[exLbfgsMemory];
+            lbfgsState.LbfgsAlpha = new float[exLbfgsMemory];
+            lbfgsState.LbfgsPrevParam = new float[lbfgsTotal];
+            lbfgsState.LbfgsPrevGrad = new float[lbfgsTotal];
+            lbfgsState.LbfgsQ = new float[lbfgsTotal];
+            lbfgsState.LbfgsCount = 0;
+            lbfgsState.LbfgsHead = 0;
+            lbfgsState.LbfgsHasPrev = false;
+        }
+
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -2446,6 +2516,242 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
             float lr = (float)lrSchedule.GetLr(_optimizerStep);
+            if (optType == OptimizerType.LBFGS)
+            {
+                // L-BFGS two-loop recursion (Nocedal 1980; Nocedal & Wright, Numerical Optimization,
+                // Algorithm 7.4). This is NOT expressible as a per-element kernel: every one of the 2m+2
+                // inner products couples all parameters, so the step runs as an alternating sequence of
+                // global reductions and whole-vector axpys — the same two-phase shape HypergradientSGD and
+                // DAdaptationSGD already use here, just repeated 2m times instead of once.
+                //
+                // Working entirely on the flat concatenation of all parameters keeps each of those a single
+                // contiguous pass. Gather in, recurse, scatter out.
+                var st = lbfgsState;
+                float[] q = st.LbfgsQ!, prevX = st.LbfgsPrevParam!, prevG = st.LbfgsPrevGrad!;
+                float[][] S = st.LbfgsS!, Y = st.LbfgsY!;
+                float[] rho = st.LbfgsRho!, alpha = st.LbfgsAlpha!;
+                int mem = S.Length;
+
+                // Gather the flat gradient into q, and the flat parameters into the scratch we will need
+                // for the curvature pair.
+                int off = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    int len2 = lengths[p];
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) { off += len2; continue; }
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
+                        for (int i = 0; i < len2; i++) q[off + i] = pGrad[i];
+                    off += len2;
+                }
+
+                // Record the curvature pair (s, y) from the PREVIOUS step, now that we have x_k and g_k.
+                // s_{k-1} = x_k - x_{k-1}, y_{k-1} = g_k - g_{k-1}.
+                if (st.LbfgsHasPrev)
+                {
+                    int o2 = 0;
+                    double sy = 0, yy = 0;
+                    var sSlot = S[st.LbfgsHead];
+                    var ySlot = Y[st.LbfgsHead];
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        int len2 = lengths[p];
+                        if (paramArrays[p].Length == 0) { o2 += len2; continue; }
+                        fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
+                            for (int i = 0; i < len2; i++)
+                            {
+                                float sv = pParam[i] - prevX[o2 + i];
+                                float yv = q[o2 + i] - prevG[o2 + i];
+                                sSlot[o2 + i] = sv;
+                                ySlot[o2 + i] = yv;
+                                sy += (double)sv * yv;
+                                yy += (double)yv * yv;
+                            }
+                        o2 += len2;
+                    }
+
+                    // Curvature condition. Accepting a pair with s.y <= 0 would make the implicit inverse
+                    // Hessian indefinite and the resulting direction can point uphill — the standard guard,
+                    // and the reason L-BFGS stays stable on non-convex objectives.
+                    if (sy > 1e-10)
+                    {
+                        rho[st.LbfgsHead] = (float)(1.0 / sy);
+                        st.LbfgsHead = (st.LbfgsHead + 1) % mem;
+                        if (st.LbfgsCount < mem) st.LbfgsCount++;
+                        st.LbfgsGammaNum = (float)sy;
+                        st.LbfgsGammaDen = (float)yy;
+                    }
+                }
+
+                // Save x_k, g_k for the next step's pair before the update overwrites x.
+                {
+                    int o3 = 0;
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        int len2 = lengths[p];
+                        if (paramArrays[p].Length == 0) { o3 += len2; continue; }
+                        fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
+                            for (int i = 0; i < len2; i++) prevX[o3 + i] = pParam[i];
+                        o3 += len2;
+                    }
+                    Array.Copy(q, prevG, lbfgsTotal);
+                    st.LbfgsHasPrev = true;
+                }
+
+                // Backward loop: newest pair first. alpha_i = rho_i * (s_i . q); q -= alpha_i * y_i.
+                int count = st.LbfgsCount;
+                for (int j = 0; j < count; j++)
+                {
+                    int slot = ((st.LbfgsHead - 1 - j) % mem + mem) % mem;
+                    var sS = S[slot];
+                    var yS = Y[slot];
+                    double dot = 0;
+                    for (int i = 0; i < lbfgsTotal; i++) dot += (double)sS[i] * q[i];
+                    float a = rho[slot] * (float)dot;
+                    alpha[slot] = a;
+                    for (int i = 0; i < lbfgsTotal; i++) q[i] -= a * yS[i];
+                }
+
+                // Initial inverse-Hessian scaling gamma = (s.y)/(y.y) from the newest pair. Without it the
+                // first iterations take a raw gradient-sized step and L-BFGS loses most of its advantage.
+                float gamma = (count > 0 && st.LbfgsGammaDen > 0f) ? st.LbfgsGammaNum / st.LbfgsGammaDen : 1f;
+                for (int i = 0; i < lbfgsTotal; i++) q[i] *= gamma;
+
+                // Forward loop: oldest pair first. beta = rho_i * (y_i . r); r += s_i * (alpha_i - beta).
+                for (int j = count - 1; j >= 0; j--)
+                {
+                    int slot = ((st.LbfgsHead - 1 - j) % mem + mem) % mem;
+                    var sS = S[slot];
+                    var yS = Y[slot];
+                    double dot = 0;
+                    for (int i = 0; i < lbfgsTotal; i++) dot += (double)yS[i] * q[i];
+                    float b = rho[slot] * (float)dot;
+                    float diff = alpha[slot] - b;
+                    for (int i = 0; i < lbfgsTotal; i++) q[i] += diff * sS[i];
+                }
+
+                // q now holds H*g, the quasi-Newton direction (before negation). No line search here: the
+                // tape yields one gradient per step and re-evaluating the loss at trial points would mean
+                // extra forward passes the caller did not ask for, so the schedule's lr is the step length.
+                // gamma already scales the direction sensibly, which is why lr = 1 is a reasonable default.
+                int o4 = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    int len2 = lengths[p];
+                    if (paramArrays[p].Length == 0) { o4 += len2; continue; }
+                    fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
+                        for (int i = 0; i < len2; i++) pParam[i] -= lr * q[o4 + i];
+                    o4 += len2;
+                    MarkHostWeightMutated(p);
+                }
+                return;
+            }
+            if (optType == OptimizerType.TrustRegion)
+            {
+                // Trust-region Cauchy point with B = I (Nocedal & Wright, Algorithm 4.1 / eq. 4.11):
+                //   alpha = min(radius / ||g||, lr);  x -= alpha * g
+                // ||g|| couples every parameter, so this is a global reduction followed by an elementwise
+                // step — exactly the shape HypergradientSGD uses, which is why it fits the plan despite not
+                // being a per-element kernel.
+                //
+                // The radius is NOT adapted here. Classical trust region rescales it from the ratio of actual
+                // to predicted reduction, and the actual reduction needs the loss at the trial point; a fused
+                // step has one gradient and no loss evaluation. Callers adapt it between configurations,
+                // which is where AiDotNet's TrustRegionOptimizer already does it (per epoch).
+                double norm2 = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
+                        for (int i = 0; i < len2; i++) norm2 += (double)pGrad[i] * pGrad[i];
+                }
+                double gradNorm = Math.Sqrt(norm2);
+
+                // A vanishing gradient means there is no descent direction and radius/||g|| would blow up.
+                // Take no step rather than an unbounded one.
+                if (gradNorm > 1e-10)
+                {
+                    float alphaTr = (float)Math.Min(exTrustRadius / gradNorm, lr);
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                        int len2 = lengths[p];
+                        fixed (float* pParam = &paramArrays[p][paramOffsets[p]],
+                               pGrad = &gradArrays[p][gradOffsets[p]])
+                            for (int i = 0; i < len2; i++) pParam[i] -= alphaTr * pGrad[i];
+                        MarkHostWeightMutated(p);
+                    }
+                }
+                return;
+            }
+            if (optType == OptimizerType.ConjugateGradient)
+            {
+                // Fletcher-Reeves CG. Structurally SGD-with-momentum where the coefficient is recomputed
+                // every step, which is precisely why it cannot reuse the SGDMomentum kernel: that one bakes
+                // beta1 in at plan-build time. Two global reductions plus an elementwise update - the same
+                // two-phase shape HypergradientSGD uses.
+                //
+                //   beta = (g.g) / (g_prev.g_prev)
+                //   d    = -g + beta*d_prev            (d_prev lives in m[p])
+                //   if d.g >= 0: d = -g                (Powell restart)
+                //   x   += lr*d
+                double gg = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
+                        for (int i = 0; i < len2; i++) gg += (double)pGrad[i] * pGrad[i];
+                }
+
+                // First step, or a vanished previous gradient: fall back to steepest descent rather than
+                // dividing by ~0 and poisoning every later direction with a non-finite beta.
+                float beta = scalarState.CgPrevGradNorm2 > 1e-30f
+                    ? (float)(gg / scalarState.CgPrevGradNorm2)
+                    : 0f;
+
+                // Build d into m[p], then test whether it still descends.
+                double dg = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]], pD = m[p])
+                        for (int i = 0; i < len2; i++)
+                        {
+                            float d = -pGrad[i] + beta * pD[i];
+                            pD[i] = d;
+                            dg += (double)d * pGrad[i];
+                        }
+                }
+
+                // Powell restart: a conjugate direction that stopped pointing downhill would be followed
+                // uphill while the optimizer still reported progress. Rebuild as steepest descent.
+                bool restart = dg >= 0;
+                if (restart)
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        if (gradArrays[p].Length == 0) continue;
+                        int len2 = lengths[p];
+                        fixed (float* pGrad = &gradArrays[p][gradOffsets[p]], pD = m[p])
+                            for (int i = 0; i < len2; i++) pD[i] = -pGrad[i];
+                    }
+
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pParam = &paramArrays[p][paramOffsets[p]], pD = m[p])
+                        for (int i = 0; i < len2; i++) pParam[i] += lr * pD[i];
+                    MarkHostWeightMutated(p);
+                }
+
+                scalarState.CgPrevGradNorm2 = (float)gg;
+                return;
+            }
+
+
+
 
             if (optType == OptimizerType.HypergradientSGD)
             {
@@ -2931,7 +3237,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.LARS:
                             // velocity=pM; layer-wise trust ratio consumes wd + trust coefficient.
                             FusedOptimizer.LARSUpdateSimd(pParam, pGrad, pM, len,
-                                lr, extras.Momentum, wd, extras.TrustCoefficient);
+                                lr, extras.Momentum, wd, extras.TrustCoefficient, epsVal);
                             break;
                         case OptimizerType.FTRL:
                             // z=pV, n=pVMax; FTRL applies its own L1/L2 regularization.
@@ -2953,6 +3259,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 for (int i = 0; i < len; i++) pV[i] = extras.RpropInitialStep;
                             FusedOptimizer.RpropUpdate(pParam, pGrad, pM, pV, len,
                                 extras.RpropEtaPlus, extras.RpropEtaMinus, extras.RpropStepMin, extras.RpropStepMax);
+                            break;
+                        case OptimizerType.ProximalL1:
+                            // Stateless: the prox reads only param and grad. L1 strength from extras.
+                            FusedOptimizer.ProximalL1UpdateSimd(pParam, pGrad, len, lr, extras.L1);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -3544,7 +3854,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.LARS:
                             FusedOptimizer.LARSUpdateSimd(pParam, pGrad, pM, len,
-                                lr, extras.Momentum, wd, extras.TrustCoefficient);
+                                lr, extras.Momentum, wd, extras.TrustCoefficient, epsVal);
                             break;
                         case OptimizerType.FTRL:
                             FusedOptimizer.FTRLUpdateSimd(pParam, pGrad, pV, pVMax, len,
@@ -3563,6 +3873,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 for (int i = 0; i < len; i++) pV[i] = extras.RpropInitialStep;
                             FusedOptimizer.RpropUpdate(pParam, pGrad, pM, pV, len,
                                 extras.RpropEtaPlus, extras.RpropEtaMinus, extras.RpropStepMin, extras.RpropStepMax);
+                            break;
+                        case OptimizerType.ProximalL1:
+                            // Stateless: the prox reads only param and grad. L1 strength from extras.
+                            FusedOptimizer.ProximalL1UpdateSimd(pParam, pGrad, len, lr, extras.L1);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -3995,6 +4309,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 DAdaptationEstimate = rt.Scalars.DAdaptationEstimate,
                 DAdaptationRAccum = rt.Scalars.DAdaptationRAccum,
                 ScheduleFreeWeightSum = rt.Scalars.ScheduleFreeWeightSum,
+                ConjugateGradientPrevGradNorm2 = rt.Scalars.CgPrevGradNorm2,
             },
             Parameters = new FusedOptimizerParameterCheckpoint[_parameters.Length],
         };
@@ -4059,6 +4374,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         rt.Scalars.DAdaptationEstimate = checkpoint.Scalars.DAdaptationEstimate;
         rt.Scalars.DAdaptationRAccum = checkpoint.Scalars.DAdaptationRAccum;
         rt.Scalars.ScheduleFreeWeightSum = checkpoint.Scalars.ScheduleFreeWeightSum;
+        rt.Scalars.CgPrevGradNorm2 = checkpoint.Scalars.ConjugateGradientPrevGradNorm2;
 
         for (int p = 0; p < checkpoint.Parameters.Length; p++)
             RestoreOptimizerParameterState(rt, p, checkpoint.Parameters[p]);
