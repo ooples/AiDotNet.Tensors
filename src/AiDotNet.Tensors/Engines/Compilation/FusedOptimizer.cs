@@ -1369,11 +1369,42 @@ internal static class FusedOptimizer
         }
     }
 
-    /// <summary>AVX2 LARS: Layer-wise Adaptive Rate Scaling</summary>
+    /// <summary>AVX2 LARS: Layer-wise Adaptive Rate Scaling (You, Gitman &amp; Ginsburg, 2017, Algorithm 1).
+    /// <code>
+    /// local_lr = lr * trust * ||w|| / (||g|| + wd*||w|| + eps)
+    /// v        = momentum*v + local_lr*(g + wd*w)
+    /// w       -= v
+    /// </code></summary>
+    /// <remarks>
+    /// <para>
+    /// Three details separate this from "SGD-with-momentum at a rescaled learning rate", and getting any of
+    /// them wrong changes training rather than breaking it:
+    /// </para>
+    /// <list type="number">
+    /// <item><description>
+    /// The trust ratio is recomputed every step from the current norms, so <c>local_lr</c> is a different
+    /// number each step. That makes it wrong to leave the rate outside the velocity: <c>v = m*v + g</c>
+    /// followed by <c>w -= local_lr*v</c> re-scales the ENTIRE accumulated history by whatever the ratio
+    /// happens to be now, whereas the paper scales each gradient by the rate that was current when it
+    /// arrived. The two agree only if the trust ratio never moves, which is exactly what LARS exists to
+    /// avoid.
+    /// </description></item>
+    /// <item><description>
+    /// Weight decay appears twice and means different things: inside the ratio's denominator it bounds the
+    /// step, and inside the velocity it is the actual decay applied to the weights. Folding it into only
+    /// one of the two leaves the other behaviour missing.
+    /// </description></item>
+    /// <item><description>
+    /// The <c>eps</c> guard is a floor on the denominator, and a layer whose weights or gradients are
+    /// smaller than it falls back to the unscaled base rate — a trust ratio computed from a numerically
+    /// zero norm is noise, and for a freshly zero-initialised bias vector it is 0/0.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void LARSUpdateSimd(
         float* param, float* grad, float* velocity, int length,
-        float lr, float momentum, float weightDecay, float trustCoeff)
+        float lr, float momentum, float weightDecay, float trustCoeff, float eps)
     {
         // Compute layer-wise norms with AVX2
         float paramNorm = 0f, gradNorm = 0f;
@@ -1403,13 +1434,36 @@ internal static class FusedOptimizer
         paramNorm = MathF.Sqrt(paramNorm);
         gradNorm = MathF.Sqrt(gradNorm);
 
-        // Trust ratio
+        // Trust ratio. A layer with a numerically zero weight or gradient norm keeps the base rate.
         float localLr = lr;
-        if (paramNorm > 0f && gradNorm > 0f)
-            localLr = lr * trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm);
+        if (paramNorm >= eps && gradNorm >= eps)
+            localLr = lr * trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm + eps);
 
-        // SGD+momentum with local lr
-        SgdMomentumUpdateSimd(param, grad, velocity, length, localLr, momentum, false);
+        // v = momentum*v + local_lr*(g + wd*w);  w -= v
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vMomentum = Vector256.Create(momentum);
+            var vLocalLr = Vector256.Create(localLr);
+            var vWd = Vector256.Create(weightDecay);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var p = Avx.LoadVector256(param + i);
+                var g = Fma.MultiplyAdd(vWd, p, Avx.LoadVector256(grad + i));
+                var v = Fma.MultiplyAdd(vMomentum, Avx.LoadVector256(velocity + i), Avx.Multiply(vLocalLr, g));
+                Avx.Store(velocity + i, v);
+                Avx.Store(param + i, Avx.Subtract(p, v));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float g = grad[i] + weightDecay * param[i];
+            velocity[i] = momentum * velocity[i] + localLr * g;
+            param[i] -= velocity[i];
+        }
     }
 
     /// <summary>AVX2 LAMB: Layer-wise Adaptive Moments (LARS + Adam)</summary>
@@ -1919,7 +1973,7 @@ internal static class FusedOptimizer
     /// (equals dense ‖g‖₂² since untouched indices have zero gradient).</summary>
     internal static unsafe void SparseLARSUpdate(
         float* param, int* indices, float* values, float* velocity, int paramLen, int nnz,
-        float lr, float momentum, float wd, float trustCoeff)
+        float lr, float momentum, float wd, float trustCoeff, float eps)
     {
         // Full ‖p‖₂ reduction.
         float pNormSq = 0f;
@@ -1931,8 +1985,11 @@ internal static class FusedOptimizer
         for (int k = 0; k < nnz; k++) gNormSq += values[k] * values[k];
         float gNorm = MathF.Sqrt(gNormSq);
 
-        float denom = gNorm + wd * pNorm;
-        float localLr = (pNorm > 0f && denom > 0f) ? (lr * trustCoeff * pNorm / denom) : lr;
+        // Same trust ratio and eps floor as the dense kernel, so a parameter does not change algorithm
+        // depending on whether its gradient happened to arrive sparse.
+        float localLr = (pNorm >= eps && gNorm >= eps)
+            ? (lr * trustCoeff * pNorm / (gNorm + wd * pNorm + eps))
+            : lr;
 
         for (int k = 0; k < nnz; k++)
         {
@@ -2066,9 +2123,60 @@ internal static class FusedOptimizer
         _ = alpha; // alpha is consumed by external schedule when lr is computed
     }
 
-    /// <summary>Rprop: Resilient backpropagation.
-    /// Per-element step sizes adapt based on sign-changes of consecutive gradients.
-    /// Reference: Riedmiller &amp; Braun, 1993.</summary>
+    /// <summary>
+    /// AVX2 Proximal Gradient Descent with an L1 proximal operator (ISTA).
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.
+    /// </summary>
+    /// <remarks>
+    /// The soft-threshold is the whole method. Folding the L1 penalty into the gradient instead would only
+    /// shrink coordinates toward zero and leave them oscillating around it at a scale set by lr; the prox
+    /// sets them to EXACTLY zero, which is what makes the solution genuinely sparse.
+    ///
+    /// Branchless in the SIMD body: the sign is recovered by masking off the sign bit and re-applying it,
+    /// so no per-element compare/branch is needed and the shrink is a single max against zero.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void ProximalL1UpdateSimd(
+        float* param, float* grad, int length, float lr, float l1Strength)
+    {
+        float threshold = lr * l1Strength;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vNegLr = Vector256.Create(-lr);
+            var vThreshold = Vector256.Create(threshold);
+            var vZero = Vector256<float>.Zero;
+            // Mask with the sign bit cleared: AND extracts |x|, ANDNOT extracts the sign.
+            var vAbsMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+            var vSignMask = Vector256.Create(unchecked((int)0x80000000)).AsSingle();
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                // z = param - lr*grad
+                var z = Fma.MultiplyAdd(vNegLr, Avx.LoadVector256(grad + i), Avx.LoadVector256(param + i));
+                var magnitude = Avx.And(z, vAbsMask);
+                var sign = Avx.And(z, vSignMask);
+                // max(|z| - lr*l1, 0), sign re-applied.
+                var shrunk = Avx.Max(Avx.Subtract(magnitude, vThreshold), vZero);
+                Avx.Store(param + i, Avx.Or(shrunk, sign));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float z = param[i] - lr * grad[i];
+            float magnitude = MathF.Abs(z) - threshold;
+            param[i] = magnitude <= 0f ? 0f : (z > 0f ? magnitude : -magnitude);
+        }
+    }
+
+
+    /// <summary>
+    /// Rprop: Resilient backpropagation. Per-element step sizes adapt based on
+    /// sign changes of consecutive gradients.
+    /// Reference: Riedmiller &amp; Braun, 1993.
+    /// </summary>
     internal static unsafe void RpropUpdate(
         float* param, float* grad, float* prevGrad, float* stepSize, int length,
         float etaPlus, float etaMinus, float stepMin, float stepMax)
@@ -2489,6 +2597,30 @@ public sealed class FusedOptimizerExtras
     public float SfBeta { get; init; } = 0.9f;
 
     /// <summary>
+    /// L-BFGS history size m: how many (s, y) curvature pairs are retained. Default 10.
+    /// </summary>
+    /// <remarks>
+    /// This is the memory/quality knob and the reason L-BFGS exists at all — full BFGS stores a dense n-by-n
+    /// inverse Hessian, which is impossible at network scale, while L-BFGS reconstructs its action from the
+    /// last m curvature pairs. Cost is 2*m float vectors the size of the whole parameter set, so m = 10 on a
+    /// 10M-parameter model is 800 MB of optimizer state. Nocedal and Wright recommend m in [3, 20]; larger
+    /// values buy diminishing curvature accuracy for strictly linear memory growth.
+    /// </remarks>
+    public int LbfgsMemorySize { get; init; } = 10;
+
+    /// <summary>
+    /// Trust-region radius used by the Cauchy-point step. Default 1.
+    /// </summary>
+    /// <remarks>
+    /// Held FIXED across fused steps. Classical trust region rescales the radius from the ratio of actual to
+    /// predicted reduction, which needs the loss at the trial point; the fused step has one gradient and no
+    /// loss evaluation, so the radius is whatever the caller set. Callers that adapt it do so between
+    /// configurations, which is also where AiDotNet's TrustRegionOptimizer updates it (per epoch, in
+    /// UpdateAdaptiveParameters, not per step).
+    /// </remarks>
+    public float TrustRegionRadius { get; init; } = 1f;
+
+    /// <summary>
     /// SGD-with-momentum: use Nesterov accelerated gradient rather than classical momentum.
     /// Default <c>false</c> (classical).
     /// </summary>
@@ -2581,5 +2713,40 @@ public enum OptimizerType
     /// <summary>Schedule-Free SGD: scheduler-free, weighted-average evaluation (Defazio et al., 2024)</summary>
     ScheduleFreeSGD = 20,
     /// <summary>D-Adaptation SGD: learning-rate-free SGD (Defazio &amp; Mishchenko, 2023)</summary>
-    DAdaptationSGD = 21
+    DAdaptationSGD = 21,
+
+    /// <summary>Proximal gradient descent with an L1 proximal operator (ISTA):
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.
+    /// The L1 strength travels in <see cref="FusedOptimizerExtras.L1"/>.</summary>
+    /// <remarks>
+    /// The soft-threshold is what makes this proximal gradient descent rather than SGD with an L1 penalty
+    /// added to the gradient: it drives coordinates to EXACTLY zero instead of merely shrinking them, which
+    /// is the entire reason to choose the method. A subgradient step cannot do that — it oscillates around
+    /// zero at a scale set by the learning rate.
+    /// </remarks>
+    ProximalL1 = 22,
+
+    /// <summary>Trust-region Cauchy-point step with B = I:
+    /// <c>alpha = min(radius/||g||, lr); param -= alpha*g</c>.
+    /// Radius travels in <see cref="FusedOptimizerExtras.TrustRegionRadius"/>.</summary>
+    /// <remarks>
+    /// A global reduction (||g|| couples every parameter) followed by an elementwise step — the same
+    /// two-phase shape HypergradientSGD uses. The radius is fixed per configuration: adapting it requires
+    /// the loss at the trial point, which a fused step has no way to obtain.
+    /// </remarks>
+    TrustRegion = 23,
+
+    /// <summary>Fletcher-Reeves conjugate gradient:
+    /// <c>beta = (g.g)/(g_prev.g_prev); d = -g + beta*d_prev; x += lr*d</c>,
+    /// with a Powell restart to steepest descent whenever <c>d.g &gt;= 0</c>.</summary>
+    /// <remarks>
+    /// Structurally SGD-with-momentum where the momentum coefficient is RECOMPUTED every step from a global
+    /// reduction, which is exactly why it cannot reuse the SGDMomentum kernel: that one bakes beta1 in when
+    /// the plan is built. Two reductions per step (g.g for beta, d.g for the restart test) followed by an
+    /// elementwise update - the same two-phase shape HypergradientSGD uses.
+    ///
+    /// No line search: the step length is the schedule's lr. Classical CG line-searches along d, which needs
+    /// loss evaluations the fused step has no way to obtain.
+    /// </remarks>
+    ConjugateGradient = 24
 }
