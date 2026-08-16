@@ -298,7 +298,6 @@ public class AdaptiveLrKernelsTests
     }
 
     [Theory]
-    [InlineData(OptimizerType.LBFGS)]
     [InlineData(OptimizerType.SparseAdam)]
     public void IsFusedPathEligible_RejectsLegitimateExclusions(OptimizerType opt)
     {

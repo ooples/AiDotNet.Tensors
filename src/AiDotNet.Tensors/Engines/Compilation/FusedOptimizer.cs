@@ -2066,9 +2066,60 @@ internal static class FusedOptimizer
         _ = alpha; // alpha is consumed by external schedule when lr is computed
     }
 
-    /// <summary>Rprop: Resilient backpropagation.
-    /// Per-element step sizes adapt based on sign-changes of consecutive gradients.
-    /// Reference: Riedmiller &amp; Braun, 1993.</summary>
+    /// <summary>
+    /// AVX2 Proximal Gradient Descent with an L1 proximal operator (ISTA).
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.
+    /// </summary>
+    /// <remarks>
+    /// The soft-threshold is the whole method. Folding the L1 penalty into the gradient instead would only
+    /// shrink coordinates toward zero and leave them oscillating around it at a scale set by lr; the prox
+    /// sets them to EXACTLY zero, which is what makes the solution genuinely sparse.
+    ///
+    /// Branchless in the SIMD body: the sign is recovered by masking off the sign bit and re-applying it,
+    /// so no per-element compare/branch is needed and the shrink is a single max against zero.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void ProximalL1UpdateSimd(
+        float* param, float* grad, int length, float lr, float l1Strength)
+    {
+        float threshold = lr * l1Strength;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vNegLr = Vector256.Create(-lr);
+            var vThreshold = Vector256.Create(threshold);
+            var vZero = Vector256<float>.Zero;
+            // Mask with the sign bit cleared: AND extracts |x|, ANDNOT extracts the sign.
+            var vAbsMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+            var vSignMask = Vector256.Create(unchecked((int)0x80000000)).AsSingle();
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                // z = param - lr*grad
+                var z = Fma.MultiplyAdd(vNegLr, Avx.LoadVector256(grad + i), Avx.LoadVector256(param + i));
+                var magnitude = Avx.And(z, vAbsMask);
+                var sign = Avx.And(z, vSignMask);
+                // max(|z| - lr*l1, 0), sign re-applied.
+                var shrunk = Avx.Max(Avx.Subtract(magnitude, vThreshold), vZero);
+                Avx.Store(param + i, Avx.Or(shrunk, sign));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float z = param[i] - lr * grad[i];
+            float magnitude = MathF.Abs(z) - threshold;
+            param[i] = magnitude <= 0f ? 0f : (z > 0f ? magnitude : -magnitude);
+        }
+    }
+
+
+    /// <summary>
+    /// Rprop: Resilient backpropagation. Per-element step sizes adapt based on
+    /// sign changes of consecutive gradients.
+    /// Reference: Riedmiller &amp; Braun, 1993.
+    /// </summary>
     internal static unsafe void RpropUpdate(
         float* param, float* grad, float* prevGrad, float* stepSize, int length,
         float etaPlus, float etaMinus, float stepMin, float stepMax)
@@ -2489,6 +2540,30 @@ public sealed class FusedOptimizerExtras
     public float SfBeta { get; init; } = 0.9f;
 
     /// <summary>
+    /// L-BFGS history size m: how many (s, y) curvature pairs are retained. Default 10.
+    /// </summary>
+    /// <remarks>
+    /// This is the memory/quality knob and the reason L-BFGS exists at all — full BFGS stores a dense n-by-n
+    /// inverse Hessian, which is impossible at network scale, while L-BFGS reconstructs its action from the
+    /// last m curvature pairs. Cost is 2*m float vectors the size of the whole parameter set, so m = 10 on a
+    /// 10M-parameter model is 800 MB of optimizer state. Nocedal and Wright recommend m in [3, 20]; larger
+    /// values buy diminishing curvature accuracy for strictly linear memory growth.
+    /// </remarks>
+    public int LbfgsMemorySize { get; init; } = 10;
+
+    /// <summary>
+    /// Trust-region radius used by the Cauchy-point step. Default 1.
+    /// </summary>
+    /// <remarks>
+    /// Held FIXED across fused steps. Classical trust region rescales the radius from the ratio of actual to
+    /// predicted reduction, which needs the loss at the trial point; the fused step has one gradient and no
+    /// loss evaluation, so the radius is whatever the caller set. Callers that adapt it do so between
+    /// configurations, which is also where AiDotNet's TrustRegionOptimizer updates it (per epoch, in
+    /// UpdateAdaptiveParameters, not per step).
+    /// </remarks>
+    public float TrustRegionRadius { get; init; } = 1f;
+
+    /// <summary>
     /// SGD-with-momentum: use Nesterov accelerated gradient rather than classical momentum.
     /// Default <c>false</c> (classical).
     /// </summary>
@@ -2581,5 +2656,26 @@ public enum OptimizerType
     /// <summary>Schedule-Free SGD: scheduler-free, weighted-average evaluation (Defazio et al., 2024)</summary>
     ScheduleFreeSGD = 20,
     /// <summary>D-Adaptation SGD: learning-rate-free SGD (Defazio &amp; Mishchenko, 2023)</summary>
-    DAdaptationSGD = 21
+    DAdaptationSGD = 21,
+
+    /// <summary>Proximal gradient descent with an L1 proximal operator (ISTA):
+    /// <c>z = param - lr*grad; param = sign(z) * max(|z| - lr*l1, 0)</c>.
+    /// The L1 strength travels in <see cref="FusedOptimizerExtras.L1"/>.</summary>
+    /// <remarks>
+    /// The soft-threshold is what makes this proximal gradient descent rather than SGD with an L1 penalty
+    /// added to the gradient: it drives coordinates to EXACTLY zero instead of merely shrinking them, which
+    /// is the entire reason to choose the method. A subgradient step cannot do that — it oscillates around
+    /// zero at a scale set by the learning rate.
+    /// </remarks>
+    ProximalL1 = 22,
+
+    /// <summary>Trust-region Cauchy-point step with B = I:
+    /// <c>alpha = min(radius/||g||, lr); param -= alpha*g</c>.
+    /// Radius travels in <see cref="FusedOptimizerExtras.TrustRegionRadius"/>.</summary>
+    /// <remarks>
+    /// A global reduction (||g|| couples every parameter) followed by an elementwise step — the same
+    /// two-phase shape HypergradientSGD uses. The radius is fixed per configuration: adapting it requires
+    /// the loss at the trial point, which a fused step has no way to obtain.
+    /// </remarks>
+    TrustRegion = 23
 }
