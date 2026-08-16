@@ -2176,7 +2176,7 @@ internal static class FusedOptimizer
     /// variable.
     /// <code>
     /// x = x - lr*(g + rho*((x - z) + u))
-    /// z = soft_threshold((x + u)/rho, l1)
+    /// z = soft_threshold(x + u, l1)        // caller passes l1 = Strength/rho
     /// u = u + (x - z)
     /// </code></summary>
     /// <remarks>
@@ -2192,6 +2192,13 @@ internal static class FusedOptimizer
     /// looks like it is working.
     /// </para>
     /// <para>
+    /// <c>rho</c> scales the STRENGTH of the prox, not its argument: Boyd's z-step is
+    /// <c>prox_{g/rho}(x + u)</c>, so for an L1 split the threshold is <c>Strength/rho</c> and the caller
+    /// passes that as <c>l1</c>. Thresholding <c>(x + u)/rho</c> at <c>Strength</c> instead is a different
+    /// function — it equals <c>(1/rho)·soft_threshold(x + u, Strength·rho)</c> — and the two coincide only
+    /// at rho = 1.
+    /// </para>
+    /// <para>
     /// <c>l1 = 0</c> makes the soft-threshold the identity, which is the correct prox for an unregularized
     /// split, so one parameter covers both cases without a mode flag.
     /// </para>
@@ -2201,14 +2208,12 @@ internal static class FusedOptimizer
         float* param, float* grad, float* z, float* u, int length,
         float lr, float rho, float l1)
     {
-        float invRho = 1f / rho;
         int i = 0;
 #if NET5_0_OR_GREATER
         if (Fma.IsSupported && length >= 8)
         {
             var vNegLr = Vector256.Create(-lr);
             var vRho = Vector256.Create(rho);
-            var vInvRho = Vector256.Create(invRho);
             var vL1 = Vector256.Create(l1);
             var vZero = Vector256<float>.Zero;
             var vAbsMask = Vector256.Create(0x7FFFFFFF).AsSingle();
@@ -2226,8 +2231,8 @@ internal static class FusedOptimizer
                 x = Fma.MultiplyAdd(vNegLr, total, x);
                 Avx.Store(param + i, x);
 
-                // z = soft_threshold((x + u)/rho, l1)
-                var t = Avx.Multiply(Avx.Add(x, ui), vInvRho);
+                // z = soft_threshold(x + u, l1)
+                var t = Avx.Add(x, ui);
                 var magnitude = Avx.And(t, vAbsMask);
                 var sign = Avx.And(t, vSignMask);
                 var zNew = Avx.Or(Avx.Max(Avx.Subtract(magnitude, vL1), vZero), sign);
@@ -2243,7 +2248,7 @@ internal static class FusedOptimizer
             float coupling = (param[i] - z[i]) + u[i];
             param[i] -= lr * (grad[i] + rho * coupling);
 
-            float t = (param[i] + u[i]) * invRho;
+            float t = param[i] + u[i];
             float magnitude = MathF.Abs(t) - l1;
             z[i] = magnitude <= 0f ? 0f : (t > 0f ? magnitude : -magnitude);
 

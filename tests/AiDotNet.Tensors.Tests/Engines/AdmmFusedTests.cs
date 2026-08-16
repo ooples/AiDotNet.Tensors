@@ -40,7 +40,7 @@ public class AdmmFusedTests
             float coupling = (param[i] - z[i]) + u[i];
             param[i] -= lr * (grad[i] + rho * coupling);
 
-            float t = (param[i] + u[i]) / rho;
+            float t = param[i] + u[i];
             float magnitude = Math.Abs(t) - l1;
             z[i] = magnitude <= 0f ? 0f : (t > 0f ? magnitude : -magnitude);
 
@@ -132,7 +132,9 @@ public class AdmmFusedTests
     /// </summary>
     /// <remarks>
     /// This is what lets one parameter cover both the regularized and unregularized cases without a mode
-    /// flag, so it is worth pinning: <c>z</c> must come out as exactly <c>(x + u)/rho</c>.
+    /// flag, so it is worth pinning: <c>z</c> must come out as exactly <c>x + u</c>. Note that rho does NOT
+    /// scale the argument — Boyd's z-step is prox_{g/rho}(x + u), so rho belongs in the threshold, which
+    /// the caller supplies as Strength/rho.
     /// </remarks>
     [Fact]
     public void ZeroL1_LeavesTheSplitVariableUnthresholded()
@@ -145,7 +147,46 @@ public class AdmmFusedTests
         RunKernel(param, (float[])grad.Clone(), z, u, lr, rho, l1: 0f);
 
         for (int i = 0; i < VectorLength; i++)
-            Assert.Equal((param[i] + 0f) / rho, z[i], 5);
+            Assert.Equal(param[i] + 0f, z[i], 5);
+    }
+
+    /// <summary>
+    /// Rho scales the prox STRENGTH, which the caller supplies, and never the prox argument.
+    /// </summary>
+    /// <remarks>
+    /// Boyd's z-step is <c>prox_{g/rho}(x + u)</c>. Thresholding <c>(x + u)/rho</c> at the raw strength
+    /// instead is a different function — equal to <c>(1/rho)·soft_threshold(x + u, Strength·rho)</c> — and
+    /// the two agree only at rho = 1, which is the default and therefore the value least likely to catch
+    /// the mistake. This runs at rho = 4 with the argument fixed, so the kernel's z must not depend on rho
+    /// at all.
+    /// </remarks>
+    [Fact]
+    public void RhoDoesNotScaleTheProxArgument()
+    {
+        const float lr = 0f, l1 = 0.2f;
+        var param = new float[] { 1.0f, -1.0f, 0.1f, 0.5f, -0.5f, 0.3f, -0.3f, 0.05f, 0.9f };
+        var grad = new float[param.Length];
+
+        var zLowRho = new float[param.Length];
+        var uLowRho = new float[param.Length];
+        RunKernel((float[])param.Clone(), grad, zLowRho, uLowRho, lr, rho: 1f, l1: l1);
+
+        var zHighRho = new float[param.Length];
+        var uHighRho = new float[param.Length];
+        RunKernel((float[])param.Clone(), grad, zHighRho, uHighRho, lr, rho: 4f, l1: l1);
+
+        // lr = 0 means x does not move, so with u starting at zero the z-step sees the same argument in
+        // both runs and must produce the same z.
+        for (int i = 0; i < param.Length; i++)
+            Assert.Equal(zLowRho[i], zHighRho[i], 6);
+
+        // And it is the plain soft-threshold of x, not of x/rho.
+        for (int i = 0; i < param.Length; i++)
+        {
+            float mag = Math.Abs(param[i]) - l1;
+            float expected = mag <= 0f ? 0f : (param[i] > 0f ? mag : -mag);
+            Assert.Equal(expected, zHighRho[i], 6);
+        }
     }
 
     /// <summary>
