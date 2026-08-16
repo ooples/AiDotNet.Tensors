@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -29,6 +30,33 @@ public static class GradientCheckpointing<T>
         IReadOnlyList<Func<Tensor<T>, Tensor<T>>> functions,
         Tensor<T> input,
         int segmentSize = 2)
+        => CheckpointCore(functions, input, parameterSourceFactory: null, segmentSize);
+
+    /// <summary>
+    /// Runs a checkpointed sequence while differentiating only the explicitly selected parameters.
+    /// </summary>
+    /// <remarks>
+    /// The source factory is evaluated after the no-grad forward has materialized lazy parameters.
+    /// This is the activation-checkpointing equivalent of freezing a backbone: the recompute still
+    /// calculates the input VJP needed to cross the frozen block, but it neither allocates nor returns
+    /// gradients for parameters outside <paramref name="parameterSourceFactory"/>.
+    /// </remarks>
+    public static Tensor<T> Checkpoint(
+        IReadOnlyList<Func<Tensor<T>, Tensor<T>>> functions,
+        Tensor<T> input,
+        Func<IReadOnlyList<Tensor<T>>> parameterSourceFactory,
+        int segmentSize = 2)
+    {
+        if (parameterSourceFactory is null)
+            throw new ArgumentNullException(nameof(parameterSourceFactory));
+        return CheckpointCore(functions, input, parameterSourceFactory, segmentSize);
+    }
+
+    private static Tensor<T> CheckpointCore(
+        IReadOnlyList<Func<Tensor<T>, Tensor<T>>> functions,
+        Tensor<T> input,
+        Func<IReadOnlyList<Tensor<T>>>? parameterSourceFactory,
+        int segmentSize)
     {
         if (functions == null || functions.Count == 0) return input;
         if (segmentSize <= 0)
@@ -56,23 +84,46 @@ public static class GradientCheckpointing<T>
 
             // Run segment forward WITHOUT recording (save memory)
             Tensor<T> segmentOutput;
+            using (var segmentArena = TensorArena.Create(poolWhenNested: true))
             using (GradientTape<T>.NoGrad())
             {
                 segmentOutput = segmentInput;
                 for (int i = startIdx; i < endIdx; i++)
                     segmentOutput = functions[i](segmentOutput);
+                // Only the segment boundary escapes. Copy it out, then release every internal
+                // activation instead of letting the caller's outer training arena retain the
+                // no-grad scratch until the end of the whole model step. A nested arena does not
+                // return its buffers to the shared pool because layers may cache internal tensors.
+                segmentOutput = CloneCheckpointBoundary(segmentOutput);
             }
 
-            // Record a single "checkpoint" op that recomputes during backward
+            // Record a single "checkpoint" op that recomputes during backward. A selective
+            // checkpoint records its chosen parameters as logical inputs as well as the segment
+            // boundary. Besides making the dependency explicit, this lets requested-source graph
+            // pruning retain the checkpoint when a caller asks only for trainable parameters.
+            Tensor<T>[]? checkpointInputs = null;
+            if (parameterSourceFactory is not null)
+            {
+                var selected = parameterSourceFactory();
+                var unique = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                checkpointInputs = new Tensor<T>[selected.Count + 1];
+                checkpointInputs[0] = segmentInput;
+                int write = 1;
+                for (int i = 0; i < selected.Count; i++)
+                {
+                    var parameter = selected[i];
+                    if (parameter is not null && !ReferenceEquals(parameter, segmentInput) && unique.Add(parameter))
+                        checkpointInputs[write++] = parameter;
+                }
+                if (write != checkpointInputs.Length)
+                    Array.Resize(ref checkpointInputs, write);
+            }
+
             int capturedStart = startIdx;
             int capturedEnd = endIdx;
             var capturedFunctions = functions;
 
-            DifferentiableOps.RecordUnary<T>(
-                $"Checkpoint_seg{seg}",
-                segmentOutput,
-                segmentInput,
-                (gradOutput, inputs, output, savedState, eng, grads) =>
+            BackwardFunction<T> backward = (gradOutput, inputs, output, savedState, eng, grads) =>
                 {
                     // RECOMPUTE: run the segment forward again WITH recording so
                     // backward can flow through the ops. Use a fresh, NON-persistent
@@ -85,13 +136,14 @@ public static class GradientCheckpointing<T>
                     // which produces NullReferenceException in
                     // SymbolicBackwardGraphBuilder.Analyze when the cached pattern
                     // does not match the current tape's reachable entries).
-                    using var recomputeTape = new GradientTape<T>(
-                        // SuppressArenaScope: this inner tape runs mid-backward, where the outer
-                        // tape has nulled the thread-current tape, so it would otherwise look like a
-                        // step-boundary tape and Reset() the OUTER tape's arena — corrupting the
-                        // accumulating gradients (#734). It borrows the arena for scratch only.
-                        new GradientTapeOptions { Persistent = false, SuppressArenaScope = true });
                     var reInput = inputs[0];
+                    List<(Tensor<T> Key, Tensor<T> Gradient)> detachedGradients;
+                    using (var recomputeArena = TensorArena.Create(poolWhenNested: true))
+                    using (var recomputeTape = new GradientTape<T>(
+                        // A dedicated nested arena owns this segment's replay. SuppressArenaScope
+                        // keeps the tape from resetting it before gradients are copied out below.
+                        new GradientTapeOptions { Persistent = false, SuppressArenaScope = true }))
+                    {
                     // Detach the segment input so the recompute graph is SELF-CONTAINED: its backward
                     // stops at the segment boundary instead of following reInput's producer into an
                     // EARLIER checkpoint segment. Without this, ComputeGradients(sources: null) below
@@ -101,10 +153,10 @@ public static class GradientCheckpointing<T>
                     // mirrors torch.utils.checkpoint's detach_variable(inputs). StopGradient returns a
                     // fresh leaf (data copy, no GradFn); the input gradient it produces is remapped
                     // back onto the original reInput tensor when scattering below.
-                    var reInputDetached = eng.StopGradient(reInput);
-                    var reOutput = reInputDetached;
-                    for (int i = capturedStart; i < capturedEnd; i++)
-                        reOutput = capturedFunctions[i](reOutput);
+                        var reInputDetached = eng.StopGradient(reInput);
+                        var reOutput = reInputDetached;
+                        for (int i = capturedStart; i < capturedEnd; i++)
+                            reOutput = capturedFunctions[i](reOutput);
 
                     // Vector-Jacobian product (VJP) seed. The previous
                     // implementation computed gradients with the inner tape's
@@ -140,8 +192,8 @@ public static class GradientCheckpointing<T>
                     // tensor — both ops are recorded on the inner tape via the
                     // DifferentiableOps backward registry, so ComputeGradients
                     // walks them and computes the correct VJP into reInput.
-                    var weighted = eng.TensorMultiply(reOutput, gradOutput);
-                    var pseudoLoss = eng.ReduceSum(weighted);
+                        var weighted = eng.TensorMultiply(reOutput, gradOutput);
+                        var pseudoLoss = eng.ReduceSum(weighted);
 
                     // Differentiate the recomputed segment w.r.t. EVERY leaf it touched — the
                     // (detached) segment input AND every weight/parameter the segment's functions
@@ -159,38 +211,66 @@ public static class GradientCheckpointing<T>
                     // instances the caller never queries — harmless. The sole exclusion is gradOutput:
                     // an outer-tape constant folded into the pseudo-loss only to seed the VJP, whose
                     // inner "gradient" (== reOutput) is not a real gradient and must not leak back.
-                    var segGrads = recomputeTape.ComputeGradients(pseudoLoss, sources: null);
+                        Tensor<T>[]? recomputeSources = null;
+                        if (checkpointInputs is not null)
+                        {
+                            recomputeSources = new Tensor<T>[inputs.Length];
+                            recomputeSources[0] = reInputDetached;
+                            for (int i = 1; i < inputs.Length; i++) recomputeSources[i] = inputs[i];
+                        }
+                        var segGrads = recomputeTape.ComputeGradients(pseudoLoss, recomputeSources);
 
-                    bool accumulatedAny = false;
-                    foreach (var kvp in segGrads)
-                    {
-                        if (ReferenceEquals(kvp.Key, gradOutput)) continue;
-                        if (kvp.Value is null) continue;
-                        // The detached input's gradient belongs to the ORIGINAL segment-input tensor
-                        // the caller tracks (and that the outer walk hands to the previous segment);
-                        // remap it. Every other key is a live parameter the segment read directly.
-                        var key = ReferenceEquals(kvp.Key, reInputDetached) ? reInput : kvp.Key;
-                        DifferentiableOps.AccumulateGrad(grads, key, kvp.Value, eng);
-                        accumulatedAny = true;
+                        // Segment-recompute arrays must not escape their bounded arena. Preserve only
+                        // the selected VJPs in ordinary owned storage; after this scope disposes, every
+                        // other activation/temporary is immediately reusable by the next block.
+                        detachedGradients = new List<(Tensor<T>, Tensor<T>)>(segGrads.Count);
+                        foreach (var kvp in segGrads)
+                        {
+                            if (ReferenceEquals(kvp.Key, gradOutput) || kvp.Value is null) continue;
+                            var key = ReferenceEquals(kvp.Key, reInputDetached) ? reInput : kvp.Key;
+                            var copied = CloneCheckpointBoundary(kvp.Value);
+                            detachedGradients.Add((key, copied));
+                        }
+
+                        if (detachedGradients.Count == 0 && ReferenceEquals(reOutput, reInputDetached))
+                        {
+                            var copied = CloneCheckpointBoundary(gradOutput);
+                            detachedGradients.Add((reInput, copied));
+                        }
                     }
 
-                    // Identity / no-op segment (output IS input by reference, nothing recorded on
-                    // the recompute tape): pass the upstream gradient straight through. Reference-
-                    // equality is the only safe alias predicate — it covers the empty-segment case
-                    // without false positives on shape coincidence. For a genuinely input-
-                    // independent segment, leaving grads[input] untouched (zero) is the correct VJP.
-                    if (!accumulatedAny && ReferenceEquals(reOutput, reInputDetached))
+                    foreach (var (key, gradient) in detachedGradients)
                     {
-                        // Empty / no-op segment (no functions ran): pass the upstream gradient straight
-                        // through to the original input.
-                        DifferentiableOps.AccumulateGrad(grads, reInput, gradOutput, eng);
+                        DifferentiableOps.AccumulateGrad(grads, key, gradient, eng);
                     }
-                });
+                };
+
+            if (checkpointInputs is null)
+            {
+                DifferentiableOps.RecordUnary<T>(
+                    $"Checkpoint_seg{seg}", segmentOutput, segmentInput, backward);
+            }
+            else
+            {
+                DifferentiableOps.RecordIfActive<T>(
+                    $"Checkpoint_seg{seg}", segmentOutput, checkpointInputs, backward);
+            }
 
             current2 = segmentOutput;
         }
 
         return current2;
+    }
+
+    /// <summary>
+    /// Copies a checkpoint boundary into ordinary owned storage. Segment outputs and VJPs may
+    /// be transpose/permute views, whose logical order cannot be exposed through AsSpan until
+    /// the view is materialized.
+    /// </summary>
+    private static Tensor<T> CloneCheckpointBoundary(Tensor<T> source)
+    {
+        var contiguous = source.IsContiguous ? source : source.Contiguous();
+        return new Tensor<T>(contiguous.AsSpan().ToArray(), source.Shape.ToArray());
     }
 
     private static bool ShapesEqual(int[] a, int[] b)

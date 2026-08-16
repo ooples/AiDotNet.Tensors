@@ -203,6 +203,8 @@ internal static class RebindablePlanCache<T>
                 if (idx < 0 || idx >= currentEntries.Count) return null;
                 ref var entry = ref currentEntries[idx];
 
+                if (!DifferentiableOps.IsGradientRequired(entry.Output))
+                    continue;
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                     continue;
 

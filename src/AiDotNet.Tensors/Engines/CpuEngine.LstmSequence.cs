@@ -821,6 +821,11 @@ public partial class CpuEngine
 
     // Seed a ping-pong state buffer (#478): copy the initial state in, or zero it when none is given.
     // default(T) is the additive identity for the numeric structs this path serves, so Clear() zeroes.
+    /// <summary>Seeds a ping-pong LSTM state buffer from an initial state, or zeroes it when none is given.</summary>
+    /// <remarks>
+    /// <c>default(T)</c> is the additive identity for the numeric structs this path serves, so
+    /// <c>Clear()</c> is a correct zero rather than merely a cheap one.
+    /// </remarks>
     private static void SeedLstmState<T>(Tensor<T> buffer, Tensor<T>? source, int n)
     {
         var dst = buffer.AsWritableSpan();
@@ -830,6 +835,7 @@ public partial class CpuEngine
             source.GetFlattenedData().AsSpan(0, n).CopyTo(dst.Slice(0, n));
     }
 
+    /// <summary>Logistic sigmoid over the generic numeric abstraction: 1 / (1 + e^-x).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static T Sigmoid<T>(INumericOperations<T> ops, T x)
     {
@@ -839,6 +845,7 @@ public partial class CpuEngine
         return ops.Divide(ops.One, ops.Add(ops.One, expNeg));
     }
 
+    /// <summary>Hyperbolic tangent over the generic numeric abstraction: (e^2x - 1) / (e^2x + 1).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static T TanhScalar<T>(INumericOperations<T> ops, T x)
     {
