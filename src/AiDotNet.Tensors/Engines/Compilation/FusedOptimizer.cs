@@ -2760,7 +2760,10 @@ public sealed class FusedOptimizerExtras
         if (!(SfBeta >= 0f && SfBeta <= 1f))
             throw new ArgumentOutOfRangeException(nameof(SfBeta), SfBeta,
                 "Schedule-Free SfBeta must be in [0, 1].");
-        if (!(AdmmRho > 0f) || !float.IsFinite(AdmmRho))
+        // float.IsFinite is .NET Core 2.1+ / netstandard2.1 and does not exist on net471, which this
+        // library still targets. float.IsInfinity does, and the negated comparison already rejects NaN
+        // (!(NaN > 0) is true) and -inf, so this covers the same set on every target.
+        if (!(AdmmRho > 0f) || float.IsInfinity(AdmmRho))
             throw new ArgumentOutOfRangeException(nameof(AdmmRho), AdmmRho,
                 "ADMM penalty parameter AdmmRho must be finite and > 0.");
     }
