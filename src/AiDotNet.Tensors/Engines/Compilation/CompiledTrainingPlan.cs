@@ -1926,6 +1926,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (optimizerType == OptimizerType.ProximalL1 && weightDecay != 0f)
             throw new NotSupportedException(
                 "ProximalL1 does not support weightDecay; use extras.L1 for the L1 proximal strength.");
+        if (optimizerType == OptimizerType.ADMM && weightDecay != 0f)
+            throw new NotSupportedException(
+                "ADMM does not support weightDecay; the split variable's proximal operator is where " +
+                "regularization enters, via extras.L1.");
     }
 
     /// <summary>Gate at the plan-level dispatch surface. The fused kernels
@@ -2002,6 +2006,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.ASGD
             or OptimizerType.Rprop
             or OptimizerType.ProximalL1
+            or OptimizerType.ADMM
             or OptimizerType.LBFGS
             or OptimizerType.TrustRegion
             or OptimizerType.ConjugateGradient
@@ -3264,6 +3269,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // Stateless: the prox reads only param and grad. L1 strength from extras.
                             FusedOptimizer.ProximalL1UpdateSimd(pParam, pGrad, len, lr, extras.L1);
                             break;
+                        case OptimizerType.ADMM:
+                            // z=pM, u=pV; rho and the prox threshold from extras.
+                            FusedOptimizer.AdmmUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, extras.AdmmRho, extras.L1);
+                            break;
                         default:
                             throw new NotSupportedException(
                                 $"Optimizer type {optType} is not yet supported by ConfigureOptimizer. " +
@@ -3877,6 +3887,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.ProximalL1:
                             // Stateless: the prox reads only param and grad. L1 strength from extras.
                             FusedOptimizer.ProximalL1UpdateSimd(pParam, pGrad, len, lr, extras.L1);
+                            break;
+                        case OptimizerType.ADMM:
+                            // z=pM, u=pV; rho and the prox threshold from extras.
+                            FusedOptimizer.AdmmUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, extras.AdmmRho, extras.L1);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -4587,6 +4602,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // report itself as classical/beta-0, and restore as a different algorithm than it ran.
             Nesterov = extras.Nesterov,
             FtrlBeta = extras.FtrlBeta,
+            // Same trap, three more fields. LbfgsMemorySize and TrustRegionRadius were added without
+            // reaching this clone, so an L-BFGS plan configured with a memory of 20 reported itself as the
+            // default 10 and a trust region of any size reported 1 — and restored as those.
+            LbfgsMemorySize = extras.LbfgsMemorySize,
+            TrustRegionRadius = extras.TrustRegionRadius,
+            AdmmRho = extras.AdmmRho,
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)
