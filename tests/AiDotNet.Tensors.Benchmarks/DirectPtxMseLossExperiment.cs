@@ -78,7 +78,8 @@ internal static class DirectPtxMseLossExperiment
     private static void RunDirect(List<Result> results)
     {
         using var runtime = new DirectPtxRuntime();
-        if (runtime.ArchitectureFamily != DirectPtxArchitectureFamily.Ampere) return;
+        if (!DirectPtxArchitecture.HasValidatedMseLoss(
+            runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor)) return;
         using (runtime.Enter())
         foreach ((int rows, int columns) in Shapes)
         {
@@ -120,8 +121,13 @@ internal static class DirectPtxMseLossExperiment
             Action launch = () => backend.MseLoss(predBuffer, targetBuffer, lossBuffer, rows, columns);
             Distribution distribution = Measure(backend.Synchronize, launch);
             long allocation = Allocation(backend.Synchronize, launch);
+            launch();
+            backend.Synchronize();
+            var actual = new float[rows];
+            backend.DownloadBuffer(lossBuffer, actual);
+            float error = Validate(actual, pred, target, rows, columns);
             results.Add(new Result(rows, columns, "AiDotNet mse_loss", distribution,
-                Bandwidth(rows, columns, distribution.Median), allocation, 0, 0f, -1, -1));
+                Bandwidth(rows, columns, distribution.Median), allocation, 0, error, -1, -1));
         }
     }
 
@@ -142,8 +148,17 @@ internal static class DirectPtxMseLossExperiment
             }
             Distribution distribution = Measure(() => torch.cuda.synchronize(), Launch);
             long allocation = Allocation(() => torch.cuda.synchronize(), Launch);
-            results.Add(new Result(rows, columns, "PyTorch mean((p-t)^2)", distribution,
-                Bandwidth(rows, columns, distribution.Median), allocation, -1, 0f, -1, -1));
+            float error;
+            using (TorchTensor diff = p.sub(t))
+            using (TorchTensor sq = diff.mul(diff))
+            using (TorchTensor output = sq.mean([1L]))
+            using (TorchTensor outputCpu = output.cpu())
+            {
+                torch.cuda.synchronize();
+                error = Validate(outputCpu.data<float>().ToArray(), pred, target, rows, columns);
+            }
+            results.Add(new Result(rows, columns, "PyTorch eager mean((p-t)^2)", distribution,
+                Bandwidth(rows, columns, distribution.Median), allocation, -1, error, -1, -1));
         }
     }
 

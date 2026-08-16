@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Which loss gradient a <see cref="PtxFusedLossBackwardF32Kernel"/> emits.
 /// The two operators have different launch ABIs - MSE takes a broadcast
-/// gradOutput scalar and a baked 1/N, MAE takes neither - so each is a separate
+/// gradOutput scalar and a launch-time 1/N parameter, MAE takes neither - so each is a separate
 /// module and a separate issue-#847 coverage cell.
 /// </summary>
 internal enum DirectPtxLossBackwardOp
@@ -34,8 +34,8 @@ internal enum DirectPtxLossBackwardOp
 ///   which C evaluates as <c>((g * 2) * d) * invN</c>. gradOutput[0] is a
 ///   broadcast scalar, so <c>g * 2</c> is loop-invariant and is hoisted once;
 ///   the per-element work is then exactly two multiplies in that same order.
-///   inv_n is baked into the module as an IEEE-754 literal, so the kernel keys
-///   on its exact bit pattern rather than dividing.
+///   inv_n arrives as a validated launch parameter, so one shape module serves
+///   every valid scale without dividing.
 /// - mae_gradient computes <c>(d &gt; 0) ? 1 : ((d &lt; 0) ? -1 : 0)</c>. Two
 ///   predicates and two selects reproduce it exactly, including the NaN case:
 ///   both comparisons are false, so the result is +0.
@@ -99,12 +99,20 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, op, size, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             op, size, blockThreads);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPointFor(op), out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPointFor(op), info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPointFor(op), out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPointFor(op), info, BlockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     /// <summary>
@@ -116,10 +124,8 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         DirectPtxTensorView predictions,
         DirectPtxTensorView targets,
         DirectPtxTensorView gradInput,
-        DirectPtxTensorView? gradOutput = null,
-        float invN = 1f)
+        DirectPtxTensorView? gradOutput = null)
     {
-        ValidateInvN(Op, invN);
         bool needsGradOutput = Op == DirectPtxLossBackwardOp.MeanSquaredError;
         if (needsGradOutput && !gradOutput.HasValue)
             throw new ArgumentException(
@@ -145,6 +151,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
         IntPtr predictionsPointer = predictions.Pointer;
         IntPtr targetsPointer = targets.Pointer;
         IntPtr gradInputPointer = gradInput.Pointer;
+        float invN = InvN;
 
         void** arguments = stackalloc void*[5];
         int argumentCount = 0;
@@ -352,7 +359,7 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "none",
                 ["division"] = op == DirectPtxLossBackwardOp.MeanSquaredError
-                    ? "none-invN-baked-as-literal"
+                    ? "none-invN-is-a-launch-parameter"
                     : "none",
                 ["byte-offset"] = "zero-entire-allocation-view",
                 ["padding"] = "none-logical-equals-physical"
@@ -391,16 +398,16 @@ internal sealed class PtxFusedLossBackwardF32Kernel : IDisposable
     }
 
     /// <summary>
-    /// invN is baked into the module, so a non-finite value would silently
-    /// poison every gradient the cache serves for that key.
+    /// invN is a launch parameter. Reject non-positive and non-finite scales
+    /// before a kernel instance can carry them into training.
     /// </summary>
-    private static void ValidateInvN(DirectPtxLossBackwardOp op, float invN)
+    internal static void ValidateInvN(DirectPtxLossBackwardOp op, float invN)
     {
         if (op != DirectPtxLossBackwardOp.MeanSquaredError)
             return;
-        if (!PtxCompat.IsFinite(invN))
+        if (!(invN > 0f) || !PtxCompat.IsFinite(invN))
             throw new ArgumentOutOfRangeException(nameof(invN),
-                "The MSE gradient scale must be finite.");
+                "The MSE gradient scale must be finite and > 0.");
     }
 
     private static void Require(

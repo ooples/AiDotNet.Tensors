@@ -206,6 +206,25 @@ class Program
             return;
         }
 
+        // GPU-free cubin generation, verification and SASS audit for the loss family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-loss-cubins")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-loss-cubins")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-loss-sass")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.AuditSass(args);
+            return;
+        }
+
         // GPU-free cubin generation, verification and SASS audit for the optimizer family.
         // Without these the artifact pipeline had no way to invoke DirectPtxOptimizerCubinTool
         // through the benchmark executable, which is how every other family is driven.

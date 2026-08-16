@@ -81,8 +81,18 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
-    /// <summary>Benchmark-only access to MSE-loss cells that have not passed promotion.</summary>
-    internal static bool MseLossExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_mseLossExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to MSE-loss cells that have not passed promotion. Thread-local
+    /// state keeps an experimental opt-in from leaking into unrelated concurrent dispatches.
+    /// </summary>
+    internal static bool MseLossExperimentOverride
+    {
+        get => s_mseLossExperimentOverride;
+        set => s_mseLossExperimentOverride = value;
+    }
     [ThreadStatic]
     private static bool s_sgdMomentumExperimentOverride;
 

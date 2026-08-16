@@ -79,21 +79,34 @@ def measure_device(operation):
         result = operation()
         del result
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    values = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(SAMPLES):
+        start.record()
         for _ in range(DEVICE_LAUNCHES):
             result = operation()
+        end.record()
+        end.synchronize()
+        values.append(start.elapsed_time(end) * 1000.0 / DEVICE_LAUNCHES)
+        del result
+    return summarize(values)
+
+
+def measure_graph(replay):
+    for _ in range(WARMUPS):
+        replay()
     torch.cuda.synchronize()
     values = []
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     for _ in range(SAMPLES):
         start.record()
-        graph.replay()
+        for _ in range(DEVICE_LAUNCHES):
+            replay()
         end.record()
         end.synchronize()
         values.append(start.elapsed_time(end) * 1000.0 / DEVICE_LAUNCHES)
-    del result
     return summarize(values)
 
 
@@ -232,7 +245,8 @@ def main():
                 probe = graph_operation()
                 torch.cuda.synchronize()
                 graph_error = (probe.double() - expected).abs().max().item()
-                emit(run, rows, columns, "PyTorch CUDA graph", eager_device,
+                graph_device = measure_graph(graph_operation)
+                emit(run, rows, columns, "PyTorch CUDA graph", graph_device,
                      measure_e2e(graph_operation), managed_peak_bytes(graph_operation),
                      graph_bytes, graph_error)
             except Exception as exception:
@@ -253,7 +267,8 @@ def main():
                 probe = compiled_graph()
                 torch.cuda.synchronize()
                 compiled_graph_error = (probe.double() - expected).abs().max().item()
-                emit(run, rows, columns, "PyTorch compile graph", compiled_device,
+                compiled_graph_device = measure_graph(compiled_graph)
+                emit(run, rows, columns, "PyTorch compile graph", compiled_graph_device,
                      measure_e2e(compiled_graph), managed_peak_bytes(compiled_graph),
                      compiled_graph_bytes, compiled_graph_error)
             except Exception as exception:

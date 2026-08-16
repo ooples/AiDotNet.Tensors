@@ -2551,6 +2551,22 @@ public sealed partial class CudaBackend
             return false;
         }
 
+        if (predictions is null)
+        {
+            DirectPtxLastError = "mse-loss-null-predictions-buffer";
+            return false;
+        }
+        if (targets is null)
+        {
+            DirectPtxLastError = "mse-loss-null-targets-buffer";
+            return false;
+        }
+        if (loss is null)
+        {
+            DirectPtxLastError = "mse-loss-null-output-buffer";
+            return false;
+        }
+
         long matrixBytes = checked((long)rows * columns * sizeof(float));
         if (predictions.SizeInBytes != matrixBytes || targets.SizeInBytes != matrixBytes ||
             loss.SizeInBytes != checked((long)rows * sizeof(float)))
@@ -2561,6 +2577,7 @@ public sealed partial class CudaBackend
 
         try
         {
+            bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
             var key = new DirectPtxMseLossKey(rows, columns);
             lock (_directPtxLock)
@@ -2568,7 +2585,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxMseLossKernels.TryGetValue(
                     key, out PtxFusedMseLossF32Kernel? kernel))
                 {
-                    if (IsStreamCapturing())
+                    if (capturing)
                     {
                         DirectPtxLastError =
                             "Direct PTX MSE loss must be prewarmed before CUDA graph capture.";
@@ -2577,6 +2594,13 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMseLossKernelSlow(key);
                 }
+                // A graph executable retains this CUfunction after capture. Pin
+                // the cache entry so later LRU eviction cannot unload its module
+                // and leave graph replay holding a freed function handle.
+                if (capturing &&
+                    !PinDirectPtxKernelForCapture(_directPtxMseLossKernels, key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX MSE-loss module for CUDA graph capture.");
                 lock (GpuDispatchLock)
                     kernel.Launch(
                         DirectPtxTensorView.Create(predictions, kernel.Blueprint.Tensors[0]),
@@ -2714,6 +2738,11 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "sgd-momentum-performance-gate-not-met";
             return false;
         }
+
+        // These Try* methods are internal entry points that tests and benchmarks call directly,
+        // so every sibling route guards its buffers explicitly rather than relying on the one
+        // public caller that happens to check. Without this a null argument escapes as a
+        // NullReferenceException instead of a clean false plus a reason string.
         if (param is null || gradient is null || velocity is null)
         {
             DirectPtxLastError = "sgd-momentum-null-buffer";
@@ -2731,6 +2760,10 @@ public sealed partial class CudaBackend
         {
             bool capturing = IsStreamCapturing();
             EnsureContextCurrent();
+            // Identity is shape plus weight-decay presence, nothing else. EmitPtx varies only on
+            // those two, so keying on the scalar bits compiled byte-identical PTX into a separate
+            // module per learning rate: a schedule triggered a fresh JIT and module load every
+            // step, and churned the 16-entry LRU continuously.
             var key = new DirectPtxSgdMomentumKey(size, weightDecay != 0f);
             lock (_directPtxLock)
             {
@@ -2746,6 +2779,10 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheSgdMomentumKernelSlow(key);
                 }
+                // A cache HIT during capture reached the launch with no pin. A graph executable
+                // retains this CUfunction after capture, and cuModuleUnload invalidates function
+                // handles, so a captured specialization must never become an LRU victim -- a
+                // replayed graph would call a freed function. Every sibling route pins here.
                 if (capturing &&
                     !PinDirectPtxKernelForCapture(_directPtxSgdMomentumKernels, key))
                     throw new InvalidOperationException(

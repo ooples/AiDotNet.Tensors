@@ -13,9 +13,9 @@ on:
     branches: [master, main]
     paths:
       - '.github/workflows/direct-ptx-loss-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedMseLossF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedLossBackwardF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+      - 'tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxLossCubinTool.cs'
       - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
   push:
@@ -23,8 +23,14 @@ on:
     paths:
       - '.github/workflows/direct-ptx-loss-gate.yml'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+      - 'tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj'
+      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxLossCubinTool.cs'
+      - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,10 +51,12 @@ jobs:
   offline-cubin-and-sass:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
@@ -119,7 +127,7 @@ jobs:
       # family they are what gets committed to seed the manifest.
       - name: Upload cubins and SASS evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: direct-ptx-loss-sm86
           path: |

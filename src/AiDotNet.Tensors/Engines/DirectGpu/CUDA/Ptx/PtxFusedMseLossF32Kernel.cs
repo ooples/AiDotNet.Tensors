@@ -50,12 +50,20 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
         BlockThreads = blockThreads;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, rows, columns, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, rows, columns, blockThreads);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                var audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -234,11 +242,10 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
     private static void Validate(int rows, int columns)
     {
         if (!IsSupportedShape(rows, columns))
-            throw new ArgumentOutOfRangeException(nameof(rows),
+            throw new ArgumentOutOfRangeException(
+                rows is 256 or 2048 or 8192 ? nameof(columns) : nameof(rows),
                 "The first MSE-loss family supports exact (rows,columns) buckets " +
                 "(256,128), (2048,64), (2048,128), and (8192,128).");
-        if (columns % 32 != 0)
-            throw new ArgumentOutOfRangeException(nameof(columns));
     }
 
     private static void ValidateBlockThreads(int rows, int blockThreads)

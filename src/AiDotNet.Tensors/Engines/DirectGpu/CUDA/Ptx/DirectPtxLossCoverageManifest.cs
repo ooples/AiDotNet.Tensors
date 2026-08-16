@@ -34,7 +34,7 @@ internal static class DirectPtxLossCoverageManifest
 
     internal static IReadOnlyList<DirectPtxLossCoverageCell> All { get; } =
     [
-        Experimental("CudaBackend.MseLoss", "NVRTC mse_loss", "loss[i] = mean_j (pred-target)^2", Rows, "FP32", "v1 Ampere warp-row C64/C128 exact-shape cells"),
+        Experimental("CudaBackend.MseLoss", "NVRTC mse_loss", "loss[i] = mean_j (pred-target)^2", Rows, "FP32", "v1 SM86 warp-row C64/C128 exact-shape cells"),
         Planned("CudaBackend.MaeLoss", "NVRTC mae_loss", "loss[i] = mean_j |pred-target|", Rows, "FP32", "warp-row-mae-families"),
         Planned("CudaBackend.HuberLoss", "NVRTC huber_loss", "smooth-L1 with baked delta", Rows, "FP32", "baked-delta-warp-row-families"),
         Planned("CudaBackend.BceLoss", "NVRTC bce_loss", "binary cross-entropy from probabilities", Vector, "FP32", "warp-row-bce-families"),
@@ -46,8 +46,8 @@ internal static class DirectPtxLossCoverageManifest
         Planned("CudaBackend.FusedLinearCrossEntropyIndex", "NVRTC fused_linear_cross_entropy_index", "indexed fused linear cross-entropy", "canonical contiguous with INT32 targets", "FP32; INT32 targets", "fused-gemm-indexed-nll-families"),
         Planned("CudaBackend.CosineEmbeddingLoss", "none - no backend op and no cosine_embedding_loss kernel exist", "1 - cos similarity margin loss", Rows, "FP32", "blocked: needs a public backend op first, then warp-row-cosine-families"),
         Planned("CudaBackend.TripletLoss", "NVRTC triplet_loss", "max(0, d(a,p)-d(a,n)+margin)", Rows, "FP32", "baked-margin-triplet-families"),
-        Experimental("CudaBackend.MseLossBackward", "NVRTC mse_loss_backward", "grad = ((gradOut[0] * 2) * (pred-target)) * invN", Vector, "FP32", "v1 Ampere linear-vec4 exact-size cells; invN baked, broadcast scalar hoisted, association order preserved"),
-        Experimental("CudaBackend.MaeBackward", "NVRTC mae_gradient", "grad = sign(pred-target); zero at zero and at NaN - NO 1/N and NO gradOut, contrary to the earlier description here", Vector, "FP32", "v1 Ampere linear-vec4 exact-size cells; two predicates and two selects reproduce the ternary chain exactly"),
+        Experimental("CudaBackend.MseLossBackward", "NVRTC mse_loss_backward", "grad = ((gradOut[0] * 2) * (pred-target)) * invN", Vector, "FP32", "v1 SM86 linear-vec4 exact-size cells; invN launch parameter, broadcast scalar hoisted, association order preserved"),
+        Experimental("CudaBackend.MaeBackward", "NVRTC mae_gradient", "grad = sign(pred-target); zero at zero and at NaN; applies neither 1/N scaling nor gradOut", Vector, "FP32", "v1 SM86 linear-vec4 exact-size cells; two predicates and two selects reproduce the ternary chain exactly"),
         Planned("CudaBackend.HuberLossBackward", "NVRTC huber_loss_backward", "clamped smooth-L1 gradient", Vector, "FP32", "baked-delta-backward-families"),
         Planned("CudaBackend.CrossEntropyBackward", "NVRTC cross_entropy_backward", "softmax(pred) - onehot(target)", Rows, "FP32", "fused-softmax-minus-onehot-families"),
         Planned("CudaBackend.BinaryCrossEntropyBackward", "NVRTC binary_cross_entropy_backward", "BCE input gradient", Vector, "FP32", "elementwise-bce-backward-families"),

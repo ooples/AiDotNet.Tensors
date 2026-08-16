@@ -1,9 +1,12 @@
 using System;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -11,7 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// Focused coverage for the exact-shape FP32 per-sample MSE-loss direct-PTX
 /// family (issue #847). The emitter and shape-domain assertions run without a
-/// GPU; the driver correctness assertion is skipped unless a validated Ampere
+/// GPU; the driver correctness assertion is skipped unless the validated SM86
 /// device is present. The specialization stays disabled by default and fails
 /// closed until three clean promotion runs clear the release gate.
 /// </summary>
@@ -24,12 +27,12 @@ public class DirectPtxMseLossTests
         Assert.Contains(".maxntid 128, 1, 1", ptx);
         Assert.Contains("exact-shape rows=2048 columns=128 block=128", ptx);
         Assert.Contains("op=mse-loss", ptx);
-        Assert.Equal(3, Count(ptx, "ld.param.u64"));
-        Assert.Equal(2, Count(ptx, "ld.global.nc.v4.f32"));
-        Assert.Equal(4, Count(ptx, "sub.rn.f32"));
-        Assert.Equal(4, Count(ptx, "fma.rn.f32"));
-        Assert.Equal(5, Count(ptx, "shfl.sync.bfly.b32"));
-        Assert.Equal(1, Count(ptx, "st.global.f32"));
+        Assert.Equal(3, PtxText.CountOccurrences(ptx, "ld.param.u64"));
+        Assert.Equal(2, PtxText.CountOccurrences(ptx, "ld.global.nc.v4.f32"));
+        Assert.Equal(4, PtxText.CountOccurrences(ptx, "sub.rn.f32"));
+        Assert.Equal(4, PtxText.CountOccurrences(ptx, "fma.rn.f32"));
+        Assert.Equal(5, PtxText.CountOccurrences(ptx, "shfl.sync.bfly.b32"));
+        Assert.Equal(1, PtxText.CountOccurrences(ptx, "st.global.f32"));
         // 1/128 = 0x3C000000
         Assert.Contains("0f3C000000", ptx);
         Assert.Contains("ld.global.nc.v2.f32",
@@ -53,6 +56,74 @@ public class DirectPtxMseLossTests
         Assert.False(PtxFusedMseLossF32Kernel.IsPromotedShape(2048, 128));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             PtxFusedMseLossF32Kernel.EmitPtx(8, 6, 17, 128));
+    }
+
+    [Fact]
+    public async Task UnsupportedShape_IdentifiesTheInvalidDimension()
+    {
+        await Task.Yield();
+
+        var rowsError = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedMseLossF32Kernel.EmitPtx(8, 6, 17, 128));
+        var columnsError = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PtxFusedMseLossF32Kernel.EmitPtx(8, 6, 256, 64));
+
+        Assert.Equal("rows", rowsError.ParamName);
+        Assert.Equal("columns", columnsError.ParamName);
+    }
+
+    [Fact]
+    public async Task MseLossExperimentOverride_IsThreadLocal()
+    {
+        await Task.Yield();
+
+        using var ownerReady = new ManualResetEventSlim();
+        using var observerFinished = new ManualResetEventSlim();
+        var ownerCompletion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var observerCompletion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var owner = new Thread(() =>
+        {
+            try
+            {
+                DirectPtxFeatureGate.MseLossExperimentOverride = true;
+                ownerReady.Set();
+                observerFinished.Wait();
+                Assert.True(DirectPtxFeatureGate.MseLossExperimentOverride);
+                ownerCompletion.SetResult(true);
+            }
+            catch (Exception exception)
+            {
+                ownerCompletion.SetException(exception);
+            }
+            finally
+            {
+                DirectPtxFeatureGate.MseLossExperimentOverride = false;
+            }
+        });
+        var observer = new Thread(() =>
+        {
+            try
+            {
+                ownerReady.Wait();
+                Assert.False(DirectPtxFeatureGate.MseLossExperimentOverride);
+                observerCompletion.SetResult(true);
+            }
+            catch (Exception exception)
+            {
+                observerCompletion.SetException(exception);
+            }
+            finally
+            {
+                observerFinished.Set();
+            }
+        });
+
+        owner.Start();
+        observer.Start();
+        await Task.WhenAll(ownerCompletion.Task, observerCompletion.Task);
     }
 
     [Fact]
@@ -135,8 +206,9 @@ public class DirectPtxMseLossTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
-        Skip.IfNot(runtime.ArchitectureFamily == DirectPtxArchitectureFamily.Ampere,
-            "The checked-in MSE-loss specialization is validated on Ampere.");
+        Skip.IfNot(DirectPtxArchitecture.HasValidatedMseLoss(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
+            "The checked-in MSE-loss specialization is validated only on GA102/SM86.");
         using var kernel = new PtxFusedMseLossF32Kernel(runtime, rows, columns);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
         Assert.Equal(0, kernel.Audit.Function.StaticSharedBytes);
@@ -181,14 +253,4 @@ public class DirectPtxMseLossTests
         }
     }
 
-    private static int Count(string text, string value)
-    {
-        int count = 0, offset = 0;
-        while ((offset = text.IndexOf(value, offset, StringComparison.Ordinal)) >= 0)
-        {
-            count++;
-            offset += value.Length;
-        }
-        return count;
-    }
 }
