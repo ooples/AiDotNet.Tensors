@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -4309,6 +4309,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 DAdaptationEstimate = rt.Scalars.DAdaptationEstimate,
                 DAdaptationRAccum = rt.Scalars.DAdaptationRAccum,
                 ScheduleFreeWeightSum = rt.Scalars.ScheduleFreeWeightSum,
+                ConjugateGradientPrevGradNorm2 = rt.Scalars.CgPrevGradNorm2,
             },
             Parameters = new FusedOptimizerParameterCheckpoint[_parameters.Length],
         };
@@ -4373,6 +4374,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         rt.Scalars.DAdaptationEstimate = checkpoint.Scalars.DAdaptationEstimate;
         rt.Scalars.DAdaptationRAccum = checkpoint.Scalars.DAdaptationRAccum;
         rt.Scalars.ScheduleFreeWeightSum = checkpoint.Scalars.ScheduleFreeWeightSum;
+        rt.Scalars.CgPrevGradNorm2 = checkpoint.Scalars.ConjugateGradientPrevGradNorm2;
 
         for (int p = 0; p < checkpoint.Parameters.Length; p++)
             RestoreOptimizerParameterState(rt, p, checkpoint.Parameters[p]);
