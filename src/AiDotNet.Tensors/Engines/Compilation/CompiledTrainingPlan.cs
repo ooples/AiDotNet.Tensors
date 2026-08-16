@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -750,6 +750,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public float DAdaptationEstimate;
         public float DAdaptationRAccum;
         public float ScheduleFreeWeightSum;
+        // Fletcher-Reeves: ||g_{k-1}||^2, the denominator of the next beta. Cached rather than recomputed
+        // because the numerator of step k is the denominator of step k+1 - one reduction, used twice.
+        public float CgPrevGradNorm2;
     }
 
     private sealed class FusedOptimizerRuntimeState
@@ -1883,7 +1886,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var candidate = groupOptimizerTypes?[g] ?? optimizerType;
             if (candidate is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
-                or OptimizerType.ScheduleFreeSGD or OptimizerType.LBFGS or OptimizerType.TrustRegion)
+                or OptimizerType.ScheduleFreeSGD or OptimizerType.LBFGS or OptimizerType.TrustRegion
+                or OptimizerType.ConjugateGradient)
                 throw new NotSupportedException(
                     $"{candidate} maintains global optimizer state across the complete parameter set " +
                     "(a learning-rate/distance/radius scalar, parameter transform, or curvature history) " +
@@ -2000,6 +2004,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.ProximalL1
             or OptimizerType.LBFGS
             or OptimizerType.TrustRegion
+            or OptimizerType.ConjugateGradient
             or OptimizerType.HypergradientSGD
             or OptimizerType.DAdaptationSGD
             or OptimizerType.ScheduleFreeSGD;
@@ -2198,6 +2203,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
                 or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ConjugateGradient          // m[p] = d, the conjugate direction
                 or OptimizerType.ScheduleFreeSGD;   // m[p] = z (SGD trajectory)
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
@@ -2678,6 +2684,72 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 return;
             }
+            if (optType == OptimizerType.ConjugateGradient)
+            {
+                // Fletcher-Reeves CG. Structurally SGD-with-momentum where the coefficient is recomputed
+                // every step, which is precisely why it cannot reuse the SGDMomentum kernel: that one bakes
+                // beta1 in at plan-build time. Two global reductions plus an elementwise update - the same
+                // two-phase shape HypergradientSGD uses.
+                //
+                //   beta = (g.g) / (g_prev.g_prev)
+                //   d    = -g + beta*d_prev            (d_prev lives in m[p])
+                //   if d.g >= 0: d = -g                (Powell restart)
+                //   x   += lr*d
+                double gg = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
+                        for (int i = 0; i < len2; i++) gg += (double)pGrad[i] * pGrad[i];
+                }
+
+                // First step, or a vanished previous gradient: fall back to steepest descent rather than
+                // dividing by ~0 and poisoning every later direction with a non-finite beta.
+                float beta = scalarState.CgPrevGradNorm2 > 1e-30f
+                    ? (float)(gg / scalarState.CgPrevGradNorm2)
+                    : 0f;
+
+                // Build d into m[p], then test whether it still descends.
+                double dg = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = &gradArrays[p][gradOffsets[p]], pD = m[p])
+                        for (int i = 0; i < len2; i++)
+                        {
+                            float d = -pGrad[i] + beta * pD[i];
+                            pD[i] = d;
+                            dg += (double)d * pGrad[i];
+                        }
+                }
+
+                // Powell restart: a conjugate direction that stopped pointing downhill would be followed
+                // uphill while the optimizer still reported progress. Rebuild as steepest descent.
+                bool restart = dg >= 0;
+                if (restart)
+                    for (int p = 0; p < paramCount; p++)
+                    {
+                        if (gradArrays[p].Length == 0) continue;
+                        int len2 = lengths[p];
+                        fixed (float* pGrad = &gradArrays[p][gradOffsets[p]], pD = m[p])
+                            for (int i = 0; i < len2; i++) pD[i] = -pGrad[i];
+                    }
+
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pParam = &paramArrays[p][paramOffsets[p]], pD = m[p])
+                        for (int i = 0; i < len2; i++) pParam[i] += lr * pD[i];
+                    MarkHostWeightMutated(p);
+                }
+
+                scalarState.CgPrevGradNorm2 = (float)gg;
+                return;
+            }
+
 
 
 
@@ -4237,6 +4309,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 DAdaptationEstimate = rt.Scalars.DAdaptationEstimate,
                 DAdaptationRAccum = rt.Scalars.DAdaptationRAccum,
                 ScheduleFreeWeightSum = rt.Scalars.ScheduleFreeWeightSum,
+                ConjugateGradientPrevGradNorm2 = rt.Scalars.CgPrevGradNorm2,
             },
             Parameters = new FusedOptimizerParameterCheckpoint[_parameters.Length],
         };
@@ -4301,6 +4374,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         rt.Scalars.DAdaptationEstimate = checkpoint.Scalars.DAdaptationEstimate;
         rt.Scalars.DAdaptationRAccum = checkpoint.Scalars.DAdaptationRAccum;
         rt.Scalars.ScheduleFreeWeightSum = checkpoint.Scalars.ScheduleFreeWeightSum;
+        rt.Scalars.CgPrevGradNorm2 = checkpoint.Scalars.ConjugateGradientPrevGradNorm2;
 
         for (int p = 0; p < checkpoint.Parameters.Length; p++)
             RestoreOptimizerParameterState(rt, p, checkpoint.Parameters[p]);
