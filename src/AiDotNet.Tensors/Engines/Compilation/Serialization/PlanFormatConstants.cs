@@ -26,8 +26,11 @@ internal static class PlanFormatConstants
     /// the fused-checkpoint payload. Version 3 readers and writers disagree on
     /// that payload width, so accepting a version 3 plan would misalign every
     /// field that follows it.
+    /// Version 5 adds Fletcher-Reeves conjugate-gradient scalar state to the
+    /// same payload. Version 4 plans do not contain that value and must be
+    /// rejected rather than shifting the following parameter-state fields.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 4;
+    internal const ushort CurrentFormatVersion = 5;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:

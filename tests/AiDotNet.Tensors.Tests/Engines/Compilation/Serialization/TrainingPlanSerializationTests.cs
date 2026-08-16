@@ -119,8 +119,10 @@ public class TrainingPlanSerializationTests
         loaded.Dispose();
     }
 
-    [Fact]
-    public async Task Load_Version3TrainingPlan_IsRejectedAfterOptimizerPayloadChange()
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task Load_LegacyTrainingPlan_IsRejectedAfterOptimizerPayloadChanges(int legacyVersion)
     {
         await Task.Yield();
 
@@ -137,16 +139,16 @@ public class TrainingPlanSerializationTests
         byte[] bytes = stream.ToArray();
 
         // Header layout starts with uint magic followed by ushort format version.
-        BitConverter.GetBytes((ushort)3).CopyTo(bytes, sizeof(uint));
+        BitConverter.GetBytes((ushort)legacyVersion).CopyTo(bytes, sizeof(uint));
 
         const int FooterSize = sizeof(long) + sizeof(ulong);
         int bodyLength = bytes.Length - FooterSize;
         ulong checksum = XXHash64.Compute(bytes, 0, bodyLength);
         BitConverter.GetBytes(checksum).CopyTo(bytes, bodyLength + sizeof(long));
 
-        using var version3Stream = new MemoryStream(bytes);
+        using var legacyStream = new MemoryStream(bytes);
         var loaded = await CompiledPlanLoader.LoadTrainingAsync<float>(
-            version3Stream, engine, new[] { weight });
+            legacyStream, engine, new[] { weight });
 
         Assert.Null(loaded);
     }
