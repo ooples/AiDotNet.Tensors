@@ -233,6 +233,16 @@ internal sealed class FusedOptimizerScalarCheckpoint
     public float DAdaptationEstimate { get; set; }
     public float DAdaptationRAccum { get; set; }
     public float ScheduleFreeWeightSum { get; set; }
+
+    /// <summary>
+    /// Fletcher-Reeves' previous squared gradient norm, the denominator of beta.
+    /// </summary>
+    /// <remarks>
+    /// Without it in the checkpoint, a restored conjugate-gradient plan computes beta against a zero
+    /// denominator on its first step, falls back to steepest descent, and discards the conjugacy the
+    /// method exists for — silently, since it still descends.
+    /// </remarks>
+    public float ConjugateGradientPrevGradNorm2 { get; set; }
 }
 
 internal sealed class FusedOptimizerParameterCheckpoint
