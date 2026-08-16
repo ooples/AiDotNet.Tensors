@@ -17702,17 +17702,57 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated element-wise arithmetic
     // ──────────────────────────────────────────────────────────────
 
-    /// <summary>PR #638 A1: resident-step out-of-place elementwise binary — compute into a FRESH resident-bound
-    /// output (no AllocateOutputBuffer temp, no download), so the backward grad stays GPU-resident for capture.
-    /// Returns the bound output on success, else null (off the resident step / autocast / non-float → caller's
-    /// normal download path). Records nothing; the caller records the backward exactly as its eager path.</summary>
+    /// <summary>Out-of-place elementwise binary for resident float operands — compute into a FRESH resident-bound
+    /// output (no AllocateOutputBuffer temp, no download), so eager and compiled backward gradients stay on GPU.
+    /// Returns the bound output on success, else null (non-resident inputs / autocast / non-float → caller's
+    /// normal path). Records nothing; the caller records the backward exactly as its eager path.</summary>
     private Tensor<T>? TryBinaryResidentOutOfPlace<T>(Tensor<T> a, Tensor<T> b,
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> kernel)
     {
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
-        var output = new Tensor<T>(new T[a.Length], a.Shape._dims);
-        return TryRunBinaryInto(output, a, b, kernel) ? output : null;
+
+        // Compiled execution needs a stable, capture-safe scratch address. Keep the existing
+        // resident-step route rather than allocating a fresh eager buffer during graph capture.
+        if (ResidentStepActive)
+        {
+            var capturedOutput = new Tensor<T>(new T[a.Length], a.Shape._dims);
+            return TryRunBinaryInto(capturedOutput, a, b, kernel) ? capturedOutput : null;
+        }
+
+        if (!TryGetBackend(out var backend))
+            return null;
+        // Outside a resident/capture step, a direct buffer is usable only when it is the
+        // current tensor version and its cache owner is still live. ResolveResidentBufferNoUpload
+        // deliberately omits this gate for capture-time metadata views, so using it here could
+        // execute eager arithmetic against a stale pre-mutation buffer.
+        if (a._gpuBuffer is null || !ReferenceEquals(a._gpuBackend, backend)
+            || a._gpuBufferVersion != a.Version || !IsCachedGpuBufferLive(a, backend)
+            || a._gpuBuffer.Handle == System.IntPtr.Zero || a._gpuBuffer.Size < a.Length
+            || b._gpuBuffer is null || !ReferenceEquals(b._gpuBackend, backend)
+            || b._gpuBufferVersion != b.Version || !IsCachedGpuBufferLive(b, backend)
+            || b._gpuBuffer.Handle == System.IntPtr.Zero || b._gpuBuffer.Size < b.Length)
+            return null;
+        var residentA = a._gpuBuffer;
+        var residentB = b._gpuBuffer;
+        IGpuBuffer? output = null;
+        try
+        {
+            output = backend.AllocateBuffer(a.Length);
+            kernel(backend, residentA, residentB, output, a.Length);
+            var result = DeferTensorResult<T>(backend, output, a.Length, a.Shape.ToArray());
+            output = null; // ownership transferred to the deferred tensor
+            return result;
+        }
+        catch (Exception ex)
+        {
+            AliasDiag($"binary-eager-resident FELLBACK shape=[{string.Join(",", a._shape)}]: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            output?.Dispose();
+        }
     }
 
     /// <summary>PR #638 A1: resident-step GEMM — [M,K]x[K,N] into a fresh resident-bound output, no temp output
