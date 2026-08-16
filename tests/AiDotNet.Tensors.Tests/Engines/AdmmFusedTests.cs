@@ -91,8 +91,8 @@ public class AdmmFusedTests
             Assert.NotNull(checkpoint.Parameters[0].VFloat); // u
 
             var loss = plan.Step();
-            Assert.True(float.IsFinite(loss[0]));
-            Assert.All(parameter.ToArray(), value => Assert.True(float.IsFinite(value)));
+            Assert.True(IsFinite(loss[0]));
+            Assert.All(parameter.ToArray(), value => Assert.True(IsFinite(value)));
         }
     }
 
@@ -163,8 +163,8 @@ public class AdmmFusedTests
             Assert.NotNull(checkpoint.Parameters[0].VFloat); // u
 
             var loss = plan.Step();
-            Assert.True(float.IsFinite(loss[0]));
-            Assert.All(parameter.ToArray(), value => Assert.True(float.IsFinite(value)));
+            Assert.True(IsFinite(loss[0]));
+            Assert.All(parameter.ToArray(), value => Assert.True(IsFinite(value)));
         }
     }
 
@@ -387,4 +387,6 @@ public class AdmmFusedTests
             Assert.NotEqual(before[i] - z[i], u[i], 5);
         }
     }
+
+    private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
 }

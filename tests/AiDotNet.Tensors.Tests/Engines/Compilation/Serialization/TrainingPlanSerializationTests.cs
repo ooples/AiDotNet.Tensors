@@ -495,6 +495,8 @@ public class TrainingPlanSerializationTests
         D0 = 1e-4f,
         DGrowthRate = 2f,
         SfBeta = 0.75f,
+        LbfgsMemorySize = 17,
+        TrustRegionRadius = 0.25f,
         AdmmRho = 2f,
         // Deliberately NON-default (Nesterov defaults false, FtrlBeta defaults 0) so a serializer that drops
         // them fails this round trip instead of accidentally reproducing the defaults.
@@ -610,6 +612,9 @@ public class TrainingPlanSerializationTests
         Assert.Equal(expected.D0, actual.D0);
         Assert.Equal(expected.DGrowthRate, actual.DGrowthRate);
         Assert.Equal(expected.SfBeta, actual.SfBeta);
+        Assert.Equal(expected.LbfgsMemorySize, actual.LbfgsMemorySize);
+        Assert.Equal(expected.TrustRegionRadius, actual.TrustRegionRadius);
+        Assert.Equal(expected.AdmmRho, actual.AdmmRho);
         // These two select an ALGORITHM, not just a constant: Nesterov vs classical momentum, and FTRL's
         // per-coordinate denominator. A round trip that dropped them would restore a quietly different
         // optimizer, so they belong in this comparison as much as any other field.
