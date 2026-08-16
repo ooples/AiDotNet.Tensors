@@ -258,4 +258,31 @@ public class ProximalL1FusedTests
             Assert.Contains("does not support weightDecay", error.Message);
         }
     }
+
+    [Fact]
+    public void ConfigureOptimizerGrouped_PerGroupProximalL1_RejectsPerGroupWeightDecay()
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 8 });
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(weight, weight), null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+
+        using (plan)
+        {
+            var error = Assert.Throws<NotSupportedException>(() => plan.ConfigureOptimizerGrouped(
+                OptimizerType.SGD,
+                new[] { OptimizerType.ProximalL1 },
+                new[] { LrSchedule.Constant(0.05) },
+                new[] { 0 },
+                groupWeightDecays: new[] { 0.01f },
+                extras: new FusedOptimizerExtras { L1 = 1.0f }));
+
+            Assert.Contains("does not support weightDecay", error.Message);
+        }
+    }
 }

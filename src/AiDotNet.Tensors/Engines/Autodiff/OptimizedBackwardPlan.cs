@@ -137,6 +137,8 @@ internal sealed class OptimizedBackwardPlan<T>
             {
                 ref var entry = ref _entries[i];
 
+                if (!DifferentiableOps.IsGradientRequired(entry.Output))
+                    continue;
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                     continue;
 

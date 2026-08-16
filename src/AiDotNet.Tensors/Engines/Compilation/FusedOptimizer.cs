@@ -2158,7 +2158,7 @@ internal static class FusedOptimizer
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void FTRLUpdateSimd(
         float* param, float* grad, float* z, float* n, int length,
-        float lr, float l1Reg, float l2Reg, float lrPower)
+        float lr, float l1Reg, float l2Reg, float lrPower, float beta = 0f)
     {
         int i = 0;
 #if NET5_0_OR_GREATER
@@ -2210,7 +2210,7 @@ internal static class FusedOptimizer
 
                 // denom = pow(nNew, -lrPower)/lr + l2Reg
                 for (int j = 0; j < 8; j++)
-                    denomArr[j] = MathF.Pow(nNewArr[j], -lrPower) / lr + l2Reg;
+                    denomArr[j] = (beta + MathF.Pow(nNewArr[j], -lrPower)) / lr + l2Reg;
                 var denom = Avx.LoadVector256(denomArr);
 
                 // result = -(z - sign*l1Reg) / denom
@@ -2237,7 +2237,7 @@ internal static class FusedOptimizer
             else
             {
                 float sign = z[i] > 0f ? 1f : -1f;
-                param[i] = -(z[i] - sign * l1Reg) / (MathF.Pow(n[i], -lrPower) / lr + l2Reg);
+                param[i] = -(z[i] - sign * l1Reg) / ((beta + MathF.Pow(n[i], -lrPower)) / lr + l2Reg);
             }
         }
     }
@@ -2562,6 +2562,29 @@ public sealed class FusedOptimizerExtras
     /// UpdateAdaptiveParameters, not per step).
     /// </remarks>
     public float TrustRegionRadius { get; init; } = 1f;
+
+    /// <summary>
+    /// SGD-with-momentum: use Nesterov accelerated gradient rather than classical momentum.
+    /// Default <c>false</c> (classical).
+    /// </summary>
+    /// <remarks>
+    /// <c>SgdMomentumUpdateSimd</c> has always accepted a nesterov flag, but the plan passed a
+    /// hardcoded <c>false</c>, so a Nesterov optimizer routed through the fused path silently ran
+    /// CLASSICAL momentum instead — a different algorithm, with no error. This surfaces the flag so
+    /// the caller's choice reaches the kernel.
+    /// </remarks>
+    public bool Nesterov { get; init; }
+
+    /// <summary>
+    /// FTRL-Proximal's β term in the per-coordinate learning rate <c>α / (β + √n)</c>. Default 0.
+    /// </summary>
+    /// <remarks>
+    /// The kernel previously computed <c>√n / α</c> for the denominator, i.e. it assumed β = 0.
+    /// Callers whose FTRL uses a non-zero β (McMahan et al. 2013 uses β = 1) therefore could not be
+    /// expressed, and fusing them would have changed the effective learning-rate schedule. Keeping the
+    /// default at 0 preserves the previous behaviour exactly for existing callers.
+    /// </remarks>
+    public float FtrlBeta { get; init; }
 
     /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or

@@ -124,74 +124,239 @@ internal sealed class LazyGraphCompiler
         public string Name => "OperationReordering";
 
         public List<ILazyNode> Run(List<ILazyNode> nodes)
+            => ReorderOperations(nodes);
+    }
+
+    /// <summary>
+    /// Topologically schedules operations while preferring a producer whose first consumer is
+    /// closest to becoming ready.
+    /// </summary>
+    /// <remarks>
+    /// Ready nodes that share a first consumer also share the same priority. Grouping them by that
+    /// consumer makes priority changes O(log V) instead of rescanning every ready node after each
+    /// scheduled operation. Node identity is resolved once while building the graph; the scheduling
+    /// loop itself uses array indices and performs no dictionary lookups.
+    /// </remarks>
+    internal static List<ILazyNode> ReorderOperations(List<ILazyNode> nodes)
+    {
+        int nodeCount = nodes.Count;
+        if (nodeCount <= 2)
+            return nodes;
+
+        var nodeIndices = new Dictionary<ILazyNode, int>(nodeCount);
+        var inDegree = new int[nodeCount];
+        var dependents = new List<int>?[nodeCount];
+
+        for (int i = 0; i < nodeCount; i++)
+            nodeIndices[nodes[i]] = i;
+
+        for (int nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++)
         {
-            if (nodes.Count <= 2)
-                return nodes;
-
-            // Build dependency graph: for each node, which nodes must come before it
-            var nodeSet = new HashSet<ILazyNode>(nodes);
-            var inDegree = new Dictionary<ILazyNode, int>();
-            var dependents = new Dictionary<ILazyNode, List<ILazyNode>>();
-
-            foreach (var node in nodes)
+            foreach (var input in nodes[nodeIndex].GetInputNodes())
             {
-                inDegree[node] = 0;
-                dependents[node] = new List<ILazyNode>();
+                if (!nodeIndices.TryGetValue(input, out int inputIndex))
+                    continue;
+
+                inDegree[nodeIndex]++;
+                (dependents[inputIndex] ??= new List<int>()).Add(nodeIndex);
+            }
+        }
+
+        // A ready producer's score is the remaining in-degree of its first consumer. Producers
+        // with no consumer use the terminal group, which retains the original int.MaxValue score.
+        //
+        // Keep the original ready-list positions as the secondary key. The previous implementation
+        // removed a selected node by replacing it with the final ready node, so equal-score choices
+        // were intentionally not stable input order. Preserving those positions retains the exact
+        // historical execution plan while eliminating the full ready-list scan.
+        int terminalGroup = nodeCount;
+        var firstDependentGroups = new int[nodeCount];
+        var readyGroups = new SortedSet<int>?[nodeCount + 1];
+        var groupVersions = new int[nodeCount + 1];
+        var ready = new List<int>(nodeCount);
+        var readyGroupQueue = new ReadyGroupPriorityQueue(nodeCount);
+
+        for (int i = 0; i < nodeCount; i++)
+        {
+            firstDependentGroups[i] = dependents[i] is { Count: > 0 } nodeDependents
+                ? nodeDependents[0]
+                : terminalGroup;
+        }
+
+        void PublishGroup(int group)
+        {
+            SortedSet<int>? members = readyGroups[group];
+            if (members is null || members.Count == 0)
+                return;
+
+            int version = ++groupVersions[group];
+            int score = group == terminalGroup ? int.MaxValue : inDegree[group];
+            readyGroupQueue.Enqueue(group, version, score, members.Min);
+        }
+
+        void AddReadyNode(int nodeIndex)
+        {
+            int group = firstDependentGroups[nodeIndex];
+            SortedSet<int> members = readyGroups[group] ??= new SortedSet<int>();
+            bool wasEmpty = members.Count == 0;
+            int position = ready.Count;
+            ready.Add(nodeIndex);
+            members.Add(position);
+            if (wasEmpty)
+                PublishGroup(group);
+        }
+
+        for (int i = 0; i < nodeCount; i++)
+        {
+            if (inDegree[i] == 0)
+                AddReadyNode(i);
+        }
+
+        var result = new List<ILazyNode>(nodeCount);
+        while (readyGroupQueue.TryDequeue(out int group, out int version))
+        {
+            SortedSet<int>? members = readyGroups[group];
+            if (version != groupVersions[group] || members is null || members.Count == 0)
+                continue;
+
+            int chosenPosition = members.Min;
+            int chosenIndex = ready[chosenPosition];
+            int lastPosition = ready.Count - 1;
+            int lastIndex = ready[lastPosition];
+            int lastGroup = firstDependentGroups[lastIndex];
+
+            members.Remove(chosenPosition);
+            groupVersions[group]++;
+
+            if (chosenPosition != lastPosition)
+            {
+                SortedSet<int> lastMembers = readyGroups[lastGroup]!;
+                lastMembers.Remove(lastPosition);
+                lastMembers.Add(chosenPosition);
+                ready[chosenPosition] = lastIndex;
+
+                if (lastGroup != group)
+                    groupVersions[lastGroup]++;
             }
 
-            foreach (var node in nodes)
+            ready.RemoveAt(lastPosition);
+            PublishGroup(group);
+            if (lastGroup != group)
+                PublishGroup(lastGroup);
+
+            result.Add(nodes[chosenIndex]);
+            List<int>? chosenDependents = dependents[chosenIndex];
+            if (chosenDependents is null)
+                continue;
+
+            foreach (int dependentIndex in chosenDependents)
             {
-                foreach (var input in node.GetInputNodes())
+                int remaining = --inDegree[dependentIndex];
+
+                // Every ready producer whose first consumer is this dependent belongs to the
+                // dependent's group. Republish that group with its new shared priority.
+                if (readyGroups[dependentIndex] is { Count: > 0 })
+                    PublishGroup(dependentIndex);
+
+                if (remaining == 0)
+                    AddReadyNode(dependentIndex);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Minimal stable min-heap used by operation reordering. Kept local instead of relying on
+    /// <c>System.Collections.Generic.PriorityQueue</c>, which is unavailable on the net471 target.
+    /// </summary>
+    private sealed class ReadyGroupPriorityQueue
+    {
+        private readonly List<Entry> _entries;
+
+        internal ReadyGroupPriorityQueue(int capacity)
+        {
+            _entries = new List<Entry>(capacity);
+        }
+
+        internal void Enqueue(int group, int version, int score, int order)
+        {
+            var entry = new Entry(group, version, score, order);
+            int index = _entries.Count;
+            _entries.Add(entry);
+
+            while (index > 0)
+            {
+                int parent = (index - 1) / 2;
+                if (!ComesBefore(entry, _entries[parent]))
+                    break;
+
+                _entries[index] = _entries[parent];
+                index = parent;
+            }
+
+            _entries[index] = entry;
+        }
+
+        internal bool TryDequeue(out int group, out int version)
+        {
+            if (_entries.Count == 0)
+            {
+                group = 0;
+                version = 0;
+                return false;
+            }
+
+            Entry first = _entries[0];
+            int lastIndex = _entries.Count - 1;
+            Entry last = _entries[lastIndex];
+            _entries.RemoveAt(lastIndex);
+
+            if (lastIndex > 0)
+            {
+                int index = 0;
+                while (true)
                 {
-                    if (nodeSet.Contains(input))
-                    {
-                        inDegree[node]++;
-                        dependents[input].Add(node);
-                    }
+                    int left = index * 2 + 1;
+                    if (left >= lastIndex)
+                        break;
+
+                    int right = left + 1;
+                    int child = right < lastIndex && ComesBefore(_entries[right], _entries[left])
+                        ? right
+                        : left;
+                    if (!ComesBefore(_entries[child], last))
+                        break;
+
+                    _entries[index] = _entries[child];
+                    index = child;
                 }
+
+                _entries[index] = last;
             }
 
-            // Kahn's algorithm with priority: prefer nodes that feed into
-            // operations that are closest to being ready (lowest remaining in-degree)
-            var ready = new List<ILazyNode>();
-            foreach (var node in nodes)
+            group = first.Group;
+            version = first.Version;
+            return true;
+        }
+
+        private static bool ComesBefore(Entry left, Entry right)
+            => left.Score < right.Score || left.Score == right.Score && left.Order < right.Order;
+
+        private readonly struct Entry
+        {
+            internal Entry(int group, int version, int score, int order)
             {
-                if (inDegree[node] == 0)
-                    ready.Add(node);
+                Group = group;
+                Version = version;
+                Score = score;
+                Order = order;
             }
 
-            var result = new List<ILazyNode>(nodes.Count);
-            while (ready.Count > 0)
-            {
-                // Pick the ready node whose first dependent has the lowest remaining in-degree
-                // (heuristic: schedule producers right before their consumer becomes ready)
-                int bestIdx = 0;
-                int bestScore = int.MaxValue;
-                for (int i = 0; i < ready.Count; i++)
-                {
-                    var deps = dependents[ready[i]];
-                    int score = deps.Count > 0 ? inDegree[deps[0]] : int.MaxValue;
-                    if (score < bestScore)
-                    {
-                        bestScore = score;
-                        bestIdx = i;
-                    }
-                }
-
-                var chosen = ready[bestIdx];
-                ready[bestIdx] = ready[ready.Count - 1];
-                ready.RemoveAt(ready.Count - 1);
-                result.Add(chosen);
-
-                foreach (var dep in dependents[chosen])
-                {
-                    inDegree[dep]--;
-                    if (inDegree[dep] == 0)
-                        ready.Add(dep);
-                }
-            }
-
-            return result;
+            internal int Group { get; }
+            internal int Version { get; }
+            internal int Score { get; }
+            internal int Order { get; }
         }
     }
 

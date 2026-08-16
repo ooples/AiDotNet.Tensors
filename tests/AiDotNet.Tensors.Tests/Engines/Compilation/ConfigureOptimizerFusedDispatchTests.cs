@@ -94,6 +94,41 @@ public class ConfigureOptimizerFusedDispatchTests
     }
 
     /// <summary>
+    /// The GPU SgdMomentum kernel implements classical momentum only, so a Nesterov request on a
+    /// GPU-resident plan must be refused by the EARLY gate.
+    /// </summary>
+    /// <remarks>
+    /// The rejection deliberately lives here rather than in the per-parameter update closure. That closure
+    /// first runs on the initial Step(), by which point a mixed CPU/GPU plan would already have mutated every
+    /// CPU parameter before reaching the first GPU one — a half-applied step, from a misconfiguration that was
+    /// knowable at configure time.
+    /// </remarks>
+    [Fact]
+    public void ConfigureOptimizer_GpuPlanWithNesterov_ThrowsAtEarlyGate()
+    {
+        var ex = Assert.Throws<NotSupportedException>(
+            () => InvokeValidatePlanOptimizerSupport(
+                OptimizerType.SGDMomentum, isFloat: true, hasGpuParams: true, nesterov: true));
+
+        Assert.Contains("Nesterov", ex.Message);
+    }
+
+    /// <summary>
+    /// The same gate must NOT reject the CPU case, which does implement Nesterov, nor classical momentum on
+    /// the GPU. Without these the test above would pass just as well against a gate that rejected everything.
+    /// </summary>
+    [Theory]
+    [InlineData(false, true)]    // CPU plan, Nesterov requested -> supported
+    [InlineData(true, false)]    // GPU plan, classical momentum -> supported
+    [InlineData(false, false)]   // CPU plan, classical momentum -> supported
+    public void ConfigureOptimizer_SgdMomentumNesterov_PassesEarlyGateWhereverItIsImplemented(
+        bool hasGpuParams, bool nesterov)
+    {
+        InvokeValidatePlanOptimizerSupport(
+            OptimizerType.SGDMomentum, isFloat: true, hasGpuParams: hasGpuParams, nesterov: nesterov);
+    }
+
+    /// <summary>
     /// Every wired float optimizer must dispatch through the fused plan (no
     /// NotSupportedException), update the parameter in place, stay finite, and
     /// move it meaningfully over several steps. Catches a missing buffer
@@ -392,7 +427,8 @@ public class ConfigureOptimizerFusedDispatchTests
         }
     }
 
-    private static void InvokeValidatePlanOptimizerSupport(OptimizerType opt, bool isFloat, bool hasGpuParams)
+    private static void InvokeValidatePlanOptimizerSupport(
+        OptimizerType opt, bool isFloat, bool hasGpuParams, bool nesterov = false)
     {
         var method = typeof(CompiledTrainingPlan<float>).GetMethod(
             "ValidatePlanOptimizerSupport",
@@ -401,7 +437,10 @@ public class ConfigureOptimizerFusedDispatchTests
 
         try
         {
-            method!.Invoke(null, [opt, isFloat, hasGpuParams]);
+            // Every parameter must be supplied explicitly: MethodInfo.Invoke does not apply C# optional-
+            // parameter defaults, so an arity mismatch here surfaces as a TargetParameterCountException
+            // rather than as the gate decision under test.
+            method!.Invoke(null, [opt, isFloat, hasGpuParams, nesterov]);
         }
         catch (TargetInvocationException ex) when (ex.InnerException is not null)
         {

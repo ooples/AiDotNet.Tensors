@@ -458,6 +458,10 @@ public class TrainingPlanSerializationTests
         D0 = 1e-4f,
         DGrowthRate = 2f,
         SfBeta = 0.75f,
+        // Deliberately NON-default (Nesterov defaults false, FtrlBeta defaults 0) so a serializer that drops
+        // them fails this round trip instead of accidentally reproducing the defaults.
+        Nesterov = true,
+        FtrlBeta = 1f,
     };
 
     private static FusedOptimizerCheckpoint CaptureCheckpoint<T>(ICompiledTrainingPlan<T> plan)
@@ -567,6 +571,11 @@ public class TrainingPlanSerializationTests
         Assert.Equal(expected.D0, actual.D0);
         Assert.Equal(expected.DGrowthRate, actual.DGrowthRate);
         Assert.Equal(expected.SfBeta, actual.SfBeta);
+        // These two select an ALGORITHM, not just a constant: Nesterov vs classical momentum, and FTRL's
+        // per-coordinate denominator. A round trip that dropped them would restore a quietly different
+        // optimizer, so they belong in this comparison as much as any other field.
+        Assert.Equal(expected.Nesterov, actual.Nesterov);
+        Assert.Equal(expected.FtrlBeta, actual.FtrlBeta);
     }
 
     private static void AssertScalarCheckpointEqual(
