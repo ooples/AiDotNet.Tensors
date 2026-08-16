@@ -1369,11 +1369,42 @@ internal static class FusedOptimizer
         }
     }
 
-    /// <summary>AVX2 LARS: Layer-wise Adaptive Rate Scaling</summary>
+    /// <summary>AVX2 LARS: Layer-wise Adaptive Rate Scaling (You, Gitman &amp; Ginsburg, 2017, Algorithm 1).
+    /// <code>
+    /// local_lr = lr * trust * ||w|| / (||g|| + wd*||w|| + eps)
+    /// v        = momentum*v + local_lr*(g + wd*w)
+    /// w       -= v
+    /// </code></summary>
+    /// <remarks>
+    /// <para>
+    /// Three details separate this from "SGD-with-momentum at a rescaled learning rate", and getting any of
+    /// them wrong changes training rather than breaking it:
+    /// </para>
+    /// <list type="number">
+    /// <item><description>
+    /// The trust ratio is recomputed every step from the current norms, so <c>local_lr</c> is a different
+    /// number each step. That makes it wrong to leave the rate outside the velocity: <c>v = m*v + g</c>
+    /// followed by <c>w -= local_lr*v</c> re-scales the ENTIRE accumulated history by whatever the ratio
+    /// happens to be now, whereas the paper scales each gradient by the rate that was current when it
+    /// arrived. The two agree only if the trust ratio never moves, which is exactly what LARS exists to
+    /// avoid.
+    /// </description></item>
+    /// <item><description>
+    /// Weight decay appears twice and means different things: inside the ratio's denominator it bounds the
+    /// step, and inside the velocity it is the actual decay applied to the weights. Folding it into only
+    /// one of the two leaves the other behaviour missing.
+    /// </description></item>
+    /// <item><description>
+    /// The <c>eps</c> guard is a floor on the denominator, and a layer whose weights or gradients are
+    /// smaller than it falls back to the unscaled base rate — a trust ratio computed from a numerically
+    /// zero norm is noise, and for a freshly zero-initialised bias vector it is 0/0.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void LARSUpdateSimd(
         float* param, float* grad, float* velocity, int length,
-        float lr, float momentum, float weightDecay, float trustCoeff)
+        float lr, float momentum, float weightDecay, float trustCoeff, float eps)
     {
         // Compute layer-wise norms with AVX2
         float paramNorm = 0f, gradNorm = 0f;
@@ -1403,13 +1434,36 @@ internal static class FusedOptimizer
         paramNorm = MathF.Sqrt(paramNorm);
         gradNorm = MathF.Sqrt(gradNorm);
 
-        // Trust ratio
+        // Trust ratio. A layer with a numerically zero weight or gradient norm keeps the base rate.
         float localLr = lr;
-        if (paramNorm > 0f && gradNorm > 0f)
-            localLr = lr * trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm);
+        if (paramNorm >= eps && gradNorm >= eps)
+            localLr = lr * trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm + eps);
 
-        // SGD+momentum with local lr
-        SgdMomentumUpdateSimd(param, grad, velocity, length, localLr, momentum, false);
+        // v = momentum*v + local_lr*(g + wd*w);  w -= v
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vMomentum = Vector256.Create(momentum);
+            var vLocalLr = Vector256.Create(localLr);
+            var vWd = Vector256.Create(weightDecay);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var p = Avx.LoadVector256(param + i);
+                var g = Fma.MultiplyAdd(vWd, p, Avx.LoadVector256(grad + i));
+                var v = Fma.MultiplyAdd(vMomentum, Avx.LoadVector256(velocity + i), Avx.Multiply(vLocalLr, g));
+                Avx.Store(velocity + i, v);
+                Avx.Store(param + i, Avx.Subtract(p, v));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float g = grad[i] + weightDecay * param[i];
+            velocity[i] = momentum * velocity[i] + localLr * g;
+            param[i] -= velocity[i];
+        }
     }
 
     /// <summary>AVX2 LAMB: Layer-wise Adaptive Moments (LARS + Adam)</summary>
@@ -1919,7 +1973,7 @@ internal static class FusedOptimizer
     /// (equals dense ‖g‖₂² since untouched indices have zero gradient).</summary>
     internal static unsafe void SparseLARSUpdate(
         float* param, int* indices, float* values, float* velocity, int paramLen, int nnz,
-        float lr, float momentum, float wd, float trustCoeff)
+        float lr, float momentum, float wd, float trustCoeff, float eps)
     {
         // Full ‖p‖₂ reduction.
         float pNormSq = 0f;
@@ -1931,8 +1985,11 @@ internal static class FusedOptimizer
         for (int k = 0; k < nnz; k++) gNormSq += values[k] * values[k];
         float gNorm = MathF.Sqrt(gNormSq);
 
-        float denom = gNorm + wd * pNorm;
-        float localLr = (pNorm > 0f && denom > 0f) ? (lr * trustCoeff * pNorm / denom) : lr;
+        // Same trust ratio and eps floor as the dense kernel, so a parameter does not change algorithm
+        // depending on whether its gradient happened to arrive sparse.
+        float localLr = (pNorm >= eps && gNorm >= eps)
+            ? (lr * trustCoeff * pNorm / (gNorm + wd * pNorm + eps))
+            : lr;
 
         for (int k = 0; k < nnz; k++)
         {
