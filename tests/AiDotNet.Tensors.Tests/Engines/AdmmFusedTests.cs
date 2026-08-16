@@ -126,6 +126,93 @@ public class AdmmFusedTests
         }
     }
 
+    /// <summary>
+    /// The grouped configure path has to allocate z and u too.
+    /// </summary>
+    /// <remarks>
+    /// ADMM is not on the global-state exclusion list, so a caller can reach it through per-group
+    /// configuration — and that path keeps its own copy of the buffer-allocation predicates, which is
+    /// exactly how the two drift apart. The ungrouped test above would not notice.
+    /// </remarks>
+    [Fact]
+    public async Task ConfigureOptimizerGrouped_AllocatesBothAdmmStateBuffers_AndStepRuns()
+    {
+        await Task.Yield();
+
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 1f, -2f, 3f, -4f }, new[] { 4 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(parameter, null);
+            plan = scope.CompileTraining(new[] { parameter });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizerGrouped(
+                OptimizerType.ADMM,
+                new[] { LrSchedule.Constant(0.05f) },
+                new[] { 0 },
+                0f, 0f, 0f, 0f,
+                new FusedOptimizerExtras { AdmmRho = 2f, L1 = 0.1f });
+
+            var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            var checkpoint = Assert.IsType<FusedOptimizerCheckpoint>(compiled.CaptureFusedOptimizerCheckpoint());
+            Assert.NotNull(checkpoint.Parameters[0].MFloat); // z
+            Assert.NotNull(checkpoint.Parameters[0].VFloat); // u
+
+            var loss = plan.Step();
+            Assert.True(float.IsFinite(loss[0]));
+            Assert.All(parameter.ToArray(), value => Assert.True(float.IsFinite(value)));
+        }
+    }
+
+    /// <summary>
+    /// z and u must persist across steps, which is what makes this ADMM rather than a gradient step with
+    /// two scratch arrays.
+    /// </summary>
+    /// <remarks>
+    /// Buffers that were reallocated or zeroed each step would still produce a finite, descending
+    /// trajectory — so "it ran and nothing was NaN" cannot catch it. This runs four steps through the plan
+    /// on f(w) = sum(w²) and compares against an independent transcription that threads z and u forward.
+    /// </remarks>
+    [Fact]
+    public async Task PlanStateCarriesAcrossSteps()
+    {
+        await Task.Yield();
+
+        const float lr = 0.05f, rho = 1.5f;
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(parameter, parameter), null);
+            plan = scope.CompileTraining(new[] { parameter });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(
+                OptimizerType.ADMM,
+                learningRate: lr,
+                extras: new FusedOptimizerExtras { AdmmRho = rho, L1 = 0f });
+            for (int s = 0; s < 4; s++) plan.Step();
+        }
+
+        float x = 1f, z = 0f, u = 0f;
+        for (int s = 0; s < 4; s++)
+        {
+            float g = 2f * x;
+            x -= lr * (g + rho * ((x - z) + u));
+            z = x + u;              // l1 = 0 makes the prox the identity
+            u += x - z;
+        }
+
+        Assert.Equal(x, parameter[0], 4);
+    }
+
     [Fact]
     public void MatchesTheReferenceAcrossSteps_IncludingTheScalarTail()
     {
