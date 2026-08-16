@@ -758,6 +758,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public bool IsGrouped;
         public LrSchedule[] Schedules = Array.Empty<LrSchedule>();
         public int[]? ParamToGroup;
+        /// <summary>
+        /// Per-group optimizer types, or null when every group runs <see cref="OptimizerType"/>.
+        /// </summary>
+        /// <remarks>
+        /// Null rather than an all-same array so that "one optimizer for the whole plan" — overwhelmingly the
+        /// common case — stays distinguishable from "several groups that happen to agree today", both here and
+        /// in the checkpoint.
+        /// </remarks>
+        public OptimizerType[]? GroupOptimizerTypes;
+        /// <summary>
+        /// Per-group weight decay, or null when every group uses <see cref="WeightDecay"/>.
+        /// </summary>
+        public float[]? GroupWeightDecays;
         public float Beta1;
         public float Beta2;
         public float Epsilon;
@@ -1706,8 +1719,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // optimizers without a GPU backend kernel.
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
-        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
         var ex = extras ?? new FusedOptimizerExtras();
+        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams, ex.Nesterov);
         ex.Validate();
         if (typeof(T) == typeof(float))
         {
@@ -1734,6 +1747,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float beta2 = 0.999f,
         float eps = 1e-8f,
         float weightDecay = 0f,
+        FusedOptimizerExtras? extras = null)
+        => ConfigureOptimizerGrouped(
+            optimizerType, groupOptimizerTypes: null, groupSchedules, paramToGroup,
+            beta1, beta2, eps, weightDecay, groupWeightDecays: null, extras);
+
+    /// <inheritdoc/>
+    public unsafe void ConfigureOptimizerGrouped(
+        OptimizerType optimizerType,
+        System.Collections.Generic.IReadOnlyList<OptimizerType>? groupOptimizerTypes,
+        System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
+        System.Collections.Generic.IReadOnlyList<int> paramToGroup,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f,
+        System.Collections.Generic.IReadOnlyList<float>? groupWeightDecays = null,
         FusedOptimizerExtras? extras = null)
     {
         if (groupSchedules is null) throw new ArgumentNullException(nameof(groupSchedules));
@@ -1796,7 +1825,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // optimizers without a GPU backend kernel.
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
-        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
+        // Per-group types: validate EVERY group's optimizer, not just the fallback. A group whose type is
+        // unsupported would otherwise reach the closure's default case and throw on the first Step(), after
+        // earlier parameters had already been updated.
+        bool isFloatPlan = typeof(T) == typeof(float);
+        bool nesterov = extras?.Nesterov ?? false;
+        if (groupOptimizerTypes is null)
+        {
+            ValidatePlanOptimizerSupport(optimizerType, isFloatPlan, hasGpuParams, nesterov);
+        }
+        else
+        {
+            if (groupOptimizerTypes.Count != groupSchedules.Count)
+                throw new ArgumentException(
+                    $"groupOptimizerTypes.Count ({groupOptimizerTypes.Count}) must equal groupSchedules.Count " +
+                    $"({groupSchedules.Count}) — every group needs exactly one optimizer.",
+                    nameof(groupOptimizerTypes));
+            for (int g = 0; g < groupOptimizerTypes.Count; g++)
+                ValidatePlanOptimizerSupport(groupOptimizerTypes[g], isFloatPlan, hasGpuParams, nesterov);
+        }
+        if (groupWeightDecays is not null && groupWeightDecays.Count != groupSchedules.Count)
+            throw new ArgumentException(
+                $"groupWeightDecays.Count ({groupWeightDecays.Count}) must equal groupSchedules.Count " +
+                $"({groupSchedules.Count}).",
+                nameof(groupWeightDecays));
         // Drop any Schedule-Free pre-forward hook left over from a prior ungrouped
         // ConfigureOptimizer(ScheduleFreeSGD); a grouped optimizer never sets one,
         // and Step() unconditionally invokes it — leaving it active would rewrite
@@ -1804,23 +1856,38 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _preForwardParamTransform = null;
         // Global-state optimizers adapt ONE learning-rate/distance scalar across all
         // parameters — a per-group schedule is meaningless for them, so they are only
-        // supported through the ungrouped ConfigureOptimizer.
-        if (optimizerType is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
-            or OptimizerType.ScheduleFreeSGD)
-            throw new NotSupportedException(
-                $"{optimizerType} maintains a single global learning-rate/distance/weight-sum scalar " +
-                "(or a per-step parameter transform) and is not supported with per-group schedules; " +
-                "use the ungrouped ConfigureOptimizer.");
+        // supported through the ungrouped ConfigureOptimizer. Checked for every group's
+        // type, not just the fallback, or a per-group configuration could smuggle one in.
+        for (int g = -1; g < (groupOptimizerTypes?.Count ?? 0); g++)
+        {
+            var candidate = g < 0 ? optimizerType : groupOptimizerTypes![g];
+            if (candidate is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ScheduleFreeSGD)
+                throw new NotSupportedException(
+                    $"{candidate} maintains a single global learning-rate/distance/weight-sum scalar " +
+                    "(or a per-step parameter transform) and is not supported with per-group schedules; " +
+                    "use the ungrouped ConfigureOptimizer.");
+        }
         var ex = extras ?? new FusedOptimizerExtras();
         ex.Validate();
+
+        // Materialize the per-group arrays once. Null means "uniform", which the closures read as
+        // "use the scalar fallback" — keeping the common single-optimizer path free of an indirection.
+        OptimizerType[]? groupTypes = groupOptimizerTypes is null
+            ? null
+            : System.Linq.Enumerable.ToArray(groupOptimizerTypes);
+        float[]? groupWds = groupWeightDecays is null
+            ? null
+            : System.Linq.Enumerable.ToArray(groupWeightDecays);
+
         if (typeof(T) == typeof(float))
         {
-            ConfigureOptimizerFloatGrouped(optimizerType, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, ex);
+            ConfigureOptimizerFloatGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds, ex);
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            ConfigureOptimizerDoubleGrouped(optimizerType, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay);
+            ConfigureOptimizerDoubleGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -1830,8 +1897,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// support more optimizer math than every compiled-plan/device combination
     /// can safely replay, so this keeps configure-time acceptance aligned with
     /// the available closures and backend contracts.</summary>
-    private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType, bool isFloat, bool hasGpuParams)
+    private static void ValidatePlanOptimizerSupport(
+        OptimizerType optimizerType, bool isFloat, bool hasGpuParams, bool nesterov = false)
     {
+        // The GPU SgdMomentum kernel implements CLASSICAL momentum only, so a Nesterov request on a
+        // GPU-resident plan cannot be honored. Reject it HERE, at configure time, rather than from
+        // inside the per-parameter update closure: that closure runs on the first Step(), and on a
+        // mixed CPU/GPU plan it would already have mutated (and MarkHostWeightMutated'd) every CPU
+        // parameter before reaching the first GPU one, leaving a half-applied step. Failing at
+        // configuration matches FusedOptimizerExtras.Validate()'s contract.
+        if (hasGpuParams && nesterov && optimizerType is OptimizerType.SGDMomentum)
+        {
+            throw new NotSupportedException(
+                "Nesterov momentum is not implemented by the GPU fused optimizer kernel. " +
+                "Run this model on the CPU engine, which supports it, or use classical " +
+                "momentum. Refusing rather than silently applying classical momentum.");
+        }
+
         // Device-aware gate (CodeRabbit, PR #501): reject unsupported GPU
         // combinations before _optimizerUpdate is published so a mixed CPU/GPU
         // plan cannot partially update CPU parameters and then throw on the
@@ -2669,6 +2751,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     lr, b1, b2, wd, len);
                                 break;
                             case OptimizerType.SGDMomentum:
+                                // The GPU kernel implements CLASSICAL momentum only. A Nesterov request
+                                // on a GPU-resident plan is rejected eagerly by
+                                // ValidatePlanOptimizerSupport, so reaching here means classical momentum
+                                // is what the caller asked for.
                                 gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
                                     lr, b1, wd, len);
                                 break;
@@ -2827,7 +2913,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.SGDMomentum:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, false);
+                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
                             break;
                         case OptimizerType.AdaMax:
                             if (wd != 0f)
@@ -2850,7 +2936,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.FTRL:
                             // z=pV, n=pVMax; FTRL applies its own L1/L2 regularization.
                             FusedOptimizer.FTRLUpdateSimd(pParam, pGrad, pV, pVMax, len,
-                                lr, extras.L1, extras.L2, extras.LrPower);
+                                lr, extras.L1, extras.L2, extras.LrPower, extras.FtrlBeta);
                             break;
                         case OptimizerType.ASGD:
                             {
@@ -2897,9 +2983,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private unsafe void ConfigureOptimizerFloatGrouped(
         OptimizerType optimizerType,
+        OptimizerType[]? groupOptimizerTypes,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
         float beta1, float beta2, float eps, float weightDecay,
+        float[]? groupWeightDecays,
         FusedOptimizerExtras extras)
     {
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
@@ -2928,6 +3016,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // and used only by the AMSGrad case; allocated per-param below only when
         // the optimizer is AMSGrad, else left as an empty array.
         var vMax = new float[paramCount][];
+        // Quantized/bf16 moment storage is an Adam-specific footprint optimization whose buffer layout is
+        // chosen once for the whole plan. Rather than guess how it should interact with a heterogeneous group
+        // configuration, refuse the combination outright — the alternative is silently storing one group's
+        // moments in a format its kernel does not read.
+        if (groupOptimizerTypes is not null && _momentStorageMode != FusedMomentStorageMode.Float32)
+            throw new NotSupportedException(
+                "Per-group optimizer types are supported only with Float32 moment storage; this plan uses " +
+                $"{_momentStorageMode}. bf16/int8 fused moments are an Adam-specific layout applied plan-wide.");
         bool useBf16Moments = _momentStorageMode == FusedMomentStorageMode.BFloat16
             && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW);
         bool useInt8Moments = _momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized;
@@ -2964,18 +3060,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < paramCount; p++)
         {
             lengths[p] = _parameters[p].Length;
-            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+            // Which state buffers this parameter needs follows ITS OWN group's optimizer, not the plan-wide
+            // fallback. Sizing from the fallback would leave a group running (say) Adam with no second-moment
+            // buffer while its neighbours were fine — a null-deref on the first Step(), or worse, a silently
+            // shared buffer.
+            var slotType = groupOptimizerTypes is null ? optimizerType : groupOptimizerTypes[paramToGroup[p]];
+            bool needsMomentum = slotType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
                 or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
-            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+            bool needsSecondMoment = slotType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
-            bool needsThirdState = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;
+            bool needsThirdState = slotType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;
 
             // GPU fast path — same logic as ConfigureOptimizerFloat. See
             // there for the full rationale on per-param GPU/CPU dispatch.
@@ -3129,8 +3230,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var b1 = beta1;
         var b2 = beta2;
         var epsVal = eps;
-        var wd = weightDecay;
-        var optType = optimizerType;
+        var fallbackWd = weightDecay;
+        var fallbackOptType = optimizerType;
+        // Null when every group runs the same optimizer, which keeps the common path a captured scalar
+        // rather than an array index per parameter per step.
+        var groupOptTypes = groupOptimizerTypes;
+        var groupWds = groupWeightDecays;
         var groupLrs = new float[groupCount];
 
         _optimizerRuntimeState = new FusedOptimizerRuntimeState
@@ -3139,6 +3244,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             IsGrouped = true,
             Schedules = schedules,
             ParamToGroup = paramGroup,
+            GroupOptimizerTypes = groupOptimizerTypes is null ? null : (OptimizerType[])groupOptimizerTypes.Clone(),
+            GroupWeightDecays = groupWeightDecays is null ? null : (float[])groupWeightDecays.Clone(),
             Beta1 = beta1,
             Beta2 = beta2,
             Epsilon = eps,
@@ -3188,7 +3295,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int p = 0; p < paramCount; p++)
             {
                 int len = lengths[p];
-                float lr = groupLrs[paramGroup[p]];
+                int grp = paramGroup[p];
+                float lr = groupLrs[grp];
+                // Per-group optimizer and weight decay. Both fall back to the plan-wide value when the caller
+                // did not supply per-group arrays, so the uniform case costs one null check per parameter.
+                var optType = groupOptTypes is null ? fallbackOptType : groupOptTypes[grp];
+                float wd = groupWds is null ? fallbackWd : groupWds[grp];
 
                 // GPU path (mirrors ConfigureOptimizerFloat).
                 if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
@@ -3291,6 +3403,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     lr, b1, b2, wd, len);
                                 break;
                             case OptimizerType.SGDMomentum:
+                                // The GPU kernel implements CLASSICAL momentum only. A Nesterov request
+                                // on a GPU-resident plan is rejected eagerly by
+                                // ValidatePlanOptimizerSupport, so reaching here means classical momentum
+                                // is what the caller asked for.
                                 gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
                                     lr, b1, wd, len);
                                 break;
@@ -3412,7 +3528,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.SGDMomentum:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, false);
+                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
                             break;
                         case OptimizerType.AdaMax:
                             if (wd != 0f)
@@ -3432,7 +3548,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.FTRL:
                             FusedOptimizer.FTRLUpdateSimd(pParam, pGrad, pV, pVMax, len,
-                                lr, extras.L1, extras.L2, extras.LrPower);
+                                lr, extras.L1, extras.L2, extras.LrPower, extras.FtrlBeta);
                             break;
                         case OptimizerType.ASGD:
                             {
@@ -3666,9 +3782,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private unsafe void ConfigureOptimizerDoubleGrouped(
         OptimizerType optimizerType,
+        OptimizerType[]? groupOptimizerTypes,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
-        float beta1, float beta2, float eps, float weightDecay)
+        float beta1, float beta2, float eps, float weightDecay,
+        float[]? groupWeightDecays)
     {
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -3698,6 +3816,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int p = 0; p < paramCount; p++) paramGroup[p] = paramToGroup[p];
 
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
+        // GROUPED double path: buffer sizing follows each parameter's own group optimizer (slotType below).
         for (int p = 0; p < paramCount; p++)
         {
             var boundParam = BindCpuOptimizerTensor(
@@ -3715,13 +3834,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             lengths[p] = _parameters[p].Length;
 
-            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+            var slotType = groupOptimizerTypes is null ? optimizerType : groupOptimizerTypes[paramToGroup[p]];
+            bool needsMomentum = slotType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
                 or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
-            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+            bool needsSecondMoment = slotType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
@@ -3729,15 +3849,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
             v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
-            vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
+            vMax[p] = slotType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
         }
 
         _optimizerStep = 0;
         double b1 = beta1;
         double b2 = beta2;
         double epsVal = eps;
-        double wd = weightDecay;
-        var optType = optimizerType;
+        double fallbackWd = weightDecay;
+        var fallbackOptType = optimizerType;
+        var groupOptTypes = groupOptimizerTypes;
+        var groupWds = groupWeightDecays;
         var groupLrs = new double[groupCount];
 
         _optimizerRuntimeState = new FusedOptimizerRuntimeState
@@ -3746,6 +3868,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             IsGrouped = true,
             Schedules = schedules,
             ParamToGroup = paramGroup,
+            GroupOptimizerTypes = groupOptimizerTypes is null ? null : (OptimizerType[])groupOptimizerTypes.Clone(),
+            GroupWeightDecays = groupWeightDecays is null ? null : (float[])groupWeightDecays.Clone(),
             Beta1 = beta1,
             Beta2 = beta2,
             Epsilon = eps,
@@ -3778,7 +3902,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Skip params with no gradient OR no materialized weight backing (#1738).
                 if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                 int len = lengths[p];
-                double lr = groupLrs[paramGroup[p]];
+                int grp = paramGroup[p];
+                double lr = groupLrs[grp];
+                // Per-group optimizer and weight decay; both fall back to the plan-wide value when the
+                // caller supplied no per-group array. See ConfigureOptimizerFloatGrouped.
+                var optType = groupOptTypes is null ? fallbackOptType : groupOptTypes[grp];
+                double wd = groupWds is null ? fallbackWd : groupWds[grp];
 
                 fixed (double* pParam = &paramArrays[p][paramOffsets[p]],
                        pGrad = &gradArrays[p][gradOffsets[p]],
@@ -3846,6 +3975,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             OptimizerType = rt.OptimizerType,
             IsGrouped = rt.IsGrouped,
+            // Copies, not shared references: the runtime state stays live and mutable after capture.
+            GroupOptimizerTypes = rt.GroupOptimizerTypes is null ? null : (OptimizerType[])rt.GroupOptimizerTypes.Clone(),
+            GroupWeightDecays = rt.GroupWeightDecays is null ? null : (float[])rt.GroupWeightDecays.Clone(),
             OptimizerStep = _optimizerStep,
             Beta1 = rt.Beta1,
             Beta2 = rt.Beta2,
@@ -3893,12 +4025,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 throw new InvalidDataException("Grouped optimizer checkpoint is missing ParamToGroup.");
             ConfigureOptimizerGrouped(
                 checkpoint.OptimizerType,
+                checkpoint.GroupOptimizerTypes,
                 schedules,
                 checkpoint.ParamToGroup,
                 checkpoint.Beta1,
                 checkpoint.Beta2,
                 checkpoint.Epsilon,
                 checkpoint.WeightDecay,
+                checkpoint.GroupWeightDecays,
                 checkpoint.Extras);
         }
         else
@@ -4132,6 +4266,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             D0 = extras.D0,
             DGrowthRate = extras.DGrowthRate,
             SfBeta = extras.SfBeta,
+            // Must be copied like every other field. This clone is what the runtime state — and therefore the
+            // checkpoint — records, so dropping these two here made a Nesterov or non-zero-beta FTRL plan
+            // report itself as classical/beta-0, and restore as a different algorithm than it ran.
+            Nesterov = extras.Nesterov,
+            FtrlBeta = extras.FtrlBeta,
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)

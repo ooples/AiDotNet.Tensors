@@ -514,6 +514,51 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         FusedOptimizerExtras? extras = null);
 
     /// <summary>
+    /// Configures fused optimizer updates where each parameter group may run a DIFFERENT optimizer, not just a
+    /// different learning-rate schedule.
+    /// </summary>
+    /// <param name="optimizerType">The optimizer for every group when <paramref name="groupOptimizerTypes"/> is
+    /// null, and the fallback recorded in checkpoints otherwise.</param>
+    /// <param name="groupOptimizerTypes">Per-group optimizer, parallel to <paramref name="groupSchedules"/>, or
+    /// null for "every group runs <paramref name="optimizerType"/>".</param>
+    /// <param name="groupSchedules">Per-group learning-rate schedule.
+    /// <c>groupSchedules.Count</c> = number of distinct groups.</param>
+    /// <param name="paramToGroup">For each compiled parameter (parallel order), an index into
+    /// <paramref name="groupSchedules"/>.</param>
+    /// <param name="groupWeightDecays">Per-group weight decay, parallel to <paramref name="groupSchedules"/>, or
+    /// null to apply <paramref name="weightDecay"/> everywhere.</param>
+    /// <remarks>
+    /// <para>
+    /// This exists because several published recipes are not expressible with a single optimizer per plan. The
+    /// motivating one is LARS, whose papers exclude biases and normalization parameters from the layer-wise
+    /// trust ratio AND from weight decay — so those tensors must run plain SGD or SGD-with-momentum at zero
+    /// decay while the weight tensors run LARS. With one optimizer per plan the only options were to apply LARS
+    /// to biases (wrong) or to refuse to fuse at all (useless).
+    /// </para>
+    /// <para>
+    /// Everything else stays plan-wide: beta1/beta2/eps and <see cref="FusedOptimizerExtras"/> are shared across
+    /// groups. Those are per-algorithm constants the recipes above do not vary, and keeping them global holds
+    /// the per-step hot path to one array index per parameter.
+    /// </para>
+    /// <para>
+    /// Requires <c>Float32</c> moment storage: bf16/int8 fused moments are an Adam-specific layout chosen once
+    /// for the whole plan, and would otherwise silently store one group's moments in a format its kernel does
+    /// not read.
+    /// </para>
+    /// </remarks>
+    void ConfigureOptimizerGrouped(
+        OptimizerType optimizerType,
+        System.Collections.Generic.IReadOnlyList<OptimizerType>? groupOptimizerTypes,
+        System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
+        System.Collections.Generic.IReadOnlyList<int> paramToGroup,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f,
+        System.Collections.Generic.IReadOnlyList<float>? groupWeightDecays = null,
+        FusedOptimizerExtras? extras = null);
+
+    /// <summary>
     /// Issue #338 Phase G.4: Enables pre-packed-B caching on the forward
     /// MatMul fast paths. The compiled training plan defaults to
     /// <c>allowCachedB=false</c> (PackB on every call) because the

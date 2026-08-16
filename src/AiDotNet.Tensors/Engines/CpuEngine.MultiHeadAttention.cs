@@ -316,6 +316,14 @@ public partial class CpuEngine
             output.AsSpan(0, rows * dModel), rows, dModel, dModel);
     }
 
+    /// <summary>
+    /// Scatters one projection's rows into a column block of the interleaved concat buffer.
+    /// </summary>
+    /// <remarks>
+    /// The MHA fast paths keep Q, K and V side by side in a single rented buffer so the three
+    /// projection GEMMs write into one allocation; this places <paramref name="source"/> at
+    /// <paramref name="destinationColumn"/> within a row of <paramref name="destinationStride"/>.
+    /// </remarks>
     private static void CopyMhaProjection(
         float[] source, float[] destination,
         int rows, int dModel, int destinationStride, int destinationColumn)
@@ -514,6 +522,7 @@ public partial class CpuEngine
     }
 
 #if NET5_0_OR_GREATER
+    /// <summary>Horizontal sum of an AVX vector — the softmax denominator for one row.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe float HSum256(Vector256<float> v)
     {
@@ -521,6 +530,7 @@ public partial class CpuEngine
         return t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
     }
 
+    /// <summary>Horizontal maximum of an AVX vector — the shift that keeps softmax stable.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe float HMax256(Vector256<float> v)
     {

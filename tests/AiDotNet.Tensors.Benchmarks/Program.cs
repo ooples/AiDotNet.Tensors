@@ -250,6 +250,34 @@ class Program
                 args[1], artifactDirectory, evidenceDirectory);
             return;
         }
+
+        // GPU-free cubin generation, verification and SASS audit for the optimizer family.
+        // Without these the artifact pipeline had no way to invoke DirectPtxOptimizerCubinTool
+        // through the benchmark executable, which is how every other family is driven.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-optimizer-cubins")
+        {
+            Environment.ExitCode = DirectPtxOptimizerCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-optimizer-cubins")
+        {
+            Environment.ExitCode = DirectPtxOptimizerCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-optimizer-sass")
+        {
+            Environment.ExitCode = DirectPtxOptimizerCubinTool.AuditSass(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--direct-ptx-sgd-momentum")
+        {
+            DirectPtxSgdMomentumExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int sgdRuns) ? sgdRuns : 1);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-global-avgpool")
         {
             DirectPtxGlobalAvgPoolExperiment.Run(
@@ -569,6 +597,12 @@ class Program
         if (args.Length == 0 || args[0] == "--quick")
         {
             QuickPerformanceTest.Run();
+            return;
+        }
+
+        if (args[0] == "--video-warp")
+        {
+            BenchmarkRunner.Run<VideoWarpBenchmarks>(BenchConfig);
             return;
         }
 
@@ -1386,6 +1420,14 @@ class Program
             return;
         }
 
+        // Conv3D backward at four-frame video-diffusion temporal-block shapes.
+        // This is the regression surface for the im2col/GEMM dInput and dKernel paths.
+        if (args[0] == "--conv3d-backward")
+        {
+            BenchmarkRunner.Run<Conv3DBackwardBenchmarks>(BenchConfig);
+            return;
+        }
+
         // FP64 primitive ops (BatchNorm, LayerNorm, Softmax, activations,
         // pools). Stage 0 baseline for Stage 4 SIMD ports of currently-scalar
         // FP64 primitives. (~10-20min).
@@ -1516,6 +1558,9 @@ class Program
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
         Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
         Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
+        Console.WriteLine("  --generate-direct-ptx-optimizer-cubins <ptxas> <output>: build the release optimizer cubin set");
+        Console.WriteLine("  --verify-direct-ptx-optimizer-cubins <ptxas> <artifacts>: verify release optimizer cubin identity");
+        Console.WriteLine("  --audit-direct-ptx-optimizer-sass <nvdisasm> <artifacts> <evidence>: audit final optimizer SASS for local memory");
         Console.WriteLine("  --direct-ptx-convolution [--no-external]: issue #841 fused Conv2D screening harness");
         Console.WriteLine("  --direct-ptx-convolution-resnet [--no-external]: ResNet-class convolution promotion matrix");
         Console.WriteLine("  --export-direct-ptx-convolution-cubins [directory]: compile and preserve release SM86 conv cubin");
@@ -1588,6 +1633,7 @@ class Program
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-matmul-double : FP64 GEMM at DiT-XL + cluster-#6 shapes; Stage 0 baseline (docs/mkl-replacement/PLAN.md)");
         Console.WriteLine("  --conv2d-backward-double : FP64 Conv2DBackward dW+dX across cluster-#6 shapes; Stage 0 baseline");
+        Console.WriteLine("  --conv3d-backward : FP32 Conv3D dInput+dKernel at video-diffusion temporal-block shapes");
         Console.WriteLine("  --fp64-primitives   : FP64 BN/LN/Softmax/activations/pools; Stage 0 baseline for Stage 4");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
@@ -1595,6 +1641,7 @@ class Program
         Console.WriteLine("A/B microkernel + dispatch benchmarks:");
         Console.WriteLine("  --ab-parallel          : head-to-head of CPU parallel-dispatch primitives (Parallel.For vs LightweightParallel)");
         Console.WriteLine("  --ab-parallel-cpu      : idle-CPU / warm-window simulation for LightweightParallel (AIDOTNET_PPE_WARMWINDOW_US)");
+        Console.WriteLine("  --video-warp           : forward-splat flat-storage/batch-parallel benchmark vs former indexer path");
         Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
         Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
         Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");

@@ -69,7 +69,7 @@ internal static class OpRegistry
         "Embedding", "Dropout",
         // Interleaved RoPE: orthogonal rotation, records with ApplyRoPEInterleavedBackward (inverse rotation).
         "ApplyRoPEInterleaved",
-        "GridSample", "Unfold", "Fold",
+        "GridSample", "Unfold", "Fold", "ForwardSplat",
 
         // Spatial
         "Upsample", "Upsample3D", "PixelShuffle", "Crop", "Pad",
@@ -302,6 +302,7 @@ internal static class OpRegistry
         "DeformableConv2DGroupedBackwardInput", "DeformableConv2DGroupedBackwardKernel",
         "DeformableConv2DGroupedBackwardOffset", "DeformableConv2DGroupedBackwardMask",
         "GridSampleBackwardInput", "GridSampleBackwardGrid",
+        "ForwardSplatBackwardInput", "ForwardSplatBackwardFlow",
         "BatchNormBackward", "LayerNormBackward", "GroupNormBackward", "RMSNormBackward", "InstanceNormBackward",
         "DropoutBackward", "EmbeddingBackward",
         "ReduceMaxBackward", "ReduceMaxBackwardWithTensorIndices", "ReduceMeanBackward",
@@ -439,6 +440,8 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Expressed entirely through tape-connected Unfold/reshape/multiply/reduce primitives.
+        "PartialCorrelationVolume",
         // IEngine wrappers that delegate to internal methods
         "TensorSigmoid",     // -> Sigmoid (records)
         "TensorReLU",        // -> ReLU (records)
