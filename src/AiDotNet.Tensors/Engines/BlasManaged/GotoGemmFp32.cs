@@ -41,6 +41,16 @@ internal static class GotoGemmFp32
     /// dispatch (below this the per-tile pack/launch overhead dominates — stay on the existing path).</summary>
     internal const long ParallelMinWork = 8L * 1024 * 1024; // ~8.4e6
 
+    /// <summary>
+    /// Returns whether the Goto-style per-tile decomposition is appropriate for the active
+    /// CPU thread budget. This kernel was tuned on a 3990X and wins by assigning many private
+    /// L2-resident tiles concurrently. On smaller machines the redundant panel packing and
+    /// worker coordination can dominate a mixed model workload even when an isolated GEMM is
+    /// competitive. PackBoth is the safer default below this measured crossover.
+    /// </summary>
+    internal static bool IsPreferredForThreadBudget(int maxDegreeOfParallelism)
+        => maxDegreeOfParallelism >= 48;
+
     /// <summary>Shape regime where the per-tile GotoBLAS path beats the PackBoth strategy (measured on the
     /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
     /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was

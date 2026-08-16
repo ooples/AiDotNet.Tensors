@@ -211,6 +211,14 @@ public class DifferentiableOpsGradCheckSweep
 
         // --- sampling grids: grid is [N, H, W, 2] for 2-D, theta is [N, 2, 3] ---
         ["GridSample|T,T"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([1, 3, 3, 2], r)],
+        ["ForwardSplat|T,T,bool"] = r =>
+        [
+            SafeTensor([1, 2, 3, 3], r),
+            SafeTensor([1, 2, 3, 3], r),
+            // Exercise the unnormalized branch here; VideoWarpOperationsTests performs
+            // full input-and-flow finite differences for both false and true.
+            false
+        ],
         ["AffineGrid"] = r => [SafeTensor([1, 2, 3], r), 3, 3],
         ["AffineGrid3D"] = r => [SafeTensor([1, 3, 4], r), 2, 2, 2, false],
 

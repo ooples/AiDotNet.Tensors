@@ -612,10 +612,13 @@ public static partial class BlasManaged
         // tails. Gated to float, no trans, no pre-pack, no epilogue, large-shape regime. (The CCX-aware
         // pinned-pool variant beats this ~2x at the kernel level but its win is masked by per-call engine
         // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
+        int gotoThreadBudget = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (gotoThreadBudget <= 0) gotoThreadBudget = Environment.ProcessorCount;
         if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
             && options.PackedA is null && options.PackedB is null
             && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            && GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {
