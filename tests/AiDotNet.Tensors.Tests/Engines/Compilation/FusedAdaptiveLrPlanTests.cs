@@ -177,10 +177,14 @@ public class FusedAdaptiveLrPlanTests
         var w = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
         using var plan = CompileReduceSumPlan(engine, w);
 
-        // LBFGS isn't fused-eligible — closure-based. Caller should get a
-        // clear error, not a silent fall-through to the eager path.
+        // SparseAdam needs sparse-gradient index lists; the plan operates on dense gradients. The caller
+        // should get a clear error, not a silent fall-through to the eager path.
+        //
+        // LBFGS used to be asserted here too. It is now dispatchable: the two-loop recursion runs as a
+        // sequence of global reductions rather than a per-element kernel, which the plan supports (the same
+        // shape HypergradientSGD and DAdaptationSGD use). See ConfigureOptimizerLbfgsTests.
         Assert.Throws<NotSupportedException>(() =>
-            plan.ConfigureOptimizer(OptimizerType.LBFGS, LrSchedule.Constant(0.01)));
+            plan.ConfigureOptimizer(OptimizerType.SparseAdam, LrSchedule.Constant(0.01)));
     }
 
     [Theory]
