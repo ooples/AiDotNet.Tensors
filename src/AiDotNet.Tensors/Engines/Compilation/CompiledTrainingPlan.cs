@@ -2208,14 +2208,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
                 or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
-                or OptimizerType.ConjugateGradient          // m[p] = d, the conjugate direction
-                or OptimizerType.ScheduleFreeSGD;   // m[p] = z (SGD trajectory)
+                or OptimizerType.ConjugateGradient  // m[p] = d, the conjugate direction
+                or OptimizerType.ScheduleFreeSGD    // m[p] = z (SGD trajectory)
+                or OptimizerType.ADMM;              // m[p] = z (split variable)
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
                 or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop
-                or OptimizerType.ScheduleFreeSGD;   // v[p] = x (eval/average copy)
+                or OptimizerType.ScheduleFreeSGD    // v[p] = x (eval/average copy)
+                or OptimizerType.ADMM;              // v[p] = u (scaled dual variable)
             bool needsThirdState = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;
 
             // GPU fast path: param is GPU-resident → allocate matching GPU
@@ -3390,12 +3392,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
-                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ADMM;
             bool needsSecondMoment = slotType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
-                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
+                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop
+                or OptimizerType.ADMM;
             bool needsThirdState = slotType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;
 
             // GPU fast path — same logic as ConfigureOptimizerFloat. See
@@ -3974,12 +3978,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
-                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ADMM;
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
-                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
+                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop
+                or OptimizerType.ADMM;
 
             m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
             v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
@@ -4169,12 +4175,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
-                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ADMM;
             bool needsSecondMoment = slotType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
-                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
+                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop
+                or OptimizerType.ADMM;
 
             m[p] = needsMomentum ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();
             v[p] = needsSecondMoment ? TensorArena.RentPersistentZeroed<double>(lengths[p]) : Array.Empty<double>();

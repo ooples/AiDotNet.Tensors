@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
+using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -38,6 +39,7 @@ public class TrainingPlanSerializationTests
         OptimizerType.HypergradientSGD,
         OptimizerType.DAdaptationSGD,
         OptimizerType.ScheduleFreeSGD,
+        OptimizerType.ADMM,
     };
 
     public static TheoryData<OptimizerType> SupportedDoubleOptimizerCheckpointCases => new()
@@ -115,6 +117,38 @@ public class TrainingPlanSerializationTests
 
         original.Dispose();
         loaded.Dispose();
+    }
+
+    [Fact]
+    public async Task Load_Version3TrainingPlan_IsRejectedAfterOptimizerPayloadChange()
+    {
+        await Task.Yield();
+
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        using var original = CompileLinearPlan(engine, weight);
+        original.ConfigureOptimizer(
+            OptimizerType.ADMM,
+            learningRate: 0.01f,
+            extras: new FusedOptimizerExtras { AdmmRho = 2f, L1 = 0.05f });
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        byte[] bytes = stream.ToArray();
+
+        // Header layout starts with uint magic followed by ushort format version.
+        BitConverter.GetBytes((ushort)3).CopyTo(bytes, sizeof(uint));
+
+        const int FooterSize = sizeof(long) + sizeof(ulong);
+        int bodyLength = bytes.Length - FooterSize;
+        ulong checksum = XXHash64.Compute(bytes, 0, bodyLength);
+        BitConverter.GetBytes(checksum).CopyTo(bytes, bodyLength + sizeof(long));
+
+        using var version3Stream = new MemoryStream(bytes);
+        var loaded = await CompiledPlanLoader.LoadTrainingAsync<float>(
+            version3Stream, engine, new[] { weight });
+
+        Assert.Null(loaded);
     }
 
     [Fact]
@@ -426,6 +460,7 @@ public class TrainingPlanSerializationTests
             or OptimizerType.ScheduleFreeSGD
             or OptimizerType.FTRL
             or OptimizerType.Rprop
+            or OptimizerType.ADMM
             ? 0f
             : 0.0005f;
 
@@ -458,6 +493,7 @@ public class TrainingPlanSerializationTests
         D0 = 1e-4f,
         DGrowthRate = 2f,
         SfBeta = 0.75f,
+        AdmmRho = 2f,
         // Deliberately NON-default (Nesterov defaults false, FtrlBeta defaults 0) so a serializer that drops
         // them fails this round trip instead of accidentally reproducing the defaults.
         Nesterov = true,
@@ -510,13 +546,14 @@ public class TrainingPlanSerializationTests
         OptimizerType.Adam or OptimizerType.AdamW or OptimizerType.AMSGrad or OptimizerType.Nadam or
         OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.Lion or OptimizerType.SGDMomentum or
         OptimizerType.AdaMax or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop or
-        OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD or OptimizerType.ScheduleFreeSGD;
+        OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD or OptimizerType.ScheduleFreeSGD or
+        OptimizerType.ADMM;
 
     private static bool NeedsSecondFloatState(OptimizerType optimizer) => optimizer is
         OptimizerType.Adam or OptimizerType.AdamW or OptimizerType.AMSGrad or OptimizerType.Nadam or
         OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.RMSprop or OptimizerType.Adagrad or
         OptimizerType.AdaMax or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop or
-        OptimizerType.ScheduleFreeSGD;
+        OptimizerType.ScheduleFreeSGD or OptimizerType.ADMM;
 
     private static bool NeedsThirdFloatState(OptimizerType optimizer) => optimizer is
         OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL;

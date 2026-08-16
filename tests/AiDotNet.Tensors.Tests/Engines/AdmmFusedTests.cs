@@ -1,5 +1,8 @@
 using System;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -59,6 +62,68 @@ public class AdmmFusedTests
             grad[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
         }
         return (param, grad);
+    }
+
+    [Fact]
+    public async Task ConfigureOptimizer_AllocatesBothAdmmStateBuffers_AndStepRuns()
+    {
+        await Task.Yield();
+
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 1f, -2f, 3f, -4f }, new[] { 4 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(parameter, null);
+            plan = scope.CompileTraining(new[] { parameter });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(
+                OptimizerType.ADMM,
+                learningRate: 0.05f,
+                extras: new FusedOptimizerExtras { AdmmRho = 2f, L1 = 0.1f });
+
+            var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            var checkpoint = Assert.IsType<FusedOptimizerCheckpoint>(compiled.CaptureFusedOptimizerCheckpoint());
+            Assert.NotNull(checkpoint.Parameters[0].MFloat); // z
+            Assert.NotNull(checkpoint.Parameters[0].VFloat); // u
+
+            var loss = plan.Step();
+            Assert.True(float.IsFinite(loss[0]));
+            Assert.All(parameter.ToArray(), value => Assert.True(float.IsFinite(value)));
+        }
+    }
+
+    [Theory]
+    [InlineData(0f)]
+    [InlineData(-1f)]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    public async Task ConfigureOptimizer_RejectsInvalidRho(float rho)
+    {
+        await Task.Yield();
+
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(parameter, null);
+            plan = scope.CompileTraining(new[] { parameter });
+        }
+
+        using (plan)
+        {
+            var error = Assert.Throws<ArgumentOutOfRangeException>(() =>
+                plan.ConfigureOptimizer(
+                    OptimizerType.ADMM,
+                    learningRate: 0.05f,
+                    extras: new FusedOptimizerExtras { AdmmRho = rho }));
+            Assert.Equal("AdmmRho", error.ParamName);
+        }
     }
 
     [Fact]

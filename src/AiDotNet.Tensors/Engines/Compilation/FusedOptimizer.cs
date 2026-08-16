@@ -2732,9 +2732,10 @@ public sealed class FusedOptimizerExtras
     /// variable z. Default 1.
     /// </summary>
     /// <remarks>
-    /// ρ appears twice in the update and does different work each time: it scales the coupling term in the
-    /// x-step, and it scales the argument of the prox in the z-step. Both come from this one value, which
-    /// is why it is a single knob rather than two.
+    /// ρ scales the augmented-Lagrangian coupling term in the x-step. The z-step receives the already
+    /// normalized L1 threshold through <see cref="L1"/>: callers that start from a regularization strength
+    /// λ pass λ/ρ. The prox argument remains <c>x + u</c>; dividing that argument by ρ would implement a
+    /// different algorithm.
     /// </remarks>
     public float AdmmRho { get; init; } = 1f;
 
@@ -2759,6 +2760,9 @@ public sealed class FusedOptimizerExtras
         if (!(SfBeta >= 0f && SfBeta <= 1f))
             throw new ArgumentOutOfRangeException(nameof(SfBeta), SfBeta,
                 "Schedule-Free SfBeta must be in [0, 1].");
+        if (!(AdmmRho > 0f) || !float.IsFinite(AdmmRho))
+            throw new ArgumentOutOfRangeException(nameof(AdmmRho), AdmmRho,
+                "ADMM penalty parameter AdmmRho must be finite and > 0.");
     }
 }
 
