@@ -932,6 +932,7 @@ public sealed class LarsOptimizer : OptimizerBase
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1e-2, ["momentum"] = 0.9, ["weight_decay"] = 0.0, ["trust_coeff"] = 1e-3,
+        ["eps"] = 1e-8,
     };
     private static readonly string[] _stateNames = new[] { "momentum_buffer" };
     /// <inheritdoc />
@@ -950,6 +951,7 @@ public sealed class LarsOptimizer : OptimizerBase
             float mom = (float)g.GetOption("momentum", 0.9);
             float wd = (float)g.GetOption("weight_decay", 0.0);
             float tc = (float)g.GetOption("trust_coeff", 1e-3);
+            float eps = (float)g.GetOption("eps", 1e-8);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
@@ -965,7 +967,7 @@ public sealed class LarsOptimizer : OptimizerBase
                     unsafe
                     {
                         fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pv = v)
-                            FusedOptimizer.SparseLARSUpdate(pp, pIdx, pVal, pv, p.Length, sNnz, lr, mom, wd, tc);
+                            FusedOptimizer.SparseLARSUpdate(pp, pIdx, pVal, pv, p.Length, sNnz, lr, mom, wd, tc, eps);
                     }
                     continue;
                 }
@@ -973,7 +975,7 @@ public sealed class LarsOptimizer : OptimizerBase
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
-                        FusedOptimizer.LARSUpdateSimd(pp, pg, pv, p.Length, lr, mom, wd, tc);
+                        FusedOptimizer.LARSUpdateSimd(pp, pg, pv, p.Length, lr, mom, wd, tc, eps);
                 }
             }
         }

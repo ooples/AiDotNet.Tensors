@@ -19,6 +19,9 @@ internal static class DirectPtxFeatureGate
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
     internal const string MseLossEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MSE_LOSS";
+    internal const string CastFp16EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP16";
+    internal const string CastFp32EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP32";
+    internal const string Transpose2DEnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRANSPOSE2D";
     internal const string SgdMomentumEnvironmentVariable = "AIDOTNET_DIRECT_PTX_SGD_MOMENTUM";
     internal const string GlobalAvgPoolEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GLOBAL_AVGPOOL";
     internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
@@ -66,6 +69,9 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentRngDropoutEnabled = ReadEnabled(RngDropoutEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentMseLossEnabled = ReadEnabled(MseLossEnvironmentVariable);
+    private static readonly bool EnvironmentCastFp16Enabled = ReadEnabled(CastFp16EnvironmentVariable);
+    private static readonly bool EnvironmentCastFp32Enabled = ReadEnabled(CastFp32EnvironmentVariable);
+    private static readonly bool EnvironmentTranspose2DEnabled = ReadEnabled(Transpose2DEnvironmentVariable);
     private static readonly bool EnvironmentSgdMomentumEnabled = ReadEnabled(SgdMomentumEnvironmentVariable);
     private static readonly bool EnvironmentGlobalAvgPoolEnabled = ReadEnabled(GlobalAvgPoolEnvironmentVariable);
     private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
@@ -93,6 +99,13 @@ internal static class DirectPtxFeatureGate
         get => s_mseLossExperimentOverride;
         set => s_mseLossExperimentOverride = value;
     }
+
+    /// <summary>Benchmark-only access to cast cells that have not passed promotion.</summary>
+    internal static bool CastFp16ExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to widening-cast cells that have not passed promotion.</summary>
+    internal static bool CastFp32ExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to transpose cells that have not passed promotion.</summary>
+    internal static bool Transpose2DExperimentOverride { get; set; }
     [ThreadStatic]
     private static bool s_sgdMomentumExperimentOverride;
 
@@ -221,6 +234,15 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsMseLossEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentMseLossEnabled);
+
+    internal static bool IsCastFp16Enabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentCastFp16Enabled);
+
+    internal static bool IsCastFp32Enabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentCastFp32Enabled);
+
+    internal static bool IsTranspose2DEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentTranspose2DEnabled);
 
     internal static bool IsSgdMomentumEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentSgdMomentumEnabled);
