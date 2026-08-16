@@ -679,7 +679,10 @@ public static class OptimizerKernels
     public static bool IsFusedPathEligible(OptimizerType optimizerType)
         => optimizerType switch
         {
-            OptimizerType.LBFGS => false,
+            // LBFGS became plan-dispatchable once the two-loop recursion was wired as a sequence of global
+            // reductions. It is not a per-element kernel, but the plan does not require one — the same
+            // two-phase shape HypergradientSGD and DAdaptationSGD use. The step takes a fixed lr rather than
+            // a line search, which is what torch.optim.LBFGS does by default (line_search_fn=None).
             OptimizerType.SparseAdam => false,
             _ => true,
         };
