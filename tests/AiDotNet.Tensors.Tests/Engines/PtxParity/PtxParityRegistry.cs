@@ -62,6 +62,27 @@ public static class PtxParityRegistry
             "BackendRowSum_ThreeWay_CudaAndPtxBothMatchCpuOracle over MseLoss; the per-row warp " +
             "reduction accumulates, so that spec needs a summation-order-aware tolerance rather than " +
             "bit-exact equality."),
+
+        new PtxParitySpec("PtxFusedAdamUpdateF32Kernel", PtxParityStatus.Deferred,
+            "Adam parameter update, fp32 (#848) - CudaBackend.AdamUpdate",
+            "updates param, m, and v in place, so a gate-off/gate-on spec must snapshot and restore all " +
+            "three between legs and drive both legs with identical hyperparameter bits -- launch " +
+            "parameters, not baked module identity. Unlike " +
+            "the loss gradients this one canNOT be bit-exact: the two bias corrections are precomputed " +
+            "on the host to remove powf from the kernel, and nvcc may contract some of the reference " +
+            "kernel's multiply-adds into FMAs, so the spec needs a small tolerance. That is a property " +
+            "of the design, not a gap - it is recorded here so nobody later mistakes the tolerance for " +
+            "sloppiness."),
+
+        new PtxParitySpec("PtxFusedSgdMomentumF32Kernel", PtxParityStatus.Deferred,
+            "fused SGD-momentum update, fp32 (#848) — CudaBackend.SgdMomentumUpdate",
+            "has a public route, but the op mutates param and velocity in place, so a gate-off/gate-on " +
+            "spec must snapshot and restore both buffers between legs rather than just comparing one " +
+            "output. Its tests currently cover PTX-vs-CPU only. Converts to ThreeWayParity once that " +
+            "in-place-safe harness exists. Both legs must still use identical " +
+            "learning-rate/momentum/weight-decay bit patterns -- not because those bits are baked " +
+            "into module identity (they are launch parameters) but because the two legs have to be " +
+            "computing the same thing to be comparable at all."),
         new PtxParitySpec("PtxFusedGlobalMaxPoolF32Kernel", PtxParityStatus.Deferred,
             "global max pool 2D, fp32 (#842) - CudaBackend.GlobalMaxPool2D (value path)",
             "a max reduction only selects an element, so its three-way spec can assert bit-for-bit " +

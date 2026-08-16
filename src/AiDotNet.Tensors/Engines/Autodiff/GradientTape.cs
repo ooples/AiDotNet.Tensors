@@ -835,6 +835,15 @@ public sealed class GradientTape<T> : IDisposable
         }
         int recordedEntryCount = _entries.Count;
 
+        // Build requested-source reachability once and keep it active across every backward
+        // implementation. Previously only the large-tape interpreter skipped irrelevant nodes;
+        // the normal GradFn/compiled-chain path still computed gradients for frozen parameters
+        // and discarded them at the end. This scope lets heavyweight backward functions skip
+        // individual irrelevant inputs and makes AccumulateGrad stop upstream traversal at a
+        // frozen boundary.
+        using var gradientRelevance = DifferentiableOps.PushGradientRelevance(
+            createGraph ? null : BuildGradientRelevance(loss, sources));
+
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
         // (GradFn is always set), so the graph path would always win otherwise.
@@ -1030,47 +1039,6 @@ public sealed class GradientTape<T> : IDisposable
             bool anomalyActive = DetectAnomaly || AnomalyModeScope.IsActive;
             var numOpsForAnomaly = anomalyActive ? MathHelper.GetNumericOperations<T>() : null;
 
-            // Tape backward pruning: when sources are specified, forward-walk to find all tensors
-            // downstream of those sources. Skip entries whose output is not reachable.
-            // For persistent tapes, cache the relevance set since sources are typically the same
-            // across training steps (always the model parameters).
-            HashSet<Tensor<T>>? relevantTensors = null;
-            // Only build relevance set for large tapes — the O(n) forward-walk cost
-            // exceeds the backward pruning benefit for small tapes (< 100 entries).
-            if (sources is not null && sources.Count > 0 && _entries.Count >= 100)
-            {
-                relevantTensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-                foreach (var s in sources)
-                    relevantTensors.Add(s);
-
-                // Forward pass: mark tensors reachable from sources
-                // Uses inline input fields to avoid per-entry array allocation
-                for (int i = 0; i < _entries.Count; i++)
-                {
-                    ref var entry = ref _entries[i];
-                    bool inputRelevant = false;
-
-                    if (entry.InputsOverflow is not null)
-                    {
-                        foreach (var inp in entry.InputsOverflow)
-                        {
-                            if (relevantTensors.Contains(inp)) { inputRelevant = true; break; }
-                        }
-                    }
-                    else
-                    {
-                        if (relevantTensors.Contains(entry.Input0)) inputRelevant = true;
-                        else if (entry.InputCount >= 2 && entry.Input1 is not null && relevantTensors.Contains(entry.Input1)) inputRelevant = true;
-                        else if (entry.InputCount >= 3 && entry.Input2 is not null && relevantTensors.Contains(entry.Input2)) inputRelevant = true;
-                    }
-
-                    if (inputRelevant)
-                    {
-                        relevantTensors.Add(entry.Output);
-                    }
-                }
-            }
-
             for (int i = _entries.Count - 1; i >= 0; i--)
             {
                 ref var entry = ref _entries[i];
@@ -1081,8 +1049,9 @@ public sealed class GradientTape<T> : IDisposable
                     continue;
                 }
 
-                // Tape backward pruning: skip entries that don't contribute to requested sources.
-                if (relevantTensors is not null && !relevantTensors.Contains(entry.Output))
+                // Requested-source pruning is built once before dispatch and shared by tape,
+                // graph, and compiled execution. Avoid rebuilding the same set in this loop.
+                if (!DifferentiableOps.IsGradientRequired(entry.Output))
                 {
                     continue;
                 }
@@ -1346,6 +1315,136 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         return grads;
+    }
+
+    private Tensor<T>? _cachedGradientRelevanceLoss;
+    private Tensor<T>[]? _cachedGradientRelevanceSources;
+    private int _cachedGradientRelevanceEntryCount = -1;
+    private HashSet<Tensor<T>>? _cachedGradientRelevance;
+
+    private HashSet<Tensor<T>>? BuildGradientRelevance(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources)
+    {
+        if (sources is null) return null;
+
+        // The forward reachability walk costs more than it saves on small tapes. Explicitly
+        // empty sources remain special: they must install an empty set and produce no gradients.
+        if (sources.Count > 0 && _entries.Count < 100) return null;
+
+        bool canCache = _options.Persistent
+            && (_retainGrad is null || _retainGrad.Count == 0)
+            && (_hooks is null || _hooks.Count == 0);
+        if (canCache
+            && ReferenceEquals(_cachedGradientRelevanceLoss, loss)
+            && _cachedGradientRelevanceEntryCount == _entries.Count
+            && SourcesMatch(_cachedGradientRelevanceSources, sources))
+        {
+            return _cachedGradientRelevance;
+        }
+
+        var relevant = new HashSet<Tensor<T>>(
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var source in sources) relevant.Add(source);
+        if (_retainGrad is not null)
+            foreach (var retained in _retainGrad) relevant.Add(retained);
+        if (_hooks is not null)
+            foreach (var hooked in _hooks.Keys) relevant.Add(hooked);
+
+        // Prefer the GradFn graph because it can cross tape boundaries. Higher-order
+        // differentiation intentionally returns a gradient whose producer nodes belong to an
+        // inner tape; the outer tape records only the operations that consume that gradient.
+        // Building reachability from this tape's entries alone therefore misses the entire
+        // differentiable-gradient chain and incorrectly prunes HVP/Hessian contributions.
+        if (loss.GradFn is not null)
+        {
+            var visited = new HashSet<GradNode<T>>();
+            var topoOrder = new List<GradNode<T>>();
+            TopologicalSort(loss.GradFn, visited, topoOrder);
+
+            // TopologicalSort returns producers before consumers, so source reachability can be
+            // propagated in one forward pass across both current- and cross-tape nodes.
+            foreach (var node in topoOrder)
+            {
+                bool inputRelevant = false;
+                if (node.InputsOverflow is not null)
+                {
+                    foreach (var input in node.InputsOverflow)
+                    {
+                        if (relevant.Contains(input))
+                        {
+                            inputRelevant = true;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    inputRelevant = node.Input0 is not null && relevant.Contains(node.Input0)
+                        || node.InputCount >= 2 && node.Input1 is not null && relevant.Contains(node.Input1)
+                        || node.InputCount >= 3 && node.Input2 is not null && relevant.Contains(node.Input2);
+                }
+
+                if (inputRelevant && node.Output is not null) relevant.Add(node.Output);
+            }
+
+            return CacheGradientRelevance(loss, sources, relevant, canCache);
+        }
+
+        // Tape entries are recorded in forward topological order. An output can contribute to a
+        // requested source exactly when at least one of its inputs is already source-relevant.
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var entry = ref _entries[i];
+            bool inputRelevant = false;
+            if (entry.InputsOverflow is not null)
+            {
+                foreach (var input in entry.InputsOverflow)
+                {
+                    if (relevant.Contains(input))
+                    {
+                        inputRelevant = true;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                inputRelevant = relevant.Contains(entry.Input0)
+                    || entry.InputCount >= 2 && entry.Input1 is not null && relevant.Contains(entry.Input1)
+                    || entry.InputCount >= 3 && entry.Input2 is not null && relevant.Contains(entry.Input2);
+            }
+
+            if (inputRelevant) relevant.Add(entry.Output);
+        }
+
+        return CacheGradientRelevance(loss, sources, relevant, canCache);
+    }
+
+    private static bool SourcesMatch(
+        Tensor<T>[]? cached,
+        IReadOnlyList<Tensor<T>> sources)
+    {
+        if (cached is null || cached.Length != sources.Count) return false;
+        for (int i = 0; i < cached.Length; i++)
+            if (!ReferenceEquals(cached[i], sources[i])) return false;
+        return true;
+    }
+
+    private HashSet<Tensor<T>> CacheGradientRelevance(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        HashSet<Tensor<T>> relevant,
+        bool canCache)
+    {
+        if (canCache)
+        {
+            _cachedGradientRelevanceLoss = loss;
+            _cachedGradientRelevanceSources = sources.ToArray();
+            _cachedGradientRelevanceEntryCount = _entries.Count;
+            _cachedGradientRelevance = relevant;
+        }
+        return relevant;
     }
 
     private void CleanupTapeEntryGrad(Tensor<T> t, HashSet<Tensor<T>>? sourceSet, HashSet<Tensor<T>> intermediates)
