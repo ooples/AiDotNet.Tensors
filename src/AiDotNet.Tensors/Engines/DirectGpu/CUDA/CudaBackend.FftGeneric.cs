@@ -67,6 +67,12 @@ public sealed partial class CudaBackend
                 useFastMath: false);
             compileError = null;
         }
+        catch (OutOfMemoryException)
+        {
+            // Resource exhaustion is not an optional feature-compatibility failure. Let backend
+            // construction surface it rather than continuing in an unknown memory state.
+            throw;
+        }
         catch (Exception ex)
         {
             // Generic FFT is an optional CUDA capability. Preserve the rest of the backend and
@@ -75,6 +81,32 @@ public sealed partial class CudaBackend
             compileError = ex.Message;
             System.Diagnostics.Trace.TraceWarning(
                 $"CUDA {type} generic FFT kernels are unavailable: {ex.Message}");
+        }
+    }
+
+    private void DisableGenericFftModules(Exception error)
+    {
+        try
+        {
+            UnloadGenericFftModules();
+        }
+        catch (Exception unloadError)
+        {
+            // Capability state below remains authoritative even if a partially loaded module
+            // cannot be unloaded here; destroying the CUDA context reclaims it at disposal.
+            System.Diagnostics.Trace.TraceWarning(
+                $"[CudaBackend] Could not unload partially compiled generic FFT modules: " +
+                $"{unloadError.GetType().Name}: {unloadError.Message}");
+        }
+        finally
+        {
+            _fftGenericFloat32Module = IntPtr.Zero;
+            _fftGenericFloat16Module = IntPtr.Zero;
+            _fftGenericBFloat16Module = IntPtr.Zero;
+            string detail = $"{error.GetType().Name}: {error.Message}";
+            _fftGenericFloat32CompileError = detail;
+            _fftGenericFloat16CompileError = detail;
+            _fftGenericBFloat16CompileError = detail;
         }
     }
 
@@ -287,6 +319,45 @@ public sealed partial class CudaBackend
         throw new InvalidOperationException($"CUDA generic FFT kernel was not registered: {name}.");
     }
 
+    private IGpuBuffer AllocateFftScratchBuffer(int size) =>
+        new DeferredFftScratchBuffer(this, AllocateBuffer(size));
+
+    private IGpuBuffer AllocateFftScratchByteBuffer(int size) =>
+        new DeferredFftScratchBuffer(this, AllocateByteBuffer(size));
+
+    /// <summary>
+    /// Gives every temporary FFT allocation stream-safe RAII semantics. The normal async
+    /// allocator releases in stream order; the legacy allocator records an event and keeps
+    /// the buffer out of its reuse pool until all preceding FFT work has completed.
+    /// </summary>
+    private sealed class DeferredFftScratchBuffer : IGpuBuffer
+    {
+        private readonly CudaBackend _owner;
+        private IGpuBuffer? _buffer;
+
+        internal DeferredFftScratchBuffer(CudaBackend owner, IGpuBuffer buffer)
+        {
+            _owner = owner;
+            _buffer = buffer;
+        }
+
+        private IGpuBuffer Buffer => _buffer ??
+            throw new ObjectDisposedException(nameof(DeferredFftScratchBuffer));
+
+        public int Size => Buffer.Size;
+        public long SizeInBytes => Buffer.SizeInBytes;
+        public IntPtr Handle => Buffer.Handle;
+
+        public void Dispose()
+        {
+            IGpuBuffer? buffer = System.Threading.Interlocked.Exchange(ref _buffer, null);
+            if (buffer is not null)
+            {
+                _owner.FreeBufferDeferred(buffer);
+            }
+        }
+    }
+
     private unsafe void LaunchTypedRadix2(
         IGpuBuffer real,
         IGpuBuffer imaginary,
@@ -298,12 +369,12 @@ public sealed partial class CudaBackend
         int count = checked(batch * n);
         int bytes = checked(count * type.ByteSize());
         int half = Math.Max(1, n / 2);
-        using IGpuBuffer twiddleReal = AllocateBuffer(half);
-        using IGpuBuffer twiddleImaginary = AllocateBuffer(half);
+        using IGpuBuffer twiddleReal = AllocateFftScratchBuffer(half);
+        using IGpuBuffer twiddleImaginary = AllocateFftScratchBuffer(half);
         BuildTwiddles(twiddleReal, twiddleImaginary, n, inverse);
 
-        using IGpuBuffer scratchReal = AllocateByteBuffer(bytes);
-        using IGpuBuffer scratchImaginary = AllocateByteBuffer(bytes);
+        using IGpuBuffer scratchReal = AllocateFftScratchByteBuffer(bytes);
+        using IGpuBuffer scratchImaginary = AllocateFftScratchByteBuffer(bytes);
         IntPtr bitReverse = RequireGenericFftKernel("fftg_batched_bit_reverse" + type.KernelSuffix(), type);
         IntPtr realPtr = real.Handle;
         IntPtr imaginaryPtr = imaginary.Handle;
@@ -354,12 +425,12 @@ public sealed partial class CudaBackend
     {
         int count = checked(batch * n);
         int half = Math.Max(1, n / 2);
-        using IGpuBuffer twiddleReal = AllocateBuffer(half);
-        using IGpuBuffer twiddleImaginary = AllocateBuffer(half);
+        using IGpuBuffer twiddleReal = AllocateFftScratchBuffer(half);
+        using IGpuBuffer twiddleImaginary = AllocateFftScratchBuffer(half);
         BuildTwiddles(twiddleReal, twiddleImaginary, n, inverse);
 
-        using IGpuBuffer scratchReal = AllocateBuffer(count);
-        using IGpuBuffer scratchImaginary = AllocateBuffer(count);
+        using IGpuBuffer scratchReal = AllocateFftScratchBuffer(count);
+        using IGpuBuffer scratchImaginary = AllocateFftScratchBuffer(count);
         IntPtr bitReverse = RequireInvariantGenericFftKernel("fftg_f32_bit_reverse");
         IntPtr realPtr = real.Handle;
         IntPtr imaginaryPtr = imaginary.Handle;
@@ -462,12 +533,12 @@ public sealed partial class CudaBackend
     {
         int m = CudaFFTGenericKernels.BluesteinLength(n);
         int workspaceCount = checked(batch * m);
-        using IGpuBuffer chirpReal = AllocateBuffer(n);
-        using IGpuBuffer chirpImaginary = AllocateBuffer(n);
-        using IGpuBuffer kernelReal = AllocateBuffer(m);
-        using IGpuBuffer kernelImaginary = AllocateBuffer(m);
-        using IGpuBuffer workspaceReal = AllocateBuffer(workspaceCount);
-        using IGpuBuffer workspaceImaginary = AllocateBuffer(workspaceCount);
+        using IGpuBuffer chirpReal = AllocateFftScratchBuffer(n);
+        using IGpuBuffer chirpImaginary = AllocateFftScratchBuffer(n);
+        using IGpuBuffer kernelReal = AllocateFftScratchBuffer(m);
+        using IGpuBuffer kernelImaginary = AllocateFftScratchBuffer(m);
+        using IGpuBuffer workspaceReal = AllocateFftScratchBuffer(workspaceCount);
+        using IGpuBuffer workspaceImaginary = AllocateFftScratchBuffer(workspaceCount);
 
         BuildChirp(chirpReal, chirpImaginary, n, inverse);
         BuildPaddedChirp(kernelReal, kernelImaginary, n, m, inverse);

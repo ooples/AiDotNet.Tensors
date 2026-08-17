@@ -488,6 +488,18 @@ public class CudaFftGenericKernelTests
     }
 
     [Fact]
+    public async Task DirectGpuContractOverridesManagedCpuFftGeneric()
+    {
+        await Task.Yield();
+        var method = typeof(DirectGpuTensorEngine).GetMethod(
+            nameof(IEngine.FftGeneric),
+            new[] { typeof(Tensor<float>), typeof(bool), typeof(FftElementType) });
+
+        Assert.NotNull(method);
+        Assert.Equal(typeof(DirectGpuTensorEngine), method.DeclaringType);
+    }
+
+    [Fact]
     public async Task IEngineContractRecordsAutogradOnCpu()
     {
         await Task.Yield();
@@ -500,6 +512,29 @@ public class CudaFftGenericKernelTests
         Tensor<float> loss = engine.ReduceSum(result, new[] { 0 }, keepDims: false);
         var gradients = tape.ComputeGradients(loss);
         Assert.True(gradients.ContainsKey(input), "FftGeneric must keep the active tape connected to its input.");
+    }
+
+    [SkippableFact]
+    public async Task FftGenericRecordsAutogradOnCuda()
+    {
+        await Task.Yield();
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.GetBackend() is CudaBackend, "Active DirectGpu backend is not CUDA.");
+        Skip.IfNot(
+            engine.SupportsFftElementType(FftElementType.Float32),
+            "CUDA Float32 generic FFT is unavailable.");
+
+        var input = new Tensor<float>(new float[] { 1, 0, 2, -1, 3, 0.5f }, new[] { 6 });
+        using var tape = new GradientTape<float>();
+
+        Tensor<float> result = ((IEngine)engine).FftGeneric(input);
+        Assert.NotNull(result.GradFn);
+        Tensor<float> loss = engine.ReduceSum(result, new[] { 0 }, keepDims: false);
+        var gradients = tape.ComputeGradients(loss);
+        Assert.True(
+            gradients.ContainsKey(input),
+            "CUDA FftGeneric must keep the active tape connected to its input.");
     }
 
     private static Complex[] DownloadComplex(

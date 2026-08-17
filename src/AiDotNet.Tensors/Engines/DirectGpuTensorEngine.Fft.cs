@@ -84,7 +84,9 @@ public partial class DirectGpuTensorEngine
             {
                 return ExecuteCudaFftGeneric(cuda, interleaved, inverse, FftElementType.Float32);
             }
-            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or ArgumentException)
+            catch (Exception ex) when (
+                ex is not CudaGenericFftRecoveryException &&
+                (ex is InvalidOperationException or NotSupportedException or ArgumentException))
             {
                 if (ThrowOnGpuKernelFallback) throw;
                 System.Diagnostics.Trace.TraceWarning(
@@ -207,11 +209,14 @@ public partial class DirectGpuTensorEngine
         IGpuBuffer? imaginaryStorage = null;
         IGpuBuffer? interleavedOutput = null;
         bool outputHandedOff = false;
+        bool cudaWorkMayBePending = false;
+        Exception? dispatchFailure = null;
         try
         {
             using var input = GetOrAllocateBuffer(cuda, interleaved);
             realFloat = cuda.AllocateBuffer(complexCount);
             imaginaryFloat = cuda.AllocateBuffer(complexCount);
+            cudaWorkMayBePending = true;
             cuda.StridedGather(input.Buffer, realFloat, 0, 2, complexCount);
             cuda.StridedGather(input.Buffer, imaginaryFloat, 1, 2, complexCount);
 
@@ -247,13 +252,46 @@ public partial class DirectGpuTensorEngine
             outputHandedOff = true;
             return result;
         }
+        catch (Exception ex)
+        {
+            dispatchFailure = ex;
+            throw;
+        }
         finally
         {
+            // A generic FFT error may occur after one or more asynchronous launches. Do not
+            // release or reuse any device buffer, or enter a legacy CUDA fallback, until the
+            // stream proves those launches completed. If synchronization itself reports a
+            // device fault, surface a non-fallback exception and leave cleanup to backend
+            // teardown rather than risk a use-after-free on a poisoned context.
+            if (!outputHandedOff && cudaWorkMayBePending && dispatchFailure is not null)
+            {
+                try
+                {
+                    cuda.Synchronize();
+                }
+                catch (Exception synchronizationFailure)
+                {
+                    throw new CudaGenericFftRecoveryException(dispatchFailure, synchronizationFailure);
+                }
+            }
+
             if (!ReferenceEquals(realStorage, realFloat)) realStorage?.Dispose();
             if (!ReferenceEquals(imaginaryStorage, imaginaryFloat)) imaginaryStorage?.Dispose();
             realFloat?.Dispose();
             imaginaryFloat?.Dispose();
             if (!outputHandedOff) interleavedOutput?.Dispose();
+        }
+    }
+
+    private sealed class CudaGenericFftRecoveryException : InvalidOperationException
+    {
+        internal CudaGenericFftRecoveryException(Exception dispatchFailure, Exception synchronizationFailure)
+            : base(
+                "CUDA generic FFT failed and the stream could not be synchronized safely; " +
+                "legacy GPU fallback was blocked to preserve the original device fault.",
+                new AggregateException(dispatchFailure, synchronizationFailure))
+        {
         }
     }
 }
