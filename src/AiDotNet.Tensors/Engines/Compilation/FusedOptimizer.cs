@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Simd;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -1301,9 +1301,11 @@ internal static class FusedOptimizer
                 Avx.Store(m + i, mNew);
                 var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
                 Avx.Store(v + i, vNew);
-                var mHat = Avx.Multiply(mNew, vBc1Inv);
                 var vHat = Avx.Multiply(vNew, vBc2Inv);
-                var mNesterov = Avx.Add(Avx.Multiply(vB1, mHat), Avx.Multiply(Avx.Multiply(v1mB1, g), vBc1NextInv));
+                // Dozat (2016) Alg. 8: momentum term / (1 - b1^(t+1)), gradient term / (1 - b1^t).
+                // These were swapped.
+                var mNesterovMom = Avx.Multiply(mNew, vBc1NextInv);
+                var mNesterov = Avx.Add(Avx.Multiply(vB1, mNesterovMom), Avx.Multiply(Avx.Multiply(v1mB1, g), vBc1Inv));
                 var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
                 Avx.Store(param + i, Fma.MultiplyAdd(vLr, Avx.Divide(mNesterov, denom), Avx.LoadVector256(param + i)));
             }
@@ -1313,9 +1315,9 @@ internal static class FusedOptimizer
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
-            float mHat = m[i] / bc1;
             float vHat = v[i] / bc2;
-            float mNesterov = beta1 * mHat + (1f - beta1) * grad[i] / bc1Next;
+            // Dozat (2016) Alg. 8: momentum term / (1 - b1^(t+1)), gradient term / (1 - b1^t).
+            float mNesterov = beta1 * (m[i] / bc1Next) + (1f - beta1) * grad[i] / bc1;
             param[i] -= lr * mNesterov / (MathF.Sqrt(vHat) + eps);
         }
     }
