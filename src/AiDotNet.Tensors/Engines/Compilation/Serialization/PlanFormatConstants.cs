@@ -22,8 +22,15 @@ internal static class PlanFormatConstants
     /// Version 3 added fused compiled optimizer configuration and transient
     /// state to training plans so saved plans resume Adam-family moments and
     /// optimizer-specific scalar state instead of restarting fresh.
+    /// Version 4 adds the L-BFGS, trust-region, and ADMM optimizer extras to
+    /// the fused-checkpoint payload. Version 3 readers and writers disagree on
+    /// that payload width, so accepting a version 3 plan would misalign every
+    /// field that follows it.
+    /// Version 5 adds Fletcher-Reeves conjugate-gradient scalar state to the
+    /// same payload. Version 4 plans do not contain that value and must be
+    /// rejected rather than shifting the following parameter-state fields.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 3;
+    internal const ushort CurrentFormatVersion = 5;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:
