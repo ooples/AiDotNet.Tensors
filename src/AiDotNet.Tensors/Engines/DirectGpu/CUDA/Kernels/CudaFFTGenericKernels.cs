@@ -28,6 +28,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
         /// </summary>
         private static readonly string[] TypedKernelBaseNames =
         {
+            "fftg_from_f32",
+            "fftg_to_f32",
             "fftg_batched_bit_reverse",
             "fftg_batched_butterfly",
             "fftg_scale",
@@ -67,7 +69,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
         /// </summary>
         public static int BluesteinLength(int n)
         {
-            if (n <= 1)
+            const int MaximumTransformLength = 1 << 29;
+            if (n <= 0 || n > MaximumTransformLength)
+            {
+                throw new System.ArgumentOutOfRangeException(
+                    nameof(n),
+                    n,
+                    $"Transform length must be in the range [1, {MaximumTransformLength}].");
+            }
+
+            if (n == 1)
             {
                 return 1;
             }
@@ -128,6 +139,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 #include <math.h>
 
 #define AIDN_PI 3.14159265358979323846f
+#define AIDN_FFTG_THREADS_PER_BLOCK 256
 #define STORE_T " + storeType + @"
 __device__ __forceinline__ float aidn_ld(STORE_T v) { return " + loadExpr + @"; }
 __device__ __forceinline__ STORE_T aidn_st(float v) { return " + storeExpr + @"; }
@@ -141,7 +153,7 @@ __device__ __forceinline__ STORE_T aidn_st(float v) { return " + storeExpr + @";
 // Twiddle table for a length-n radix-2 transform: w[j] = exp(-2*pi*i*j/n) for j < n/2.
 // The existing radix-2 butterfly calls cosf/sinf per element per stage; tabulating once removes
 // log2(n) transcendental pairs per element and makes the butterfly purely load/store bound.
-extern ""C"" __global__ __launch_bounds__(256) void fftg_build_twiddles(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_build_twiddles(
     float* twRe, float* twIm, int half, int n, int inverse)
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -155,7 +167,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_build_twiddles(
 // Bluestein chirp c[k] = exp(+i*pi*k^2/n) (forward; conjugated when inverse), length n.
 // k*k overflows int for n beyond ~46341, so the squaring is done in 64-bit and reduced mod 2n
 // BEFORE the float conversion - reducing after conversion loses the low bits that carry the phase.
-extern ""C"" __global__ __launch_bounds__(256) void fftg_build_chirp(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_build_chirp(
     float* chRe, float* chIm, int n, int inverse)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -178,7 +190,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_build_chirp(
 // transform correct at k = 0 and wrong everywhere else - a reference implementation of this exact omission
 // measures 0.71 relative error at n = 896 (hre_port_tests/fftref.py, negative control), i.e. it is the kind of
 // bug that passes a smoke test on DC and fails on everything anyone cares about.
-extern ""C"" __global__ __launch_bounds__(256) void fftg_build_chirp_padded(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_build_chirp_padded(
     float* bRe, float* bIm, int n, int m, int inverse)
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -200,7 +212,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_build_chirp_padded(
     bIm[j] = sinf(angle);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fftg_f32_bit_reverse(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_f32_bit_reverse(
     const float* srcRe, const float* srcIm, float* dstRe, float* dstIm, int batch, int n, int log2n)
 {
     int b = blockIdx.y;
@@ -213,7 +225,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_f32_bit_reverse(
     dstIm[base + idx] = srcIm[base + rev];
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fftg_f32_butterfly(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_f32_butterfly(
     float* re, float* im, const float* twRe, const float* twIm,
     int batch, int n, int stride)
 {
@@ -240,7 +252,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_f32_butterfly(
     re[bot] = tR - xR; im[bot] = tI - xI;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fftg_f32_scale(float* re, float* im, int count, float s)
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_f32_scale(float* re, float* im, int count, float s)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -248,7 +260,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_f32_scale(float* re, fl
 }
 
 // Pointwise product of the padded signal spectrum with the pre-transformed chirp spectrum.
-extern ""C"" __global__ __launch_bounds__(256) void fftg_bluestein_pointwise(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_bluestein_pointwise(
     float* re, float* im, const float* kRe, const float* kIm, int batch, int m)
 {
     int b = blockIdx.y;
@@ -267,7 +279,21 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_bluestein_pointwise(
 // Element-type specialized kernels. Narrow load, float32 compute, narrow store.
 // ---------------------------------------------------------------------------
 
-extern ""C"" __global__ __launch_bounds__(256) void fftg_batched_bit_reverse" + suffix + @"(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_from_f32" + suffix + @"(
+    const float* src, STORE_T* dst, int count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) dst[idx] = aidn_st(src[idx]);
+}
+
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_to_f32" + suffix + @"(
+    const STORE_T* src, float* dst, int count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) dst[idx] = aidn_ld(src[idx]);
+}
+
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_batched_bit_reverse" + suffix + @"(
     const STORE_T* srcRe, const STORE_T* srcIm, STORE_T* dstRe, STORE_T* dstIm, int batch, int n, int log2n)
 {
     int b = blockIdx.y;
@@ -280,7 +306,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_batched_bit_reverse" + 
     dstIm[base + idx] = srcIm[base + rev];
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fftg_batched_butterfly" + suffix + @"(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_batched_butterfly" + suffix + @"(
     STORE_T* re, STORE_T* im, const float* twRe, const float* twIm,
     int batch, int n, int stride)
 {
@@ -308,7 +334,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_batched_butterfly" + su
     re[bot] = aidn_st(tR - xR); im[bot] = aidn_st(tI - xI);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fftg_scale" + suffix + @"(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_scale" + suffix + @"(
     STORE_T* re, STORE_T* im, int count, float s)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -320,7 +346,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_scale" + suffix + @"(
 // Bluestein step 1: x[k] * conj(chirp[k]) into a zero-padded float32 workspace of length m.
 // The workspace is float32 regardless of the caller's element type: it is transient scratch, so narrowing it
 // would compound rounding through two extra transforms while saving no traffic the caller ever sees.
-extern ""C"" __global__ __launch_bounds__(256) void fftg_bluestein_premul" + suffix + @"(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_bluestein_premul" + suffix + @"(
     const STORE_T* xRe, const STORE_T* xIm, const float* chRe, const float* chIm,
     float* wRe, float* wIm, int batch, int n, int m)
 {
@@ -337,7 +363,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fftg_bluestein_premul" + suf
 }
 
 // Bluestein step 3: multiply the first n outputs by conj(chirp) and write back in the caller's element type.
-extern ""C"" __global__ __launch_bounds__(256) void fftg_bluestein_postmul" + suffix + @"(
+extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_bluestein_postmul" + suffix + @"(
     const float* wRe, const float* wIm, const float* chRe, const float* chIm,
     STORE_T* yRe, STORE_T* yIm, int batch, int n, int m, float scale)
 {

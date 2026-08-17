@@ -17,8 +17,13 @@
 
 using System;
 using System.Numerics;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -205,8 +210,9 @@ public class CudaFftGenericKernelTests
     [InlineData(8)]
     [InlineData(64)]
     [InlineData(256)]
-    public void TwiddleTableIndexingMatchesDirectDft(int n)
+    public async Task TwiddleTableIndexingMatchesDirectDft(int n)
     {
+        await Task.Yield();
         Complex[] x = Random(n, 1234 + n);
         Assert.True(RelErr(Radix2WithTable(x, false), Dft(x, false)) < Tol);
         Assert.True(RelErr(Radix2WithTable(x, true), Dft(x, true)) < Tol);
@@ -220,8 +226,9 @@ public class CudaFftGenericKernelTests
     [InlineData(896)]   // Qwen2.5-0.5B hidden width, 2^7 * 7 - the size that forced this path onto the CPU
     [InlineData(900)]
     [InlineData(1023)]
-    public void BluesteinMatchesDirectDftForArbitraryLengths(int n)
+    public async Task BluesteinMatchesDirectDftForArbitraryLengths(int n)
     {
+        await Task.Yield();
         Complex[] x = Random(n, 99 + n);
         Assert.True(RelErr(Bluestein(x, false), Dft(x, false)) < Tol, $"forward n={n}");
         Assert.True(RelErr(Bluestein(x, true), Dft(x, true)) < Tol, $"inverse n={n}");
@@ -231,8 +238,9 @@ public class CudaFftGenericKernelTests
     [InlineData(5)]
     [InlineData(100)]
     [InlineData(896)]
-    public void BluesteinRequiresSymmetricChirpTail(int n)
+    public async Task BluesteinRequiresSymmetricChirpTail(int n)
     {
+        await Task.Yield();
         // NEGATIVE CONTROL. An m-point FFT computes a CYCLIC convolution; Bluestein needs a LINEAR one, and the
         // two coincide only when the chirp kernel is mirrored into the upper tail. Dropping the mirror leaves
         // the transform correct at k=0 and wrong elsewhere, so a test that only checked DC would pass.
@@ -242,12 +250,25 @@ public class CudaFftGenericKernelTests
     }
 
     [Fact]
-    public void BluesteinLengthIsSmallestPowerOfTwoAtLeastTwoNMinusOne()
+    public async Task BluesteinLengthIsSmallestPowerOfTwoAtLeastTwoNMinusOne()
     {
+        await Task.Yield();
         Assert.Equal(1, CudaFFTGenericKernels.BluesteinLength(1));
         Assert.Equal(8, CudaFFTGenericKernels.BluesteinLength(3));      // 2*3-1 = 5  -> 8
         Assert.Equal(16, CudaFFTGenericKernels.BluesteinLength(8));     // 2*8-1 = 15 -> 16
         Assert.Equal(2048, CudaFFTGenericKernels.BluesteinLength(896)); // 2*896-1 = 1791 -> 2048
+        Assert.Equal(1 << 30, CudaFFTGenericKernels.BluesteinLength(1 << 29));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData((1 << 29) + 1)]
+    [InlineData(int.MaxValue)]
+    public async Task BluesteinLengthRejectsNonPositiveAndOverflowingLengths(int n)
+    {
+        await Task.Yield();
+        Assert.Throws<ArgumentOutOfRangeException>(() => CudaFFTGenericKernels.BluesteinLength(n));
     }
 
     [Theory]
@@ -256,8 +277,11 @@ public class CudaFftGenericKernelTests
     [InlineData(1024, true)]
     [InlineData(896, false)]
     [InlineData(0, false)]
-    public void IsPowerOfTwoClassifiesLengths(int n, bool expected)
-        => Assert.Equal(expected, CudaFFTGenericKernels.IsPowerOfTwo(n));
+    public async Task IsPowerOfTwoClassifiesLengths(int n, bool expected)
+    {
+        await Task.Yield();
+        Assert.Equal(expected, CudaFFTGenericKernels.IsPowerOfTwo(n));
+    }
 
     // ── source generation ───────────────────────────────────────────────────
 
@@ -265,8 +289,9 @@ public class CudaFftGenericKernelTests
     [InlineData(FftElementType.Float32, "float", "_f32")]
     [InlineData(FftElementType.Float16, "__half", "_f16")]
     [InlineData(FftElementType.BFloat16, "__nv_bfloat16", "_bf16")]
-    public void SourceUsesTheRequestedStorageType(FftElementType type, string storeType, string suffix)
+    public async Task SourceUsesTheRequestedStorageType(FftElementType type, string storeType, string suffix)
     {
+        await Task.Yield();
         string src = CudaFFTGenericKernels.GetSource(type);
         Assert.Contains($"#define STORE_T {storeType}", src);
         Assert.Contains($"fftg_batched_butterfly{suffix}", src);
@@ -276,12 +301,16 @@ public class CudaFftGenericKernelTests
     [Theory]
     [InlineData(FftElementType.Float16, "cuda_fp16.h")]
     [InlineData(FftElementType.BFloat16, "cuda_bf16.h")]
-    public void NarrowTypesIncludeTheirHeader(FftElementType type, string header)
-        => Assert.Contains(header, CudaFFTGenericKernels.GetSource(type));
+    public async Task NarrowTypesIncludeTheirHeader(FftElementType type, string header)
+    {
+        await Task.Yield();
+        Assert.Contains(header, CudaFFTGenericKernels.GetSource(type));
+    }
 
     [Fact]
-    public void Float32SourceNeedsNoNarrowHeaders()
+    public async Task Float32SourceNeedsNoNarrowHeaders()
     {
+        await Task.Yield();
         string src = CudaFFTGenericKernels.GetSource(FftElementType.Float32);
         Assert.DoesNotContain("cuda_fp16.h", src);
         Assert.DoesNotContain("cuda_bf16.h", src);
@@ -291,8 +320,9 @@ public class CudaFftGenericKernelTests
     [InlineData(FftElementType.Float32)]
     [InlineData(FftElementType.Float16)]
     [InlineData(FftElementType.BFloat16)]
-    public void EveryDeclaredKernelIsPresentInTheSource(FftElementType type)
+    public async Task EveryDeclaredKernelIsPresentInTheSource(FftElementType type)
     {
+        await Task.Yield();
         string src = CudaFFTGenericKernels.GetSource(type);
         foreach (string name in CudaFFTGenericKernels.GetKernelNames(type))
         {
@@ -301,8 +331,9 @@ public class CudaFftGenericKernelTests
     }
 
     [Fact]
-    public void ArithmeticIsFloat32ForEveryElementType()
+    public async Task ArithmeticIsFloat32ForEveryElementType()
     {
+        await Task.Yield();
         // The accumulator must stay float32 whatever the storage width: an n-point transform is log2(n)
         // accumulation stages, and a 7-bit mantissa cannot survive them. The narrow type appears only at the
         // load/store boundary, which is where the bandwidth saving lives.
@@ -318,16 +349,214 @@ public class CudaFftGenericKernelTests
     [InlineData(FftElementType.Float32, 4)]
     [InlineData(FftElementType.Float16, 2)]
     [InlineData(FftElementType.BFloat16, 2)]
-    public void ByteSizeMatchesStorageWidth(FftElementType type, int expected)
-        => Assert.Equal(expected, type.ByteSize());
+    public async Task ByteSizeMatchesStorageWidth(FftElementType type, int expected)
+    {
+        await Task.Yield();
+        Assert.Equal(expected, type.ByteSize());
+    }
 
     [Fact]
-    public void BFloat16RequiresAmpere()
+    public async Task UnknownElementTypeIsRejectedByStorageContracts()
     {
+        await Task.Yield();
+        var unknown = (FftElementType)int.MaxValue;
+        Assert.Throws<ArgumentOutOfRangeException>(() => unknown.ByteSize());
+        Assert.Throws<ArgumentOutOfRangeException>(() => unknown.KernelSuffix());
+    }
+
+    [Theory]
+    [InlineData(FftElementType.Float32)]
+    [InlineData(FftElementType.Float16)]
+    [InlineData(FftElementType.BFloat16)]
+    public async Task LaunchBoundsUsesOneNamedSourceConstant(FftElementType type)
+    {
+        await Task.Yield();
+        string source = CudaFFTGenericKernels.GetSource(type);
+        Assert.Contains("#define AIDN_FFTG_THREADS_PER_BLOCK 256", source);
+        Assert.DoesNotContain("__launch_bounds__(256)", source);
+    }
+
+    [Fact]
+    public async Task BFloat16RequiresAmpere()
+    {
+        await Task.Yield();
         // Reporting the requirement lets a backend refuse cleanly; the alternative is an NVRTC compile failure
         // inside a launch, which is far harder to attribute to the element type that caused it.
         Assert.Equal(80, FftElementType.BFloat16.MinComputeCapabilityX10());
         Assert.Equal(53, FftElementType.Float16.MinComputeCapabilityX10());
         Assert.True(FftElementType.Float32.MinComputeCapabilityX10() < 53);
+    }
+
+    [SkippableTheory]
+    [InlineData(FftElementType.Float32, 8)]
+    [InlineData(FftElementType.Float16, 8)]
+    [InlineData(FftElementType.BFloat16, 8)]
+    [InlineData(FftElementType.Float32, 5)]
+    [InlineData(FftElementType.Float16, 5)]
+    [InlineData(FftElementType.BFloat16, 5)]
+    public async Task CudaExecutionMatchesReferenceAndRoundTrips(
+        FftElementType type,
+        int n)
+    {
+        await Task.Yield();
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
+
+        const int batch = 2;
+        int count = batch * n;
+        Complex[] source = Random(count, 4200 + n + (int)type);
+        float[] sourceReal = new float[count];
+        float[] sourceImaginary = new float[count];
+        for (int i = 0; i < count; i++)
+        {
+            sourceReal[i] = (float)source[i].Real;
+            sourceImaginary[i] = (float)source[i].Imaginary;
+        }
+
+        IGpuBuffer real = type == FftElementType.Float32
+            ? backend.AllocateBuffer(sourceReal)
+            : backend.AllocateByteBuffer(checked(count * type.ByteSize()));
+        IGpuBuffer imaginary = type == FftElementType.Float32
+            ? backend.AllocateBuffer(sourceImaginary)
+            : backend.AllocateByteBuffer(checked(count * type.ByteSize()));
+        using (real)
+        using (imaginary)
+        {
+            if (type != FftElementType.Float32)
+            {
+                using IGpuBuffer sourceRealBuffer = backend.AllocateBuffer(sourceReal);
+                using IGpuBuffer sourceImaginaryBuffer = backend.AllocateBuffer(sourceImaginary);
+                backend.ConvertFloatToFftStorage(sourceRealBuffer, real, count, type);
+                backend.ConvertFloatToFftStorage(sourceImaginaryBuffer, imaginary, count, type);
+            }
+
+            Complex[] quantizedInput = DownloadComplex(backend, real, imaginary, count, type);
+            backend.LaunchFftGeneric(real, imaginary, batch, n, inverse: false, type);
+            Complex[] actualForward = DownloadComplex(backend, real, imaginary, count, type);
+            Complex[] expectedForward = DftBatched(quantizedInput, batch, n, inverse: false);
+            double tolerance = type switch
+            {
+                FftElementType.Float32 => 2e-5,
+                FftElementType.Float16 => 3e-2,
+                FftElementType.BFloat16 => 8e-2,
+                _ => throw new ArgumentOutOfRangeException(nameof(type)),
+            };
+            Assert.True(
+                RelErr(actualForward, expectedForward) < tolerance,
+                $"{type} forward n={n}: rel-err {RelErr(actualForward, expectedForward):E3}");
+
+            backend.LaunchFftGeneric(real, imaginary, batch, n, inverse: true, type);
+            Complex[] roundTrip = DownloadComplex(backend, real, imaginary, count, type);
+            Assert.True(
+                RelErr(roundTrip, quantizedInput) < tolerance,
+                $"{type} round-trip n={n}: rel-err {RelErr(roundTrip, quantizedInput):E3}");
+        }
+    }
+
+    [SkippableFact]
+    public async Task IEngineContractDispatchesArbitraryLengthCudaWithoutHostFallback()
+    {
+        await Task.Yield();
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.GetBackend() is CudaBackend, "Active DirectGpu backend is not CUDA.");
+        Skip.IfNot(engine.SupportsFftElementType(FftElementType.Float32), "CUDA Float32 generic FFT is unavailable.");
+
+        var input = new Tensor<float>(
+            new float[] { 1, 0, 2, -1, -3, 0.5f, 4, 2, -2, -0.25f },
+            new[] { 10 });
+        Tensor<float> output = ((IEngine)engine).FftGeneric(input);
+        Complex[] expected = Dft(ToComplex(input.GetFlattenedData()), inverse: false);
+        Complex[] actual = ToComplex(output.GetFlattenedData());
+        Assert.True(RelErr(actual, expected) < 2e-5, $"IEngine CUDA path rel-err {RelErr(actual, expected):E3}");
+    }
+
+    [SkippableFact]
+    public async Task ExplicitPeerBackendRequestThrowsInsteadOfCopyingToHost()
+    {
+        await Task.Yield();
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.IsGpuAvailable, "No DirectGpu backend is available.");
+        Skip.If(engine.GetBackend() is CudaBackend, "Requires a non-CUDA DirectGpu backend.");
+        var input = new Tensor<float>(new float[] { 1, 0, 2, -1, 3, 0.5f }, new[] { 6 });
+
+        NotSupportedException error = Assert.Throws<NotSupportedException>(
+            () => ((IEngine)engine).FftGeneric(input));
+        Assert.Contains("No host fallback was performed", error.Message);
+    }
+
+    [Fact]
+    public async Task IEngineContractRecordsAutogradOnCpu()
+    {
+        await Task.Yield();
+        IEngine engine = new CpuEngine();
+        var input = new Tensor<float>(new float[] { 1, 0, 2, -1, 3, 0.5f }, new[] { 6 });
+        using var tape = new GradientTape<float>();
+
+        Tensor<float> result = engine.FftGeneric(input);
+        Assert.NotNull(result.GradFn);
+        Tensor<float> loss = engine.ReduceSum(result, new[] { 0 }, keepDims: false);
+        var gradients = tape.ComputeGradients(loss);
+        Assert.True(gradients.ContainsKey(input), "FftGeneric must keep the active tape connected to its input.");
+    }
+
+    private static Complex[] DownloadComplex(
+        CudaBackend backend,
+        IGpuBuffer real,
+        IGpuBuffer imaginary,
+        int count,
+        FftElementType type)
+    {
+        float[] realValues = new float[count];
+        float[] imaginaryValues = new float[count];
+        if (type == FftElementType.Float32)
+        {
+            backend.DownloadBuffer(real, realValues);
+            backend.DownloadBuffer(imaginary, imaginaryValues);
+        }
+        else
+        {
+            using IGpuBuffer realFloat = backend.AllocateBuffer(count);
+            using IGpuBuffer imaginaryFloat = backend.AllocateBuffer(count);
+            backend.ConvertFftStorageToFloat(real, realFloat, count, type);
+            backend.ConvertFftStorageToFloat(imaginary, imaginaryFloat, count, type);
+            backend.DownloadBuffer(realFloat, realValues);
+            backend.DownloadBuffer(imaginaryFloat, imaginaryValues);
+        }
+
+        var values = new Complex[count];
+        for (int i = 0; i < count; i++)
+        {
+            values[i] = new Complex(realValues[i], imaginaryValues[i]);
+        }
+
+        return values;
+    }
+
+    private static Complex[] ToComplex(float[] interleaved)
+    {
+        var values = new Complex[interleaved.Length / 2];
+        for (int i = 0; i < values.Length; i++)
+        {
+            values[i] = new Complex(interleaved[2 * i], interleaved[(2 * i) + 1]);
+        }
+
+        return values;
+    }
+
+    private static Complex[] DftBatched(Complex[] values, int batch, int n, bool inverse)
+    {
+        var result = new Complex[values.Length];
+        for (int b = 0; b < batch; b++)
+        {
+            var row = new Complex[n];
+            Array.Copy(values, b * n, row, 0, n);
+            Complex[] transformed = Dft(row, inverse);
+            Array.Copy(transformed, 0, result, b * n, n);
+        }
+
+        return result;
     }
 }

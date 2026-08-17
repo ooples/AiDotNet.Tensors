@@ -43,7 +43,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
     public static class FftElementTypeExtensions
     {
         /// <summary>Bytes occupied by one real component (a complex value uses twice this).</summary>
-        public static int ByteSize(this FftElementType type) => type == FftElementType.Float32 ? 4 : 2;
+        public static int ByteSize(this FftElementType type) => type switch
+        {
+            FftElementType.Float32 => 4,
+            FftElementType.Float16 => 2,
+            FftElementType.BFloat16 => 2,
+            _ => throw new System.ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type."),
+        };
 
         /// <summary>
         /// Kernel-name suffix for the specialization compiled for this type, e.g. <c>"_bf16"</c>. Kernel sources
