@@ -50,6 +50,8 @@ public sealed partial class CudaBackend
         _directPtxComplexMultiplyKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxFlashAttentionBackwardKey, PtxFlashAttentionBackwardD64Kernel>
         _directPtxFlashAttentionBackwardKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
+    private readonly DirectPtxKernelCache<DirectPtxMseLossKey, PtxFusedMseLossF32Kernel>
+        _directPtxMseLossKernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
     private readonly DirectPtxKernelCache<DirectPtxCastFp16Key, PtxFusedCastF32ToF16Kernel>
         _directPtxCastFp16Kernels = new(Math.Max(4, DirectPtxFeatureGate.CacheCapacity / 2));
 
@@ -80,6 +82,7 @@ public sealed partial class CudaBackend
     private long _directPtxSgdMomentumDispatchCount;
     private long _directPtxGlobalAvgPoolDispatchCount;
     private long _directPtxComplexMultiplyDispatchCount;
+    private long _directPtxMseLossDispatchCount;
     private long _directPtxCastFp16DispatchCount;
     private long _directPtxCastFp32DispatchCount;
     private long _directPtxTranspose2DDispatchCount;
@@ -308,6 +311,13 @@ public sealed partial class CudaBackend
     {
         get { lock (_directPtxLock) return _directPtxFusedLinearKernels.PinnedCount; }
     }
+
+    internal bool IsDirectPtxMseLossEnabled =>
+        DirectPtxFeatureGate.IsMseLossEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedMseLoss(_ccMajor, _ccMinor);
+
+    internal long DirectPtxMseLossDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxMseLossDispatchCount);
 
     internal bool IsDirectPtxCastFp16Enabled =>
         DirectPtxFeatureGate.IsCastFp16Enabled && IsAvailable &&
@@ -3290,6 +3300,187 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// Attempts exact contiguous FP32 per-sample MSE loss of [rows,columns]
+    /// prediction/target matrices to a [rows] loss vector. Shape validation
+    /// happens before dispatch; the PTX ABI receives only pred/target/loss pointers.
+    /// </summary>
+    internal bool TryDirectPtxMseLoss(
+        IGpuBuffer predictions,
+        IGpuBuffer targets,
+        IGpuBuffer loss,
+        int rows,
+        int columns)
+    {
+        if (!DirectPtxFeatureGate.IsMseLossEnabled)
+        {
+            DirectPtxLastError = "mse-loss-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "mse-loss-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedMseLoss(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "mse-loss-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "mse-loss-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.MseLossExperimentOverride)
+        {
+            DirectPtxLastError = "mse-loss-performance-gate-not-met";
+            return false;
+        }
+
+        if (predictions is null)
+        {
+            DirectPtxLastError = "mse-loss-null-predictions-buffer";
+            return false;
+        }
+        if (targets is null)
+        {
+            DirectPtxLastError = "mse-loss-null-targets-buffer";
+            return false;
+        }
+        if (loss is null)
+        {
+            DirectPtxLastError = "mse-loss-null-output-buffer";
+            return false;
+        }
+
+        long matrixBytes = checked((long)rows * columns * sizeof(float));
+        if (predictions.SizeInBytes != matrixBytes || targets.SizeInBytes != matrixBytes ||
+            loss.SizeInBytes != checked((long)rows * sizeof(float)))
+        {
+            DirectPtxLastError = "mse-loss-physical-extent-mismatch";
+            return false;
+        }
+
+        try
+        {
+            bool capturing = IsStreamCapturing();
+            EnsureContextCurrent();
+            var key = new DirectPtxMseLossKey(rows, columns);
+            lock (_directPtxLock)
+            {
+                if (!_directPtxMseLossKernels.TryGetValue(
+                    key, out PtxFusedMseLossF32Kernel? kernel))
+                {
+                    if (capturing)
+                    {
+                        DirectPtxLastError =
+                            "Direct PTX MSE loss must be prewarmed before CUDA graph capture.";
+                        return false;
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    kernel = CreateAndCacheMseLossKernelSlow(key);
+                }
+                // A graph executable retains this CUfunction after capture. Pin
+                // the cache entry so later LRU eviction cannot unload its module
+                // and leave graph replay holding a freed function handle.
+                if (capturing &&
+                    !PinDirectPtxKernelForCapture(_directPtxMseLossKernels, key))
+                    throw new InvalidOperationException(
+                        "Could not pin the direct-PTX MSE-loss module for CUDA graph capture.");
+                lock (GpuDispatchLock)
+                    kernel.Launch(
+                        DirectPtxTensorView.Create(predictions, kernel.Blueprint.Tensors[0]),
+                        DirectPtxTensorView.Create(targets, kernel.Blueprint.Tensors[1]),
+                        DirectPtxTensorView.Create(loss, kernel.Blueprint.Tensors[2]));
+            }
+            System.Threading.Interlocked.Increment(ref _directPtxMseLossDispatchCount);
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private PtxFusedMseLossF32Kernel CreateAndCacheMseLossKernelSlow(
+        DirectPtxMseLossKey key) =>
+        _directPtxMseLossKernels.GetOrAdd(key, () =>
+            new PtxFusedMseLossF32Kernel(_directPtxRuntime!, key.Rows, key.Columns));
+
+    internal bool PrewarmDirectPtxMseLoss(int rows, int columns)
+    {
+        if (!DirectPtxFeatureGate.IsMseLossEnabled)
+        {
+            DirectPtxLastError = "mse-loss-feature-disabled";
+            return false;
+        }
+        if (!IsAvailable)
+        {
+            DirectPtxLastError = "mse-loss-cuda-unavailable";
+            return false;
+        }
+        if (!DirectPtxArchitecture.HasValidatedMseLoss(_ccMajor, _ccMinor))
+        {
+            DirectPtxLastError = "mse-loss-architecture-not-validated";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsSupportedShape(rows, columns))
+        {
+            DirectPtxLastError = "mse-loss-shape-not-implemented";
+            return false;
+        }
+        if (!PtxFusedMseLossF32Kernel.IsPromotedShape(rows, columns) &&
+            !DirectPtxFeatureGate.MseLossExperimentOverride)
+        {
+            DirectPtxLastError = "mse-loss-performance-gate-not-met";
+            return false;
+        }
+        try
+        {
+            if (IsStreamCapturing())
+            {
+                DirectPtxLastError = "Direct PTX MSE loss prewarm is not capture-safe.";
+                return false;
+            }
+            EnsureContextCurrent();
+            lock (_directPtxLock)
+            {
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                var key = new DirectPtxMseLossKey(rows, columns);
+                if (!_directPtxMseLossKernels.TryGetValue(key, out _))
+                    _ = CreateAndCacheMseLossKernelSlow(key);
+            }
+            DirectPtxLastError = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal bool TryGetDirectPtxMseLossAudit(int rows, int columns, out DirectPtxKernelAudit audit)
+    {
+        lock (_directPtxLock)
+        {
+            var key = new DirectPtxMseLossKey(rows, columns);
+            if (_directPtxMseLossKernels.TryGetValue(key, out var kernel))
+            {
+                audit = kernel.Audit;
+                return true;
+            }
+        }
+        audit = null!;
+        return false;
+    }
+
+    /// <summary>
     /// Attempts an exact contiguous FP32 fused SGD-with-momentum update step.
     /// Param and velocity are updated in place.
     /// </summary>
@@ -3815,6 +4006,7 @@ public sealed partial class CudaBackend
             _directPtxSgdMomentumKernels.Dispose();
             _directPtxGlobalAvgPoolKernels.Dispose();
             _directPtxComplexMultiplyKernels.Dispose();
+            _directPtxMseLossKernels.Dispose();
             _directPtxCastFp16Kernels.Dispose();
             _directPtxCastFp32Kernels.Dispose();
             _directPtxTranspose2DKernels.Dispose();
@@ -4011,6 +4203,7 @@ public sealed partial class CudaBackend
         int ScaleBits,
         int BiasBatchStride);
     private readonly record struct DirectPtxComplexMultiplyKey(int NumPairs);
+    private readonly record struct DirectPtxMseLossKey(int Rows, int Columns);
     private readonly record struct DirectPtxQkvRopeCacheKey(
         int Heads,
         int CacheCapacity,

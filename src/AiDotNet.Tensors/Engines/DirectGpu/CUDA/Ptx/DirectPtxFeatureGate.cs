@@ -18,6 +18,7 @@ internal static class DirectPtxFeatureGate
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
     internal const string AttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION_BACKWARD";
     internal const string FlashAttentionBackwardEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_ATTENTION_BACKWARD";
+    internal const string MseLossEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MSE_LOSS";
     internal const string CastFp16EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP16";
     internal const string CastFp32EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAST_FP32";
     internal const string Transpose2DEnvironmentVariable = "AIDOTNET_DIRECT_PTX_TRANSPOSE2D";
@@ -68,6 +69,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentAttentionBackwardEnabled = ReadEnabled(AttentionBackwardEnvironmentVariable);
     private static readonly bool EnvironmentRngDropoutEnabled = ReadEnabled(RngDropoutEnvironmentVariable);
     private static readonly bool EnvironmentFlashAttentionBackwardEnabled = ReadEnabled(FlashAttentionBackwardEnvironmentVariable);
+    private static readonly bool EnvironmentMseLossEnabled = ReadEnabled(MseLossEnvironmentVariable);
     private static readonly bool EnvironmentCastFp16Enabled = ReadEnabled(CastFp16EnvironmentVariable);
     private static readonly bool EnvironmentCastFp32Enabled = ReadEnabled(CastFp32EnvironmentVariable);
     private static readonly bool EnvironmentTranspose2DEnabled = ReadEnabled(Transpose2DEnvironmentVariable);
@@ -87,6 +89,19 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_mseLossExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to MSE-loss cells that have not passed promotion. Thread-local
+    /// state keeps an experimental opt-in from leaking into unrelated concurrent dispatches.
+    /// </summary>
+    internal static bool MseLossExperimentOverride
+    {
+        get => s_mseLossExperimentOverride;
+        set => s_mseLossExperimentOverride = value;
+    }
+
     /// <summary>Benchmark-only access to cast cells that have not passed promotion.</summary>
     internal static bool CastFp16ExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to widening-cast cells that have not passed promotion.</summary>
@@ -229,6 +244,9 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashAttentionBackwardEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashAttentionBackwardEnabled);
+
+    internal static bool IsMseLossEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentMseLossEnabled);
 
     internal static bool IsCastFp16Enabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentCastFp16Enabled);
