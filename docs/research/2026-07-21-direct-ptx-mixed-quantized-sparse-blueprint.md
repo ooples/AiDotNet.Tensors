@@ -286,8 +286,17 @@ powershell -ExecutionPolicy Bypass -File `
 
 ## Next #837 increments
 
-1. Generalize the proven FP16 M=16 async panel family to larger M buckets,
-   BF16, and fused residual epilogues without adding dynamic stride checks.
+1. Generalize the proven FP16 M=16 async panel family to larger M buckets and
+   fused residual epilogues without adding dynamic stride checks. **BF16
+   tensor-core GEMM is now implemented** in `PtxTensorCoreEmitter` on both the
+   naive and staged wmma paths: `.global`/`.shared.bf16` fragment loads plus the
+   explicit `.m16n16k16.f32.bf16.bf16.f32` mma (bf16 is not the PTX default), the
+   recogniser accepts matched bf16 multiplicands with fp32 accumulate and refuses
+   bf16 below sm_80, and `Plan.AbType` carries the type. Byte math is unchanged
+   (bf16 is 2 bytes like f16). Codegen tests: `EmittedKernel_Bf16_UsesBf16Wmma`,
+   `StagedKernel_Bf16_UsesBf16Wmma`, `PlainBf16MatMul_IsEligible`,
+   `Bf16_BelowSm80_IsRefused`. GPU championship (p15 + Nsight zero-spill) for the
+   bf16 path remains PENDING on Ampere+ hardware.
 2. Extend W8A8 to M>=16 asynchronous IMMA buckets and add W4A16
    register-dequant projection families.
 3. FP8 E4M3/E5M2 architecture-specific families with explicit scale ABI.
