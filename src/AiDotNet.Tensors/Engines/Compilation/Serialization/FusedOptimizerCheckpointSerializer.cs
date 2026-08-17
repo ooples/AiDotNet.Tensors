@@ -95,6 +95,12 @@ internal static class FusedOptimizerCheckpointSerializer
         // omitting them here would let a checkpoint round trip into a quietly different optimizer.
         writer.Write(extras.Nesterov);
         writer.Write(extras.FtrlBeta);
+        // Same reason again: each of these selects behaviour, not just a constant. A checkpoint that
+        // omitted them restored L-BFGS with the default memory depth, a trust region with radius 1, and
+        // ADMM with rho 1 — a different optimizer from the one that was saved.
+        writer.Write(extras.LbfgsMemorySize);
+        writer.Write(extras.TrustRegionRadius);
+        writer.Write(extras.AdmmRho);
     }
 
     private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
@@ -119,6 +125,9 @@ internal static class FusedOptimizerCheckpointSerializer
             SfBeta = reader.ReadSingle(),
             Nesterov = reader.ReadBoolean(),
             FtrlBeta = reader.ReadSingle(),
+            LbfgsMemorySize = reader.ReadInt32(),
+            TrustRegionRadius = reader.ReadSingle(),
+            AdmmRho = reader.ReadSingle(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)
