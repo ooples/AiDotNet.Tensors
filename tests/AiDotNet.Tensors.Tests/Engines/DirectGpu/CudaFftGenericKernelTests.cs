@@ -521,9 +521,9 @@ public class CudaFftGenericKernelTests
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
         using var engine = new DirectGpuTensorEngine();
         Skip.IfNot(engine.GetBackend() is CudaBackend, "Active DirectGpu backend is not CUDA.");
-        Skip.IfNot(
+        Assert.True(
             engine.SupportsFftElementType(FftElementType.Float32),
-            "CUDA Float32 generic FFT is unavailable.");
+            "CUDA Float32 generic FFT module must be initialized.");
 
         var input = new Tensor<float>(new float[] { 1, 0, 2, -1, 3, 0.5f }, new[] { 6 });
         using var tape = new GradientTape<float>();
