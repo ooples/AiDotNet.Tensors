@@ -205,6 +205,31 @@ class Program
                 args.Length > 1 && int.TryParse(args[1], out int gatherRuns) ? gatherRuns : 1);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mse-loss")
+        {
+            DirectPtxMseLossExperiment.Run(
+                args.Length > 1 && int.TryParse(args[1], out int mseRuns) ? mseRuns : 1);
+            return;
+        }
+
+        // GPU-free cubin generation, verification and SASS audit for the loss family.
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-loss-cubins")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-loss-cubins")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-loss-sass")
+        {
+            Environment.ExitCode = DirectPtxLossCubinTool.AuditSass(args);
+            return;
+        }
 
         if (args.Length > 0 && args[0] == "--direct-ptx-cast-fp16")
         {
