@@ -135,8 +135,11 @@ public sealed class StreamingTensorPool : IDisposable
         // live files (the recursive-delete is unconditional). The Guid
         // sub-dir makes Dispose safe to scope to this pool's lifetime.
         string baseDir = opts.StreamingBackingStorePath ?? Path.GetTempPath();
-        _backingDir = Path.Combine(baseDir, "aidotnet-streaming-pool-" + Guid.NewGuid().ToString("N"));
+        _backingDir = Path.Combine(baseDir, BackingDirPrefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_backingDir);
+        // Reclaim what earlier runs stranded here. Once per process, off the
+        // constructor's thread -- see SweepOrphanedBackingStores.
+        ScheduleOrphanSweep(baseDir);
     }
 
     /// <summary>Total resident bytes — pool does not exceed
@@ -984,7 +987,39 @@ public sealed class StreamingTensorPool : IDisposable
             // read-only memory-mapping of the same file concurrently with the
             // pool's append handle. The pool stays the only WRITER (no other
             // handle is granted write), so the append-only contract is intact.
-            FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
+            FileMode.Create, FileAccess.ReadWrite, FileShare.Read,
+            DefaultBufferSize,
+            // DELETE-ON-CLOSE IS THE ONLY RECLAIM THAT SURVIVES A KILL.
+            //
+            // Dispose() deletes _backingDir, which is correct and which never
+            // runs when the process dies first -- and a test host that OOMs or
+            // is killed is the normal case here, not the exotic one. Measured on
+            // a developer machine: 430 stranded pool directories accumulated in
+            // eight days, 257 GB total, the largest single backing.bin 117 GB.
+            // The disk hit zero and every build on the box started failing.
+            //
+            // With DeleteOnClose the kernel drops the file when the LAST handle
+            // to it closes, including the handles it closes on our behalf when
+            // the process dies abnormally. Nothing is left but an empty
+            // directory, which SweepOrphanedBackingStores below reclaims.
+            //
+            // Safe against the zero-copy mmap path: MmapTensorMemoryManager
+            // opens the same file with FileShare.Delete (a delete-pending file
+            // is legal to map), and this handle still grants FileShare.Read, so
+            // the reader's access is unchanged. The file's bytes stay live for
+            // every existing mapping until the last one is released -- Windows
+            // unlinks the name, not the data.
+            //
+            // On Unix the runtime emulates this by unlinking at close, so a
+            // SIGKILL still strands the file there. That is exactly why the
+            // sweep exists as well: belt and braces, and the sweep is the only
+            // half that can clean up what previous builds already stranded.
+            FileOptions.DeleteOnClose);
+
+    // FileStream's own default. Named because the FileOptions overload has no
+    // form that omits it, and a silently different buffer size here would be a
+    // performance change smuggled in behind a lifetime fix.
+    private const int DefaultBufferSize = 4096;
 
     // Absolute path of the single contiguous backing file. Stable for the
     // pool's lifetime; used by the zero-copy mmap path.
@@ -1053,6 +1088,111 @@ public sealed class StreamingTensorPool : IDisposable
             throw new InvalidOperationException(
                 $"Streaming backing file: short read at offset {offset} ({read}/{count} bytes).");
         return buf;
+    }
+
+    /// <summary>Directory-name prefix for every pool's backing store.</summary>
+    internal const string BackingDirPrefix = "aidotnet-streaming-pool-";
+
+    /// <summary>
+    /// A backing directory younger than this is never swept, however dead it
+    /// looks. The pool creates its directory in the constructor and opens
+    /// backing.bin lazily on first page-out, so a live pool that has not
+    /// evicted anything yet is an EMPTY directory with no file to lock —
+    /// indistinguishable from an orphan except by age.
+    /// </summary>
+    internal static readonly TimeSpan OrphanMinimumAge = TimeSpan.FromHours(1);
+
+    // One sweep per process, per base directory. Interlocked rather than a
+    // lock: the constructor is on the caller's hot path and must not block on
+    // a directory walk.
+    private static int _sweepStarted;
+
+    private static void ScheduleOrphanSweep(string baseDir)
+    {
+        // TOKEN: an escape hatch for anyone debugging a stranded pool, who
+        // needs the evidence to still be there when they look.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_STREAMING_POOL_NO_SWEEP") is { Length: > 0 })
+            return;
+        if (Interlocked.Exchange(ref _sweepStarted, 1) != 0) return;
+
+        // Background + IsBackground so a sweep of a large temp directory can
+        // never delay process exit, and never delays pool construction.
+        var thread = new Thread(() => { try { SweepOrphanedBackingStores(baseDir); } catch { /* best-effort */ } })
+        {
+            IsBackground = true,
+            Name = "aidotnet-streaming-pool-sweep",
+        };
+        thread.Start();
+    }
+
+    /// <summary>
+    /// Deletes backing directories left behind by pools whose process died.
+    ///
+    /// <para>WHY THIS IS NEEDED AT ALL: <see cref="Dispose"/> deletes the
+    /// directory, and a killed process never reaches it. DeleteOnClose (see
+    /// <c>BackingFile</c>) reclaims the BYTES on Windows, but the empty
+    /// directory survives, and on Unix a SIGKILL strands the file too. Neither
+    /// half can clean up what a previous build already stranded — only this
+    /// can.</para>
+    ///
+    /// <para>HOW AN ORPHAN IS IDENTIFIED, and why it cannot take a live pool
+    /// with it: a running pool holds backing.bin open with
+    /// <see cref="FileShare.Read"/>, so an exclusive open of that file FAILS
+    /// while its owner lives and succeeds once the owner is gone. That test is
+    /// the authority. The age gate covers the one case the lock cannot: a pool
+    /// constructed moments ago that has not yet opened its backing file.</para>
+    ///
+    /// <para>Every failure is swallowed. A machine that cannot delete a stale
+    /// temp directory has a problem this method is not entitled to escalate.</para>
+    /// </summary>
+    /// <returns>Number of directories reclaimed.</returns>
+    internal static int SweepOrphanedBackingStores(string baseDir, TimeSpan? minimumAge = null)
+    {
+        int reclaimed = 0;
+        DateTime cutoff = DateTime.UtcNow - (minimumAge ?? OrphanMinimumAge);
+
+        string[] candidates;
+        try { candidates = Directory.GetDirectories(baseDir, BackingDirPrefix + "*"); }
+        catch { return 0; }
+
+        foreach (string dir in candidates)
+        {
+            try
+            {
+                // Age gate first: it is the cheap check, and it is the one that
+                // protects a pool that exists but has not paged out yet.
+                if (Directory.GetCreationTimeUtc(dir) > cutoff) continue;
+
+                string backing = Path.Combine(dir, "backing.bin");
+                if (File.Exists(backing) && !CanOpenExclusively(backing)) continue;
+
+                Directory.Delete(dir, recursive: true);
+                reclaimed++;
+            }
+            catch
+            {
+                // Raced with its owner, permissions, or a handle we cannot see.
+                // Leaving it is always safe; the next process sweeps again.
+            }
+        }
+
+        return reclaimed;
+    }
+
+    /// <summary>
+    /// True when nothing else holds the file — the signal that its owning pool
+    /// is gone. Opening for READ with <see cref="FileShare.None"/> is refused
+    /// while any other handle is open, which is precisely the question.
+    /// </summary>
+    private static bool CanOpenExclusively(string path)
+    {
+        try
+        {
+            using var probe = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            return true;
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
     }
 
     public void Dispose()
