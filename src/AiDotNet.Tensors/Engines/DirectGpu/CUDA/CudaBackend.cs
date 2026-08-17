@@ -211,6 +211,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private readonly CudaPinnedBufferPool _pinnedPool = new();
     private IntPtr _wmmaModule;
     private int _ccMajor;
+    // CUdevice handle kept for the lazily-compiled generic-precision FFT modules (CudaBackend.FftGeneric.cs).
+    private int _fftGenericDevice;
     private int _ccMinor;
     // cublasGemmEx fp32 compute type: COMPUTE_32F (TF32 allowed) or COMPUTE_32F_PEDANTIC (strict fp32),
     // set at init to mirror the handle math mode / AIDOTNET_DISABLE_TF32. Default = TF32-allowed.
@@ -833,6 +835,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private void CompileAllKernels(int device)
     {
+
+        // Retained for the generic-precision FFT modules, which are compiled lazily on first use rather than
+        // here: three NVRTC compilations would otherwise be paid by every backend construction, and the
+        // bfloat16 specialization cannot be compiled below compute capability 8.0 at all, so compiling it
+        // eagerly would fail construction on older hardware for a capability the caller may never ask for.
+        _fftGenericDevice = device;
         using var _ = PushContext();
 
         _activationModule = CompileKernelModule(device, CudaActivationKernels.GetSource(), "activation_kernels", CudaActivationKernels.GetKernelNames());
@@ -16503,6 +16511,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             _fftModule = IntPtr.Zero;
         }
 
+        // Generic-precision FFT modules are compiled on demand, so there may be none, one, or one per element
+        // type. Clear the function cache first: its handles belong to these modules and dangle once unloaded.
+        if (!_fftGenericModules.IsEmpty)
+        {
+            _fftGenericKernels.Clear();
+            foreach (var kv in _fftGenericModules)
+            {
+                if (kv.Value != IntPtr.Zero)
+                    CudaNativeBindings.cuModuleUnload(kv.Value);
+            }
+            _fftGenericModules.Clear();
+        }
         if (_spectralPerfModule != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_spectralPerfModule);
