@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Simd;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -2172,6 +2172,90 @@ internal static class FusedOptimizer
     }
 
 
+    /// <summary>AVX2 linearized ADMM (Boyd et al., 2011, §3.1 and §6.3) with an L1 prox on the split
+    /// variable.
+    /// <code>
+    /// x = x - lr*(g + rho*((x - z) + u))
+    /// z = soft_threshold(x + u, l1)        // caller passes l1 = Strength/rho
+    /// u = u + (x - z)
+    /// </code></summary>
+    /// <remarks>
+    /// <para>
+    /// ADMM splits the objective in two and alternates: a gradient step on the augmented Lagrangian
+    /// (linearized here, so it is one step rather than an inner solve), a proximal step on the split
+    /// variable, and a dual ascent step on the multiplier. All three are elementwise given z and u, which
+    /// is why this fits a fused kernel despite not being an SGD-shaped update.
+    /// </para>
+    /// <para>
+    /// The <c>rho</c> term in the x-step is what couples x to z; drop it and the whole thing degenerates
+    /// into plain gradient descent with two unused buffers — the failure mode that still converges and so
+    /// looks like it is working.
+    /// </para>
+    /// <para>
+    /// <c>rho</c> scales the STRENGTH of the prox, not its argument: Boyd's z-step is
+    /// <c>prox_{g/rho}(x + u)</c>, so for an L1 split the threshold is <c>Strength/rho</c> and the caller
+    /// passes that as <c>l1</c>. Thresholding <c>(x + u)/rho</c> at <c>Strength</c> instead is a different
+    /// function — it equals <c>(1/rho)·soft_threshold(x + u, Strength·rho)</c> — and the two coincide only
+    /// at rho = 1.
+    /// </para>
+    /// <para>
+    /// <c>l1 = 0</c> makes the soft-threshold the identity, which is the correct prox for an unregularized
+    /// split, so one parameter covers both cases without a mode flag.
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void AdmmUpdateSimd(
+        float* param, float* grad, float* z, float* u, int length,
+        float lr, float rho, float l1)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vNegLr = Vector256.Create(-lr);
+            var vRho = Vector256.Create(rho);
+            var vL1 = Vector256.Create(l1);
+            var vZero = Vector256<float>.Zero;
+            var vAbsMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+            var vSignMask = Vector256.Create(unchecked((int)0x80000000)).AsSingle();
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var x = Avx.LoadVector256(param + i);
+                var zi = Avx.LoadVector256(z + i);
+                var ui = Avx.LoadVector256(u + i);
+
+                // x -= lr*(g + rho*((x - z) + u))
+                var coupling = Avx.Add(Avx.Subtract(x, zi), ui);
+                var total = Fma.MultiplyAdd(vRho, coupling, Avx.LoadVector256(grad + i));
+                x = Fma.MultiplyAdd(vNegLr, total, x);
+                Avx.Store(param + i, x);
+
+                // z = soft_threshold(x + u, l1)
+                var t = Avx.Add(x, ui);
+                var magnitude = Avx.And(t, vAbsMask);
+                var sign = Avx.And(t, vSignMask);
+                var zNew = Avx.Or(Avx.Max(Avx.Subtract(magnitude, vL1), vZero), sign);
+                Avx.Store(z + i, zNew);
+
+                // u += x - z
+                Avx.Store(u + i, Avx.Add(ui, Avx.Subtract(x, zNew)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float coupling = (param[i] - z[i]) + u[i];
+            param[i] -= lr * (grad[i] + rho * coupling);
+
+            float t = param[i] + u[i];
+            float magnitude = MathF.Abs(t) - l1;
+            z[i] = magnitude <= 0f ? 0f : (t > 0f ? magnitude : -magnitude);
+
+            u[i] += param[i] - z[i];
+        }
+    }
+
     /// <summary>
     /// Rprop: Resilient backpropagation. Per-element step sizes adapt based on
     /// sign changes of consecutive gradients.
@@ -2644,6 +2728,18 @@ public sealed class FusedOptimizerExtras
     public float FtrlBeta { get; init; }
 
     /// <summary>
+    /// ADMM's penalty parameter ρ, which sets how hard the primal variable is pulled toward the split
+    /// variable z. Default 1.
+    /// </summary>
+    /// <remarks>
+    /// ρ scales the augmented-Lagrangian coupling term in the x-step. The z-step receives the already
+    /// normalized L1 threshold through <see cref="L1"/>: callers that start from a regularization strength
+    /// λ pass λ/ρ. The prox argument remains <c>x + u</c>; dividing that argument by ρ would implement a
+    /// different algorithm.
+    /// </remarks>
+    public float AdmmRho { get; init; } = 1f;
+
+    /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or
     /// divergent fused-optimizer math, throwing <see cref="ArgumentOutOfRangeException"/>
     /// at configuration time rather than silently corrupting a training run.
@@ -2664,6 +2760,12 @@ public sealed class FusedOptimizerExtras
         if (!(SfBeta >= 0f && SfBeta <= 1f))
             throw new ArgumentOutOfRangeException(nameof(SfBeta), SfBeta,
                 "Schedule-Free SfBeta must be in [0, 1].");
+        // float.IsFinite is .NET Core 2.1+ / netstandard2.1 and does not exist on net471, which this
+        // library still targets. float.IsInfinity does, and the negated comparison already rejects NaN
+        // (!(NaN > 0) is true) and -inf, so this covers the same set on every target.
+        if (!(AdmmRho > 0f) || float.IsInfinity(AdmmRho))
+            throw new ArgumentOutOfRangeException(nameof(AdmmRho), AdmmRho,
+                "ADMM penalty parameter AdmmRho must be finite and > 0.");
     }
 }
 
@@ -2748,5 +2850,18 @@ public enum OptimizerType
     /// No line search: the step length is the schedule's lr. Classical CG line-searches along d, which needs
     /// loss evaluations the fused step has no way to obtain.
     /// </remarks>
-    ConjugateGradient = 24
+    ConjugateGradient = 24,
+
+    /// <summary>
+    /// Linearized ADMM (Boyd et al., 2011) with an L1 prox on the split variable: a gradient step on the
+    /// augmented Lagrangian, a proximal step on z, and a dual ascent step on u.
+    /// </summary>
+    /// <remarks>
+    /// Buffer slots: z = m, u = v. The penalty parameter travels in
+    /// <see cref="FusedOptimizerExtras.AdmmRho"/> and the prox threshold in
+    /// <see cref="FusedOptimizerExtras.L1"/>, where 0 means an unregularized split (the soft-threshold
+    /// becomes the identity). Callers starting from a regularization strength lambda pass lambda/rho,
+    /// because Boyd's z-step is prox_{g/rho}(x + u) — rho scales the threshold, not the argument.
+    /// </remarks>
+    ADMM = 25
 }
