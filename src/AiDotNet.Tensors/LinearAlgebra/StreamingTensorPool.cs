@@ -137,8 +137,12 @@ public sealed class StreamingTensorPool : IDisposable
         string baseDir = opts.StreamingBackingStorePath ?? Path.GetTempPath();
         _backingDir = Path.Combine(baseDir, BackingDirPrefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_backingDir);
-        // Reclaim what earlier runs stranded here. Once per process, off the
-        // constructor's thread -- see SweepOrphanedBackingStores.
+        // BEFORE scheduling the sweep, not after: the sweep runs on another
+        // thread and must never observe this directory as unowned, however
+        // briefly.
+        RegisterLivePool(_backingDir);
+        // Reclaim what earlier runs stranded here. Once per base directory, off
+        // the constructor's thread -- see SweepOrphanedBackingStores.
         ScheduleOrphanSweep(baseDir);
     }
 
@@ -1095,17 +1099,79 @@ public sealed class StreamingTensorPool : IDisposable
 
     /// <summary>
     /// A backing directory younger than this is never swept, however dead it
-    /// looks. The pool creates its directory in the constructor and opens
-    /// backing.bin lazily on first page-out, so a live pool that has not
-    /// evicted anything yet is an EMPTY directory with no file to lock —
-    /// indistinguishable from an orphan except by age.
+    /// looks. It is a coarse backstop only — <see cref="_liveBackingDirs"/> is
+    /// what actually protects a live pool, at any age.
     /// </summary>
     internal static readonly TimeSpan OrphanMinimumAge = TimeSpan.FromHours(1);
 
-    // One sweep per process, per base directory. Interlocked rather than a
-    // lock: the constructor is on the caller's hot path and must not block on
-    // a directory walk.
-    private static int _sweepStarted;
+    /// <summary>
+    /// Path equality as the filesystem sees it. Getting this wrong in the
+    /// permissive direction schedules a redundant sweep, which is harmless;
+    /// getting it wrong in the strict direction fails to recognise a LIVE
+    /// pool's directory and deletes it, which is not.
+    /// </summary>
+    private static readonly StringComparer PathComparer =
+        Path.DirectorySeparatorChar == '\\' ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
+    private static readonly object SweepState = new();
+
+    /// <summary>
+    /// Base directories already swept, BY PATH.
+    ///
+    /// <para>This was a single process-wide flag. With it, the first pool to be
+    /// constructed swept its own base directory and every pool afterwards
+    /// skipped — so a process that used the temp directory and then a custom
+    /// <see cref="GpuOffloadOptions.StreamingBackingStorePath"/> swept only the
+    /// first, and orphans under the second accumulated forever. One sweep per
+    /// distinct base directory is the actual intent.</para>
+    /// </summary>
+    private static readonly HashSet<string> _sweptBaseDirs = new(PathComparer);
+
+    /// <summary>
+    /// Backing directories belonging to pools that are ALIVE right now.
+    ///
+    /// <para>The file lock cannot protect these on its own. A pool creates its
+    /// directory in the constructor but only opens backing.bin on its FIRST
+    /// page-out, so a pool that stays under budget has an empty directory and no
+    /// handle to detect. Once that directory ages past
+    /// <see cref="OrphanMinimumAge"/>, a later pool's sweep would delete it out
+    /// from under its living owner, and the owner's next page-out would fail
+    /// because <c>FileMode.Create</c> cannot create a file under a directory
+    /// that is gone.</para>
+    ///
+    /// <para>Registered in the constructor, removed in <see cref="Dispose"/>.</para>
+    /// </summary>
+    private static readonly HashSet<string> _liveBackingDirs = new(PathComparer);
+
+    /// <summary>Full path, with any trailing separator removed, for set comparison.</summary>
+    private static string NormalizePath(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch
+        {
+            // An unresolvable path cannot match a real directory either way.
+            return path;
+        }
+    }
+
+    private static void RegisterLivePool(string backingDir)
+    {
+        lock (SweepState) _liveBackingDirs.Add(NormalizePath(backingDir));
+    }
+
+    private static void UnregisterLivePool(string backingDir)
+    {
+        lock (SweepState) _liveBackingDirs.Remove(NormalizePath(backingDir));
+    }
+
+    private static bool IsLivePool(string dir)
+    {
+        lock (SweepState) return _liveBackingDirs.Contains(NormalizePath(dir));
+    }
 
     private static void ScheduleOrphanSweep(string baseDir)
     {
@@ -1113,7 +1179,14 @@ public sealed class StreamingTensorPool : IDisposable
         // needs the evidence to still be there when they look.
         if (Environment.GetEnvironmentVariable("AIDOTNET_STREAMING_POOL_NO_SWEEP") is { Length: > 0 })
             return;
-        if (Interlocked.Exchange(ref _sweepStarted, 1) != 0) return;
+
+        // Per base directory, not per process. The lock is held only for a set
+        // insert -- the directory walk happens on the background thread, so the
+        // constructor's hot path still does not wait on I/O.
+        lock (SweepState)
+        {
+            if (!_sweptBaseDirs.Add(NormalizePath(baseDir))) return;
+        }
 
         // Background + IsBackground so a sweep of a large temp directory can
         // never delay process exit, and never delays pool construction.
@@ -1135,12 +1208,21 @@ public sealed class StreamingTensorPool : IDisposable
     /// half can clean up what a previous build already stranded — only this
     /// can.</para>
     ///
-    /// <para>HOW AN ORPHAN IS IDENTIFIED, and why it cannot take a live pool
-    /// with it: a running pool holds backing.bin open with
-    /// <see cref="FileShare.Read"/>, so an exclusive open of that file FAILS
-    /// while its owner lives and succeeds once the owner is gone. That test is
-    /// the authority. The age gate covers the one case the lock cannot: a pool
-    /// constructed moments ago that has not yet opened its backing file.</para>
+    /// <para>AN ORPHAN MUST CLEAR FOUR GATES, because this method deletes
+    /// recursively and a false positive destroys live data:</para>
+    /// <list type="number">
+    /// <item>The name is one WE mint — prefix plus a 32-digit "N" Guid. A
+    /// directory that merely starts with the prefix, such as a person's
+    /// <c>aidotnet-streaming-pool-backup</c>, is not ours to delete.</item>
+    /// <item>It is not registered in <see cref="_liveBackingDirs"/>. This is
+    /// what protects a living pool that has not paged out yet and therefore has
+    /// no file to lock.</item>
+    /// <item>It is older than <paramref name="minimumAge"/> — a backstop for
+    /// pools belonging to OTHER processes, which we cannot see registered.</item>
+    /// <item>Its backing.bin, if present, opens exclusively. A running pool
+    /// holds that file with <see cref="FileShare.Read"/>, so the probe fails
+    /// while its owner lives and succeeds once the owner is gone.</item>
+    /// </list>
     ///
     /// <para>Every failure is swallowed. A machine that cannot delete a stale
     /// temp directory has a problem this method is not entitled to escalate.</para>
@@ -1159,10 +1241,18 @@ public sealed class StreamingTensorPool : IDisposable
         {
             try
             {
-                // Age gate first: it is the cheap check, and it is the one that
-                // protects a pool that exists but has not paged out yet.
+                // Gate 1 -- is this name one we could have created at all?
+                if (!IsPoolDirectoryName(Path.GetFileName(dir))) continue;
+
+                // Gate 2 -- a pool in THIS process that is still alive. Checked
+                // before the age gate because it is authoritative at any age.
+                if (IsLivePool(dir)) continue;
+
+                // Gate 3 -- young enough that another process's pool may still
+                // be starting up inside it.
                 if (Directory.GetCreationTimeUtc(dir) > cutoff) continue;
 
+                // Gate 4 -- somebody still holds the backing file.
                 string backing = Path.Combine(dir, "backing.bin");
                 if (File.Exists(backing) && !CanOpenExclusively(backing)) continue;
 
@@ -1180,6 +1270,27 @@ public sealed class StreamingTensorPool : IDisposable
     }
 
     /// <summary>
+    /// Is this directory name one the pool itself would have minted — the
+    /// prefix followed by exactly a 32-digit hexadecimal Guid ("N" format)?
+    ///
+    /// <para>A prefix match alone is not ownership. <c>GetDirectories</c> with
+    /// <c>prefix + "*"</c> happily returns <c>aidotnet-streaming-pool-backup</c>
+    /// or <c>...-old</c>, and this method deletes recursively.</para>
+    /// </summary>
+    internal static bool IsPoolDirectoryName(string? name)
+    {
+        if (name is null || name.Length != BackingDirPrefix.Length + 32) return false;
+        if (!name.StartsWith(BackingDirPrefix, StringComparison.Ordinal)) return false;
+        for (int i = BackingDirPrefix.Length; i < name.Length; i++)
+        {
+            char c = name[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// True when nothing else holds the file — the signal that its owning pool
     /// is gone. Opening for READ with <see cref="FileShare.None"/> is refused
     /// while any other handle is open, which is precisely the question.
@@ -1193,6 +1304,31 @@ public sealed class StreamingTensorPool : IDisposable
         }
         catch (IOException) { return false; }
         catch (UnauthorizedAccessException) { return false; }
+    }
+
+    /// <summary>
+    /// Closes the backing-file handle and NOTHING else — the directory, the
+    /// entries and the pool's usability are left alone.
+    ///
+    /// <para>Exists so that delete-on-close can be tested for what it actually
+    /// is. <see cref="Dispose"/> closes the handle and then deletes the whole
+    /// directory, so "backing.bin is gone after Dispose" is true whether or not
+    /// <c>FileOptions.DeleteOnClose</c> is set — a test asserting it proves
+    /// nothing and would keep passing if the flag were dropped. Closing the
+    /// handle in isolation is the only in-process way to observe the kernel
+    /// reclaiming the file on its own.</para>
+    ///
+    /// <para>The next page-out reopens the file through <c>BackingFile()</c>
+    /// with <c>FileMode.Create</c>, so calling this does not break the pool —
+    /// it discards already-paged-out bytes, which is why it is not public.</para>
+    /// </summary>
+    internal void CloseBackingFileForTests()
+    {
+        lock (_lock)
+        {
+            try { _backingFile?.Dispose(); } catch { /* best-effort */ }
+            _backingFile = null;
+        }
     }
 
     public void Dispose()
@@ -1221,6 +1357,11 @@ public sealed class StreamingTensorPool : IDisposable
         // protect anymore.
         try { if (Directory.Exists(_backingDir)) Directory.Delete(_backingDir, recursive: true); }
         catch { /* best-effort */ }
+        // Deregister LAST. Until the directory is actually gone this pool still
+        // owns it, and a concurrent sweep must not race the delete above.
+        // Unconditional: if the delete failed, what remains is a genuine orphan
+        // and the next sweep should be free to reclaim it.
+        UnregisterLivePool(_backingDir);
     }
 
     private void ThrowIfDisposed()
