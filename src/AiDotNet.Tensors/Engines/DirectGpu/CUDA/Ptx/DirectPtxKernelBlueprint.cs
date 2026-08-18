@@ -61,6 +61,15 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The checked-in FP32 row-sum reduction specialization is measured and
+    /// promoted only on GA10x/SM86. Other Ampere variants (SM80, SM87) are
+    /// independent tuning domains and must supply and benchmark their own
+    /// specialization rather than silently inheriting SM86's launch geometry.
+    /// </summary>
+    internal static bool HasValidatedRowReduction(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The checked-in embedding-gather specialization is measured only on
     /// GA102/SM86. Admitting the whole Ampere family would run PTX that was
     /// never validated on SM80/SM87, so this pins the exact pair.
