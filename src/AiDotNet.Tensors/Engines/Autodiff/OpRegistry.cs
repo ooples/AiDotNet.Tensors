@@ -185,7 +185,7 @@ internal static class OpRegistry
         "FusedLinearCrossEntropyWithLogits",
 
         // Signal
-        "RFFT", "IRFFT",
+        "RFFT", "IRFFT", "FftGeneric",
 
         // Other differentiable ops
         "TensorWhere", "TensorTrilinearInterpolate",

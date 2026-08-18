@@ -877,6 +877,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
+        try
+        {
+            CompileGenericFftModules(device);
+        }
+        catch (OutOfMemoryException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Generic-precision FFT is optional. An unexpected NVRTC/toolkit failure must
+            // disable only this capability, never the entire CUDA backend.
+            DisableGenericFftModules(ex);
+            System.Diagnostics.Trace.TraceWarning(
+                $"[CudaBackend] Generic-precision FFT kernel compilation failed: " +
+                $"{ex.GetType().Name}: {ex.Message}. Other CUDA kernels remain available.");
+        }
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
@@ -11412,6 +11429,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxGather(source, indices, output, numIndices, featureSize))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
 
@@ -16509,6 +16530,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CudaNativeBindings.cuModuleUnload(_fftModule);
             _fftModule = IntPtr.Zero;
         }
+
+        UnloadGenericFftModules();
 
         if (_spectralPerfModule != IntPtr.Zero)
         {
