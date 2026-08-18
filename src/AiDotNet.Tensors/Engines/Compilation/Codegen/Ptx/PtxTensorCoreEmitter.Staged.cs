@@ -94,6 +94,12 @@ public sealed partial class PtxTensorCoreEmitter
     private int _warpTilesM = 2;
     private int _warpTilesN = 2;
 
+    // Multiplicand PTX type for the staged wmma path: "f16" (sm_70+) or "bf16" (sm_80+). Set from the plan at the
+    // top of EmitStaged; the staged loads and mma read it so bf16 is never silently emitted as f16. Byte math is
+    // identical for both (each is 2 bytes = HalfBytes), so only the load type and the mma type suffix change.
+    private string _abType = "f16";
+    private string _mmaTypes = "f32.f32";
+
     /// <summary>
     /// The only warp-tile extents the staged lowering supports, matching the ladder
     /// SelectWarpTile chooses from: (4,4), (4,2), (2,4), (2,2).
@@ -349,6 +355,11 @@ public sealed partial class PtxTensorCoreEmitter
         int aIndex = spec.ProductInputs[0], bIndex = spec.ProductInputs[1];
         int outIndex = spec.Inputs.Count;
         EmittedEntryName = MmaCeilingProbe ? spec.Name + "_ceiling_probe" : spec.Name;
+
+        // f16 uses the short mma form (.f32.f32); bf16 is not the PTX default and must name its multiplicand type
+        // explicitly (.f32.bf16.bf16.f32). TryPlan already guaranteed bf16 only reaches here on sm_80+.
+        _abType = plan.AbType;
+        _mmaTypes = _abType == "bf16" ? "f32.bf16.bf16.f32" : "f32.f32";
 
         bool doubleBuffer = !MmaCeilingProbe
             && EnableDoubleBuffering && CanDoubleBuffer(plan, out _);
@@ -840,7 +851,7 @@ public sealed partial class PtxTensorCoreEmitter
         {
             string addr = NextRd();
             L($"add.u64 {addr}, %rd3, {warpAOffset};");
-            L($"wmma.load.a.sync.aligned.row.m16n16k16.shared.f16 " +
+            L($"wmma.load.a.sync.aligned.row.m16n16k16.shared.{_abType} " +
               $"{Fragment("%fa", i * FragmentRegisters)}, " +
               $"[{addr}+{I(bufferBase + i * TileM * ASharedRowBytes)}], {I(BlockTileK + SharedPadHalves)};");
         }
@@ -849,7 +860,7 @@ public sealed partial class PtxTensorCoreEmitter
         {
             string addr = NextRd();
             L($"add.u64 {addr}, %rd3, {warpBOffset};");
-            L($"wmma.load.b.sync.aligned.row.m16n16k16.shared.f16 " +
+            L($"wmma.load.b.sync.aligned.row.m16n16k16.shared.{_abType} " +
               $"{Fragment("%fb", j * FragmentRegisters)}, " +
               $"[{addr}+{I(bufferBase + BSlabOffset + j * TileN * HalfBytes)}], {I(BlockTileN + SharedPadHalves)};");
         }
@@ -862,7 +873,7 @@ public sealed partial class PtxTensorCoreEmitter
             for (int j = 0; j < WarpTilesN; j++)
             {
                 int t = i * WarpTilesN + j;
-                L($"wmma.mma.sync.aligned.row.row.m16n16k16.f32.f32 " +
+                L($"wmma.mma.sync.aligned.row.row.m16n16k16.{_mmaTypes} " +
                   $"{Fragment("%fc", t * FragmentRegisters)}, {Fragment("%fa", i * FragmentRegisters)}, " +
                   $"{Fragment("%fb", j * FragmentRegisters)}, {Fragment("%fc", t * FragmentRegisters)};");
                 MmaInstructions++;

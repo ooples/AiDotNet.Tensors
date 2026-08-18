@@ -97,6 +97,50 @@ public class CodegenTensorCoreTests
         Assert.Contains("wmma.store.d.sync.aligned.row.m16n16k16.global.f32", ptx, StringComparison.Ordinal);
     }
 
+    /// <summary>bf16 multiplicands with fp32 accumulate are eligible on sm_80+ and tag the plan "bf16".</summary>
+    [Theory]
+    [InlineData(16, 16, 16)]
+    [InlineData(64, 64, 64)]
+    [InlineData(256, 2048, 256)]
+    public void PlainBf16MatMul_IsEligible(int m, int k, int n)
+    {
+        Assert.True(PtxTensorCoreEmitter.TryPlan(
+            MatMul(m, k, n, CodegenElementType.BFloat16), Sm86Major, Sm86Minor,
+            out var plan, out string reason), reason);
+
+        Assert.NotNull(plan);
+        Assert.Equal("bf16", plan!.AbType);
+    }
+
+    /// <summary>The bf16 kernel loads bf16 fragments and issues the explicit-type bf16 mma, still fp32 out, and
+    /// must NOT fall back to the f16 forms.</summary>
+    [Fact]
+    public void EmittedKernel_Bf16_UsesBf16Wmma()
+    {
+        string ptx = Naive().Emit(MatMul(64, 64, 64, CodegenElementType.BFloat16), Sm86Major, Sm86Minor);
+
+        Assert.Contains("wmma.load.a.sync.aligned.row.m16n16k16.global.bf16", ptx, StringComparison.Ordinal);
+        Assert.Contains("wmma.load.b.sync.aligned.row.m16n16k16.global.bf16", ptx, StringComparison.Ordinal);
+        // bf16 is not the PTX default, so the multiplicand types are named explicitly.
+        Assert.Contains("wmma.mma.sync.aligned.row.row.m16n16k16.f32.bf16.bf16.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("wmma.store.d.sync.aligned.row.m16n16k16.global.f32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("global.f16", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>bf16 wmma is Ampere+ (sm_80); on sm_70 the recogniser must refuse it with a reason rather than
+    /// emit PTX the target cannot load.</summary>
+    [Fact]
+    public void Bf16_BelowSm80_IsRefused()
+    {
+        bool ok = PtxTensorCoreEmitter.TryPlan(
+            MatMul(64, 64, 64, CodegenElementType.BFloat16), computeMajor: 7, computeMinor: 5,
+            out var plan, out string reason);
+
+        Assert.False(ok);
+        Assert.Null(plan);
+        Assert.Contains("sm_80", reason, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// The tile index must come from the WARP, not the thread. wmma instructions are
     /// warp-synchronous: if lanes of one warp reached different tiles, or if some lanes took
