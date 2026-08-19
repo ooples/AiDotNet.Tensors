@@ -8145,6 +8145,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             outputBuffer.RelinquishOwnership();
+
+            // RECORD, and keep the GPU result. This path previously returned raw, so the op was
+            // simply absent from the tape: no exception, a correct forward, and no gradient for
+            // anything UPSTREAM of the pool. Bisecting SVTRThinPlateSplineLayer, gradient reached
+            // the first convolution, batch-norm and activation and then stopped dead at the first
+            // MaxPoolingLayer, so six convolution blocks feeding its localization head trained on
+            // nothing -- on a GPU-backed machine, while CPU-only CI stayed green.
+            //
+            // Recording rather than deferring to base is what keeps this a GPU op. A tape is open
+            // for the whole of training, so `if (IsTapeActive) return base...` would move both the
+            // forward AND the backward onto the CPU for every training step. The backward stays on
+            // the device too: MaxPool2DWithIndicesBackward calls engine.MaxPool2DBackward, which
+            // this engine overrides with a real kernel.
+            //
+            // Same savedState the CPU path supplies -- the backward routes each output cell's
+            // gradient to the argmax it came from, so it needs the indices computed above.
+            Autodiff.DifferentiableOps.RecordUnary(
+                "MaxPool2DWithIndices", result, input,
+                Autodiff.BackwardFunctions<T>.MaxPool2DWithIndicesBackward,
+                new object[] { maxIndices, poolSize, stride });
             return result;
         }
         catch
