@@ -124,6 +124,60 @@ public class RgLruScanTests
         }
     }
 
+    /// <summary>
+    /// The input scale is s = sqrt(1 - a^2) and its derivative is -a/s, which diverges as a
+    /// approaches 1. Griffin's own initialization (Section 2.4, a^c drawn from [0.9, 0.999] with
+    /// c = 8) puts a in roughly [0.987, 0.9999], so operating near 1 is the design point rather
+    /// than an edge case, and skipping the term only at s == 0 leaves it unbounded just above that
+    /// threshold. RecurrentGemma (Botev et al., 2024) Section 2 states the reference implementation
+    /// "always clip[s] the derivative to a maximum value of 1000 for stability"; this pins that.
+    /// </summary>
+    [Fact]
+    public void Backward_ClipsTheSqrtDerivative_WhenTransitionApproachesOne()
+    {
+        var engine = new CpuEngine();
+        int batch = 1, seqLen = 3, recDim = 2;
+
+        // a = recGate * sigmoid(-decay). A large negative decay drives sigmoid(-decay) to 1, and a
+        // recurrence gate at 1 then puts a within a few 1e-9 of 1, where -a/s exceeds 1e4 without
+        // the clip and the unclipped term swamps every other contribution to the gradient.
+        var value = new Tensor<double>(new[] { batch, seqLen, recDim });
+        var recGate = new Tensor<double>(new[] { batch, seqLen, recDim });
+        var inpGate = new Tensor<double>(new[] { batch, seqLen, recDim });
+        var decay = new Tensor<double>(new[] { recDim });
+        for (int k = 0; k < value.Length; k++)
+        {
+            value.SetFlat(k, 1.0);
+            recGate.SetFlat(k, 1.0);
+            inpGate.SetFlat(k, 1.0);
+        }
+        for (int c = 0; c < recDim; c++) decay.SetFlat(c, -30.0);
+
+        Tensor<double> outp;
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads;
+        using (var tape = new GradientTape<double>())
+        {
+            outp = engine.RgLruScanForward(value, recGate, inpGate, decay);
+            grads = tape.ComputeGradients(outp, new[] { value, recGate, inpGate, decay });
+        }
+
+        foreach (var input in new[] { value, recGate, inpGate, decay })
+        {
+            var grad = grads[input];
+            for (int k = 0; k < grad.Length; k++)
+            {
+                double g = grad.GetFlat(k);
+                Assert.False(double.IsNaN(g) || double.IsInfinity(g),
+                    $"gradient element {k} is non-finite ({g}) with a driven to 1");
+                // Every contribution is bounded by the clip times the local factors, all of which
+                // are 1 here; the assertion is that it stays in that neighbourhood rather than the
+                // ~1e9 an unclipped -a/s produces at this decay.
+                Assert.True(Math.Abs(g) <= 1e5,
+                    $"gradient element {k} = {g}, which is past the clipped range");
+            }
+        }
+    }
+
     private static double SumForward(
         CpuEngine engine, Tensor<double> v, Tensor<double> r, Tensor<double> i, Tensor<double> d)
     {
