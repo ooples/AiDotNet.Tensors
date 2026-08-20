@@ -10,6 +10,19 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <summary>
+    /// Ceiling on |ds/da| for s = sqrt(1 - a^2) in the RG-LRU backward pass.
+    /// </summary>
+    /// <remarks>
+    /// From RecurrentGemma (Botev et al., 2024), Section 2: "when backpropagating through the square
+    /// root operation in the recurrent layers, we always clip the derivative to a maximum value of
+    /// 1000 for stability." The derivative is -a/sqrt(1 - a^2), which diverges as a approaches 1 --
+    /// and Griffin's own initialization (Section 2.4, a^c sampled from [0.9, 0.999] with c = 8) puts
+    /// a in roughly [0.987, 0.9999], so approaching 1 is the designed operating point rather than an
+    /// edge case. Skipping the term only at s == 0 leaves it unbounded just above that threshold.
+    /// </remarks>
+    private const double SqrtDerivativeClip = 1000.0;
+
+    /// <summary>
     /// Fused Real-Gated Linear Recurrent Unit (RG-LRU) scan over a whole sequence in a SINGLE op
     /// (forward + custom autodiff backward), replacing the per-timestep tape micro-ops the decomposed
     /// <c>RealGatedLinearRecurrenceLayer.GatedRecurrenceForward</c> loop records — the core sequence
@@ -173,8 +186,24 @@ public partial class CpuEngine
 
                         double dS = dh * iv;
                         // s = sqrt(1-a^2) (when positive): ds/da = -a/s.
+                        //
+                        // CLIPPED, not merely guarded. The guard alone only skips s == 0; it leaves
+                        // -a/s unbounded either side of the threshold, so an a_t that lands a hair
+                        // below 1 (which the Griffin initialization makes ordinary: Section 2.4
+                        // samples a^c in [0.9, 0.999], so a is ~0.987-0.9999 by construction) yields
+                        // a derivative of ~1e11 and overflows the whole backward pass to NaN.
+                        //
+                        // RecurrentGemma, Section 2: "when backpropagating through the square root
+                        // operation in the recurrent layers, we always clip the derivative to a
+                        // maximum value of 1000 for stability."
                         double dA = dh * hPrev;
-                        if (s > 1e-12) dA += dS * (-a / s);
+                        if (s > 1e-12)
+                        {
+                            double dSqrt = -a / s;
+                            if (dSqrt > SqrtDerivativeClip) dSqrt = SqrtDerivativeClip;
+                            else if (dSqrt < -SqrtDerivativeClip) dSqrt = -SqrtDerivativeClip;
+                            dA += dS * dSqrt;
+                        }
 
                         // a = r * base.
                         dR[off + c] += dA * bd;
@@ -233,6 +262,8 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         T one = ops.One, zero = ops.Zero;
         T tiny = ops.FromDouble(1e-12);
+        T clipHi = ops.FromDouble(SqrtDerivativeClip);
+        T clipLo = ops.FromDouble(-SqrtDerivativeClip);
         var baseDecay = new T[recDim];
         for (int c = 0; c < recDim; c++) baseDecay[c] = SigGeneric(ops, ops.Negate(decay[c]));
 
@@ -280,7 +311,13 @@ public partial class CpuEngine
                         T dS = ops.Multiply(dh, iv);
                         T dA = ops.Multiply(dh, hPrev);
                         if (ops.GreaterThan(s, tiny))
-                            dA = ops.Add(dA, ops.Multiply(dS, ops.Divide(ops.Negate(a), s)));
+                        {
+                            // Same clip as the double path above (RecurrentGemma, Section 2).
+                            T dSqrt = ops.Divide(ops.Negate(a), s);
+                            if (ops.GreaterThan(dSqrt, clipHi)) dSqrt = clipHi;
+                            else if (ops.LessThan(dSqrt, clipLo)) dSqrt = clipLo;
+                            dA = ops.Add(dA, ops.Multiply(dS, dSqrt));
+                        }
 
                         dR[off + c] = ops.Add(dR[off + c], ops.Multiply(dA, bd));
                         dBase[c] = ops.Add(dBase[c], ops.Multiply(dA, R[off + c]));
