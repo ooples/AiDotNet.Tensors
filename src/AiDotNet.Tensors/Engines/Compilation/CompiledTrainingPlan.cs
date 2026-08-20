@@ -1152,6 +1152,80 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public static System.Action<int, string, Tensor<T>>? ForwardStepObserver { get; set; }
 
     /// <summary>
+    /// Fills every forward step's output buffer with a sentinel before that step runs, then reports
+    /// any step that left the sentinel behind — a step that did not write its whole output.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Forward outputs come from <c>TensorAllocator.RentUninitialized</c>, so the standing contract
+    /// is that a kernel writes ALL of its output; whatever it skips keeps the previous tenant's
+    /// bytes. A kernel that breaks that contract does not fail predictably. It fails when the
+    /// recycled block happens to hold something harmful, which makes it intermittent, and it stops
+    /// failing the moment anything perturbs the heap — including the diagnostics used to look at
+    /// it. That is not a debuggable state.
+    /// </para>
+    /// <para>
+    /// Poisoning the buffer first removes the luck: a partial write leaves sentinels that are
+    /// counted immediately, in the op that produced them, on every run rather than some runs.
+    /// </para>
+    /// <para>
+    /// Off by default. Enabling it costs a fill per step and changes what a non-conforming kernel
+    /// leaves behind, so it is a diagnostic, not a hardening measure.
+    /// </para>
+    /// </remarks>
+    public static bool SanitizeForwardBuffers { get; set; }
+
+    /// <summary>
+    /// Called for each forward step that left sentinel values behind under
+    /// <see cref="SanitizeForwardBuffers"/>: the action index, the op name, and how many of the
+    /// step's output elements it never wrote.
+    /// </summary>
+    public static System.Action<int, string, int>? ForwardBufferLeak { get; set; }
+
+    /// <summary>
+    /// Called for each forward step that CONSUMED sentinel values under
+    /// <see cref="SanitizeForwardBuffers"/>: the action index, the op name, and how many of the
+    /// elements it read had not been written by any earlier step.
+    /// </summary>
+    /// <remarks>
+    /// A step reading unwritten memory is the mirror image of one leaving its own output unwritten,
+    /// and it fails the same way: the value is whatever the pool handed back. The two need separate
+    /// reporting because the culprit is a different op — the reader is wrong about ordering or
+    /// aliasing, not about how much it writes.
+    /// </remarks>
+    public static System.Action<int, string, int>? ForwardBufferReadBeforeWrite { get; set; }
+
+    /// <summary>
+    /// The sentinel written into forward outputs under <see cref="SanitizeForwardBuffers"/>. A
+    /// magnitude no real activation reaches, so a survivor is unambiguous — unlike NaN, which a
+    /// kernel could legitimately produce.
+    /// </summary>
+    private const double ForwardSanitizerSentinel = -8.5070591e37;
+
+    /// <summary>Writes the sentinel across a step's output buffer.</summary>
+    private static void PoisonForwardBuffer(Tensor<T> buffer)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
+        var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
+        var span = buffer.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++) span[i] = sentinel;
+    }
+
+    /// <summary>Counts sentinel values a step failed to overwrite.</summary>
+    private static int CountForwardBufferLeaks(Tensor<T> buffer)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return 0;
+        var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
+        var span = buffer.AsSpan();
+        int leaked = 0;
+        for (int i = 0; i < span.Length; i++)
+        {
+            if (EqualityComparer<T>.Default.Equals(span[i], sentinel)) leaked++;
+        }
+        return leaked;
+    }
+
+    /// <summary>
     /// Maps a forward ACTION index to the step that emitted it. Actions and steps are not 1:1 --
     /// a skipped step emits none and a fused group emits one for several -- so indexing the step
     /// list by action position mislabels everything after the first skip.
@@ -1554,13 +1628,51 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var fwd = _forwardActions;
             var probe = StepProbe;
             var observer = ForwardStepObserver;
-            if (probe != null || observer != null)
+            bool sanitize = SanitizeForwardBuffers;
+            if (probe != null || observer != null || sanitize)
             {
                 var actionToStep = ActionToStepIndex;
+
+                // Poison EVERY forward output before anything runs. Per-step poisoning would only
+                // expose a step that under-writes its own buffer; filling them all up front also
+                // exposes a step that READS one before its producer has run, because the sentinel
+                // is still sitting there when it is read.
+                if (sanitize && _forwardSteps is not null)
+                {
+                    for (int st = 0; st < _forwardSteps.Length; st++)
+                        PoisonForwardBuffer(_forwardSteps[st].OutputBuffer);
+                }
+
                 probe?.Invoke("BEGIN-FWD");
                 for (int i = 0; i < fwd.Length; i++)
                 {
+                    // Resolve the step BEFORE running, so its inputs can be checked first.
+                    CompiledStep<T>? sanitizeTarget = null;
+                    if (sanitize && _forwardSteps is not null)
+                    {
+                        int idx = actionToStep is not null && i < actionToStep.Length ? actionToStep[i] : i;
+                        if (idx < _forwardSteps.Length) sanitizeTarget = _forwardSteps[idx];
+
+                        if (sanitizeTarget is not null && ForwardBufferReadBeforeWrite is not null)
+                        {
+                            int unwritten = 0;
+                            foreach (var operand in sanitizeTarget.Inputs)
+                            {
+                                if (operand is not null) unwritten += CountForwardBufferLeaks(operand);
+                            }
+                            if (unwritten > 0)
+                                ForwardBufferReadBeforeWrite(i, sanitizeTarget.OpName, unwritten);
+                        }
+                    }
+
                     fwd[i](engine);
+
+                    if (sanitizeTarget is not null)
+                    {
+                        int leaked = CountForwardBufferLeaks(sanitizeTarget.OutputBuffer);
+                        if (leaked > 0)
+                            ForwardBufferLeak?.Invoke(i, sanitizeTarget.OpName, leaked);
+                    }
 
                     // Resolve the STEP this action came from. Indexing _forwardSteps by the action
                     // position is wrong as soon as any step is skipped or folded into a fused group.
@@ -5635,6 +5747,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Tensor<T>? graphRefreshTensor = firstIsEmbedding
             ? forwardSteps[0].OutputBuffer
             : compiledInputTensor;
+
+        // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
+        //
+        // These buffers come from TensorAllocator.RentUninitialized, and a pooled tensor whose
+        // storage is larger than its logical length does not settle which array IS the tensor until
+        // something asks for writable storage. Until then a writer that reaches for the data array
+        // can be handed a pool-padded COPY while the plan goes on reading the live backing, so the
+        // values written are simply not the values read back. The same hazard is already documented
+        // and fixed for the gradient buffers via BindInternalStepBuffer.
+        //
+        // It presents as a first-step loss that is intermittently enormous (1e10..1e35) or NaN,
+        // because what the plan reads is whatever the recycled block held. MEASURED on a span-scorer
+        // forward: roughly 60% of freshly built plans, and it disappears the instant anything
+        // touches those buffers first -- including the diagnostics used to look at it, which is what
+        // made it read as a heisenbug rather than a defect.
+        //
+        // One AsWritableSpan per buffer at COMPILE time settles the backing once, before any kernel
+        // binds it. Nothing is written and nothing is read; the cost is a single call per buffer,
+        // not per step.
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            var outputBuffer = forwardSteps[i].OutputBuffer;
+
+            // Only a CONTIGUOUS buffer owns storage that could be served as a padded copy. A
+            // non-contiguous output is a view onto another tensor's storage -- an Expand's output
+            // carries stride 0 on its broadcast axes -- and has no writable span of its own to bind.
+            if (outputBuffer is null || outputBuffer.Length == 0 || !outputBuffer.IsContiguous) continue;
+
+            outputBuffer.AsWritableSpan();
+        }
 
         return new CompiledTrainingPlan<T>(
             forwardActions,
