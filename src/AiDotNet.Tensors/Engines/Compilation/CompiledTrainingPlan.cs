@@ -1131,6 +1131,50 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     public static System.Action<string>? StepProbe { get; set; }
 
+    /// <summary>
+    /// Called after each forward action during replay with the step it came from and the buffer it
+    /// just wrote, so a caller can compare a compiled plan against an eager run op by op.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A compiled plan otherwise reports one number -- the loss -- which says a replay went wrong
+    /// but not where. Reconstructing the intermediate values from outside is not possible: the
+    /// tensors handed back while tracing are placeholders, and reading one after a Step shows
+    /// whatever the buffer holds now, not what this step produced. Both of those look like real
+    /// measurements and are not, which is exactly how a wrong answer gets built on one.
+    /// </para>
+    /// <para>
+    /// The buffer is passed live rather than copied, so an observer that wants to keep values must
+    /// copy them itself. Null by default and checked once per action, so replay is unaffected when
+    /// nothing is watching.
+    /// </para>
+    /// </remarks>
+    public static System.Action<int, string, Tensor<T>>? ForwardStepObserver { get; set; }
+
+    /// <summary>
+    /// Maps a forward ACTION index to the step that emitted it. Actions and steps are not 1:1 --
+    /// a skipped step emits none and a fused group emits one for several -- so indexing the step
+    /// list by action position mislabels everything after the first skip.
+    /// </summary>
+    private int[]? ActionToStepIndex
+    {
+        get
+        {
+            if (_actionToStepIndex is not null) return _actionToStepIndex;
+            if (_forwardEmitKinds is null) return null;
+
+            var map = new List<int>(_forwardEmitKinds.Length);
+            for (int step = 0; step < _forwardEmitKinds.Length; step++)
+            {
+                if (_forwardEmitKinds[step] != ForwardEmit.Skip) map.Add(step);
+            }
+            _actionToStepIndex = map.ToArray();
+            return _actionToStepIndex;
+        }
+    }
+
+    private int[]? _actionToStepIndex;
+
     /// <summary>Diagnostic capture: TensorSubtract specialized forward writes
     /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
     /// what the kernel sees vs writes.</summary>
@@ -1509,14 +1553,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var fwd = _forwardActions;
             var probe = StepProbe;
-            if (probe != null)
+            var observer = ForwardStepObserver;
+            if (probe != null || observer != null)
             {
-                probe("BEGIN-FWD");
+                var actionToStep = ActionToStepIndex;
+                probe?.Invoke("BEGIN-FWD");
                 for (int i = 0; i < fwd.Length; i++)
                 {
                     fwd[i](engine);
-                    var name = i < (_forwardSteps?.Length ?? 0) ? _forwardSteps![i].OpName : $"#{i}";
-                    probe($"AFTER-FWD-{i}:{name}");
+
+                    // Resolve the STEP this action came from. Indexing _forwardSteps by the action
+                    // position is wrong as soon as any step is skipped or folded into a fused group.
+                    CompiledStep<T>? step = null;
+                    if (_forwardSteps is not null)
+                    {
+                        int stepIndex = actionToStep is not null && i < actionToStep.Length
+                            ? actionToStep[i]
+                            : i;
+                        if (stepIndex < _forwardSteps.Length) step = _forwardSteps[stepIndex];
+                    }
+
+                    var name = step?.OpName ?? $"#{i}";
+                    probe?.Invoke($"AFTER-FWD-{i}:{name}");
+                    if (observer is not null && step is not null) observer(i, name, step.OutputBuffer);
                 }
             }
             else
