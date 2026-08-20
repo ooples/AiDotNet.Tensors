@@ -178,6 +178,115 @@ public class RgLruScanTests
         }
     }
 
+    /// <summary>
+    /// The clip is exactly 1000, not merely "bounded" — pinned on a single step where the expected
+    /// gradient is the clip value itself.
+    /// </summary>
+    /// <remarks>
+    /// With seqLen 1 the recurrence has no history, so <c>hPrev</c> is 0 and the backward reduces to
+    /// one term: <c>dA = dS * clip(-a/s)</c> with <c>dS = dh * i * v</c>. Driving <c>dh</c>, <c>i</c>
+    /// and <c>v</c> to 1 makes <c>dA</c> the clipped derivative outright, and
+    /// <c>dR = dA * sigmoid(-decay)</c> with a decay of -30 puts <c>sigmoid(-decay)</c> within 1e-13
+    /// of 1. So the recurrence-gate gradient IS the clip, and a tolerance of 1e-6 around 1000 pins
+    /// the constant: raising it to 5000, or dropping the clip for the bare <c>-a/s</c> (~2.3e6 here),
+    /// both fail. The existing three-step test bounds the gradient by 1e5, which any clip below that
+    /// satisfies, so it cannot see the constant change.
+    /// </remarks>
+    [Fact]
+    public void RgLruBackward_OneStep_RecurrenceGateGradientIsExactlyTheClip()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 1, recDim = 1;
+
+        var value = new Tensor<double>(new[] { batch, seqLen, recDim });
+        var recGate = new Tensor<double>(new[] { batch, seqLen, recDim });
+        var inpGate = new Tensor<double>(new[] { batch, seqLen, recDim });
+        var decay = new Tensor<double>(new[] { recDim });
+        value.SetFlat(0, 1.0);
+        recGate.SetFlat(0, 1.0);
+        inpGate.SetFlat(0, 1.0);
+        decay.SetFlat(0, -30.0);
+
+        Tensor<double> outp;
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads;
+        using (var tape = new GradientTape<double>())
+        {
+            outp = engine.RgLruScanForward(value, recGate, inpGate, decay);
+            grads = tape.ComputeGradients(outp, new[] { value, recGate, inpGate, decay });
+        }
+
+        double bd = Sigmoid(30.0);
+        double expected = -1000.0 * bd;
+        double actual = grads[recGate].GetFlat(0);
+
+        Assert.True(Math.Abs(actual - expected) <= 1e-6 * 1000.0,
+            $"recurrence-gate gradient was {actual}, expected {expected} (the 1000 clip times " +
+            $"sigmoid(-decay) = {bd}). Unclipped, -a/s here is about {-1.0 / Math.Sqrt(1.0 - bd * bd):E3}, " +
+            "so this value is what says the clip engaged AND what its constant is.");
+    }
+
+    /// <summary>
+    /// The same clip on the GENERIC backward, which a <c>Tensor&lt;double&gt;</c> never reaches.
+    /// </summary>
+    /// <remarks>
+    /// The backward dispatches on <c>typeof(T) == typeof(double)</c> to a specialized double kernel
+    /// and sends every other element type to <c>RgLruBackwardGeneric&lt;T&gt;</c>. Every other test
+    /// here uses double, so the generic path — a separate copy of the clip, written against
+    /// <c>INumericOperations&lt;T&gt;</c> — had no coverage at all and could regress silently.
+    ///
+    /// float needs a different transition than the double case: <c>sigmoid(30)</c> rounds to exactly
+    /// 1f, which drives <c>1 - a^2</c> to 0, and the branch is then skipped rather than clipped. The
+    /// recurrence gate carries the transition instead, at 1 - 2.98e-7 (five float steps below 1 —
+    /// the band where <c>a</c> is still strictly under 1 in float yet <c>a/s</c> is about 1.3e3, so
+    /// the clip is genuinely exercised).
+    /// </remarks>
+    [Fact]
+    public void RgLruBackward_GenericPath_ClipsTheSqrtDerivativeForFloat()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 1, recDim = 1;
+
+        // Strictly below 1 in float, and close enough that a/s exceeds the clip.
+        const float nearOne = 0.9999997f;
+
+        var value = new Tensor<float>(new[] { batch, seqLen, recDim });
+        var recGate = new Tensor<float>(new[] { batch, seqLen, recDim });
+        var inpGate = new Tensor<float>(new[] { batch, seqLen, recDim });
+        var decay = new Tensor<float>(new[] { recDim });
+        value.SetFlat(0, 1.0f);
+        recGate.SetFlat(0, nearOne);
+        inpGate.SetFlat(0, 1.0f);
+        decay.SetFlat(0, -30.0f);
+
+        Tensor<float> outp;
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads;
+        using (var tape = new GradientTape<float>())
+        {
+            outp = engine.RgLruScanForward(value, recGate, inpGate, decay);
+            grads = tape.ComputeGradients(outp, new[] { value, recGate, inpGate, decay });
+        }
+
+        // Confirm the operand really is in the clipping band, so a pass cannot come from the branch
+        // being skipped instead of the clip being applied.
+        float a = nearOne * 1.0f;
+        float s = MathF.Sqrt(1.0f - a * a);
+        Assert.True(s > 1e-12f, $"1 - a^2 underflowed (s = {s}); the clip branch would be skipped, not taken.");
+        Assert.True(a / s > 1000.0f, $"a/s = {a / s} is below the clip, so this case would not exercise it.");
+
+        float gr = grads[recGate].GetFlat(0);
+        foreach (var input in new[] { value, recGate, inpGate, decay })
+        {
+            float g = grads[input].GetFlat(0);
+            Assert.False(float.IsNaN(g) || float.IsInfinity(g),
+                $"generic-path gradient is non-finite ({g}) with a driven just below 1 in float");
+        }
+
+        // dR = clip * sigmoid(-decay), and sigmoid(30) is 1f in float, so this is the clip itself.
+        Assert.True(Math.Abs(Math.Abs(gr) - 1000.0f) <= 1e-2f * 1000.0f,
+            $"generic-path recurrence-gate gradient was {gr}; expected magnitude 1000 (the clip). " +
+            $"Unclipped, -a/s here is about {-a / s}.");
+    }
+
     private static double SumForward(
         CpuEngine engine, Tensor<double> v, Tensor<double> r, Tensor<double> i, Tensor<double> d)
     {
