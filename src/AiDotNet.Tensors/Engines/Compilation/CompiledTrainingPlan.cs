@@ -6679,14 +6679,44 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
                 };
             }
-            // Broadcast path: copy a into output, then in-place add b (b is the
-            // smaller operand and broadcasts up to a's shape).
-            return eng =>
+            // Broadcast path: seed the output with whichever operand ALREADY CARRIES THE OUTPUT
+            // SHAPE, then broadcast the other one up into it.
+            //
+            // WHICH OPERAND IS THE LARGER ONE IS NOT KNOWN IN ADVANCE, and this path used to assume
+            // it was always `a`. Seeding from `a` when `a` is the SMALLER operand copies only a's
+            // elements into the full-size buffer and leaves the remainder holding whatever was
+            // there before -- zeros from a fresh allocation, or a previous step's bytes from a
+            // recycled one. Addition is commutative, so seeding from the full-shape operand
+            // instead is the same arithmetic with every element actually written.
+            //
+            // This is reached constantly: TensorBroadcastTo expresses a genuine expansion as
+            // TensorBroadcastAdd(input, zeros(targetShape)), whose FIRST operand is by construction
+            // the small one, so every such broadcast replayed through a compiled plan was wrong.
+            // MEASURED on [4,1] -> [4,3]: a correctly SHAPED 12-element output holding the 4 source
+            // values contiguously and 8 stale slots -- a silent wrong answer at exactly 1/3 of the
+            // true sum when the buffer was fresh, and NaN/1e35 when it was recycled, which then
+            // poisons every parameter through the gradient.
+            bool aIsFullShape = ShapeMatchesBuffer(a._shape, o._shape);
+            bool bIsFullShape = ShapeMatchesBuffer(b._shape, o._shape);
+            if (aIsFullShape || bIsFullShape)
             {
-                a.AsSpan().CopyTo(o.AsWritableSpan());
-                if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, b);
-                else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
-            };
+                var full = aIsFullShape ? a : b;
+                var addend = aIsFullShape ? b : a;
+                return eng =>
+                {
+                    full.AsSpan().CopyTo(o.AsWritableSpan());
+                    if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, addend);
+                    else
+                    {
+                        var r = eng.TensorAdd(a, b);
+                        if (!r.IsContiguous) r = r.Contiguous();
+                        r.AsSpan().CopyTo(o.AsWritableSpan());
+                    }
+                };
+            }
+            // Neither operand carries the output shape -- a MUTUAL broadcast such as
+            // [4,1] + [1,3] -> [4,3], where each side expands along a different axis. There is no
+            // operand to seed from, so fall through to the generic path rather than guess.
         }
 
         // ConvTranspose2D forward: route compiled-plan replay through
@@ -7293,6 +7323,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// reads the now-clipped grads. Returns false if any gradient is not CUDA-resident (caller uses the CPU
     /// clip instead); the global norm requires ALL grads present, so a mixed CPU/GPU set is not handled here.
     /// </summary>
+    /// <summary>
+    /// True when <paramref name="shape"/> is exactly the plan buffer's shape, i.e. this operand
+    /// already spans the whole output and nothing about it needs broadcasting.
+    /// </summary>
+    private static bool ShapeMatchesBuffer(int[] shape, int[] bufferShape)
+    {
+        if (shape is null || bufferShape is null) return false;
+        if (shape.Length != bufferShape.Length) return false;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] != bufferShape[i]) return false;
+        }
+        return true;
+    }
+
     private static bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
     {
         // The CUDA reduction/scale path is float-typed. For a Tensor<double> (or any
