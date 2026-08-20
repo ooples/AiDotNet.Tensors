@@ -124,6 +124,34 @@ internal static class FusedOptimizer
         return true;
     }
 
+    /// <summary>
+    /// Double-precision counterpart to <see cref="AllFiniteSimd(float*, int)"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe bool AllFiniteSimd(double* values, int length)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && length >= 4)
+        {
+            for (; i <= length - 4; i += 4)
+            {
+                var v = Avx.LoadVector256(values + i);
+                var diff = Avx.Subtract(v, v);
+                var cmp = Avx.Compare(diff, Vector256<double>.Zero, FloatComparisonMode.OrderedEqualNonSignaling);
+                if (Avx.MoveMask(cmp) != 0xF) return false;
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            double x = values[i];
+            if (double.IsNaN(x) || double.IsInfinity(x)) return false;
+        }
+
+        return true;
+    }
+
     /// <summary>AVX2 SGD: param -= lr * grad</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void SgdUpdateSimd(float* param, float* grad, int length, float lr)

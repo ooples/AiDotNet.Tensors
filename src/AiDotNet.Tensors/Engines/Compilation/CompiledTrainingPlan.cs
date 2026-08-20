@@ -764,6 +764,106 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     public bool LastStepSkippedNonFiniteGradients { get; private set; }
 
+    /// <summary>
+    /// Checks every materialized CPU gradient before any optimizer state or parameter is written.
+    /// GPU-resident entries intentionally have no host array and remain in the existing device-path
+    /// scope; unmaterialized parameters are also skipped because their pooled gradient storage was
+    /// not written by this step.
+    /// </summary>
+    private unsafe bool TryDiscardNonFiniteOptimizerStep(
+        float[][] gradArrays,
+        int[] gradOffsets,
+        float[][] paramArrays,
+        int[] paramOffsets,
+        int[] lengths,
+        OptimizerType optimizerType,
+        float[][] scheduleFreeEvalCopies)
+    {
+        bool gradientsFinite = true;
+        for (int p = 0; p < gradArrays.Length && gradientsFinite; p++)
+        {
+            var gradients = gradArrays[p];
+            var parameters = paramArrays[p];
+            if (gradients is null || gradients.Length == 0 ||
+                parameters is null || parameters.Length == 0)
+            {
+                continue;
+            }
+
+            fixed (float* pGrad = &gradients[gradOffsets[p]])
+            {
+                gradientsFinite = FusedOptimizer.AllFiniteSimd(pGrad, lengths[p]);
+            }
+        }
+
+        if (gradientsFinite)
+        {
+            LastStepSkippedNonFiniteGradients = false;
+            return false;
+        }
+
+        // Schedule-Free evaluates at y, written by _preForwardParamTransform before backward.
+        // A discarded step must restore the externally-visible x copy or it would still mutate
+        // the model despite skipping all optimizer-state updates.
+        if (optimizerType == OptimizerType.ScheduleFreeSGD)
+        {
+            for (int p = 0; p < paramArrays.Length; p++)
+            {
+                var parameters = paramArrays[p];
+                if (parameters is null || parameters.Length == 0) continue;
+                Array.Copy(scheduleFreeEvalCopies[p], 0, parameters, paramOffsets[p], lengths[p]);
+                MarkHostWeightMutated(p);
+            }
+        }
+
+        MarkOptimizerStepDiscarded();
+        return true;
+    }
+
+    /// <summary>Double-precision CPU counterpart to the float finiteness gate.</summary>
+    private unsafe bool TryDiscardNonFiniteOptimizerStep(
+        double[][] gradArrays,
+        int[] gradOffsets,
+        double[][] paramArrays,
+        int[] lengths)
+    {
+        bool gradientsFinite = true;
+        for (int p = 0; p < gradArrays.Length && gradientsFinite; p++)
+        {
+            var gradients = gradArrays[p];
+            var parameters = paramArrays[p];
+            if (gradients is null || gradients.Length == 0 ||
+                parameters is null || parameters.Length == 0)
+            {
+                continue;
+            }
+
+            fixed (double* pGrad = &gradients[gradOffsets[p]])
+            {
+                gradientsFinite = FusedOptimizer.AllFiniteSimd(pGrad, lengths[p]);
+            }
+        }
+
+        if (gradientsFinite)
+        {
+            LastStepSkippedNonFiniteGradients = false;
+            return false;
+        }
+
+        MarkOptimizerStepDiscarded();
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void MarkOptimizerStepDiscarded()
+    {
+        // The step counter drives schedules and bias correction. A discarded update must be
+        // invisible to both, matching GradScaler's contract.
+        _optimizerStep--;
+        _nonFiniteStepsSkipped++;
+        LastStepSkippedNonFiniteGradients = true;
+    }
+
     private sealed class FusedOptimizerRuntimeScalars
     {
         public float HypergradientAdjustment;
@@ -2531,6 +2631,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
             _optimizerStep++;
+            if (TryDiscardNonFiniteOptimizerStep(
+                gradArrays, gradOffsets, paramArrays, paramOffsets, lengths, optimizerType, v))
+            {
+                return;
+            }
             float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
             float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
             // #739 review: retire any captured on-device step graph before the CPU fused optimizer
@@ -2920,50 +3025,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return;
                 }
             }
-
-            // GRADIENT GATE: VALIDATE EVERY GRADIENT BEFORE WRITING ANY PARAMETER.
-            //
-            // The kernels below fuse backward and update into one pass -- each reads grad and writes
-            // param in place. That makes a non-finite gradient unrecoverable rather than merely bad:
-            // the NaN lands in the weights, every later step reads it back, and the loss is NaN from
-            // then on with nothing to say which step caused it. The eager tape does not have this
-            // property, which is why a model can show perfectly finite gradients from
-            // ComputeGradients while Train destroys it.
-            //
-            // torch.amp.GradScaler is the reference behaviour: inspect the gradients each iteration
-            // and SKIP the optimizer step when any are inf or NaN, leaving the parameters untouched
-            // so the run continues from the last good state. Fusing backward with the update removed
-            // the point where that check naturally sits, so it is reinstated here.
-            //
-            // The scan must cover ALL parameters before ANY is written -- a per-parameter check
-            // would still apply the tensors it had already reached before hitting the bad one,
-            // leaving the model half-updated, which is worse than either clean outcome.
-            //
-            // Scope: this gates the CPU path. The multi-tensor GPU path returns above with its
-            // gradients in device buffers, so it needs an equivalent device-side reduction rather
-            // than this host scan.
-            bool gradientsFinite = true;
-            for (int p = 0; p < paramCount && gradientsFinite; p++)
-            {
-                if (gradArrays[p].Length == 0) continue;
-                fixed (float* pGradCheck = &gradArrays[p][gradOffsets[p]])
-                {
-                    gradientsFinite = FusedOptimizer.AllFiniteSimd(pGradCheck, lengths[p]);
-                }
-            }
-
-            if (!gradientsFinite)
-            {
-                // Discard the step. Parameters, optimizer moments and the step counter that drives
-                // bias correction all stay as they were, so the next step behaves as though this one
-                // never happened -- the same contract GradScaler gives on an overflow.
-                _optimizerStep--;
-                _nonFiniteStepsSkipped++;
-                LastStepSkippedNonFiniteGradients = true;
-                return;
-            }
-
-            LastStepSkippedNonFiniteGradients = false;
 
             for (int p = 0; p < paramCount; p++)
             {
@@ -3668,6 +3729,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
             _optimizerStep++;
+            if (TryDiscardNonFiniteOptimizerStep(
+                gradArrays, gradOffsets, paramArrays, paramOffsets, lengths, optimizerType, v))
+            {
+                return;
+            }
             float stepBc1 = 1f - MathF.Pow(b1, _optimizerStep);
             float stepBc2 = 1f - MathF.Pow(b2, _optimizerStep);
             // #739 review: retire any captured on-device step graph before this CPU fused optimizer
@@ -4100,6 +4166,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
             _optimizerStep++;
+            if (TryDiscardNonFiniteOptimizerStep(gradArrays, gradOffsets, paramArrays, lengths))
+            {
+                return;
+            }
             // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
             // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
             // (bit-identical — a deep model with many small tensors paid ~2x(param count) Pow/step).
@@ -4290,6 +4360,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
             _optimizerStep++;
+            if (TryDiscardNonFiniteOptimizerStep(gradArrays, gradOffsets, paramArrays, lengths))
+            {
+                return;
+            }
             // Bias corrections stepBc1=1-b1^step, stepBc2=1-b2^step are STEP-GLOBAL; compute the
             // two Math.Pow ONCE here instead of once per parameter inside the Adam/AdamW kernels
             // (bit-identical — a deep model with many small tensors paid ~2x(param count) Pow/step).
