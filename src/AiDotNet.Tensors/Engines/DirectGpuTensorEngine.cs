@@ -9951,6 +9951,124 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// Fused ABC slot recurrence (#1464). GPU inference fast path; tape-active / non-float /
+    /// no-backend defer to the differentiable CpuEngine path, which owns the single fused tape node.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the other scans in this file there is no dedicated ABC device kernel yet. The work is
+    /// instead COMPOSED from GPU-resident primitives, so it genuinely executes on-device: the write
+    /// scores for the entire sequence are one batched GEMM plus one softmax (they do not depend on
+    /// the recurrent state at all), and only the state update and the read remain per-step. That
+    /// composition is the reason a dedicated kernel is not required for residency — see the note in
+    /// BackendCompletenessTests. A fused device kernel is still the faster end state, and would slot
+    /// in here behind the same guards.
+    /// </remarks>
+    public override Tensor<T> AbcScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> forgetGate,
+        Tensor<T> slotKeys, int numHeads, double slotInitScale = 0.1)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out _))
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (qProj.Rank != 3 || kProj.Rank != 3 || vProj.Rank != 3 || numHeads < 1)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        if (kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (modelDim % numHeads != 0)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        int headDim = modelDim / numHeads;
+        if (forgetGate.Rank != 3 || forgetGate.Shape._dims[0] != batch ||
+            forgetGate.Shape._dims[1] != seqLen || forgetGate.Shape._dims[2] != numHeads)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (slotKeys.Rank != 3 || slotKeys.Shape._dims[0] != numHeads || slotKeys.Shape._dims[2] != headDim)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        int numSlots = slotKeys.Shape._dims[1];
+
+        try
+        {
+            return AbcScanComposed(this, qProj, kProj, vProj, forgetGate, slotKeys,
+                batch, seqLen, modelDim, numHeads, headDim, numSlots, slotInitScale);
+        }
+        catch
+        {
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        }
+    }
+
+    /// <summary>
+    /// The ABC recurrence expressed purely as IEngine primitive calls. Engine-agnostic on purpose:
+    /// run through <c>this</c> it executes on the GPU, and run through a <see cref="CpuEngine"/> it
+    /// is the very same op sequence, so the shape algebra and the math can be verified against the
+    /// fused kernel WITHOUT a device present. Only the dispatch target differs on real hardware.
+    /// </summary>
+    internal static Tensor<T> AbcScanComposed<T>(
+        IEngine e, Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> forgetGate,
+        Tensor<T> slotKeys, int batch, int seqLen, int modelDim, int numHeads, int headDim,
+        int numSlots, double slotInitScale)
+    {
+        int hb = numHeads * batch;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scale = ops.FromDouble(1.0 / Math.Sqrt(headDim));
+
+        // [B,S,M] -> [H,B,S,D]: the head axis leads so every later reshape to [H*B, ...] is a
+        // no-op view over contiguous per-(head,batch) blocks.
+        Tensor<T> ToHeadMajor(Tensor<T> x) =>
+            e.TensorPermute(e.Reshape(x, new[] { batch, seqLen, numHeads, headDim }), new[] { 2, 0, 1, 3 });
+
+        var qh = ToHeadMajor(qProj);
+        var vh = ToHeadMajor(vProj);
+        var kh = ToHeadMajor(kProj);
+        var fgh = e.TensorPermute(forgetGate, new[] { 2, 0, 1 });   // [H,B,S]
+
+        // Write scores for the WHOLE sequence at once: they depend only on k and the slot keys,
+        // never on the recurrent state. [H, B*S, D] x [H, D, N] -> [H, B*S, N].
+        var wAll = e.Softmax(
+            e.TensorMultiplyScalar(
+                e.BatchMatMul(
+                    e.Reshape(kh, new[] { numHeads, batch * seqLen, headDim }),
+                    e.TensorPermute(slotKeys, new[] { 0, 2, 1 })),
+                scale),
+            axis: 2);
+        wAll = e.Reshape(wAll, new[] { numHeads, batch, seqLen, numSlots });
+
+        // slot_-1 = slotInitScale * slotKeys, one copy per batch element: [H,N,D] -> [H*B,N,D].
+        var slot = e.Reshape(
+            e.TensorTile(
+                e.Reshape(e.TensorMultiplyScalar(slotKeys, ops.FromDouble(slotInitScale)),
+                    new[] { numHeads, 1, numSlots, headDim }),
+                new[] { 1, batch, 1, 1 }),
+            new[] { hb, numSlots, headDim });
+
+        var steps = new Tensor<T>[seqLen];
+        for (int t = 0; t < seqLen; t++)
+        {
+            var wT = e.Reshape(e.TensorSliceAxis(wAll, 2, t), new[] { hb, numSlots, 1 });   // [H,B,N]
+            var vT = e.Reshape(e.TensorSliceAxis(vh, 2, t), new[] { hb, 1, headDim });      // [H,B,D]
+            var qT = e.Reshape(e.TensorSliceAxis(qh, 2, t), new[] { hb, 1, headDim });
+            // fg is scalar per (head,batch); tile it to the state shape rather than relying on
+            // broadcast semantics, which IEngine does not promise for TensorMultiply.
+            var fgT = e.TensorTile(e.Reshape(e.TensorSliceAxis(fgh, 2, t), new[] { hb, 1, 1 }),
+                new[] { 1, numSlots, headDim });
+
+            // slot_t = fg_t * slot_{t-1} + outer(w_t, v_t)
+            slot = e.TensorAdd(e.TensorMultiply(slot, fgT), e.BatchMatMul(wT, vT));
+
+            // Read: softmax over slots of q_t . slot_t, then the weighted slot read.
+            var r = e.Softmax(
+                e.TensorMultiplyScalar(e.BatchMatMul(qT, e.TensorPermute(slot, new[] { 0, 2, 1 })), scale),
+                axis: 2);                                                                   // [H*B,1,N]
+            steps[t] = e.Reshape(e.BatchMatMul(r, slot), new[] { numHeads, batch, 1, headDim });
+        }
+
+        var stacked = seqLen == 1 ? steps[0] : e.TensorConcatenate(steps, axis: 2);          // [H,B,S,D]
+        return e.Reshape(e.TensorPermute(stacked, new[] { 1, 2, 0, 3 }), new[] { batch, seqLen, modelDim });
+    }
+
     // Fused xLSTM scan (#1464). GPU inference fast path; tape-active / non-float / no-backend /
     // headDim over the kernel cap defer to the differentiable CpuEngine path.
     public override Tensor<T> XLstmScanForward<T>(
