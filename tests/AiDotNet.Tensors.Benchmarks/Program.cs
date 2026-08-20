@@ -1151,6 +1151,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--gpu-precision-evidence")
+        {
+            Environment.ExitCode = GpuPrecisionEvidence.Run(args);
+            return;
+        }
+
         // GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU, Softmax)
         if (args[0] == "--activation")
         {
@@ -1667,6 +1673,7 @@ class Program
         Console.WriteLine("  --cold-start             : Cold-start latency (AiDotNet vs PyTorch subprocess)");
         Console.WriteLine("  --cold-start-aidotnet    : Cold-start latency (AiDotNet only)");
         Console.WriteLine("  --determinism-bench      : Deterministic vs fast-mode reduction cost");
+        Console.WriteLine("  --gpu-precision-evidence [size] [iterations] [out.md]: PR #971 type/format/performance evidence");
         Console.WriteLine("  --layers                 : End-to-end layer (Linear/Conv/Norm) microbench");
         Console.WriteLine("  --unet                   : U-Net step microbench");
         Console.WriteLine("  --pr319-grain            : PR #319 grain-size migration regression harness");
