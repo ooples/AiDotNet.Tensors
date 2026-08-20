@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -15,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// silently changes behaviour between training and GPU inference.
 /// They SKIP when no backend is present rather than passing vacuously.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class AbcScanGpuParityTests
 {
     private const double InitScale = 0.1;
@@ -50,11 +52,17 @@ public class AbcScanGpuParityTests
         var cpu = new CpuEngine();
         int headDim = modelDim / numHeads;
         var (q, k, v, fg, sk) = MakeInputs(batch, seqLen, modelDim, numHeads, numSlots, headDim);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
 
-        var expected = (float[])(object)cpu.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale).GetDataArray()!;
-        var composed = (float[])(object)DirectGpuTensorEngine.AbcScanComposed(
-            cpu, q, k, v, fg, sk, batch, seqLen, modelDim, numHeads, headDim, numSlots, InitScale)
-            .GetDataArray()!;
+        using var expectedTensor = cpu.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        using var composedTensor = DirectGpuTensorEngine.AbcScanComposed(
+            cpu, q, k, v, fg, sk, batch, seqLen, modelDim, numHeads, headDim, numSlots, InitScale);
+        var expected = (float[])(object)expectedTensor.GetDataArray()!;
+        var composed = (float[])(object)composedTensor.GetDataArray()!;
 
         Assert.Equal(expected.Length, composed.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -80,25 +88,51 @@ public class AbcScanGpuParityTests
     [InlineData(2, 1, 8, 4, 2)]   // seqLen 1 takes the no-concat path
     public void GpuComposedPath_MatchesCpuEngine(int batch, int seqLen, int modelDim, int numHeads, int numSlots)
     {
-        var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.DirectGpu?.IsAvailable ?? false, "No DirectGpu backend available");
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
 
         int headDim = modelDim / numHeads;
-        var shape = new[] { batch, seqLen, modelDim };
-        var q = new Tensor<float>(Gen(batch * seqLen * modelDim, 1), shape);
-        var k = new Tensor<float>(Gen(batch * seqLen * modelDim, 2), shape);
-        var v = new Tensor<float>(Gen(batch * seqLen * modelDim, 3), shape);
-        var fg = new Tensor<float>(GenGate(batch * seqLen * numHeads, 4), new[] { batch, seqLen, numHeads });
-        var sk = new Tensor<float>(Gen(numHeads * numSlots * headDim, 5), new[] { numHeads, numSlots, headDim });
+        var (q, k, v, fg, sk) = MakeInputs(batch, seqLen, modelDim, numHeads, numSlots, headDim);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
 
-        var expected = (float[])(object)new CpuEngine()
-            .AbcScanForward(q, k, v, fg, sk, numHeads, InitScale).GetDataArray()!;
-        var got = (float[])(object)gpu
-            .AbcScanForward(q, k, v, fg, sk, numHeads, InitScale).GetDataArray()!;
+        using var expectedTensor = new CpuEngine().AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        var expected = (float[])(object)expectedTensor.GetDataArray()!;
 
-        Assert.Equal(expected.Length, got.Length);
-        for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(expected[i] - got[i]) < 1e-4f,
-                $"[{batch}x{seqLen}x{modelDim}, H={numHeads}, N={numSlots}] element {i}: cpu={expected[i]} gpu={got[i]}");
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        bool savedCaptureReadbackSites = GpuLaunchProbe.CaptureReadbackSites;
+        Tensor<float>? gpuResult = null;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            GpuLaunchProbe.CaptureReadbackSites = true;
+            GpuLaunchProbe.Reset();
+            // Invoke the composition directly: the public wrapper must not be able to hide a
+            // primitive failure by returning the CPU reference result.
+            gpuResult = DirectGpuTensorEngine.AbcScanComposed(
+                gpu, q, k, v, fg, sk, batch, seqLen, modelDim, numHeads, headDim, numSlots, InitScale);
+
+            Assert.True(GpuLaunchProbe.Count > 0, "ABC composition launched no GPU work.");
+            Assert.True(GpuLaunchProbe.Readbacks == 0,
+                $"ABC composition performed {GpuLaunchProbe.Readbacks} device-to-host transfers: " +
+                string.Join("; ", GpuLaunchProbe.ReadbackSites));
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+
+            var got = (float[])(object)gpuResult.GetDataArray()!;
+
+            Assert.Equal(expected.Length, got.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - got[i]) < 1e-4f,
+                    $"[{batch}x{seqLen}x{modelDim}, H={numHeads}, N={numSlots}] element {i}: cpu={expected[i]} gpu={got[i]}");
+        }
+        finally
+        {
+            gpuResult?.Dispose();
+            GpuLaunchProbe.CaptureReadbackSites = savedCaptureReadbackSites;
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
     }
 }

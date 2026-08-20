@@ -127,8 +127,13 @@ public class AbcScanTests
         var engine = new CpuEngine();
         int batch = 2, seqLen = 4, modelDim = 6, numHeads = 3, numSlots = 4;
         var (q, k, v, fg, sk) = MakeInputs(batch, seqLen, modelDim, numHeads, numSlots, 9);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
 
-        var outp = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        using var outp = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
         var expected = ReferenceForward(
             (double[])(object)q.GetDataArray()!, (double[])(object)k.GetDataArray()!,
             (double[])(object)v.GetDataArray()!, (double[])(object)fg.GetDataArray()!,
@@ -147,11 +152,16 @@ public class AbcScanTests
         var engine = new CpuEngine();
         int batch = 1, seqLen = 3, modelDim = 4, numHeads = 2, numSlots = 3;
         var (q, k, v, fg, sk) = MakeInputs(batch, seqLen, modelDim, numHeads, numSlots, 5);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
 
         // A NON-uniform output weighting. Under a plain sum(output) the two softmax Jacobians can
         // partially cancel, which would let a wrong softmax backward pass; distinct per-element
         // weights keep every path observable.
-        var weights = new Tensor<double>(Gen(batch * seqLen * modelDim, 77, 1.0),
+        using var weights = new Tensor<double>(Gen(batch * seqLen * modelDim, 77, 1.0),
             new[] { batch, seqLen, modelDim });
 
         Dictionary<Tensor<double>, Tensor<double>> grads;
@@ -159,8 +169,9 @@ public class AbcScanTests
         var inputs = new[] { q, k, v, fg, sk };
         using (var tape = new GradientTape<double>())
         {
-            var outp = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
-            var loss = engine.ReduceSum(engine.TensorMultiply(outp, weights), new[] { 0, 1, 2 }, keepDims: false);
+            using var outp = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+            using var weighted = engine.TensorMultiply(outp, weights);
+            using var loss = engine.ReduceSum(weighted, new[] { 0, 1, 2 }, keepDims: false);
             grads = tape.ComputeGradients(loss, inputs);
             // Copy inside the tape scope: gradient tensors are pooled buffers and are recycled once
             // the tape is disposed, which would silently fabricate values here.
@@ -204,16 +215,38 @@ public class AbcScanTests
         var engine = new CpuEngine();
         int batch = 2, seqLen = 3, modelDim = 4, numHeads = 2, numSlots = 3;
         var (q, k, v, fg, sk) = MakeInputs(batch, seqLen, modelDim, numHeads, numSlots, 21);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
 
-        var expected = (double[])(object)engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale).GetDataArray()!;
+        using var expectedTensor = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        var expected = (double[])(object)expectedTensor.GetDataArray()!;
 
-        var qf = ToFloat(q); var kf = ToFloat(k); var vf = ToFloat(v);
-        var fgf = ToFloat(fg); var skf = ToFloat(sk);
-        var got = (float[])(object)engine.AbcScanForward(qf, kf, vf, fgf, skf, numHeads, InitScale).GetDataArray()!;
+        using var qf = ToFloat(q); using var kf = ToFloat(k); using var vf = ToFloat(v);
+        using var fgf = ToFloat(fg); using var skf = ToFloat(sk);
+        using var actualTensor = engine.AbcScanForward(qf, kf, vf, fgf, skf, numHeads, InitScale);
+        var got = (float[])(object)actualTensor.GetDataArray()!;
 
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(got[i] - expected[i]) < 1e-5,
                 $"generic[{i}] = {got[i]} vs double path {expected[i]}");
+    }
+
+    [Fact]
+    public void ZeroSlots_FailsWithShapeError()
+    {
+        var engine = new CpuEngine();
+        using var q = new Tensor<double>(new double[4], new[] { 1, 1, 4 });
+        using var k = new Tensor<double>(new double[4], new[] { 1, 1, 4 });
+        using var v = new Tensor<double>(new double[4], new[] { 1, 1, 4 });
+        using var fg = new Tensor<double>(new double[2], new[] { 1, 1, 2 });
+        using var slotKeys = new Tensor<double>(Array.Empty<double>(), new[] { 2, 0, 2 });
+
+        var error = Assert.Throws<ArgumentException>(
+            () => engine.AbcScanForward(q, k, v, fg, slotKeys, numHeads: 2, slotInitScale: InitScale));
+        Assert.Contains("numSlots >= 1", error.Message);
     }
 
     private static Tensor<float> ToFloat(Tensor<double> t)
@@ -228,7 +261,7 @@ public class AbcScanTests
         CpuEngine engine, Tensor<double> q, Tensor<double> k, Tensor<double> v,
         Tensor<double> fg, Tensor<double> sk, int numHeads, Tensor<double> weights)
     {
-        var outp = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        using var outp = engine.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
         var data = (double[])(object)outp.GetDataArray()!;
         var w = (double[])(object)weights.GetDataArray()!;
         double s = 0.0;

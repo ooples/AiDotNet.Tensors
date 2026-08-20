@@ -67,6 +67,10 @@ public partial class CpuEngine
         if (slotKeys.Rank != 3 || slotKeys.Shape[0] != numHeads || slotKeys.Shape[2] != headDim)
             throw new ArgumentException($"slotKeys must be [numHeads={numHeads}, numSlots, headDim={headDim}].", nameof(slotKeys));
         int numSlots = slotKeys.Shape[1];
+        if (numSlots < 1)
+            throw new ArgumentException(
+                $"slotKeys must be [numHeads={numHeads}, numSlots >= 1, headDim={headDim}]; got numSlots={numSlots}.",
+                nameof(slotKeys));
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 
