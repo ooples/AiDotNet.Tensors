@@ -82,6 +82,8 @@ extern ""C"" __global__ void dequant_gemm_fp8_e4m3(
 // Symmetric W8A8 decode projection. This correctness fallback preserves the
 // direct-PTX physical ABI: contiguous input[K], output-major weights[N,K],
 // scalar activation scale, per-output weight scales/bias, and FP32 output.
+// Its tanhf epilogue and direct PTX's tanh.approx.f32 are compared under the
+// benchmark's 5e-4 maximum-error tolerance.
 extern ""C"" __global__ void fused_linear_gelu_w8a8_m1(
     const signed char* input, const signed char* weights,
     const float* activationScale, const float* weightScales,

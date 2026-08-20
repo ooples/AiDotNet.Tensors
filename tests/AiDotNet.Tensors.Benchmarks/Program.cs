@@ -1574,6 +1574,7 @@ class Program
         Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-mixed-linear [runs]: FP16 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-mixed-linear-m16 [runs]: async Tensor Core M=16 championship matrix");
+        Console.WriteLine("  --direct-ptx-w8a8-linear [runs]: symmetric W8A8 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
@@ -1600,6 +1601,7 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear-m16: deterministic Nsight async MMA target");
+        Console.WriteLine("  --direct-ptx-profile-w8a8-linear: deterministic Nsight W8A8 DP4A target");
         Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");

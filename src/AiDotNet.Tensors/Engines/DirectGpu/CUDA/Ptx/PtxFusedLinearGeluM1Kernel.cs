@@ -41,13 +41,21 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             inputFeatures, outputFeatures);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -56,11 +64,13 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         DirectPtxTensorView bias,
         DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(weights, Blueprint.Tensors[1], nameof(weights));
-        Require(bias, Blueprint.Tensors[2], nameof(bias));
-        Require(output, Blueprint.Tensors[3], nameof(output));
-        if (Overlaps(output, input) || Overlaps(output, weights) || Overlaps(output, bias))
+        PtxFusedLinearGeluShared.Require(input, Blueprint.Tensors[0], nameof(input));
+        PtxFusedLinearGeluShared.Require(weights, Blueprint.Tensors[1], nameof(weights));
+        PtxFusedLinearGeluShared.Require(bias, Blueprint.Tensors[2], nameof(bias));
+        PtxFusedLinearGeluShared.Require(output, Blueprint.Tensors[3], nameof(output));
+        if (PtxFusedLinearGeluShared.Overlaps(output, input) ||
+            PtxFusedLinearGeluShared.Overlaps(output, weights) ||
+            PtxFusedLinearGeluShared.Overlaps(output, bias))
             throw new ArgumentException("Fused-linear output may not alias input, weights, or bias.");
 
         IntPtr inputPointer = input.Pointer;
@@ -74,7 +84,7 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         arguments[3] = &outputPointer;
         _module.Launch(
             _function,
-            (uint)(OutputFeatures / (OutputsPerWarp(OutputFeatures) * (BlockThreads / 32))), 1, 1,
+            (uint)(OutputFeatures / (OutputsPerWarp * (BlockThreads / 32))), 1, 1,
             BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -87,7 +97,7 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         int outputFeatures)
     {
         ValidateShape(inputFeatures, outputFeatures);
-        int outputsPerWarp = OutputsPerWarp(outputFeatures);
+        int outputsPerWarp = OutputsPerWarp;
         var ptx = new StringBuilder(8_192);
         int weightRowBytes = checked(inputFeatures * sizeof(float));
         ptx.AppendLine(".version 7.1");
@@ -172,15 +182,8 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {inputFeatures};");
         ptx.AppendLine("    @%p0 bra.uni LINEAR_K_LOOP;");
         for (int output = 0; output < outputsPerWarp; output++)
-        {
-            foreach (int delta in new[] { 16, 8, 4, 2, 1 })
-            {
-                ptx.AppendLine($"    mov.b32 %r10, %f{output};");
-                ptx.AppendLine($"    shfl.sync.bfly.b32 %r11, %r10, {delta}, 31, 0xffffffff;");
-                ptx.AppendLine("    mov.b32 %f10, %r11;");
-                ptx.AppendLine($"    add.rn.f32 %f{output}, %f{output}, %f10;");
-            }
-        }
+            PtxFusedLinearGeluShared.EmitFp32WarpButterflyReduction(
+                ptx, $"%f{output}", "%r10", "%r11", "%f10");
         ptx.AppendLine("    setp.ne.u32 %p1, %r1, 0;");
         ptx.AppendLine("    @%p1 bra LINEAR_RETURN;");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r4, 4;");
@@ -192,15 +195,8 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
             string suffix = outputOffset == 0 ? string.Empty : $"+{outputOffset}";
             ptx.AppendLine($"    ld.global.nc.f32 %f9, [%rd8{suffix}];");
             ptx.AppendLine($"    add.rn.f32 %f{output}, %f{output}, %f9;");
-            ptx.AppendLine($"    mul.rn.f32 %f11, %f{output}, %f{output};");
-            ptx.AppendLine($"    mul.rn.f32 %f11, %f11, %f{output};");
-            ptx.AppendLine($"    fma.rn.f32 %f11, %f11, 0f3D372713, %f{output};");
-            ptx.AppendLine("    mul.rn.f32 %f11, %f11, 0f3F4C422A;");
-            ptx.AppendLine("    tanh.approx.f32 %f11, %f11;");
-            ptx.AppendLine("    add.rn.f32 %f11, %f11, 0f3F800000;");
-            ptx.AppendLine($"    mul.rn.f32 %f11, %f11, %f{output};");
-            ptx.AppendLine("    mul.rn.f32 %f11, %f11, 0f3F000000;");
-            ptx.AppendLine($"    st.global.f32 [%rd9{suffix}], %f11;");
+            PtxFusedLinearGeluShared.EmitTanhGeluEpilogue(
+                ptx, $"%f{output}", "%f11", $"%rd9{suffix}");
         }
     }
 
@@ -254,7 +250,7 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
     internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
         (inputFeatures, outputFeatures) is (512, 2048);
 
-    private static int OutputsPerWarp(int outputFeatures) => 2;
+    private const int OutputsPerWarp = 2;
 
     private static void ValidateShape(int inputFeatures, int outputFeatures)
     {
@@ -264,24 +260,4 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
                 "Supported K and N buckets are 256, 512, 1024, 2048, and 4096.");
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
-
-    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
-    {
-        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
-        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
-        nuint leftEnd = checked(leftStart + left.ByteLength);
-        nuint rightEnd = checked(rightStart + right.ByteLength);
-        return leftStart < rightEnd && rightStart < leftEnd;
-    }
 }

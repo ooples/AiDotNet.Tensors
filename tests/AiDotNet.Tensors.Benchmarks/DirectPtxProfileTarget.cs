@@ -294,6 +294,7 @@ internal static class DirectPtxProfileTarget
 
     internal static void RunFusedLinear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-fused-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluM1Kernel(
@@ -313,10 +314,12 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-fused-linear-end", afterSuite: true);
     }
 
     internal static void RunMixedLinear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-mixed-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluFp16M1Kernel(
@@ -336,10 +339,12 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-mixed-linear-end", afterSuite: true);
     }
 
     internal static void RunMixedLinearM16()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-mixed-linear-m16-start");
         using var runtime = new DirectPtxRuntime();
         const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
         const int inputFeatures = 1024, outputFeatures = 4096;
@@ -360,10 +365,12 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-mixed-linear-m16-end", afterSuite: true);
     }
 
     internal static void RunW8A8Linear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-w8a8-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 1024, outputFeatures = 4096;
         using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
@@ -389,6 +396,7 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-w8a8-linear-end", afterSuite: true);
     }
 
     internal static void RunVisionBoxIou()

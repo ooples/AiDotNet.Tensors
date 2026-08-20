@@ -71,7 +71,6 @@ def measure_e2e(operation):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--json-lines", action="store_true")
     args = parser.parse_args()
     if args.runs <= 0:
         parser.error("--runs must be positive")
@@ -90,7 +89,7 @@ def main():
             ) * 0.0625
             bias = (torch.rand((output_features,), device=device) * 2.0 - 1.0) * 0.0625
 
-            def operation():
+            def operation(x=x, weights=weights, bias=bias):
                 return functional.gelu(
                     functional.linear(x, weights, bias), approximate="tanh"
                 )
@@ -113,7 +112,7 @@ def main():
             with torch.cuda.graph(graph):
                 graph_output = operation()
 
-            def graph_operation():
+            def graph_operation(graph=graph, graph_output=graph_output):
                 graph.replay()
                 return graph_output
 
