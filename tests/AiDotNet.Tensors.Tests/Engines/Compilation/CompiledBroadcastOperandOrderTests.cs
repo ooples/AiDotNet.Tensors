@@ -132,6 +132,59 @@ public class CompiledBroadcastOperandOrderTests
         });
     }
 
+    /// <summary>
+    /// Subtract and multiply go through the same single builder, and subtract is NOT commutative:
+    /// seeding the buffer from the wrong operand would silently compute <c>big - small</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(4, 3)]
+    [InlineData(8, 9)]
+    public void BroadcastSubtractAndMultiply_PreserveOperandOrder(int rows, int cols)
+    {
+        AssertAgrees("small - big", e =>
+        {
+            var small = Filled(new[] { rows, 1 }, 0.3f, 2);
+            var big = Filled(new[] { rows, cols }, 0.1f, 9);
+            return (e.TensorSubtract(small, big), new[] { small, big });
+        });
+
+        AssertAgrees("big - small", e =>
+        {
+            var small = Filled(new[] { rows, 1 }, 0.3f, 2);
+            var big = Filled(new[] { rows, cols }, 0.1f, 9);
+            return (e.TensorSubtract(big, small), new[] { small, big });
+        });
+
+        AssertAgrees("small * big", e =>
+        {
+            var small = Filled(new[] { rows, 1 }, 0.3f, 2);
+            var big = Filled(new[] { rows, cols }, 0.1f, 9);
+            return (e.TensorMultiply(small, big), new[] { small, big });
+        });
+
+        AssertAgrees("big * small", e =>
+        {
+            var small = Filled(new[] { rows, 1 }, 0.3f, 2);
+            var big = Filled(new[] { rows, cols }, 0.1f, 9);
+            return (e.TensorMultiply(big, small), new[] { small, big });
+        });
+    }
+
+    /// <summary>
+    /// A MUTUAL broadcast has no operand spanning the output; the single builder declines it and
+    /// the generic path must still produce the eager answer.
+    /// </summary>
+    [Fact]
+    public void MutualBroadcast_FallsBackAndStillAgrees()
+    {
+        AssertAgrees("[4,1] + [1,3]", e =>
+        {
+            var rowsOnly = Filled(new[] { 4, 1 }, 0.3f, 2);
+            var colsOnly = Filled(new[] { 1, 3 }, 0.1f, 9);
+            return (e.TensorAdd(rowsOnly, colsOnly), new[] { rowsOnly, colsOnly });
+        });
+    }
+
     [Fact]
     public void BiasAddPattern_StillAgrees()
     {

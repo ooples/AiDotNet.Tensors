@@ -6643,80 +6643,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // Legacy TensorBroadcastAdd forward: route compiled-plan replay through
-        // a copy-into-output + TensorBroadcastAddInPlace pair instead of the
-        // generic "allocate fresh result + memcpy into plan output" closure.
-        // Used in every SD UNet ResBlock for the time-embedding conditioning
-        // (15+ calls per UNet forward × 10 sampling steps per Predict).
-        //
-        // Save: 1 tensor allocation per Execute. Still pays one memcpy (to copy
-        // `a` into the plan's output buffer before the in-place add), but that
-        // memcpy is one fewer than the generic path which copies the eager
-        // result back into the output buffer.
-        if (step.OpType == OpType.TensorBroadcastAdd && step.Inputs.Length == 2
-            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        // Broadcasting binary forward (add / subtract / multiply). ONE builder owns every one of
+        // these, so the question "which operand spans the output" is answered in a single place.
         {
-            var a = step.Inputs[0];
-            var b = step.Inputs[1];
-            var o = step.OutputBuffer;
-            // Same-shape fast path: just call TensorAddInPlace (no broadcast needed).
-            // Many SD ResBlock residual adds hit this — both operands are
-            // [batch, channels, h, w].
-            bool sameShape = a._shape.Length == b._shape.Length;
-            if (sameShape)
-            {
-                for (int d = 0; d < a._shape.Length; d++)
-                {
-                    if (a._shape[d] != b._shape[d]) { sameShape = false; break; }
-                }
-            }
-            if (sameShape)
-            {
-                return eng =>
-                {
-                    a.AsSpan().CopyTo(o.AsWritableSpan());
-                    if (eng is CpuEngine cpuEng) cpuEng.TensorAddInPlace(o, b);
-                    else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
-                };
-            }
-            // Broadcast path: seed the output with whichever operand ALREADY CARRIES THE OUTPUT
-            // SHAPE, then broadcast the other one up into it.
-            //
-            // WHICH OPERAND IS THE LARGER ONE IS NOT KNOWN IN ADVANCE, and this path used to assume
-            // it was always `a`. Seeding from `a` when `a` is the SMALLER operand copies only a's
-            // elements into the full-size buffer and leaves the remainder holding whatever was
-            // there before -- zeros from a fresh allocation, or a previous step's bytes from a
-            // recycled one. Addition is commutative, so seeding from the full-shape operand
-            // instead is the same arithmetic with every element actually written.
-            //
-            // This is reached constantly: TensorBroadcastTo expresses a genuine expansion as
-            // TensorBroadcastAdd(input, zeros(targetShape)), whose FIRST operand is by construction
-            // the small one, so every such broadcast replayed through a compiled plan was wrong.
-            // MEASURED on [4,1] -> [4,3]: a correctly SHAPED 12-element output holding the 4 source
-            // values contiguously and 8 stale slots -- a silent wrong answer at exactly 1/3 of the
-            // true sum when the buffer was fresh, and NaN/1e35 when it was recycled, which then
-            // poisons every parameter through the gradient.
-            bool aIsFullShape = ShapeMatchesBuffer(a._shape, o._shape);
-            bool bIsFullShape = ShapeMatchesBuffer(b._shape, o._shape);
-            if (aIsFullShape || bIsFullShape)
-            {
-                var full = aIsFullShape ? a : b;
-                var addend = aIsFullShape ? b : a;
-                return eng =>
-                {
-                    full.AsSpan().CopyTo(o.AsWritableSpan());
-                    if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, addend);
-                    else
-                    {
-                        var r = eng.TensorAdd(a, b);
-                        if (!r.IsContiguous) r = r.Contiguous();
-                        r.AsSpan().CopyTo(o.AsWritableSpan());
-                    }
-                };
-            }
-            // Neither operand carries the output shape -- a MUTUAL broadcast such as
-            // [4,1] + [1,3] -> [4,3], where each side expands along a different axis. There is no
-            // operand to seed from, so fall through to the generic path rather than guess.
+            var broadcastReplay = TryBuildBroadcastBinaryForward(step);
+            if (broadcastReplay is not null) return broadcastReplay;
         }
 
         // ConvTranspose2D forward: route compiled-plan replay through
@@ -7074,28 +7005,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // BroadcastAdd/Sub/Mul forward: direct array loop for [N,M] op [M] pattern
-        if ((step.OpType == OpType.TensorBroadcastAdd || step.OpType == OpType.TensorBroadcastSubtract || step.OpType == OpType.TensorBroadcastMultiply)
-            && step.Inputs.Length == 2 && typeof(T) == typeof(float)
-            && step.Inputs[0].Rank == 2 && (step.Inputs[1].Rank == 1 || (step.Inputs[1].Rank == 2 && step.Inputs[1]._shape[0] == 1)))
-        {
-            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            int rows = a._shape[0], cols = a._shape[1];
-            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
-            if (cols == bCols)
-            {
-                var aArr = TryGetLiveFloatBacking(a)!;
-                var bArr = TryGetLiveFloatBacking(b)!;
-                var oArr = TryGetLiveFloatBacking(o)!;
-                if (step.OpType == OpType.TensorBroadcastAdd)
-                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] + bArr[c]; } };
-                else if (step.OpType == OpType.TensorBroadcastSubtract)
-                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] - bArr[c]; } };
-                else
-                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] * bArr[c]; } };
-            }
-        }
-
         // MSELoss forward: fused single-pass diff^2 sum
         if (step.OpType == OpType.MSELoss && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
@@ -7323,6 +7232,135 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// reads the now-clipped grads. Returns false if any gradient is not CUDA-resident (caller uses the CPU
     /// clip instead); the global norm requires ALL grads present, so a mixed CPU/GPU set is not handled here.
     /// </summary>
+    /// <summary>
+    /// Builds the compiled replay for a broadcasting binary op — add, subtract or multiply —
+    /// writing <c>left OP right</c> into the plan's output buffer. Returns <see langword="null"/>
+    /// for the shapes it deliberately leaves to the generic engine path.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS THE ONLY PLACE THAT DECIDES HOW A BROADCASTING BINARY IS REPLAYED. There used to be
+    /// two independent branches — a zero-alloc add and a float <c>[N,M] op [M]</c> loop — and each
+    /// re-derived which operand was the larger one. One of them assumed the FIRST operand always
+    /// was, which holds for <c>big + small</c> and fails for <c>small + big</c>: it copied the small
+    /// operand's elements into the full-size buffer and left the remainder holding whatever was
+    /// there before. That is not an exotic shape — <c>TensorBroadcastTo</c> expresses an expansion
+    /// as <c>input + zeros(target)</c>, whose first operand is by construction the small one.
+    /// </para>
+    /// <para>
+    /// The seed operand is chosen once, from shapes, and the output is filled in full either way,
+    /// so no caller has to know the convention and no second branch can disagree about it.
+    /// </para>
+    /// <para>
+    /// Order is preserved rather than normalized, because subtract and multiply are not both
+    /// commutative and <c>small - big</c> must stay <c>small - big</c>.
+    /// </para>
+    /// </remarks>
+    private static Action<IEngine>? TryBuildBroadcastBinaryForward(CompiledStep<T> step)
+    {
+        if (step.Inputs.Length != 2) return null;
+
+        bool isAdd = step.OpType == OpType.TensorBroadcastAdd;
+        bool isSubtract = step.OpType == OpType.TensorBroadcastSubtract;
+        bool isMultiply = step.OpType == OpType.TensorBroadcastMultiply;
+        if (!isAdd && !isSubtract && !isMultiply) return null;
+
+        var left = step.Inputs[0];
+        var right = step.Inputs[1];
+        var output = step.OutputBuffer;
+        if (!left.IsContiguous || !right.IsContiguous || !output.IsContiguous) return null;
+
+        // The single orientation decision.
+        bool leftSpansOutput = ShapeMatchesBuffer(left._shape, output._shape);
+        bool rightSpansOutput = ShapeMatchesBuffer(right._shape, output._shape);
+
+        // A MUTUAL broadcast such as [4,1] op [1,3] -> [4,3] has no operand to seed from, and
+        // guessing one is the defect this method exists to prevent. The generic engine path
+        // computes it correctly.
+        if (!leftSpansOutput && !rightSpansOutput) return null;
+
+        // Dense float [N,M] op [M] (row-vector / bias shape): a tight indexed loop, kept as a fast
+        // sub-case of the one path rather than as a branch that re-decides orientation.
+        if (typeof(T) == typeof(float) && leftSpansOutput && !rightSpansOutput
+            && left.Rank == 2
+            && (right.Rank == 1 || (right.Rank == 2 && right._shape[0] == 1))
+            && left._shape[1] == (right.Rank == 1 ? right._shape[0] : right._shape[1]))
+        {
+            var leftArray = TryGetLiveFloatBacking(left);
+            var rightArray = TryGetLiveFloatBacking(right);
+            var outputArray = TryGetLiveFloatBacking(output);
+            if (leftArray is not null && rightArray is not null && outputArray is not null)
+            {
+                int rows = left._shape[0];
+                int cols = left._shape[1];
+                if (isAdd)
+                    return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] + rightArray[c]; } };
+                if (isSubtract)
+                    return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] - rightArray[c]; } };
+                return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] * rightArray[c]; } };
+            }
+        }
+
+        // Subtract and multiply have no in-place broadcasting kernel for a smaller RIGHT operand,
+        // and the row-vector case above did not apply. Leave it to the generic path rather than
+        // open-code a second expansion here.
+        if ((isSubtract || isMultiply) && !rightSpansOutput) return null;
+
+        return engine =>
+        {
+            if (engine is not CpuEngine cpu)
+            {
+                ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
+                return;
+            }
+
+            // 1. Fill the output from the LEFT operand, expanding it when it is the smaller side.
+            //    Every element is written, so nothing downstream can read a stale slot.
+            if (leftSpansOutput)
+            {
+                left.AsSpan().CopyTo(output.AsWritableSpan());
+            }
+            else
+            {
+                output.AsWritableSpan().Clear();
+                cpu.TensorBroadcastAddInPlace(output, left);
+            }
+
+            // 2. Apply the RIGHT operand in place, broadcasting it if it is the smaller side.
+            if (rightSpansOutput)
+            {
+                if (isAdd) cpu.TensorAddInPlace(output, right);
+                else if (isSubtract) cpu.TensorSubtractInPlace(output, right);
+                else cpu.TensorMultiplyInPlace(output, right);
+            }
+            else
+            {
+                cpu.TensorBroadcastAddInPlace(output, right);
+            }
+        };
+    }
+
+    /// <summary>
+    /// Generic replay for engines without the in-place CPU kernels: recompute eagerly, materialize
+    /// any strided result, and copy it into the plan's buffer.
+    /// </summary>
+    private static void ReplayBroadcastBinaryEagerly(
+        IEngine engine, OpType opType, Tensor<T> left, Tensor<T> right, Tensor<T> output)
+    {
+        var result = opType switch
+        {
+            OpType.TensorBroadcastSubtract => engine.TensorSubtract(left, right),
+            OpType.TensorBroadcastMultiply => engine.TensorMultiply(left, right),
+            _ => engine.TensorAdd(left, right),
+        };
+
+        // A broadcast result can be a stride-0 VIEW whose backing storage is smaller than its
+        // logical shape; AsSpan() would then copy only that backing and leave the rest of output
+        // untouched.
+        if (!result.IsContiguous) result = result.Contiguous();
+        result.AsSpan().CopyTo(output.AsWritableSpan());
+    }
+
     /// <summary>
     /// True when <paramref name="shape"/> is exactly the plan buffer's shape, i.e. this operand
     /// already spans the whole output and nothing about it needs broadcasting.
