@@ -18,7 +18,10 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// </summary>
 public class FusedConv2DDoublePerfTests
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    // These tests target the CPU SIMD implementations named above. Binding them to the ambient
+    // engine made their route depend on whether the test host happened to have a GPU, and mixed
+    // speed-first FP32 GPU references with exact-double CPU fused kernels.
+    private readonly IEngine _engine = new CpuEngine();
 
     // ─── FusedConv2D<double> bias fold ────────────────────────────────
 
