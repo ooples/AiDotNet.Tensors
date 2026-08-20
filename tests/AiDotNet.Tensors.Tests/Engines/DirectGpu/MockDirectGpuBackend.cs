@@ -64,6 +64,8 @@ internal sealed class MockBackendState
     public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
     public int DownloadBufferCalls { get; set; }
     public int ClassifyFloatCalls { get; set; }
+    public int FillCalls { get; set; }
+    public int MultiplyCalls { get; set; }
     public int ScalarMinCalls { get; set; }
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
@@ -152,8 +154,15 @@ public class MockDirectGpuBackend : DispatchProxy
             }
 
             // Device-resident non-finite-gradient preflight used by compiled optimizers.
-            // ClassifyFloat mode 2 writes an exact 0/1 finite mask; scalar Min then returns
-            // one iff every inspected element was finite, without downloading the gradient.
+            case "Fill":
+            {
+                _state.FillCalls++;
+                var output = (MockGpuBuffer)args[0]!;
+                float value = (float)args[1]!;
+                int size = (int)args[2]!;
+                for (int i = 0; i < size; i++) output.Data[i] = value;
+                return null!;
+            }
             case "ClassifyFloat":
             {
                 _state.ClassifyFloatCalls++;
@@ -164,6 +173,16 @@ public class MockDirectGpuBackend : DispatchProxy
                 if (mode != 2) throw new NotSupportedException("Mock ClassifyFloat supports isfinite mode only.");
                 for (int i = 0; i < size; i++)
                     output.Data[i] = float.IsNaN(input.Data[i]) || float.IsInfinity(input.Data[i]) ? 0f : 1f;
+                return null!;
+            }
+            case "Multiply":
+            {
+                _state.MultiplyCalls++;
+                var left = (MockGpuBuffer)args[0]!;
+                var right = (MockGpuBuffer)args[1]!;
+                var output = (MockGpuBuffer)args[2]!;
+                int size = (int)args[3]!;
+                for (int i = 0; i < size; i++) output.Data[i] = left.Data[i] * right.Data[i];
                 return null!;
             }
             case "Min" when args.Length == 2:

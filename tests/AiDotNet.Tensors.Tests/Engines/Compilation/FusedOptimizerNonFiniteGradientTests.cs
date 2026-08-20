@@ -267,10 +267,12 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.True(plan.LastStepSkippedNonFiniteGradients);
             Assert.Equal(1, plan.NonFiniteStepsSkipped);
             Assert.Equal(2, state.ClassifyFloatCalls);
-            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(1, state.FillCalls);
+            Assert.Equal(2, state.MultiplyCalls);
+            Assert.Equal(1, state.ScalarMinCalls);
             Assert.Empty(state.OptimizerCalls);
             Assert.Equal(0, state.DownloadBufferCalls);
-            Assert.Equal(new[] { 16 }, state.AllocationSizes);
+            Assert.Equal(new[] { 16, 16 }, state.AllocationSizes);
             Assert.Equal(0, GetOptimizerStep(plan));
 
             foreach (var gradient in gradients) AttachGpuBuffer(gradient, backend, 1f);
@@ -302,10 +304,12 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.False(plan.LastStepSkippedNonFiniteGradients);
             Assert.Equal(0, plan.NonFiniteStepsSkipped);
             Assert.Equal(2, state.ClassifyFloatCalls);
-            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(1, state.FillCalls);
+            Assert.Equal(2, state.MultiplyCalls);
+            Assert.Equal(1, state.ScalarMinCalls);
             Assert.Equal(new[] { "SgdUpdate", "SgdUpdate" }, state.OptimizerCalls);
             Assert.Equal(0, state.DownloadBufferCalls);
-            Assert.Equal(new[] { 16 }, state.AllocationSizes);
+            Assert.Equal(new[] { 16, 16 }, state.AllocationSizes);
         }
     }
 
@@ -330,7 +334,9 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.Equal(1, plan.NonFiniteStepsSkipped);
             Assert.Empty(state.OptimizerCalls);
             Assert.Equal(2, state.ClassifyFloatCalls);
-            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(1, state.FillCalls);
+            Assert.Equal(2, state.MultiplyCalls);
+            Assert.Equal(1, state.ScalarMinCalls);
             Assert.Equal(0, state.DownloadBufferCalls);
         }
     }
@@ -355,7 +361,9 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.Equal(0, plan.NonFiniteStepsSkipped);
             Assert.Equal(new[] { "AdamMultiTensorUpdate" }, state.OptimizerCalls);
             Assert.Equal(2, state.ClassifyFloatCalls);
-            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(1, state.FillCalls);
+            Assert.Equal(2, state.MultiplyCalls);
+            Assert.Equal(1, state.ScalarMinCalls);
             Assert.Equal(0, state.DownloadBufferCalls);
         }
     }
@@ -384,8 +392,10 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.True(plan.LastStepSkippedNonFiniteGradients);
             Assert.Equal(1, plan.NonFiniteStepsSkipped);
             Assert.Empty(state.OptimizerCalls);
-            Assert.Equal(1, state.ClassifyFloatCalls);
-            Assert.Equal(1, state.ScalarMinCalls);
+            Assert.Equal(0, state.FillCalls);
+            Assert.Equal(0, state.ClassifyFloatCalls);
+            Assert.Equal(0, state.MultiplyCalls);
+            Assert.Equal(0, state.ScalarMinCalls);
             Assert.Equal(0, state.DownloadBufferCalls);
         }
     }
@@ -422,8 +432,14 @@ public class FusedOptimizerNonFiniteGradientTests
 
                     using var gradient = backend!.AllocateBuffer(values);
                     using var scratch = backend.AllocateBuffer(length);
+                    using var aggregate = backend.AllocateBuffer(length);
+                    using var finitePrefix = backend.AllocateBuffer(new float[] { 1f });
+                    backend.Fill(aggregate, 1f, length);
+                    backend.ClassifyFloat(finitePrefix, scratch, mode: 2, size: 1);
+                    backend.Multiply(scratch, aggregate, aggregate, size: 1);
                     backend.ClassifyFloat(gradient, scratch, mode: 2, size: length);
-                    Assert.Equal(allFinite ? 1f : 0f, backend.Min(scratch, length));
+                    backend.Multiply(scratch, aggregate, aggregate, size: length);
+                    Assert.Equal(allFinite ? 1f : 0f, backend.Min(aggregate, length));
                 }
             }
         }

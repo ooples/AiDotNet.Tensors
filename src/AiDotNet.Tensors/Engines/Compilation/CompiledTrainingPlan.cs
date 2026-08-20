@@ -812,14 +812,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <summary>
-    /// Allocates one reusable classification buffer per distinct GPU backend, sized for that
-    /// backend's largest parameter. Sharing keeps the guard's persistent memory bounded by the
-    /// largest tensor rather than the sum of every gradient tensor.
+    /// Allocates a reusable classification buffer and aggregate mask per distinct GPU backend,
+    /// sized for that backend's largest parameter. Sharing keeps the guard's persistent memory
+    /// bounded by twice the largest tensor rather than the sum of every gradient tensor.
     /// </summary>
     private void AllocateGpuFinitenessScratch(
         Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
         int[] lengths,
-        Engines.DirectGpu.IGpuBuffer?[] scratchByParameter)
+        Engines.DirectGpu.IGpuBuffer?[] scratchByParameter,
+        Engines.DirectGpu.IGpuBuffer?[] aggregateByParameter,
+        int[] reductionLengths)
     {
         for (int p = 0; p < gpuBackends.Length; p++)
         {
@@ -832,17 +834,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     maximumLength = Math.Max(maximumLength, lengths[q]);
 
             var sharedScratch = backend.AllocateBuffer(maximumLength);
+            var sharedAggregate = backend.AllocateBuffer(maximumLength);
             _gpuOptimizerBuffers.Add(sharedScratch);
+            _gpuOptimizerBuffers.Add(sharedAggregate);
+            reductionLengths[p] = maximumLength;
             for (int q = p; q < gpuBackends.Length; q++)
                 if (ReferenceEquals(gpuBackends[q], backend))
+                {
                     scratchByParameter[q] = sharedScratch;
+                    aggregateByParameter[q] = sharedAggregate;
+                }
         }
     }
 
     /// <summary>
     /// Checks every authoritative CPU or GPU gradient before any optimizer state or parameter is
     /// written. GPU gradients are classified on-device using the backend's IEEE-bitwise
-    /// <c>ClassifyFloat</c> kernel and reduced to one scalar; the full gradient is never downloaded.
+    /// <c>ClassifyFloat</c> kernel, aggregated on-device, and reduced to one scalar per backend; the
+    /// full gradient is never downloaded.
     /// </summary>
     private unsafe bool TryDiscardNonFiniteOptimizerStep(
         float[][] gradArrays,
@@ -850,6 +859,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Engines.DirectGpu.IGpuBuffer?[] gpuGradients,
         Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
         Engines.DirectGpu.IGpuBuffer?[] gpuFinitenessScratch,
+        Engines.DirectGpu.IGpuBuffer?[] gpuFinitenessAggregate,
+        int[] gpuFinitenessReductionLengths,
         int[] paramOffsets,
         int[] lengths,
         OptimizerType optimizerType,
@@ -857,25 +868,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float[][] scheduleFreeEvalCopies)
     {
         bool gradientsFinite = true;
+        // Inspect host-authoritative gradients first. If one is already bad, avoid launching any
+        // device work; no optimizer state or parameter has been touched at this point.
         for (int p = 0; p < gradArrays.Length && gradientsFinite; p++)
         {
-            if (gpuGradients[p] is { } gpuGradient)
-            {
-                var backend = gpuBackends[p]
-                    ?? throw new InvalidOperationException("A GPU gradient has no owning backend.");
-                var scratch = gpuFinitenessScratch[p]
-                    ?? throw new InvalidOperationException("GPU gradient finiteness scratch was not allocated.");
-                int length = lengths[p];
-                if (length <= 0)
-                    continue;
-
-                // mode 2 = isfinite. Min(mask) is exactly 1 only when every element is finite;
-                // unlike summing a 0/1 mask, this cannot lose a single zero to float rounding for
-                // tensors larger than 2^24 elements.
-                backend.ClassifyFloat(gpuGradient, scratch, mode: 2, size: length);
-                gradientsFinite = backend.Min(scratch, length) == 1.0f;
+            if (gpuGradients[p] is not null)
                 continue;
-            }
 
             var gradients = gradArrays[p];
             if (gradients is null || gradients.Length == 0)
@@ -886,6 +884,69 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             fixed (float* pGrad = &gradients[gradOffsets[p]])
             {
                 gradientsFinite = FusedOptimizer.AllFiniteSimd(pGrad, lengths[p]);
+            }
+        }
+
+        if (gradientsFinite)
+        {
+            // Aggregate every gradient mask on-device and synchronize only once per backend. The
+            // accumulator begins as all ones; multiplying a 0/1 mask into its prefix preserves a
+            // zero from any tensor while unused tail entries remain one.
+            for (int p = 0; p < gpuFinitenessReductionLengths.Length; p++)
+            {
+                int reductionLength = gpuFinitenessReductionLengths[p];
+                if (reductionLength <= 0)
+                    continue;
+
+                var backend = gpuBackends[p]
+                    ?? throw new InvalidOperationException("GPU finiteness reduction has no owning backend.");
+                bool hasDeviceGradient = false;
+                for (int q = 0; q < gpuGradients.Length && !hasDeviceGradient; q++)
+                    hasDeviceGradient = gpuGradients[q] is not null &&
+                        ReferenceEquals(gpuBackends[q], backend);
+                if (!hasDeviceGradient)
+                    continue;
+
+                var aggregate = gpuFinitenessAggregate[p]
+                    ?? throw new InvalidOperationException("GPU gradient finiteness aggregate was not allocated.");
+                backend.Fill(aggregate, 1.0f, reductionLength);
+            }
+
+            for (int p = 0; p < gpuGradients.Length; p++)
+            {
+                if (gpuGradients[p] is not { } gpuGradient || lengths[p] <= 0)
+                    continue;
+
+                var backend = gpuBackends[p]
+                    ?? throw new InvalidOperationException("A GPU gradient has no owning backend.");
+                var scratch = gpuFinitenessScratch[p]
+                    ?? throw new InvalidOperationException("GPU gradient finiteness scratch was not allocated.");
+                var aggregate = gpuFinitenessAggregate[p]
+                    ?? throw new InvalidOperationException("GPU gradient finiteness aggregate was not allocated.");
+
+                // mode 2 = isfinite. Multiplication acts as exact logical AND for the 0/1 masks.
+                backend.ClassifyFloat(gpuGradient, scratch, mode: 2, size: lengths[p]);
+                backend.Multiply(scratch, aggregate, aggregate, lengths[p]);
+            }
+
+            for (int p = 0; p < gpuFinitenessReductionLengths.Length && gradientsFinite; p++)
+            {
+                int reductionLength = gpuFinitenessReductionLengths[p];
+                if (reductionLength <= 0)
+                    continue;
+
+                var backend = gpuBackends[p]!;
+                bool hasDeviceGradient = false;
+                for (int q = 0; q < gpuGradients.Length && !hasDeviceGradient; q++)
+                    hasDeviceGradient = gpuGradients[q] is not null &&
+                        ReferenceEquals(gpuBackends[q], backend);
+                if (!hasDeviceGradient)
+                    continue;
+
+                var aggregate = gpuFinitenessAggregate[p]!;
+                // Min(mask) is exactly 1 only when every value is finite; unlike summing a 0/1
+                // mask, this cannot lose one zero to float rounding beyond 2^24 elements.
+                gradientsFinite = backend.Min(aggregate, reductionLength) == 1.0f;
             }
         }
 
@@ -2403,6 +2464,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
         var gpuGradUploadScratch = new float[paramCount][];
         var gpuFinitenessScratch = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuFinitenessAggregate = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuFinitenessReductionLengths = new int[paramCount];
 
         // Issue #350: GetDataArray() returns a COPY when the parameter tensor's
         // backing storage is pool-padded (e.g. logical length 6 on a 16-slot
@@ -2604,7 +2667,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
-        AllocateGpuFinitenessScratch(gpuBackends, lengths, gpuFinitenessScratch);
+        AllocateGpuFinitenessScratch(
+            gpuBackends, lengths, gpuFinitenessScratch,
+            gpuFinitenessAggregate, gpuFinitenessReductionLengths);
 
         _optimizerStep = 0;
         var b1 = beta1;
@@ -2731,6 +2796,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             if (TryDiscardNonFiniteOptimizerStep(
                 gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
+                gpuFinitenessAggregate, gpuFinitenessReductionLengths,
                 paramOffsets, lengths, optimizerType, paramArrays, v))
             {
                 return;
@@ -3574,6 +3640,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
         var gpuGradUploadScratch = new float[paramCount][];
         var gpuFinitenessScratch = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuFinitenessAggregate = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuFinitenessReductionLengths = new int[paramCount];
 
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
@@ -3747,7 +3815,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
-        AllocateGpuFinitenessScratch(gpuBackends, lengths, gpuFinitenessScratch);
+        AllocateGpuFinitenessScratch(
+            gpuBackends, lengths, gpuFinitenessScratch,
+            gpuFinitenessAggregate, gpuFinitenessReductionLengths);
 
         _optimizerStep = 0;
         var b1 = beta1;
@@ -3807,6 +3877,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             if (TryDiscardNonFiniteOptimizerStep(
                 gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
+                gpuFinitenessAggregate, gpuFinitenessReductionLengths,
                 paramOffsets, lengths, optimizerType, paramArrays, v))
             {
                 return;
