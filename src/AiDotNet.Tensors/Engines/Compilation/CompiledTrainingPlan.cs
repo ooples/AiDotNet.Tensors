@@ -115,6 +115,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Phase G.4: rebuild state captured at compile time so
     // EnableFrozenWeightOptimizations() can preserve fused-group action
     // identity while replacing non-fused MatMul forward specializations.
+    /// <summary>
+    /// What the compile-time forward walk decided to emit for one step.
+    /// </summary>
+    /// <remarks>
+    /// The walk that builds the forward actions weighs SEVEN cases -- analytic MatMul-into-loss
+    /// forwards, skippable ReduceSums, slice-prefix fusion, slice steps consumed by that fusion,
+    /// fused groups, per-op specializations, and the generic engine dispatch. Anything that needs
+    /// to rebuild those actions later must reach the same verdict on every step, and the rebuild
+    /// used to re-derive them from scratch while knowing only three of the seven -- so it silently
+    /// re-executed slice steps that a fused MatMul had already consumed and dropped the analytic
+    /// forwards entirely. Recording the verdict once removes the second opinion.
+    /// </remarks>
+    private enum ForwardEmit : byte
+    {
+        /// <summary>Emit nothing: another step's action already covers this one.</summary>
+        Skip = 0,
+
+        /// <summary>Emit the exact action decided at compile time; it cannot be re-derived.</summary>
+        Fixed = 1,
+
+        /// <summary>Emit a per-op specialization, or the generic dispatch when there is none.</summary>
+        Rebuildable = 2,
+    }
+
+    /// <summary>The compile-time verdict for each forward step, indexed by step.</summary>
+    private readonly ForwardEmit[]? _forwardEmitKinds;
+
+    /// <summary>The action to re-emit for each <see cref="ForwardEmit.Fixed"/> step.</summary>
+    private readonly Action<IEngine>?[]? _forwardFixedActions;
+
     private readonly int[]? _fusedStepIndices;
     private readonly Action<IEngine>[]? _fusedForwardActions;
     private bool _isFrozenWeights;
@@ -167,7 +197,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Action<IEngine>[]? fusedForwardActions = null,
         bool graphStepEligible = false,
         ILazyNode[]? fp16HeteroOrder = null,
-        int[][]? gradPoolReZeroByStep = null)
+        int[][]? gradPoolReZeroByStep = null,
+        ForwardEmit[]? forwardEmitKinds = null,
+        Action<IEngine>?[]? forwardFixedActions = null)
     {
         _gradPoolReZeroByStep = gradPoolReZeroByStep;
         _forwardActions = forwardActions;
@@ -195,6 +227,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _compiledInputTensor = compiledInputTensor;
         // Fall back to the compiled input when no distinct refresh tensor was supplied (non-graph / non-embedding).
         _graphRefreshTensor = graphRefreshTensor ?? compiledInputTensor;
+        _forwardEmitKinds = forwardEmitKinds;
+        _forwardFixedActions = forwardFixedActions;
         _fusedStepIndices = fusedStepIndices;
         _fusedForwardActions = fusedForwardActions;
         _lossGradDest = lossGradDest;
@@ -602,35 +636,37 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 "EnableFrozenWeightOptimizations requires a compiled plan with retained forward steps. " +
                 "Plans loaded from serialization don't currently carry the step metadata.");
 
-        // Rebuild forward actions with allowCachedB=true. Walks the original
-        // step list, preserves fused-group action identity, replaces non-
-        // fused step specializations with the cached-B variant.
-        var fusedSet = _fusedStepIndices is null
-            ? null
-            : new HashSet<int>(_fusedStepIndices);
+        // Rebuild the forward actions, replaying the verdict the compile-time walk already
+        // reached for each step instead of re-deriving it. Only a Rebuildable step is
+        // re-specialized; a Fixed one keeps the exact action it was given (analytic forward,
+        // slice-prefix MatMul, fused group) and a Skip stays skipped.
+        //
+        // Re-deriving here is what made this wrong: the walk that built these actions weighs seven
+        // cases and this one knew three, so a slice step already consumed by a fused MatMul was
+        // re-executed as a standalone action and the analytic forwards were dropped.
+        if (_forwardEmitKinds is null || _forwardFixedActions is null)
+            throw new InvalidOperationException(
+                "EnableFrozenWeightOptimizations requires the compile-time forward decisions. " +
+                "Plans loaded from serialization don't currently carry them.");
+
         var rebuiltForward = new List<Action<IEngine>>(_forwardSteps.Length);
         bool installedSpecialization = false;
-        int nextFusedGroupIdx = 0;
         for (int i = 0; i < _forwardSteps.Length; i++)
         {
-            if (fusedSet is not null && fusedSet.Contains(i))
+            switch (_forwardEmitKinds[i])
             {
-                bool isFirstInGroup = i == 0 || !fusedSet.Contains(i - 1);
-                if (isFirstInGroup && _fusedForwardActions is not null
-                    && nextFusedGroupIdx < _fusedForwardActions.Length)
-                {
-                    rebuiltForward.Add(_fusedForwardActions[nextFusedGroupIdx]);
-                    nextFusedGroupIdx++;
-                }
-                continue;
+                case ForwardEmit.Skip:
+                    continue;
+
+                case ForwardEmit.Fixed:
+                    var fixedAction = _forwardFixedActions[i];
+                    if (fixedAction is not null) rebuiltForward.Add(fixedAction);
+                    continue;
             }
 
             var step = _forwardSteps[i];
             // Training plans mutate parameters in-place between Step() calls, so the
-            // identity-keyed pre-pack cache would serve stale weights — same policy as
-            // the initial build below. (This site used to pass true, which was
-            // harmlessly ignored while the FusedLinear branch hardcoded false; now that
-            // the branch respects the caller's policy, training must say false here.)
+            // identity-keyed pre-pack cache would serve stale weights.
             var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
@@ -641,9 +677,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
-                rebuiltForward.Add(eng => exec(eng, output));
+                var opName = step.OpName;
+                rebuiltForward.Add(eng =>
+                {
+                    Engines.DirectGpuTensorEngine.s_currentForwardOp = opName;
+                    exec(eng, output);
+                    Engines.DirectGpuTensorEngine.TagProducer(output, opName);
+                });
             }
         }
+
         _forwardActions = rebuiltForward.ToArray();
         _isFrozenWeights = true;
         // Installing host-only forward specializations makes the action set unsafe for
@@ -5169,6 +5212,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var allForwardActions = new List<Action<IEngine>>();
         int genericForwardCount = 0; // engine-dispatched forward actions (for CUDA-graph eligibility)
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
+        // The verdict for each step, recorded as it is reached, so a later rebuild replays this
+        // walk instead of re-deriving it from a subset of the inputs.
+        var forwardEmitKinds = new ForwardEmit[forwardSteps.Count];
+        var forwardFixedActions = new Action<IEngine>?[forwardSteps.Count];
         for (int i = 0; i < forwardSteps.Count; i++)
         {
             // Phase G.8: analytic forward for MatMul→ReduceSum-loss replaces
@@ -5176,6 +5223,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (analyticForwardSpecs.TryGetValue(i, out var analyticFwdAction))
             {
                 allForwardActions.Add(analyticFwdAction);
+                forwardEmitKinds[i] = ForwardEmit.Fixed;
+                forwardFixedActions[i] = analyticFwdAction;
                 continue;
             }
             // Skip the ReduceSum's forward action when paired with an
@@ -5183,6 +5232,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the loss into the ReduceSum's output buffer.
             if (skippableReduceSumForwardIndices.Contains(i))
             {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
                 continue;
             }
             // Phase G.9: slice-prefix MatMul fusion — MatMul step uses
@@ -5190,10 +5240,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (slicePrefixForwardSpecs.TryGetValue(i, out var slicePrefixFwd))
             {
                 allForwardActions.Add(slicePrefixFwd);
+                forwardEmitKinds[i] = ForwardEmit.Fixed;
+                forwardFixedActions[i] = slicePrefixFwd;
                 continue;
             }
             if (consumedBySlicePrefix.Contains(i))
             {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
                 continue;  // Slice step — already handled by the fused MatMul above
             }
             if (fusedStepIndices.Contains(i))
@@ -5201,9 +5254,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // A fused step starts a new group when its predecessor is NOT fused.
                 // This correctly handles consecutive groups (e.g., {0,1,2, 3,4,5}).
                 bool isFirstInGroup = i == 0 || !fusedStepIndices.Contains(i - 1);
+                forwardEmitKinds[i] = ForwardEmit.Skip;
                 if (isFirstInGroup && nextFusedGroupIdx < fusedForwardActions.Count)
                 {
-                    allForwardActions.Add(fusedForwardActions[nextFusedGroupIdx]);
+                    var fusedGroupAction = fusedForwardActions[nextFusedGroupIdx];
+                    allForwardActions.Add(fusedGroupAction);
+                    forwardEmitKinds[i] = ForwardEmit.Fixed;
+                    forwardFixedActions[i] = fusedGroupAction;
                     nextFusedGroupIdx++;
                 }
                 continue;
@@ -5215,6 +5272,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // for training specialization; correctness over cache-hit speed.
             // On a GPU engine, skip the host CPU-SIMD specialization entirely (preferGenericForGpu) so the
             // op runs on the GPU and stays CUDA-graph-capturable.
+            forwardEmitKinds[i] = ForwardEmit.Rebuildable;
             var specialized = preferGenericForGpu ? null : TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
@@ -5540,7 +5598,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
             graphStepEligible,
             fp16HeteroOrder,
-            gradPoolReZeroByStep);
+            gradPoolReZeroByStep,
+            forwardEmitKinds,
+            forwardFixedActions);
     }
 
     /// <summary>
