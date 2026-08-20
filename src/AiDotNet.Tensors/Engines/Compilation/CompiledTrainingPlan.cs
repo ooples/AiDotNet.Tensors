@@ -765,27 +765,120 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public bool LastStepSkippedNonFiniteGradients { get; private set; }
 
     /// <summary>
-    /// Checks every materialized CPU gradient before any optimizer state or parameter is written.
-    /// GPU-resident entries intentionally have no host array and remain in the existing device-path
-    /// scope; unmaterialized parameters are also skipped because their pooled gradient storage was
-    /// not written by this step.
+    /// Resolves the authoritative gradient for every GPU-resident parameter before the optimizer
+    /// writes anything. A resident gradient is usable only when its device version is current;
+    /// otherwise the backward pass wrote the host backing and that backing remains authoritative.
+    /// </summary>
+    private void ResolveAuthoritativeGpuGradients(
+        Engines.DirectGpu.IGpuBuffer?[] gpuParameters,
+        Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
+        Engines.DirectGpu.IGpuBuffer?[] gpuGradients,
+        float[][] gradArrays,
+        int[] gradOffsets,
+        bool[] stagedGrads)
+    {
+        for (int p = 0; p < gpuGradients.Length; p++)
+        {
+            gpuGradients[p] = null;
+            if (gpuParameters[p] is null || gpuBackends[p] is not { } backend)
+                continue;
+
+            var gradient = _gradients[p];
+            if (gradient is null)
+                continue;
+
+            var resident = gradient.TryGetGpuBuffer();
+            bool streamCapturing =
+                backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing();
+            if (resident is not null &&
+                (streamCapturing || gradient._gpuBufferVersion == gradient.Version))
+            {
+                gpuGradients[p] = resident;
+                continue;
+            }
+
+            // A lazy gradient can materialize after ConfigureOptimizer. Bind it before the
+            // finiteness preflight; otherwise the update loop could upload and consume a gradient
+            // that the preflight never inspected.
+            if (gradArrays[p] is null || gradArrays[p].Length == 0)
+            {
+                var rebound = BindCpuOptimizerTensor(
+                    gradient, out gradOffsets[p], out stagedGrads[p]);
+                gradArrays[p] = (float[])(object)rebound;
+                if (stagedGrads[p] && gradArrays[p].Length != 0)
+                    gradient.CopyLogicalTo((T[])(object)gradArrays[p]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Allocates one reusable classification buffer per distinct GPU backend, sized for that
+    /// backend's largest parameter. Sharing keeps the guard's persistent memory bounded by the
+    /// largest tensor rather than the sum of every gradient tensor.
+    /// </summary>
+    private void AllocateGpuFinitenessScratch(
+        Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
+        int[] lengths,
+        Engines.DirectGpu.IGpuBuffer?[] scratchByParameter)
+    {
+        for (int p = 0; p < gpuBackends.Length; p++)
+        {
+            if (gpuBackends[p] is not { } backend || scratchByParameter[p] is not null)
+                continue;
+
+            int maximumLength = lengths[p];
+            for (int q = p + 1; q < gpuBackends.Length; q++)
+                if (ReferenceEquals(gpuBackends[q], backend))
+                    maximumLength = Math.Max(maximumLength, lengths[q]);
+
+            var sharedScratch = backend.AllocateBuffer(maximumLength);
+            _gpuOptimizerBuffers.Add(sharedScratch);
+            for (int q = p; q < gpuBackends.Length; q++)
+                if (ReferenceEquals(gpuBackends[q], backend))
+                    scratchByParameter[q] = sharedScratch;
+        }
+    }
+
+    /// <summary>
+    /// Checks every authoritative CPU or GPU gradient before any optimizer state or parameter is
+    /// written. GPU gradients are classified on-device using the backend's IEEE-bitwise
+    /// <c>ClassifyFloat</c> kernel and reduced to one scalar; the full gradient is never downloaded.
     /// </summary>
     private unsafe bool TryDiscardNonFiniteOptimizerStep(
         float[][] gradArrays,
         int[] gradOffsets,
-        float[][] paramArrays,
+        Engines.DirectGpu.IGpuBuffer?[] gpuGradients,
+        Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
+        Engines.DirectGpu.IGpuBuffer?[] gpuFinitenessScratch,
         int[] paramOffsets,
         int[] lengths,
         OptimizerType optimizerType,
+        float[][] paramArrays,
         float[][] scheduleFreeEvalCopies)
     {
         bool gradientsFinite = true;
         for (int p = 0; p < gradArrays.Length && gradientsFinite; p++)
         {
+            if (gpuGradients[p] is { } gpuGradient)
+            {
+                var backend = gpuBackends[p]
+                    ?? throw new InvalidOperationException("A GPU gradient has no owning backend.");
+                var scratch = gpuFinitenessScratch[p]
+                    ?? throw new InvalidOperationException("GPU gradient finiteness scratch was not allocated.");
+                int length = lengths[p];
+                if (length <= 0)
+                    continue;
+
+                // mode 2 = isfinite. Min(mask) is exactly 1 only when every element is finite;
+                // unlike summing a 0/1 mask, this cannot lose a single zero to float rounding for
+                // tensors larger than 2^24 elements.
+                backend.ClassifyFloat(gpuGradient, scratch, mode: 2, size: length);
+                gradientsFinite = backend.Min(scratch, length) == 1.0f;
+                continue;
+            }
+
             var gradients = gradArrays[p];
-            var parameters = paramArrays[p];
-            if (gradients is null || gradients.Length == 0 ||
-                parameters is null || parameters.Length == 0)
+            if (gradients is null || gradients.Length == 0)
             {
                 continue;
             }
@@ -2309,6 +2402,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
         var gpuGradUploadScratch = new float[paramCount][];
+        var gpuFinitenessScratch = new Engines.DirectGpu.IGpuBuffer?[paramCount];
 
         // Issue #350: GetDataArray() returns a COPY when the parameter tensor's
         // backing storage is pool-padded (e.g. logical length 6 on a 16-slot
@@ -2510,6 +2604,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
+        AllocateGpuFinitenessScratch(gpuBackends, lengths, gpuFinitenessScratch);
+
         _optimizerStep = 0;
         var b1 = beta1;
         var b2 = beta2;
@@ -2631,8 +2727,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
             _optimizerStep++;
+            ResolveAuthoritativeGpuGradients(
+                gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             if (TryDiscardNonFiniteOptimizerStep(
-                gradArrays, gradOffsets, paramArrays, paramOffsets, lengths, optimizerType, v))
+                gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
+                paramOffsets, lengths, optimizerType, paramArrays, v))
             {
                 return;
             }
@@ -3003,9 +3102,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (gpuM[p] is not { } gm || gpuV[p] is not { } gv) { eligible = false; break; }
                     int lp = lengths[p];
                     if (lp <= 0) { eligible = false; break; }
-                    var gt = _gradients[p];
-                    var gradResident = gt?.TryGetGpuBuffer();
-                    if (gt is null || gradResident is null || gt._gpuBufferVersion != gt.Version) { eligible = false; break; }
+                    var gradResident = gpuGrad[p];
+                    if (gradResident is null) { eligible = false; break; }
                     mtParams.Add(gp); mtGrads.Add(gradResident); mtM.Add(gm); mtV.Add(gv); mtSizes.Add(lp);
                 }
                 if (eligible && mtParams.Count == paramCount)
@@ -3057,37 +3155,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // (uploaded transiently) or GPU (passed through directly).
                 if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
                 {
-                    // CAPTURE-FREEZE FIX (#638): re-resolve the gradient's resident buffer EACH STEP. gpuGrad[p]
-                    // was bound ONCE at ConfigureOptimizer time — but under CUDA-graph capture the backward writes
-                    // grads into a buffer made GPU-resident by the capture pre-pass (EnsureResidentBuffer on
-                    // _preAllocatedGrads), which runs AFTER ConfigureOptimizer. So at config time the param-grad
-                    // tensor was NOT yet resident → gpuGrad[p] was null → the optimizer fell back to uploading the
-                    // stale host backing (gradArrays[p], all zeros after the captured resident backward bypassed
-                    // it) → AdamUpdate ran on ~zero grads → weights never changed → FLAT loss / frozen pL1 across
-                    // epochs (the capture-doesn't-learn bug; only visible at a learning scale, not the smoke run).
-                    // Reading the tensor's CURRENT resident buffer each step makes the optimizer consume the grads
-                    // the captured backward actually produced. Mirrors the param-side pin near the GPU fast path.
-                    // Eager paths are unaffected: a non-resident grad still yields null here → gpuGrad/host fallback.
-                    // The #638 line trusts the grad tensor's resident GPU buffer as authoritative. That is correct
-                    // ONLY when that buffer actually holds the gradient the backward produced THIS step. Two backward
-                    // paths write it and keep its version in sync with the tensor Version: (a) CUDA-graph capture —
-                    // the captured backward writes it in place; (b) the FP16-hetero resident backward. But the plain
-                    // eager backward instead accumulates into the grad's HOST backing (gradArrays[p]) and leaves the
-                    // resident buffer at its memset-zero: Version bumps, _gpuBufferVersion does NOT. Consuming that
-                    // stale-zero buffer makes the fused optimizer apply ~ZERO grads, so the weights barely move and
-                    // the loss goes FLAT — the GPU-resident-param mistrain (7.70->7.70 resident vs 7.70->1.31
-                    // non-resident on the same graph; the TimeSeries family runs this path by default). So trust the
-                    // resident grad buffer only when it is version-FRESH (or we are mid stream-capture, where a host
-                    // download is impossible anyway); otherwise upload the authoritative HOST gradient the backward
-                    // produced. This keeps the #638 capture path AND the FP16 resident backward intact.
-                    bool gradStreamCapturing =
-                        gpuBe is Engines.DirectGpu.CUDA.CudaBackend _cbGrad && _cbGrad.IsStreamCapturing();
-                    var _gradT = _gradients[p];
-                    bool residentGradAuthoritative = _gradT is not null && _gradT.TryGetGpuBuffer() is not null
-                        && (gradStreamCapturing || _gradT._gpuBufferVersion == _gradT.Version);
-                    Engines.DirectGpu.IGpuBuffer? gradBuf = residentGradAuthoritative
-                        ? _gradT!.TryGetGpuBuffer()
-                        : null;
+                    // The preflight resolved this step's authoritative gradient before checking
+                    // every gradient for finiteness. Reuse that exact buffer here so the update
+                    // cannot consume a different, unchecked source.
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = gpuGrad[p];
                     bool gradTransient = false;
                     if (gradBuf is null)
                     {
@@ -3502,6 +3573,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
         var gpuGradUploadScratch = new float[paramCount][];
+        var gpuFinitenessScratch = new Engines.DirectGpu.IGpuBuffer?[paramCount];
 
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
@@ -3675,6 +3747,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
+        AllocateGpuFinitenessScratch(gpuBackends, lengths, gpuFinitenessScratch);
+
         _optimizerStep = 0;
         var b1 = beta1;
         var b2 = beta2;
@@ -3729,8 +3803,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
             _optimizerStep++;
+            ResolveAuthoritativeGpuGradients(
+                gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             if (TryDiscardNonFiniteOptimizerStep(
-                gradArrays, gradOffsets, paramArrays, paramOffsets, lengths, optimizerType, v))
+                gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
+                paramOffsets, lengths, optimizerType, paramArrays, v))
             {
                 return;
             }
@@ -3759,18 +3836,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // GPU path (mirrors ConfigureOptimizerFloat).
                 if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
                 {
-                    // CAPTURE-FREEZE FIX (#638): re-resolve the gradient's resident buffer EACH STEP. gpuGrad[p]
-                    // was bound ONCE at ConfigureOptimizer time — but under CUDA-graph capture the backward writes
-                    // grads into a buffer made GPU-resident by the capture pre-pass (EnsureResidentBuffer on
-                    // _preAllocatedGrads), which runs AFTER ConfigureOptimizer. So at config time the param-grad
-                    // tensor was NOT yet resident → gpuGrad[p] was null → the optimizer fell back to uploading the
-                    // stale host backing (gradArrays[p], all zeros after the captured resident backward bypassed
-                    // it) → AdamUpdate ran on ~zero grads → weights never changed → FLAT loss / frozen pL1 across
-                    // epochs (the capture-doesn't-learn bug; only visible at a learning scale, not the smoke run).
-                    // Reading the tensor's CURRENT resident buffer each step makes the optimizer consume the grads
-                    // the captured backward actually produced. Mirrors the param-side pin near the GPU fast path.
-                    // Eager paths are unaffected: a non-resident grad still yields null here → gpuGrad/host fallback.
-                    Engines.DirectGpu.IGpuBuffer? gradBuf = (_gradients[p]?.TryGetGpuBuffer()) ?? gpuGrad[p];
+                    // Use the source selected and checked by the all-gradient preflight. This also
+                    // fixes the grouped path's former unconditional trust of a stale resident
+                    // gradient when the current backward had written the host backing instead.
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = gpuGrad[p];
                     bool gradTransient = false;
                     if (gradBuf is null)
                     {

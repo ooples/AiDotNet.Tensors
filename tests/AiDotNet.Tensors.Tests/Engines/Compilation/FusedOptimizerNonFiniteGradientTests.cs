@@ -1,6 +1,9 @@
+using System;
+using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -73,6 +76,67 @@ public class FusedOptimizerNonFiniteGradientTests
         }
 
         return (plan, param);
+    }
+
+    private static (ICompiledTrainingPlan<float> plan, Tensor<float>[] parameters) BuildTwoParameterPlan()
+    {
+        var first = new Tensor<float>(new[] { 16 });
+        var second = new Tensor<float>(new[] { 16 });
+        var input = new Tensor<float>(new[] { 16 });
+        for (int i = 0; i < input.Length; i++)
+        {
+            first[i] = 1f;
+            second[i] = 2f;
+            input[i] = 1f;
+        }
+
+        var engine = new CpuEngine();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var firstProduct = engine.TensorMultiply(first, input);
+            var secondProduct = engine.TensorMultiply(second, input);
+            var combined = engine.TensorAdd(firstProduct, secondProduct);
+            engine.ReduceSum(combined, null);
+            plan = scope.CompileTraining(new[] { first, second });
+        }
+
+        return (plan, new[] { first, second });
+    }
+
+    private static void AttachGpuBuffer(
+        Tensor<float> tensor,
+        AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend backend,
+        float value)
+    {
+        var data = new float[tensor.Length];
+        for (int i = 0; i < data.Length; i++) data[i] = value;
+        tensor._gpuBuffer = new MockGpuBuffer(data);
+        tensor._gpuBackend = backend;
+        tensor._gpuBufferVersion = tensor.Version;
+    }
+
+    private static Tensor<float>[] GetPlanGradients(ICompiledTrainingPlan<float> plan)
+    {
+        var field = plan.GetType().GetField("_gradients", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Compiled plan gradient field was not found.");
+        return (Tensor<float>[])field.GetValue(plan)!;
+    }
+
+    private static void InvokeOptimizerUpdate(ICompiledTrainingPlan<float> plan)
+    {
+        var field = plan.GetType().GetField("_optimizerUpdate", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Compiled plan optimizer closure was not found.");
+        var update = (Action?)field.GetValue(plan)
+            ?? throw new InvalidOperationException("Compiled plan optimizer was not configured.");
+        update();
+    }
+
+    private static int GetOptimizerStep(ICompiledTrainingPlan<float> plan)
+    {
+        var field = plan.GetType().GetField("_optimizerStep", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Compiled plan optimizer step field was not found.");
+        return (int)field.GetValue(plan)!;
     }
 
     private static float[] Snapshot(Tensor<float> t)
@@ -179,6 +243,192 @@ public class FusedOptimizerNonFiniteGradientTests
                 Assert.True(before[i].Equals(param[i]), $"grouped parameter[{i}] changed");
         }
     }
+
+    [Theory]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    public void GpuResidentGradient_NonFiniteValue_SkipsBeforeAnyGpuUpdate(float badGradient)
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var (plan, parameters) = BuildTwoParameterPlan();
+        using (plan)
+        {
+            foreach (var parameter in parameters) AttachGpuBuffer(parameter, backend, 1f);
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.1f);
+
+            var gradients = GetPlanGradients(plan);
+            AttachGpuBuffer(gradients[0], backend, 1f);
+            AttachGpuBuffer(gradients[1], backend, badGradient);
+
+            InvokeOptimizerUpdate(plan);
+
+            Assert.True(plan.LastStepSkippedNonFiniteGradients);
+            Assert.Equal(1, plan.NonFiniteStepsSkipped);
+            Assert.Equal(2, state.ClassifyFloatCalls);
+            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Empty(state.OptimizerCalls);
+            Assert.Equal(0, state.DownloadBufferCalls);
+            Assert.Equal(new[] { 16 }, state.AllocationSizes);
+            Assert.Equal(0, GetOptimizerStep(plan));
+
+            foreach (var gradient in gradients) AttachGpuBuffer(gradient, backend, 1f);
+            InvokeOptimizerUpdate(plan);
+
+            Assert.False(plan.LastStepSkippedNonFiniteGradients);
+            Assert.Equal(1, plan.NonFiniteStepsSkipped);
+            Assert.Equal(1, GetOptimizerStep(plan));
+            Assert.Equal(new[] { "SgdUpdate", "SgdUpdate" }, state.OptimizerCalls);
+        }
+    }
+
+    [Fact]
+    public void GpuResidentFiniteGradients_RunEveryGpuUpdate()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var (plan, parameters) = BuildTwoParameterPlan();
+        using (plan)
+        {
+            foreach (var parameter in parameters) AttachGpuBuffer(parameter, backend, 1f);
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.1f);
+
+            foreach (var gradient in GetPlanGradients(plan))
+                AttachGpuBuffer(gradient, backend, 1f);
+
+            InvokeOptimizerUpdate(plan);
+
+            Assert.False(plan.LastStepSkippedNonFiniteGradients);
+            Assert.Equal(0, plan.NonFiniteStepsSkipped);
+            Assert.Equal(2, state.ClassifyFloatCalls);
+            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(new[] { "SgdUpdate", "SgdUpdate" }, state.OptimizerCalls);
+            Assert.Equal(0, state.DownloadBufferCalls);
+            Assert.Equal(new[] { 16 }, state.AllocationSizes);
+        }
+    }
+
+    [Fact]
+    public void MultiTensorGpuRoute_NonFiniteGradient_SkipsBeforeBatchedUpdate()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.CreateMultiTensor(state);
+        var (plan, parameters) = BuildTwoParameterPlan();
+        using (plan)
+        {
+            foreach (var parameter in parameters) AttachGpuBuffer(parameter, backend, 1f);
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.001f);
+
+            var gradients = GetPlanGradients(plan);
+            AttachGpuBuffer(gradients[0], backend, 1f);
+            AttachGpuBuffer(gradients[1], backend, float.NaN);
+
+            InvokeOptimizerUpdate(plan);
+
+            Assert.True(plan.LastStepSkippedNonFiniteGradients);
+            Assert.Equal(1, plan.NonFiniteStepsSkipped);
+            Assert.Empty(state.OptimizerCalls);
+            Assert.Equal(2, state.ClassifyFloatCalls);
+            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(0, state.DownloadBufferCalls);
+        }
+    }
+
+    [Fact]
+    public void MultiTensorGpuRoute_FiniteGradients_UsesOneBatchedUpdate()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.CreateMultiTensor(state);
+        var (plan, parameters) = BuildTwoParameterPlan();
+        using (plan)
+        {
+            foreach (var parameter in parameters) AttachGpuBuffer(parameter, backend, 1f);
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.001f);
+
+            foreach (var gradient in GetPlanGradients(plan))
+                AttachGpuBuffer(gradient, backend, 1f);
+
+            InvokeOptimizerUpdate(plan);
+
+            Assert.False(plan.LastStepSkippedNonFiniteGradients);
+            Assert.Equal(0, plan.NonFiniteStepsSkipped);
+            Assert.Equal(new[] { "AdamMultiTensorUpdate" }, state.OptimizerCalls);
+            Assert.Equal(2, state.ClassifyFloatCalls);
+            Assert.Equal(2, state.ScalarMinCalls);
+            Assert.Equal(0, state.DownloadBufferCalls);
+        }
+    }
+
+    [Fact]
+    public void GroupedGpuPlan_StaleResidentGradientChecksAuthoritativeHostValues()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var (plan, parameters) = BuildTwoParameterPlan();
+        using (plan)
+        {
+            foreach (var parameter in parameters) AttachGpuBuffer(parameter, backend, 1f);
+            plan.ConfigureOptimizerGrouped(
+                OptimizerType.SGD,
+                new[] { LrSchedule.Constant(0.1) },
+                new[] { 0, 0 });
+
+            var gradients = GetPlanGradients(plan);
+            AttachGpuBuffer(gradients[0], backend, 1f);
+            AttachGpuBuffer(gradients[1], backend, 1f);
+            for (int i = 0; i < gradients[1].Length; i++) gradients[1][i] = float.NaN;
+
+            InvokeOptimizerUpdate(plan);
+
+            Assert.True(plan.LastStepSkippedNonFiniteGradients);
+            Assert.Equal(1, plan.NonFiniteStepsSkipped);
+            Assert.Empty(state.OptimizerCalls);
+            Assert.Equal(1, state.ClassifyFloatCalls);
+            Assert.Equal(1, state.ScalarMinCalls);
+            Assert.Equal(0, state.DownloadBufferCalls);
+        }
+    }
+
+#if !NETFRAMEWORK
+    [SkippableFact]
+    public void ActiveGpuBackend_ClassifyAndReduceDetectsEveryNonFiniteKind()
+    {
+        AiDotNet.Tensors.Engines.DirectGpuTensorEngine? engine = null;
+        try
+        {
+            engine = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        }
+        catch
+        {
+            Skip.If(true, "No direct GPU backend is available on this host.");
+        }
+
+        using (engine)
+        {
+            Skip.If(engine is null || !engine.IsGpuAvailable, "No direct GPU backend is available on this host.");
+            var backend = engine!.GetBackend();
+            Skip.If(backend is null, "No direct GPU backend is available on this host.");
+
+            foreach (int length in new[] { 1, 4, 31, 32, 33, 255, 256, 257, 1025 })
+            {
+                foreach (float badValue in new[]
+                         { 0f, float.NaN, float.PositiveInfinity, float.NegativeInfinity })
+                {
+                    var values = new float[length];
+                    for (int i = 0; i < length; i++) values[i] = 1f;
+                    bool allFinite = badValue == 0f;
+                    if (!allFinite) values[length - 1] = badValue;
+
+                    using var gradient = backend!.AllocateBuffer(values);
+                    using var scratch = backend.AllocateBuffer(length);
+                    backend.ClassifyFloat(gradient, scratch, mode: 2, size: length);
+                    Assert.Equal(allFinite ? 1f : 0f, backend.Min(scratch, length));
+                }
+            }
+        }
+    }
+#endif
 
     [Theory]
     [InlineData(double.NaN)]
