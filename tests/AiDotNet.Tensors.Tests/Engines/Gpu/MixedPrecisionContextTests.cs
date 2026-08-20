@@ -28,17 +28,15 @@ public class MixedPrecisionContextTests
     }
 
     [Fact]
-    public void BeginAutocast_WithBFloat16_ThrowsNotSupported()
+    public void BeginAutocast_WithBFloat16_ReturnsActiveScope()
     {
-        // MixedPrecisionContext accepts BFloat16 at construction for
-        // policy/routing purposes, but the FP16 compute path in
-        // AutocastScope doesn't yet handle BFloat16 — BeginAutocast must
-        // throw rather than silently degrade. This test pins that
-        // contract so a future implementation change doesn't accidentally
-        // promote BFloat16 to an unsupported runtime path.
         using var ctx = new MixedPrecisionContext<float>(
             defaultPrecision: PrecisionMode.BFloat16);
-        Assert.Throws<NotSupportedException>(() => ctx.BeginAutocast());
+        using var scope = ctx.BeginAutocast();
+
+        Assert.True(AutocastScope.IsEnabled);
+        Assert.Equal(PrecisionMode.BFloat16, AutocastScope.ActivePrecision);
+        Assert.Same(ctx.Policy, scope.Policy);
     }
 
     [Fact]

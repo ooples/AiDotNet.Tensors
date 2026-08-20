@@ -181,6 +181,20 @@ namespace AiDotNet.Tensors.Tests.TestHelpers
 
         #endregion
 
+        #region IsFinite
+
+        /// <summary>Returns true when <paramref name="value"/> is neither NaN nor infinite
+        /// (float.IsFinite is net-core-only).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
+        /// <summary>Returns true when <paramref name="value"/> is neither NaN nor infinite
+        /// (double.IsFinite is net-core-only).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
+
+        #endregion
+
         #region Float bit helpers (net471-safe reinterpret + BitDecrement)
 
         /// <summary>Reinterprets a float's bits as an int (BitConverter.SingleToInt32Bits is net-core-only).</summary>

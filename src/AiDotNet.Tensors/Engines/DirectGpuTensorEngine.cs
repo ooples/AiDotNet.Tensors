@@ -3484,17 +3484,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunUnary<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
-        // Same precision guard as TryRunBinary: do not upload CPU-resident doubles into a
-        // single-precision kernel. Sqrt is the one that mattered for Adam. See IsGpuPrecisionSafe.
+        // PreserveInputType and the legacy strict-FP64 switch keep exact-T work on CPU.
         if (!IsGpuPrecisionSafe(input))
             return null;
 
         if (!TryGetBackend(out var backend))
             return null;
 
+        var precisionOperation = PrecisionOperationForUnary(callerName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, callerName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
+
         try
         {
-            return TryRunUnaryGpu(backend, input, op);
+            return TryRunUnaryGpu(backend, input, op, precisionOperation, precisionPlan);
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
@@ -3518,35 +3525,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    private T[]? TryRunUnaryGpu<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
+    private T[]? TryRunUnaryGpu<T>(
+        IDirectGpuBackend backend,
+        Tensor<T> input,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
+        Gpu.GpuPrecisionOperation precisionOperation,
+        Gpu.GpuComputePlan precisionPlan)
     {
         using var bufferA = GetOrAllocateBuffer(backend, input);
         var bufferB = AllocateOutputBuffer(backend, input.Length);
         try
         {
-            // AutocastScope: convert to fp16 for compute, back to fp32 for output.
-            // try/finally guarantees fp16Input is released even if op() or
-            // ConvertToFp32 throws.
-            IGpuBuffer? fp16Input = null;
-            try
+            if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
             {
-                fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, input.Length);
-                if (fp16Input is not null)
-                {
-                    using var fp16Output = AllocateOutputBuffer(backend, input.Length);
-                    op(backend, fp16Input, fp16Output.Buffer, input.Length);
-                    backend.ConvertToFp32(fp16Output.Buffer, bufferB.Buffer, input.Length);
-                }
-                else
-                {
-                    op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
-                }
+                using var fp16Input = AllocateReducedPrecisionInput(
+                    backend, bufferA.Buffer, input.Length, precisionPlan);
+                using var fp16Output = AllocateReducedPrecisionOutput(backend, input.Length, precisionPlan);
+                ExecuteFp16Unary(backend, precisionOperation, fp16Input, fp16Output, input.Length);
+                backend.ConvertToFp32(fp16Output, bufferB.Buffer, input.Length);
             }
-            finally
+            else
             {
-                fp16Input?.Dispose();
+                op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
             }
-            return FinishGpuOp<T>(backend, bufferB, input.Length);
+            var result = FinishGpuOp<T>(backend, bufferB, input.Length);
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return result;
         }
         catch
         {
@@ -3572,6 +3576,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal T[]? TryRunUnaryChunked<T>(IDirectGpuBackend backend, Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent, string opName = "Unary")
     {
         emittedEvent = false;
+        var precisionOperation = PrecisionOperationForUnary(opName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, opName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
         long capBytes = ex.DeviceMaxAllocBytes;
         if (capBytes <= 0) return null;
         int totalElements = input.Length;
@@ -3622,33 +3633,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 using var bufferIn = new OwnedBuffer(backend.AllocateBuffer(slice), ownsBuffer: true);
                 using var bufferOut = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                // Mirror the AutocastScope behaviour from TryRunUnaryGpu: when
-                // autocast is enabled, run the kernel on fp16 and convert back
-                // to fp32 for the downloaded result. Without this the chunked
-                // fallback would silently change numeric / perf behaviour vs
-                // the normal GPU path.
-                IGpuBuffer? fp16Input = null;
-                try
+                if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
                 {
-                    fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferIn.Buffer, len);
-                    if (fp16Input is not null)
-                    {
-                        using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                        op(backend, fp16Input, fp16Out.Buffer, len);
-                        backend.ConvertToFp32(fp16Out.Buffer, bufferOut.Buffer, len);
-                    }
-                    else
-                    {
-                        op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
-                    }
+                    using var fp16Input = AllocateReducedPrecisionInput(
+                        backend, bufferIn.Buffer, len, precisionPlan);
+                    using var fp16Out = AllocateReducedPrecisionOutput(backend, len, precisionPlan);
+                    ExecuteFp16Unary(backend, precisionOperation, fp16Input, fp16Out, len);
+                    backend.ConvertToFp32(fp16Out, bufferOut.Buffer, len);
                 }
-                finally
+                else
                 {
-                    fp16Input?.Dispose();
+                    op(backend, bufferIn.Buffer, bufferOut.Buffer, len);
                 }
                 var chunkResult = backend.DownloadBuffer(bufferOut.Buffer);
                 Array.Copy(chunkResult, 0, resultFloat, offset, len);
             }
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
             return (T[])(object)resultFloat;
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException)
@@ -3675,42 +3675,78 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Tensor-aware TryRunBinary: checks GPU activation cache BEFORE triggering CPU materialization.
     /// </summary>
     /// <summary>
-    /// True when running <typeparamref name="T"/> through a single-precision GPU kernel cannot
-    /// silently lose precision the caller asked for.
+    /// True when the active execution policy permits conversion through the FP32 GPU boundary.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// Narrowing double -> float is intended only at a real device boundary, for data that already
-    /// lives on the device. The upload-compute-download paths are the opposite case: the operands
-    /// are CPU-resident, so they get copied into a float kernel and the caller receives
-    /// float-accurate answers despite having asked for double.
-    /// </para>
-    /// <para>
-    /// Measured before this guard: <c>AiDotNetEngine.Current.Multiply</c> on a CPU-resident
-    /// <c>Vector&lt;double&gt;</c> returned 0.30000001192092896 where double gives
-    /// 0.30000000000000004 -- 3.974E-008 relative, which is float32 epsilon (~1.19e-7), not double
-    /// (~2.2e-16). The same ops on an explicitly constructed <c>CpuEngine</c> were exact, so the
-    /// kernels were never the problem; the dispatch was. It also cost a host-&gt;device-&gt;host round
-    /// trip PER OP on data that never needed to leave the CPU.
-    /// </para>
-    /// <para>
-    /// Tensors that really are device-resident are unaffected: they are served by the resident
-    /// paths (<c>TryBinaryResidentOutOfPlace</c> and friends), which run before this check.
-    /// </para>
+    /// Speed-first is the default and accepts T -&gt; FP32 -&gt; T conversion for every numeric T.
+    /// PreserveInputType (and the legacy strict-FP64 environment switch) returns false so the
+    /// caller falls through to the generic CPU implementation.
     /// </remarks>
     private static bool IsGpuPrecisionSafe<T>(Tensor<T> a, Tensor<T>? b = null)
+        // The planner that immediately follows this check can honor PreserveInputType with an
+        // exact backend route (for example Half ReLU). Only the legacy process-wide FP64 switch
+        // must short-circuit before planning.
+        => !(DirectGpuEngine.StrictFp64Fallback && typeof(T) == typeof(double));
+
+    private static Gpu.GpuPrecisionOperation PrecisionOperationForUnary(string operationName)
     {
-        if (typeof(T) != typeof(double)) return true;          // float/half already match the kernels
-        if (a.IsGpuResident) return true;                      // already on the device by the caller's choice
-        if (b is not null && b.IsGpuResident) return true;
-        return false;
+        if (operationName.IndexOf("gelu", StringComparison.OrdinalIgnoreCase) >= 0)
+            return Gpu.GpuPrecisionOperation.Gelu;
+        if (operationName.IndexOf("relu", StringComparison.OrdinalIgnoreCase) >= 0)
+            return Gpu.GpuPrecisionOperation.Relu;
+        return Gpu.GpuPrecisionOperation.Elementwise;
+    }
+
+    private static Gpu.GpuPrecisionOperation PrecisionOperationForBinary(string operationName)
+        => operationName.IndexOf("add", StringComparison.OrdinalIgnoreCase) >= 0
+            ? Gpu.GpuPrecisionOperation.Add
+            : Gpu.GpuPrecisionOperation.Elementwise;
+
+    private static void ExecuteFp16Unary(
+        IDirectGpuBackend backend,
+        Gpu.GpuPrecisionOperation operation,
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int size)
+    {
+        if (backend is not Gpu.IGpuFp16ElementwiseBackend fp16 || !fp16.SupportsFp16NativeOps)
+            throw new NotSupportedException($"{backend.BackendName} advertised typed FP16 element-wise support without a dispatch implementation.");
+
+        switch (operation)
+        {
+            case Gpu.GpuPrecisionOperation.Relu:
+                fp16.Fp16Relu(input, output, size);
+                break;
+            case Gpu.GpuPrecisionOperation.Gelu:
+                fp16.Fp16Gelu(input, output, size);
+                break;
+            default:
+                throw new NotSupportedException($"No typed FP16 unary dispatch exists for {operation}.");
+        }
+    }
+
+    private static void ExecuteFp16Binary(
+        IDirectGpuBackend backend,
+        Gpu.GpuPrecisionOperation operation,
+        IGpuBuffer left,
+        IGpuBuffer right,
+        IGpuBuffer output,
+        int size)
+    {
+        if (operation != Gpu.GpuPrecisionOperation.Add
+            || backend is not Gpu.IGpuFp16ElementwiseBackend fp16
+            || !fp16.SupportsFp16NativeOps)
+        {
+            throw new NotSupportedException($"No typed FP16 binary dispatch exists for {operation} on {backend.BackendName}.");
+        }
+
+        fp16.Fp16Add(left, right, output, size);
     }
 
     private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
-        // Fall through to base (CpuEngine), which computes in the declared T, rather than uploading
-        // CPU-resident doubles into a single-precision kernel. See IsGpuPrecisionSafe.
+        // Exact-T policies fall through to the generic CPU implementation.
         if (!IsGpuPrecisionSafe(left, right))
             return null;
 
@@ -3719,9 +3755,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (left.Length != right.Length)
             return null;
 
+        var precisionOperation = PrecisionOperationForBinary(callerName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, callerName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
+
         try
         {
-            return TryRunBinaryGpu(backend, left, right, op);
+            return TryRunBinaryGpu(backend, left, right, op, precisionOperation, precisionPlan);
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex)
         {
@@ -3737,39 +3781,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    private T[]? TryRunBinaryGpu<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
+    private T[]? TryRunBinaryGpu<T>(
+        IDirectGpuBackend backend,
+        Tensor<T> left,
+        Tensor<T> right,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
+        Gpu.GpuPrecisionOperation precisionOperation,
+        Gpu.GpuComputePlan precisionPlan)
     {
         using var bufferA = GetOrAllocateBuffer(backend, left);
         using var bufferB = GetOrAllocateBuffer(backend, right);
         var bufferC = AllocateOutputBuffer(backend, left.Length);
         try
         {
-            // fp16A / fp16B are raw IGpuBuffer? (no IDisposable wrapper) so we
-            // must guarantee Dispose() runs even if op() or ConvertToFp32 throws.
-            // Previously these leaked on any exception inside the if-branch.
-            IGpuBuffer? fp16A = null;
-            IGpuBuffer? fp16B = null;
-            try
+            if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
             {
-                fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
-                fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
-                if (fp16A is not null && fp16B is not null)
-                {
-                    using var fp16Out = AllocateOutputBuffer(backend, left.Length);
-                    op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
-                    backend.ConvertToFp32(fp16Out.Buffer, bufferC.Buffer, left.Length);
-                }
-                else
-                {
-                    op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-                }
+                using var fp16A = AllocateReducedPrecisionInput(
+                    backend, bufferA.Buffer, left.Length, precisionPlan);
+                using var fp16B = AllocateReducedPrecisionInput(
+                    backend, bufferB.Buffer, right.Length, precisionPlan);
+                using var fp16Out = AllocateReducedPrecisionOutput(backend, left.Length, precisionPlan);
+                ExecuteFp16Binary(backend, precisionOperation, fp16A, fp16B, fp16Out, left.Length);
+                backend.ConvertToFp32(fp16Out, bufferC.Buffer, left.Length);
             }
-            finally
+            else
             {
-                fp16A?.Dispose();
-                fp16B?.Dispose();
+                op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
             }
-            return FinishGpuOp<T>(backend, bufferC, left.Length);
+            var result = FinishGpuOp<T>(backend, bufferC, left.Length);
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return result;
         }
         catch
         {
@@ -3786,6 +3827,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal T[]? TryRunBinaryChunked<T>(IDirectGpuBackend backend, Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex, out bool emittedEvent, string opName = "Binary")
     {
         emittedEvent = false;
+        var precisionOperation = PrecisionOperationForBinary(opName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, opName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
         long capBytes = ex.DeviceMaxAllocBytes;
         if (capBytes <= 0) return null;
         int totalElements = left.Length;
@@ -3830,34 +3878,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bA = new OwnedBuffer(backend.AllocateBuffer(sliceL), ownsBuffer: true);
                 using var bB = new OwnedBuffer(backend.AllocateBuffer(sliceR), ownsBuffer: true);
                 using var bC = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                // Mirror the AutocastScope behaviour from TryRunBinaryGpu so the
-                // chunked fallback doesn't silently change numeric/perf behaviour
-                // when autocast is enabled.
-                IGpuBuffer? fp16A = null;
-                IGpuBuffer? fp16B = null;
-                try
+                if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
                 {
-                    fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bA.Buffer, len);
-                    fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bB.Buffer, len);
-                    if (fp16A is not null && fp16B is not null)
-                    {
-                        using var fp16Out = new OwnedBuffer(backend.AllocateBuffer(len), ownsBuffer: true);
-                        op(backend, fp16A, fp16B, fp16Out.Buffer, len);
-                        backend.ConvertToFp32(fp16Out.Buffer, bC.Buffer, len);
-                    }
-                    else
-                    {
-                        op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
-                    }
+                    using var fp16A = AllocateReducedPrecisionInput(backend, bA.Buffer, len, precisionPlan);
+                    using var fp16B = AllocateReducedPrecisionInput(backend, bB.Buffer, len, precisionPlan);
+                    using var fp16Out = AllocateReducedPrecisionOutput(backend, len, precisionPlan);
+                    ExecuteFp16Binary(backend, precisionOperation, fp16A, fp16B, fp16Out, len);
+                    backend.ConvertToFp32(fp16Out, bC.Buffer, len);
                 }
-                finally
+                else
                 {
-                    fp16A?.Dispose();
-                    fp16B?.Dispose();
+                    op(backend, bA.Buffer, bB.Buffer, bC.Buffer, len);
                 }
                 var chunkResult = backend.DownloadBuffer(bC.Buffer);
                 Array.Copy(chunkResult, 0, resultFloat, offset, len);
             }
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
             return (T[])(object)resultFloat;
         }
         catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException)
@@ -3881,12 +3917,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
-        // A T[] is CPU memory by definition -- see the note on the binary array overload.
-        if (typeof(T) == typeof(double))
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
 
         if (!TryGetBackend(out var backend))
             return null;
+
+        var precisionOperation = PrecisionOperationForUnary(callerName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, callerName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
 
         try
         {
@@ -3894,8 +3937,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufferB = AllocateOutputBuffer(backend, input.Length);
             try
             {
-                op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
-                return FinishGpuOpImmediate<T>(backend, bufferB, input.Length);
+                if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
+                {
+                    using var fp16Input = AllocateReducedPrecisionInput(
+                        backend, bufferA.Buffer, input.Length, precisionPlan);
+                    using var fp16Output = AllocateReducedPrecisionOutput(backend, input.Length, precisionPlan);
+                    ExecuteFp16Unary(backend, precisionOperation, fp16Input, fp16Output, input.Length);
+                    backend.ConvertToFp32(fp16Output, bufferB.Buffer, input.Length);
+                }
+                else
+                {
+                    op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                }
+                var result = FinishGpuOpImmediate<T>(backend, bufferB, input.Length);
+                Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+                return result;
             }
             catch
             {
@@ -3912,18 +3968,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
-        // A T[] is CPU memory by definition, so uploading double data into a single-precision
-        // kernel here is ALWAYS a silent precision loss -- there is no device residency to respect.
-        // This is the overload the explicit IEngine.Add/Subtract/Multiply/Divide vector members
-        // call via GetDataArray(), which is how CPU-resident doubles were reaching a float kernel.
-        // See IsGpuPrecisionSafe; returning null falls through to base (CpuEngine).
-        if (typeof(T) == typeof(double))
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
 
         if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
             return null;
+
+        var precisionOperation = PrecisionOperationForBinary(callerName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, callerName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
 
         try
         {
@@ -3932,8 +3991,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufferC = AllocateOutputBuffer(backend, left.Length);
             try
             {
-                op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-                return FinishGpuOpImmediate<T>(backend, bufferC, left.Length);
+                if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
+                {
+                    using var fp16A = AllocateReducedPrecisionInput(
+                        backend, bufferA.Buffer, left.Length, precisionPlan);
+                    using var fp16B = AllocateReducedPrecisionInput(
+                        backend, bufferB.Buffer, right.Length, precisionPlan);
+                    using var fp16Out = AllocateReducedPrecisionOutput(backend, left.Length, precisionPlan);
+                    ExecuteFp16Binary(backend, precisionOperation, fp16A, fp16B, fp16Out, left.Length);
+                    backend.ConvertToFp32(fp16Out, bufferC.Buffer, left.Length);
+                }
+                else
+                {
+                    op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+                }
+                var result = FinishGpuOpImmediate<T>(backend, bufferC, left.Length);
+                Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+                return result;
             }
             catch
             {
@@ -3950,10 +4024,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
-        // A T[] is CPU memory by definition -- see the note on the binary array overload. Note this
-        // overload's kernel signature takes a `float` scalar, so a double scalar could never have
-        // survived the call in the first place.
-        if (typeof(T) == typeof(double))
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
 
         if (!TryGetBackend(out var backend))
@@ -4796,10 +4867,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return false;
 
+        var precisionOperation = PrecisionOperationForBinary(callerName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, callerName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return false;
+        }
+
         // GPU-RESIDENT compiled-step path: op directly into destination's stable buffer — no temp output
         // allocation and no DtoH download (both abort CUDA-graph capture + ping-pong host every op). Gated on
         // suspended eviction (the compiled step pins buffers) and no autocast fp16 remap.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled)
+        if (ResidentStepActive && precisionPlan.InputStorage == Gpu.GpuScalarType.Float32)
         {
             try
             {
@@ -4835,30 +4914,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var output = AllocateOutputBuffer(backend, left.Length);
             try
             {
-                IGpuBuffer? fp16A = null;
-                IGpuBuffer? fp16B = null;
-                try
+                if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
                 {
-                    fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
-                    fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
-                    if (fp16A is not null && fp16B is not null)
-                    {
-                        using var fp16Out = AllocateOutputBuffer(backend, left.Length);
-                        op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
-                        backend.ConvertToFp32(fp16Out.Buffer, output.Buffer, left.Length);
-                    }
-                    else
-                    {
-                        op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
-                    }
+                    using var fp16A = AllocateReducedPrecisionInput(
+                        backend, bufferA.Buffer, left.Length, precisionPlan);
+                    using var fp16B = AllocateReducedPrecisionInput(
+                        backend, bufferB.Buffer, right.Length, precisionPlan);
+                    using var fp16Out = AllocateReducedPrecisionOutput(backend, left.Length, precisionPlan);
+                    ExecuteFp16Binary(backend, precisionOperation, fp16A, fp16B, fp16Out, left.Length);
+                    backend.ConvertToFp32(fp16Out, output.Buffer, left.Length);
                 }
-                finally
+                else
                 {
-                    fp16A?.Dispose();
-                    fp16B?.Dispose();
+                    op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
                 }
 
                 DownloadGpuBufferInto(backend, output, destinationArray, left.Length);
+                Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
                 return true;
             }
             catch
@@ -5226,20 +5298,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
                 && halfBackend.SupportsHgemm)
             {
-                // Issue #560: FP16 tensor-core fast path. cublasGemmEx with
+                // Issue #560: FP16 vendor-library fast path. cublasGemmEx with
                 // FP16 inputs and an FP32 accumulator is the standard
                 // mixed-precision matmul (matches the AMP forward pass): the
-                // multiply runs on tensor cores, the FP32 accumulator preserves
+                // vendor library chooses the available FP16 execution units, and the FP32
+                // accumulator preserves
                 // long-chain precision, and the FP32 output flows back into
                 // the activation cache so downstream FP32 ops can consume it
                 // directly. The two FP32→FP16 conversions are O(MK+KN) —
                 // negligible against the O(MKN) GEMM.
                 //
-                // GemmFp16In32fOut requires tensor cores. Some CC>=5 GPUs
-                // (notably Turing TU116/TU117 — the GTX 16-series) advertise
-                // FP16 support but lack tensor cores, and cublasGemmEx returns
-                // CUBLAS_STATUS_NOT_SUPPORTED on those parts. Try the FP16 path
-                // first; on a clean failure fall through to SGEMM on the same
+                // A backend can support FP16 storage conversion without supporting this typed GEMM
+                // combination. Try the FP16 path first; on a clean capability/runtime failure fall
+                // through to SGEMM on the same
                 // (already-uploaded) FP32 inputs. This is the right behavior
                 // for "Half user on hardware that can't accelerate Half" —
                 // they get the FP32 speed of the GPU instead of dropping to
@@ -5255,7 +5326,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 catch (InvalidOperationException)
                 {
-                    // Tensor cores not available — SGEMM fallback below.
+                    // Typed FP16 GEMM unavailable at runtime — SGEMM fallback below.
                 }
                 catch (NotSupportedException)
                 {
@@ -19007,6 +19078,156 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated matrix operations (MatMul, Transpose, Permute)
     // ──────────────────────────────────────────────────────────────
 
+    private static IGpuBuffer AllocateReducedPrecisionInput(
+        IDirectGpuBackend backend,
+        IGpuBuffer fp32Input,
+        int elementCount,
+        Gpu.GpuComputePlan plan)
+    {
+        if (plan.InputStorage != Gpu.GpuScalarType.Float16)
+            throw new NotSupportedException($"No conversion implementation exists for {plan.InputStorage} input storage.");
+
+        var reduced = plan.ReducesStorageBytes
+            ? backend.AllocateByteBuffer(checked(elementCount * 2))
+            : backend.AllocateBuffer(elementCount);
+        try
+        {
+            backend.ConvertToFp16(fp32Input, reduced, elementCount);
+            return reduced;
+        }
+        catch
+        {
+            reduced.Dispose();
+            throw;
+        }
+    }
+
+    private static IGpuBuffer AllocateReducedPrecisionOutput(
+        IDirectGpuBackend backend,
+        int elementCount,
+        Gpu.GpuComputePlan plan)
+    {
+        if (plan.OutputStorage != Gpu.GpuScalarType.Float16)
+            throw new NotSupportedException($"No reduced output allocation exists for {plan.OutputStorage} storage.");
+
+        return plan.ReducesStorageBytes
+            ? backend.AllocateByteBuffer(checked(elementCount * 2))
+            : backend.AllocateBuffer(elementCount);
+    }
+
+    private Tensor<T> ExecutePlannedGemm<T>(
+        IDirectGpuBackend backend,
+        Tensor<T> a,
+        Tensor<T> b,
+        int m,
+        int n,
+        int k,
+        int[] outputShape,
+        Gpu.GpuComputePlan plan)
+    {
+        using var bufferA = GetOrAllocateBuffer(backend, a);
+        using var bufferB = GetOrAllocateBuffer(backend, b);
+        var bufferOut = AllocateOutputBuffer(backend, checked(m * n));
+        try
+        {
+            if (plan.InputStorage == Gpu.GpuScalarType.Float16)
+            {
+                if (backend is not IGpuHalfPrecisionBackend halfBackend || !halfBackend.SupportsHgemm)
+                    throw new NotSupportedException($"{backend.BackendName} advertised FP16 GEMM without an executable half GEMM route.");
+
+                using var fp16A = AllocateReducedPrecisionInput(backend, bufferA.Buffer, checked(m * k), plan);
+                using var fp16B = AllocateReducedPrecisionInput(backend, bufferB.Buffer, checked(k * n), plan);
+                halfBackend.GemmFp16In32fOut(fp16A, fp16B, bufferOut.Buffer, m, n, k);
+            }
+            else if (plan.InputStorage == Gpu.GpuScalarType.Float32)
+            {
+                backend.Gemm(bufferA.Buffer, bufferB.Buffer, bufferOut.Buffer, m, n, k);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"The selected {plan.InputStorage} GEMM route has no backend dispatch implementation.");
+            }
+
+            var result = DeferTensorResult<T>(backend, bufferOut.Buffer, checked(m * n), outputShape);
+            Gpu.GpuPrecisionDiagnostics.Publish(plan);
+            return result;
+        }
+        catch
+        {
+            bufferOut.Dispose();
+            throw;
+        }
+    }
+
+    private Tensor<T> ExecutePlannedBatchedGemm<T>(
+        IDirectGpuBackend backend,
+        Tensor<T> a,
+        Tensor<T> b,
+        int batchCount,
+        int m,
+        int n,
+        int k,
+        int[] outputShape,
+        Gpu.GpuComputePlan plan)
+    {
+        // IDirectGpuBackend currently exposes only an FP32 BatchedGemm contract. Explicit FP16/BF16/FP8
+        // requests therefore resolve to FP32 before reaching this method rather than being misrepresented.
+        if (plan.InputStorage != Gpu.GpuScalarType.Float32)
+            throw new NotSupportedException($"No batched GEMM dispatch exists for {plan.InputStorage} storage.");
+
+        using var bufferA = GetOrAllocateBuffer(backend, a);
+        using var bufferB = GetOrAllocateBuffer(backend, b);
+        var outputLength = checked(batchCount * m * n);
+        var bufferOut = AllocateOutputBuffer(backend, outputLength);
+        try
+        {
+            backend.BatchedGemm(bufferA.Buffer, bufferB.Buffer, bufferOut.Buffer, m, n, k, batchCount);
+            var result = DeferTensorResult<T>(backend, bufferOut.Buffer, outputLength, outputShape);
+            Gpu.GpuPrecisionDiagnostics.Publish(plan);
+            return result;
+        }
+        catch
+        {
+            bufferOut.Dispose();
+            throw;
+        }
+    }
+
+    private static bool TryGetContiguousBatchedMatMulDimensions<T>(
+        Tensor<T> a,
+        Tensor<T> b,
+        out int batchCount,
+        out int m,
+        out int n,
+        out int k,
+        out int[] outputShape)
+    {
+        batchCount = 0;
+        m = n = k = 0;
+        outputShape = Array.Empty<int>();
+        if (a.Rank < 3 || b.Rank != a.Rank || !a.IsContiguous || !b.IsContiguous)
+            return false;
+
+        int rank = a.Rank;
+        m = a.Shape._dims[rank - 2];
+        k = a.Shape._dims[rank - 1];
+        if (b.Shape._dims[rank - 2] != k)
+            return false;
+        n = b.Shape._dims[rank - 1];
+        batchCount = 1;
+        for (int dimension = 0; dimension < rank - 2; dimension++)
+        {
+            if (a.Shape._dims[dimension] != b.Shape._dims[dimension])
+                return false;
+            batchCount = checked(batchCount * a.Shape._dims[dimension]);
+        }
+
+        outputShape = (int[])a.Shape._dims.Clone();
+        outputShape[rank - 1] = n;
+        return true;
+    }
+
     public override Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
@@ -19019,9 +19240,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // A is row-major [.., K], so collapsing all leading dims into a single M is a pure reshape (same
         // memory): do ONE GPU GEMM [M*, K]×[K, N] then reshape the result back to a.dims[:-1] + [N].
         // MatMulBackward already handles the ND×2D shapes (the base CpuEngine path recorded it identically).
-        if (typeof(T) == typeof(float) && a.Rank > 2 && b.Rank == 2
+        if (a.Rank > 2 && b.Rank == 2
             && a.Shape._dims[a.Rank - 1] == b.Shape._dims[0])
         {
+            var ndPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(
+                backend, Gpu.GpuPrecisionOperation.MatMul, "TensorMatMul.NDx2D");
+            if (ndPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+            {
+                Gpu.GpuPrecisionDiagnostics.Publish(ndPlan);
+                return base.TensorMatMul(a, b);
+            }
+
             try
             {
                 int Kc = a.Shape._dims[a.Rank - 1];
@@ -19030,44 +19259,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int d = 0; d < a.Rank - 1; d++) Mc *= a.Shape._dims[d];
                 int[] outShapeRes = (int[])a.Shape._dims.Clone();
                 outShapeRes[a.Rank - 1] = Nc;
-                if (TryMatMulResident(a, b, Mc, Nc, Kc, outShapeRes) is { } rmm)
+                if (ndPlan.InputStorage == Gpu.GpuScalarType.Float32
+                    && TryMatMulResident(a, b, Mc, Nc, Kc, outShapeRes) is { } rmm)
                 {
+                    Gpu.GpuPrecisionDiagnostics.Publish(ndPlan);
                     Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", rmm, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
                     return rmm;
                 }
-                using var bufAc = GetOrAllocateBuffer(backend, a);
-                using var bufBc = GetOrAllocateBuffer(backend, b);
-                var bufOutc = AllocateOutputBuffer(backend, Mc * Nc);
-                backend.Gemm(bufAc.Buffer, bufBc.Buffer, bufOutc.Buffer, Mc, Nc, Kc);
-                int[] outShapec = (int[])a.Shape._dims.Clone();
-                outShapec[a.Rank - 1] = Nc;
-                var outputc = DeferTensorResult<T>(backend, bufOutc.Buffer, Mc * Nc, outShapec);
+                var outputc = ExecutePlannedGemm(backend, a, b, Mc, Nc, Kc, outShapeRes, ndPlan);
                 Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", outputc, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
                 return outputc;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
+                    backend, "TensorMatMul.NDx2D", ndPlan.RequestedPreference,
+                    $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
                 return base.TensorMatMul(a, b);
             }
         }
-        // PR #638 A1: resident-step CONTIGUOUS BATCHED matmul for ND×ND (the 4D attention score/output backward
-        // GEMMs: [B,H,M,K]×[B,H,K,N] → [B,H,M,N]). Collapse the leading dims into batchCount and run one resident
-        // BatchedGemm into a resident-bound output (capture-safe sequential cublasSgemm-per-batch loop) — no
-        // base CpuEngine download. Same contiguous batched semantics base.TensorMatMul records (MatMulBackward).
-        if (typeof(T) == typeof(float) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled
-            && a.Rank >= 3 && b.Rank == a.Rank)
+        // Contiguous ND×ND matmul collapses every matching leading dimension into one batch count. This is the
+        // same shape contract for float, double, Half, and other generic T values; only the physical compute plan
+        // differs. The resident fast path remains available for its existing FP32 capture-safe case.
+        if (TryGetContiguousBatchedMatMulDimensions(
+            a, b, out int batch, out int Mb, out int Nb, out int Kb, out int[] batchedOutShape))
         {
-            int rk = a.Rank;
-            int Mb = a.Shape._dims[rk - 2], Kb = a.Shape._dims[rk - 1];
-            int Nb = b.Shape._dims[rk - 1];
-            bool leadingMatch = b.Shape._dims[rk - 2] == Kb;
-            int batch = 1;
-            for (int d = 0; d < rk - 2 && leadingMatch; d++)
+            var batchPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(
+                backend, Gpu.GpuPrecisionOperation.BatchMatMul, "TensorMatMul.NDxND");
+            if (batchPlan.Route == Gpu.GpuExecutionRoute.Cpu)
             {
-                if (a.Shape._dims[d] != b.Shape._dims[d]) { leadingMatch = false; break; }
-                batch *= a.Shape._dims[d];
+                Gpu.GpuPrecisionDiagnostics.Publish(batchPlan);
+                return base.TensorMatMul(a, b);
             }
-            if (leadingMatch && a.IsContiguous && b.IsContiguous)
+
+            if (typeof(T) == typeof(float) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled
+                && batchPlan.InputStorage == Gpu.GpuScalarType.Float32)
             {
                 var aR = ResolveResidentBufferNoUpload(backend, a, batch * Mb * Kb);
                 var bR = ResolveResidentBufferNoUpload(backend, b, batch * Kb * Nb);
@@ -19075,15 +19301,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     try
                     {
-                        var outDims = (int[])a.Shape._dims.Clone();
-                        outDims[rk - 1] = Nb;
-                        var output = new Tensor<T>(new T[(long)batch * Mb * Nb], outDims);
+                        var output = new Tensor<T>(new T[(long)batch * Mb * Nb], batchedOutShape);
                         var outBuf = GetOrCreateResidentBuffer(backend, output, batch * Mb * Nb);
                         if (outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= (long)batch * Mb * Nb)
                         {
                             backend.BatchedGemm(aR, bR, outBuf, Mb, Nb, Kb, batch, 1f, 0f);
                             ResidentSyncCheck("BatchedMatMulResident");
                             BindResidentBuffer(output, outBuf, backend);
+                            Gpu.GpuPrecisionDiagnostics.Publish(batchPlan);
                             Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", output, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
                             return output;
                         }
@@ -19093,14 +19318,38 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 else if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
                     AliasDiag($"BatchedMatMul bail aResident={aR is not null} bResident={bR is not null} aShape=[{string.Join(",", a._shape)}]");
             }
+
+            try
+            {
+                var output = ExecutePlannedBatchedGemm(
+                    backend, a, b, batch, Mb, Nb, Kb, batchedOutShape, batchPlan);
+                Autodiff.DifferentiableOps.RecordBinary(
+                    "TensorMatMul", output, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                return output;
+            }
+            catch (Exception ex)
+            {
+                Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
+                    backend, "TensorMatMul.NDxND", batchPlan.RequestedPreference,
+                    $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+                return base.TensorMatMul(a, b);
+            }
         }
 
-        // Remaining non-2D shapes (ND × ND, K-mismatch, non-float) go through the base CpuEngine path,
-        // which correctly handles ND × ND (per-batch GEMM) and records on the tape.
+        // Remaining non-2D shapes (broadcasting, non-contiguous views, or shape mismatch) retain the CPU
+        // reference semantics until the backend contract can represent them without materializing incorrectly.
         if (a.Rank != 2 || b.Rank != 2)
         {
             if (ResidentStepActive && System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
                 AliasDiag($"MatMul ND-base-fallthrough aShape=[{string.Join(",", a._shape)}] bShape=[{string.Join(",", b._shape)}]");
+            return base.TensorMatMul(a, b);
+        }
+
+        var rank2Plan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(
+            backend, Gpu.GpuPrecisionOperation.MatMul, "TensorMatMul.Rank2");
+        if (rank2Plan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(rank2Plan);
             return base.TensorMatMul(a, b);
         }
 
@@ -19121,8 +19370,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // PR #638 A1: resident-step GEMM into a resident-bound output (no temp/download) so the backward
             // matmul grads stay resident for capture.
-            if (TryMatMulResident(a, b, M, N, K, new[] { M, N }) is { } rmm2d)
+            if (rank2Plan.InputStorage == Gpu.GpuScalarType.Float32
+                && TryMatMulResident(a, b, M, N, K, new[] { M, N }) is { } rmm2d)
             {
+                Gpu.GpuPrecisionDiagnostics.Publish(rank2Plan);
                 Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", rmm2d, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
                 return rmm2d;
             }
@@ -19133,7 +19384,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. Runs on ANY
             // backend that ships a half-output GEMM (IGpuHalfPrecisionBackend.Hgemm / SupportsHgemm) — the
             // half-resident matmul forward is no longer CUDA-only.
-            if (typeof(T) == typeof(Half) && s_fp16FwdStore
+            if (rank2Plan.InputStorage == Gpu.GpuScalarType.Float16
+                && typeof(T) == typeof(Half) && s_fp16FwdStore
                 && backend is IGpuHalfPrecisionBackend hpFwd && hpFwd.SupportsHgemm)
             {
                 IGpuBuffer? hAiOwned = null, hBiOwned = null, hOut = null;
@@ -19147,6 +19399,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
+                    Gpu.GpuPrecisionDiagnostics.Publish(rank2Plan);
                     Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", outputH, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
                     storeOk = true;
                     return outputH;
@@ -19161,17 +19414,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 finally { hAiOwned?.Dispose(); hBiOwned?.Dispose(); if (!storeOk) hOut?.Dispose(); }
             }
 
-            using var bufA = GetOrAllocateBuffer(backend, a);
-            using var bufB = GetOrAllocateBuffer(backend, b);
-
-            var bufOut = AllocateOutputBuffer(backend, M * N);
-            backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
-            var output = DeferTensorResult<T>(backend, bufOut.Buffer, M * N, new[] { M, N });
+            var output = ExecutePlannedGemm(backend, a, b, M, N, K, new[] { M, N }, rank2Plan);
             Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", output, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
             return output;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
+                backend, "TensorMatMul.Rank2", rank2Plan.RequestedPreference,
+                $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
             return base.TensorMatMul(a, b);
         }
     }
@@ -19179,12 +19430,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <inheritdoc/>
     public override Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b)
     {
-        // GPU path: float-only + 2D for now (matches the CPU fast-path
-        // contract). Other dtypes / higher rank fall through to the
-        // CpuEngine base implementation which correctly materializes
-        // the transpose for the generic case.
-        if (typeof(T) != typeof(float) || a.Rank != 2 || b.Rank != 2 || !TryGetBackend(out var backend))
+        if (a.Rank != 2 || b.Rank != 2 || !TryGetBackend(out var backend))
             return base.TensorMatMulTransposed(a, b);
+
+        var plan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(
+            backend, Gpu.GpuPrecisionOperation.MatMulTransposed, "TensorMatMulTransposed");
+        if (plan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(plan);
+            return base.TensorMatMulTransposed(a, b);
+        }
 
         try
         {
@@ -19204,14 +19459,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // no materialized transpose copy.
             backend.MatMulTransposed(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
             var output = DeferTensorResult<T>(backend, bufOut.Buffer, M * N, new[] { M, N });
+            Gpu.GpuPrecisionDiagnostics.Publish(plan);
             // Use the dedicated MatMulTransposedBackward — see CpuEngine
             // override for why MatMulBackward is wrong here.
             Autodiff.DifferentiableOps.RecordBinary("TensorMatMulTransposed", output, a, b,
                 Autodiff.BackwardFunctions<T>.MatMulTransposedBackward);
             return output;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
+                backend, "TensorMatMulTransposed", plan.RequestedPreference,
+                $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
             return base.TensorMatMulTransposed(a, b);
         }
     }
@@ -19301,24 +19560,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend) || a.Rank < 3 || b.Rank < 3)
             return base.BatchMatMul(a, b);
 
+        if (!TryGetContiguousBatchedMatMulDimensions(
+            a, b, out int batchCount, out int m, out int n, out int k, out int[] outputShape))
+            return base.BatchMatMul(a, b);
+
+        var plan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(
+            backend, Gpu.GpuPrecisionOperation.BatchMatMul, "BatchMatMul");
+        if (plan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(plan);
+            return base.BatchMatMul(a, b);
+        }
+
         try
         {
-            int batchSize = a.Shape._dims[0];
-            int M = a.Shape._dims[a.Rank - 2];
-            int K = a.Shape._dims[a.Rank - 1];
-            int N = b.Shape._dims[b.Rank - 1];
-            using var bufA = GetOrAllocateBuffer(backend, a);
-            using var bufB = GetOrAllocateBuffer(backend, b);
-            var bufOut = AllocateOutputBuffer(backend, batchSize * M * N);
-            backend.BatchedGemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K, batchSize);
-            int[] outShape = (int[])a.Shape._dims.Clone();
-            outShape[a.Rank - 1] = N;
-            var output = DeferTensorResult<T>(backend, bufOut.Buffer, batchSize * M * N, outShape);
+            var output = ExecutePlannedBatchedGemm(
+                backend, a, b, batchCount, m, n, k, outputShape, plan);
             Autodiff.DifferentiableOps.RecordBinary("BatchMatMul", output, a, b, Autodiff.BackwardFunctions<T>.BatchMatMulBackward);
             return output;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
+                backend, "BatchMatMul", plan.RequestedPreference,
+                $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
             return base.BatchMatMul(a, b);
         }
     }

@@ -1,23 +1,24 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
 /// <summary>
-/// A caller that asks for <c>double</c> and hands the engine CPU-resident data must get double
-/// answers, whatever the ambient engine happens to be.
+/// A caller that opts into input-type preservation must get exact <c>double</c> answers, whatever
+/// engine happens to be selected.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Narrowing double -&gt; float belongs at a real device boundary, for data that already lives on the
-/// device. It was also happening on the upload-compute-download paths: with
+/// Speed-first GPU execution intentionally permits a double -&gt; float32 -&gt; double boundary. These
+/// tests exercise the complementary preservation contract: with
 /// <c>AiDotNetEngine.Current</c> resolving to <see cref="DirectGpuTensorEngine"/>, a CPU-resident
 /// <c>Vector&lt;double&gt;</c> multiplied by a double came back with 3.974E-008 relative error --
-/// float32 epsilon (~1.19e-7), not double epsilon (~2.2e-16) -- because the operands were copied
-/// into a single-precision kernel. The same operations on an explicitly constructed
-/// <see cref="CpuEngine"/> were exact, so the kernels were never the problem; the dispatch was.
+/// float32 epsilon (~1.19e-7), not double epsilon (~2.2e-16), unless preservation was selected.
+/// The same operations on an explicitly constructed <see cref="CpuEngine"/> were exact, so the
+/// preservation policy must route to a computation that really retains double precision.
 /// </para>
 /// <para>
 /// The cost was not only accuracy: every such op paid a host-&gt;device-&gt;host round trip for data
@@ -88,6 +89,7 @@ public class CpuResidentDoublePrecisionTests : IDisposable
         // -- which is EVERY run on a CPU-only host, i.e. the common case.
         _owned.Add(gpu);
         Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/…).");
+        _owned.Add(new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve));
         return gpu;
     }
 

@@ -2261,7 +2261,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                             betaPtr,
                             sPtr, CuBlasNative.CUDA_R_32F, seqLen,
                             _fp32GemmComputeType,
-                            0 /* CUBLAS_GEMM_DEFAULT */),
+                            CuBlasNative.CUBLAS_GEMM_DEFAULT),
                         $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
                 });
             }
@@ -2445,7 +2445,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         betaPtr,
                         cPtr, CuBlasNative.CUDA_R_32F, N,
                         _fp32GemmComputeType,
-                        0 /* CUBLAS_GEMM_DEFAULT */),
+                        CuBlasNative.CUBLAS_GEMM_DEFAULT),
                     $"cublasGemmEx slice {slice}");
             });
         }
@@ -13972,7 +13972,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             betaPtr,
             C.Handle, CuBlasNative.CUDA_R_32F, N,
             CuBlasNative.CUBLAS_COMPUTE_32F,
-            0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */);
+            CuBlasNative.CUBLAS_GEMM_DEFAULT);
 
         // CUBLAS_STATUS_NOT_SUPPORTED is a CAPABILITY signal, not an operational failure:
         // the FP16-in / FP32-compute cublasGemmEx config isn't available on this device
