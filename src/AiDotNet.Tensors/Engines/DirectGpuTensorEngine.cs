@@ -10089,7 +10089,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Gpu.GpuPrecisionDiagnostics.Publish(abcPlan);
             return result;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
         {
             throw new InvalidOperationException(
                 $"AbcScanForward failed on the selected {abcBackend.DeviceType} backend; CPU fallback is disabled for this GPU route.",
@@ -18363,7 +18363,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new ArgumentException("TensorAdd operands must have identical shapes in strict GPU mode.");
             return base.TensorAdd(a, b);
+        }
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Add(ia, ib, o, n)) is { } radd)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorAdd", radd, a, b, Autodiff.BackwardFunctions<T>.AddBackward);
@@ -18405,7 +18409,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorAdd has no eligible GPU route for the selected inputs and precision policy.");
         return base.TensorAdd(a, b);
     }
 
@@ -18436,7 +18445,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new ArgumentException("TensorMultiply operands must have identical shapes in strict GPU mode.");
             return base.TensorMultiply(a, b);
+        }
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Multiply(ia, ib, o, n)) is { } rmul)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorMultiply", rmul, a, b, Autodiff.BackwardFunctions<T>.MultiplyBackward);
@@ -18452,7 +18465,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorMultiply has no eligible GPU route for the selected inputs and precision policy.");
         return base.TensorMultiply(a, b);
     }
 
@@ -19223,7 +19241,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorMultiplyScalar has no eligible GPU route for the selected input and precision policy.");
         return base.TensorMultiplyScalar(tensor, scalar);
     }
 
@@ -20677,7 +20700,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Softmax<T>(Tensor<T> input, int axis)
     {
         if (!TryGetBackend(out var backend))
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException("Softmax requires an available GPU backend in strict GPU mode.");
             return base.Softmax(input, axis);
+        }
 
         // The GPU softmax kernel here only handles softmax over the LAST
         // axis correctly — it reshapes the tensor as (outerSize, features)
@@ -20688,7 +20715,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int rank = input.Rank;
         int ea = axis < 0 ? rank + axis : axis;
         if (ea != rank - 1)
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException("The direct GPU softmax route supports only the last axis.");
             return base.Softmax(input, axis);
+        }
 
         try
         {
@@ -20750,8 +20781,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Autodiff.BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
             return output;
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.Softmax(input, axis);
         }
     }
@@ -23133,7 +23165,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 handedOff = true;
                 return result;
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
+            catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
             {
                 System.Diagnostics.Trace.TraceWarning($"GPU pixel shuffle fallback: {ex.GetType().Name}: {ex.Message}");
             }
@@ -23421,8 +23453,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
                 // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
                 System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
+                if (ThrowOnGpuKernelFallback) throw;
             }
         }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorConcatenate has no eligible GPU route for the selected inputs.");
         return base.TensorConcatenate(tensors, axis);
     }
 
@@ -23928,6 +23963,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (IsTapeActive<T>()) return base.TensorSliceAxis(tensor, axis, index);
         int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
         if (TryDeviceSliceAxis(tensor, normalizedAxis, index) is { } resident) return resident;
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorSliceAxis has no eligible GPU route for the selected input.");
         return base.TensorSliceAxis(tensor, axis, index);
     }
 
