@@ -1,6 +1,7 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -34,6 +35,13 @@ public class AbcScanGpuParityTests
         var a = new float[n];
         for (int i = 0; i < n; i++) a[i] = (float)(1.0 / (1.0 + Math.Exp(-Math.Sin(0.5 * (i + 1) + 1.3 * s))));
         return a;
+    }
+
+    private static double[] ToDouble(float[] values)
+    {
+        var result = new double[values.Length];
+        for (int i = 0; i < values.Length; i++) result[i] = values[i];
+        return result;
     }
 
     /// <summary>
@@ -80,6 +88,19 @@ public class AbcScanGpuParityTests
                 new Tensor<float>(Gen(batch * seqLen * modelDim, 3), shape),
                 new Tensor<float>(GenGate(batch * seqLen * numHeads, 4), new[] { batch, seqLen, numHeads }),
                 new Tensor<float>(Gen(numHeads * numSlots * headDim, 5), new[] { numHeads, numSlots, headDim }));
+    }
+
+    private static (Tensor<double> q, Tensor<double> k, Tensor<double> v, Tensor<double> fg, Tensor<double> sk)
+        MakeDoubleInputs(int batch, int seqLen, int modelDim, int numHeads, int numSlots, int headDim)
+    {
+        var shape = new[] { batch, seqLen, modelDim };
+        return (new Tensor<double>(ToDouble(Gen(batch * seqLen * modelDim, 1)), shape),
+                new Tensor<double>(ToDouble(Gen(batch * seqLen * modelDim, 2)), shape),
+                new Tensor<double>(ToDouble(Gen(batch * seqLen * modelDim, 3)), shape),
+                new Tensor<double>(ToDouble(GenGate(batch * seqLen * numHeads, 4)),
+                    new[] { batch, seqLen, numHeads }),
+                new Tensor<double>(ToDouble(Gen(numHeads * numSlots * headDim, 5)),
+                    new[] { numHeads, numSlots, headDim }));
     }
 
     [SkippableTheory]
@@ -134,5 +155,72 @@ public class AbcScanGpuParityTests
             GpuLaunchProbe.CaptureReadbackSites = savedCaptureReadbackSites;
             DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
         }
+    }
+
+    [SkippableFact]
+    public void SpeedFirstDouble_ConvertsThroughGpuWithoutChangingPublicType()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
+
+        const int batch = 2, seqLen = 3, modelDim = 8, numHeads = 2, numSlots = 3;
+        const int headDim = modelDim / numHeads;
+        var (q, k, v, fg, sk) = MakeDoubleInputs(batch, seqLen, modelDim, numHeads, numSlots, headDim);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
+        using var expectedTensor = new CpuEngine().AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        var expected = (double[])(object)expectedTensor.GetDataArray()!;
+
+        bool savedCaptureReadbackSites = GpuLaunchProbe.CaptureReadbackSites;
+        try
+        {
+            GpuLaunchProbe.CaptureReadbackSites = true;
+            GpuLaunchProbe.Reset();
+            using var result = gpu.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+
+            Assert.True(GpuLaunchProbe.Count > 0, "Speed-first double ABC launched no GPU work.");
+            Assert.True(GpuLaunchProbe.Readbacks == 0,
+                $"Speed-first double ABC performed {GpuLaunchProbe.Readbacks} internal readbacks: " +
+                string.Join("; ", GpuLaunchProbe.ReadbackSites));
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+
+            var actual = (double[])(object)result.GetDataArray()!;
+            Assert.Equal(expected.Length, actual.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) < 2e-5,
+                    $"speed-first double[{i}] cpu={expected[i]} gpu-fp32={actual[i]}");
+        }
+        finally
+        {
+            GpuLaunchProbe.CaptureReadbackSites = savedCaptureReadbackSites;
+        }
+    }
+
+    [SkippableFact]
+    public void PreserveInputTypeDouble_UsesExactCpuRoute()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve);
+
+        const int batch = 1, seqLen = 2, modelDim = 4, numHeads = 2, numSlots = 2;
+        const int headDim = modelDim / numHeads;
+        var (q, k, v, fg, sk) = MakeDoubleInputs(batch, seqLen, modelDim, numHeads, numSlots, headDim);
+        using var qOwner = q;
+        using var kOwner = k;
+        using var vOwner = v;
+        using var fgOwner = fg;
+        using var skOwner = sk;
+        using var expectedTensor = new CpuEngine().AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        var expected = (double[])(object)expectedTensor.GetDataArray()!;
+
+        GpuLaunchProbe.Reset();
+        using var result = gpu.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
+        Assert.Equal(0, GpuLaunchProbe.Count);
+        Assert.Equal(expected, (double[])(object)result.GetDataArray()!);
     }
 }
