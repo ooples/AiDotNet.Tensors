@@ -71,6 +71,59 @@ internal static class FusedOptimizer
         return (length + chunk - 1) / chunk;
     }
 
+    /// <summary>
+    /// Returns <c>false</c> as soon as any element is NaN or infinite. Used to gate a fused
+    /// optimizer step on the gradients being usable BEFORE any parameter is written.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every update kernel below reads <c>grad</c> and writes <c>param</c> in a single pass, so a
+    /// non-finite gradient is not merely a bad step -- it is written into the weights and every
+    /// later step inherits it. The damage is permanent and silent: the loss reports NaN from then
+    /// on, with nothing to indicate which step poisoned it.
+    /// </para>
+    /// <para>
+    /// PyTorch handles this with <c>torch.amp.GradScaler</c>, which inspects the gradients for inf
+    /// and NaN each iteration and SKIPS the optimizer step when it finds any, leaving the
+    /// parameters untouched so training can continue from the last good state. The skip is free
+    /// there because backward and the update are separate phases. Fusing them removes that natural
+    /// checkpoint, so the check has to be reinstated explicitly -- which is what this provides.
+    /// </para>
+    /// <para>
+    /// The test is <c>x - x == 0</c>: finite values give exactly zero, NaN gives NaN (which fails
+    /// every comparison) and both infinities give NaN as well. That catches all three cases in one
+    /// vector op, without the mask-and-compare an <c>Abs(x) &lt;= MaxValue</c> formulation needs.
+    /// Cost is one streaming pass over the gradients with an early exit, against a backward pass
+    /// that is orders of magnitude more expensive.
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe bool AllFiniteSimd(float* values, int length)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && length >= 8)
+        {
+            for (; i <= length - 8; i += 8)
+            {
+                var v = Avx.LoadVector256(values + i);
+                var diff = Avx.Subtract(v, v);
+                // OrderedNonSignaling equality: NaN operands compare false, so a zero mask bit
+                // marks a non-finite lane.
+                var cmp = Avx.Compare(diff, Vector256<float>.Zero, FloatComparisonMode.OrderedEqualNonSignaling);
+                if (Avx.MoveMask(cmp) != 0xFF) return false;
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            float x = values[i];
+            if (float.IsNaN(x) || float.IsInfinity(x)) return false;
+        }
+
+        return true;
+    }
+
     /// <summary>AVX2 SGD: param -= lr * grad</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void SgdUpdateSimd(float* param, float* grad, int length, float lr)

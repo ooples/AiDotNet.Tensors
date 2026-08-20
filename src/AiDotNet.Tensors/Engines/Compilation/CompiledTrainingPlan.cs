@@ -744,6 +744,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private int _optimizerStep;
     private FusedOptimizerRuntimeState? _optimizerRuntimeState;
 
+    private int _nonFiniteStepsSkipped;
+
+    /// <summary>
+    /// How many fused optimizer steps have been skipped because the gradients for that step were
+    /// not finite. Zero on a healthy run.
+    /// </summary>
+    /// <remarks>
+    /// A skipped step leaves every parameter exactly as it was, so training continues from the last
+    /// good state instead of propagating a NaN forward. Surfaced so a caller can tell "the model is
+    /// not learning" apart from "the model is diverging and its steps are being discarded" -- those
+    /// look identical from the loss alone once the weights are already poisoned.
+    /// </remarks>
+    public int NonFiniteStepsSkipped => _nonFiniteStepsSkipped;
+
+    /// <summary>
+    /// True when the most recent <see cref="Step"/> discarded its optimizer update because the
+    /// gradients were not finite.
+    /// </summary>
+    public bool LastStepSkippedNonFiniteGradients { get; private set; }
+
     private sealed class FusedOptimizerRuntimeScalars
     {
         public float HypergradientAdjustment;
@@ -2900,6 +2920,50 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return;
                 }
             }
+
+            // GRADIENT GATE: VALIDATE EVERY GRADIENT BEFORE WRITING ANY PARAMETER.
+            //
+            // The kernels below fuse backward and update into one pass -- each reads grad and writes
+            // param in place. That makes a non-finite gradient unrecoverable rather than merely bad:
+            // the NaN lands in the weights, every later step reads it back, and the loss is NaN from
+            // then on with nothing to say which step caused it. The eager tape does not have this
+            // property, which is why a model can show perfectly finite gradients from
+            // ComputeGradients while Train destroys it.
+            //
+            // torch.amp.GradScaler is the reference behaviour: inspect the gradients each iteration
+            // and SKIP the optimizer step when any are inf or NaN, leaving the parameters untouched
+            // so the run continues from the last good state. Fusing backward with the update removed
+            // the point where that check naturally sits, so it is reinstated here.
+            //
+            // The scan must cover ALL parameters before ANY is written -- a per-parameter check
+            // would still apply the tensors it had already reached before hitting the bad one,
+            // leaving the model half-updated, which is worse than either clean outcome.
+            //
+            // Scope: this gates the CPU path. The multi-tensor GPU path returns above with its
+            // gradients in device buffers, so it needs an equivalent device-side reduction rather
+            // than this host scan.
+            bool gradientsFinite = true;
+            for (int p = 0; p < paramCount && gradientsFinite; p++)
+            {
+                if (gradArrays[p].Length == 0) continue;
+                fixed (float* pGradCheck = &gradArrays[p][gradOffsets[p]])
+                {
+                    gradientsFinite = FusedOptimizer.AllFiniteSimd(pGradCheck, lengths[p]);
+                }
+            }
+
+            if (!gradientsFinite)
+            {
+                // Discard the step. Parameters, optimizer moments and the step counter that drives
+                // bias correction all stay as they were, so the next step behaves as though this one
+                // never happened -- the same contract GradScaler gives on an overflow.
+                _optimizerStep--;
+                _nonFiniteStepsSkipped++;
+                LastStepSkippedNonFiniteGradients = true;
+                return;
+            }
+
+            LastStepSkippedNonFiniteGradients = false;
 
             for (int p = 0; p < paramCount; p++)
             {
