@@ -25,6 +25,12 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// position mislabels every op after the first skip, which is what the old probe did.
 /// </para>
 /// </remarks>
+/// <remarks>
+/// Serialized against the other global-state suites: <c>ForwardStepObserver</c> is static, matching
+/// the existing <c>StepProbe</c>, so any plan replayed on another thread reports into whatever
+/// observer is installed. Run in parallel these assertions see a neighbouring test's steps.
+/// </remarks>
+[Collection("EngineCurrentGlobalState")]
 public class CompiledForwardObserverTests
 {
     private static Tensor<float> Filled(int[] shape, float scale, int salt)
