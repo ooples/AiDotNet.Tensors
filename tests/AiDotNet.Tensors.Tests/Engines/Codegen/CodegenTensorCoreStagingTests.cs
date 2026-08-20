@@ -51,7 +51,8 @@ public class CodegenTensorCoreStagingTests
     private static CodegenKernelSpec MatMul(
         int m, int k, int n,
         CodegenActivationKind activation = CodegenActivationKind.None,
-        bool transposeB = false)
+        bool transposeB = false,
+        CodegenElementType operands = CodegenElementType.Float16)
     {
         var space = new CodegenIterationSpace(
             CodegenAxis.Parallel("m", m), CodegenAxis.Parallel("n", n),
@@ -59,15 +60,15 @@ public class CodegenTensorCoreStagingTests
 
         var a = new CodegenTensorBinding(0, "a", new[] { m, k },
             new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2) },
-            elementType: CodegenElementType.Float16);
+            elementType: operands);
 
         var b = transposeB
             ? new CodegenTensorBinding(1, "b", new[] { n, k },
                 new[] { CodegenAffineExpr.Axis(1), CodegenAffineExpr.Axis(2) },
-                elementType: CodegenElementType.Float16)
+                elementType: operands)
             : new CodegenTensorBinding(1, "b", new[] { k, n },
                 new[] { CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1) },
-                elementType: CodegenElementType.Float16);
+                elementType: operands);
 
         var output = new CodegenTensorBinding(2, "out", new[] { m, n },
             new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true);
@@ -81,6 +82,20 @@ public class CodegenTensorCoreStagingTests
         Assert.True(PtxTensorCoreEmitter.TryPlan(
             spec, Sm86Major, Sm86Minor, out var plan, out string reason), reason);
         return plan!;
+    }
+
+    /// <summary>The staged bf16 kernel loads bf16 fragments from shared memory and issues the explicit-type
+    /// bf16 mma; it must not fall back to the f16 shared-load form.</summary>
+    [Fact]
+    public void StagedKernel_Bf16_UsesBf16Wmma()
+    {
+        string ptx = Tile2x2().Emit(
+            MatMul(512, 512, 512, operands: CodegenElementType.BFloat16), Sm86Major, Sm86Minor);
+
+        Assert.Contains("wmma.load.a.sync.aligned.row.m16n16k16.shared.bf16", ptx, StringComparison.Ordinal);
+        Assert.Contains("wmma.load.b.sync.aligned.row.m16n16k16.shared.bf16", ptx, StringComparison.Ordinal);
+        Assert.Contains("wmma.mma.sync.aligned.row.row.m16n16k16.f32.bf16.bf16.f32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("shared.f16", ptx, StringComparison.Ordinal);
     }
 
     /// <summary>A whole number of 64x64 block tiles is what staging needs.</summary>
