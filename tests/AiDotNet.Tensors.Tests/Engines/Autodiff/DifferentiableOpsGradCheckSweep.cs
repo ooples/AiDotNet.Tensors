@@ -329,6 +329,9 @@ public class DifferentiableOpsGradCheckSweep
                                          SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), 2],
         ["GlaScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                    SafeTensor([1, 3, 2], r), 2],
+        // ABC additionally takes per-head slot keys [numHeads, numSlots, headDim] and an initial-state scale.
+        ["AbcScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+                                   SafeTensor([1, 3, 2], r), SafeTensor([2, 3, 2], r), 2, 0.1],
         ["GatedDeltaNetScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                              SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
         ["XLstmScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
@@ -818,7 +821,7 @@ public class DifferentiableOpsGradCheckSweep
         // without a ratchet the next op whose parameters the synthesizer cannot handle would slip
         // back in silently and CI would stay green while coverage rotted.
         //
-        // Measured 0 skips on BOTH target frameworks (net10.0 and net471, 251 ops verified on each),
+        // Measured 0 skips on BOTH target frameworks (net10.0 and net471, 252 ops verified on each),
         // so 0 is the honest floor rather than a number chosen to make the assertion pass.
         //
         // An op that genuinely cannot be gradient-checked has a supported escape hatch — add it to
