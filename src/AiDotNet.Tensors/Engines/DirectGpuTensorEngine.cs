@@ -8145,6 +8145,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             outputBuffer.RelinquishOwnership();
+
+            // RECORD, and keep the GPU result. This path previously returned raw, so the op was
+            // simply absent from the tape: no exception, a correct forward, and no gradient for
+            // anything UPSTREAM of the pool. Bisecting SVTRThinPlateSplineLayer, gradient reached
+            // the first convolution, batch-norm and activation and then stopped dead at the first
+            // MaxPoolingLayer, so six convolution blocks feeding its localization head trained on
+            // nothing -- on a GPU-backed machine, while CPU-only CI stayed green.
+            //
+            // Recording rather than deferring to base is what keeps this a GPU op. A tape is open
+            // for the whole of training, so `if (IsTapeActive) return base...` would move both the
+            // forward AND the backward onto the CPU for every training step. The backward stays on
+            // the device too: MaxPool2DWithIndicesBackward calls engine.MaxPool2DBackward, which
+            // this engine overrides with a real kernel.
+            //
+            // Same savedState the CPU path supplies -- the backward routes each output cell's
+            // gradient to the argmax it came from, so it needs the indices computed above.
+            Autodiff.DifferentiableOps.RecordUnary(
+                "MaxPool2DWithIndices", result, input,
+                Autodiff.BackwardFunctions<T>.MaxPool2DWithIndicesBackward,
+                new object[] { maxIndices, poolSize, stride });
             return result;
         }
         catch
@@ -8512,6 +8532,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     outputBuffer.RelinquishOwnership();
                     if (ResidentStepActive && typeof(T) == typeof(float))
                         BindResidentBuffer(directResult, outputBuffer.Buffer, backend);
+
+                    // RECORD, and keep the GPU result. Returning raw left this op off the tape, so the
+                    // forward stayed correct and nothing upstream received gradient. BOTH success paths
+                    // need it -- the direct-kernel path under the #if and the standard one below -- since
+                    // either can return, and recording only one leaves the bug live on the other.
+                    Autodiff.DifferentiableOps.RecordBinary(
+                        "DepthwiseConv2D", directResult, input, kernel,
+                        Autodiff.BackwardFunctions<T>.DepthwiseConv2DBackward,
+                        new object[] { stride, padding });
                     return directResult;
                 }
             }
@@ -8528,6 +8557,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             outputBuffer.RelinquishOwnership();
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so the
+            // forward stayed correct and nothing upstream received gradient. BOTH success paths
+            // need it -- the direct-kernel path under the #if and the standard one below -- since
+            // either can return, and recording only one leaves the bug live on the other.
+            Autodiff.DifferentiableOps.RecordBinary(
+                "DepthwiseConv2D", result, input, kernel,
+                Autodiff.BackwardFunctions<T>.DepthwiseConv2DBackward,
+                new object[] { stride, padding });
             return result;
         }
         catch
@@ -8713,6 +8751,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                     new[] { batch, outChannels, outHeight, outWidth });
                 outputBuffer.RelinquishOwnership();
+
+                // RECORD, and keep the GPU result. Returning raw left this op off the
+                // tape, so the forward stayed correct and neither the input nor the
+                // per-location weights received gradient. Mirrors the CpuEngine call.
+                Autodiff.DifferentiableOps.RecordBinary(
+                    "LocallyConnectedConv2D", result, input, weights,
+                    Autodiff.BackwardFunctions<T>.LocallyConnectedConv2DBackward,
+                    new object[] { stride });
                 return result;
             }
             finally
@@ -9051,7 +9097,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                     new[] { batch, outChannels, outHeight, outWidth });
                 outputBuffer.RelinquishOwnership();
-                return result;
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so the
+            // forward stayed correct while the input, kernel AND offsets all received no gradient.
+            // Offsets are what make the convolution deformable, so losing their gradient means the
+            // sampling geometry never learns at all.
+            //
+            // Mirrors the CpuEngine call exactly, including the mask branch: the masked variant has
+            // its own backward and carries the mask as a fourth input, so pairing the wrong one
+            // would produce a plausible-looking gradient rather than an obvious failure.
+            var deformSavedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(),
+            };
+            if (mask is null)
+            {
+                Autodiff.DifferentiableOps.RecordIfActive("DeformableConv2D", result,
+                    new[] { input, kernel, offsets },
+                    Autodiff.BackwardFunctions<T>.DeformableConv2DBackward,
+                    deformSavedState);
+            }
+            else
+            {
+                Autodiff.DifferentiableOps.RecordIfActive("DeformableConv2D", result,
+                    new[] { input, kernel, offsets, mask },
+                    Autodiff.BackwardFunctions<T>.DeformableConv2DBackwardWithMask,
+                    deformSavedState);
+            }
+            return result;
             }
             finally
             {
@@ -9127,7 +9200,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                     new[] { batch, outChannels, outHeight, outWidth });
                 outputBuffer.RelinquishOwnership();
-                return result;
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so the
+            // forward stayed correct while the input, kernel AND offsets all received no gradient.
+            // Offsets are what make the convolution deformable, so losing their gradient means the
+            // sampling geometry never learns at all.
+            //
+            // Mirrors the CpuEngine call exactly, including the mask branch: the masked variant has
+            // its own backward and carries the mask as a fourth input, so pairing the wrong one
+            // would produce a plausible-looking gradient rather than an obvious failure.
+            var deformSavedState = new object[]
+            {
+                (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone(), groups, deformGroups,
+            };
+            if (mask is null)
+            {
+                Autodiff.DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                    new[] { input, kernel, offset },
+                    Autodiff.BackwardFunctions<T>.DeformableConv2DGroupedBackward,
+                    deformSavedState);
+            }
+            else
+            {
+                Autodiff.DifferentiableOps.RecordIfActive("DeformableConv2DGrouped", result,
+                    new[] { input, kernel, offset, mask },
+                    Autodiff.BackwardFunctions<T>.DeformableConv2DGroupedBackwardWithMask,
+                    deformSavedState);
+            }
+            return result;
             }
             finally
             {
@@ -15355,7 +15455,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Run MaxAxis (values) and ArgMaxAxis (indices) on the same
             // GPU upload — replaces the previous CPU re-reduce that did
             // 2× the work for every ReduceMax-with-indices call.
-            return ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out maxIndices);
+            // RECORD, and keep the GPU result. ReduceMaxWithIndicesGpu computes on the
+            // device and does not record, so returning its value directly left the op off
+            // the tape entirely. savedState mirrors the CpuEngine call: the backward routes
+            // each reduced cell's gradient to the argmax it came from, so it needs the
+            // indices the helper just produced via the out parameter.
+            var reduceMaxResult = ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out maxIndices);
+            Autodiff.DifferentiableOps.RecordUnary(
+                "ReduceMax", reduceMaxResult, input,
+                Autodiff.BackwardFunctions<T>.ReduceMaxBackward,
+                new object[] { maxIndices });
+            return reduceMaxResult;
         }
         catch
         {
@@ -17620,8 +17730,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufferA = GetOrAllocateBuffer(backend, a);
             using var bufferB = GetOrAllocateBuffer(backend, b);
-            return DispatchDeferredGpuOp<T>(backend, size, a.Shape.ToArray(), output =>
+            var lerpResult = DispatchDeferredGpuOp<T>(backend, size, a.Shape.ToArray(), output =>
                 backend.Lerp(bufferA.Buffer, bufferB.Buffer, output, tFloat, size));
+
+            // RECORD, and keep the GPU result. Returning the dispatch result directly left
+            // this op off the tape. savedState mirrors the CpuEngine call, which boxes the
+            // scalar(s); the backward casts savedState back to T, so boxing here is the same
+            // contract. Records rather than deferring: a tape is open throughout training.
+            Autodiff.DifferentiableOps.RecordBinary(
+                "TensorLerp", lerpResult, a, b,
+                Autodiff.BackwardFunctions<T>.LerpBackward,
+                new object[] { t is not null ? (object)t : throw new InvalidOperationException("t cannot be null") });
+            return lerpResult;
         }
         catch (Exception)
         {
@@ -17646,8 +17766,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufferA = GetOrAllocateBuffer(backend, a);
             using var bufferB = GetOrAllocateBuffer(backend, b);
-            return DispatchDeferredGpuOp<T>(backend, size, a.Shape.ToArray(), output =>
+            var addScaledResult = DispatchDeferredGpuOp<T>(backend, size, a.Shape.ToArray(), output =>
                 backend.AddScaled(bufferA.Buffer, bufferB.Buffer, output, scaleAFloat, scaleBFloat, size));
+
+            // RECORD, and keep the GPU result. Returning the dispatch result directly left
+            // this op off the tape. savedState mirrors the CpuEngine call, which boxes the
+            // scalar(s); the backward casts savedState back to T, so boxing here is the same
+            // contract. Records rather than deferring: a tape is open throughout training.
+            Autodiff.DifferentiableOps.RecordBinary(
+                "TensorAddScaled", addScaledResult, a, b,
+                Autodiff.BackwardFunctions<T>.AddScaledBackward,
+                new object[]
+                {
+                    scaleA is not null ? (object)scaleA : throw new InvalidOperationException("scaleA cannot be null"),
+                    scaleB is not null ? (object)scaleB : throw new InvalidOperationException("scaleB cannot be null"),
+                });
+            return addScaledResult;
         }
         catch (Exception)
         {
@@ -19735,8 +19869,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufOut = AllocateOutputBuffer(backend, batch * outChannels * outWidth);
             backend.Conv1D(bufIn.Buffer, bufK.Buffer, bufOut.Buffer,
                 batch, inChannels, inWidth, outChannels, outWidth, kernelW, stride, padding, dilation);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outWidth,
+            var conv1dResult = DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outWidth,
                 new[] { batch, outChannels, outWidth });
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so with
+            // a tape open the forward was correct and nothing upstream received any gradient.
+            // Records rather than deferring to base: a tape is open for the whole of training,
+            // so falling back would move forward AND backward onto the CPU every step. Mirrors
+            // the CpuEngine recording for this op exactly -- same backward, same savedState.
+            Autodiff.DifferentiableOps.RecordBinary(
+                "Conv1D", conv1dResult, input, kernel,
+                Autodiff.BackwardFunctions<T>.Conv1DBackward,
+                new object[] { stride, padding, dilation });
+            return conv1dResult;
         }
         catch (Exception)
         {
@@ -20364,8 +20509,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
             backend.NearestNeighborUpsample(bufIn.Buffer, bufOut.Buffer, batch * channels, inH, inW, scaleH);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
+            var upsampleResult = DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so with
+            // a tape open the forward was correct and nothing upstream received any gradient.
+            // Records rather than deferring to base: a tape is open for the whole of training,
+            // so falling back would move forward AND backward onto the CPU every step. Mirrors
+            // the CpuEngine recording for this op exactly -- same backward, same savedState.
+            Autodiff.DifferentiableOps.RecordUnary(
+                "Upsample", upsampleResult, input,
+                Autodiff.BackwardFunctions<T>.UpsampleBackward,
+                savedState: new object[] { scaleH, scaleW });
+            return upsampleResult;
         }
         catch (Exception ex)
         {
@@ -20395,8 +20551,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // conventions are runtime branches inside them.
             backend.GridSample(bufIn.Buffer, bufGrid.Buffer, bufOut.Buffer,
                 batch, channels, inH, inW, outH, outW, paddingMode: 0, alignCorners: false);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
+            var gridSampleResult = DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outH * outW,
                 new[] { batch, channels, outH, outW });
+
+            // RECORD, and keep the GPU result. This path returned raw, so with a tape open the
+            // sample was absent from the gradient graph: no exception, a correct forward, and no
+            // gradient for the sampled input OR for whatever produced the grid. For a spatial
+            // transformer that is the whole localization branch -- the grid is the only route by
+            // which its parameters reach the output.
+            //
+            // Records rather than deferring to base, for the reason MaxPool2DWithIndices records:
+            // a tape is open for the whole of training, so falling back would move the forward and
+            // the backward onto the CPU for every training step. Both stay on the device here --
+            // GridSampleBackward calls engine.GridSampleBackwardInput / GridSampleBackwardGrid,
+            // which this engine overrides.
+            //
+            // No savedState, mirroring the narrow CpuEngine forward exactly: this overload is
+            // torchvision-default bilinear + zeros + alignCorners=false, which is what the kernel
+            // above is invoked with and what the 3-arg backward implements. The mode-aware
+            // GridSample overload carries its parameters in savedState instead.
+            Autodiff.DifferentiableOps.RecordBinary(
+                "GridSample", gridSampleResult, input, grid,
+                Autodiff.BackwardFunctions<T>.GridSampleBackward);
+            return gridSampleResult;
         }
         catch (Exception)
         {
@@ -20416,8 +20593,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, batch * channels * outputHeight * outputWidth);
             backend.AdaptiveAvgPool2D(bufIn.Buffer, bufOut.Buffer, batch, channels, inH, inW, outputHeight, outputWidth);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outputHeight * outputWidth,
+            var adaptivePoolResult = DeferTensorResult<T>(backend, bufOut.Buffer, batch * channels * outputHeight * outputWidth,
                 new[] { batch, channels, outputHeight, outputWidth });
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so with
+            // a tape open the forward was correct and nothing upstream received any gradient.
+            // Records rather than deferring to base: a tape is open for the whole of training,
+            // so falling back would move forward AND backward onto the CPU every step. Mirrors
+            // the CpuEngine recording for this op exactly -- same backward, same savedState.
+            Autodiff.DifferentiableOps.RecordUnary(
+                "AdaptiveAvgPool2D", adaptivePoolResult, input,
+                Autodiff.BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
+                savedState: new object[] { outputHeight, outputWidth });
+            return adaptivePoolResult;
         }
         catch (Exception)
         {
@@ -20568,8 +20756,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, colSize);
             backend.Unfold(bufIn.Buffer, bufOut.Buffer, batch, channels, inH, inW, kH, kW, sH, sW, pH, pW);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, colSize,
+            var unfoldResult = DeferTensorResult<T>(backend, bufOut.Buffer, colSize,
                 new[] { batch, channels * kH * kW, outH * outW });
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so with
+            // a tape open the forward was correct and nothing upstream received any gradient.
+            // Records rather than deferring to base: a tape is open for the whole of training,
+            // so falling back would move forward AND backward onto the CPU every step. Mirrors
+            // the CpuEngine recording for this op exactly -- same backward, same savedState.
+            Autodiff.DifferentiableOps.RecordUnary(
+                "Unfold", unfoldResult, input,
+                Autodiff.BackwardFunctions<T>.UnfoldBackward,
+                new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
+            return unfoldResult;
         }
         catch (Exception ex)
         {
@@ -20600,8 +20799,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var bufOut = AllocateOutputBuffer(backend, totalOut);
             backend.Fill(bufOut.Buffer, 0f, totalOut);
             backend.Fold(bufIn.Buffer, bufOut.Buffer, batch, outC, outH, outW, kH, kW, sH, sW, pH, pW);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, totalOut,
+            var foldResult = DeferTensorResult<T>(backend, bufOut.Buffer, totalOut,
                 new[] { batch, outC, outH, outW });
+
+            // RECORD, and keep the GPU result. Returning raw left this op off the tape, so with
+            // a tape open the forward was correct and nothing upstream received any gradient.
+            // Records rather than deferring to base: a tape is open for the whole of training,
+            // so falling back would move forward AND backward onto the CPU every step. Mirrors
+            // the CpuEngine recording for this op exactly -- same backward, same savedState.
+            Autodiff.DifferentiableOps.RecordUnary(
+                "Fold", foldResult, input,
+                Autodiff.BackwardFunctions<T>.FoldBackward,
+                new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
+            return foldResult;
         }
         catch (Exception)
         {

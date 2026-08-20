@@ -10,11 +10,13 @@ using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.CpuJit;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Groups;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.LinearAlgebra.Fft;
 using AiDotNet.Tensors.Operators;
 using static AiDotNet.Tensors.Helpers.CpuParallelSettings;
 
@@ -40397,6 +40399,80 @@ public partial class CpuEngine : ITensorLevelEngine
     #endregion
 
     #region FFT and Signal Processing
+
+    /// <inheritdoc/>
+    public virtual bool SupportsFftElementType(FftElementType type) => type switch
+    {
+        FftElementType.Float32 => true,
+        FftElementType.Float16 => false,
+        FftElementType.BFloat16 => false,
+        _ => throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type."),
+    };
+
+    /// <inheritdoc/>
+    public virtual Tensor<float> FftGeneric(
+        Tensor<float> input,
+        bool inverse = false,
+        FftElementType elementType = FftElementType.Float32)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        _ = elementType.ByteSize();
+        if (!SupportsFftElementType(elementType))
+        {
+            throw new NotSupportedException(
+                $"{Name} does not support {elementType} FFT storage. " +
+                "Use Float32 or select an engine that advertises the requested storage type.");
+        }
+
+        if (input.Rank == 0)
+            throw new ArgumentException("Generic FFT input must have at least one dimension.", nameof(input));
+
+        int interleavedLength = input._shape[^1];
+        if (interleavedLength < 2 || (interleavedLength & 1) != 0)
+        {
+            throw new ArgumentException(
+                "The final input dimension must contain one or more interleaved real/imaginary pairs.",
+                nameof(input));
+        }
+
+        int n = interleavedLength / 2;
+        int[] componentShape = (int[])input._shape.Clone();
+        componentShape[^1] = n;
+        var real = new Tensor<float>(componentShape);
+        var imaginary = new Tensor<float>(componentShape);
+        float[] source = input.GetFlattenedData();
+        float[] realData = real.GetDataArray();
+        float[] imaginaryData = imaginary.GetDataArray();
+        for (int i = 0; i < realData.Length; i++)
+        {
+            realData[i] = source[2 * i];
+            imaginaryData[i] = source[(2 * i) + 1];
+        }
+
+        Tensor<float> outputReal;
+        Tensor<float> outputImaginary;
+        if (inverse)
+            IFFT(real, imaginary, out outputReal, out outputImaginary);
+        else
+            FFT(real, imaginary, out outputReal, out outputImaginary);
+
+        var result = new Tensor<float>((int[])input._shape.Clone());
+        float[] destination = result.GetDataArray();
+        float[] outputRealData = outputReal.GetDataArray();
+        float[] outputImaginaryData = outputImaginary.GetDataArray();
+        for (int i = 0; i < outputRealData.Length; i++)
+        {
+            destination[2 * i] = outputRealData[i];
+            destination[(2 * i) + 1] = outputImaginaryData[i];
+        }
+
+        if (inverse)
+            FftAutograd.RecordIFft1(result, input, n, FftNorm.Backward);
+        else
+            FftAutograd.RecordFft1(result, input, n, FftNorm.Backward);
+
+        return result;
+    }
 
     /// <summary>
     /// Test-only switch selecting the legacy FFTCore path instead of NativeFFTInPlace.
