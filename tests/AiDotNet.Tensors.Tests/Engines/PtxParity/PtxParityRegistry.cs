@@ -47,6 +47,15 @@ public static class PtxParityRegistry
 {
     public static IReadOnlyList<PtxParitySpec> Specs { get; } = new[]
     {
+        new PtxParitySpec("PtxFusedSoftmaxF32Kernel", PtxParityStatus.ThreeWayParity,
+            "row softmax, fp32 (#840) — CudaBackend.Softmax",
+            "runnable spec: DirectPtxSoftmaxTests.BackendSoftmax_ThreeWay_CudaAndPtxBothMatchCpuOracle. " +
+            "Leg 1 runs the op with the direct-PTX gate off and asserts the existing CUDA kernel matches " +
+            "the fp64-accumulated CPU oracle while the PTX dispatch counter stays put; leg 2 runs it with " +
+            "the gate on and asserts direct-PTX matches the same oracle while the counter advances, " +
+            "proving the PTX path actually fired; leg 3 cross-checks the two GPU paths. Driver-gated, so " +
+            "it skips off an SM86 CUDA machine."),
+
         new PtxParitySpec("PtxFusedRowReduceOpF32Kernel", PtxParityStatus.Deferred,
             "row mean/max/min/sum-of-squares, fp32 (#843) - CudaBackend.MeanAxis, CudaBackend.MaxAxis",
             "one module per operator, sharing the row-sum memory schedule. Mean and Max have public " +
@@ -123,7 +132,6 @@ public static class PtxParityRegistry
             "leg yet. Widening is exact for every FP16 input (including subnormals, infinities, and " +
             "signed zero), so its three-way spec can assert bit-for-bit equality on all three legs " +
             "rather than a tolerance."),
-
         new PtxParitySpec("PtxFusedGeGluF32Kernel", PtxParityStatus.Deferred,
             "GeGLU forward, fp32 (#839) — CudaBackend.GeGluForward",
             "has a public route, but its tests compare the PTX result against a CPU reference only, so " +

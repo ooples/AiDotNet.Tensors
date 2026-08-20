@@ -43,8 +43,7 @@ public enum PrecisionMode
 /// </remarks>
 public sealed class AutocastScope : IDisposable
 {
-    [ThreadStatic]
-    private static AutocastScope? _current;
+    private static readonly System.Threading.AsyncLocal<AutocastScope?> s_current = new();
 
     private readonly AutocastScope? _previous;
     private bool _disposed;
@@ -52,7 +51,7 @@ public sealed class AutocastScope : IDisposable
     /// <summary>
     /// Gets the currently active autocast scope, or null if none.
     /// </summary>
-    public static AutocastScope? Current => _current;
+    public static AutocastScope? Current => s_current.Value;
 
     /// <summary>
     /// Gets the precision mode for this scope.
@@ -62,12 +61,12 @@ public sealed class AutocastScope : IDisposable
     /// <summary>
     /// Gets whether autocast is currently enabled (any scope is active).
     /// </summary>
-    public static bool IsEnabled => _current is not null;
+    public static bool IsEnabled => Current is not null;
 
     /// <summary>
     /// Gets the active precision mode, defaulting to Float32 when no scope is active.
     /// </summary>
-    public static PrecisionMode ActivePrecision => _current?.Precision ?? PrecisionMode.Float32;
+    public static PrecisionMode ActivePrecision => Current?.Precision ?? PrecisionMode.Float32;
 
     /// <summary>
     /// Optional per-layer precision policy. When non-null,
@@ -101,12 +100,10 @@ public sealed class AutocastScope : IDisposable
     /// <paramref name="precision"/> applies to every layer.</param>
     public AutocastScope(PrecisionMode precision, LayerPrecisionPolicy? policy)
     {
-        if (precision == PrecisionMode.BFloat16)
-            throw new NotSupportedException("BFloat16 autocast is not yet implemented. Use Float16 instead.");
         Precision = precision;
         Policy = policy;
-        _previous = _current;
-        _current = this;
+        _previous = Current;
+        s_current.Value = this;
     }
 
     /// <summary>
@@ -119,11 +116,9 @@ public sealed class AutocastScope : IDisposable
     /// // model forward / backward — runs in env-selected precision if set,
     /// // otherwise full FP32.
     /// </code>
-    /// Recognized values (case-insensitive): <c>fp16</c> / <c>float16</c> /
-    /// <c>half</c> → FP16; <c>fp8</c> / <c>float8</c> / <c>e5m2</c> →
-    /// Float8E5M2. Any other value (including unset / empty) yields a
-    /// no-op (returns null). <c>BFloat16</c> intentionally not auto-engaged
-    /// because the in-tree BFloat16 autocast is not yet implemented.
+    /// Recognized values (case-insensitive): FP16, BF16, FP8 E4M3, and FP8 E5M2 aliases.
+    /// Unsupported physical formats are resolved by <see cref="GpuPrecisionPlanner"/> at operation dispatch;
+    /// constructing a backend-agnostic scope never throws merely because one device lacks the requested format.
     /// </summary>
     /// <returns>An active <see cref="AutocastScope"/> when the env-var
     /// selects a supported precision, otherwise null.</returns>
@@ -131,22 +126,9 @@ public sealed class AutocastScope : IDisposable
     {
         var raw = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
         if (string.IsNullOrWhiteSpace(raw)) return null;
-        var trimmed = raw.Trim();
-        if (string.Equals(trimmed, "fp16", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "float16", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "half", StringComparison.OrdinalIgnoreCase))
-        {
-            return new AutocastScope(PrecisionMode.Float16);
-        }
-        if (string.Equals(trimmed, "fp8", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "float8", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "e5m2", StringComparison.OrdinalIgnoreCase))
-        {
-            return new AutocastScope(PrecisionMode.Float8E5M2);
-        }
-        // Unknown / explicitly-fp32 / disabled — return null so the caller
-        // gets a no-op `using var x = null;` without throwing.
-        return null;
+        return TryParsePrecision(raw, out var precision) && precision != PrecisionMode.Float32
+            ? new AutocastScope(precision)
+            : null;
     }
 
     /// <summary>
@@ -160,16 +142,52 @@ public sealed class AutocastScope : IDisposable
     {
         var raw = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
         if (string.IsNullOrWhiteSpace(raw)) return PrecisionMode.Float32;
-        var trimmed = raw.Trim();
-        if (string.Equals(trimmed, "fp16", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "float16", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "half", StringComparison.OrdinalIgnoreCase))
-            return PrecisionMode.Float16;
-        if (string.Equals(trimmed, "fp8", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "float8", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "e5m2", StringComparison.OrdinalIgnoreCase))
-            return PrecisionMode.Float8E5M2;
-        return PrecisionMode.Float32;
+        return TryParsePrecision(raw, out var precision) ? precision : PrecisionMode.Float32;
+    }
+
+    private static bool TryParsePrecision(string value, out PrecisionMode precision)
+    {
+        var normalized = value.Trim().Replace("-", string.Empty).Replace("_", string.Empty);
+        if (normalized.Equals("fp16", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("float16", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("half", StringComparison.OrdinalIgnoreCase))
+        {
+            precision = PrecisionMode.Float16;
+            return true;
+        }
+        if (normalized.Equals("bf16", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("bfloat16", StringComparison.OrdinalIgnoreCase))
+        {
+            precision = PrecisionMode.BFloat16;
+            return true;
+        }
+        if (normalized.Equals("e4m3", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("fp8e4m3", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("float8e4m3", StringComparison.OrdinalIgnoreCase))
+        {
+            precision = PrecisionMode.Float8E4M3;
+            return true;
+        }
+        if (normalized.Equals("fp8", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("float8", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("e5m2", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("fp8e5m2", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("float8e5m2", StringComparison.OrdinalIgnoreCase))
+        {
+            precision = PrecisionMode.Float8E5M2;
+            return true;
+        }
+        if (normalized.Equals("fp32", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("float32", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("off", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            precision = PrecisionMode.Float32;
+            return true;
+        }
+
+        precision = PrecisionMode.Float32;
+        return false;
     }
 
     /// <summary>
@@ -317,17 +335,24 @@ public sealed class AutocastScope : IDisposable
     /// Converts a fp32 GPU buffer to the active precision for computation.
     /// Returns null if no conversion is needed. Caller MUST dispose the returned buffer.
     /// </summary>
-    public static IGpuBuffer? MaybeConvertInput(IDirectGpuBackend backend, IGpuBuffer fp32Buffer, int size)
+    public static IGpuBuffer? MaybeConvertInput(
+        IDirectGpuBackend backend,
+        IGpuBuffer fp32Buffer,
+        int size,
+        GpuPrecisionOperation operation = GpuPrecisionOperation.General)
     {
         if (!IsEnabled || ActivePrecision == PrecisionMode.Float32)
             return null;
 
-        // FP16 storage is 2 bytes/element. AllocateBuffer(size) reserves size FLOATS (size*4 bytes), so the
-        // fp16-compute inputs were stored float-sized and saved no memory (#558 layer-5 secondary finding).
-        // AllocateByteBuffer(size*2) reserves exactly the half-precision footprint — a contained ½-size win
-        // on the transient autocast GEMM inputs. IGpuBuffer.SizeInBytes then reflects the true 2-byte size,
-        // so the activation-cache byte accounting stays correct.
-        var fp16Buffer = backend.AllocateByteBuffer(size * 2);
+        var plan = GpuPrecisionPlanner.CreatePlan<float>(backend, operation, operation.ToString());
+        if (plan.Route != GpuExecutionRoute.Gpu || plan.InputStorage != GpuScalarType.Float16)
+            return null;
+
+        // Native/packed FP16 uses two bytes per element. An emulated backend (currently WebGPU without
+        // shader-f16) quantizes values but retains FP32 storage and must allocate accordingly.
+        var fp16Buffer = plan.ReducesStorageBytes
+            ? backend.AllocateByteBuffer(checked(size * 2))
+            : backend.AllocateBuffer(size);
         backend.ConvertToFp16(fp32Buffer, fp16Buffer, size);
         return fp16Buffer;
     }
@@ -335,9 +360,17 @@ public sealed class AutocastScope : IDisposable
     /// <summary>
     /// Converts a result buffer back to fp32 for gradient accumulation.
     /// </summary>
-    public static IGpuBuffer? MaybeConvertOutput(IDirectGpuBackend backend, IGpuBuffer resultBuffer, int size)
+    public static IGpuBuffer? MaybeConvertOutput(
+        IDirectGpuBackend backend,
+        IGpuBuffer resultBuffer,
+        int size,
+        GpuPrecisionOperation operation = GpuPrecisionOperation.General)
     {
         if (!IsEnabled || ActivePrecision == PrecisionMode.Float32)
+            return null;
+
+        var plan = GpuPrecisionPlanner.CreatePlan<float>(backend, operation, operation.ToString());
+        if (plan.Route != GpuExecutionRoute.Gpu || plan.OutputStorage != GpuScalarType.Float16)
             return null;
 
         var fp32Buffer = backend.AllocateBuffer(size);
@@ -349,7 +382,7 @@ public sealed class AutocastScope : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        _current = _previous;
+        s_current.Value = _previous;
         ClearTensors();
     }
 }

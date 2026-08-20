@@ -103,6 +103,23 @@ public class AutocastFromEnvironmentTests
         }
     }
 
+    [Theory]
+    [InlineData("bf16", PrecisionMode.BFloat16)]
+    [InlineData("fp8-e4m3", PrecisionMode.Float8E4M3)]
+    [InlineData("float8_e5m2", PrecisionMode.Float8E5M2)]
+    public void EnableFromEnvironment_ExplicitReducedFormatSelectsRequestedMode(
+        string value,
+        PrecisionMode expected)
+    {
+        using (SetEnv(value))
+        {
+            using var scope = AutocastScope.EnableFromEnvironment();
+            Assert.NotNull(scope);
+            Assert.Equal(expected, scope!.Precision);
+            Assert.Equal(expected, AutocastScope.ActivePrecision);
+        }
+    }
+
     [Fact]
     public void EnableFromEnvironment_UnrecognizedValue_ReturnsNull()
     {

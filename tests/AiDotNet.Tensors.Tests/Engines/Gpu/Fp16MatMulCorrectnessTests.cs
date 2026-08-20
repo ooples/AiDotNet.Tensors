@@ -52,18 +52,26 @@ public class Fp16MatMulCorrectnessTests
         var ref32 = cFp32.ToArray();
         var got = cFp16.ToArray();
 
-        // FP16 has ~3 decimal digits; for a K-deep accumulation, a relative tolerance that
-        // scales mildly with K (FP32 accumulate keeps this small) bounds the rounding.
-        float tol = 2e-2f + 1e-3f * k;
-        double maxRel = 0;
+        // A max-relative metric is not a stable GEMM oracle: values near zero make a tiny,
+        // expected FP16 quantization error look arbitrarily large. Use scale-invariant relative
+        // L2 plus a K-scaled absolute ceiling, while separately rejecting non-finite output.
+        double squaredError = 0;
+        double squaredReference = 0;
+        double maxAbsolute = 0;
         for (int i = 0; i < ref32.Length; i++)
         {
-            float denom = Math.Max(1e-3f, Math.Abs(ref32[i]));
-            double rel = Math.Abs(got[i] - ref32[i]) / denom;
-            if (rel > maxRel) maxRel = rel;
             Assert.False(float.IsNaN(got[i]) || float.IsInfinity(got[i]),
                 $"FP16 matmul produced non-finite at {i}");
+            double error = got[i] - ref32[i];
+            squaredError += error * error;
+            squaredReference += ref32[i] * ref32[i];
+            maxAbsolute = Math.Max(maxAbsolute, Math.Abs(error));
         }
-        Assert.True(maxRel < tol, $"FP16 matmul max relative error {maxRel:F4} exceeded tol {tol:F4} (m={m} k={k} n={n})");
+        double relativeL2 = Math.Sqrt(squaredError / Math.Max(squaredReference, double.Epsilon));
+        double maxAbsoluteTolerance = 3e-3 * Math.Sqrt(k);
+        Assert.True(relativeL2 < 2e-3,
+            $"FP16 matmul relative L2 error {relativeL2:E4} exceeded 2E-3 (m={m} k={k} n={n})");
+        Assert.True(maxAbsolute < maxAbsoluteTolerance,
+            $"FP16 matmul max absolute error {maxAbsolute:E4} exceeded {maxAbsoluteTolerance:E4} (m={m} k={k} n={n})");
     }
 }

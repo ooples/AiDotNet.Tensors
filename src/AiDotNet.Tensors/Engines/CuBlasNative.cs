@@ -621,6 +621,10 @@ public static class CuBlasNative
     public const int CUBLAS_COMPUTE_32F_FAST_16F = 74;
     public const int CUBLAS_COMPUTE_32F_FAST_TF32 = 77;
 
+    // cublasGemmAlgo_t. DEFAULT is -1 in cublas_api.h; zero is the first fixed algorithm,
+    // which can reject otherwise-supported datatype combinations.
+    public const int CUBLAS_GEMM_DEFAULT = -1;
+
     #endregion
 
     #region Helper Methods
