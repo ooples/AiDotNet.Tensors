@@ -35,17 +35,13 @@ public sealed class DirectGpuEngine : IDisposable
         Environment.GetEnvironmentVariable("AIDOTNET_GEMM_VALIDATE") == "1";
 
     /// <summary>
-    /// Stage 8 (#415): when set, generic-T entry points that would route a
-    /// non-float T (notably <c>double</c>, <c>Half</c>, <c>BFloat16</c>)
-    /// through the FP32 GPU boundary return <c>null</c> instead — forcing
-    /// the caller to fall back to the CPU path which preserves the
-    /// requested precision. Default: ON for double (silent downcast was
-    /// the source of precision loss in cluster #6 ResNet50/VGG FP64 tests).
-    /// Override via env var <c>AIDOTNET_DIRECTGPU_STRICT_FP64=0</c> to opt
-    /// back into the legacy lossy behavior for benchmarking / smoke tests.
+    /// Compatibility switch for callers that previously opted into strict FP64 CPU fallback.
+    /// Speed-first generic GPU conversion is the package default; new code should use
+    /// <see cref="Gpu.GpuExecutionPolicyScope"/> to request preservation explicitly.
+    /// Set <c>AIDOTNET_DIRECTGPU_STRICT_FP64=1</c> to retain the legacy process-wide behavior.
     /// </summary>
     public static readonly bool StrictFp64Fallback =
-        Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_STRICT_FP64") != "0";
+        Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_STRICT_FP64") == "1";
 
     /// <summary>
     /// Stage 8 (#415): returns true when the requested element type would
@@ -55,12 +51,10 @@ public sealed class DirectGpuEngine : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static bool ShouldFallbackForPrecision<T>()
     {
-        if (!StrictFp64Fallback) return false;
-        // float is the GPU boundary type — never lossy. Everything else is
-        // potentially lossy. Half / BFloat16 callers are rare and usually
-        // opt into the downcast deliberately; only double is the high-
-        // leverage case for cluster #6.
-        return typeof(T) == typeof(double);
+        if (Gpu.GpuExecutionPolicyScope.CurrentPolicy.AccuracyMode == Gpu.GpuAccuracyMode.PreserveInputType)
+            return typeof(T) != typeof(float);
+
+        return StrictFp64Fallback && typeof(T) == typeof(double);
     }
 
     /// <summary>
@@ -220,6 +214,18 @@ public sealed class DirectGpuEngine : IDisposable
 
         Trace.WriteLine("[DirectGpuEngine] No GPU backends available. Falling back to CPU.");
         _isAvailable = false;
+    }
+
+    /// <summary>Creates an engine around an already-selected backend.</summary>
+    /// <remarks>
+    /// Internal so deterministic routing tests can exercise conversion and dispatch without probing
+    /// machine hardware. Production callers continue to use the public capability-detecting constructor.
+    /// </remarks>
+    internal DirectGpuEngine(IDirectGpuBackend backend)
+    {
+        _backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        _fusionManager = new KernelFusionManager();
+        _isAvailable = backend.IsAvailable;
     }
 
     private static IReadOnlyList<string> GetBackendOrderFromEnv()
@@ -1250,6 +1256,4 @@ public sealed class DirectGpuEngine : IDisposable
         _disposed = true;
     }
 }
-
-
 
