@@ -3159,7 +3159,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool gradientsFinite = true;
             for (int p = 0; p < paramCount && gradientsFinite; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
+                // A parameter whose gradient is not a host float array has no entry here -- a
+                // heterogeneous FP16 plan keeps some gradients in Half or in device buffers, which
+                // is the same case the scope note above calls out for the multi-tensor GPU path.
+                // Those need a scan in their own storage; skipping them keeps this one from
+                // dereferencing a slot it was never given (an FP16 plan threw NullReference here on
+                // its first step).
+                if (gradArrays[p] is null || gradArrays[p].Length == 0) continue;
                 fixed (float* pGradCheck = &gradArrays[p][gradOffsets[p]])
                 {
                     gradientsFinite = FusedOptimizer.AllFiniteSimd(pGradCheck, lengths[p]);
