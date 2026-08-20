@@ -2246,7 +2246,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                             betaPtr,
                             sPtr, CuBlasNative.CUDA_R_32F, seqLen,
                             _fp32GemmComputeType,
-                            0 /* CUBLAS_GEMM_DEFAULT */),
+                            CuBlasNative.CUBLAS_GEMM_DEFAULT),
                         $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
                 });
             }
@@ -2430,7 +2430,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         betaPtr,
                         cPtr, CuBlasNative.CUDA_R_32F, N,
                         _fp32GemmComputeType,
-                        0 /* CUBLAS_GEMM_DEFAULT */),
+                        CuBlasNative.CUBLAS_GEMM_DEFAULT),
                     $"cublasGemmEx slice {slice}");
             });
         }
@@ -4299,21 +4299,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int maximumPartials = (size + blockSize - 1) / blockSize;
         using var temporaryA = AllocateBuffer(maximumPartials);
         using var temporaryB = AllocateBuffer(maximumPartials);
+        using var scalarResult = AllocateBuffer(1);
         IGpuBuffer current = input;
         int currentSize = size;
         bool writeA = true;
         while (currentSize > 1)
         {
             int partialCount = (currentSize + blockSize - 1) / blockSize;
-            IGpuBuffer next = writeA ? temporaryA : temporaryB;
+            IGpuBuffer next = partialCount == 1
+                ? scalarResult
+                : writeA ? temporaryA : temporaryB;
             LaunchReductionKernel(kernelName, current, next, currentSize, blockSize);
             current = next;
             currentSize = partialCount;
             writeA = !writeA;
         }
 
+        // DownloadBuffer intentionally requires a destination large enough for the buffer's physical
+        // capacity. A reduction's logical size can be one while its scratch buffer is larger, so make
+        // the final device value live in an exact one-element allocation before reading it back.
+        if (current.Handle != scalarResult.Handle)
+            Copy(current, scalarResult, 1);
+
         var result = new float[1];
-        DownloadBuffer(current, result);
+        DownloadBuffer(scalarResult, result);
         return result[0];
     }
 
@@ -13646,7 +13655,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             betaPtr,
             C.Handle, CuBlasNative.CUDA_R_32F, N,
             CuBlasNative.CUBLAS_COMPUTE_32F,
-            0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */);
+            CuBlasNative.CUBLAS_GEMM_DEFAULT);
 
         // CUBLAS_STATUS_NOT_SUPPORTED is a CAPABILITY signal, not an operational failure:
         // the FP16-in / FP32-compute cublasGemmEx config isn't available on this device

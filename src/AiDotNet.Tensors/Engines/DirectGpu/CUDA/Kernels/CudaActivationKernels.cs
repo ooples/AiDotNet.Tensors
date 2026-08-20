@@ -921,15 +921,17 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* __re
         scratch[warpId] = val;
     __syncthreads();
 
-    // Final reduction across warps (only first warp)
+    // Final reduction across warps. Every lane in the first warp participates and
+    // lanes beyond numWarps contribute the identity. Using a partial active mask with
+    // offsets larger than numWarps makes __shfl_down_sync read an inactive source lane;
+    // CUDA leaves that value undefined (observed as zero for 4-element reductions).
     unsigned int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps)
+    if (warpId == 0)
     {
-        val = scratch[tid];
-        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        val = lane < numWarps ? scratch[lane] : 0.0f;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            val += __shfl_down_sync(warp_mask, val, offset);
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
 
         if (tid == 0)
             output[blockIdx.x] = val;
@@ -959,16 +961,15 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
         scratch[warpId] = val;
     __syncthreads();
 
-    // Final reduction across warps (only first warp)
+    // Final reduction across warps; inactive logical lanes contribute -infinity.
     unsigned int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps)
+    if (warpId == 0)
     {
-        val = scratch[tid];
-        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        val = lane < numWarps ? scratch[lane] : -INFINITY;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other = __shfl_down_sync(warp_mask, val, offset);
+            float other = __shfl_down_sync(0xFFFFFFFF, val, offset);
             val = fmaxf(val, other);
         }
 
@@ -1000,16 +1001,15 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
         scratch[warpId] = val;
     __syncthreads();
 
-    // Final reduction across warps (only first warp)
+    // Final reduction across warps; inactive logical lanes contribute +infinity.
     unsigned int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps)
+    if (warpId == 0)
     {
-        val = scratch[tid];
-        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        val = lane < numWarps ? scratch[lane] : INFINITY;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other = __shfl_down_sync(warp_mask, val, offset);
+            float other = __shfl_down_sync(0xFFFFFFFF, val, offset);
             val = fminf(val, other);
         }
 
@@ -1477,4 +1477,3 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
         }
     }
 }
-
