@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Groups;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -4778,6 +4779,47 @@ public interface IEngine
     #endregion
 
     #region FFT and Signal Processing
+
+    /// <summary>
+    /// Reports whether this engine can execute the generic complex FFT with the requested storage precision.
+    /// </summary>
+    /// <param name="type">Storage precision used by the FFT implementation.</param>
+    /// <returns><see langword="true"/> only when the complete transform path is available.</returns>
+    /// <remarks>
+    /// <para>
+    /// This is an execution guarantee, not a best-effort hint. An engine must return <see langword="false"/>
+    /// when a required compiler, kernel, device feature, or arbitrary-length path is unavailable.
+    /// </para>
+    /// <para><b>For Beginners:</b> Call this before explicitly requesting half or bfloat16 storage. A false
+    /// result means the engine will not silently copy the transform to the CPU.</para>
+    /// </remarks>
+    bool SupportsFftElementType(FftElementType type);
+
+    /// <summary>
+    /// Computes a batched complex FFT over the final interleaved real/imaginary axis.
+    /// </summary>
+    /// <param name="input">Tensor whose final axis is <c>[re0, im0, re1, im1, ...]</c>.</param>
+    /// <param name="inverse">When true, computes the inverse transform and applies the <c>1/n</c> scale.</param>
+    /// <param name="elementType">Device-storage precision. Arithmetic remains float32 for every value.</param>
+    /// <returns>A tensor with the same shape and interleaved layout as <paramref name="input"/>.</returns>
+    /// <remarks>
+    /// <para>
+    /// Transform lengths need not be powers of two. Accelerated engines use their device-resident Bluestein
+    /// implementation for other lengths. If a requested storage type is unsupported, the method throws
+    /// <see cref="NotSupportedException"/> instead of performing a hidden host fallback.
+    /// </para>
+    /// <para>
+    /// The logical tensor type is float so all three storage formats share one beginner-friendly API. Narrow
+    /// storage is an execution detail: inputs are narrowed on device, FFT arithmetic uses float32 registers,
+    /// and results are widened on device before they enter the normal tensor pipeline.
+    /// </para>
+    /// <para><b>For Beginners:</b> Use <see cref="FftElementType.Float32"/> for maximum accuracy, or request
+    /// Float16/BFloat16 when the capability method says the current engine supports it.</para>
+    /// </remarks>
+    Tensor<float> FftGeneric(
+        Tensor<float> input,
+        bool inverse = false,
+        FftElementType elementType = FftElementType.Float32);
 
     /// <summary>
     /// Computes the 1D Fast Fourier Transform of a real-valued signal.
