@@ -9,6 +9,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// retains every lane value from the sole global load through both reductions
 /// to the sole final global store.
 /// </summary>
+/// <remarks>
+/// This is a CUDA-specific optimization behind the existing cross-backend Softmax operation,
+/// not a new public operation. Native HIP, Metal, OpenCL, Vulkan, and WebGPU routes are recorded
+/// and enforced by <see cref="DirectPtxSoftmaxCoverageManifest"/>.
+/// </remarks>
 internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
 {
     internal const string EntryPoint = "aidotnet_fused_softmax_f32";
@@ -46,13 +51,21 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
             runtime.ArchitectureFamily, rows, columns, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             rows, columns, blockThreads);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(

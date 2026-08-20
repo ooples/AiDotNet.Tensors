@@ -33,44 +33,7 @@ class Program
         }
 
         // GPU-free cubin generation and verification for the online-attention family.
-        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
-            return;
-        }
-
-        // GPU-free cubin generation and verification for the online-attention family.
-        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
-            return;
-        }
-
-        // GPU-free cubin generation and verification for the online-attention family.
+        // The tool contract accepts only operands, so strip the dispatch flag exactly once.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args.Skip(1).ToArray());
@@ -1548,7 +1511,7 @@ class Program
         Console.WriteLine("  --quick    : Run quick performance validation (default)");
         Console.WriteLine("  --full     : Run full BenchmarkDotNet suite (trigonometric)");
         Console.WriteLine("  --linalg   : Run linear algebra benchmarks vs MathNet.Numerics");
-        Console.WriteLine("  --direct-ptx-softmax [runs]: exact-shape FP32 row-softmax championship matrix");
+        Console.WriteLine("  --direct-ptx-softmax [operation ...]: exact-shape FP32 row-softmax championship matrix");
         Console.WriteLine("  --cpu-matmul: Run CPU matrix multiply diagnostics");
         Console.WriteLine("  --microkernel-gflops: Microkernel-only GFLOPS vs register-FMA peak (Sub-S #409)");
         Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");

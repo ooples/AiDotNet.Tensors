@@ -54,8 +54,8 @@ if (-not (Test-Path $targetDll)) { throw "Benchmark DLL not found: $targetDll (b
 $rows = New-Object System.Collections.Generic.List[object]
 for ($r = 1; $r -le $Runs; $r++) {
     $log = Join-Path $evidenceDir "run-$r.log"
-    Write-Host "[run $r/$Runs] $flag 1"
-    & dotnet $targetDll $flag 1 *> $log
+    Write-Host "[run $r/$Runs] $flag"
+    & dotnet $targetDll $flag *> $log
     if ($LASTEXITCODE -ne 0) { Write-Warning "run $r exited with code $LASTEXITCODE (see $log)" }
     foreach ($line in Get-Content -LiteralPath $log) {
         if ($line.StartsWith($evidencePrefix, [StringComparison]::Ordinal)) {
@@ -77,13 +77,27 @@ function Median([double[]]$values) {
     return ($s[$n/2 - 1] + $s[$n/2]) / 2.0
 }
 
-$byShape = $rows | Group-Object { "{0}x{1}" -f $_.rows, $_.columns }
+$requiredShapes = @('256x128', '2048x64', '2048x128', '8192x128')
+$rowsByShape = @{}
+foreach ($shapeGroup in ($rows | Group-Object { "{0}x{1}" -f $_.rows, $_.columns })) {
+    $rowsByShape[$shapeGroup.Name] = $shapeGroup.Group
+}
 $manifest = New-Object System.Collections.Generic.List[object]
 $anyHold = $false
 
-foreach ($shapeGroup in $byShape) {
-    $shape = $shapeGroup.Name
-    $byMethod = $shapeGroup.Group | Group-Object method
+foreach ($shape in $requiredShapes) {
+    if (-not $rowsByShape.ContainsKey($shape)) {
+        $failure = 'missing all direct and competitor evidence'
+        Write-Warning "[$shape] $failure; HOLD."
+        $manifest.Add([pscustomobject]@{
+            Shape = $shape; Verdict = 'HOLD'; Speedup = $null
+            Direct = $null; BestCompetitor = $null; Failures = @($failure)
+        })
+        $anyHold = $true
+        continue
+    }
+
+    $byMethod = $rowsByShape[$shape] | Group-Object method
     $methodAgg = @{}
     foreach ($m in $byMethod) {
         $medians = @($m.Group | ForEach-Object { [double]$_.median_us })
@@ -102,7 +116,13 @@ foreach ($shapeGroup in $byShape) {
     $direct = $methodAgg.Values | Where-Object { $_.Method.StartsWith($directMethodPrefix, [StringComparison]::Ordinal) } | Select-Object -First 1
     $competitors = @($methodAgg.Values | Where-Object { -not $_.Method.StartsWith($directMethodPrefix, [StringComparison]::Ordinal) })
     if (-not $direct -or $competitors.Count -eq 0) {
-        Write-Warning "[$shape] missing direct or competitor rows; skipping."
+        $failure = 'missing direct or competitor evidence'
+        Write-Warning "[$shape] $failure; HOLD."
+        $manifest.Add([pscustomobject]@{
+            Shape = $shape; Verdict = 'HOLD'; Speedup = $null
+            Direct = $direct; BestCompetitor = $null; Failures = @($failure)
+        })
+        $anyHold = $true
         continue
     }
     $best = $competitors | Sort-Object MedianOfMed | Select-Object -First 1
@@ -115,7 +135,8 @@ foreach ($shapeGroup in $byShape) {
     if ($direct.MaxTemp -gt 0)    { $fail.Add("temp-bytes=$($direct.MaxTemp)>0") }
     if ($direct.MaxLocal -gt 0)   { $fail.Add("local-bytes=$($direct.MaxLocal)>0") }
     if ($direct.MaxError -gt $ErrorTolerance) { $fail.Add(("max-error={0:E1}>{1:E1}" -f $direct.MaxError, $ErrorTolerance)) }
-    if ($direct.Runs -lt 3) { $fail.Add("independent-runs=$($direct.Runs)<3") }
+    if ($direct.Runs -lt $Runs) { $fail.Add("direct-runs=$($direct.Runs)<required-$Runs") }
+    if ($best.Runs -lt $Runs) { $fail.Add("competitor-runs=$($best.Runs)<required-$Runs") }
 
     $passed = ($fail.Count -eq 0)
     if (-not $passed) { $anyHold = $true }
@@ -133,5 +154,8 @@ $manifestPath = Join-Path $evidenceDir 'manifest.json'
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 Write-Host ""
 Write-Host "Manifest: $manifestPath"
+if ($manifest.Count -ne $requiredShapes.Count) {
+    throw "Internal evidence error: manifest contains $($manifest.Count) of $($requiredShapes.Count) required shapes."
+}
 if ($anyHold) { Write-Host "Softmax release evidence: HOLD (see failures above)."; exit 1 }
 Write-Host "Softmax release evidence: PASS on every promoted shape."
