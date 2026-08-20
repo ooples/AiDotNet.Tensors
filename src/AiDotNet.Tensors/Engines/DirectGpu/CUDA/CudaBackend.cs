@@ -878,6 +878,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
+        try
+        {
+            CompileGenericFftModules(device);
+        }
+        catch (OutOfMemoryException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Generic-precision FFT is optional. An unexpected NVRTC/toolkit failure must
+            // disable only this capability, never the entire CUDA backend.
+            DisableGenericFftModules(ex);
+            System.Diagnostics.Trace.TraceWarning(
+                $"[CudaBackend] Generic-precision FFT kernel compilation failed: " +
+                $"{ex.GetType().Name}: {ex.Message}. Other CUDA kernels remain available.");
+        }
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
@@ -4417,6 +4434,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (B.Size < outerSize)
             throw new ArgumentException("Output buffer size is too small for the specified dimensions.");
+
+        if (TryDirectPtxRowSum(A, B, outerSize, reduceSize))
+            return;
 
         if (!_kernelCache.TryGetValue("sum_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: sum_axis");
@@ -11597,6 +11617,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
+#if NET5_0_OR_GREATER
+        if (TryDirectPtxGather(source, indices, output, numIndices, featureSize))
+            return;
+#endif
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
 
@@ -12122,6 +12146,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MeanAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Mean, A, B, outerSize, reduceSize))
+            return;
         if (!_kernelCache.TryGetValue("mean_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: mean_axis");
 
@@ -12192,6 +12218,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
+            return;
         if (!_kernelCache.TryGetValue("max_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: max_axis");
 
@@ -16701,6 +16729,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             _fftModule = IntPtr.Zero;
         }
 
+        UnloadGenericFftModules();
+
         if (_spectralPerfModule != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_spectralPerfModule);
@@ -17036,7 +17066,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
     public void CumSumAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("cumsum_axis", input, output, outerSize, innerSize);
     public void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size) => LaunchFusedScalar("scalar_minus_tensor", input, output, scalar, size);
-    public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize) => LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
+    public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        if (TryDirectPtxRowL2Normalize(input, output, outerSize, innerSize))
+            return;
+        LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
+    }
     public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
     public void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_mean_backward", gradOutput, gradInput, outerSize, reduceSize);
 

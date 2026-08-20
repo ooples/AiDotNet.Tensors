@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.128.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.127.0...v0.128.0) (2026-08-18)
+
+
+### Features
+
+* **fft:** generic-precision, arbitrary-length GPU FFT path ([#959](https://github.com/ooples/AiDotNet.Tensors/issues/959)) ([3647d32](https://github.com/ooples/AiDotNet.Tensors/commit/3647d3267b8875a95e574cb186a419ec0f827ba7))
+* **fused:** dispatch Fletcher-Reeves conjugate gradient through the plan ([#957](https://github.com/ooples/AiDotNet.Tensors/issues/957)) ([fa81d5e](https://github.com/ooples/AiDotNet.Tensors/commit/fa81d5e19858588dc145b93c54d687d04bcfe5bb))
+* **fused:** dispatch linearized ADMM through the plan ([#956](https://github.com/ooples/AiDotNet.Tensors/issues/956)) ([7456fdd](https://github.com/ooples/AiDotNet.Tensors/commit/7456fddaff70240ee81c5d21eaaab084c92adee3))
+* **ptx:** bf16 tensor-core wmma GEMM on the naive and staged paths ([#967](https://github.com/ooples/AiDotNet.Tensors/issues/967)) ([83db840](https://github.com/ooples/AiDotNet.Tensors/commit/83db8400009a3a6f9d0d99e13fa7966044e39d7f))
+* **ptx:** exact-shape FP32 embedding gather blueprint ([#844](https://github.com/ooples/AiDotNet.Tensors/issues/844)) ([#870](https://github.com/ooples/AiDotNet.Tensors/issues/870)) ([f22edb1](https://github.com/ooples/AiDotNet.Tensors/commit/f22edb1ab76ac805806e13197bc4fbaa67ac87c8))
+* **ptx:** exact-shape FP32 row-sum reduction blueprint ([#843](https://github.com/ooples/AiDotNet.Tensors/issues/843)) ([#869](https://github.com/ooples/AiDotNet.Tensors/issues/869)) ([31497cc](https://github.com/ooples/AiDotNet.Tensors/commit/31497cceb2be429ba7fcf5eed049d54a11e8c10a))
+* **ptx:** exact-shape FP32→FP16 cast blueprint ([#845](https://github.com/ooples/AiDotNet.Tensors/issues/845)) ([#871](https://github.com/ooples/AiDotNet.Tensors/issues/871)) ([c283a93](https://github.com/ooples/AiDotNet.Tensors/commit/c283a93ed90428af5a0b244560fa9883e60fdf63))
+* **ptx:** per-sample FP32 MSE-loss blueprint ([#847](https://github.com/ooples/AiDotNet.Tensors/issues/847)) ([#872](https://github.com/ooples/AiDotNet.Tensors/issues/872)) ([e64cd40](https://github.com/ooples/AiDotNet.Tensors/commit/e64cd409c72ca411d2ed193c03b419d87bc20c6a))
+
+
+### Bug Fixes
+
+* **fused:** make the dense LARS kernel implement You et al. Algorithm 1 ([#955](https://github.com/ooples/AiDotNet.Tensors/issues/955)) ([a781bd4](https://github.com/ooples/AiDotNet.Tensors/commit/a781bd4d330cc34c0ce0fc1c4b7b9c7a3075ed31))
+* **fused:** RAdam rectification precision and Nadam bias-correction placement ([#960](https://github.com/ooples/AiDotNet.Tensors/issues/960)) ([8cec7b3](https://github.com/ooples/AiDotNet.Tensors/commit/8cec7b33f8f618770a0de80706462c902264dd4f))
+* **streaming:** reclaim backing files when the pool's process is killed ([#966](https://github.com/ooples/AiDotNet.Tensors/issues/966)) ([4c5e975](https://github.com/ooples/AiDotNet.Tensors/commit/4c5e975038f6686819e728ca7cb4a806a3c8ca12))
+
 ## [0.127.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.126.0...v0.127.0) (2026-08-16)
 
 

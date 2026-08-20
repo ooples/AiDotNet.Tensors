@@ -89,9 +89,9 @@ public sealed partial class PtxTensorCoreEmitter
     /// </summary>
     public sealed class Plan
     {
-        internal Plan(int m, int n, int k, bool aRowMajor, bool bRowMajor)
+        internal Plan(int m, int n, int k, bool aRowMajor, bool bRowMajor, string abType)
         {
-            M = m; N = n; K = k; ARowMajor = aRowMajor; BRowMajor = bRowMajor;
+            M = m; N = n; K = k; ARowMajor = aRowMajor; BRowMajor = bRowMajor; AbType = abType;
         }
 
         /// <summary>Rows of the output.</summary>
@@ -108,6 +108,10 @@ public sealed partial class PtxTensorCoreEmitter
 
         /// <summary>Whether B is stored [K, N] rather than [N, K].</summary>
         public bool BRowMajor { get; }
+
+        /// <summary>PTX multiplicand element type for the wmma load/mma: "f16" (sm_70+) or "bf16" (sm_80+).
+        /// Both accumulate and store fp32; the two differ only in the load type and the mma type suffix.</summary>
+        public string AbType { get; }
 
         /// <summary>Output tiles, one warp each.</summary>
         public int TileCount => (M / TileM) * (N / TileN);
@@ -190,11 +194,21 @@ public sealed partial class PtxTensorCoreEmitter
         var a = spec.Inputs[spec.ProductInputs[0]];
         var b = spec.Inputs[spec.ProductInputs[1]];
 
-        if (a.ElementType != CodegenElementType.Float16 ||
-            b.ElementType != CodegenElementType.Float16)
+        if (a.ElementType != b.ElementType ||
+            (a.ElementType != CodegenElementType.Float16 &&
+             a.ElementType != CodegenElementType.BFloat16))
         {
-            reason = "wmma multiplicands must be fp16; got " + a.ElementType + " and " +
-                b.ElementType;
+            reason = "wmma multiplicands must both be fp16 or both be bf16; got " +
+                a.ElementType + " and " + b.ElementType;
+            return false;
+        }
+
+        // bf16 wmma multiplicands were added in Ampere (sm_80); fp16 wmma works from sm_70. Refuse bf16 on
+        // older targets with a named reason rather than emit PTX the driver cannot load.
+        if (a.ElementType == CodegenElementType.BFloat16 && computeMajor < 8)
+        {
+            reason = "bf16 tensor-core wmma requires sm_80+ (Ampere); target is sm_" +
+                computeMajor + computeMinor;
             return false;
         }
 
@@ -228,7 +242,8 @@ public sealed partial class PtxTensorCoreEmitter
 
         // TryOrientation reports "first named axis is the row". For B the axes are handed
         // over as (N, K), so a "row-major" answer means [N, K] -- which is B TRANSPOSED.
-        plan = new Plan(m, n, k, aRowMajor, bRowMajor: !bColumnOfN);
+        string abType = a.ElementType == CodegenElementType.BFloat16 ? "bf16" : "f16";
+        plan = new Plan(m, n, k, aRowMajor, bRowMajor: !bColumnOfN, abType: abType);
         reason = "eligible";
         return true;
     }
@@ -449,6 +464,12 @@ public sealed partial class PtxTensorCoreEmitter
         string bLayout = plan.BRowMajor ? "row" : "col";
         string fragA = Fragment("%fa"), fragB = Fragment("%fb"), fragC = Fragment("%fc");
 
+        // f16 uses the short mma form (.f32.f32, with f16 multiplicands implied by the fragment); bf16 is not
+        // the PTX default, so its multiplicand type must be named explicitly: .f32.bf16.bf16.f32. The a/b LOAD
+        // type is the plan's element type in both cases. Byte stride is unchanged: bf16 is 2 bytes, like f16.
+        string abType = plan.AbType;
+        string mmaTypes = abType == "bf16" ? "f32.bf16.bf16.f32" : "f32.f32";
+
         // Unrolling matters more here than on the scalar path: each step is three
         // instructions, so a runtime loop's compare-and-branch is a large fraction of the
         // body, and an unrolled walk lets ptxas overlap the loads of step i+1 with the mma
@@ -465,9 +486,9 @@ public sealed partial class PtxTensorCoreEmitter
         int emitted = Unrolled ? steps : 1;
         for (int s = 0; s < emitted; s++)
         {
-            L($"wmma.load.a.sync.aligned.{aLayout}.m16n16k16.global.f16 {fragA}, [%rd4], {I(aLeading)};");
-            L($"wmma.load.b.sync.aligned.{bLayout}.m16n16k16.global.f16 {fragB}, [%rd6], {I(bLeading)};");
-            L($"wmma.mma.sync.aligned.{aLayout}.{bLayout}.m16n16k16.f32.f32 {fragC}, {fragA}, {fragB}, {fragC};");
+            L($"wmma.load.a.sync.aligned.{aLayout}.m16n16k16.global.{abType} {fragA}, [%rd4], {I(aLeading)};");
+            L($"wmma.load.b.sync.aligned.{bLayout}.m16n16k16.global.{abType} {fragB}, [%rd6], {I(bLeading)};");
+            L($"wmma.mma.sync.aligned.{aLayout}.{bLayout}.m16n16k16.{mmaTypes} {fragC}, {fragA}, {fragB}, {fragC};");
             MmaInstructions++;
 
             if (s < emitted - 1 || !Unrolled)

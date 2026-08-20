@@ -40,12 +40,11 @@ public static class Fft
     /// <summary>Forward 1D complex FFT along the last axis.</summary>
     /// <remarks>
     /// GPU fast-path: when T == float, the active engine is a
-    /// <see cref="DirectGpuTensorEngine"/>, the transform length is a power
-    /// of two, no length override is requested, and the norm is Backward,
-    /// we dispatch to the engine's custom GPU FFT kernels (Cooley-Tukey on
-    /// CUDA/HIP/OpenCL — no cuFFT). Every other case uses the managed
-    /// Cooley-Tukey / Bluestein pipeline which is correct for arbitrary
-    /// length but runs on the CPU.
+    /// <see cref="DirectGpuTensorEngine"/>, no length override is requested,
+    /// and the norm is Backward, we ask the active backend for a device FFT.
+    /// CUDA supports arbitrary lengths through radix-2 or device-resident
+    /// Bluestein dispatch; legacy GPU backends currently accept powers of two.
+    /// Unsupported cases use the managed arbitrary-length implementation.
     /// </remarks>
     public static Tensor<T> Fft1<T>(Tensor<T> input, int? n = null, FftNorm norm = FftNorm.Backward)
         where T : unmanaged, IEquatable<T>, IComparable<T>
@@ -90,8 +89,7 @@ public static class Fft
         int last = input.Shape[input.Rank - 1];
         if (last % 2 != 0) return false;
         int n = last / 2;
-        if (!FftKernels.IsPowerOfTwo(n)) return false;
-        if (n < 2) return false;
+        if (n < 1) return false;
 
         var output = gpu.TryBackendFft((Tensor<float>)(object)input, inverse);
         if (output is null) return false;
