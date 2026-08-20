@@ -85,7 +85,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheDirectPtxCrossEntropyKernelSlow(key);
                 }
-                if (capturing && !_directPtxCrossEntropyKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxCrossEntropyKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused linear/CE module for CUDA graph capture.");
 

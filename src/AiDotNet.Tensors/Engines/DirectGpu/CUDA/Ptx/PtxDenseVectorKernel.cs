@@ -54,16 +54,14 @@ internal sealed class PtxDenseVectorKernel : IDisposable
         N = n;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, operation, m, n);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, operation, m, n);
-        _module = runtime.LoadModule(Ptx);
         string entry = operation == DirectPtxDenseVectorOperation.Dot
             ? DotEntryPoint : OuterEntryPoint;
-        _function = _module.GetFunction(entry, out DirectPtxFunctionInfo info);
         _launchThreads = GetBlockThreads(operation, m);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, _launchThreads);
-        Blueprint.ResourceBudget.Validate(entry, info, _launchThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            _launchThreads, activeBlocks, _module);
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, entry, _launchThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audit = loaded.Audit;
     }
 
     internal unsafe void Launch(

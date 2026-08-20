@@ -108,7 +108,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheDirectPtxStridedDotKernelSlow(key);
                 }
-                if (capturing && !_directPtxStridedDotKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxStridedDotKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX strided-dot module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -184,7 +184,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheDirectPtxDenseVectorKernelSlow(key);
                 }
-                if (capturing && !_directPtxDenseVectorKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxDenseVectorKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX dense-vector module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -260,7 +260,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheDirectPtxBatchedVectorKernelSlow(key);
                 }
-                if (capturing && !_directPtxBatchedVectorKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxBatchedVectorKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX batched-vector module for CUDA graph capture.");
                 lock (GpuDispatchLock)

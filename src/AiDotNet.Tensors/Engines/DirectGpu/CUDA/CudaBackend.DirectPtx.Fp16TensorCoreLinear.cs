@@ -118,7 +118,7 @@ public sealed partial class CudaBackend
                 if (!_directPtxFp16TensorCoreLinearKernels.TryGetValue(
                         key, out PtxFusedLinearGeluFp16M16Kernel? kernel))
                     kernel = CreateAndCacheDirectPtxFp16TensorCoreLinearSlow(key);
-                if (capturing && !_directPtxFp16TensorCoreLinearKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxFp16TensorCoreLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX FP16 Tensor-Core module for graph capture.");
                 lock (GpuDispatchLock)

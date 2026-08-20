@@ -50,12 +50,11 @@ internal sealed class PtxBatchedGemmExFanoutKernel : IDisposable
         Batch = batch;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, k, n, batch);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, EntryPoint, BlockThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audit = loaded.Audit;
     }
 
     /// <summary>

@@ -62,15 +62,13 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             targetKind, rows, hiddenDimension, vocabulary);
-        _module = runtime.LoadModule(Ptx);
         string entry = targetKind == DirectPtxCrossEntropyTarget.Index
             ? IndexEntryPoint : DenseEntryPoint;
-        _function = _module.GetFunction(entry, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(entry, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, entry, BlockThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audit = loaded.Audit;
     }
 
     internal unsafe void Launch(

@@ -43,14 +43,12 @@ internal sealed class PtxStridedDotKernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             aSize, bSize, bOffset, bStep);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         _blockThreads = GetBlockThreads(aSize, bSize, bOffset, bStep);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, _blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, _blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            _blockThreads, activeBlocks, _module);
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, EntryPoint, _blockThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audit = loaded.Audit;
     }
 
     internal unsafe void Launch(

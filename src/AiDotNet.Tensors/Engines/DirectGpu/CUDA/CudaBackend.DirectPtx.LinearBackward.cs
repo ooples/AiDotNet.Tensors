@@ -81,7 +81,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheDirectPtxLinearBackwardKernelSlow(key);
                 }
-                if (capturing && !_directPtxLinearBackwardKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxLinearBackwardKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused-linear-backward module for capture.");
                 lock (GpuDispatchLock)

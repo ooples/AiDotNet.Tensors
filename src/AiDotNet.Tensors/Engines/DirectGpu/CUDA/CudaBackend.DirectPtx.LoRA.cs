@@ -84,7 +84,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheDirectPtxLoRAKernelSlow(key);
                 }
-                if (capturing && !_directPtxLoRAKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxLoRAKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused-LoRA module for CUDA graph capture.");
                 lock (GpuDispatchLock)

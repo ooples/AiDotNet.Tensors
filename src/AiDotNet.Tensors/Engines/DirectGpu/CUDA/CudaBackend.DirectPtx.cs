@@ -1224,7 +1224,8 @@ public sealed partial class CudaBackend
                 }
                 // CUDA graph executables retain the CUfunction after capture.
                 // Pin its module so later specialization churn cannot unload it.
-                if (capturing && !_directPtxFusedLinearKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxFusedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)

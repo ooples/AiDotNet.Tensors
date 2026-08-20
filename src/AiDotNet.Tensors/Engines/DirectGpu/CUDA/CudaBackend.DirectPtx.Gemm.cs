@@ -68,7 +68,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheGemmKernelSlow(key);
                 }
-                if (capturing && !_directPtxGemmKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxGemmKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX GEMM module for CUDA graph capture.");
                 lock (GpuDispatchLock)

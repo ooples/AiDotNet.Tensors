@@ -69,7 +69,7 @@ public sealed partial class CudaBackend
             {
                 PtxFp16GemmKernel kernel = GetOrCreateDirectPtxFp16GemmKernel(
                     key, capturing, inputType, outputType);
-                if (capturing && !_directPtxFp16GemmKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxFp16GemmKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX 16-bit GEMM module for CUDA graph capture.");
                 lock (GpuDispatchLock)

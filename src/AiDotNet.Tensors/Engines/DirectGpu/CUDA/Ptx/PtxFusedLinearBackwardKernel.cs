@@ -53,18 +53,13 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
         Activation = activation;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, m, k, n, activation);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, m, k, n, activation);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
         _blockThreads = IsExactChampionshipCell(m, k, n, activation)
             ? ExactBlockThreads : BlockThreads;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(
-            _function, _blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            EntryPoint, info, _blockThreads, activeBlocks);
-        DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            _blockThreads, activeBlocks, _module);
-        Audits = [audit];
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, EntryPoint, _blockThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audits = [loaded.Audit];
     }
 
     internal unsafe void Launch(

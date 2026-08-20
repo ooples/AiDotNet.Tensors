@@ -99,7 +99,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheFusedLinearTiledKernelSlow(key);
                 }
-                if (capturing && !_directPtxFusedLinearTiledKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxFusedLinearTiledKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX tiled fused-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -380,7 +380,7 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheFusedLinearTiledKernelSlow(key);
                 }
-                if (capturing && !_directPtxFusedLinearTiledKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(_directPtxFusedLinearTiledKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX GEMM module for CUDA graph capture.");
                 lock (GpuDispatchLock)
