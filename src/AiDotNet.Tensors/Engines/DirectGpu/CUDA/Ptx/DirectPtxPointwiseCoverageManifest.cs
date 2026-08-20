@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -109,10 +108,25 @@ internal static class DirectPtxPointwiseCoverageManifest
         Existing("DirectGpuTensorEngine activation routes", "resident backend route or CPU fallback", "public tensor activation semantics", Vector, "generic public; GPU FP32/FP16", "public-activation-routing-families")
     ];
 
-    internal static DirectPtxPointwiseCoverageCell Get(string api) =>
-        All.FirstOrDefault(cell => string.Equals(cell.Api, api, StringComparison.Ordinal)) ??
-        throw new KeyNotFoundException(
-            $"No #839 pointwise coverage cell is assigned to '{api}'.");
+    private static readonly Dictionary<string, DirectPtxPointwiseCoverageCell> ByApi =
+        CreateByApi();
+
+    internal static DirectPtxPointwiseCoverageCell Get(string api)
+    {
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
+        return ByApi.TryGetValue(api, out DirectPtxPointwiseCoverageCell? cell)
+            ? cell
+            : throw new KeyNotFoundException(
+                $"No #839 pointwise coverage cell is assigned to '{api}'.");
+    }
+
+    private static Dictionary<string, DirectPtxPointwiseCoverageCell> CreateByApi()
+    {
+        var result = new Dictionary<string, DirectPtxPointwiseCoverageCell>(StringComparer.Ordinal);
+        foreach (DirectPtxPointwiseCoverageCell cell in All)
+            result.Add(cell.Api, cell);
+        return result;
+    }
 
     private static DirectPtxPointwiseCoverageCell Planned(
         string api, string implementation, string semantics, string layout,

@@ -3385,6 +3385,11 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "swiglu-performance-gate-not-met";
             return false;
         }
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "swiglu-null-buffer";
+            return false;
+        }
 
         long outputBytes = checked((long)outerSize * halfDimension * sizeof(float));
         if (input.SizeInBytes != checked(2 * outputBytes) ||
@@ -3413,7 +3418,8 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheSwiGluKernelSlow(key);
                 }
-                if (capturing && !_directPtxSwiGluKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxSwiGluKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX SwiGLU module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -3547,6 +3553,11 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "geglu-performance-gate-not-met";
             return false;
         }
+        if (input is null || output is null)
+        {
+            DirectPtxLastError = "geglu-null-buffer";
+            return false;
+        }
 
         long outputBytes = checked((long)outerSize * halfDimension * sizeof(float));
         if (input.SizeInBytes != checked(2 * outputBytes) ||
@@ -3575,7 +3586,8 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheGeGluKernelSlow(key);
                 }
-                if (capturing && !_directPtxGeGluKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxGeGluKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX GeGLU module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -3710,6 +3722,11 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "geglu-backward-performance-gate-not-met";
             return false;
         }
+        if (gradOutput is null || input is null || gradInput is null)
+        {
+            DirectPtxLastError = "geglu-backward-null-buffer";
+            return false;
+        }
 
         long halfBytes = checked((long)outerSize * halfDimension * sizeof(float));
         long splitBytes = checked(2 * halfBytes);
@@ -3739,7 +3756,8 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheGeGluBackwardKernelSlow(key);
                 }
-                if (capturing && !_directPtxGeGluBackwardKernels.Pin(key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxGeGluBackwardKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX GeGLU-backward module for CUDA graph capture.");
                 lock (GpuDispatchLock)

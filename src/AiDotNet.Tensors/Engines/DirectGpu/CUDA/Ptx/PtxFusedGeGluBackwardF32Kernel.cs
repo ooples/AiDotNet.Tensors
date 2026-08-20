@@ -39,13 +39,21 @@ internal sealed class PtxFusedGeGluBackwardF32Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, outerSize, halfDimension);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             outerSize, halfDimension);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -53,10 +61,11 @@ internal sealed class PtxFusedGeGluBackwardF32Kernel : IDisposable
         DirectPtxTensorView input,
         DirectPtxTensorView gradInput)
     {
-        Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
-        Require(input, Blueprint.Tensors[1], nameof(input));
-        Require(gradInput, Blueprint.Tensors[2], nameof(gradInput));
-        if (Overlaps(gradInput, gradOutput) || Overlaps(gradInput, input))
+        PtxGatedGluShared.Require(gradOutput, Blueprint.Tensors[0], nameof(gradOutput));
+        PtxGatedGluShared.Require(input, Blueprint.Tensors[1], nameof(input));
+        PtxGatedGluShared.Require(gradInput, Blueprint.Tensors[2], nameof(gradInput));
+        if (PtxGatedGluShared.Overlaps(gradInput, gradOutput) ||
+            PtxGatedGluShared.Overlaps(gradInput, input))
             throw new ArgumentException("The GeGLU input gradient may not alias either read tensor.");
 
         IntPtr gradOutputPointer = gradOutput.Pointer;
@@ -219,24 +228,4 @@ internal sealed class PtxFusedGeGluBackwardF32Kernel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(halfDimension));
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
-
-    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
-    {
-        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
-        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
-        nuint leftEnd = checked(leftStart + left.ByteLength);
-        nuint rightEnd = checked(rightStart + right.ByteLength);
-        return leftStart < rightEnd && rightStart < leftEnd;
-    }
 }

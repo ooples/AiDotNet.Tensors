@@ -41,22 +41,30 @@ internal sealed class PtxFusedSwiGluF32Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             outerSize, halfDimension);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
         DirectPtxTensorView input,
         DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(output, Blueprint.Tensors[1], nameof(output));
-        if (Overlaps(input, output))
+        PtxGatedGluShared.Require(input, Blueprint.Tensors[0], nameof(input));
+        PtxGatedGluShared.Require(output, Blueprint.Tensors[1], nameof(output));
+        if (PtxGatedGluShared.Overlaps(input, output))
             throw new ArgumentException("The SwiGLU output may not alias its split input tensor.");
 
         IntPtr inputPointer = input.Pointer;
@@ -195,27 +203,6 @@ internal sealed class PtxFusedSwiGluF32Kernel : IDisposable
                 "(1,4096), (32,4096), (256,4096), and (256,11008).");
         if ((halfDimension & 3) != 0)
             throw new ArgumentOutOfRangeException(nameof(halfDimension));
-    }
-
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
-
-    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
-    {
-        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
-        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
-        nuint leftEnd = checked(leftStart + left.ByteLength);
-        nuint rightEnd = checked(rightStart + right.ByteLength);
-        return leftStart < rightEnd && rightStart < leftEnd;
     }
 
     private static string FloatLiteral(float value) =>
