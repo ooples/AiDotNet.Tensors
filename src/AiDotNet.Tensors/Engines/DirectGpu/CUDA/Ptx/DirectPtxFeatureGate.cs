@@ -31,6 +31,8 @@ internal static class DirectPtxFeatureGate
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
     internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
     internal const string QuantizedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR";
+    internal const string ReductionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_REDUCTION";
+    internal const string GatherEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GATHER";
     internal const string Cholesky4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CHOLESKY_4X4";
     internal const string LuFactor4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LU_FACTOR_4X4";
     internal const string Qr4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_QR_4X4";
@@ -61,6 +63,8 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentFlashDecodeEnabled = ReadEnabled(FlashDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedDecodeEnabled = ReadEnabled(PagedDecodeEnvironmentVariable);
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
+    private static readonly bool EnvironmentReductionEnabled = ReadEnabled(ReductionEnvironmentVariable);
+    private static readonly bool EnvironmentGatherEnabled = ReadEnabled(GatherEnvironmentVariable);
     private static readonly bool EnvironmentCholesky4x4Enabled = ReadEnabled(Cholesky4x4EnvironmentVariable);
     private static readonly bool EnvironmentLuFactor4x4Enabled = ReadEnabled(LuFactor4x4EnvironmentVariable);
     private static readonly bool EnvironmentQr4x4Enabled = ReadEnabled(Qr4x4EnvironmentVariable);
@@ -97,6 +101,12 @@ internal static class DirectPtxFeatureGate
 
     /// <summary>Test-only override. Null restores environment-based behavior.</summary>
     internal static bool? TestOverride { get; set; }
+    /// <summary>Benchmark-only access to reduction cells that have not passed promotion.</summary>
+    internal static bool ReductionExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to mean/max/min/sum-of-squares row cells that have not passed promotion.</summary>
+    internal static bool RowReduceOpExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to gather cells that have not passed promotion.</summary>
+    internal static bool GatherExperimentOverride { get; set; }
     [ThreadStatic]
     private static bool s_mseLossExperimentOverride;
 
@@ -235,6 +245,11 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
+
+    internal static bool IsReductionEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentReductionEnabled);
+    internal static bool IsGatherEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentGatherEnabled);
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);
