@@ -117,7 +117,7 @@ public sealed partial class CudaBackend
                 betaPtr,
                 cFp32.Handle, CuBlasNative.CUDA_R_32F, n,
                 CuBlasNative.CUBLAS_COMPUTE_32F,
-                0 /* CUBLAS_GEMM_DEFAULT — let cuBLAS pick algorithm */),
+                CuBlasNative.CUBLAS_GEMM_DEFAULT),
             "cublasGemmEx(FP16 in / FP32 out)");
     }
 
@@ -158,7 +158,7 @@ public sealed partial class CudaBackend
             betaPtr,
             Chalf.Handle, CuBlasNative.CUDA_R_16F, N,
             CuBlasNative.CUBLAS_COMPUTE_32F,
-            0 /* CUBLAS_GEMM_DEFAULT */);
+            CuBlasNative.CUBLAS_GEMM_DEFAULT);
         if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException($"FP16 Tensor-Core GEMM (Half out) not supported on this device (cc {_ccMajor}.{_ccMinor}).");
         CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(GemmFp16HalfOut)");

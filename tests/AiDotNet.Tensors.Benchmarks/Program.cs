@@ -33,25 +33,7 @@ class Program
         }
 
         // GPU-free cubin generation and verification for the online-attention family.
-        if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
-        {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
-            return;
-        }
-
-        // GPU-free cubin generation and verification for the online-attention family.
+        // The tool contract accepts only operands, so strip the dispatch flag exactly once.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
@@ -248,6 +230,13 @@ class Program
                 : Path.Combine("artifacts", "direct-ptx", "dense-linear", "sass");
             DirectPtxDenseLinearSassAuditTool.Run(
                 args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
+        {
+            // main reshaped Run to take an OPERATION FILTER rather than a run count, so forward
+            // the trailing arguments instead of parsing one as an iteration count.
+            DirectPtxSoftmaxExperiment.Run(args.Length > 1 ? args[1..] : System.Array.Empty<string>());
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-reduction")
@@ -1212,6 +1201,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--gpu-precision-evidence")
+        {
+            Environment.ExitCode = GpuPrecisionEvidence.Run(args);
+            return;
+        }
+
         // GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU, Softmax)
         if (args[0] == "--activation")
         {
@@ -1583,6 +1578,7 @@ class Program
         Console.WriteLine("  --quick    : Run quick performance validation (default)");
         Console.WriteLine("  --full     : Run full BenchmarkDotNet suite (trigonometric)");
         Console.WriteLine("  --linalg   : Run linear algebra benchmarks vs MathNet.Numerics");
+        Console.WriteLine("  --direct-ptx-softmax [operation ...]: exact-shape FP32 row-softmax championship matrix");
         Console.WriteLine("  --cpu-matmul: Run CPU matrix multiply diagnostics");
         Console.WriteLine("  --microkernel-gflops: Microkernel-only GFLOPS vs register-FMA peak (Sub-S #409)");
         Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");
@@ -1606,6 +1602,7 @@ class Program
         Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
         Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
+        Console.WriteLine("  --kernel-championship: autotune -> fp64 proof -> competitor -> diagnose non-wins");
         Console.WriteLine("  --verify-direct-ptx-attention-offline-cubins <ptxas> <artifacts>: verify release cubin identity");
         Console.WriteLine("  --audit-direct-ptx-attention-offline-sass <nvdisasm> <artifacts> <evidence>: audit final SASS for local memory");
         Console.WriteLine("  --generate-direct-ptx-optimizer-cubins <ptxas> <output>: build the release optimizer cubin set");
@@ -1735,6 +1732,7 @@ class Program
         Console.WriteLine("  --cold-start             : Cold-start latency (AiDotNet vs PyTorch subprocess)");
         Console.WriteLine("  --cold-start-aidotnet    : Cold-start latency (AiDotNet only)");
         Console.WriteLine("  --determinism-bench      : Deterministic vs fast-mode reduction cost");
+        Console.WriteLine("  --gpu-precision-evidence [size] [iterations] [out.md]: PR #971 type/format/performance evidence");
         Console.WriteLine("  --layers                 : End-to-end layer (Linear/Conv/Norm) microbench");
         Console.WriteLine("  --unet                   : U-Net step microbench");
         Console.WriteLine("  --pr319-grain            : PR #319 grain-size migration regression harness");
