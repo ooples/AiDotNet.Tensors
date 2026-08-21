@@ -55,13 +55,26 @@ public sealed class CompiledRoPEInterleavedTests
         }
     }
 
+    [Fact]
+    public void GraphCapture_RejectsInvalidRoPERankBeforeRecording()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 8 });
+        var (cos, sin) = CreateDoubleCache(maxSequenceLength: 4, headDimension: 8);
+
+        using var scope = GraphMode.EnableTraining(new[] { input });
+        var exception = Assert.Throws<ArgumentException>(
+            () => engine.ApplyRoPEInterleaved(input, cos, sin));
+
+        Assert.Equal("input", exception.ParamName);
+        Assert.Contains("rank >= 2", exception.Message, StringComparison.Ordinal);
+    }
+
 #if NET6_0_OR_GREATER
     [SkippableFact]
     public void DirectGpuTrainingPlan_RecordsRoPEAndMatchesCpuGradient()
     {
-        DirectGpuTensorEngine gpu;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch { Skip.If(true, "No GPU backend"); return; }
+        var gpu = new DirectGpuTensorEngine();
         if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
 
         var previous = AiDotNetEngine.Current;

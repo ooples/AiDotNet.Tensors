@@ -26852,6 +26852,15 @@ public partial class CpuEngine : ITensorLevelEngine
         if (cos == null) throw new ArgumentNullException(nameof(cos));
         if (sin == null) throw new ArgumentNullException(nameof(sin));
 
+        int rank = input._shape.Length;
+        if (rank < 2)
+            throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
+        int headDim = input._shape[rank - 1];
+        int seqLen = input._shape[rank - 2];
+        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        int halfDim = headDim / 2;
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -26877,15 +26886,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     new object[] { cos, sin, startPosition });
             }
         }
-
-        int rank = input._shape.Length;
-        if (rank < 2)
-            throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
-        int headDim = input._shape[rank - 1];
-        int seqLen = input._shape[rank - 2];
-        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
-            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
-        int halfDim = headDim / 2;
 
         var src = input.IsContiguous ? input : input.Contiguous();
         int total = src.Length;
