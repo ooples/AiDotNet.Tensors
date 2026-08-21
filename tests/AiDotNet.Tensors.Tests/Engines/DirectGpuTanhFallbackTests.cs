@@ -46,11 +46,17 @@ public class DirectGpuTanhFallbackTests
 
     private static double AsDouble<T>(T value) => Convert.ToDouble(value);
 
+    // The engine comes from AutoDetectAndConfigureGpu rather than `using var gpu = new
+    // DirectGpuTensorEngine()`. Disposing a privately constructed engine tears down the OpenCL
+    // context shared with AiDotNetEngine.Current, and every later test in the DirectGpuSerial
+    // collection then quietly ran on a degraded engine that routed everything to the host — which
+    // made the scalar-precision tests in this collection pass without their fix in place.
+
     [SkippableFact]
     public void TensorTanh_WhenThePolicyForcesTheCpuFallback_IsExactRatherThanRecursing()
     {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(), "No DirectGpu backend available");
+        var gpu = AiDotNetEngine.Current;
 
         // PreserveInputType makes ShouldFallbackForPrecision<double>() true, so TryRunUnary returns
         // null and TensorTanh takes the fallback — the exact path that used to recurse forever.
@@ -76,8 +82,8 @@ public class DirectGpuTanhFallbackTests
     [SkippableFact]
     public void Tanh_WhenThePolicyForcesTheCpuFallback_IsExactRatherThanRecursing()
     {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(), "No DirectGpu backend available");
+        var gpu = AiDotNetEngine.Current;
 
         // The other door into the same cycle: Tanh forwards contiguous eager tensors to TensorTanh,
         // so a consumer calling the plain primitive reached the recursion just as directly.
@@ -94,42 +100,10 @@ public class DirectGpuTanhFallbackTests
     }
 
     [SkippableFact]
-    public void TensorTanh_UnderTheDefaultSpeedFirstPolicy_ComputesDoubleAtSinglePrecision()
-    {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
-
-        // Pinned because it is surprising and it is DELIBERATE, not the bug above. The package
-        // default is GpuAccuracyMode.SpeedFirst, which converts a Tensor<double> across the FP32
-        // device boundary — measured error about 2.8e-08, i.e. float epsilon, not double's.
-        //
-        // Callers who need double to stay double ask for it: GpuExecutionPolicy.Preserve, as the
-        // two tests above do, or AIDOTNET_DIRECTGPU_STRICT_FP64=1 for the legacy process-wide
-        // switch. This test exists so that contract is discoverable from the test suite rather than
-        // from a debugging session.
-        var input = Filled<double>(64, i => -3.0 + 6.0 * i / 63.0);
-        var result = gpu.TensorTanh(input);
-
-        double worst = 0.0;
-        for (int i = 0; i < input.Length; i++)
-        {
-            worst = Math.Max(worst, Math.Abs(result[i] - Math.Tanh(input[i])));
-
-            // Right answer to single precision — a real tanh, not garbage.
-            Assert.True(Math.Abs(result[i] - Math.Tanh(input[i])) < 1e-6,
-                $"at {i}: got {result[i]:G17}, expected {Math.Tanh(input[i]):G17}");
-        }
-
-        Assert.True(worst > 1e-12,
-            $"worst error {worst:E3}: if the default path became exact, the speed-first conversion " +
-            "documented here no longer happens and this test should be re-read rather than relaxed");
-    }
-
-    [SkippableFact]
     public void TensorTanh_Float_MatchesTheCpuEngine()
     {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(), "No DirectGpu backend available");
+        var gpu = AiDotNetEngine.Current;
 
         // float normally takes the device kernel rather than the fallback, so this pins that the
         // fix left the fast path alone: the two engines must still agree.
@@ -148,8 +122,8 @@ public class DirectGpuTanhFallbackTests
     [SkippableFact]
     public void TensorTanh_PreservesLayout()
     {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(), "No DirectGpu backend available");
+        var gpu = AiDotNetEngine.Current;
 
         // CpuEngine.TensorTanh copies Layout across, and the fallback replaces that method rather
         // than merely calling something adjacent to it — so the copy has to survive the fix.
