@@ -63,6 +63,10 @@ internal sealed class MockBackendState
     public List<int> AllocationSizes { get; } = new();
     public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
     public int DownloadBufferCalls { get; set; }
+    public int ClassifyFloatCalls { get; set; }
+    public int FillCalls { get; set; }
+    public int MultiplyCalls { get; set; }
+    public int ScalarMinCalls { get; set; }
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
     public List<string> OptimizerCalls { get; } = new();
@@ -84,6 +88,13 @@ public class MockDirectGpuBackend : DispatchProxy
         var proxy = (MockDirectGpuBackend)Create<IDirectGpuBackend, MockDirectGpuBackend>();
         proxy._state = state;
         return (IDirectGpuBackend)(object)proxy;
+    }
+
+    internal static IMultiTensorGpuOptimizerBackend CreateMultiTensor(MockBackendState state)
+    {
+        var proxy = (MockDirectGpuBackend)Create<IMultiTensorGpuOptimizerBackend, MockDirectGpuBackend>();
+        proxy._state = state;
+        return (IMultiTensorGpuOptimizerBackend)(object)proxy;
     }
 
     protected override object Invoke(MethodInfo targetMethod, object[] args)
@@ -142,6 +153,48 @@ public class MockDirectGpuBackend : DispatchProxy
                 return null!;
             }
 
+            // Device-resident non-finite-gradient preflight used by compiled optimizers.
+            case "Fill":
+            {
+                _state.FillCalls++;
+                var output = (MockGpuBuffer)args[0]!;
+                float value = (float)args[1]!;
+                int size = (int)args[2]!;
+                for (int i = 0; i < size; i++) output.Data[i] = value;
+                return null!;
+            }
+            case "ClassifyFloat":
+            {
+                _state.ClassifyFloatCalls++;
+                var input = (MockGpuBuffer)args[0]!;
+                var output = (MockGpuBuffer)args[1]!;
+                int mode = (int)args[2]!;
+                int size = (int)args[3]!;
+                if (mode != 2) throw new NotSupportedException("Mock ClassifyFloat supports isfinite mode only.");
+                for (int i = 0; i < size; i++)
+                    output.Data[i] = float.IsNaN(input.Data[i]) || float.IsInfinity(input.Data[i]) ? 0f : 1f;
+                return null!;
+            }
+            case "Multiply":
+            {
+                _state.MultiplyCalls++;
+                var left = (MockGpuBuffer)args[0]!;
+                var right = (MockGpuBuffer)args[1]!;
+                var output = (MockGpuBuffer)args[2]!;
+                int size = (int)args[3]!;
+                for (int i = 0; i < size; i++) output.Data[i] = left.Data[i] * right.Data[i];
+                return null!;
+            }
+            case "Min" when args.Length == 2:
+            {
+                _state.ScalarMinCalls++;
+                var input = (MockGpuBuffer)args[0]!;
+                int size = (int)args[1]!;
+                float minimum = float.PositiveInfinity;
+                for (int i = 0; i < size; i++) minimum = Math.Min(minimum, input.Data[i]);
+                return minimum;
+            }
+
             // Optimizer dispatch probes. These methods are void on IDirectGpuBackend; tests
             // verify the wrapper reached the backend and marked only the mutated tensors current.
             case "AdamUpdate":
@@ -160,6 +213,8 @@ public class MockDirectGpuBackend : DispatchProxy
             case "LionUpdate":
             case "NadamUpdate":
             case "FtrlUpdate":
+            case "AdamMultiTensorUpdate":
+            case "AdamWMultiTensorUpdate":
             case "SparseAdamUpdate":
             case "SparseAdamWUpdate":
             case "SparseSgdUpdate":
