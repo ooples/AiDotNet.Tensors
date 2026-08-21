@@ -68,6 +68,7 @@ public sealed class CompiledRoPEInterleavedTests
 
         Assert.Equal("input", exception.ParamName);
         Assert.Contains("rank >= 2", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scope.NodeCount);
     }
 
 #if NET6_0_OR_GREATER
