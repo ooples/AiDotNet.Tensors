@@ -26852,6 +26852,32 @@ public partial class CpuEngine : ITensorLevelEngine
         if (cos == null) throw new ArgumentNullException(nameof(cos));
         if (sin == null) throw new ArgumentNullException(nameof(sin));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedInput = input;
+                var capturedCos = cos;
+                var capturedSin = sin;
+                int capturedStartPosition = startPosition;
+                var outputShape = (int[])input._shape.Clone();
+                return scope.RecordVariadic(
+                    LazyNodeType.Custom,
+                    "ApplyRoPEInterleaved",
+                    new[] { input, cos, sin },
+                    outputShape,
+                    (eng, output) =>
+                    {
+                        var rotated = eng.ApplyRoPEInterleaved(
+                            capturedInput, capturedCos, capturedSin, capturedStartPosition);
+                        DirectGpuTensorEngine.CopyResultInto(eng, rotated, output);
+                    },
+                    BackwardFunctions<T>.ApplyRoPEInterleavedBackward,
+                    new object[] { cos, sin, startPosition });
+            }
+        }
+
         int rank = input._shape.Length;
         if (rank < 2)
             throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
