@@ -89,11 +89,12 @@ def main():
                  .to(torch.float16))
             weights = (((torch.rand((output_features, input_features), device=device) * 2.0 - 1.0)
                         * 0.0625).to(torch.float16))
-            # FP32 bias/output matches the direct kernel's public ABI. PyTorch
-            # promotes the FP16 dot result before this FP32 epilogue.
+            # FP32 bias/output matches the direct kernel's public ABI. The
+            # functional.linear result is FP16, so the dot product is rounded
+            # before .float() begins the FP32 bias/GELU epilogue.
             bias = ((torch.rand(output_features, device=device) * 2.0 - 1.0) * 0.0625)
 
-            def operation():
+            def operation(x=x, weights=weights, bias=bias):
                 projected = functional.linear(x, weights, None).float() + bias
                 return functional.gelu(projected, approximate="tanh")
 
@@ -115,7 +116,7 @@ def main():
             with torch.cuda.graph(graph):
                 graph_output = operation()
 
-            def graph_operation():
+            def graph_operation(graph=graph, graph_output=graph_output):
                 graph.replay()
                 return graph_output
 

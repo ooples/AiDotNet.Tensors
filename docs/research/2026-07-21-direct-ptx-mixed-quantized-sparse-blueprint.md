@@ -4,6 +4,11 @@ Date: 2026-07-21
 
 Tracking issue: #837
 
+Cross-backend parity status: CUDA owns the implemented FP32 M=1, FP16 M=1/M=16,
+W8A8 M=1, and W8A8 dequant/bias/GELU routes in this slice. HIP, Metal, OpenCL,
+Vulkan, and WebGPU do not yet expose equivalent fused routes; their resident,
+fail-closed implementations and parity tests are tracked explicitly in #974.
+
 Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 
 ## Verdict
@@ -241,8 +246,11 @@ PTX/binary version: 86/86
 ```
 
 The experiment-only K=512/N=2048 module reports 40 registers/thread, 12,288 static shared
-bytes, 0 local bytes/thread, and seven active blocks/SM. These driver-JIT
-attributes are enforced before either module enters the cache and prove that
+bytes, 0 local bytes/thread, and seven active blocks/SM. The v3 M=16 budget in
+`PtxFusedLinearGeluFp16M16Kernel.CreateBlueprint` admits at most 48 registers/thread,
+the exact input-dependent staged-panel allocation (12,288 or 24,576 static shared
+bytes), 0 local bytes/thread, and at least four active blocks/SM. These v3
+driver-JIT attributes are enforced before either M=16 module enters the cache and prove that
 the compiled function has no local-memory frame or spill allocation. The new
 `mixed-linear-m16` Nsight target attaches to the correct entry point, but the
 host again returns `ERR_NVGPUCTRPERM`; executed-counter proof is not claimed.
@@ -286,8 +294,17 @@ powershell -ExecutionPolicy Bypass -File `
 
 ## Next #837 increments
 
-1. Generalize the proven FP16 M=16 async panel family to larger M buckets,
-   BF16, and fused residual epilogues without adding dynamic stride checks.
+1. Generalize the proven FP16 M=16 async panel family to larger M buckets and
+   fused residual epilogues without adding dynamic stride checks. **BF16
+   tensor-core GEMM is now implemented** in `PtxTensorCoreEmitter` on both the
+   naive and staged wmma paths: `.global`/`.shared.bf16` fragment loads plus the
+   explicit `.m16n16k16.f32.bf16.bf16.f32` mma (bf16 is not the PTX default), the
+   recogniser accepts matched bf16 multiplicands with fp32 accumulate and refuses
+   bf16 below sm_80, and `Plan.AbType` carries the type. Byte math is unchanged
+   (bf16 is 2 bytes like f16). Codegen tests: `EmittedKernel_Bf16_UsesBf16Wmma`,
+   `StagedKernel_Bf16_UsesBf16Wmma`, `PlainBf16MatMul_IsEligible`,
+   `Bf16_BelowSm80_IsRefused`. GPU championship (p15 + Nsight zero-spill) for the
+   bf16 path remains PENDING on Ampere+ hardware.
 2. Extend W8A8 to M>=16 asynchronous IMMA buckets and add W4A16
    register-dequant projection families.
 3. FP8 E4M3/E5M2 architecture-specific families with explicit scale ABI.

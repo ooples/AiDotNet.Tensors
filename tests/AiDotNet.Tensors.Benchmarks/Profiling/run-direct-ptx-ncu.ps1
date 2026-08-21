@@ -38,6 +38,10 @@ $switch = switch ($Target) {
     'attention-backward' { '--direct-ptx-profile-attention-backward' }
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
+    'fused-linear' { '--direct-ptx-profile-fused-linear' }
+    'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
+    'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
+    'w8a8-linear' { '--direct-ptx-profile-w8a8-linear' }
     'global-avgpool' { '--direct-ptx-profile-global-avgpool' }
     'complex-multiply' { '--direct-ptx-profile-complex-multiply' }
     'solvers-4x4' { '--direct-ptx-profile-solvers-4x4' }
@@ -60,6 +64,10 @@ $kernel = switch ($Target) {
     'rng-dropout' { 'regex:aidotnet_philox_dropout_f32' }
     'rng-stochastic' { 'regex:aidotnet_(philox_dropout|philox_uniform|philox_normal|philox_bernoulli_mask|philox_drop_threshold_mask|dropout_backward|philox_gumbel_softmax32|philox_importance_sampling64|bias_philox_dropout256|fused_ddim_step|philox_categorical32|gumbel_softmax_backward32|philox_rrelu|rrelu|rrelu_backward)_f32' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
+    'fused-linear' { 'regex:^aidotnet_fused_linear_gelu_m1$' }
+    'mixed-linear' { 'regex:^aidotnet_fused_linear_gelu_fp16_m1$' }
+    'mixed-linear-m16' { 'regex:^aidotnet_fused_linear_gelu_fp16_m16$' }
+    'w8a8-linear' { 'regex:^aidotnet_fused_linear_gelu_w8a8_m1$' }
     'vision-box-iou' { 'regex:aidotnet_(fused_pairwise_box_iou_f32|vision_.*)' }
     'rglru' { 'regex:aidotnet_rglru_scan_b1_s128_d256' }
     'convolution' { 'regex:aidotnet_conv2d_n1_c64_h16_w16_k64_k1_bias_relu' }
@@ -77,6 +85,10 @@ $expectedLaunches = switch ($Target) {
     'rng-stochastic' { 45 }
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
+    'fused-linear' { 10 }
+    'mixed-linear' { 10 }
+    'mixed-linear-m16' { 10 }
+    'w8a8-linear' { 10 }
     'vision-box-iou' { 31 }
     'rglru' { 1 }
     'convolution' { 1 }

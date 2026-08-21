@@ -4477,21 +4477,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int maximumPartials = (size + blockSize - 1) / blockSize;
         using var temporaryA = AllocateBuffer(maximumPartials);
         using var temporaryB = AllocateBuffer(maximumPartials);
+        using var scalarResult = AllocateBuffer(1);
         IGpuBuffer current = input;
         int currentSize = size;
         bool writeA = true;
         while (currentSize > 1)
         {
             int partialCount = (currentSize + blockSize - 1) / blockSize;
-            IGpuBuffer next = writeA ? temporaryA : temporaryB;
+            IGpuBuffer next = partialCount == 1
+                ? scalarResult
+                : writeA ? temporaryA : temporaryB;
             LaunchReductionKernel(kernelName, current, next, currentSize, blockSize);
             current = next;
             currentSize = partialCount;
             writeA = !writeA;
         }
 
+        // DownloadBuffer intentionally requires a destination large enough for the buffer's physical
+        // capacity. A reduction's logical size can be one while its scratch buffer is larger, so make
+        // the final device value live in an exact one-element allocation before reading it back.
+        if (current.Handle != scalarResult.Handle)
+            Copy(current, scalarResult, 1);
+
         var result = new float[1];
-        DownloadBuffer(current, result);
+        DownloadBuffer(scalarResult, result);
         return result[0];
     }
 

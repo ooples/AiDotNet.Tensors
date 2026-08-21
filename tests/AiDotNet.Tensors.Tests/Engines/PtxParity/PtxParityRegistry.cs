@@ -164,24 +164,27 @@ public static class PtxParityRegistry
             "has a public route, but its tests compare the PTX result against a CPU reference only, so " +
             "the gate-off CUDA==CPU leg is unproven. The op fuses matmul + bias + GELU, so a three-way " +
             "spec must compare against the same fused CPU oracle on both legs rather than the " +
-            "three-kernel fallback sequence, which rounds differently."),
+            "three-kernel fallback sequence, which rounds differently. HIP, Metal, OpenCL, Vulkan, and " +
+            "WebGPU parity is tracked by #974."),
 
         new PtxParitySpec("PtxFusedLinearGeluFp16M1Kernel", PtxParityStatus.Deferred,
-            "fused decode linear + GELU, fp16 weights M=1 (#837)",
-            "fp16 weight operand; its harness needs System.Half, which does not exist on net471, so the " +
-            "spec is net-core-only. Same missing gate-off leg as the fp32 variant, plus an fp16 " +
-            "accumulation oracle question that needs a dedicated tolerance."),
+            "fused decode linear + GELU, fp16 weights M=1 (#837) — CudaBackend.FusedLinearGELUFp16TransposedM1",
+            "fp16 weight operand. Same missing gate-off leg as the fp32 variant, plus an fp16 " +
+            "accumulation oracle question that needs a dedicated tolerance. HIP, Metal, OpenCL, Vulkan, " +
+            "and WebGPU parity is tracked by #974."),
 
         new PtxParitySpec("PtxFusedLinearGeluFp16M16Kernel", PtxParityStatus.Deferred,
-            "fused decode linear + GELU, fp16 weights M=16 (#837)",
+            "fused decode linear + GELU, fp16 weights M=16 (#837) — CudaBackend.FusedLinearGELUFp16TransposedM16",
             "the M=16 tile of the fp16 decode-linear family; same fp16 oracle and missing gate-off leg " +
-            "as the M=1 variant, and its larger tile also needs an occupancy assertion before promotion."),
+            "as the M=1 variant, and its larger tile also needs an occupancy assertion before promotion. " +
+            "HIP, Metal, OpenCL, Vulkan, and WebGPU parity is tracked by #974."),
 
         new PtxParitySpec("PtxFusedLinearGeluW8A8M1Kernel", PtxParityStatus.Deferred,
-            "fused decode linear + GELU, W8A8 M=1 (#837)",
+            "fused decode linear + GELU, W8A8 M=1 (#837) — CudaBackend.FusedLinearGELUW8A8TransposedM1",
             "int8 weights and activations with per-tensor activation scale and per-column weight scales. " +
             "A three-way spec needs a quantization-aware oracle (dequantize in fp64, then fuse) rather " +
-            "than a direct float comparison, so it is deferred until that oracle exists."),
+            "than a direct float comparison, so it is deferred until that oracle exists. HIP, Metal, " +
+            "OpenCL, Vulkan, and WebGPU parity is tracked by #974."),
 
         new PtxParitySpec("PtxFusedAdamUpdateF32Kernel", PtxParityStatus.Deferred,
             "Adam parameter update, fp32 (#848) - CudaBackend.AdamUpdate",

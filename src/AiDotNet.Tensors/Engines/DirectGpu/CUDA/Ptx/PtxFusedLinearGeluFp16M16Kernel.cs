@@ -15,8 +15,9 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
     internal const int Rows = 16;
     internal const int BlockThreads = 128;
     internal const int OutputsPerBlock = 32;
-    internal const int MaxStaticSharedBytes = 24_576;
     internal const string EntryPoint = "aidotnet_fused_linear_gelu_fp16_m16";
+    private const int AsyncCopyBytes = 16;
+    private const int MmaK = 16;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -45,13 +46,21 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             inputFeatures, outputFeatures);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -60,11 +69,13 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         DirectPtxTensorView bias,
         DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(weights, Blueprint.Tensors[1], nameof(weights));
-        Require(bias, Blueprint.Tensors[2], nameof(bias));
-        Require(output, Blueprint.Tensors[3], nameof(output));
-        if (Overlaps(output, input) || Overlaps(output, weights) || Overlaps(output, bias))
+        PtxFusedLinearGeluShared.Require(input, Blueprint.Tensors[0], nameof(input));
+        PtxFusedLinearGeluShared.Require(weights, Blueprint.Tensors[1], nameof(weights));
+        PtxFusedLinearGeluShared.Require(bias, Blueprint.Tensors[2], nameof(bias));
+        PtxFusedLinearGeluShared.Require(output, Blueprint.Tensors[3], nameof(output));
+        if (PtxFusedLinearGeluShared.Overlaps(output, input) ||
+            PtxFusedLinearGeluShared.Overlaps(output, weights) ||
+            PtxFusedLinearGeluShared.Overlaps(output, bias))
             throw new ArgumentException("FP16 fused-linear output may not alias input, weights, or bias.");
 
         IntPtr inputPointer = input.Pointer;
@@ -96,6 +107,9 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int kPerPanel = GetKPerPanel(inputFeatures);
         int aPanelBytes = Rows * kPerPanel * sizeof(ushort);
         int weightPanelBytes = OutputsPerBlock * kPerPanel * sizeof(ushort);
+        int aSubpanelBytes = Rows * MmaK * sizeof(ushort);
+        int weightSubpanelBytes = OutputsPerBlock * MmaK * sizeof(ushort);
+        int stagedOutputStrideBytes = 2 * AsyncCopyBytes;
         int bufferBytes = aPanelBytes + weightPanelBytes;
         int staticSharedBytes = 2 * bufferBytes;
         int chunks = inputFeatures / kPerPanel;
@@ -134,11 +148,11 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         ptx.AppendLine("    shr.u32 %r8, %r0, 3;");
         ptx.AppendLine("    shr.u32 %r10, %r7, 1;");
         ptx.AppendLine("    and.b32 %r19, %r7, 1;");
-        ptx.AppendLine("    shl.b32 %r19, %r19, 4;");
-        ptx.AppendLine("    mad.lo.u32 %r13, %r10, 512, %r19;");
-        ptx.AppendLine("    mad.lo.u32 %r13, %r8, 32, %r13;");
-        ptx.AppendLine("    mad.lo.u32 %r10, %r10, 1024, %r19;");
-        ptx.AppendLine("    mad.lo.u32 %r10, %r8, 32, %r10;");
+        ptx.AppendLine($"    shl.b32 %r19, %r19, {Log2(AsyncCopyBytes)};");
+        ptx.AppendLine($"    mad.lo.u32 %r13, %r10, {aSubpanelBytes}, %r19;");
+        ptx.AppendLine($"    mad.lo.u32 %r13, %r8, {stagedOutputStrideBytes}, %r13;");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r10, {weightSubpanelBytes}, %r19;");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r8, {stagedOutputStrideBytes}, %r10;");
         ptx.AppendLine("    shl.b32 %r7, %r7, 4;");
         ptx.AppendLine($"    mad.lo.u32 %r9, %r8, {inputRowBytes}, %r7;");
         ptx.AppendLine("    add.u32 %r11, %r4, %r8;");
@@ -225,17 +239,29 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int bufferBase = buffer * bufferBytes;
         int weightsBase = bufferBase + aPanelBytes;
         int globalOffset = chunk * kPerPanel * sizeof(ushort);
+        int weightSubpanelBytes = OutputsPerBlock * MmaK * sizeof(ushort);
+        int halfOutputGroupBytes = weightSubpanelBytes / 2;
+        int secondKHalfBytes = OutputsPerBlock * (kPerPanel / 2) * sizeof(ushort);
         ptx.AppendLine("    add.u64 %rd12, %rd4, %rd7;");
         ptx.AppendLine("    add.u64 %rd13, %rd4, %rd15;");
         ptx.AppendLine($"    cp.async.ca.shared.global [%rd12+{bufferBase}], [%rd5+{globalOffset}], 16;");
         ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase}], [%rd6+{globalOffset}], 16;");
-        ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + 512}], [%rd6+{globalOffset + 16 * inputRowBytes}], 16;");
+        ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + halfOutputGroupBytes}], [%rd6+{globalOffset + (OutputsPerBlock / 2) * inputRowBytes}], 16;");
         if (kPerPanel == 128)
         {
-            ptx.AppendLine($"    cp.async.ca.shared.global [%rd12+{bufferBase + 2_048}], [%rd5+{globalOffset + 128}], 16;");
-            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + 4_096}], [%rd6+{globalOffset + 128}], 16;");
-            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + 4_608}], [%rd6+{globalOffset + 16 * inputRowBytes + 128}], 16;");
+            int secondAHalfBytes = Rows * (kPerPanel / 2) * sizeof(ushort);
+            int globalSecondHalfOffset = (kPerPanel / 2) * sizeof(ushort);
+            ptx.AppendLine($"    cp.async.ca.shared.global [%rd12+{bufferBase + secondAHalfBytes}], [%rd5+{globalOffset + globalSecondHalfOffset}], 16;");
+            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + secondKHalfBytes}], [%rd6+{globalOffset + globalSecondHalfOffset}], 16;");
+            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + secondKHalfBytes + halfOutputGroupBytes}], [%rd6+{globalOffset + (OutputsPerBlock / 2) * inputRowBytes + globalSecondHalfOffset}], 16;");
         }
+    }
+
+    private static int Log2(int powerOfTwo)
+    {
+        int result = 0;
+        while ((1 << result) != powerOfTwo) result++;
+        return result;
     }
 
     private static void EmitMma(
@@ -329,6 +355,35 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
     internal static int GetStaticSharedBytes(int inputFeatures) =>
         2 * (Rows + OutputsPerBlock) * GetKPerPanel(inputFeatures) * sizeof(ushort);
 
+    internal static int[] GetWeightStagingDestinationOffsets(int inputFeatures)
+    {
+        int kPerPanel = GetKPerPanel(inputFeatures);
+        int weightPanelBytes = OutputsPerBlock * kPerPanel * sizeof(ushort);
+        int weightSubpanelBytes = OutputsPerBlock * MmaK * sizeof(ushort);
+        int halfOutputGroupBytes = weightSubpanelBytes / 2;
+        int secondKHalfBytes = weightPanelBytes / 2;
+        int copiesPerThread = kPerPanel == 128 ? 4 : 2;
+        var offsets = new int[BlockThreads * copiesPerThread];
+        int index = 0;
+        for (int thread = 0; thread < BlockThreads; thread++)
+        {
+            int laneInCopyGroup = thread & 7;
+            int outputInHalf = thread >> 3;
+            int subpanel = laneInCopyGroup >> 1;
+            int tileInOutput = laneInCopyGroup & 1;
+            int baseOffset = subpanel * weightSubpanelBytes +
+                outputInHalf * (2 * AsyncCopyBytes) + tileInOutput * AsyncCopyBytes;
+            offsets[index++] = baseOffset;
+            offsets[index++] = baseOffset + halfOutputGroupBytes;
+            if (kPerPanel == 128)
+            {
+                offsets[index++] = baseOffset + secondKHalfBytes;
+                offsets[index++] = baseOffset + secondKHalfBytes + halfOutputGroupBytes;
+            }
+        }
+        return offsets;
+    }
+
     internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
         (inputFeatures, outputFeatures) == (1024, 4096);
 
@@ -337,27 +392,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         if (!IsSupportedShape(inputFeatures, outputFeatures))
             throw new ArgumentOutOfRangeException(
                 nameof(inputFeatures),
+                $"inputFeatures={inputFeatures}, outputFeatures={outputFeatures}",
                 "The M=16 Tensor Core experiment supports only K/N 512/2048 and 1024/4096.");
-    }
-
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
-
-    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
-    {
-        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
-        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
-        nuint leftEnd = checked(leftStart + left.ByteLength);
-        nuint rightEnd = checked(rightStart + right.ByteLength);
-        return leftStart < rightEnd && rightStart < leftEnd;
     }
 }

@@ -368,6 +368,28 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     Tensor<T> Step();
 
     /// <summary>
+    /// How many optimizer updates have been discarded because that step's gradients were not
+    /// finite. Zero on a healthy run.
+    /// </summary>
+    /// <remarks>
+    /// The fused kernels read a gradient and write its parameter in the same pass, so applying a
+    /// non-finite gradient is unrecoverable — it lands in the weights and every later step reads it
+    /// back. Steps whose gradients fail the finiteness check are therefore skipped outright,
+    /// matching <c>torch.amp.GradScaler</c>, which does the same on an inf/NaN overflow.
+    /// </remarks>
+    int NonFiniteStepsSkipped { get; }
+
+    /// <summary>
+    /// True when the most recent <see cref="Step"/> discarded its optimizer update because the
+    /// gradients were not finite. The parameters are unchanged in that case.
+    /// </summary>
+    /// <remarks>
+    /// Worth surfacing rather than silently skipping: from the loss alone, "the model is not
+    /// learning" and "the model is diverging and its updates are being discarded" look identical.
+    /// </remarks>
+    bool LastStepSkippedNonFiniteGradients { get; }
+
+    /// <summary>
     /// CUDA-Graph-capture-safe counterpart to <see cref="Step"/>: runs forward +
     /// backward, writes the final loss into <paramref name="lossOutput"/>, and
     /// leaves gradients in <see cref="Gradients"/>. No per-call allocation of the

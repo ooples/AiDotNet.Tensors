@@ -212,7 +212,7 @@ internal static class DirectPtxMixedLinearExperiment
             directAllocation, 0, directError, audit.Function.RegistersPerThread,
             audit.Function.StaticSharedBytes, audit.Function.LocalBytesPerThread,
             audit.ActiveBlocksPerMultiprocessor);
-        Print(run, shape, "Direct graph", directGraphDevice, directGraphE2e,
+        Print(run, shape, "Direct PTX graph", directGraphDevice, directGraphE2e,
             directGraphAllocation, 0, directError, audit.Function.RegistersPerThread,
             audit.Function.StaticSharedBytes, audit.Function.LocalBytesPerThread,
             audit.ActiveBlocksPerMultiprocessor);
@@ -309,9 +309,11 @@ internal static class DirectPtxMixedLinearExperiment
         start.ArgumentList.Add(rows.ToString(System.Globalization.CultureInfo.InvariantCulture));
         using Process process = Process.Start(start) ??
             throw new InvalidOperationException("Could not start the PyTorch CUDA baseline.");
+        System.Threading.Tasks.Task<string> stderrTask = process.StandardError.ReadToEndAsync();
         var records = new List<PythonRecord>();
         while (process.StandardOutput.ReadLine() is { } line)
         {
+            if (!line.StartsWith("{", StringComparison.Ordinal)) continue;
             JsonElement root = JsonDocument.Parse(line).RootElement;
             records.Add(new PythonRecord(
                 root.GetProperty("status").GetString()!, root.GetProperty("run").GetInt32(),
@@ -322,7 +324,7 @@ internal static class DirectPtxMixedLinearExperiment
                 root.GetProperty("e2e_p95_us").GetDouble(), root.GetProperty("e2e_p99_us").GetDouble(),
                 root.GetProperty("peak_device_bytes").GetInt64(), root.GetProperty("max_error").GetDouble()));
         }
-        string stderr = process.StandardError.ReadToEnd();
+        string stderr = stderrTask.GetAwaiter().GetResult();
         process.WaitForExit();
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"PyTorch CUDA baseline exited {process.ExitCode}: {stderr}");

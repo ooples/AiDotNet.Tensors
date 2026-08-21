@@ -119,21 +119,26 @@ internal static class DirectPtxW8A8LinearExperiment
         MeasureGraphAndPrint(run, "AiDotNet NVRTC graph", backend, BaselineLaunch,
             baselineError, temporaryBytes: 0);
 
+        bool cublasLtEligible = true;
         try
         {
             CuBlasLtLaunch();
             backend.Synchronize();
+        }
+        catch (NotSupportedException exception)
+        {
+            cublasLtEligible = false;
+            Console.WriteLine(
+                $"{run,3} m1-k1024-n4096      {"NVIDIA cuBLASLt",-23} INELIGIBLE: " +
+                exception.Message.Replace(Environment.NewLine, " ", StringComparison.Ordinal));
+        }
+        if (cublasLtEligible)
+        {
             float cublasLtError = MaximumError(backend.DownloadBuffer(cublasLtOutput), expected);
             MeasureAndPrint(run, "NVIDIA cuBLASLt", backend, CuBlasLtLaunch,
                 cublasLtError, temporaryBytes: N * sizeof(int));
             MeasureGraphAndPrint(run, "cuBLASLt graph", backend, CuBlasLtLaunch,
                 cublasLtError, temporaryBytes: N * sizeof(int));
-        }
-        catch (Exception exception)
-        {
-            Console.WriteLine(
-                $"{run,3} m1-k1024-n4096      {"NVIDIA cuBLASLt",-23} INELIGIBLE: " +
-                exception.Message.Replace(Environment.NewLine, " ", StringComparison.Ordinal));
         }
 
         DirectPtxFeatureGate.TestOverride = true;
@@ -294,9 +299,13 @@ internal static class DirectPtxW8A8LinearExperiment
         start.ArgumentList.Add(script);
         using Process process = Process.Start(start) ??
             throw new InvalidOperationException("Could not start the PyTorch W8A8 eligibility probe.");
-        string line = process.StandardOutput.ReadLine() ?? string.Empty;
-        string stderr = process.StandardError.ReadToEnd();
+        System.Threading.Tasks.Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+        System.Threading.Tasks.Task<string> stderrTask = process.StandardError.ReadToEndAsync();
         process.WaitForExit();
+        string line = stdoutTask.GetAwaiter().GetResult()
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault(candidate => candidate.StartsWith("{", StringComparison.Ordinal)) ?? string.Empty;
+        string stderr = stderrTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0)
             throw new InvalidOperationException(
                 $"PyTorch W8A8 eligibility probe exited {process.ExitCode}: {stderr}");
