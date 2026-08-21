@@ -14,6 +14,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
 {
     internal const int Rows = 16;
     internal const int DefaultOutputsPerBlock = 64;
+    internal const int OutputsPerBlock = DefaultOutputsPerBlock;
     internal const int MaxStaticSharedBytes = 40_960;
     internal const string EntryPoint = "aidotnet_fused_linear_gelu_fp16_m16";
 
@@ -22,8 +23,8 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
 
     internal int InputFeatures { get; }
     internal int OutputFeatures { get; }
-    internal int OutputsPerBlock { get; }
-    internal int BlockThreads => OutputsPerBlock * 4;
+    internal int TileOutputsPerBlock { get; }
+    internal int BlockThreads => TileOutputsPerBlock * 4;
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
@@ -35,7 +36,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int outputsPerBlock = DefaultOutputsPerBlock)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedFusedLinear(
+        if (!DirectPtxArchitecture.HasValidatedMixedLinear(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in FP16 Tensor Core fused-linear specialization is measured only on GA10x/SM86.");
@@ -44,7 +45,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
 
         InputFeatures = inputFeatures;
         OutputFeatures = outputFeatures;
-        OutputsPerBlock = outputsPerBlock;
+        TileOutputsPerBlock = outputsPerBlock;
         Blueprint = CreateBlueprint(
             runtime.ArchitectureFamily, inputFeatures, outputFeatures, outputsPerBlock);
         Ptx = EmitPtx(
@@ -81,7 +82,7 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         arguments[3] = &outputPointer;
         _module.Launch(
             _function,
-            (uint)(OutputFeatures / OutputsPerBlock), 1, 1,
+            (uint)(OutputFeatures / TileOutputsPerBlock), 1, 1,
             (uint)BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -368,6 +369,40 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int inputFeatures,
         int outputsPerBlock = DefaultOutputsPerBlock) =>
         2 * (Rows + outputsPerBlock) * GetKPerPanel(inputFeatures) * sizeof(ushort);
+
+    internal static int[] GetWeightStagingDestinationOffsets(int inputFeatures)
+    {
+        if (inputFeatures is not (512 or 1024))
+            throw new ArgumentOutOfRangeException(nameof(inputFeatures));
+
+        int outputsPerBlock = DefaultOutputsPerBlock;
+        int kPerPanel = GetKPerPanel(inputFeatures);
+        int blockThreads = outputsPerBlock * 4;
+        int copiesPerThread = kPerPanel == 128 ? 4 : 2;
+        int weightHalfKBytes = outputsPerBlock * 64 * sizeof(ushort);
+        int weightHalfRowsBytes =
+            (outputsPerBlock / 2) * 16 * sizeof(ushort);
+        var offsets = new int[blockThreads * copiesPerThread];
+        int index = 0;
+        for (int thread = 0; thread < blockThreads; thread++)
+        {
+            int laneInEight = thread & 7;
+            int group = thread >> 3;
+            int destination =
+                (laneInEight >> 1) * outputsPerBlock * 32 +
+                (laneInEight & 1) * 16 +
+                group * 32;
+            offsets[index++] = destination;
+            offsets[index++] = destination + weightHalfRowsBytes;
+            if (kPerPanel == 128)
+            {
+                offsets[index++] = destination + weightHalfKBytes;
+                offsets[index++] =
+                    destination + weightHalfKBytes + weightHalfRowsBytes;
+            }
+        }
+        return offsets;
+    }
 
     internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) => false;
 

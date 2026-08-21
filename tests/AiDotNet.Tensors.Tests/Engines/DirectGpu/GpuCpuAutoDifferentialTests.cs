@@ -498,10 +498,11 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         // fused recurrence / LM-head scans (#1464) — q/k/v [B,S,D] vs gate/alpha/etc. [B,S,H],
         // or [N,d]+[d,vocab]+[N] CE shapes: distinct shapes per tensor arg the generic single-shape
         // generator can't drive. Each has a dedicated GPU-vs-CPU parity suite:
-        //   GlaScanGpuParityTests, XLstmScanGpuParityTests, GatedDeltaNetScanGpuParityTests,
+        //   AbcScanGpuParityTests, GlaScanGpuParityTests, XLstmScanGpuParityTests, GatedDeltaNetScanGpuParityTests,
         //   RgLruScanGpuParityTests, Rwkv4WkvGpuParityTests, MambaScanGpuParityTests,
         //   Mamba2ScanGpuParityTests, FusedLinearCeGpuParityTests.
         "GlaScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        "AbcScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32,Double)",
         "XLstmScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
         "GatedDeltaNetScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
         "RgLruScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",

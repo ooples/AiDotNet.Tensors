@@ -1,4 +1,3 @@
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 
@@ -80,6 +79,9 @@ internal static class DirectPtxDenseLinearCoverageManifest
         Cell("DirectGpuTensorEngine.FusedLoRAForward", "CudaBackend.FusedLoRAForward or CPU fallback", "public LoRA forward", "input[M,K], base[M,N], A[K,R], B[R,N]", "FP32", DirectLinear)
     ];
 
+    private static readonly Dictionary<string, DirectPtxDenseLinearCoverageCell> ByApi =
+        CreateByApi();
+
     private static DirectPtxDenseLinearCoverageCell Cell(
         string api, string existing, string semantics, string layout, string dtypes,
         string assignment,
@@ -88,11 +90,18 @@ internal static class DirectPtxDenseLinearCoverageManifest
 
     internal static DirectPtxDenseLinearCoverageCell Get(string api)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(api);
+        PtxCompat.ThrowIfNullOrWhiteSpace(api, nameof(api));
+        return ByApi.TryGetValue(api, out DirectPtxDenseLinearCoverageCell? cell)
+            ? cell
+            : throw new KeyNotFoundException(
+                $"Dense-linear API '{api}' is not assigned in the #836 coverage manifest.");
+    }
+
+    private static Dictionary<string, DirectPtxDenseLinearCoverageCell> CreateByApi()
+    {
+        var result = new Dictionary<string, DirectPtxDenseLinearCoverageCell>(StringComparer.Ordinal);
         foreach (DirectPtxDenseLinearCoverageCell cell in All)
-            if (string.Equals(cell.Api, api, StringComparison.Ordinal)) return cell;
-        throw new KeyNotFoundException(
-            $"Dense-linear API '{api}' is not assigned in the #836 coverage manifest.");
+            result.Add(cell.Api, cell);
+        return result;
     }
 }
-#endif

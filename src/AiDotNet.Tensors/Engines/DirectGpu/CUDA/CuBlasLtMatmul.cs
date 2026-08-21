@@ -123,6 +123,109 @@ public sealed class CuBlasLtMatmul : IDisposable
         }
     }
 
+    /// <summary>
+    /// Resident signed-INT8 GEMM with exact INT32 accumulation/output. The
+    /// caller supplies already-packed device operands; scaling and nonlinear
+    /// epilogues are intentionally separate because cuBLASLt's INT32 compute
+    /// contract does not accept the FP32 per-channel scale ABI used by W8A8.
+    /// Operands use standard column-major packing. Before transposition, A is
+    /// <c>[m,k]</c> (or <c>[k,m]</c> when transposed), B is <c>[k,n]</c> (or
+    /// <c>[n,k]</c> when transposed), and C/D are <c>[m,n]</c>. Device pointers,
+    /// the reduction dimension, and the leading dimensions must satisfy the
+    /// four-byte INT8 dot-product alignment contract.
+    /// </summary>
+    public void MatmulInt8ToInt32(
+        IntPtr aDev, int m, int k, bool transA,
+        IntPtr bDev, int n, bool transB,
+        IntPtr dDev,
+        IntPtr stream = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuBlasLtMatmul));
+        ValidateInt8LayoutArguments(aDev, m, k, transA, bDev, n, transB, dDev);
+
+        ulong aRows = checked((ulong)(transA ? k : m));
+        ulong aColumns = checked((ulong)(transA ? m : k));
+        long aLeadingDimension = checked((long)aRows);
+        ulong bRows = checked((ulong)(transB ? n : k));
+        ulong bColumns = checked((ulong)(transB ? k : n));
+        long bLeadingDimension = checked((long)bRows);
+
+        IntPtr opDesc = IntPtr.Zero, aDesc = IntPtr.Zero, bDesc = IntPtr.Zero;
+        IntPtr cDesc = IntPtr.Zero, dDesc = IntPtr.Zero;
+        try
+        {
+            Check(CuBlasLtNative.cublasLtMatmulDescCreate(
+                out opDesc, CublasComputeType.Int32, CublasDataType.Int32), "INT8 DescCreate");
+            int tA = transA ? 1 : 0;
+            int tB = transB ? 1 : 0;
+            SetAttr(opDesc, CublasLtMatmulDescAttributes.TransA, ref tA, sizeof(int));
+            SetAttr(opDesc, CublasLtMatmulDescAttributes.TransB, ref tB, sizeof(int));
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out aDesc, CublasDataType.Int8, aRows, aColumns,
+                aLeadingDimension), "INT8 A layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out bDesc, CublasDataType.Int8, bRows, bColumns,
+                bLeadingDimension), "INT8 B layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out cDesc, CublasDataType.Int32, (ulong)m, (ulong)n, m),
+                "INT32 C layout");
+            Check(CuBlasLtNative.cublasLtMatrixLayoutCreate(
+                out dDesc, CublasDataType.Int32, (ulong)m, (ulong)n, m),
+                "INT32 D layout");
+            int alpha = 1, beta = 0;
+            CublasStatus status = CuBlasLtNative.cublasLtMatmulInt32(
+                _handle, opDesc, ref alpha,
+                aDev, aDesc, bDev, bDesc, ref beta,
+                dDev, cDesc, dDev, dDesc,
+                IntPtr.Zero, IntPtr.Zero, 0, stream);
+            if (status == CublasStatus.NotSupported)
+                throw new NotSupportedException(
+                    "cuBLASLt does not support this standard-column-major INT8 matmul on the active device.");
+            Check(status, "INT8 Matmul");
+        }
+        finally
+        {
+            if (dDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(dDesc);
+            if (cDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(cDesc);
+            if (bDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(bDesc);
+            if (aDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(aDesc);
+            if (opDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatmulDescDestroy(opDesc);
+        }
+    }
+
+    internal static void ValidateInt8LayoutArguments(
+        IntPtr aDev, int m, int k, bool transA,
+        IntPtr bDev, int n, bool transB,
+        IntPtr dDev)
+    {
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Matrix dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Matrix dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Matrix dimensions must be positive.");
+        if ((m & 3) != 0 || (k & 3) != 0)
+            throw new ArgumentException(
+                $"Standard-layout INT8 matmul requires m and k to be multiples of four (m={m}, k={k}).");
+
+        ValidateAlignedDevicePointer(aDev, nameof(aDev));
+        ValidateAlignedDevicePointer(bDev, nameof(bDev));
+        ValidateAlignedDevicePointer(dDev, nameof(dDev));
+
+        int aLeadingDimension = transA ? k : m;
+        int bLeadingDimension = transB ? n : k;
+        if ((aLeadingDimension & 3) != 0 || (bLeadingDimension & 3) != 0)
+            throw new ArgumentException(
+                "Standard-layout INT8 operand leading dimensions must be multiples of four. " +
+                $"Computed lda={aLeadingDimension}, ldb={bLeadingDimension} for " +
+                $"transA={transA}, transB={transB}.");
+    }
+
+    private static void ValidateAlignedDevicePointer(IntPtr pointer, string paramName)
+    {
+        if (pointer == IntPtr.Zero)
+            throw new ArgumentException("The device pointer cannot be null.", paramName);
+        if ((pointer.ToInt64() & 3L) != 0)
+            throw new ArgumentException("The device pointer must be at least four-byte aligned.", paramName);
+    }
+
     private static void SetAttr<TAttr>(IntPtr desc, CublasLtMatmulDescAttributes attr, ref TAttr value, int sizeInBytes)
         where TAttr : unmanaged
     {

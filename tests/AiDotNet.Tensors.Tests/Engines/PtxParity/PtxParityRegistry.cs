@@ -132,6 +132,33 @@ public static class PtxParityRegistry
             "leg yet. Widening is exact for every FP16 input (including subnormals, infinities, and " +
             "signed zero), so its three-way spec can assert bit-for-bit equality on all three legs " +
             "rather than a tolerance."),
+        new PtxParitySpec("PtxFusedLinearGeluM1Kernel", PtxParityStatus.Deferred,
+            "fused decode linear + GELU, fp32 M=1 (#836) — CudaBackend.FusedLinearGELUTransposedM1",
+            "has a public route, but its tests compare the PTX result against a CPU reference only, so " +
+            "the gate-off CUDA==CPU leg is unproven. The op fuses matmul + bias + GELU, so a three-way " +
+            "spec must compare against the same fused CPU oracle on both legs rather than the " +
+            "three-kernel fallback sequence, which rounds differently. HIP, Metal, OpenCL, Vulkan, and " +
+            "WebGPU parity is tracked by #974."),
+
+        new PtxParitySpec("PtxFusedLinearGeluFp16M1Kernel", PtxParityStatus.Deferred,
+            "fused decode linear + GELU, fp16 weights M=1 (#837) — CudaBackend.FusedLinearGELUFp16TransposedM1",
+            "fp16 weight operand. Same missing gate-off leg as the fp32 variant, plus an fp16 " +
+            "accumulation oracle question that needs a dedicated tolerance. HIP, Metal, OpenCL, Vulkan, " +
+            "and WebGPU parity is tracked by #974."),
+
+        new PtxParitySpec("PtxFusedLinearGeluFp16M16Kernel", PtxParityStatus.Deferred,
+            "fused decode linear + GELU, fp16 weights M=16 (#837) — CudaBackend.FusedLinearGELUFp16TransposedM16",
+            "the M=16 tile of the fp16 decode-linear family; same fp16 oracle and missing gate-off leg " +
+            "as the M=1 variant, and its larger tile also needs an occupancy assertion before promotion. " +
+            "HIP, Metal, OpenCL, Vulkan, and WebGPU parity is tracked by #974."),
+
+        new PtxParitySpec("PtxFusedLinearGeluW8A8M1Kernel", PtxParityStatus.Deferred,
+            "fused decode linear + GELU, W8A8 M=1 (#837) — CudaBackend.FusedLinearGELUW8A8TransposedM1",
+            "int8 weights and activations with per-tensor activation scale and per-column weight scales. " +
+            "A three-way spec needs a quantization-aware oracle (dequantize in fp64, then fuse) rather " +
+            "than a direct float comparison, so it is deferred until that oracle exists. HIP, Metal, " +
+            "OpenCL, Vulkan, and WebGPU parity is tracked by #974."),
+
         new PtxParitySpec("PtxFusedAdamUpdateF32Kernel", PtxParityStatus.Deferred,
             "Adam parameter update, fp32 (#848) - CudaBackend.AdamUpdate",
             "updates param, m, and v in place, so a gate-off/gate-on spec must snapshot and restore all " +
@@ -526,16 +553,6 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxFusedQkvRopeCacheD64Kernel", PtxParityStatus.Deferred,
             "fused QKV + RoPE + KV-cache write (#858)",
             "multi-output (Q + K/V cache) with baked RoPE tables; needs a dedicated QKV/RoPE/cache oracle."),
-        new PtxParitySpec("PtxFusedLinearGeluM1Kernel", PtxParityStatus.Deferred,
-            "FusedLinearGELUTransposedM1 (#836)",
-            "driver-only PTX-vs-fp64-oracle and public-route tests exist, but the output-major weight " +
-            "contract has no equivalent existing-CUDA public route in the parity harness yet; add that " +
-            "layout-explicit baseline before classifying this as three-way parity."),
-        new PtxParitySpec("PtxFusedLinearGeluFp16M16Kernel", PtxParityStatus.Deferred,
-            "exact-shape FP16 Tensor Core fused linear + GELU (#836)",
-            "driver-only PTX-vs-fp64-oracle and exact-cubin tests cover the two admitted transformer " +
-            "shapes; the resident NVIDIA and compiled-PyTorch championship matrix must pass before " +
-            "classifying this experimental specialization as three-way parity."),
         new PtxParitySpec("PtxFusedLinearTiledKernel", PtxParityStatus.Deferred,
             "general-M fused linear + bias + activation (#836)",
             "driver-only PTX-vs-fp64-oracle coverage exists for None, ReLU, and GELU. The tiled route is " +

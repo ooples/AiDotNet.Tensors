@@ -177,6 +177,7 @@ internal static class OpRegistry
         "RoutedDiagonalSsmScanForward",
         "RgLruScanForward",
         "GlaScanForward",
+        "AbcScanForward",
         "GatedDeltaNetScanForward",
         "XLstmScanForward",
         "Mamba2SsdScanForward",

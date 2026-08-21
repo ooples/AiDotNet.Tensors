@@ -37,6 +37,19 @@ public static class CuBlasLtNative
         IntPtr workspace, ulong workspaceSizeInBytes,
         IntPtr stream);
 
+    [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmul")]
+    public static extern CublasStatus cublasLtMatmulInt32(
+        IntPtr handle,
+        IntPtr computeDesc, ref int alpha,
+        IntPtr A, IntPtr Adesc,
+        IntPtr B, IntPtr Bdesc,
+        ref int beta,
+        IntPtr C, IntPtr Cdesc,
+        IntPtr D, IntPtr Ddesc,
+        IntPtr algo,
+        IntPtr workspace, ulong workspaceSizeInBytes,
+        IntPtr stream);
+
     [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmulDescCreate")]
     public static extern CublasStatus cublasLtMatmulDescCreate(
         out IntPtr matmulDesc, CublasComputeType computeType, CublasDataType scaleType);

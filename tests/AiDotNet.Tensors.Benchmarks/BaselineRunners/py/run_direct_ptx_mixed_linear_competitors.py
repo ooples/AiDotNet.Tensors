@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PyTorch CUDA peers for issue #836 M=1 fused linear + bias + tanh-GELU."""
+"""PyTorch CUDA FP16 peers for issue #837 linear+bias+tanh-GELU."""
 
 import argparse
 import json
@@ -13,29 +13,28 @@ import torch.nn.functional as functional
 
 WARMUPS = 30
 SAMPLES = 101
-DEVICE_LAUNCHES = 10
+DEVICE_LAUNCHES = 50
 SHAPES = (
     ("decode-256x256", 256, 256),
     ("decode-up-512x2048", 512, 2048),
     ("decode-up-1024x4096", 1024, 4096),
 )
-
-
-def percentile(values, q):
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * q
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+M16_SHAPES = (
+    ("m16-up-512x2048", 512, 2048),
+    ("m16-up-1024x4096", 1024, 4096),
+)
 
 
 def summarize(values):
-    return (
-        statistics.fmean(values),
-        percentile(values, 0.50),
-        percentile(values, 0.95),
-        percentile(values, 0.99),
-    )
+    ordered = sorted(values)
+
+    def percentile(q):
+        position = (len(ordered) - 1) * q
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+    return statistics.fmean(ordered), percentile(0.50), percentile(0.95), percentile(0.99)
 
 
 def measure_device(operation):
@@ -71,6 +70,7 @@ def measure_e2e(operation):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--rows", type=int, choices=(1, 16), default=1)
     args = parser.parse_args()
     if args.runs <= 0:
         parser.error("--runs must be positive")
@@ -78,25 +78,29 @@ def main():
         print("CUDA-enabled Python PyTorch is required.", file=sys.stderr)
         return 2
 
-    device = torch.device("cuda")
     torch.set_grad_enabled(False)
+    device = torch.device("cuda")
     for run in range(1, args.runs + 1):
-        torch.manual_seed(20261400 + run)
-        for name, input_features, output_features in SHAPES:
-            x = (torch.rand((input_features,), device=device) * 2.0 - 1.0) * 0.125
-            weights = (
-                torch.rand((output_features, input_features), device=device) * 2.0 - 1.0
-            ) * 0.0625
-            bias = (torch.rand((output_features,), device=device) * 2.0 - 1.0) * 0.0625
+        torch.manual_seed(20261500 + run)
+        shapes = SHAPES if args.rows == 1 else M16_SHAPES
+        for name, input_features, output_features in shapes:
+            x_shape = (input_features,) if args.rows == 1 else (args.rows, input_features)
+            x = (((torch.rand(x_shape, device=device) * 2.0 - 1.0) * 0.125)
+                 .to(torch.float16))
+            weights = (((torch.rand((output_features, input_features), device=device) * 2.0 - 1.0)
+                        * 0.0625).to(torch.float16))
+            # FP32 bias/output matches the direct kernel's public ABI. The
+            # functional.linear result is FP16, so the dot product is rounded
+            # before .float() begins the FP32 bias/GELU epilogue.
+            bias = ((torch.rand(output_features, device=device) * 2.0 - 1.0) * 0.0625)
 
             def operation(x=x, weights=weights, bias=bias):
-                return functional.gelu(
-                    functional.linear(x, weights, bias), approximate="tanh"
-                )
+                projected = functional.linear(x, weights, None).float() + bias
+                return functional.gelu(projected, approximate="tanh")
 
             probe = operation()
             expected = functional.gelu(
-                functional.linear(x.double(), weights.double(), bias.double()),
+                functional.linear(x.double(), weights.double(), None) + bias.double(),
                 approximate="tanh",
             )
             max_error = (probe.double() - expected).abs().max().item()
@@ -116,20 +120,19 @@ def main():
                 graph.replay()
                 return graph_output
 
-            useful_flops = 2.0 * input_features * output_features
-            for method, measured_operation in (
-                ("PyTorch CUDA eager", operation),
-                ("PyTorch CUDA graph", graph_operation),
+            for method, measured in (
+                ("PyTorch FP16 eager", operation),
+                ("PyTorch FP16 graph", graph_operation),
             ):
-                device_values = measure_device(measured_operation)
-                e2e_values = measure_e2e(measured_operation)
+                device_values = measure_device(measured)
+                e2e_values = measure_e2e(measured)
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 baseline = torch.cuda.memory_allocated()
-                result = measured_operation()
+                result = measured()
                 torch.cuda.synchronize()
                 peak_bytes = max(0, torch.cuda.max_memory_allocated() - baseline)
-                record = {
+                print(json.dumps({
                     "status": "ok",
                     "run": run,
                     "shape": name,
@@ -142,11 +145,9 @@ def main():
                     "e2e_median_us": e2e_values[1],
                     "e2e_p95_us": e2e_values[2],
                     "e2e_p99_us": e2e_values[3],
-                    "tflops": useful_flops / (device_values[1] * 1e-6) / 1e12,
                     "peak_device_bytes": peak_bytes,
                     "max_error": max_error,
-                }
-                print(json.dumps(record, separators=(",", ":")))
+                }, separators=(",", ":")))
                 del result
             del x, weights, bias, graph_output, graph, capture_stream
     return 0

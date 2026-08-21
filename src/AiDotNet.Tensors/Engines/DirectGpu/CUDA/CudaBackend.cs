@@ -148,6 +148,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _neuralNetModule;
     private IntPtr _fusedModule;
     private IntPtr _quantGemmModule; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
+    private string? _quantGemmInitializationError;
     private IntPtr _pagedAttnModule; // P1: paged-attention decode
     private IntPtr _flashDecodeModule; // P2: fused decode attention (FlashDecoding)
     private IntPtr _attentionModule;
@@ -155,7 +156,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _spectralPerfModule;
     private IntPtr _spatialTransformerModule;
     private IntPtr _sparseModule;
-    private IntPtr _dotProductModule;
     private IntPtr _locallyConnectedModule;
     private IntPtr _deformableConvModule;
     private IntPtr _capsuleModule;
@@ -869,12 +869,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         try
         {
             _quantGemmModule = CompileKernelModule(device, Kernels.CudaQuantGemmKernels.GetSource(), "quant_gemm_kernels", Kernels.CudaQuantGemmKernels.GetKernelNames());
+        }
+        catch (Exception exception)
+        {
+            _quantGemmInitializationError = exception.Message;
+        }
+        try
+        {
             _pagedAttnModule = CompileKernelModule(device, Kernels.CudaPagedAttentionKernels.GetSource(), "paged_attention_kernels", Kernels.CudaPagedAttentionKernels.GetKernelNames());
+        }
+        catch
+        {
+            // Optional P1 serving kernel; its public call degrades gracefully.
+        }
+        try
+        {
             _flashDecodeModule = CompileKernelModule(device, Kernels.CudaFlashDecodeKernels.GetSource(), "flash_decode_kernels", Kernels.CudaFlashDecodeKernels.GetKernelNames());
         }
         catch
         {
-            // P0/P1/P2 serving kernels are optional; leave their modules unset and degrade gracefully.
+            // Optional P2 serving kernel; its public call degrades gracefully.
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
@@ -925,29 +939,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
-
-        // Compile the established contiguous, strided, and batched dot-product
-        // baselines. These kernels previously existed in source but were never
-        // registered, which made both the public APIs and the #836 comparison
-        // arm fail with "CUDA kernel not found".
-        try
-        {
-            _dotProductModule = CompileKernelModule(device, Kernels.CudaDotProductKernels.GetSource(),
-                "dot_product_kernels", Kernels.CudaDotProductKernels.GetKernelNames());
-        }
-        catch (InvalidOperationException ex) when (
-            ex.Message.IndexOf("BUILTIN_OPERATION_FAILURE", StringComparison.OrdinalIgnoreCase) >= 0 ||
-            ex.Message.IndexOf("nvrtc-builtins", StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            // Preserve backend availability on driver-only deployments where
-            // NVRTC builtins are absent. Public dot routes retain their exact
-            // kernel-not-found fallback error and direct PTX needs no NVRTC.
-            // Syntax, registration, and all other unexpected failures still
-            // propagate so CI cannot silently lose this comparison arm.
-            System.Diagnostics.Debug.WriteLine(
-                $"CUDA dot-product kernel compilation failed: {ex.Message}");
-            _dotProductModule = IntPtr.Zero;
-        }
 
         // Compile broadcast/scalar/element-wise utility kernels
         CompileKernelModule(device, CudaBroadcastKernels.GetSource(), "broadcast_kernels", CudaBroadcastKernels.GetKernelNames());
@@ -1338,7 +1329,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ulong byteSize = (ulong)size * sizeof(float);
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -1604,7 +1594,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -1645,7 +1634,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", size, MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(size);
 
         using var _ = PushContext();
         if (_asyncAlloc)
@@ -1847,15 +1835,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
-        if (alpha == 1.0f && beta == 0.0f &&
-            TryDirectPtxGemmTiled(
-                A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor))
-            return;
-
         using var _ = PushContext();
-        // Fail-closed direct-PTX fast path (issue #836) for the standard alpha=1/beta=0
-        // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
-        if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
@@ -1880,11 +1860,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
-
-        if (alpha == 1.0f && beta == 0.0f &&
-            TryDirectPtxGemmTiled(
-                A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
-            return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -1940,12 +1915,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA backend is not available.");
 
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
-
-        if (alpha == 1.0f && beta == 0.0f &&
-            TryDirectPtxGemmTiled(
-                A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor,
-                batchCount))
-            return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -2023,16 +1992,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
-        if (alpha == 1.0f && beta == 0.0f &&
-            TryDirectPtxGemmTiled(
-                A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor,
-                batchCount))
-        {
-            // Preserve the established fanout contract: the scheduler route
-            // waits for all slice events before returning.
-            Synchronize();
-            return;
-        }
         ApplyDeterministicGemmMathMode();
 
         long strideA = (long)M * K;
@@ -2455,17 +2414,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new NotSupportedException(
                 $"BFloat16 GEMM requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
 
-        if (alpha == 1f && beta == 0f && !IsStreamCapturing() &&
-            TryDirectPtxFp16Gemm(
-                A, B, C, M, N, K, batchCount,
-                inputType: useBFloat16
-                    ? DirectPtx16BitInputType.BFloat16
-                    : DirectPtx16BitInputType.Float16))
-        {
-            Synchronize();
-            return;
-        }
-
         int inDtype = useBFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
         long strideA = (long)M * K;
         long strideB = (long)K * N;
@@ -2631,10 +2579,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         ValidateBiasBuffer(bias, N);
 
-        var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-            A, B, bias, M, K, N, DirectPtxLinearActivation.Relu);
-        if (directPtx is not null) return directPtx;
-
         // Single-launch fused path (matmul + bias + ReLU) when enabled; falls back on any failure.
         var fused = TryGemmBiasFusedEpilogue(A, B, bias, M, N, K, CublasLtEpilogue.ReLUBias);
         if (fused is not null) return fused;
@@ -2662,10 +2606,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         ValidateBiasBuffer(bias, N);
 
-        var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-            A, B, bias, M, K, N, DirectPtxLinearActivation.GeluTanh);
-        if (directPtx is not null) return directPtx;
-
         // Single-launch fused path (matmul + bias + GELU) when enabled; falls back on any failure.
         var fused = TryGemmBiasFusedEpilogue(A, B, bias, M, N, K, CublasLtEpilogue.GELUBias);
         if (fused is not null) return fused;
@@ -2691,9 +2631,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-            A, B, bias, M, K, N, DirectPtxLinearActivation.Sigmoid);
-        if (directPtx is not null) return directPtx;
         IGpuBuffer? temp = null;
         IGpuBuffer? output = null;
         try
@@ -2715,9 +2652,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-            A, B, bias, M, K, N, DirectPtxLinearActivation.Tanh);
-        if (directPtx is not null) return directPtx;
         IGpuBuffer? temp = null;
         IGpuBuffer? output = null;
         try
@@ -2739,9 +2673,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-            A, B, bias, M, K, N, DirectPtxLinearActivation.None);
-        if (directPtx is not null) return directPtx;
         var output = MatMul(A, B, M, N, K);
         ApplyBiasInPlace(output, bias, M, N);
         return output;
@@ -2758,6 +2689,112 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
         GpuKernelGuards.Capacity(scales, scaleCount, nameof(scales), nameof(DequantGemmInt8));
         return LaunchDequantGemm("dequant_gemm_int8", activations, weightsInt8, scales, M, K, N, groupSize, scaleCount);
+    }
+
+    /// <summary>
+    /// Symmetric W8A8 decode-token projection over canonical contiguous
+    /// output-major weights: <c>GELU(s32(input[K] @ transpose(weights[N,K])) *
+    /// activationScale * weightScales[N] + bias[N])</c>. Zero-points are
+    /// exactly zero. The admitted direct-PTX specialization fuses DP4A,
+    /// dequantization, bias, and GELU without a global intermediate; unsupported
+    /// cells fail closed to the resident NVRTC correctness kernel.
+    /// </summary>
+    public unsafe void FusedLinearGELUW8A8TransposedM1(
+        IGpuBuffer inputInt8,
+        IGpuBuffer outputMajorWeightsInt8,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int inputFeatures,
+        int outputFeatures)
+    {
+        if (inputInt8 is null) throw new ArgumentNullException(nameof(inputInt8));
+        if (outputMajorWeightsInt8 is null) throw new ArgumentNullException(nameof(outputMajorWeightsInt8));
+        if (activationScaleFloat is null) throw new ArgumentNullException(nameof(activationScaleFloat));
+        if (weightScalesFloat is null) throw new ArgumentNullException(nameof(weightScalesFloat));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (inputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(inputFeatures));
+        if (outputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outputFeatures));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (inputInt8.SizeInBytes < inputFeatures ||
+            outputMajorWeightsInt8.SizeInBytes < checked((long)inputFeatures * outputFeatures) ||
+            activationScaleFloat.SizeInBytes < sizeof(float) ||
+            weightScalesFloat.SizeInBytes < outputBytes ||
+            biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
+            throw new ArgumentException(
+                "W8A8 fused-linear buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedLinearGeluW8A8M1(
+            inputInt8, outputMajorWeightsInt8, activationScaleFloat,
+            weightScalesFloat, biasFloat, outputFloat,
+            inputFeatures, outputFeatures))
+            return;
+
+        if (!_kernelCache.TryGetValue("fused_linear_gelu_w8a8_m1", out var kernel))
+            throw new InvalidOperationException(
+                $"CUDA kernel not found: fused_linear_gelu_w8a8_m1. {_quantGemmInitializationError}");
+        using var _ = PushContext();
+        IntPtr inputPointer = inputInt8.Handle;
+        IntPtr weightPointer = outputMajorWeightsInt8.Handle;
+        IntPtr activationScalePointer = activationScaleFloat.Handle;
+        IntPtr weightScalePointer = weightScalesFloat.Handle;
+        IntPtr biasPointer = biasFloat.Handle;
+        IntPtr outputPointer = outputFloat.Handle;
+        int k = inputFeatures, n = outputFeatures;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPointer;
+        args[1] = &weightPointer;
+        args[2] = &activationScalePointer;
+        args[3] = &weightScalePointer;
+        args[4] = &biasPointer;
+        args[5] = &outputPointer;
+        args[6] = &k;
+        args[7] = &n;
+        uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>Applies the W8A8 FP32 per-channel dequantization, bias, and tanh-GELU epilogue.</summary>
+    public unsafe void W8A8DequantBiasGelu(
+        IGpuBuffer accumulatorInt32,
+        IGpuBuffer activationScaleFloat,
+        IGpuBuffer weightScalesFloat,
+        IGpuBuffer biasFloat,
+        IGpuBuffer outputFloat,
+        int outputFeatures)
+    {
+        if (accumulatorInt32 is null) throw new ArgumentNullException(nameof(accumulatorInt32));
+        if (activationScaleFloat is null) throw new ArgumentNullException(nameof(activationScaleFloat));
+        if (weightScalesFloat is null) throw new ArgumentNullException(nameof(weightScalesFloat));
+        if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
+        if (outputFloat is null) throw new ArgumentNullException(nameof(outputFloat));
+        if (outputFeatures <= 0) throw new ArgumentOutOfRangeException(nameof(outputFeatures));
+        long outputBytes = checked((long)outputFeatures * sizeof(float));
+        if (accumulatorInt32.SizeInBytes < outputBytes ||
+            activationScaleFloat.SizeInBytes < sizeof(float) ||
+            weightScalesFloat.SizeInBytes < outputBytes ||
+            biasFloat.SizeInBytes < outputBytes || outputFloat.SizeInBytes < outputBytes)
+            throw new ArgumentException("W8A8 epilogue buffers are smaller than the requested extent.");
+        if (!_kernelCache.TryGetValue("w8a8_dequant_bias_gelu", out var kernel))
+            throw new InvalidOperationException(
+                $"CUDA kernel not found: w8a8_dequant_bias_gelu. {_quantGemmInitializationError}");
+        using var _ = PushContext();
+        IntPtr accumulatorPointer = accumulatorInt32.Handle;
+        IntPtr activationScalePointer = activationScaleFloat.Handle;
+        IntPtr weightScalePointer = weightScalesFloat.Handle;
+        IntPtr biasPointer = biasFloat.Handle;
+        IntPtr outputPointer = outputFloat.Handle;
+        int n = outputFeatures;
+        void** args = stackalloc void*[6];
+        args[0] = &accumulatorPointer;
+        args[1] = &activationScalePointer;
+        args[2] = &weightScalePointer;
+        args[3] = &biasPointer;
+        args[4] = &outputPointer;
+        args[5] = &n;
+        uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     /// <summary>Weight-only fused dequant-GEMM (int4, 2 signed nibbles/byte, low nibble even). Weights
@@ -3105,9 +3142,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-            A, B, bias, M, K, N, DirectPtxLinearActivation.Swish);
-        if (directPtx is not null) return directPtx;
         IGpuBuffer? temp = null;
         IGpuBuffer? output = null;
         try
@@ -3129,12 +3163,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
     {
         ValidateBiasBuffer(bias, N);
-        if (alpha == 0.01f)
-        {
-            var directPtx = TryAllocateDirectPtxFusedLinearTiled(
-                A, B, bias, M, K, N, DirectPtxLinearActivation.LeakyRelu);
-            if (directPtx is not null) return directPtx;
-        }
         var output = AllocateBuffer(M * N);
 
         // LeakyReLU kernel has an extra alpha parameter
@@ -4392,21 +4420,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int maximumPartials = (size + blockSize - 1) / blockSize;
         using var temporaryA = AllocateBuffer(maximumPartials);
         using var temporaryB = AllocateBuffer(maximumPartials);
+        using var scalarResult = AllocateBuffer(1);
         IGpuBuffer current = input;
         int currentSize = size;
         bool writeA = true;
         while (currentSize > 1)
         {
             int partialCount = (currentSize + blockSize - 1) / blockSize;
-            IGpuBuffer next = writeA ? temporaryA : temporaryB;
+            IGpuBuffer next = partialCount == 1
+                ? scalarResult
+                : writeA ? temporaryA : temporaryB;
             LaunchReductionKernel(kernelName, current, next, currentSize, blockSize);
             current = next;
             currentSize = partialCount;
             writeA = !writeA;
         }
 
+        // DownloadBuffer intentionally requires a destination large enough for the buffer's physical
+        // capacity. A reduction's logical size can be one while its scratch buffer is larger, so make
+        // the final device value live in an exact one-element allocation before reading it back.
+        if (current.Handle != scalarResult.Handle)
+            Copy(current, scalarResult, 1);
+
         var result = new float[1];
-        DownloadBuffer(current, result);
+        DownloadBuffer(scalarResult, result);
         return result[0];
     }
 
@@ -4789,11 +4826,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
-        if (stream.Handle == _stream && alpha == 1.0f && beta == 0.0f &&
-            TryDirectPtxGemmTiled(
-                A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor))
-            return;
-
         using var _ = PushContext();
         float alphaVal = alpha;
         float betaVal = beta;
@@ -4852,20 +4884,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             Synchronize();
             return;
         }
-
-        DirectPtxLinearActivation directActivation = activation switch
-        {
-            FusedActivationType.ReLU => DirectPtxLinearActivation.Relu,
-            FusedActivationType.Sigmoid => DirectPtxLinearActivation.Sigmoid,
-            FusedActivationType.Tanh => DirectPtxLinearActivation.Tanh,
-            FusedActivationType.None => DirectPtxLinearActivation.None,
-            _ => (DirectPtxLinearActivation)(-1)
-        };
-        if (stream.Handle == _stream && (int)directActivation >= 0 &&
-            TryDirectPtxFusedLinearTiled(
-                A, B, bias, output, M, K, N, directActivation,
-                DirectPtxLinearWeightLayout.InputMajor))
-            return;
 
         // Map activation to fused kernel name
         string kernelName = activation switch
@@ -8250,7 +8268,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(int)));
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(int);
@@ -8273,7 +8290,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ulong byteSize = (ulong)size * sizeof(int);
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
 
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
 
@@ -8409,7 +8425,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             input, packedWeights, bias, cosine, sine, query, keyCache, valueCache,
             heads, cacheCapacity, position))
             return;
-        string? directPtxRejection = DirectPtxLastError;
         using var projected = AllocateBuffer(projection);
         using var biased = AllocateBuffer(projection);
         using var rotatedQueryKey = AllocateBuffer(checked(2 * model));
@@ -8421,9 +8436,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         Copy(rotatedQueryKey, 0, query, 0, model);
         Copy(rotatedQueryKey, model, keyCache, checked(position * model), model);
         Copy(biased, checked(2 * model), valueCache, checked(position * model), model);
-        // Nested optional PTX probes in the established composition must not
-        // erase the reason the outer fused specialization failed closed.
-        DirectPtxLastError = directPtxRejection;
     }
 
     public unsafe void RopeInterleaved(IGpuBuffer input, IGpuBuffer cos, IGpuBuffer sin, IGpuBuffer output,
@@ -10014,10 +10026,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
-        if (TryDirectPtxFusedLinearTiled(
-            input, weight, bias, output, batchSize, inFeatures, outFeatures,
-            DirectPtxLinearActivation.Relu, DirectPtxLinearWeightLayout.InputMajor))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
@@ -10034,10 +10042,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
-        if (TryDirectPtxFusedLinearTiled(
-            input, weight, bias, output, batchSize, inFeatures, outFeatures,
-            DirectPtxLinearActivation.Sigmoid, DirectPtxLinearWeightLayout.InputMajor))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid");
         using var _ = PushContext();
@@ -10054,10 +10058,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
-        if (TryDirectPtxFusedLinearTiled(
-            input, weight, bias, output, batchSize, inFeatures, outFeatures,
-            DirectPtxLinearActivation.Tanh, DirectPtxLinearWeightLayout.InputMajor))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
@@ -10074,10 +10074,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
-        if (TryDirectPtxFusedLinearTiled(
-            input, weight, bias, output, batchSize, inFeatures, outFeatures,
-            DirectPtxLinearActivation.GeluTanh, DirectPtxLinearWeightLayout.InputMajor))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu");
         using var _ = PushContext();
@@ -10110,11 +10106,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             outputMajorWeight.Size < checked(inFeatures * outFeatures) ||
             bias.Size < outFeatures || output.Size < outFeatures)
             throw new ArgumentException("Fused-linear buffers are smaller than the requested canonical extents.");
-#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluM1(
             input, outputMajorWeight, bias, output, inFeatures, outFeatures))
             return;
-#endif
         MatMulTransposed(input, outputMajorWeight, output, 1, outFeatures, inFeatures);
         BiasAdd(output, bias, output, 1, outFeatures);
         Gelu(output, output, outFeatures);
@@ -10124,10 +10118,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batchSize, int inFeatures, int outFeatures)
     {
         if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
-        if (TryDirectPtxFusedLinearTiled(
-            input, weight, bias, output, batchSize, inFeatures, outFeatures,
-            DirectPtxLinearActivation.Swish, DirectPtxLinearWeightLayout.InputMajor))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish");
         using var _ = PushContext();
@@ -10144,10 +10134,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
-        if (TryDirectPtxFusedLinearBackward(
-            gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
-            batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Relu))
-            return;
         // Grad input kernel
         if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu_backward_grad_input");
@@ -10187,10 +10173,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
-        if (TryDirectPtxFusedLinearBackward(
-            gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
-            batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Sigmoid))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
         using var _ = PushContext();
@@ -10227,10 +10209,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
-        if (TryDirectPtxFusedLinearBackward(
-            gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
-            batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Tanh))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
         using var _ = PushContext();
@@ -10267,10 +10245,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
-        if (TryDirectPtxFusedLinearBackward(
-            gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
-            batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.GeluTanh))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
         using var _ = PushContext();
@@ -10307,10 +10281,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batchSize, int inFeatures, int outFeatures)
     {
-        if (TryDirectPtxFusedLinearBackward(
-            gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
-            batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Swish))
-            return;
         if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
         using var _ = PushContext();
@@ -13820,10 +13790,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
         if (C.SizeInBytes < (long)M * N * sizeof(float)) throw new ArgumentException($"C buffer too small: {C.SizeInBytes} < {(long)M * N * sizeof(float)}.");
 
-        if (alpha == 1f && beta == 0f &&
-            TryDirectPtxFp16Gemm(Ahalf, Bhalf, C, M, N, K))
-            return;
-
         using var _ = PushContext();
         float aVal = alpha, bVal = beta;
         IntPtr alphaPtr = (IntPtr)(&aVal);
@@ -16216,12 +16182,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
-        DirectPtxCrossEntropyTarget directTarget = kernelName == "fused_linear_ce_index"
-            ? DirectPtxCrossEntropyTarget.Index
-            : DirectPtxCrossEntropyTarget.Dense;
-        if (TryDirectPtxFusedLinearCrossEntropy(
-            directTarget, hidden, weight, bias, tgt, meanLoss, n, d, vocab))
-            return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
@@ -16885,12 +16845,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_sparseModule);
             _sparseModule = IntPtr.Zero;
-        }
-
-        if (_dotProductModule != IntPtr.Zero)
-        {
-            CudaNativeBindings.cuModuleUnload(_dotProductModule);
-            _dotProductModule = IntPtr.Zero;
         }
 
         if (_linalgModule != IntPtr.Zero)
@@ -17595,7 +17549,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
     {
-        if (TryDirectPtxBatchDotProduct(a, b, output, batchSize, dim)) return;
         if (!_kernelCache.TryGetValue("batch_dot_product", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batch_dot_product");
         using var _ = PushContext();
@@ -17607,7 +17560,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N)
     {
-        if (TryDirectPtxOuterProduct(a, b, output, M, N)) return;
         if (!_kernelCache.TryGetValue("outer_product", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: outer_product");
         using var _ = PushContext();
@@ -17620,7 +17572,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void BatchOuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int M, int N)
     {
-        if (TryDirectPtxBatchOuterProduct(a, b, output, batchSize, M, N)) return;
         if (!_kernelCache.TryGetValue("batch_outer_product", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batch_outer_product");
         using var _ = PushContext();
@@ -17677,7 +17628,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
-        if (TryDirectPtxDotProduct(a, b, output, size)) return;
         using var _ = PushContext();
         IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
         void** args = stackalloc void*[4];
@@ -17696,50 +17646,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (!_kernelCache.TryGetValue("dot_product", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: dot_product");
-        MemsetBuffer(output, 0, sizeof(float));
         LaunchKernel(kernel, (uint)((size+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
 
-    public unsafe void StridedDotProduct(
-        IGpuBuffer a,
-        IGpuBuffer b,
-        IGpuBuffer output,
-        int aSize,
-        int bSize,
-        int bOffset,
-        int bStride)
+    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count)
     {
-        if (TryDirectPtxStridedDotProduct(
-            a, b, output, aSize, bSize, bOffset, bStride)) return;
+        if (!_kernelCache.TryGetValue("strided_dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: strided_dot_product");
         using var _ = PushContext();
         IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
         void** args = stackalloc void*[7];
-        args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&aSize; args[4]=&bSize; args[5]=&bOffset; args[6]=&bStride;
-
-        if (GpuDeterminism.IsActive)
-        {
-            if (!_kernelCache.TryGetValue("strided_dot_product_deterministic", out var deterministicKernel))
-                throw new InvalidOperationException("CUDA kernel not found: strided_dot_product_deterministic");
-            LaunchKernel(deterministicKernel, 1, DefaultBlockSize, args);
-            return;
-        }
-
-        if (!_kernelCache.TryGetValue("strided_dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: strided_dot_product");
-        MemsetBuffer(output, 0, sizeof(float));
-        LaunchKernel(kernel, (uint)((aSize+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
+        args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&size; args[4]=&strideA; args[5]=&strideB; args[6]=&count;
+        LaunchKernel(kernel, (uint)((count+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
 
     public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
     {
-        if (TryDirectPtxBatchDotProduct(a, b, output, batchSize, dim)) return;
         if (!_kernelCache.TryGetValue("batched_dot_product", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batched_dot_product");
         using var _ = PushContext();
         IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
         void** args = stackalloc void*[5];
         args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&batchSize; args[4]=&dim;
-        LaunchKernel2D(kernel, 1, (uint)batchSize, DefaultBlockSize, 1, args);
+        LaunchKernel(kernel, (uint)((batchSize+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
 
     ~CudaBackend()

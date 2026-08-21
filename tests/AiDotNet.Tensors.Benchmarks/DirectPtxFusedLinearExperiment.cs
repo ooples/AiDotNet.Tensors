@@ -260,12 +260,13 @@ internal static class DirectPtxFusedLinearExperiment
         start.ArgumentList.Add(script);
         start.ArgumentList.Add("--runs");
         start.ArgumentList.Add(runs.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        start.ArgumentList.Add("--json-lines");
         using Process process = Process.Start(start) ??
             throw new InvalidOperationException("Could not start the PyTorch CUDA baseline.");
+        System.Threading.Tasks.Task<string> stderrTask = process.StandardError.ReadToEndAsync();
         var records = new List<PythonRecord>();
         while (process.StandardOutput.ReadLine() is { } line)
         {
+            if (!line.StartsWith("{", StringComparison.Ordinal)) continue;
             using JsonDocument document = JsonDocument.Parse(line);
             JsonElement root = document.RootElement;
             records.Add(new PythonRecord(
@@ -284,7 +285,7 @@ internal static class DirectPtxFusedLinearExperiment
                 root.GetProperty("peak_device_bytes").GetInt64(),
                 root.GetProperty("max_error").GetDouble()));
         }
-        string stderr = process.StandardError.ReadToEnd();
+        string stderr = stderrTask.GetAwaiter().GetResult();
         process.WaitForExit();
         if (process.ExitCode != 0)
             throw new InvalidOperationException(

@@ -40,7 +40,7 @@ public sealed partial class CudaBackend
         int inputFeatures,
         int outputFeatures)
     {
-        if (!IsDirectPtxFusedLinearEnabled)
+        if (!IsDirectPtxMixedLinearEnabled)
             return false;
         if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(
                 inputFeatures, outputFeatures))
@@ -50,7 +50,7 @@ public sealed partial class CudaBackend
         }
         if (!PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(
                 inputFeatures, outputFeatures) &&
-            !DirectPtxFeatureGate.FusedLinearExperimentOverride)
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
         {
             DirectPtxLastError = "fp16-tensorcore-linear-performance-gate-not-met";
             return false;
@@ -131,6 +131,8 @@ public sealed partial class CudaBackend
             }
             System.Threading.Interlocked.Increment(
                 ref _directPtxFp16TensorCoreLinearDispatchCount);
+            System.Threading.Interlocked.Increment(
+                ref _directPtxMixedLinearM16DispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -146,7 +148,7 @@ public sealed partial class CudaBackend
         int inputFeatures,
         int outputFeatures)
     {
-        if (!IsDirectPtxFusedLinearEnabled)
+        if (!IsDirectPtxMixedLinearEnabled)
             return false;
         if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(
                 inputFeatures, outputFeatures))
@@ -156,7 +158,7 @@ public sealed partial class CudaBackend
         }
         if (!PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(
                 inputFeatures, outputFeatures) &&
-            !DirectPtxFeatureGate.FusedLinearExperimentOverride)
+            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
         {
             DirectPtxLastError = "fp16-tensorcore-linear-performance-gate-not-met";
             return false;
@@ -297,4 +299,11 @@ public sealed partial class CudaBackend
         audit = null!;
         return false;
     }
+
+    internal bool TryGetDirectPtxMixedLinearM16Audit(
+        int inputFeatures,
+        int outputFeatures,
+        out DirectPtxKernelAudit audit) =>
+        TryGetDirectPtxFp16TensorCoreLinearAudit(
+            inputFeatures, outputFeatures, out audit);
 }

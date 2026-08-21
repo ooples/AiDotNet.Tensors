@@ -27,6 +27,8 @@ internal static class DirectPtxFeatureGate
     internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
+    internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
+    internal const string QuantizedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR";
     internal const string ReductionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_REDUCTION";
     internal const string GatherEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GATHER";
     internal const string Cholesky4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CHOLESKY_4X4";
@@ -82,6 +84,8 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentComplexMultiplyEnabled = ReadEnabled(ComplexMultiplyEnvironmentVariable);
     private static readonly bool EnvironmentQkvRopeCacheEnabled = ReadEnabled(QkvRopeCacheEnvironmentVariable);
     private static readonly bool EnvironmentFusedLinearEnabled = ReadEnabled(FusedLinearEnvironmentVariable);
+    private static readonly bool EnvironmentMixedPrecisionLinearEnabled = ReadEnabled(MixedPrecisionLinearEnvironmentVariable);
+    private static readonly bool EnvironmentQuantizedLinearEnabled = ReadEnabled(QuantizedLinearEnvironmentVariable);
     private static readonly bool EnvironmentVisionBoxIouEnabled = ReadEnabled(VisionBoxIouEnvironmentVariable);
     private static readonly bool EnvironmentVisionEnabled = ReadEnabled(VisionEnvironmentVariable);
     private static readonly bool[] EnvironmentVisionOperationEnabled = ReadVisionOperationGates();
@@ -284,6 +288,12 @@ internal static class DirectPtxFeatureGate
 
     internal static bool IsFusedLinearEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFusedLinearEnabled);
+
+    internal static bool IsMixedPrecisionLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentMixedPrecisionLinearEnabled);
+
+    internal static bool IsQuantizedLinearEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentQuantizedLinearEnabled);
     internal static bool IsCholesky4x4Enabled => Cholesky4x4ExperimentOverride ?? TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentCholesky4x4Enabled);
 
@@ -582,7 +592,7 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException(
                 $"The GPU pointer is not {requiredAlignment}-byte aligned.", nameof(buffer));
 
-        long elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2L : 4L;
+        long elementBytes = GetElementSizeInBytes(physicalType);
         if (buffer.SizeInBytes % elementBytes != 0)
             throw new ArgumentException("The buffer byte extent is incompatible with its physical dtype.", nameof(buffer));
 
@@ -603,7 +613,7 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException("The direct PTX buffer is smaller than the canonical BHSD view.", nameof(buffer));
         if ((PtxCompat.ToNuint(buffer.Pointer) & 15u) != 0)
             throw new ArgumentException("The direct PTX buffer is not 16-byte aligned.", nameof(buffer));
-        int elementBytes = physicalType is DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 ? 2 : 4;
+        int elementBytes = GetElementSizeInBytes(physicalType);
         int elements = checked((int)(requiredBytes / (nuint)elementBytes));
         return new DirectPtxTensorView(
             buffer.Pointer, requiredBytes, buffer.ByteLength, physicalType,
@@ -635,4 +645,17 @@ internal readonly struct DirectPtxTensorView
             contract.PhysicalType, contract.Layout, contract.LogicalExtent,
             contract.PhysicalExtent, contract.Access);
     }
+
+    internal static int GetElementSizeInBytes(DirectPtxPhysicalType physicalType) =>
+        physicalType switch
+        {
+            DirectPtxPhysicalType.Int8 => 1,
+            DirectPtxPhysicalType.UInt8 => 1,
+            DirectPtxPhysicalType.Float16 => 2,
+            DirectPtxPhysicalType.BFloat16 => 2,
+            DirectPtxPhysicalType.Float32 => 4,
+            DirectPtxPhysicalType.Int32 => 4,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(physicalType), physicalType, "Unsupported direct-PTX physical type.")
+        };
 }

@@ -232,6 +232,24 @@ class Program
                 args[1], artifactDirectory, evidenceDirectory);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear-m16")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.RunM16(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-w8a8-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxW8A8LinearExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
         {
             // main reshaped Run to take an OPERATION FILTER rather than a run count, so forward
@@ -569,6 +587,21 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-dense-linear")
         {
             DirectPtxProfileTarget.RunDenseLinear();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-mixed-linear")
+        {
+            DirectPtxProfileTarget.RunMixedLinear();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-mixed-linear-m16")
+        {
+            DirectPtxProfileTarget.RunMixedLinearM16();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-w8a8-linear")
+        {
+            DirectPtxProfileTarget.RunW8A8Linear();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-decode")
@@ -1593,6 +1626,9 @@ class Program
         Console.WriteLine("  --export-direct-ptx-dense-linear-cubins [dir]: link and export exact SM86 cubins");
         Console.WriteLine("  --verify-direct-ptx-dense-linear-cubins [dir]: reject stale/missing dense-linear artifacts");
         Console.WriteLine("  --audit-direct-ptx-dense-linear-sass <nvdisasm> [cubins] [evidence]: reject final-SASS LDL/STL");
+        Console.WriteLine("  --direct-ptx-mixed-linear [runs]: FP16 M=1 linear+bias+GELU championship matrix");
+        Console.WriteLine("  --direct-ptx-mixed-linear-m16 [runs]: async Tensor Core M=16 championship matrix");
+        Console.WriteLine("  --direct-ptx-w8a8-linear [runs]: symmetric W8A8 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-attention-family [runs]: rectangular MHA/GQA/MQA resident release matrix");
         Console.WriteLine("  --direct-ptx-decode [runs]: dense and paged D64 decode resident release matrix");
         Console.WriteLine("  --direct-ptx-paged-prefill [runs]: causal D64 paged-prefill release matrix");
@@ -1618,6 +1654,9 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-profile-dense-linear: exact-cubin Nsight target for all issue-836 entries");
+        Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");
+        Console.WriteLine("  --direct-ptx-profile-mixed-linear-m16: deterministic Nsight async MMA target");
+        Console.WriteLine("  --direct-ptx-profile-w8a8-linear: deterministic Nsight W8A8 DP4A target");
         Console.WriteLine("  --direct-ptx-profile-decode: deterministic Nsight Compute dense+paged decode target");
         Console.WriteLine("  --direct-ptx-profile-paged-prefill: deterministic Nsight Compute paged-prefill target");
         Console.WriteLine("  --direct-ptx-profile-attention-backward: deterministic Nsight Compute backward target");

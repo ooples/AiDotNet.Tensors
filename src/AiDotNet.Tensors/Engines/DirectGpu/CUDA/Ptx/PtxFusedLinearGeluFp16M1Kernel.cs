@@ -5,14 +5,14 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// Shape-baked FP32 decode-token linear + bias + tanh-GELU. One warp owns two
-/// output rows; its lanes stream adjacent K values from canonical output-major
-/// weights, and the accumulators and activation never leave registers.
+/// Shape-baked FP16 decode-token linear + FP32 bias + tanh-GELU. Each lane
+/// consumes one contiguous half2 from the input and output-major weight row;
+/// accumulation and the activation remain FP32 registers until the sole store.
 /// </summary>
-internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
+internal sealed class PtxFusedLinearGeluFp16M1Kernel : IDisposable
 {
     internal const int BlockThreads = 128;
-    internal const string EntryPoint = "aidotnet_fused_linear_gelu_m1";
+    internal const string EntryPoint = "aidotnet_fused_linear_gelu_fp16_m1";
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
@@ -23,16 +23,16 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxFusedLinearGeluM1Kernel(
+    internal PtxFusedLinearGeluFp16M1Kernel(
         DirectPtxRuntime runtime,
         int inputFeatures,
         int outputFeatures)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
-        if (!DirectPtxArchitecture.HasValidatedFusedLinear(
+        if (!DirectPtxArchitecture.HasValidatedMixedLinear(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
-                "The checked-in fused-linear GELU specialization is measured only on GA10x/SM86.");
+                "The checked-in FP16 fused-linear specialization is measured only on GA10x/SM86.");
         ValidateShape(inputFeatures, outputFeatures);
 
         InputFeatures = inputFeatures;
@@ -41,11 +41,21 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             inputFeatures, outputFeatures);
-        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
-            runtime, Ptx, EntryPoint, BlockThreads, Blueprint);
-        _module = loaded.Module;
-        _function = loaded.Function;
-        Audit = loaded.Audit;
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -61,7 +71,7 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         if (PtxFusedLinearGeluShared.Overlaps(output, input) ||
             PtxFusedLinearGeluShared.Overlaps(output, weights) ||
             PtxFusedLinearGeluShared.Overlaps(output, bias))
-            throw new ArgumentException("Fused-linear output may not alias input, weights, or bias.");
+            throw new ArgumentException("FP16 fused-linear output may not alias input, weights, or bias.");
 
         IntPtr inputPointer = input.Pointer;
         IntPtr weightPointer = weights.Pointer;
@@ -74,7 +84,7 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         arguments[3] = &outputPointer;
         _module.Launch(
             _function,
-            (uint)(OutputFeatures / (OutputsPerWarp * (BlockThreads / 32))), 1, 1,
+            (uint)(OutputFeatures / (2 * (BlockThreads / 32))), 1, 1,
             BlockThreads, 1, 1, 0, arguments);
     }
 
@@ -87,9 +97,8 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         int outputFeatures)
     {
         ValidateShape(inputFeatures, outputFeatures);
-        int outputsPerWarp = OutputsPerWarp;
+        int weightRowBytes = checked(inputFeatures * sizeof(ushort));
         var ptx = new StringBuilder(8_192);
-        int weightRowBytes = checked(inputFeatures * sizeof(float));
         ptx.AppendLine(".version 7.1");
         ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
         ptx.AppendLine(".address_size 64");
@@ -102,92 +111,69 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<2>;");
+        ptx.AppendLine("    .reg .b16 %h<4>;");
         ptx.AppendLine("    .reg .b32 %r<16>;");
         ptx.AppendLine("    .reg .b64 %rd<12>;");
-        ptx.AppendLine("    .reg .f32 %f<20>;");
+        ptx.AppendLine("    .reg .f32 %f<16>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd1, [weights_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd2, [bias_ptr];");
         ptx.AppendLine("    ld.param.u64 %rd3, [output_ptr];");
-        EmitOutputMajorBody(ptx, inputFeatures, weightRowBytes, outputsPerWarp);
-        ptx.AppendLine("LINEAR_RETURN:");
-        ptx.AppendLine("    ret;");
-        ptx.AppendLine("}");
-        return ptx.ToString();
-    }
-
-    private static void EmitOutputMajorBody(
-        StringBuilder ptx,
-        int inputFeatures,
-        int weightRowBytes,
-        int outputsPerWarp)
-    {
-        bool vectorizedK = inputFeatures > 256;
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    and.b32 %r1, %r0, 31;");
         ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
         ptx.AppendLine("    mov.u32 %r6, %ctaid.x;");
         ptx.AppendLine($"    mad.lo.u32 %r3, %r6, {BlockThreads / 32}, %r2;");
-        ptx.AppendLine($"    mul.lo.u32 %r4, %r3, {outputsPerWarp};");
-        ptx.AppendLine($"    mul.wide.u32 %rd4, %r1, {(vectorizedK ? 16 : 4)};");
+        ptx.AppendLine("    shl.b32 %r4, %r3, 1;");
+        ptx.AppendLine("    mul.wide.u32 %rd4, %r1, 4;");
         ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");
         ptx.AppendLine($"    mul.wide.u32 %rd6, %r4, {weightRowBytes};");
         ptx.AppendLine("    add.u64 %rd6, %rd1, %rd6;");
         ptx.AppendLine("    add.u64 %rd6, %rd6, %rd4;");
-        for (int accumulator = 0; accumulator < outputsPerWarp; accumulator++)
-            ptx.AppendLine($"    mov.f32 %f{accumulator}, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f0, 0f00000000;");
+        ptx.AppendLine("    mov.f32 %f1, 0f00000000;");
         ptx.AppendLine("    mov.u32 %r5, 0;");
-        ptx.AppendLine("LINEAR_K_LOOP:");
-        if (vectorizedK)
+        ptx.AppendLine("LINEAR_FP16_K_LOOP:");
+        ptx.AppendLine("    ld.global.nc.b32 %r8, [%rd5];");
+        ptx.AppendLine("    mov.b32 {%h0,%h1}, %r8;");
+        ptx.AppendLine("    cvt.f32.f16 %f8, %h0;");
+        ptx.AppendLine("    cvt.f32.f16 %f9, %h1;");
+        for (int output = 0; output < 2; output++)
         {
-            ptx.AppendLine("    ld.global.nc.v4.f32 {%f8,%f9,%f10,%f11}, [%rd5];");
-            for (int output = 0; output < outputsPerWarp; output++)
-            {
-                int weightOffset = checked(output * weightRowBytes);
-                string suffix = weightOffset == 0 ? string.Empty : $"+{weightOffset}";
-                ptx.AppendLine(
-                    $"    ld.global.nc.v4.f32 {{%f12,%f13,%f14,%f15}}, [%rd6{suffix}];");
-                for (int component = 0; component < 4; component++)
-                    ptx.AppendLine(
-                        $"    fma.rn.f32 %f{output}, %f{8 + component}, " +
-                        $"%f{12 + component}, %f{output};");
-            }
+            int weightOffset = checked(output * weightRowBytes);
+            string suffix = weightOffset == 0 ? string.Empty : $"+{weightOffset}";
+            ptx.AppendLine($"    ld.global.nc.b32 %r9, [%rd6{suffix}];");
+            ptx.AppendLine("    mov.b32 {%h2,%h3}, %r9;");
+            ptx.AppendLine("    cvt.f32.f16 %f10, %h2;");
+            ptx.AppendLine("    cvt.f32.f16 %f11, %h3;");
+            ptx.AppendLine($"    fma.rn.f32 %f{output}, %f8, %f10, %f{output};");
+            ptx.AppendLine($"    fma.rn.f32 %f{output}, %f9, %f11, %f{output};");
         }
-        else
-        {
-            ptx.AppendLine("    ld.global.nc.f32 %f8, [%rd5];");
-            for (int output = 0; output < outputsPerWarp; output++)
-            {
-                int weightOffset = checked(output * weightRowBytes);
-                string suffix = weightOffset == 0 ? string.Empty : $"+{weightOffset}";
-                ptx.AppendLine($"    ld.global.nc.f32 %f9, [%rd6{suffix}];");
-                ptx.AppendLine($"    fma.rn.f32 %f{output}, %f8, %f9, %f{output};");
-            }
-        }
-        int laneStepElements = vectorizedK ? 128 : 32;
-        int laneStepBytes = laneStepElements * sizeof(float);
-        ptx.AppendLine($"    add.u64 %rd5, %rd5, {laneStepBytes};");
-        ptx.AppendLine($"    add.u64 %rd6, %rd6, {laneStepBytes};");
-        ptx.AppendLine($"    add.u32 %r5, %r5, {laneStepElements};");
+        ptx.AppendLine("    add.u64 %rd5, %rd5, 128;");
+        ptx.AppendLine("    add.u64 %rd6, %rd6, 128;");
+        ptx.AppendLine("    add.u32 %r5, %r5, 64;");
         ptx.AppendLine($"    setp.lt.u32 %p0, %r5, {inputFeatures};");
-        ptx.AppendLine("    @%p0 bra.uni LINEAR_K_LOOP;");
-        for (int output = 0; output < outputsPerWarp; output++)
+        ptx.AppendLine("    @%p0 bra.uni LINEAR_FP16_K_LOOP;");
+        for (int output = 0; output < 2; output++)
             PtxFusedLinearGeluShared.EmitFp32WarpButterflyReduction(
                 ptx, $"%f{output}", "%r10", "%r11", "%f10");
         ptx.AppendLine("    setp.ne.u32 %p1, %r1, 0;");
-        ptx.AppendLine("    @%p1 bra LINEAR_RETURN;");
+        ptx.AppendLine("    @%p1 bra LINEAR_FP16_RETURN;");
         ptx.AppendLine("    mul.wide.u32 %rd7, %r4, 4;");
         ptx.AppendLine("    add.u64 %rd8, %rd2, %rd7;");
         ptx.AppendLine("    add.u64 %rd9, %rd3, %rd7;");
-        for (int output = 0; output < outputsPerWarp; output++)
+        for (int output = 0; output < 2; output++)
         {
-            int outputOffset = output * sizeof(float);
-            string suffix = outputOffset == 0 ? string.Empty : $"+{outputOffset}";
+            string suffix = output == 0 ? string.Empty : "+4";
             ptx.AppendLine($"    ld.global.nc.f32 %f9, [%rd8{suffix}];");
             ptx.AppendLine($"    add.rn.f32 %f{output}, %f{output}, %f9;");
             PtxFusedLinearGeluShared.EmitTanhGeluEpilogue(
                 ptx, $"%f{output}", "%f11", $"%rd9{suffix}");
         }
+        ptx.AppendLine("LINEAR_FP16_RETURN:");
+        ptx.AppendLine("    ret;");
+        ptx.AppendLine("}");
+        return ptx.ToString();
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
@@ -200,14 +186,14 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         var output = new DirectPtxExtent(outputFeatures);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-linear-bias-gelu",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"decode-fp32-m1-k{inputFeatures}-n{outputFeatures}",
+            Variant: $"decode-fp16-fp32acc-m1-k{inputFeatures}-n{outputFeatures}",
             Tensors:
             [
-                new("input", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
+                new("input", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.Vector,
                     input, input, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
-                new("weights", DirectPtxPhysicalType.Float32,
+                new("weights", DirectPtxPhysicalType.Float16,
                     DirectPtxPhysicalLayout.LinearWeightOutputMajor,
                     weights, weights, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.Exact),
                 new("bias", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -222,14 +208,15 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 8),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "gelu_tanh(input[1,K] @ transpose(weights[N,K]) + bias[N])",
-                ["weights"] = "output-major-row-major-fp32",
-                ["activation"] = "shape-baked-tanh-gelu",
+                ["formula"] = "gelu_tanh(fp32(input_fp16[1,K] @ transpose(weights_fp16[N,K])) + bias_fp32[N])",
+                ["input"] = "fp16",
+                ["weights"] = "output-major-row-major-fp16",
                 ["accumulator"] = "lane-private-fp32-register",
-                ["input-stream"] = "lane-contiguous-read-only-cache-loads",
+                ["output"] = "fp32",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
-                ["stride-parameters"] = "none"
+                ["stride-parameters"] = "none",
+                ["shape-policy"] = "half2-simd-for-m1; tensor-core-mma-is-a-separate-m-ge-16-specialization"
             });
     }
 
@@ -237,11 +224,8 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         inputFeatures is 256 or 512 or 1024 or 2048 or 4096 &&
         outputFeatures is 256 or 512 or 1024 or 2048 or 4096;
 
-    // The final clean three-run issue matrix did not reproduce a release-gate
-    // win for any supported shape. Keep every specialization experiment-only.
-    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) => false;
-
-    private const int OutputsPerWarp = 2;
+    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
+        (inputFeatures, outputFeatures) is (512, 2048) or (1024, 4096);
 
     private static void ValidateShape(int inputFeatures, int outputFeatures)
     {

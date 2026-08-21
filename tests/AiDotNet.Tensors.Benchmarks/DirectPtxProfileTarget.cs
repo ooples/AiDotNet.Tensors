@@ -294,6 +294,7 @@ internal static class DirectPtxProfileTarget
 
     internal static void RunFusedLinear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-fused-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluM1Kernel(
@@ -313,6 +314,7 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-fused-linear-end", afterSuite: true);
     }
 
     /// <summary>
@@ -450,6 +452,88 @@ internal static class DirectPtxProfileTarget
             for (int index = buffers.Length - 1; index >= 0; index--)
                 buffers[index]?.Dispose();
         }
+    }
+
+    internal static void RunMixedLinear()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-mixed-linear-start");
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 512, outputFeatures = 2048;
+        using var kernel = new PtxFusedLinearGeluFp16M1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        input.Upload<ushort>(new ushort[inputFeatures]);
+        weights.Upload<ushort>(new ushort[inputFeatures * outputFeatures]);
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-mixed-linear-end", afterSuite: true);
+    }
+
+    internal static void RunMixedLinearM16()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-mixed-linear-m16-start");
+        using var runtime = new DirectPtxRuntime();
+        const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
+        const int inputFeatures = 1024, outputFeatures = 4096;
+        using var kernel = new PtxFusedLinearGeluFp16M16Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        input.Upload<ushort>(new ushort[rows * inputFeatures]);
+        weights.Upload<ushort>(new ushort[inputFeatures * outputFeatures]);
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-mixed-linear-m16-end", afterSuite: true);
+    }
+
+    internal static void RunW8A8Linear()
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-w8a8-linear-start");
+        using var runtime = new DirectPtxRuntime();
+        const int inputFeatures = 1024, outputFeatures = 4096;
+        using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
+            runtime, inputFeatures, outputFeatures);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var weights = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var activationScale = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var weightScales = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        input.Upload<sbyte>(new sbyte[inputFeatures]);
+        weights.Upload<sbyte>(new sbyte[inputFeatures * outputFeatures]);
+        activationScale.Upload<float>([0.01f]);
+        weightScales.Upload<float>(Enumerable.Repeat(0.005f, outputFeatures).ToArray());
+        bias.Upload<float>(new float[outputFeatures]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(activationScale, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(weightScales, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-w8a8-linear-end", afterSuite: true);
     }
 
     internal static void RunVisionBoxIou()
