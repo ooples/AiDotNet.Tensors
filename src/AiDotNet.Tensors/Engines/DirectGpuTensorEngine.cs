@@ -10022,6 +10022,402 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// Fused ABC slot recurrence (#1464). Tape-active and no-backend calls defer to the
+    /// differentiable CpuEngine path, which owns the single fused tape node. Inference follows the
+    /// shared GPU precision policy: speed-first generic tensors convert through the selected device
+    /// format, while preserve-input-type uses the CPU when no exact device route exists.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the other scans in this file there is no dedicated ABC device kernel yet. The work is
+    /// instead COMPOSED from GPU-resident primitives, so it genuinely executes on-device: the write
+    /// scores for the entire sequence are one batched GEMM plus one softmax (they do not depend on
+    /// the recurrent state at all), and only the state update and the read remain per-step. That
+    /// composition is the reason a dedicated kernel is not required for residency — see the note in
+    /// BackendCompletenessTests. A fused device kernel is still the faster end state, and would slot
+    /// in here behind the same guards.
+    /// </remarks>
+    public override Tensor<T> AbcScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> forgetGate,
+        Tensor<T> slotKeys, int numHeads, double slotInitScale = 0.1)
+    {
+        if (IsTapeActive<T>() || !TryGetBackend(out var abcBackend))
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (abcBackend is Engines.DirectGpu.CUDA.CudaBackend abcCuda && abcCuda.IsStreamCapturing())
+            throw new NotSupportedException(
+                "AbcScanForward's composed GPU path allocates per recurrence step and cannot run during CUDA stream capture.");
+
+        var abcPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(
+            abcBackend, Gpu.GpuPrecisionOperation.General, "AbcScanForward");
+        if (abcPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(abcPlan);
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        }
+        if (qProj.Rank != 3 || kProj.Rank != 3 || vProj.Rank != 3 || numHeads < 1)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        if (kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (modelDim % numHeads != 0)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        int headDim = modelDim / numHeads;
+        if (forgetGate.Rank != 3 || forgetGate.Shape._dims[0] != batch ||
+            forgetGate.Shape._dims[1] != seqLen || forgetGate.Shape._dims[2] != numHeads)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (slotKeys.Rank != 3 || slotKeys.Shape._dims[0] != numHeads || slotKeys.Shape._dims[2] != headDim)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        int numSlots = slotKeys.Shape._dims[1];
+        if (numSlots < 1)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+        if (batch == 0 || seqLen == 0 || modelDim == 0)
+            return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
+
+        bool previousThrowOnFallback = ThrowOnGpuKernelFallback;
+        try
+        {
+            // Once a usable GPU backend and supported shape have selected this route, every
+            // primitive must remain on-device. A hidden primitive fallback would make the public
+            // operation look correct while defeating both residency and its performance contract.
+            ThrowOnGpuKernelFallback = true;
+            var result = AbcScanComposed(this, qProj, kProj, vProj, forgetGate, slotKeys,
+                batch, seqLen, modelDim, numHeads, headDim, numSlots, slotInitScale);
+            Gpu.GpuPrecisionDiagnostics.Publish(abcPlan);
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
+        {
+            throw new InvalidOperationException(
+                $"AbcScanForward failed on the selected {abcBackend.DeviceType} backend; CPU fallback is disabled for this GPU route.",
+                ex);
+        }
+        finally
+        {
+            ThrowOnGpuKernelFallback = previousThrowOnFallback;
+        }
+    }
+
+    /// <summary>
+    /// The ABC recurrence expressed purely as IEngine primitive calls. Engine-agnostic on purpose:
+    /// run through <c>this</c> it executes on the GPU, and run through a <see cref="CpuEngine"/> it
+    /// is the very same op sequence, so the shape algebra and the math can be verified against the
+    /// fused kernel WITHOUT a device present. Only the dispatch target differs on real hardware.
+    /// </summary>
+    internal static Tensor<T> AbcScanComposed<T>(
+        IEngine e, Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> forgetGate,
+        Tensor<T> slotKeys, int batch, int seqLen, int modelDim, int numHeads, int headDim,
+        int numSlots, double slotInitScale)
+    {
+        int hb = numHeads * batch;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scale = ops.FromDouble(1.0 / Math.Sqrt(headDim));
+
+        // TensorPermute intentionally has view semantics. That is ideal on the CPU, but a view of
+        // an authoritative GPU tensor is strided while the direct backend primitives consume flat,
+        // contiguous buffers. Materialize those permutations device-to-device for this composition;
+        // otherwise GetOrAllocateBuffer must download the resident parent merely to pack the view.
+        Tensor<T> PermuteForCompute(Tensor<T> input, int[] axes) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.PermuteContiguousGpu(input, axes)
+                : e.TensorPermute(input, axes);
+        Tensor<T> SliceAxisForCompute(Tensor<T> input, int axis, int index) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.SliceAxisContiguousGpu(input, axis, index)
+                : e.TensorSliceAxis(input, axis, index);
+        Tensor<T> TileForCompute(Tensor<T> input, int[] multiples) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.TileSingleAxisContiguousGpu(input, multiples)
+                : e.TensorTile(input, multiples);
+        Tensor<T> ScaleForCompute(Tensor<T> input, T scalar) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.ScaleContiguousGpu(input, scalar)
+                : e.TensorMultiplyScalar(input, scalar);
+        Tensor<T> MultiplyForCompute(Tensor<T> left, Tensor<T> right) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.BinaryContiguousGpu(left, right, static (backend, a, b, output, length) =>
+                    backend.Multiply(a, b, output, length))
+                : e.TensorMultiply(left, right);
+        Tensor<T> AddForCompute(Tensor<T> left, Tensor<T> right) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.BinaryContiguousGpu(left, right, static (backend, a, b, output, length) =>
+                    backend.Add(a, b, output, length))
+                : e.TensorAdd(left, right);
+        Tensor<T> ConcatenateForCompute(Tensor<T>[] tensors, int axis) =>
+            e is DirectGpuTensorEngine gpu
+                ? gpu.ConcatenateContiguousGpu(tensors, axis)
+                : e.TensorConcatenate(tensors, axis);
+
+        // [B,S,M] -> [H,B,S,D]: the head axis leads so every later reshape to [H*B, ...] is a
+        // no-op view over contiguous per-(head,batch) blocks.
+        Tensor<T> ToHeadMajor(Tensor<T> x)
+        {
+            using var reshaped = e.Reshape(x, new[] { batch, seqLen, numHeads, headDim });
+            return PermuteForCompute(reshaped, new[] { 2, 0, 1, 3 });
+        }
+
+        using var qh = ToHeadMajor(qProj);
+        using var vh = ToHeadMajor(vProj);
+        using var kh = ToHeadMajor(kProj);
+        using var fgh = PermuteForCompute(forgetGate, new[] { 2, 0, 1 });   // [H,B,S]
+
+        // Write scores for the WHOLE sequence at once: they depend only on k and the slot keys,
+        // never on the recurrent state. [H, B*S, D] x [H, D, N] -> [H, B*S, N].
+        Tensor<T> BuildWriteScores()
+        {
+            using var keyMatrix = e.Reshape(kh, new[] { numHeads, batch * seqLen, headDim });
+            using var slotKeyMatrix = PermuteForCompute(slotKeys, new[] { 0, 2, 1 });
+            using var scores = e.BatchMatMul(keyMatrix, slotKeyMatrix);
+            using var scaledScores = ScaleForCompute(scores, scale);
+            using var probabilities = e.Softmax(scaledScores, axis: 2);
+            return e.Reshape(probabilities, new[] { numHeads, batch, seqLen, numSlots });
+        }
+        using var wAll = BuildWriteScores();
+
+        // slot_-1 = slotInitScale * slotKeys, one copy per batch element: [H,N,D] -> [H*B,N,D].
+        Tensor<T> BuildInitialSlot()
+        {
+            using var scaledKeys = ScaleForCompute(slotKeys, ops.FromDouble(slotInitScale));
+            using var withBatchAxis = e.Reshape(scaledKeys, new[] { numHeads, 1, numSlots, headDim });
+            using var tiled = TileForCompute(withBatchAxis, new[] { 1, batch, 1, 1 });
+            return e.Reshape(tiled, new[] { hb, numSlots, headDim });
+        }
+
+        Tensor<T>? slot = BuildInitialSlot();
+        var steps = new Tensor<T>[seqLen];
+        try
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                using var wSlice = SliceAxisForCompute(wAll, 2, t);
+                using var wT = e.Reshape(wSlice, new[] { hb, numSlots, 1 });                  // [H,B,N]
+                using var vSlice = SliceAxisForCompute(vh, 2, t);
+                using var vT = e.Reshape(vSlice, new[] { hb, 1, headDim });                   // [H,B,D]
+                using var qSlice = SliceAxisForCompute(qh, 2, t);
+                using var qT = e.Reshape(qSlice, new[] { hb, 1, headDim });
+                using var fgSlice = SliceAxisForCompute(fgh, 2, t);
+                using var fgScalar = e.Reshape(fgSlice, new[] { hb, 1, 1 });
+                // fg is scalar per (head,batch). Tile one axis at a time so every step uses the
+                // direct device copy route; IEngine does not promise broadcast semantics for
+                // TensorMultiply, and the generic multi-axis tile is a CPU implementation.
+                using var fgRow = TileForCompute(fgScalar, new[] { 1, 1, headDim });
+                using var fgT = TileForCompute(fgRow, new[] { 1, numSlots, 1 });
+
+                // slot_t = fg_t * slot_{t-1} + outer(w_t, v_t)
+                using var retained = MultiplyForCompute(slot!, fgT);
+                using var written = e.BatchMatMul(wT, vT);
+                var nextSlot = AddForCompute(retained, written);
+                slot!.Dispose();
+                slot = nextSlot;
+
+                // Read: softmax over slots of q_t . slot_t, then the weighted slot read.
+                using var slotTranspose = PermuteForCompute(slot, new[] { 0, 2, 1 });
+                using var readScores = e.BatchMatMul(qT, slotTranspose);
+                using var scaledReadScores = ScaleForCompute(readScores, scale);
+                using var readWeights = e.Softmax(scaledReadScores, axis: 2);                 // [H*B,1,N]
+                using var read = e.BatchMatMul(readWeights, slot);
+                steps[t] = e.Reshape(read, new[] { numHeads, batch, 1, headDim });
+            }
+
+            Tensor<T> stacked = seqLen == 1
+                ? steps[0]
+                : ConcatenateForCompute(steps, axis: 2);                                      // [H,B,S,D]
+            try
+            {
+                using var batchMajor = PermuteForCompute(stacked, new[] { 1, 2, 0, 3 });
+                return e.Reshape(batchMajor, new[] { batch, seqLen, modelDim });
+            }
+            finally
+            {
+                stacked.Dispose();
+            }
+        }
+        finally
+        {
+            slot?.Dispose();
+            for (int t = 0; t < steps.Length; t++)
+                steps[t]?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Materializes a permutation into a contiguous, authoritative GPU buffer without the eager
+    /// <see cref="TensorPermuteInto{T}(Tensor{T}, Tensor{T}, int[])"/> host download. This is an
+    /// internal compute-layout primitive, not the public metadata-view contract of TensorPermute.
+    /// </summary>
+    private Tensor<T> PermuteContiguousGpu<T>(Tensor<T> tensor, int[] axes)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("A GPU backend is required to materialize an ABC compute permutation.");
+        if (axes.Length != tensor.Rank)
+            throw new ArgumentException("Axes length must match tensor rank.", nameof(axes));
+
+        var outputShape = new int[axes.Length];
+        Span<bool> seen = axes.Length <= 32 ? stackalloc bool[axes.Length] : new bool[axes.Length];
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int axis = axes[i];
+            if ((uint)axis >= (uint)axes.Length || seen[axis])
+                throw new ArgumentException("Axes must be a permutation of the tensor dimensions.", nameof(axes));
+            seen[axis] = true;
+            outputShape[i] = tensor.Shape._dims[axis];
+        }
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, tensor);
+        using var outputBuffer = AllocateOutputBuffer(backend, tensor.Length);
+        backend.Permute(inputBuffer.Buffer, outputBuffer.Buffer, tensor.Shape._dims, axes);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, tensor.Length, outputShape);
+        outputBuffer.RelinquishOwnership();
+        return result;
+    }
+
+    private Tensor<T> SliceAxisContiguousGpu<T>(Tensor<T> tensor, int axis, int index)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("A GPU backend is required to slice an ABC compute tensor.");
+        int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
+        if (!tensor.IsContiguous || normalizedAxis < 0 || normalizedAxis >= tensor.Rank ||
+            index < 0 || index >= tensor.Shape._dims[normalizedAxis])
+            throw new ArgumentException("ABC compute slices require a contiguous tensor and an in-range axis/index.");
+
+        int outer = 1;
+        for (int d = 0; d < normalizedAxis; d++) outer = checked(outer * tensor.Shape._dims[d]);
+        int inner = 1;
+        for (int d = normalizedAxis + 1; d < tensor.Rank; d++) inner = checked(inner * tensor.Shape._dims[d]);
+        int axisSize = tensor.Shape._dims[normalizedAxis];
+        int length = checked(outer * inner);
+        var outputShape = new int[tensor.Rank - 1];
+        for (int d = 0, od = 0; d < tensor.Rank; d++)
+            if (d != normalizedAxis) outputShape[od++] = tensor.Shape._dims[d];
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, tensor);
+        using var outputBuffer = AllocateOutputBuffer(backend, length);
+        for (int o = 0; o < outer; o++)
+            backend.Copy(inputBuffer.Buffer, (o * axisSize + index) * inner,
+                outputBuffer.Buffer, o * inner, inner);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, length, outputShape);
+        outputBuffer.RelinquishOwnership();
+        return result;
+    }
+
+    private Tensor<T> TileSingleAxisContiguousGpu<T>(Tensor<T> tensor, int[] multiples)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("A GPU backend is required to tile an ABC compute tensor.");
+        if (!tensor.IsContiguous || multiples.Length != tensor.Rank)
+            throw new ArgumentException("ABC compute tiles require a contiguous tensor and one multiple per axis.");
+
+        int tiledAxis = -1;
+        for (int d = 0; d < multiples.Length; d++)
+        {
+            if (multiples[d] < 1)
+                throw new ArgumentOutOfRangeException(nameof(multiples), "Tile multiples must be positive.");
+            if (multiples[d] == 1) continue;
+            if (tiledAxis >= 0)
+                throw new NotSupportedException("ABC compute tiles expand one axis per device operation.");
+            tiledAxis = d;
+        }
+        if (tiledAxis < 0)
+            return tensor.Reshape(tensor.Shape.ToArray());
+
+        int outer = 1;
+        for (int d = 0; d < tiledAxis; d++) outer = checked(outer * tensor.Shape._dims[d]);
+        int block = 1;
+        for (int d = tiledAxis; d < tensor.Rank; d++) block = checked(block * tensor.Shape._dims[d]);
+        int repeats = multiples[tiledAxis];
+        int length = checked(tensor.Length * repeats);
+        var outputShape = tensor.Shape.ToArray();
+        outputShape[tiledAxis] = checked(outputShape[tiledAxis] * repeats);
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, tensor);
+        using var outputBuffer = AllocateOutputBuffer(backend, length);
+        for (int o = 0; o < outer; o++)
+            for (int r = 0; r < repeats; r++)
+                backend.Copy(inputBuffer.Buffer, o * block, outputBuffer.Buffer,
+                    (o * repeats + r) * block, block);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, length, outputShape);
+        outputBuffer.RelinquishOwnership();
+        return result;
+    }
+
+    private Tensor<T> ScaleContiguousGpu<T>(Tensor<T> tensor, T scalar)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("A GPU backend is required to scale an ABC compute tensor.");
+        float scale = scalar is float value ? value : Convert.ToSingle(scalar);
+        using var inputBuffer = GetOrAllocateBuffer(backend, tensor);
+        using var outputBuffer = AllocateOutputBuffer(backend, tensor.Length);
+        backend.Scale(inputBuffer.Buffer, outputBuffer.Buffer, scale, tensor.Length);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, tensor.Length, tensor.Shape.ToArray());
+        outputBuffer.RelinquishOwnership();
+        return result;
+    }
+
+    private Tensor<T> BinaryContiguousGpu<T>(Tensor<T> left, Tensor<T> right,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> operation)
+    {
+        if (!TryGetBackend(out var backend))
+            throw new InvalidOperationException("A GPU backend is required for an ABC binary compute operation.");
+        if (!ShapesMatch(left.Shape._dims, right.Shape._dims))
+            throw new ArgumentException("ABC binary compute operands must have identical shapes.");
+
+        using var leftBuffer = GetOrAllocateBuffer(backend, left);
+        using var rightBuffer = GetOrAllocateBuffer(backend, right);
+        using var outputBuffer = AllocateOutputBuffer(backend, left.Length);
+        operation(backend, leftBuffer.Buffer, rightBuffer.Buffer, outputBuffer.Buffer, left.Length);
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, left.Length, left.Shape.ToArray());
+        outputBuffer.RelinquishOwnership();
+        return result;
+    }
+
+    private Tensor<T> ConcatenateContiguousGpu<T>(Tensor<T>[] tensors, int axis)
+    {
+        if (!TryGetBackend(out var backend) || tensors.Length == 0)
+            throw new InvalidOperationException("A GPU backend and at least one tensor are required for ABC concatenation.");
+        var first = tensors[0];
+        int normalizedAxis = axis < 0 ? first.Rank + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= first.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis));
+
+        int axisLength = 0;
+        foreach (var tensor in tensors)
+        {
+            if (!tensor.IsContiguous || tensor.Rank != first.Rank)
+                throw new ArgumentException("ABC concatenation requires equal-rank contiguous tensors.", nameof(tensors));
+            for (int d = 0; d < first.Rank; d++)
+                if (d != normalizedAxis && tensor.Shape._dims[d] != first.Shape._dims[d])
+                    throw new ArgumentException("ABC concatenation tensor shapes do not match.", nameof(tensors));
+            axisLength = checked(axisLength + tensor.Shape._dims[normalizedAxis]);
+        }
+
+        int outer = 1;
+        for (int d = 0; d < normalizedAxis; d++) outer = checked(outer * first.Shape._dims[d]);
+        int inner = 1;
+        for (int d = normalizedAxis + 1; d < first.Rank; d++) inner = checked(inner * first.Shape._dims[d]);
+        int length = checked(outer * axisLength * inner);
+        var outputShape = first.Shape.ToArray();
+        outputShape[normalizedAxis] = axisLength;
+
+        using var outputBuffer = AllocateOutputBuffer(backend, length);
+        int axisOffset = 0;
+        foreach (var tensor in tensors)
+        {
+            int tensorAxis = tensor.Shape._dims[normalizedAxis];
+            int sliceLength = tensorAxis * inner;
+            using var inputBuffer = GetOrAllocateBuffer(backend, tensor);
+            for (int o = 0; o < outer; o++)
+                backend.Copy(inputBuffer.Buffer, o * sliceLength, outputBuffer.Buffer,
+                    (o * axisLength + axisOffset) * inner, sliceLength);
+            axisOffset += tensorAxis;
+        }
+        var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, length, outputShape);
+        outputBuffer.RelinquishOwnership();
+        return result;
+    }
+
     // Fused xLSTM scan (#1464). GPU inference fast path; tape-active / non-float / no-backend /
     // headDim over the kernel cap defer to the differentiable CpuEngine path.
     public override Tensor<T> XLstmScanForward<T>(
@@ -17967,7 +18363,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new ArgumentException("TensorAdd operands must have identical shapes in strict GPU mode.");
             return base.TensorAdd(a, b);
+        }
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Add(ia, ib, o, n)) is { } radd)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorAdd", radd, a, b, Autodiff.BackwardFunctions<T>.AddBackward);
@@ -18009,7 +18409,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorAdd has no eligible GPU route for the selected inputs and precision policy.");
         return base.TensorAdd(a, b);
     }
 
@@ -18040,7 +18445,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new ArgumentException("TensorMultiply operands must have identical shapes in strict GPU mode.");
             return base.TensorMultiply(a, b);
+        }
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Multiply(ia, ib, o, n)) is { } rmul)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorMultiply", rmul, a, b, Autodiff.BackwardFunctions<T>.MultiplyBackward);
@@ -18056,7 +18465,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorMultiply has no eligible GPU route for the selected inputs and precision policy.");
         return base.TensorMultiply(a, b);
     }
 
@@ -18827,7 +19241,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        catch { }
+        catch
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+        }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorMultiplyScalar has no eligible GPU route for the selected input and precision policy.");
         return base.TensorMultiplyScalar(tensor, scalar);
     }
 
@@ -19559,6 +19978,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
                 backend, "BatchMatMul", plan.RequestedPreference,
                 $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+            if (ThrowOnGpuKernelFallback) throw;
             return base.BatchMatMul(a, b);
         }
     }
@@ -20280,7 +20700,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Softmax<T>(Tensor<T> input, int axis)
     {
         if (!TryGetBackend(out var backend))
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException("Softmax requires an available GPU backend in strict GPU mode.");
             return base.Softmax(input, axis);
+        }
 
         // The GPU softmax kernel here only handles softmax over the LAST
         // axis correctly — it reshapes the tensor as (outerSize, features)
@@ -20291,7 +20715,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int rank = input.Rank;
         int ea = axis < 0 ? rank + axis : axis;
         if (ea != rank - 1)
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException("The direct GPU softmax route supports only the last axis.");
             return base.Softmax(input, axis);
+        }
 
         try
         {
@@ -20353,8 +20781,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Autodiff.BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
             return output;
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.Softmax(input, axis);
         }
     }
@@ -22736,7 +23165,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 handedOff = true;
                 return result;
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
+            catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
             {
                 System.Diagnostics.Trace.TraceWarning($"GPU pixel shuffle fallback: {ex.GetType().Name}: {ex.Message}");
             }
@@ -23024,8 +23453,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
                 // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
                 System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
+                if (ThrowOnGpuKernelFallback) throw;
             }
         }
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorConcatenate has no eligible GPU route for the selected inputs.");
         return base.TensorConcatenate(tensors, axis);
     }
 
@@ -23121,6 +23553,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             System.Diagnostics.Trace.TraceWarning($"GPU axis slice fallback: {ex.GetType().Name}: {ex.Message}");
+            if (ThrowOnGpuKernelFallback) throw;
             return null;
         }
         finally
@@ -23405,11 +23838,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool handedOff = false;
         try
         {
-            var input = UploadTensorRaw(backend, tensor);
+            // Preserve an authoritative resident input. UploadTensorRaw materializes the tensor's
+            // host array first, which turns a tile inside a composed GPU recurrence into a hidden
+            // device-to-host-to-device round trip.
+            using var input = GetOrAllocateBuffer(backend, tensor);
             output = backend.AllocateBuffer(total);
             for (int o = 0; o < outer; o++)
                 for (int r = 0; r < repeats; r++)
-                    backend.Copy(input, o * block, output, (o * repeats + r) * block, block);
+                    backend.Copy(input.Buffer, o * block, output, (o * repeats + r) * block, block);
 
             var outShape = (int[])tensor.Shape._dims.Clone();
             outShape[tiledAxis] = checked(outShape[tiledAxis] * repeats);
@@ -23420,6 +23856,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             System.Diagnostics.Trace.TraceWarning($"GPU tile fallback: {ex.GetType().Name}: {ex.Message}");
+            if (ThrowOnGpuKernelFallback) throw;
             return null;
         }
         finally
@@ -23460,6 +23897,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
         if (TryTileSingleAxisOnDevice(tensor, multiples) is { } resident) return resident;
+        if (ThrowOnGpuKernelFallback)
+            throw new InvalidOperationException(
+                $"TensorTile has no resident GPU route for shape [{string.Join(",", tensor.Shape._dims)}], " +
+                $"multiples [{string.Join(",", multiples)}], contiguous={tensor.IsContiguous}.");
         return base.TensorTile(tensor,multiples);
     }
 
@@ -23522,6 +23963,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (IsTapeActive<T>()) return base.TensorSliceAxis(tensor, axis, index);
         int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
         if (TryDeviceSliceAxis(tensor, normalizedAxis, index) is { } resident) return resident;
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorSliceAxis has no eligible GPU route for the selected input.");
         return base.TensorSliceAxis(tensor, axis, index);
     }
 

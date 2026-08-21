@@ -4400,6 +4400,26 @@ public interface IEngine
         int numHeads);
 
     /// <summary>
+    /// Fused ABC (Attention with Bounded-memory Control) slot recurrence over a whole sequence as one
+    /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.AbcScan.cs</c> (#1464).
+    /// </summary>
+    /// <param name="qProj">Query projection [batch, seqLen, modelDim].</param>
+    /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
+    /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
+    /// <param name="forgetGate">Post-sigmoid scalar-per-head forget gate [batch, seqLen, numHeads].</param>
+    /// <param name="slotKeys">Trainable slot keys [numHeads, numSlots, headDim].</param>
+    /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
+    /// <param name="slotInitScale">Scale applied to the slot keys to seed the initial slot state.</param>
+    Tensor<T> AbcScanForward<T>(
+        Tensor<T> qProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> forgetGate,
+        Tensor<T> slotKeys,
+        int numHeads,
+        double slotInitScale = 0.1);
+
+    /// <summary>
     /// Fused Gated DeltaNet (delta-rule) recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.GatedDeltaNetScan.cs</c> (#1464).
     /// </summary>

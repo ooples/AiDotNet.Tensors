@@ -115,6 +115,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Phase G.4: rebuild state captured at compile time so
     // EnableFrozenWeightOptimizations() can preserve fused-group action
     // identity while replacing non-fused MatMul forward specializations.
+    /// <summary>
+    /// What the compile-time forward walk decided to emit for one step.
+    /// </summary>
+    /// <remarks>
+    /// The walk that builds the forward actions weighs SEVEN cases -- analytic MatMul-into-loss
+    /// forwards, skippable ReduceSums, slice-prefix fusion, slice steps consumed by that fusion,
+    /// fused groups, per-op specializations, and the generic engine dispatch. Anything that needs
+    /// to rebuild those actions later must reach the same verdict on every step, and the rebuild
+    /// used to re-derive them from scratch while knowing only three of the seven -- so it silently
+    /// re-executed slice steps that a fused MatMul had already consumed and dropped the analytic
+    /// forwards entirely. Recording the verdict once removes the second opinion.
+    /// </remarks>
+    private enum ForwardEmit : byte
+    {
+        /// <summary>Emit nothing: another step's action already covers this one.</summary>
+        Skip = 0,
+
+        /// <summary>Emit the exact action decided at compile time; it cannot be re-derived.</summary>
+        Fixed = 1,
+
+        /// <summary>Emit a per-op specialization, or the generic dispatch when there is none.</summary>
+        Rebuildable = 2,
+    }
+
+    /// <summary>The compile-time verdict for each forward step, indexed by step.</summary>
+    private readonly ForwardEmit[]? _forwardEmitKinds;
+
+    /// <summary>The action to re-emit for each <see cref="ForwardEmit.Fixed"/> step.</summary>
+    private readonly Action<IEngine>?[]? _forwardFixedActions;
+
     private readonly int[]? _fusedStepIndices;
     private readonly Action<IEngine>[]? _fusedForwardActions;
     private bool _isFrozenWeights;
@@ -167,7 +197,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Action<IEngine>[]? fusedForwardActions = null,
         bool graphStepEligible = false,
         ILazyNode[]? fp16HeteroOrder = null,
-        int[][]? gradPoolReZeroByStep = null)
+        int[][]? gradPoolReZeroByStep = null,
+        ForwardEmit[]? forwardEmitKinds = null,
+        Action<IEngine>?[]? forwardFixedActions = null)
     {
         _gradPoolReZeroByStep = gradPoolReZeroByStep;
         _forwardActions = forwardActions;
@@ -195,6 +227,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _compiledInputTensor = compiledInputTensor;
         // Fall back to the compiled input when no distinct refresh tensor was supplied (non-graph / non-embedding).
         _graphRefreshTensor = graphRefreshTensor ?? compiledInputTensor;
+        _forwardEmitKinds = forwardEmitKinds;
+        _forwardFixedActions = forwardFixedActions;
         _fusedStepIndices = fusedStepIndices;
         _fusedForwardActions = fusedForwardActions;
         _lossGradDest = lossGradDest;
@@ -602,35 +636,37 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 "EnableFrozenWeightOptimizations requires a compiled plan with retained forward steps. " +
                 "Plans loaded from serialization don't currently carry the step metadata.");
 
-        // Rebuild forward actions with allowCachedB=true. Walks the original
-        // step list, preserves fused-group action identity, replaces non-
-        // fused step specializations with the cached-B variant.
-        var fusedSet = _fusedStepIndices is null
-            ? null
-            : new HashSet<int>(_fusedStepIndices);
+        // Rebuild the forward actions, replaying the verdict the compile-time walk already
+        // reached for each step instead of re-deriving it. Only a Rebuildable step is
+        // re-specialized; a Fixed one keeps the exact action it was given (analytic forward,
+        // slice-prefix MatMul, fused group) and a Skip stays skipped.
+        //
+        // Re-deriving here is what made this wrong: the walk that built these actions weighs seven
+        // cases and this one knew three, so a slice step already consumed by a fused MatMul was
+        // re-executed as a standalone action and the analytic forwards were dropped.
+        if (_forwardEmitKinds is null || _forwardFixedActions is null)
+            throw new InvalidOperationException(
+                "EnableFrozenWeightOptimizations requires the compile-time forward decisions. " +
+                "Plans loaded from serialization don't currently carry them.");
+
         var rebuiltForward = new List<Action<IEngine>>(_forwardSteps.Length);
         bool installedSpecialization = false;
-        int nextFusedGroupIdx = 0;
         for (int i = 0; i < _forwardSteps.Length; i++)
         {
-            if (fusedSet is not null && fusedSet.Contains(i))
+            switch (_forwardEmitKinds[i])
             {
-                bool isFirstInGroup = i == 0 || !fusedSet.Contains(i - 1);
-                if (isFirstInGroup && _fusedForwardActions is not null
-                    && nextFusedGroupIdx < _fusedForwardActions.Length)
-                {
-                    rebuiltForward.Add(_fusedForwardActions[nextFusedGroupIdx]);
-                    nextFusedGroupIdx++;
-                }
-                continue;
+                case ForwardEmit.Skip:
+                    continue;
+
+                case ForwardEmit.Fixed:
+                    var fixedAction = _forwardFixedActions[i];
+                    if (fixedAction is not null) rebuiltForward.Add(fixedAction);
+                    continue;
             }
 
             var step = _forwardSteps[i];
             // Training plans mutate parameters in-place between Step() calls, so the
-            // identity-keyed pre-pack cache would serve stale weights — same policy as
-            // the initial build below. (This site used to pass true, which was
-            // harmlessly ignored while the FusedLinear branch hardcoded false; now that
-            // the branch respects the caller's policy, training must say false here.)
+            // identity-keyed pre-pack cache would serve stale weights.
             var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
@@ -641,9 +677,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
-                rebuiltForward.Add(eng => exec(eng, output));
+                var opName = step.OpName;
+                rebuiltForward.Add(eng =>
+                {
+                    Engines.DirectGpuTensorEngine.s_currentForwardOp = opName;
+                    exec(eng, output);
+                    Engines.DirectGpuTensorEngine.TagProducer(output, opName);
+                });
             }
         }
+
         _forwardActions = rebuiltForward.ToArray();
         _isFrozenWeights = true;
         // Installing host-only forward specializations makes the action set unsafe for
@@ -1342,6 +1385,124 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     public static System.Action<string>? StepProbe { get; set; }
 
+    /// <summary>
+    /// Called after each forward action during replay with the step it came from and the buffer it
+    /// just wrote, so a caller can compare a compiled plan against an eager run op by op.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A compiled plan otherwise reports one number -- the loss -- which says a replay went wrong
+    /// but not where. Reconstructing the intermediate values from outside is not possible: the
+    /// tensors handed back while tracing are placeholders, and reading one after a Step shows
+    /// whatever the buffer holds now, not what this step produced. Both of those look like real
+    /// measurements and are not, which is exactly how a wrong answer gets built on one.
+    /// </para>
+    /// <para>
+    /// The buffer is passed live rather than copied, so an observer that wants to keep values must
+    /// copy them itself. Null by default and checked once per action, so replay is unaffected when
+    /// nothing is watching.
+    /// </para>
+    /// </remarks>
+    public static System.Action<int, string, Tensor<T>>? ForwardStepObserver { get; set; }
+
+    /// <summary>
+    /// Fills every forward step's output buffer with a sentinel before that step runs, then reports
+    /// any step that left the sentinel behind — a step that did not write its whole output.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Forward outputs come from <c>TensorAllocator.RentUninitialized</c>, so the standing contract
+    /// is that a kernel writes ALL of its output; whatever it skips keeps the previous tenant's
+    /// bytes. A kernel that breaks that contract does not fail predictably. It fails when the
+    /// recycled block happens to hold something harmful, which makes it intermittent, and it stops
+    /// failing the moment anything perturbs the heap — including the diagnostics used to look at
+    /// it. That is not a debuggable state.
+    /// </para>
+    /// <para>
+    /// Poisoning the buffer first removes the luck: a partial write leaves sentinels that are
+    /// counted immediately, in the op that produced them, on every run rather than some runs.
+    /// </para>
+    /// <para>
+    /// Off by default. Enabling it costs a fill per step and changes what a non-conforming kernel
+    /// leaves behind, so it is a diagnostic, not a hardening measure.
+    /// </para>
+    /// </remarks>
+    public static bool SanitizeForwardBuffers { get; set; }
+
+    /// <summary>
+    /// Called for each forward step that left sentinel values behind under
+    /// <see cref="SanitizeForwardBuffers"/>: the action index, the op name, and how many of the
+    /// step's output elements it never wrote.
+    /// </summary>
+    public static System.Action<int, string, int>? ForwardBufferLeak { get; set; }
+
+    /// <summary>
+    /// Called for each forward step that CONSUMED sentinel values under
+    /// <see cref="SanitizeForwardBuffers"/>: the action index, the op name, and how many of the
+    /// elements it read had not been written by any earlier step.
+    /// </summary>
+    /// <remarks>
+    /// A step reading unwritten memory is the mirror image of one leaving its own output unwritten,
+    /// and it fails the same way: the value is whatever the pool handed back. The two need separate
+    /// reporting because the culprit is a different op — the reader is wrong about ordering or
+    /// aliasing, not about how much it writes.
+    /// </remarks>
+    public static System.Action<int, string, int>? ForwardBufferReadBeforeWrite { get; set; }
+
+    /// <summary>
+    /// The sentinel written into forward outputs under <see cref="SanitizeForwardBuffers"/>. A
+    /// magnitude no real activation reaches, so a survivor is unambiguous — unlike NaN, which a
+    /// kernel could legitimately produce.
+    /// </summary>
+    private const double ForwardSanitizerSentinel = -8.5070591e37;
+
+    /// <summary>Writes the sentinel across a step's output buffer.</summary>
+    private static void PoisonForwardBuffer(Tensor<T> buffer)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
+        var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
+        var span = buffer.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++) span[i] = sentinel;
+    }
+
+    /// <summary>Counts sentinel values a step failed to overwrite.</summary>
+    private static int CountForwardBufferLeaks(Tensor<T> buffer)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return 0;
+        var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
+        var span = buffer.AsSpan();
+        int leaked = 0;
+        for (int i = 0; i < span.Length; i++)
+        {
+            if (EqualityComparer<T>.Default.Equals(span[i], sentinel)) leaked++;
+        }
+        return leaked;
+    }
+
+    /// <summary>
+    /// Maps a forward ACTION index to the step that emitted it. Actions and steps are not 1:1 --
+    /// a skipped step emits none and a fused group emits one for several -- so indexing the step
+    /// list by action position mislabels everything after the first skip.
+    /// </summary>
+    private int[]? ActionToStepIndex
+    {
+        get
+        {
+            if (_actionToStepIndex is not null) return _actionToStepIndex;
+            if (_forwardEmitKinds is null) return null;
+
+            var map = new List<int>(_forwardEmitKinds.Length);
+            for (int step = 0; step < _forwardEmitKinds.Length; step++)
+            {
+                if (_forwardEmitKinds[step] != ForwardEmit.Skip) map.Add(step);
+            }
+            _actionToStepIndex = map.ToArray();
+            return _actionToStepIndex;
+        }
+    }
+
+    private int[]? _actionToStepIndex;
+
     /// <summary>Diagnostic capture: TensorSubtract specialized forward writes
     /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
     /// what the kernel sees vs writes.</summary>
@@ -1720,14 +1881,67 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var fwd = _forwardActions;
             var probe = StepProbe;
-            if (probe != null)
+            var observer = ForwardStepObserver;
+            bool sanitize = SanitizeForwardBuffers;
+            if (probe != null || observer != null || sanitize)
             {
-                probe("BEGIN-FWD");
+                var actionToStep = ActionToStepIndex;
+
+                // Poison EVERY forward output before anything runs. Per-step poisoning would only
+                // expose a step that under-writes its own buffer; filling them all up front also
+                // exposes a step that READS one before its producer has run, because the sentinel
+                // is still sitting there when it is read.
+                if (sanitize && _forwardSteps is not null)
+                {
+                    for (int st = 0; st < _forwardSteps.Length; st++)
+                        PoisonForwardBuffer(_forwardSteps[st].OutputBuffer);
+                }
+
+                probe?.Invoke("BEGIN-FWD");
                 for (int i = 0; i < fwd.Length; i++)
                 {
+                    // Resolve the step BEFORE running, so its inputs can be checked first.
+                    CompiledStep<T>? sanitizeTarget = null;
+                    if (sanitize && _forwardSteps is not null)
+                    {
+                        int idx = actionToStep is not null && i < actionToStep.Length ? actionToStep[i] : i;
+                        if (idx < _forwardSteps.Length) sanitizeTarget = _forwardSteps[idx];
+
+                        if (sanitizeTarget is not null && ForwardBufferReadBeforeWrite is not null)
+                        {
+                            int unwritten = 0;
+                            foreach (var operand in sanitizeTarget.Inputs)
+                            {
+                                if (operand is not null) unwritten += CountForwardBufferLeaks(operand);
+                            }
+                            if (unwritten > 0)
+                                ForwardBufferReadBeforeWrite(i, sanitizeTarget.OpName, unwritten);
+                        }
+                    }
+
                     fwd[i](engine);
-                    var name = i < (_forwardSteps?.Length ?? 0) ? _forwardSteps![i].OpName : $"#{i}";
-                    probe($"AFTER-FWD-{i}:{name}");
+
+                    if (sanitizeTarget is not null)
+                    {
+                        int leaked = CountForwardBufferLeaks(sanitizeTarget.OutputBuffer);
+                        if (leaked > 0)
+                            ForwardBufferLeak?.Invoke(i, sanitizeTarget.OpName, leaked);
+                    }
+
+                    // Resolve the STEP this action came from. Indexing _forwardSteps by the action
+                    // position is wrong as soon as any step is skipped or folded into a fused group.
+                    CompiledStep<T>? step = null;
+                    if (_forwardSteps is not null)
+                    {
+                        int stepIndex = actionToStep is not null && i < actionToStep.Length
+                            ? actionToStep[i]
+                            : i;
+                        if (stepIndex < _forwardSteps.Length) step = _forwardSteps[stepIndex];
+                    }
+
+                    var name = step?.OpName ?? $"#{i}";
+                    probe?.Invoke($"AFTER-FWD-{i}:{name}");
+                    if (observer is not null && step is not null) observer(i, name, step.OutputBuffer);
                 }
             }
             else
@@ -5383,6 +5597,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var allForwardActions = new List<Action<IEngine>>();
         int genericForwardCount = 0; // engine-dispatched forward actions (for CUDA-graph eligibility)
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
+        // The verdict for each step, recorded as it is reached, so a later rebuild replays this
+        // walk instead of re-deriving it from a subset of the inputs.
+        var forwardEmitKinds = new ForwardEmit[forwardSteps.Count];
+        var forwardFixedActions = new Action<IEngine>?[forwardSteps.Count];
         for (int i = 0; i < forwardSteps.Count; i++)
         {
             // Phase G.8: analytic forward for MatMul→ReduceSum-loss replaces
@@ -5390,6 +5608,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (analyticForwardSpecs.TryGetValue(i, out var analyticFwdAction))
             {
                 allForwardActions.Add(analyticFwdAction);
+                forwardEmitKinds[i] = ForwardEmit.Fixed;
+                forwardFixedActions[i] = analyticFwdAction;
                 continue;
             }
             // Skip the ReduceSum's forward action when paired with an
@@ -5397,6 +5617,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the loss into the ReduceSum's output buffer.
             if (skippableReduceSumForwardIndices.Contains(i))
             {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
                 continue;
             }
             // Phase G.9: slice-prefix MatMul fusion — MatMul step uses
@@ -5404,10 +5625,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (slicePrefixForwardSpecs.TryGetValue(i, out var slicePrefixFwd))
             {
                 allForwardActions.Add(slicePrefixFwd);
+                forwardEmitKinds[i] = ForwardEmit.Fixed;
+                forwardFixedActions[i] = slicePrefixFwd;
                 continue;
             }
             if (consumedBySlicePrefix.Contains(i))
             {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
                 continue;  // Slice step — already handled by the fused MatMul above
             }
             if (fusedStepIndices.Contains(i))
@@ -5415,9 +5639,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // A fused step starts a new group when its predecessor is NOT fused.
                 // This correctly handles consecutive groups (e.g., {0,1,2, 3,4,5}).
                 bool isFirstInGroup = i == 0 || !fusedStepIndices.Contains(i - 1);
+                forwardEmitKinds[i] = ForwardEmit.Skip;
                 if (isFirstInGroup && nextFusedGroupIdx < fusedForwardActions.Count)
                 {
-                    allForwardActions.Add(fusedForwardActions[nextFusedGroupIdx]);
+                    var fusedGroupAction = fusedForwardActions[nextFusedGroupIdx];
+                    allForwardActions.Add(fusedGroupAction);
+                    forwardEmitKinds[i] = ForwardEmit.Fixed;
+                    forwardFixedActions[i] = fusedGroupAction;
                     nextFusedGroupIdx++;
                 }
                 continue;
@@ -5429,6 +5657,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // for training specialization; correctness over cache-hit speed.
             // On a GPU engine, skip the host CPU-SIMD specialization entirely (preferGenericForGpu) so the
             // op runs on the GPU and stays CUDA-graph-capturable.
+            forwardEmitKinds[i] = ForwardEmit.Rebuildable;
             var specialized = preferGenericForGpu ? null : TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
@@ -5733,6 +5962,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? forwardSteps[0].OutputBuffer
             : compiledInputTensor;
 
+        // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
+        //
+        // These buffers come from TensorAllocator.RentUninitialized, and a pooled tensor whose
+        // storage is larger than its logical length does not settle which array IS the tensor until
+        // something asks for writable storage. Until then a writer that reaches for the data array
+        // can be handed a pool-padded COPY while the plan goes on reading the live backing, so the
+        // values written are simply not the values read back. The same hazard is already documented
+        // and fixed for the gradient buffers via BindInternalStepBuffer.
+        //
+        // It presents as a first-step loss that is intermittently enormous (1e10..1e35) or NaN,
+        // because what the plan reads is whatever the recycled block held. MEASURED on a span-scorer
+        // forward: roughly 60% of freshly built plans, and it disappears the instant anything
+        // touches those buffers first -- including the diagnostics used to look at it, which is what
+        // made it read as a heisenbug rather than a defect.
+        //
+        // One AsWritableSpan per buffer at COMPILE time settles the backing once, before any kernel
+        // binds it. Nothing is written and nothing is read; the cost is a single call per buffer,
+        // not per step.
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            var outputBuffer = forwardSteps[i].OutputBuffer;
+
+            // Only a CONTIGUOUS buffer owns storage that could be served as a padded copy. A
+            // non-contiguous output is a view onto another tensor's storage -- an Expand's output
+            // carries stride 0 on its broadcast axes -- and has no writable span of its own to bind.
+            if (outputBuffer is null || outputBuffer.Length == 0 || !outputBuffer.IsContiguous) continue;
+
+            outputBuffer.AsWritableSpan();
+        }
+
         return new CompiledTrainingPlan<T>(
             forwardActions,
             backwardActions.ToArray(),
@@ -5754,7 +6013,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
             graphStepEligible,
             fp16HeteroOrder,
-            gradPoolReZeroByStep);
+            gradPoolReZeroByStep,
+            forwardEmitKinds,
+            forwardFixedActions);
     }
 
     /// <summary>
@@ -6857,50 +7118,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // Legacy TensorBroadcastAdd forward: route compiled-plan replay through
-        // a copy-into-output + TensorBroadcastAddInPlace pair instead of the
-        // generic "allocate fresh result + memcpy into plan output" closure.
-        // Used in every SD UNet ResBlock for the time-embedding conditioning
-        // (15+ calls per UNet forward × 10 sampling steps per Predict).
-        //
-        // Save: 1 tensor allocation per Execute. Still pays one memcpy (to copy
-        // `a` into the plan's output buffer before the in-place add), but that
-        // memcpy is one fewer than the generic path which copies the eager
-        // result back into the output buffer.
-        if (step.OpType == OpType.TensorBroadcastAdd && step.Inputs.Length == 2
-            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        // Broadcasting binary forward (add / subtract / multiply). ONE builder owns every one of
+        // these, so the question "which operand spans the output" is answered in a single place.
         {
-            var a = step.Inputs[0];
-            var b = step.Inputs[1];
-            var o = step.OutputBuffer;
-            // Same-shape fast path: just call TensorAddInPlace (no broadcast needed).
-            // Many SD ResBlock residual adds hit this — both operands are
-            // [batch, channels, h, w].
-            bool sameShape = a._shape.Length == b._shape.Length;
-            if (sameShape)
-            {
-                for (int d = 0; d < a._shape.Length; d++)
-                {
-                    if (a._shape[d] != b._shape[d]) { sameShape = false; break; }
-                }
-            }
-            if (sameShape)
-            {
-                return eng =>
-                {
-                    a.AsSpan().CopyTo(o.AsWritableSpan());
-                    if (eng is CpuEngine cpuEng) cpuEng.TensorAddInPlace(o, b);
-                    else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
-                };
-            }
-            // Broadcast path: copy a into output, then in-place add b (b is the
-            // smaller operand and broadcasts up to a's shape).
-            return eng =>
-            {
-                a.AsSpan().CopyTo(o.AsWritableSpan());
-                if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, b);
-                else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
-            };
+            var broadcastReplay = TryBuildBroadcastBinaryForward(step);
+            if (broadcastReplay is not null) return broadcastReplay;
         }
 
         // ConvTranspose2D forward: route compiled-plan replay through
@@ -7258,28 +7480,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // BroadcastAdd/Sub/Mul forward: direct array loop for [N,M] op [M] pattern
-        if ((step.OpType == OpType.TensorBroadcastAdd || step.OpType == OpType.TensorBroadcastSubtract || step.OpType == OpType.TensorBroadcastMultiply)
-            && step.Inputs.Length == 2 && typeof(T) == typeof(float)
-            && step.Inputs[0].Rank == 2 && (step.Inputs[1].Rank == 1 || (step.Inputs[1].Rank == 2 && step.Inputs[1]._shape[0] == 1)))
-        {
-            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            int rows = a._shape[0], cols = a._shape[1];
-            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
-            if (cols == bCols)
-            {
-                var aArr = TryGetLiveFloatBacking(a)!;
-                var bArr = TryGetLiveFloatBacking(b)!;
-                var oArr = TryGetLiveFloatBacking(o)!;
-                if (step.OpType == OpType.TensorBroadcastAdd)
-                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] + bArr[c]; } };
-                else if (step.OpType == OpType.TensorBroadcastSubtract)
-                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] - bArr[c]; } };
-                else
-                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] * bArr[c]; } };
-            }
-        }
-
         // MSELoss forward: fused single-pass diff^2 sum
         if (step.OpType == OpType.MSELoss && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
@@ -7507,6 +7707,150 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// reads the now-clipped grads. Returns false if any gradient is not CUDA-resident (caller uses the CPU
     /// clip instead); the global norm requires ALL grads present, so a mixed CPU/GPU set is not handled here.
     /// </summary>
+    /// <summary>
+    /// Builds the compiled replay for a broadcasting binary op — add, subtract or multiply —
+    /// writing <c>left OP right</c> into the plan's output buffer. Returns <see langword="null"/>
+    /// for the shapes it deliberately leaves to the generic engine path.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THIS IS THE ONLY PLACE THAT DECIDES HOW A BROADCASTING BINARY IS REPLAYED. There used to be
+    /// two independent branches — a zero-alloc add and a float <c>[N,M] op [M]</c> loop — and each
+    /// re-derived which operand was the larger one. One of them assumed the FIRST operand always
+    /// was, which holds for <c>big + small</c> and fails for <c>small + big</c>: it copied the small
+    /// operand's elements into the full-size buffer and left the remainder holding whatever was
+    /// there before. That is not an exotic shape — <c>TensorBroadcastTo</c> expresses an expansion
+    /// as <c>input + zeros(target)</c>, whose first operand is by construction the small one.
+    /// </para>
+    /// <para>
+    /// The seed operand is chosen once, from shapes, and the output is filled in full either way,
+    /// so no caller has to know the convention and no second branch can disagree about it.
+    /// </para>
+    /// <para>
+    /// Order is preserved rather than normalized, because subtract and multiply are not both
+    /// commutative and <c>small - big</c> must stay <c>small - big</c>.
+    /// </para>
+    /// </remarks>
+    private static Action<IEngine>? TryBuildBroadcastBinaryForward(CompiledStep<T> step)
+    {
+        if (step.Inputs.Length != 2) return null;
+
+        bool isAdd = step.OpType == OpType.TensorBroadcastAdd;
+        bool isSubtract = step.OpType == OpType.TensorBroadcastSubtract;
+        bool isMultiply = step.OpType == OpType.TensorBroadcastMultiply;
+        if (!isAdd && !isSubtract && !isMultiply) return null;
+
+        var left = step.Inputs[0];
+        var right = step.Inputs[1];
+        var output = step.OutputBuffer;
+        if (!left.IsContiguous || !right.IsContiguous || !output.IsContiguous) return null;
+
+        // The single orientation decision.
+        bool leftSpansOutput = ShapeMatchesBuffer(left._shape, output._shape);
+        bool rightSpansOutput = ShapeMatchesBuffer(right._shape, output._shape);
+
+        // A MUTUAL broadcast such as [4,1] op [1,3] -> [4,3] has no operand to seed from, and
+        // guessing one is the defect this method exists to prevent. The generic engine path
+        // computes it correctly.
+        if (!leftSpansOutput && !rightSpansOutput) return null;
+
+        // Dense float [N,M] op [M] (row-vector / bias shape): a tight indexed loop, kept as a fast
+        // sub-case of the one path rather than as a branch that re-decides orientation.
+        if (typeof(T) == typeof(float) && leftSpansOutput && !rightSpansOutput
+            && left.Rank == 2
+            && (right.Rank == 1 || (right.Rank == 2 && right._shape[0] == 1))
+            && left._shape[1] == (right.Rank == 1 ? right._shape[0] : right._shape[1]))
+        {
+            var leftArray = TryGetLiveFloatBacking(left);
+            var rightArray = TryGetLiveFloatBacking(right);
+            var outputArray = TryGetLiveFloatBacking(output);
+            if (leftArray is not null && rightArray is not null && outputArray is not null)
+            {
+                int rows = left._shape[0];
+                int cols = left._shape[1];
+                if (isAdd)
+                    return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] + rightArray[c]; } };
+                if (isSubtract)
+                    return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] - rightArray[c]; } };
+                return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] * rightArray[c]; } };
+            }
+        }
+
+        // Subtract and multiply have no in-place broadcasting kernel for a smaller RIGHT operand,
+        // and the row-vector case above did not apply. Leave it to the generic path rather than
+        // open-code a second expansion here.
+        if ((isSubtract || isMultiply) && !rightSpansOutput) return null;
+
+        return engine =>
+        {
+            if (engine is not CpuEngine cpu)
+            {
+                ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
+                return;
+            }
+
+            // 1. Fill the output from the LEFT operand, expanding it when it is the smaller side.
+            //    Every element is written, so nothing downstream can read a stale slot.
+            if (leftSpansOutput)
+            {
+                left.AsSpan().CopyTo(output.AsWritableSpan());
+            }
+            else
+            {
+                output.AsWritableSpan().Clear();
+                cpu.TensorBroadcastAddInPlace(output, left);
+            }
+
+            // 2. Apply the RIGHT operand in place, broadcasting it if it is the smaller side.
+            if (rightSpansOutput)
+            {
+                if (isAdd) cpu.TensorAddInPlace(output, right);
+                else if (isSubtract) cpu.TensorSubtractInPlace(output, right);
+                else cpu.TensorMultiplyInPlace(output, right);
+            }
+            else
+            {
+                cpu.TensorBroadcastAddInPlace(output, right);
+            }
+        };
+    }
+
+    /// <summary>
+    /// Generic replay for engines without the in-place CPU kernels: recompute eagerly, materialize
+    /// any strided result, and copy it into the plan's buffer.
+    /// </summary>
+    private static void ReplayBroadcastBinaryEagerly(
+        IEngine engine, OpType opType, Tensor<T> left, Tensor<T> right, Tensor<T> output)
+    {
+        var result = opType switch
+        {
+            OpType.TensorBroadcastSubtract => engine.TensorSubtract(left, right),
+            OpType.TensorBroadcastMultiply => engine.TensorMultiply(left, right),
+            _ => engine.TensorAdd(left, right),
+        };
+
+        // A broadcast result can be a stride-0 VIEW whose backing storage is smaller than its
+        // logical shape; AsSpan() would then copy only that backing and leave the rest of output
+        // untouched.
+        if (!result.IsContiguous) result = result.Contiguous();
+        result.AsSpan().CopyTo(output.AsWritableSpan());
+    }
+
+    /// <summary>
+    /// True when <paramref name="shape"/> is exactly the plan buffer's shape, i.e. this operand
+    /// already spans the whole output and nothing about it needs broadcasting.
+    /// </summary>
+    private static bool ShapeMatchesBuffer(int[] shape, int[] bufferShape)
+    {
+        if (shape is null || bufferShape is null) return false;
+        if (shape.Length != bufferShape.Length) return false;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] != bufferShape[i]) return false;
+        }
+        return true;
+    }
+
     private static bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
     {
         // The CUDA reduction/scale path is float-typed. For a Tensor<double> (or any
