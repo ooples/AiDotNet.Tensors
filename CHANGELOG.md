@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.129.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.128.0...v0.129.0) (2026-08-21)
+
+
+### Features
+
+* **autodiff:** add fused abc slot-recurrence scan kernel ([#973](https://github.com/ooples/AiDotNet.Tensors/issues/973)) ([47b72b6](https://github.com/ooples/AiDotNet.Tensors/commit/47b72b6f393fa4dac5bdc62e2cf154926bf98d8f))
+* **gpu:** add capability-aware autocast and type parity ([#971](https://github.com/ooples/AiDotNet.Tensors/issues/971)) ([f301610](https://github.com/ooples/AiDotNet.Tensors/commit/f301610b46232630bdfe66197cabe88c22621252))
+* **ptx:** add mixed-precision decode golden slice ([#837](https://github.com/ooples/AiDotNet.Tensors/issues/837)) ([#860](https://github.com/ooples/AiDotNet.Tensors/issues/860)) ([d95d3f7](https://github.com/ooples/AiDotNet.Tensors/commit/d95d3f7794a6c5f00f1004172d153c26f7189525))
+* **ptx:** exact-shape FP32 row-softmax blueprint ([#840](https://github.com/ooples/AiDotNet.Tensors/issues/840)) ([#868](https://github.com/ooples/AiDotNet.Tensors/issues/868)) ([2ce70c3](https://github.com/ooples/AiDotNet.Tensors/commit/2ce70c3ef9ad4c91bc31951a4d9b423e3a649001))
+
+
+### Bug Fixes
+
+* **autodiff:** record MaxPool2DWithIndices on the GPU fast path ([#968](https://github.com/ooples/AiDotNet.Tensors/issues/968)) ([8c0e179](https://github.com/ooples/AiDotNet.Tensors/commit/8c0e179f2f3e206c23ab1538ee419090554f10bb))
+* **compilation:** skip a fused optimizer step whose gradients are not finite ([#972](https://github.com/ooples/AiDotNet.Tensors/issues/972)) ([bc66bc0](https://github.com/ooples/AiDotNet.Tensors/commit/bc66bc0c0c2713ced924e5d752d9541cb4573975))
+* **rglru:** clip the sqrt derivative, not just skip it at zero ([#969](https://github.com/ooples/AiDotNet.Tensors/issues/969)) ([bbe86f7](https://github.com/ooples/AiDotNet.Tensors/commit/bbe86f7135af800d0e91d2b3ce58556102ff20e0))
+
 ## [0.128.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.127.0...v0.128.0) (2026-08-18)
 
 
