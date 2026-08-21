@@ -41,13 +41,21 @@ internal sealed class PtxFusedLinearGeluW8A8M1Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, inputFeatures, outputFeatures);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             inputFeatures, outputFeatures);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (Function: function, Audit: audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.Function;
+        Audit = loaded.Value.Audit;
     }
 
     internal unsafe void Launch(
@@ -58,15 +66,17 @@ internal sealed class PtxFusedLinearGeluW8A8M1Kernel : IDisposable
         DirectPtxTensorView bias,
         DirectPtxTensorView output)
     {
-        Require(input, Blueprint.Tensors[0], nameof(input));
-        Require(weights, Blueprint.Tensors[1], nameof(weights));
-        Require(activationScale, Blueprint.Tensors[2], nameof(activationScale));
-        Require(weightScales, Blueprint.Tensors[3], nameof(weightScales));
-        Require(bias, Blueprint.Tensors[4], nameof(bias));
-        Require(output, Blueprint.Tensors[5], nameof(output));
-        if (Overlaps(output, input) || Overlaps(output, weights) ||
-            Overlaps(output, activationScale) || Overlaps(output, weightScales) ||
-            Overlaps(output, bias))
+        PtxFusedLinearGeluShared.Require(input, Blueprint.Tensors[0], nameof(input));
+        PtxFusedLinearGeluShared.Require(weights, Blueprint.Tensors[1], nameof(weights));
+        PtxFusedLinearGeluShared.Require(activationScale, Blueprint.Tensors[2], nameof(activationScale));
+        PtxFusedLinearGeluShared.Require(weightScales, Blueprint.Tensors[3], nameof(weightScales));
+        PtxFusedLinearGeluShared.Require(bias, Blueprint.Tensors[4], nameof(bias));
+        PtxFusedLinearGeluShared.Require(output, Blueprint.Tensors[5], nameof(output));
+        if (PtxFusedLinearGeluShared.Overlaps(output, input) ||
+            PtxFusedLinearGeluShared.Overlaps(output, weights) ||
+            PtxFusedLinearGeluShared.Overlaps(output, activationScale) ||
+            PtxFusedLinearGeluShared.Overlaps(output, weightScales) ||
+            PtxFusedLinearGeluShared.Overlaps(output, bias))
             throw new ArgumentException(
                 "W8A8 fused-linear output may not alias any input tensor.");
 
@@ -150,13 +160,8 @@ internal sealed class PtxFusedLinearGeluW8A8M1Kernel : IDisposable
         ptx.AppendLine($"    setp.lt.u32 %p0, %r6, {inputFeatures};");
         ptx.AppendLine("    @%p0 bra.uni W8A8_K_LOOP;");
         for (int output = 0; output < OutputsPerWarp; output++)
-        {
-            foreach (int delta in new[] { 16, 8, 4, 2, 1 })
-            {
-                ptx.AppendLine($"    shfl.sync.bfly.b32 %r16, %r{12 + output}, {delta}, 31, 0xffffffff;");
-                ptx.AppendLine($"    add.s32 %r{12 + output}, %r{12 + output}, %r16;");
-            }
-        }
+            PtxFusedLinearGeluShared.EmitInt32WarpButterflyReduction(
+                ptx, $"%r{12 + output}", "%r16");
         ptx.AppendLine("    setp.ne.u32 %p1, %r1, 0;");
         ptx.AppendLine("    @%p1 bra W8A8_RETURN;");
         ptx.AppendLine("    mul.wide.u32 %rd9, %r5, 4;");
@@ -173,15 +178,8 @@ internal sealed class PtxFusedLinearGeluW8A8M1Kernel : IDisposable
             ptx.AppendLine("    mul.rn.f32 %f1, %f1, %f2;");
             ptx.AppendLine($"    ld.global.nc.f32 %f3, [%rd11{suffix}];");
             ptx.AppendLine("    add.rn.f32 %f1, %f1, %f3;");
-            ptx.AppendLine("    mul.rn.f32 %f4, %f1, %f1;");
-            ptx.AppendLine("    mul.rn.f32 %f4, %f4, %f1;");
-            ptx.AppendLine("    fma.rn.f32 %f4, %f4, 0f3D372713, %f1;");
-            ptx.AppendLine("    mul.rn.f32 %f4, %f4, 0f3F4C422A;");
-            ptx.AppendLine("    tanh.approx.f32 %f4, %f4;");
-            ptx.AppendLine("    add.rn.f32 %f4, %f4, 0f3F800000;");
-            ptx.AppendLine("    mul.rn.f32 %f4, %f4, %f1;");
-            ptx.AppendLine("    mul.rn.f32 %f4, %f4, 0f3F000000;");
-            ptx.AppendLine($"    st.global.f32 [%rd12{suffix}], %f4;");
+            PtxFusedLinearGeluShared.EmitTanhGeluEpilogue(
+                ptx, "%f1", "%f4", $"%rd12{suffix}");
         }
         ptx.AppendLine("W8A8_RETURN:");
         ptx.AppendLine("    ret;");
@@ -255,24 +253,4 @@ internal sealed class PtxFusedLinearGeluW8A8M1Kernel : IDisposable
                 nameof(inputFeatures), "The first W8A8 proof cell is exactly K=1024, N=4096.");
     }
 
-    private static void Require(
-        DirectPtxTensorView view,
-        DirectPtxTensorContract contract,
-        string parameter)
-    {
-        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
-            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
-            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
-            throw new ArgumentException(
-                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
-    }
-
-    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
-    {
-        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
-        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
-        nuint leftEnd = checked(leftStart + left.ByteLength);
-        nuint rightEnd = checked(rightStart + right.ByteLength);
-        return leftStart < rightEnd && rightStart < leftEnd;
-    }
 }

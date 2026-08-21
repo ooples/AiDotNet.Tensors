@@ -55,11 +55,16 @@ if (-not $SkipBuild) {
 if (-not (Test-Path $targetDll)) { throw "Benchmark DLL not found: $targetDll (build first)." }
 
 $rows = New-Object System.Collections.Generic.List[object]
+$failedRuns = 0
+$skippedShapes = 0
 for ($r = 1; $r -le $Runs; $r++) {
     $log = Join-Path $evidenceDir "run-$r.log"
     Write-Host "[run $r/$Runs] $Experiment 1"
     & dotnet $targetDll $Experiment 1 *> $log
-    if ($LASTEXITCODE -ne 0) { Write-Warning "run $r exited with code $LASTEXITCODE (see $log)" }
+    if ($LASTEXITCODE -ne 0) {
+        $failedRuns++
+        Write-Warning "run $r exited with code $LASTEXITCODE (see $log)"
+    }
     foreach ($line in Get-Content -LiteralPath $log) {
         if ($line.StartsWith($EvidencePrefix, [StringComparison]::Ordinal)) {
             $obj = $line.Substring($EvidencePrefix.Length) | ConvertFrom-Json
@@ -98,9 +103,16 @@ foreach ($shapeGroup in $byShape) {
             Runs        = @($m.Group | Select-Object -ExpandProperty Process -Unique).Count
         }
     }
-    $direct = $methodAgg.Values | Where-Object { $_.Method.StartsWith($DirectMethodPrefix, [StringComparison]::Ordinal) } | Select-Object -First 1
+    $direct = $methodAgg.Values |
+        Where-Object { $_.Method.StartsWith($DirectMethodPrefix, [StringComparison]::Ordinal) } |
+        Sort-Object Method, MedianOfMed |
+        Select-Object -First 1
     $competitors = @($methodAgg.Values | Where-Object { -not $_.Method.StartsWith($DirectMethodPrefix, [StringComparison]::Ordinal) })
-    if (-not $direct -or $competitors.Count -eq 0) { Write-Warning "[$shape] missing direct or competitor rows; skipping."; continue }
+    if (-not $direct -or $competitors.Count -eq 0) {
+        $skippedShapes++
+        Write-Warning "[$shape] missing direct or competitor rows; skipping."
+        continue
+    }
     $best = $competitors | Sort-Object MedianOfMed | Select-Object -First 1
 
     $speedup = if ($direct.MedianOfMed -gt 0) { $best.MedianOfMed / $direct.MedianOfMed } else { [double]::NaN }
@@ -123,5 +135,8 @@ foreach ($shapeGroup in $byShape) {
 $manifestPath = Join-Path $evidenceDir 'manifest.json'
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 Write-Host ""; Write-Host "Manifest: $manifestPath"
-if ($anyHold) { Write-Host "$Experiment release evidence: HOLD (see failures above)."; exit 1 }
+if ($manifest.Count -eq 0 -or $failedRuns -ne 0 -or $skippedShapes -ne 0 -or $anyHold) {
+    Write-Host "$Experiment release evidence: HOLD (manifest=$($manifest.Count), failed-runs=$failedRuns, skipped-shapes=$skippedShapes)."
+    exit 1
+}
 Write-Host "$Experiment release evidence: PASS on every promoted shape."

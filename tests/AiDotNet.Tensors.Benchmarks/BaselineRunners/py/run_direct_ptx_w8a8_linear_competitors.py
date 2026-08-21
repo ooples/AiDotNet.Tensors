@@ -13,9 +13,19 @@ def main():
         return 2
     x = torch.randint(-16, 17, (1, 1024), device="cuda", dtype=torch.int8)
     weights = torch.randint(-16, 17, (4096, 1024), device="cuda", dtype=torch.int8)
+    int_mm = getattr(torch, "_int_mm", None)
+    if int_mm is None:
+        error = "torch._int_mm is unavailable in this PyTorch build"
+        print(json.dumps({
+            "status": "ineligible",
+            "method": "CUDA _int_mm",
+            "reason": error,
+            "torch": torch.__version__,
+        }, separators=(",", ":")))
+        return 0
     try:
-        torch._int_mm(x, weights.t().contiguous())
-    except RuntimeError as error:
+        int_mm(x, weights.t().contiguous())
+    except (RuntimeError, NotImplementedError) as error:
         print(json.dumps({
             "status": "ineligible",
             "method": "CUDA _int_mm",

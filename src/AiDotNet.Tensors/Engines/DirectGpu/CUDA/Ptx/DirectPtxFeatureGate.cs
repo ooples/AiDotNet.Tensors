@@ -591,12 +591,7 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException(
                 $"The GPU pointer is not {requiredAlignment}-byte aligned.", nameof(buffer));
 
-        long elementBytes = physicalType switch
-        {
-            DirectPtxPhysicalType.Int8 => 1L,
-            DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2L,
-            _ => 4L
-        };
+        long elementBytes = GetElementSizeInBytes(physicalType);
         if (buffer.SizeInBytes % elementBytes != 0)
             throw new ArgumentException("The buffer byte extent is incompatible with its physical dtype.", nameof(buffer));
 
@@ -617,12 +612,7 @@ internal readonly struct DirectPtxTensorView
             throw new ArgumentException("The direct PTX buffer is smaller than the canonical BHSD view.", nameof(buffer));
         if ((PtxCompat.ToNuint(buffer.Pointer) & 15u) != 0)
             throw new ArgumentException("The direct PTX buffer is not 16-byte aligned.", nameof(buffer));
-        int elementBytes = physicalType switch
-        {
-            DirectPtxPhysicalType.Int8 => 1,
-            DirectPtxPhysicalType.Float16 or DirectPtxPhysicalType.BFloat16 => 2,
-            _ => 4
-        };
+        int elementBytes = GetElementSizeInBytes(physicalType);
         int elements = checked((int)(requiredBytes / (nuint)elementBytes));
         return new DirectPtxTensorView(
             buffer.Pointer, requiredBytes, buffer.ByteLength, physicalType,
@@ -654,4 +644,17 @@ internal readonly struct DirectPtxTensorView
             contract.PhysicalType, contract.Layout, contract.LogicalExtent,
             contract.PhysicalExtent, contract.Access);
     }
+
+    internal static int GetElementSizeInBytes(DirectPtxPhysicalType physicalType) =>
+        physicalType switch
+        {
+            DirectPtxPhysicalType.Int8 => 1,
+            DirectPtxPhysicalType.UInt8 => 1,
+            DirectPtxPhysicalType.Float16 => 2,
+            DirectPtxPhysicalType.BFloat16 => 2,
+            DirectPtxPhysicalType.Float32 => 4,
+            DirectPtxPhysicalType.Int32 => 4,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(physicalType), physicalType, "Unsupported direct-PTX physical type.")
+        };
 }

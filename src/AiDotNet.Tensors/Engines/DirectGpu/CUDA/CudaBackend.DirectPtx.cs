@@ -106,6 +106,7 @@ public sealed partial class CudaBackend
     private long _directPtxQkvRopeCacheDispatchCount;
     private long _directPtxFusedLinearDispatchCount;
     private long _directPtxMixedLinearDispatchCount;
+    private long _directPtxMixedLinearM16DispatchCount;
     private long _directPtxQuantizedLinearDispatchCount;
     private long _directPtxVisionBoxIouDispatchCount;
     private long _directPtxCholesky4x4DispatchCount;
@@ -1185,6 +1186,9 @@ public sealed partial class CudaBackend
     internal long DirectPtxMixedLinearDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxMixedLinearDispatchCount);
 
+    internal long DirectPtxMixedLinearM16DispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxMixedLinearM16DispatchCount);
+
     internal long DirectPtxQuantizedLinearDispatchCount =>
         System.Threading.Interlocked.Read(ref _directPtxQuantizedLinearDispatchCount);
     internal int DirectPtxMixedLinearPinnedKernelCount
@@ -1213,6 +1217,12 @@ public sealed partial class CudaBackend
         int outputFeatures)
     {
         if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (inputHalf is null || outputMajorWeightsHalf is null ||
+            biasFloat is null || outputFloat is null)
+        {
+            DirectPtxLastError = "mixed-linear-null-buffer";
+            return false;
+        }
         if (!PtxFusedLinearGeluFp16M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
         {
             DirectPtxLastError = "mixed-linear-shape-not-implemented";
@@ -1254,7 +1264,8 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMixedLinearKernelSlow(key);
                 }
-                if (capturing && !PinDirectPtxKernelForCapture(_directPtxMixedLinearKernels, key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxMixedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX mixed-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -1275,6 +1286,7 @@ public sealed partial class CudaBackend
         }
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private PtxFusedLinearGeluFp16M1Kernel CreateAndCacheMixedLinearKernelSlow(
         DirectPtxFusedLinearKey key) =>
         _directPtxMixedLinearKernels.GetOrAdd(key, () =>
@@ -1355,6 +1367,13 @@ public sealed partial class CudaBackend
         int outputFeatures)
     {
         if (!IsDirectPtxQuantizedLinearEnabled) return false;
+        if (inputInt8 is null || outputMajorWeightsInt8 is null ||
+            activationScaleFloat is null || weightScalesFloat is null ||
+            biasFloat is null || outputFloat is null)
+        {
+            DirectPtxLastError = "quantized-linear-null-buffer";
+            return false;
+        }
         if (!PtxFusedLinearGeluW8A8M1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
         {
             DirectPtxLastError = "quantized-linear-shape-not-implemented";
@@ -1396,7 +1415,8 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheQuantizedLinearKernelSlow(key);
                 }
-                if (capturing && !PinDirectPtxKernelForCapture(_directPtxQuantizedLinearKernels, key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxQuantizedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX W8A8-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -1419,6 +1439,7 @@ public sealed partial class CudaBackend
         }
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private PtxFusedLinearGeluW8A8M1Kernel CreateAndCacheQuantizedLinearKernelSlow(
         DirectPtxFusedLinearKey key) =>
         _directPtxQuantizedLinearKernels.GetOrAdd(key, () =>
@@ -1497,6 +1518,12 @@ public sealed partial class CudaBackend
         int outputFeatures)
     {
         if (!IsDirectPtxMixedLinearEnabled) return false;
+        if (inputHalf is null || outputMajorWeightsHalf is null ||
+            biasFloat is null || outputFloat is null)
+        {
+            DirectPtxLastError = "mixed-linear-m16-null-buffer";
+            return false;
+        }
         if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(inputFeatures, outputFeatures))
         {
             DirectPtxLastError = "mixed-linear-m16-shape-not-implemented";
@@ -1541,7 +1568,8 @@ public sealed partial class CudaBackend
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
                     kernel = CreateAndCacheMixedLinearM16KernelSlow(key);
                 }
-                if (capturing && !PinDirectPtxKernelForCapture(_directPtxMixedLinearM16Kernels, key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxMixedLinearM16Kernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX M=16 mixed-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)
@@ -1551,7 +1579,7 @@ public sealed partial class CudaBackend
                         DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[2]),
                         DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[3]));
             }
-            System.Threading.Interlocked.Increment(ref _directPtxMixedLinearDispatchCount);
+            System.Threading.Interlocked.Increment(ref _directPtxMixedLinearM16DispatchCount);
             DirectPtxLastError = null;
             return true;
         }
@@ -1562,6 +1590,7 @@ public sealed partial class CudaBackend
         }
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private PtxFusedLinearGeluFp16M16Kernel CreateAndCacheMixedLinearM16KernelSlow(
         DirectPtxFusedLinearKey key) =>
         _directPtxMixedLinearM16Kernels.GetOrAdd(key, () =>
@@ -1640,6 +1669,11 @@ public sealed partial class CudaBackend
         int outputFeatures)
     {
         if (!IsDirectPtxFusedLinearEnabled) return false;
+        if (input is null || weights is null || bias is null || output is null)
+        {
+            DirectPtxLastError = "fused-linear-null-buffer";
+            return false;
+        }
         if (!PtxFusedLinearGeluM1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
         {
             DirectPtxLastError = "fused-linear-shape-not-implemented";
@@ -1682,7 +1716,8 @@ public sealed partial class CudaBackend
                 }
                 // CUDA graph executables retain the CUfunction after capture.
                 // Pin its module so later specialization churn cannot unload it.
-                if (capturing && !PinDirectPtxKernelForCapture(_directPtxFusedLinearKernels, key))
+                if (capturing && !PinDirectPtxKernelForCapture(
+                        _directPtxFusedLinearKernels, key))
                     throw new InvalidOperationException(
                         "Could not pin the direct-PTX fused-linear module for CUDA graph capture.");
                 lock (GpuDispatchLock)

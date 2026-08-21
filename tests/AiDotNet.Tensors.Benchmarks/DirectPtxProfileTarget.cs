@@ -368,8 +368,32 @@ internal static class DirectPtxProfileTarget
         Console.WriteLine(kernel.Audit.ToJson());
     }
 
+    internal static void RunConvolution()
+    {
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-convolution-start");
+        using var runtime = new DirectPtxRuntime();
+        using var kernel = new PtxFusedConv2DNchwK1Kernel(runtime);
+        using var input = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.InputBytes);
+        using var weights = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.WeightBytes);
+        using var bias = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.BiasBytes);
+        using var output = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.OutputBytes);
+        input.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.InputBytes / sizeof(float)]);
+        weights.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.WeightBytes / sizeof(float)]);
+        bias.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.BiasBytes / sizeof(float)]);
+        kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute(
+            "ncu-convolution-end", afterSuite: true);
+    }
+
     internal static void RunFusedLinear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-fused-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluM1Kernel(
@@ -389,10 +413,12 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-fused-linear-end", afterSuite: true);
     }
 
     internal static void RunMixedLinear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-mixed-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 512, outputFeatures = 2048;
         using var kernel = new PtxFusedLinearGeluFp16M1Kernel(
@@ -412,10 +438,12 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-mixed-linear-end", afterSuite: true);
     }
 
     internal static void RunMixedLinearM16()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-mixed-linear-m16-start");
         using var runtime = new DirectPtxRuntime();
         const int rows = PtxFusedLinearGeluFp16M16Kernel.Rows;
         const int inputFeatures = 1024, outputFeatures = 4096;
@@ -436,10 +464,12 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-mixed-linear-m16-end", afterSuite: true);
     }
 
     internal static void RunW8A8Linear()
     {
+        GpuBenchmarkEnvironment.RequireIdleGpu("ncu-w8a8-linear-start");
         using var runtime = new DirectPtxRuntime();
         const int inputFeatures = 1024, outputFeatures = 4096;
         using var kernel = new PtxFusedLinearGeluW8A8M1Kernel(
@@ -465,29 +495,7 @@ internal static class DirectPtxProfileTarget
         for (int i = 0; i < 10; i++) launch();
         runtime.Synchronize();
         Console.WriteLine(kernel.Audit.ToJson());
-    }
-
-    internal static void RunConvolution()
-    {
-        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-convolution-start");
-        using var runtime = new DirectPtxRuntime();
-        using var kernel = new PtxFusedConv2DNchwK1Kernel(runtime);
-        using var input = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.InputBytes);
-        using var weights = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.WeightBytes);
-        using var bias = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.BiasBytes);
-        using var output = runtime.AllocateBytes((nuint)PtxFusedConv2DNchwK1Kernel.OutputBytes);
-        input.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.InputBytes / sizeof(float)]);
-        weights.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.WeightBytes / sizeof(float)]);
-        bias.Upload<float>(new float[PtxFusedConv2DNchwK1Kernel.BiasBytes / sizeof(float)]);
-        kernel.Launch(
-            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
-            DirectPtxTensorView.CreateOwned(weights, kernel.Blueprint.Tensors[1]),
-            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
-            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[3]));
-        runtime.Synchronize();
-        Console.WriteLine(kernel.Audit.ToJson());
-        GpuBenchmarkEnvironment.RequireNoForeignCompute(
-            "ncu-convolution-end", afterSuite: true);
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-w8a8-linear-end", afterSuite: true);
     }
 
     internal static void RunVisionBoxIou()

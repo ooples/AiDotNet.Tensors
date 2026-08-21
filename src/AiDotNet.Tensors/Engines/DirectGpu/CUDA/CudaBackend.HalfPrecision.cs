@@ -117,6 +117,9 @@ public sealed partial class CudaBackend
     /// The admitted direct-PTX path fuses the full operation; the fail-closed
     /// fallback uses FP16 cuBLAS with FP32 accumulation followed by resident
     /// bias and GELU kernels and does not transpose or allocate temporary storage.
+    /// Both routes implement tanh-GELU; the resident CUDA kernel uses
+    /// <c>tanhf</c> and direct PTX uses <c>tanh.approx.f32</c>, within the route's
+    /// documented floating-point tolerance.
     /// </summary>
     public unsafe void FusedLinearGELUFp16TransposedM1(
         IGpuBuffer inputHalf,
@@ -126,6 +129,9 @@ public sealed partial class CudaBackend
         int inFeatures,
         int outFeatures)
     {
+        if (!SupportsHgemm)
+            throw new NotSupportedException(
+                "FusedLinearGELUFp16TransposedM1 requires CUDA compute capability >= 5.0 (Maxwell+).");
         if (inputHalf is null) throw new ArgumentNullException(nameof(inputHalf));
         if (outputMajorWeightHalf is null) throw new ArgumentNullException(nameof(outputMajorWeightHalf));
         if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
@@ -137,10 +143,12 @@ public sealed partial class CudaBackend
             biasFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)) ||
             outputFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)))
             throw new ArgumentException("Mixed fused-linear buffers are smaller than the requested canonical extents.");
+#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluFp16M1(
             inputHalf, outputMajorWeightHalf, biasFloat, outputFloat,
             inFeatures, outFeatures))
             return;
+#endif
 
         using var _ = PushContext();
         float alpha = 1f, beta = 0f;
@@ -156,7 +164,7 @@ public sealed partial class CudaBackend
             betaPointer,
             outputFloat.Handle, CuBlasNative.CUDA_R_32F, outFeatures,
             CuBlasNative.CUBLAS_COMPUTE_32F,
-            0);
+            CuBlasNative.CUBLAS_GEMM_DEFAULT);
         if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException(
                 $"FP16 output-major decode projection is not supported on compute capability {_ccMajor}.{_ccMinor}.");
@@ -171,6 +179,9 @@ public sealed partial class CudaBackend
     /// transpose(weight[N,K]) + bias[N])</c>. The admitted direct-PTX path
     /// fuses asynchronous Tensor Core GEMM, bias, and GELU; the fail-closed
     /// fallback uses cuBLAS followed by resident bias and GELU kernels.
+    /// Both routes implement tanh-GELU; the resident CUDA kernel uses
+    /// <c>tanhf</c> and direct PTX uses <c>tanh.approx.f32</c>, within the route's
+    /// documented floating-point tolerance.
     /// </summary>
     public unsafe void FusedLinearGELUFp16TransposedM16(
         IGpuBuffer inputHalf,
@@ -181,6 +192,9 @@ public sealed partial class CudaBackend
         int outFeatures)
     {
         const int rows = 16;
+        if (!SupportsHgemm)
+            throw new NotSupportedException(
+                "FusedLinearGELUFp16TransposedM16 requires CUDA compute capability >= 5.0 (Maxwell+).");
         if (inputHalf is null) throw new ArgumentNullException(nameof(inputHalf));
         if (outputMajorWeightHalf is null) throw new ArgumentNullException(nameof(outputMajorWeightHalf));
         if (biasFloat is null) throw new ArgumentNullException(nameof(biasFloat));
@@ -192,10 +206,12 @@ public sealed partial class CudaBackend
             biasFloat.SizeInBytes < checked((long)outFeatures * sizeof(float)) ||
             outputFloat.SizeInBytes < checked((long)rows * outFeatures * sizeof(float)))
             throw new ArgumentException("M=16 mixed fused-linear buffers are smaller than the requested canonical extents.");
+#if NET5_0_OR_GREATER
         if (TryDirectPtxFusedLinearGeluFp16M16(
             inputHalf, outputMajorWeightHalf, biasFloat, outputFloat,
             inFeatures, outFeatures))
             return;
+#endif
 
         using var _ = PushContext();
         float alpha = 1f, beta = 0f;
@@ -211,7 +227,7 @@ public sealed partial class CudaBackend
             betaPointer,
             outputFloat.Handle, CuBlasNative.CUDA_R_32F, outFeatures,
             CuBlasNative.CUBLAS_COMPUTE_32F,
-            0);
+            CuBlasNative.CUBLAS_GEMM_DEFAULT);
         if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException(
                 $"FP16 output-major M=16 projection is not supported on compute capability {_ccMajor}.{_ccMinor}.");
