@@ -18105,12 +18105,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     Autodiff.BackwardFunctions<T>.TanhBackward);
                 return output;
             }
-            return base.TensorTanh(tensor);
+            return CpuTanhFallback(tensor);
         }
         catch (Exception)
         {
-            return base.TensorTanh(tensor);
+            return CpuTanhFallback(tensor);
         }
+    }
+
+    /// <summary>
+    /// The CPU tanh, reached without re-entering the virtual <see cref="Tanh{T}"/> dispatch.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This exists to break an infinite recursion, and the cycle is worth spelling out because the
+    /// obvious fallback -- <c>base.TensorTanh(tensor)</c> -- is the thing that closes it:
+    /// </para>
+    /// <para>
+    /// <c>DirectGpuTensorEngine.Tanh</c> forwards a contiguous eager tensor to
+    /// <c>TensorTanh</c> (see #775). When the GPU path yields nothing, <c>TensorTanh</c> used to
+    /// fall back to <c>base.TensorTanh</c>, whose CpuEngine body is <c>var r = Tanh(tensor);</c> --
+    /// a VIRTUAL call, which dispatches straight back to this class's <c>Tanh</c> override and
+    /// round-trips forever. It terminates in a StackOverflowException, which cannot be caught, so
+    /// the <c>catch</c> above never sees it and the process simply dies.
+    /// </para>
+    /// <para>
+    /// The trigger is the fallback itself: any tensor the GPU kernel declines -- an unsupported
+    /// element type, a backend that failed to initialise, a device that is busy -- takes this path.
+    /// A host with no usable GPU never reaches it, because <c>AiDotNetEngine.Current</c> is then
+    /// CpuEngine and this override is not in play at all, which is why the library's own tanh tests
+    /// (which pin the CPU engine) stayed green while a consumer on a real GPU crashed.
+    /// </para>
+    /// <para>
+    /// Calling <c>base.Tanh</c> non-virtually reaches CpuEngine's SIMD implementation directly. The
+    /// <c>Layout</c> copy reproduces what <c>CpuEngine.TensorTanh</c> does, so the fallback is
+    /// observationally identical to the old one minus the recursion.
+    /// </para>
+    /// </remarks>
+    private Tensor<T> CpuTanhFallback<T>(Tensor<T> tensor)
+    {
+        var result = base.Tanh(tensor);
+        result.Layout = tensor.Layout;
+
+        return result;
     }
 
     public override Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
