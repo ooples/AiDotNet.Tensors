@@ -181,6 +181,35 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-residual-layernorm-gelu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxResidualLayerNormGeluExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-normalization")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            string scope = args.Length > 2 ? args[2] : "all";
+            DirectPtxNormalizationExperiment.Run(runs, scope);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-normalization-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            DirectPtxNormalizationArtifactTool.Run(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-normalization-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86");
+            DirectPtxNormalizationArtifactTool.Verify(artifactDirectory);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
@@ -307,6 +336,30 @@ class Program
                 ? args[3]
                 : Path.Combine("artifacts", "direct-ptx", "normalization", "sass");
             DirectPtxSassAuditTool.Run(args[1], artifactDirectory, evidenceDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear-m16")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxMixedLinearExperiment.RunM16(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-w8a8-linear")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxW8A8LinearExperiment.Run(runs);
             return;
         }
         if (args.Length > 0 && args[0] == "--resident-spike")
@@ -532,6 +585,16 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
         {
             DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-layernorm-gelu")
+        {
+            DirectPtxProfileTarget.RunResidualLayerNormGelu();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-normalization")
+        {
+            DirectPtxProfileTarget.RunNormalization();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
@@ -1581,6 +1644,10 @@ class Program
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-residual-layernorm-gelu [runs]: fused D64 normalization championship matrix");
+        Console.WriteLine("  --direct-ptx-normalization [runs] [all|row|row256|row2048|row8192|channel]: issue #838 resident production-route screen");
+        Console.WriteLine("  --export-direct-ptx-normalization-cubins [directory]: compile and preserve release SM86 cubins");
+        Console.WriteLine("  --audit-direct-ptx-normalization-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
         Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
         Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
@@ -1598,6 +1665,7 @@ class Program
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-residual-layernorm-gelu: deterministic Nsight normalization target");
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear-m16: deterministic Nsight async MMA target");
