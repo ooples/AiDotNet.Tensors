@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.129.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.1...v0.129.2) (2026-08-22)
+
+
+### Bug Fixes
+
+* **perf:** bound the buffer caches in aggregate, not just per bucket ([#979](https://github.com/ooples/AiDotNet.Tensors/issues/979)) ([0ce3bb7](https://github.com/ooples/AiDotNet.Tensors/commit/0ce3bb7d53a052a699b7130f68cb7a555488f940))
+
 ## [0.129.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.0...v0.129.1) (2026-08-22)
 
 
