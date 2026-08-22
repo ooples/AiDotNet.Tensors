@@ -14,6 +14,11 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+// Serialized with the arena tests: these poke [ThreadStatic] caches, and the allocation assertion
+// below reads GC.GetTotalAllocatedBytes, which is PROCESS-wide — a sibling collection allocating on
+// another thread lands in the same counter and makes the measurement meaningless. Same reason
+// TensorArenaPersistentPoolTests joins this collection.
+[Collection(nameof(TensorArenaPinnedTests))]
 public class ThreadLocalTensorCacheBoundsTests
 {
     /// <summary>
@@ -67,6 +72,79 @@ public class ThreadLocalTensorCacheBoundsTests
 
         ThreadLocalTensorCache<float>.Clear();
     }
+
+    /// <summary>
+    /// Renting a bucket's last buffer must not leave the bucket behind forever. Return-then-rent for
+    /// each distinct size keeps RetainedBytes at zero, so the byte budget never fires — and if the
+    /// dictionary entry survives, _cache grows with the number of sizes the thread has ever seen.
+    /// That is the same "bounded per bucket, unbounded in buckets" defect this class was fixing,
+    /// one level up.
+    /// </summary>
+    [Fact]
+    public void ReturnThenRentEachSize_DoesNotGrowTheDictionary()
+    {
+        ThreadLocalTensorCache<float>.Clear();
+
+        for (int i = 0; i < 4000; i++)
+        {
+            int size = (64 * 1024) + i;
+            ThreadLocalTensorCache<float>.TryReturn(new float[size]);
+            Assert.NotNull(ThreadLocalTensorCache<float>.TryRent(size));
+        }
+
+        // Every buffer was rented straight back, so nothing is retained...
+        Assert.Equal(0, ThreadLocalTensorCache<float>.RetainedBytes);
+        // ...and the bookkeeping must not have kept 4,000 entries alive to say so.
+        Assert.InRange(ThreadLocalTensorCache<float>.BucketCount, 0, 1024);
+
+        ThreadLocalTensorCache<float>.Clear();
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// The single hottest pattern this cache serves is one buffer of a size cycling return -> rent
+    /// -> return. That must stay allocation-free in steady state: the whole point of the class is
+    /// that <c>TensorAllocator.Rent</c> costs nothing after warmup. Pins it directly, because the
+    /// obvious way to stop empty buckets accumulating — dropping the dictionary entry the moment its
+    /// last buffer is rented — reintroduces a Bucket + Stack allocation on every cycle.
+    /// </summary>
+    [Fact]
+    public void HotSize_ReturnRentCycle_DoesNotAllocate()
+    {
+        ThreadLocalTensorCache<float>.Clear();
+        const int size = 4096;
+
+        var buffer = new float[size];
+        // Warm up: create the bucket and let the JIT settle.
+        for (int i = 0; i < 50; i++)
+        {
+            ThreadLocalTensorCache<float>.TryReturn(buffer);
+            buffer = ThreadLocalTensorCache<float>.TryRent(size)!;
+        }
+
+        const int cycles = 50_000;
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        for (int i = 0; i < cycles; i++)
+        {
+            ThreadLocalTensorCache<float>.TryReturn(buffer);
+            buffer = ThreadLocalTensorCache<float>.TryRent(size)!;
+        }
+        long allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Assert.NotNull(buffer);
+
+        // The cache's own steady-state path allocates nothing here — a dictionary lookup and a
+        // Stack push/pop — so what this measures is ambient allocation on the test thread, which
+        // came in around 0.2 MB. Dropping the dictionary entry when its last buffer is rented
+        // instead costs a Bucket + Stack per cycle, measured at 1,212,984 bytes over 10,000 cycles
+        // (~121 B/cycle), i.e. ~6 MB at this iteration count. A 1 MB ceiling separates the two by
+        // several times over in both directions rather than sitting on top of the noise.
+        Assert.True(allocated < 1024 * 1024,
+            $"steady-state return/rent cycle allocated {allocated} bytes over {cycles} iterations");
+
+        ThreadLocalTensorCache<float>.Clear();
+    }
+#endif
 
     /// <summary>
     /// A buffer larger than the entire budget is not worth evicting the whole cache for, so it is
