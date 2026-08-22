@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -199,44 +200,50 @@ public class Rwkv7SequenceTests
             eagerGradients = tape.ComputeGradients(eagerLossTensor, parameters);
         }
 
-        using var scope = GraphMode.EnableTraining(parameters);
-        var compiledOutput = engine.Rwkv7SequenceForward(
-            parameters[0], parameters[1], parameters[2], parameters[3],
-            parameters[4], parameters[5], numHeads);
-        var compiledLossTensor = engine.ReduceSum(compiledOutput, null);
-        using var plan = scope.CompileTraining(parameters, compiledLossTensor);
-
-        var replayedLoss = plan.Step()[0];
-        Assert.True(float.IsFinite(replayedLoss));
-        Assert.InRange(Math.Abs(replayedLoss - eagerLoss), 0f, 2e-5f);
-
-        var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
-        for (int parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
         {
-            Assert.True(eagerGradients.ContainsKey(parameters[parameterIndex]),
-                $"Eager backward omitted parameter {parameterIndex}.");
-            var expected = eagerGradients[parameters[parameterIndex]].ToArray();
-            var actual = compiled.Gradients[parameterIndex].ToArray();
-            Assert.Equal(expected.Length, actual.Length);
-            for (int element = 0; element < expected.Length; element++)
-            {
-                Assert.True(float.IsFinite(actual[element]),
-                    $"Compiled gradient {parameterIndex}[{element}] is not finite.");
-                Assert.InRange(Math.Abs(actual[element] - expected[element]), 0f, 3e-4f);
-            }
+            var compiledOutput = engine.Rwkv7SequenceForward(
+                parameters[0], parameters[1], parameters[2], parameters[3],
+                parameters[4], parameters[5], numHeads);
+            var compiledLossTensor = engine.ReduceSum(compiledOutput, null);
+            plan = scope.CompileTraining(parameters, compiledLossTensor);
         }
 
-        // The recurrence used to execute eagerly DURING tracing and enter the graph as a frozen leaf.
-        // A first replay could therefore look plausible, but changing an upstream tensor had no effect.
-        parameters[0][0] += 0.25f;
-        float expectedUpdatedLoss = engine.ReduceSum(
-            engine.Rwkv7SequenceForward(
-                parameters[0], parameters[1], parameters[2], parameters[3],
-                parameters[4], parameters[5], numHeads),
-            null)[0];
-        float replayedUpdatedLoss = plan.Step()[0];
-        Assert.InRange(Math.Abs(replayedUpdatedLoss - expectedUpdatedLoss), 0f, 2e-5f);
-        Assert.NotEqual(replayedLoss, replayedUpdatedLoss);
+        using (plan)
+        {
+            var replayedLoss = plan.Step()[0];
+            Assert.True(MathCompat.IsFinite(replayedLoss));
+            Assert.InRange(Math.Abs(replayedLoss - eagerLoss), 0f, 2e-5f);
+
+            var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            for (int parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+            {
+                Assert.True(eagerGradients.ContainsKey(parameters[parameterIndex]),
+                    $"Eager backward omitted parameter {parameterIndex}.");
+                var expected = eagerGradients[parameters[parameterIndex]].ToArray();
+                var actual = compiled.Gradients[parameterIndex].ToArray();
+                Assert.Equal(expected.Length, actual.Length);
+                for (int element = 0; element < expected.Length; element++)
+                {
+                    Assert.True(MathCompat.IsFinite(actual[element]),
+                        $"Compiled gradient {parameterIndex}[{element}] is not finite.");
+                    Assert.InRange(Math.Abs(actual[element] - expected[element]), 0f, 3e-4f);
+                }
+            }
+
+            // The recurrence used to execute eagerly DURING tracing and enter the graph as a frozen leaf.
+            // A first replay could therefore look plausible, but changing an upstream tensor had no effect.
+            parameters[0][0] += 0.25f;
+            float expectedUpdatedLoss = engine.ReduceSum(
+                engine.Rwkv7SequenceForward(
+                    parameters[0], parameters[1], parameters[2], parameters[3],
+                    parameters[4], parameters[5], numHeads),
+                null)[0];
+            float replayedUpdatedLoss = plan.Step()[0];
+            Assert.InRange(Math.Abs(replayedUpdatedLoss - expectedUpdatedLoss), 0f, 2e-5f);
+            Assert.NotEqual(replayedLoss, replayedUpdatedLoss);
+        }
     }
 
     [Fact]

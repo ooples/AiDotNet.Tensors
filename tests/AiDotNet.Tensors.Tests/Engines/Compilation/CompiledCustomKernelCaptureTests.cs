@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -31,7 +34,8 @@ public class CompiledCustomKernelCaptureTests
         Forward forward,
         float lossTolerance = 2e-4f,
         float gradientTolerance = 2e-3f,
-        CpuEngine? executionEngine = null)
+        CpuEngine? executionEngine = null,
+        Action? mutateReplayInput = null)
     {
         var engine = executionEngine ?? new CpuEngine();
         var (eagerLoss, eagerGradients) = Eager(engine, parameters, forward);
@@ -62,6 +66,20 @@ public class CompiledCustomKernelCaptureTests
                 $"{operationName} replay ignored a live upstream parameter change.");
             AssertGradients(operationName + " updated", parameters, updatedEagerGradients,
                 compiled.Gradients, gradientTolerance);
+
+            if (mutateReplayInput is not null)
+            {
+                float lossBeforeInputMutation = updatedReplayLoss;
+                mutateReplayInput();
+                var (inputUpdatedEagerLoss, inputUpdatedEagerGradients) = Eager(engine, parameters, forward);
+                float inputUpdatedReplayLoss = plan.Step()[0];
+                AssertFiniteAndClose(operationName + " live input loss",
+                    inputUpdatedEagerLoss, inputUpdatedReplayLoss, lossTolerance);
+                Assert.True(Math.Abs(inputUpdatedReplayLoss - lossBeforeInputMutation) > 1e-7f,
+                    $"{operationName} replay ignored a live non-parameter input change.");
+                AssertGradients(operationName + " live input", parameters, inputUpdatedEagerGradients,
+                    compiled.Gradients, gradientTolerance);
+            }
         }
     }
 
@@ -99,8 +117,8 @@ public class CompiledCustomKernelCaptureTests
 
     private static void AssertFiniteAndClose(string label, float expected, float actual, float tolerance)
     {
-        Assert.True(float.IsFinite(expected), $"{label}: eager value {expected} is not finite.");
-        Assert.True(float.IsFinite(actual), $"{label}: compiled value {actual} is not finite.");
+        Assert.True(MathCompat.IsFinite(expected), $"{label}: eager value {expected} is not finite.");
+        Assert.True(MathCompat.IsFinite(actual), $"{label}: compiled value {actual} is not finite.");
         float allowed = tolerance * Math.Max(1f, Math.Abs(expected));
         Assert.True(Math.Abs(actual - expected) <= allowed,
             $"{label}: compiled {actual:G9} != eager {expected:G9}; allowed {allowed:G9}.");
@@ -332,6 +350,69 @@ public class CompiledCustomKernelCaptureTests
             new[] { 1f, 0f, 0f, 0f, 0f, 0f, 1f, 0f }, new[] { 2, 4 });
         AssertCompiledParity("dense fused CE", parameters,
             (e, x) => e.FusedLinearCrossEntropyWithLogits(x[0], x[1], x[2], target),
-            lossTolerance: 2e-5f, gradientTolerance: 2e-5f);
+            lossTolerance: 2e-5f, gradientTolerance: 2e-5f,
+            mutateReplayInput: () =>
+            {
+                for (int i = 0; i < target.Length; i++) target[i] = 0f;
+                target[1] = 1f;
+                target[7] = 1f;
+            });
+    }
+
+    [Fact]
+    public async Task ConcurrentStepCalls_AreSerializedAcrossForwardAndBackward()
+    {
+        var engine = new CpuEngine();
+        var parameter = Values(new[] { 1 });
+        var parameters = new[] { parameter };
+        int activeForwards = 0;
+        int maximumConcurrentForwards = 0;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var output = scope.RecordUnary(
+                LazyNodeType.Custom,
+                "ConcurrentReplayProbe",
+                parameter,
+                new[] { 1 },
+                (_, destination) =>
+                {
+                    int active = Interlocked.Increment(ref activeForwards);
+                    int observed;
+                    do
+                    {
+                        observed = maximumConcurrentForwards;
+                        if (active <= observed) break;
+                    }
+                    while (Interlocked.CompareExchange(
+                        ref maximumConcurrentForwards, active, observed) != observed);
+
+                    Thread.Sleep(40);
+                    destination[0] = parameter[0];
+                    Interlocked.Decrement(ref activeForwards);
+                },
+                BackwardFunctions<float>.ReshapeBackward,
+                new object[] { new[] { 1 } });
+            var loss = engine.ReduceSum(output, null);
+            plan = scope.CompileTraining(parameters, loss);
+        }
+
+        using (plan)
+        using (var start = new ManualResetEventSlim(false))
+        {
+            Task Replay() => Task.Run(() =>
+            {
+                start.Wait();
+                _ = plan.Step()[0];
+            });
+
+            var first = Replay();
+            var second = Replay();
+            start.Set();
+            await Task.WhenAll(first, second);
+        }
+
+        Assert.Equal(1, maximumConcurrentForwards);
     }
 }

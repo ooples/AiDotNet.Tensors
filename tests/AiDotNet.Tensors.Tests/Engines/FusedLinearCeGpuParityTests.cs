@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu.Cpu;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -115,7 +116,7 @@ public class FusedLinearCeGpuParityTests
             gpuGradients = tape.ComputeGradients(gpuLoss, gpuParameters);
         }
 
-        Assert.True(float.IsFinite(gpuLoss[0]), $"{label} DirectGpu loss is not finite.");
+        Assert.True(MathCompat.IsFinite(gpuLoss[0]), $"{label} DirectGpu loss is not finite.");
         Assert.InRange(Math.Abs(gpuLoss[0] - cpuLoss[0]), 0f, 1e-4f);
         for (int parameterIndex = 0; parameterIndex < cpuParameters.Length; parameterIndex++)
         {
@@ -124,7 +125,7 @@ public class FusedLinearCeGpuParityTests
             Assert.Equal(expected.Length, actual.Length);
             for (int element = 0; element < expected.Length; element++)
             {
-                Assert.True(float.IsFinite(actual[element]),
+                Assert.True(MathCompat.IsFinite(actual[element]),
                     $"{label} DirectGpu gradient {parameterIndex}[{element}] is not finite.");
                 Assert.InRange(Math.Abs(actual[element] - expected[element]), 0f, 2e-4f);
             }
