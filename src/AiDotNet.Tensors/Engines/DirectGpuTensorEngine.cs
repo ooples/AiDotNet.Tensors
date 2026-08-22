@@ -9974,7 +9974,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> GlaScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> gate, int numHeads)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
             return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
@@ -10041,7 +10042,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> forgetGate,
         Tensor<T> slotKeys, int numHeads, double slotInitScale = 0.1)
     {
-        if (IsTapeActive<T>() || !TryGetBackend(out var abcBackend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() || !TryGetBackend(out var abcBackend))
             return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
         if (abcBackend is Engines.DirectGpu.CUDA.CudaBackend abcCuda && abcCuda.IsStreamCapturing())
             throw new NotSupportedException(
@@ -10424,7 +10425,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
         Tensor<T> iGate, Tensor<T> fGate, Tensor<T> oGate, int numHeads)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
             return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
@@ -10477,7 +10479,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> GatedDeltaNetScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
@@ -10526,7 +10529,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> RgLruScanForward<T>(
         Tensor<T> value, Tensor<T> recGate, Tensor<T> inpGate, Tensor<T> decay)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.RgLruScanForward(value, recGate, inpGate, decay);
         if (value.Rank != 3)
             return base.RgLruScanForward(value, recGate, inpGate, decay);
@@ -10567,7 +10571,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Rwkv4WkvForward<T>(
         Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> timeDecay, Tensor<T> timeFirst)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
         if (rProj.Rank != 3)
             return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
@@ -10610,7 +10615,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> MambaSelectiveScanForward<T>(
         Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
         if (x.Rank != 3 || aLog.Rank != 2)
             return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
@@ -10661,7 +10667,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> inputMapReal, Tensor<T> inputMapImag,
         Tensor<T> outputMapReal, Tensor<T> outputMapImag, Tensor<T> skip)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
             input.Rank != 4 || transitionReal.Rank != 2)
             return base.ComplexDiagonalSsmScanForward(
                 input, transitionReal, transitionImag, inputMapReal, inputMapImag,
@@ -10711,7 +10718,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> q, Tensor<T> k, Tensor<T> v, Tensor<T> initialWeights,
         T regularization, int numHeads)
     {
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) ||
+            !TryGetBackend(out var backend) ||
             q.Rank != 3 || numHeads <= 0)
             return base.MesaScanForward(q, k, v, initialWeights, regularization, numHeads);
 
@@ -10762,7 +10770,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> input, Tensor<T> activeMask, Tensor<T> transition,
         Tensor<T> inputMap, Tensor<T> outputMap, Tensor<T> skip)
     {
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) ||
+            !TryGetBackend(out var backend) ||
             input.Rank != 3 || activeMask.Rank != 3 || transition.Rank != 2)
             return base.RoutedDiagonalSsmScanForward(input, activeMask, transition, inputMap, outputMap, skip);
         int batch = input.Shape._dims[0];
@@ -10806,7 +10815,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Mamba2SsdScanForward<T>(
         Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam, int numHeads)
     {
-        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
         if (x.Rank != 3 || numHeads < 1)
             return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
@@ -10857,10 +10867,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <inheritdoc/>
     /// <remarks>
-    /// The direct-GPU fused kernel currently has no tape-compatible backward. An active gradient tape is
-    /// rejected explicitly so GPU-resident logits are never silently downloaded through the CPU virtual path.
+    /// Graph tracing and tape-active calls use the base fused analytic backward. Replay without an
+    /// active tape still dispatches the resident device forward kernel.
     /// </remarks>
-    /// <exception cref="NotSupportedException">Thrown when a gradient tape is active.</exception>
     public override Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds)
     {
@@ -10868,9 +10877,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
-        if (IsTapeActive<T>())
-            throw new NotSupportedException(
-                "DirectGpuTensorEngine does not yet support tape-active fused linear cross-entropy with index targets; use CpuEngine explicitly for this training operation.");
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
         if (hidden.Rank != 2 || weight.Rank != 2)
@@ -10912,10 +10920,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <inheritdoc/>
     /// <remarks>
-    /// The direct-GPU fused kernel currently has no tape-compatible backward. An active gradient tape is
-    /// rejected explicitly so GPU-resident logits are never silently downloaded through the CPU virtual path.
+    /// Graph tracing and tape-active calls use the base fused analytic backward. Replay without an
+    /// active tape still dispatches the resident device forward kernel.
     /// </remarks>
-    /// <exception cref="NotSupportedException">Thrown when a gradient tape is active.</exception>
     public override Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<T> target)
     {
@@ -10923,9 +10930,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (target is null) throw new ArgumentNullException(nameof(target));
-        if (IsTapeActive<T>())
-            throw new NotSupportedException(
-                "DirectGpuTensorEngine does not yet support tape-active fused linear cross-entropy with dense targets; use CpuEngine explicitly for this training operation.");
+        if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         if (hidden.Rank != 2 || weight.Rank != 2)
@@ -18400,11 +18406,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-        {
-            if (ThrowOnGpuKernelFallback)
-                throw new ArgumentException("TensorAdd operands must have identical shapes in strict GPU mode.");
             return base.TensorAdd(a, b);
-        }
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Add(ia, ib, o, n)) is { } radd)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorAdd", radd, a, b, Autodiff.BackwardFunctions<T>.AddBackward);
@@ -18482,11 +18484,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
-        {
-            if (ThrowOnGpuKernelFallback)
-                throw new ArgumentException("TensorMultiply operands must have identical shapes in strict GPU mode.");
             return base.TensorMultiply(a, b);
-        }
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Multiply(ia, ib, o, n)) is { } rmul)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorMultiply", rmul, a, b, Autodiff.BackwardFunctions<T>.MultiplyBackward);

@@ -8,6 +8,7 @@
 
 using System;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -22,6 +23,30 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Interpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners = false)
     {
+        var outputShape = ValidateInterpolate(input, sizes, mode);
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedInput = input;
+            var capturedSizes = (int[])sizes.Clone();
+            var capturedMode = mode;
+            var capturedAlignCorners = alignCorners;
+            return scope.RecordUnary(
+                LazyNodeType.Custom,
+                "Interpolate",
+                input,
+                outputShape,
+                (eng, output) =>
+                {
+                    var replayed = eng.Interpolate(
+                        capturedInput, capturedSizes, capturedMode, capturedAlignCorners);
+                    DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                },
+                BackwardFunctions<T>.InterpolateBackward,
+                new object[] { mode, alignCorners });
+        }
+
         var result = InterpolateImpl(input, sizes, mode, alignCorners);
         AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
             "Interpolate", result, input,
@@ -32,23 +57,7 @@ public partial class CpuEngine
 
     private Tensor<T> InterpolateImpl<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners)
     {
-        if (input is null) throw new ArgumentNullException(nameof(input));
-        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
-        if (input.Rank < 3)
-            throw new ArgumentException("Interpolate requires rank >= 3 ([N, C, ...] where ... is 1/2/3 spatial dims).");
-        int spatialRank = input.Rank - 2;
-        if (sizes.Length != spatialRank)
-            throw new ArgumentException($"sizes length ({sizes.Length}) must equal spatial rank ({spatialRank}).");
-        ValidateMode(mode, spatialRank);
-
-        int N = input._shape[0], C = input._shape[1];
-        var outShape = new int[input.Rank];
-        outShape[0] = N; outShape[1] = C;
-        for (int i = 0; i < spatialRank; i++)
-        {
-            if (sizes[i] <= 0) throw new ArgumentException("sizes must be positive.");
-            outShape[2 + i] = sizes[i];
-        }
+        var outShape = ValidateInterpolate(input, sizes, mode);
         var output = new Tensor<T>(outShape);
         if (input.Length == 0 || output.Length == 0) return output;
 
@@ -73,6 +82,27 @@ public partial class CpuEngine
                 throw new ArgumentOutOfRangeException(nameof(mode));
         }
         return output;
+    }
+
+    private static int[] ValidateInterpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        if (input.Rank < 3)
+            throw new ArgumentException("Interpolate requires rank >= 3 ([N, C, ...] where ... is 1/2/3 spatial dims).");
+
+        int spatialRank = input.Rank - 2;
+        if (sizes.Length != spatialRank)
+            throw new ArgumentException($"sizes length ({sizes.Length}) must equal spatial rank ({spatialRank}).");
+        ValidateMode(mode, spatialRank);
+
+        var outputShape = (int[])input._shape.Clone();
+        for (int i = 0; i < spatialRank; i++)
+        {
+            if (sizes[i] <= 0) throw new ArgumentException("sizes must be positive.");
+            outputShape[2 + i] = sizes[i];
+        }
+        return outputShape;
     }
 
     /// <inheritdoc/>

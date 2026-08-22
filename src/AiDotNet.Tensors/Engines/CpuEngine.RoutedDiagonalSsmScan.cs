@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -15,6 +16,30 @@ public partial class CpuEngine
     {
         ValidateRoutedDiagonalSsm(input, activeMask, transition, inputMap, outputMap, skip,
             out int batch, out int time, out int model, out int experts, out int state);
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedInput = input;
+            var capturedActiveMask = activeMask;
+            var capturedTransition = transition;
+            var capturedInputMap = inputMap;
+            var capturedOutputMap = outputMap;
+            var capturedSkip = skip;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "RoutedDiagonalSsmScanForward",
+                new[] { input, activeMask, transition, inputMap, outputMap, skip },
+                new[] { batch, time, experts, model },
+                (eng, output) =>
+                {
+                    var result = eng.RoutedDiagonalSsmScanForward(
+                        capturedInput, capturedActiveMask, capturedTransition, capturedInputMap,
+                        capturedOutputMap, capturedSkip);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                RoutedDiagonalSsmBackward<T>,
+                savedState: null);
+        }
         var output = new Tensor<T>(new[] { batch, time, experts, model });
         RoutedDiagonalSsmForwardCore(
             input.GetDataArray()!, activeMask.GetDataArray()!, transition.GetDataArray()!,
