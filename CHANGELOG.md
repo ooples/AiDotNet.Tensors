@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.129.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.0...v0.129.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **compilation:** capture custom fused training kernels ([#978](https://github.com/ooples/AiDotNet.Tensors/issues/978)) ([b761bdd](https://github.com/ooples/AiDotNet.Tensors/commit/b761bdd88734ed74a10dc232431b6f4e659599b0))
+* **compilation:** record RoPE dependencies in fused training ([#975](https://github.com/ooples/AiDotNet.Tensors/issues/975)) ([f592c46](https://github.com/ooples/AiDotNet.Tensors/commit/f592c46a9b6ea84571d1f865ed2eac74b5bd7094))
+* **directgpu:** break the infinite recursion in the TensorTanh CPU fallback ([#977](https://github.com/ooples/AiDotNet.Tensors/issues/977)) ([d40cfb5](https://github.com/ooples/AiDotNet.Tensors/commit/d40cfb5de5dd2f67e7fb8981fb435155a44a567a))
+
 ## [0.129.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.128.0...v0.129.0) (2026-08-21)
 
 
