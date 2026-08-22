@@ -26861,6 +26861,32 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
         int halfDim = headDim / 2;
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedInput = input;
+                var capturedCos = cos;
+                var capturedSin = sin;
+                int capturedStartPosition = startPosition;
+                var outputShape = (int[])input._shape.Clone();
+                return scope.RecordVariadic(
+                    LazyNodeType.Custom,
+                    "ApplyRoPEInterleaved",
+                    new[] { input, cos, sin },
+                    outputShape,
+                    (eng, output) =>
+                    {
+                        var rotated = eng.ApplyRoPEInterleaved(
+                            capturedInput, capturedCos, capturedSin, capturedStartPosition);
+                        DirectGpuTensorEngine.CopyResultInto(eng, rotated, output);
+                    },
+                    BackwardFunctions<T>.ApplyRoPEInterleavedBackward,
+                    new object[] { cos, sin, startPosition });
+            }
+        }
+
         var src = input.IsContiguous ? input : input.Contiguous();
         int total = src.Length;
         int rows = total / headDim;
