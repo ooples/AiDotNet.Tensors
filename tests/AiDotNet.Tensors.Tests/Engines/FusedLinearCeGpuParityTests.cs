@@ -59,23 +59,77 @@ public class FusedLinearCeGpuParityTests
     }
 
     [Fact]
-    public void TapeActiveDirectGpuOverloads_RejectSilentCpuFallback()
+    public void TapeActiveDirectGpuOverloads_ProduceAnalyticGradients()
     {
-        using var engine = new DirectGpuTensorEngine();
-        var hidden = new Tensor<float>(Gen(8, 1), new[] { 2, 4 });
-        var weight = new Tensor<float>(Gen(12, 2), new[] { 4, 3 });
-        var bias = new Tensor<float>(Gen(3, 3), new[] { 3 });
+        var cpu = new CpuEngine();
+        using var gpu = new DirectGpuTensorEngine();
         var ids = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
         var target = new Tensor<float>(new[] { 1f, 0f, 0f, 0f, 0f, 1f }, new[] { 2, 3 });
 
-        using var tape = new GradientTape<float>();
-        NotSupportedException indexError = Assert.Throws<NotSupportedException>(() =>
-            engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids));
-        NotSupportedException denseError = Assert.Throws<NotSupportedException>(() =>
-            engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target));
+        AssertTapeParity(
+            cpu,
+            gpu,
+            (engine, hidden, weight, bias) =>
+                engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids),
+            "index");
+        AssertTapeParity(
+            cpu,
+            gpu,
+            (engine, hidden, weight, bias) =>
+                engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target),
+            "dense");
+    }
 
-        Assert.Contains("tape-active", indexError.Message, StringComparison.Ordinal);
-        Assert.Contains("tape-active", denseError.Message, StringComparison.Ordinal);
+    private static void AssertTapeParity(
+        CpuEngine cpu,
+        DirectGpuTensorEngine gpu,
+        Func<CpuEngine, Tensor<float>, Tensor<float>, Tensor<float>, Tensor<float>> forward,
+        string label)
+    {
+        var cpuParameters = new[]
+        {
+            new Tensor<float>(Gen(8, 1), new[] { 2, 4 }),
+            new Tensor<float>(Gen(12, 2), new[] { 4, 3 }),
+            new Tensor<float>(Gen(3, 3), new[] { 3 })
+        };
+        var gpuParameters = new[]
+        {
+            new Tensor<float>(Gen(8, 1), new[] { 2, 4 }),
+            new Tensor<float>(Gen(12, 2), new[] { 4, 3 }),
+            new Tensor<float>(Gen(3, 3), new[] { 3 })
+        };
+
+        Tensor<float> cpuLoss;
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> cpuGradients;
+        using (var tape = new GradientTape<float>())
+        {
+            cpuLoss = forward(cpu, cpuParameters[0], cpuParameters[1], cpuParameters[2]);
+            cpuGradients = tape.ComputeGradients(cpuLoss, cpuParameters);
+        }
+
+        Tensor<float> gpuLoss;
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> gpuGradients;
+        using (var tape = new GradientTape<float>())
+        {
+            gpuLoss = forward(gpu, gpuParameters[0], gpuParameters[1], gpuParameters[2]);
+            gpuGradients = tape.ComputeGradients(gpuLoss, gpuParameters);
+        }
+
+        Assert.True(float.IsFinite(gpuLoss[0]), $"{label} DirectGpu loss is not finite.");
+        Assert.InRange(Math.Abs(gpuLoss[0] - cpuLoss[0]), 0f, 1e-4f);
+        for (int parameterIndex = 0; parameterIndex < cpuParameters.Length; parameterIndex++)
+        {
+            var expected = cpuGradients[cpuParameters[parameterIndex]].ToArray();
+            var actual = gpuGradients[gpuParameters[parameterIndex]].ToArray();
+            Assert.Equal(expected.Length, actual.Length);
+            for (int element = 0; element < expected.Length; element++)
+            {
+                Assert.True(float.IsFinite(actual[element]),
+                    $"{label} DirectGpu gradient {parameterIndex}[{element}] is not finite.");
+                Assert.InRange(Math.Abs(actual[element] - expected[element]), 0f, 2e-4f);
+            }
+        }
+
     }
 
     private static float[] F(Tensor<float> t) => (float[])(object)t.GetDataArray()!;

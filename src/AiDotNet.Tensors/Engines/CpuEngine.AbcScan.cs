@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -71,6 +72,32 @@ public partial class CpuEngine
             throw new ArgumentException(
                 $"slotKeys must be [numHeads={numHeads}, numSlots >= 1, headDim={headDim}]; got numSlots={numSlots}.",
                 nameof(slotKeys));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedQ = qProj;
+            var capturedK = kProj;
+            var capturedV = vProj;
+            var capturedForgetGate = forgetGate;
+            var capturedSlotKeys = slotKeys;
+            int capturedNumHeads = numHeads;
+            double capturedSlotInitScale = slotInitScale;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "AbcScan",
+                new[] { qProj, kProj, vProj, forgetGate, slotKeys },
+                new[] { batch, seqLen, modelDim },
+                (eng, output) =>
+                {
+                    var result = eng.AbcScanForward(
+                        capturedQ, capturedK, capturedV, capturedForgetGate, capturedSlotKeys,
+                        capturedNumHeads, capturedSlotInitScale);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                AbcScanBackward<T>,
+                new object[] { numHeads, slotInitScale });
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 

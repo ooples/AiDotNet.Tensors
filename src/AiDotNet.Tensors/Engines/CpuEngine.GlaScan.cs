@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -54,6 +55,29 @@ public partial class CpuEngine
         // Gate is scalar-per-head: [batch, seqLen, numHeads], not the full modelDim.
         if (gate.Rank != 3 || gate.Shape[0] != batch || gate.Shape[1] != seqLen || gate.Shape[2] != numHeads)
             throw new ArgumentException($"gate must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(gate));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedQ = qProj;
+            var capturedK = kProj;
+            var capturedV = vProj;
+            var capturedGate = gate;
+            int capturedNumHeads = numHeads;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "GlaScan",
+                new[] { qProj, kProj, vProj, gate },
+                new[] { batch, seqLen, modelDim },
+                (eng, output) =>
+                {
+                    var result = eng.GlaScanForward(
+                        capturedQ, capturedK, capturedV, capturedGate, capturedNumHeads);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                GlaScanBackward<T>,
+                new object[] { numHeads });
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 
