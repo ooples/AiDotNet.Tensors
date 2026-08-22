@@ -124,6 +124,7 @@ public class DirectGpuTanhFallbackTests
     {
         Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(), "No DirectGpu backend available");
         var gpu = AiDotNetEngine.Current;
+        using var scope = new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve);
 
         // CpuEngine.TensorTanh copies Layout across, and the fallback replaces that method rather
         // than merely calling something adjacent to it — so the copy has to survive the fix.
