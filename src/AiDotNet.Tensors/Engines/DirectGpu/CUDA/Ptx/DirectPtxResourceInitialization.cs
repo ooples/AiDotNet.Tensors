@@ -9,6 +9,40 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// </summary>
 internal static class DirectPtxResourceInitialization
 {
+    internal static DirectPtxLoadedKernel LoadKernel(
+        DirectPtxRuntime runtime,
+        string ptx,
+        string entryPoint,
+        int blockThreads,
+        DirectPtxKernelBlueprint blueprint)
+    {
+        PtxCompat.ThrowIfNull(runtime, nameof(runtime));
+        PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
+        PtxCompat.ThrowIfNullOrWhiteSpace(entryPoint, nameof(entryPoint));
+        PtxCompat.ThrowIfNull(blueprint, nameof(blueprint));
+        if (blockThreads <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockThreads));
+
+        var loaded = Complete(
+            runtime.LoadModule(ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(
+                    entryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(
+                    function, blockThreads);
+                blueprint.ResourceBudget.Validate(
+                    entryPoint, info, blockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    blueprint, runtime.DeviceFingerprint, ptx, info,
+                    blockThreads, activeBlocks, module);
+                return new DirectPtxLoadedKernelValue(function, audit);
+            });
+
+        return new DirectPtxLoadedKernel(
+            loaded.Resource, loaded.Value.Function, loaded.Value.Audit);
+    }
+
     internal static (TResource Resource, TValue Value) Complete<TResource, TValue>(
         TResource resource, Func<TResource, TValue> initialize)
         where TResource : IDisposable
@@ -46,5 +80,35 @@ internal static class DirectPtxResourceInitialization
         if (resource is null) return;
         try { resource.Dispose(); }
         catch { }
+    }
+
+    private readonly struct DirectPtxLoadedKernelValue
+    {
+        internal IntPtr Function { get; }
+        internal DirectPtxKernelAudit Audit { get; }
+
+        internal DirectPtxLoadedKernelValue(
+            IntPtr function, DirectPtxKernelAudit audit)
+        {
+            Function = function;
+            Audit = audit;
+        }
+    }
+}
+
+internal readonly struct DirectPtxLoadedKernel
+{
+    internal DirectPtxModule Module { get; }
+    internal IntPtr Function { get; }
+    internal DirectPtxKernelAudit Audit { get; }
+
+    internal DirectPtxLoadedKernel(
+        DirectPtxModule module,
+        IntPtr function,
+        DirectPtxKernelAudit audit)
+    {
+        Module = module;
+        Function = function;
+        Audit = audit;
     }
 }

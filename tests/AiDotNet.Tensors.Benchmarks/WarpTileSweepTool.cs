@@ -66,6 +66,18 @@ internal static class WarpTileSweepTool
         // same kernel name looks alike to ncu.
         string? only = args.Length > 0 && args[0].Contains('x') ? args[0] : null;
         string? shapeOnly = args.Length > 1 ? args[1] : null;
+        bool fp64AnchorEstablished = false;
+        bool excludesFp64Anchor =
+            (only is not null && only != "2x2") ||
+            (shapeOnly is not null && !"256^3".StartsWith(shapeOnly, StringComparison.Ordinal));
+        if (excludesFp64Anchor)
+        {
+            Console.WriteLine(
+                "WARNING: filters exclude the 2x2-at-256^3 fp64 reference anchor; larger-shape " +
+                "comparisons are relative only and will be labeled unanchored.");
+            Console.WriteLine();
+        }
+
         foreach (var (label, spec, m, n, k) in Shapes())
         {
             if (shapeOnly is not null && !label.StartsWith(shapeOnly, StringComparison.Ordinal)) continue;
@@ -77,7 +89,7 @@ internal static class WarpTileSweepTool
                 foreach (bool async in AsyncForms)
                 {
                     double us = Measure(runtime, spec, major, minor, tm, tn, async,
-                                        m, n, k, label, ref baseline);
+                                        m, n, k, label, ref baseline, ref fp64AnchorEstablished);
                     if (us > 0 && baseline == 0) baseline = us;
                 }
 
@@ -95,7 +107,7 @@ internal static class WarpTileSweepTool
     private static double Measure(
         DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
         int tileM, int tileN, bool async, int m, int n, int k, string label,
-        ref double baseline)
+        ref double baseline, ref bool fp64AnchorEstablished)
     {
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -163,18 +175,41 @@ internal static class WarpTileSweepTool
             var got = new float[outCount];
             outBuffer.Download<float>(got);
             float[] want = RankOneMatMulReference(wide[0], m, n, k);
-            bool agrees = CodegenOutputAgreement.Agrees(
+            _ = CodegenOutputAgreement.Agrees(
                 got, want, 1e-3, out deviation, out _, out _, out _);
 
-            if (!agrees)
+            bool usesFp64Reference = (long)m * n * k <= 64L * 1024 * 1024;
+            string correctnessReference = usesFp64Reference
+                ? "fp64"
+                : !fp64AnchorEstablished ? "unanchored"
+                : tileM == 2 && tileN == 2 ? "root@256" : "tile2x2";
+            if (usesFp64Reference)
             {
-                Report(label, tileM, tileN, emitter, "fp64", deviation, 0, 0, "WRONG");
+                double[] fp64Want = spec.Interpret(wide);
+                deviation = 0;
+                for (long e = 0; e < outCount; e++)
+                    deviation = Math.Max(deviation, Math.Abs(got[e] - fp64Want[e]));
+            }
+            else if (tileM == 2 && tileN == 2)
+            {
+                deviation = 0;   // this IS the reference tile; the verified shapes cover it
+            }
+            else
+            {
+                deviation = CompareAgainstReference(runtime, spec, major, minor, pointers, got, outCount);
+            }
+
+            if (deviation > 1e-3)
+            {
+                Report(label, tileM, tileN, emitter, correctnessReference, deviation, 0, 0, "WRONG");
                 return 0;
             }
+            if (usesFp64Reference && tileM == 2 && tileN == 2)
+                fp64AnchorEstablished = true;
 
             long macs = (long)m * n * k;
             double us = TimeIt(runtime, module, fn, pointers, blocks, threads, macs);
-            Report(label, tileM, tileN, emitter, "fp64", deviation, us, macs, null);
+            Report(label, tileM, tileN, emitter, correctnessReference, deviation, us, macs, null);
             return us;
         }
         catch (Exception ex)
@@ -366,4 +401,38 @@ internal static class WarpTileSweepTool
         yield return ("256^3", MatMul("sweep_256", 256, 256, 256), 256, 256, 256);
         yield return ("4096^3", MatMul("sweep_4096", 4096, 4096, 4096), 4096, 4096, 4096);
     }
+    private static double CompareAgainstReference(
+        DirectPtxRuntime runtime, CodegenKernelSpec spec, int major, int minor,
+        IntPtr[] pointers, float[] got, long outCount)
+    {
+        var reference = new PtxTensorCoreEmitter { WarpTilesM = 2, WarpTilesN = 2, PinWarpTile = true };
+        PtxTensorCoreEmitter.TryPlan(spec, major, minor, out var plan, out _);
+
+        string ptx = reference.Emit(spec, major, minor);
+        using var module = runtime.LoadModule(ptx);
+        IntPtr fn = module.GetFunction(spec.Name, out _);
+
+        var refBuffer = runtime.AllocateBytes((nuint)(outCount * sizeof(float)));
+        try
+        {
+            var refPointers = (IntPtr[])pointers.Clone();
+            refPointers[2] = refBuffer.Pointer;
+
+            DirectPtxLaunchHelper.Launch(module, fn, refPointers,
+                (uint)reference.BlockCount(plan!), (uint)reference.BlockThreads);
+            runtime.Synchronize();
+
+            var want = new float[outCount];
+            refBuffer.Download<float>(want);
+
+            double worst = 0;
+            for (long e = 0; e < outCount; e++) worst = Math.Max(worst, Math.Abs(got[e] - want[e]));
+            return worst;
+        }
+        finally
+        {
+            refBuffer.Dispose();
+        }
+    }
+
 }

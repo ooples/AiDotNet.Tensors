@@ -36,18 +36,21 @@ class Program
         // The tool contract accepts only operands, so strip the dispatch flag exactly once.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args.Skip(1).ToArray());
             return;
         }
 
         if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
         {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args.Skip(1).ToArray());
             return;
         }
 
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
         {
+            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args.Skip(1).ToArray());
             return;
         }
@@ -185,6 +188,48 @@ class Program
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
             DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-dense-linear-full")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            bool includePython = !args.Contains("--no-python", StringComparer.Ordinal);
+            bool tuneFp16TensorCore = args.Contains(
+                "--autotune-fp16-m16", StringComparer.Ordinal);
+            string? onlyOperation = args.FirstOrDefault(
+                argument => argument.StartsWith("--only=", StringComparison.Ordinal))?[7..];
+            DirectPtxDenseLinearFullExperiment.Run(
+                runs, includePython, onlyOperation, tuneFp16TensorCore);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--export-direct-ptx-dense-linear-cubins")
+        {
+            string outputDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
+            DirectPtxDenseLinearArtifactTool.Export(outputDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-dense-linear-cubins")
+        {
+            string artifactDirectory = args.Length > 1
+                ? args[1]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
+            DirectPtxDenseLinearArtifactTool.Verify(artifactDirectory);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-dense-linear-sass")
+        {
+            if (args.Length < 2)
+                throw new ArgumentException("Pass the absolute nvdisasm executable path.");
+            string artifactDirectory = args.Length > 2
+                ? args[2]
+                : Path.Combine("src", "AiDotNet.Tensors", "Engines", "DirectGpu", "CUDA", "Ptx", "Artifacts", "sm86", "dense-linear");
+            string evidenceDirectory = args.Length > 3
+                ? args[3]
+                : Path.Combine("artifacts", "direct-ptx", "dense-linear", "sass");
+            DirectPtxDenseLinearSassAuditTool.Run(
+                args[1], artifactDirectory, evidenceDirectory);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-mixed-linear")
@@ -537,6 +582,11 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
         {
             DirectPtxProfileTarget.RunFusedLinear();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-dense-linear")
+        {
+            DirectPtxProfileTarget.RunDenseLinear();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-mixed-linear")
@@ -1572,6 +1622,10 @@ class Program
         Console.WriteLine("  --direct-ptx-online-attention: Async online S128/D64 GPU championship table");
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
         Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
+        Console.WriteLine("  --direct-ptx-dense-linear-full [runs] [--no-python] [--only=operation] [--autotune-fp16-m16]: complete #836 resident NVIDIA matrix");
+        Console.WriteLine("  --export-direct-ptx-dense-linear-cubins [dir]: link and export exact SM86 cubins");
+        Console.WriteLine("  --verify-direct-ptx-dense-linear-cubins [dir]: reject stale/missing dense-linear artifacts");
+        Console.WriteLine("  --audit-direct-ptx-dense-linear-sass <nvdisasm> [cubins] [evidence]: reject final-SASS LDL/STL");
         Console.WriteLine("  --direct-ptx-mixed-linear [runs]: FP16 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-mixed-linear-m16 [runs]: async Tensor Core M=16 championship matrix");
         Console.WriteLine("  --direct-ptx-w8a8-linear [runs]: symmetric W8A8 M=1 linear+bias+GELU championship matrix");
@@ -1599,6 +1653,7 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
+        Console.WriteLine("  --direct-ptx-profile-dense-linear: exact-cubin Nsight target for all issue-836 entries");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear-m16: deterministic Nsight async MMA target");
         Console.WriteLine("  --direct-ptx-profile-w8a8-linear: deterministic Nsight W8A8 DP4A target");

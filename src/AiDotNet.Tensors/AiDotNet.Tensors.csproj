@@ -55,6 +55,7 @@
          excluded until they pass the same source/hash/resource gates. -->
     <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.cubin" />
     <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*-cubins.tsv" />
+    <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.linker.txt" />
     <InternalsVisibleTo Include="AiDotNet" />
     <InternalsVisibleTo Include="AiDotNetTests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />

@@ -606,6 +606,14 @@ internal sealed class DirectPtxBuffer : IDisposable
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyHtoD(_pointer, (IntPtr)pSource, checked((ulong)bytes)),
                 "cuMemcpyHtoD");
+            // Standalone runtimes launch on a CU_STREAM_NON_BLOCKING stream.
+            // A synchronous pageable-host copy is issued in the null-stream
+            // ordering domain and therefore does not establish an edge to that
+            // stream. Complete the transfer before the caller can enqueue a
+            // kernel, or concurrent contexts can observe an incompletely staged
+            // input and leave apparently random output blocks at zero.
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
             // The synchronous pageable-host copy stages through the default
             // stream. Complete that stream before a caller can enqueue new work
             // on the runtime's CU_STREAM_NON_BLOCKING stream.
@@ -620,6 +628,11 @@ internal sealed class DirectPtxBuffer : IDisposable
         nuint bytes = checked((nuint)destination.Length * (nuint)sizeof(T));
         if (bytes > ByteLength) throw new ArgumentException("Destination is larger than the device buffer.", nameof(destination));
         using var _ = _runtime.Enter();
+        // The null-stream DtoH copy does not wait for work in the runtime's
+        // non-blocking stream. Make Download independently correct even when a
+        // caller omits an explicit Synchronize before reading the result.
+        DirectPtxRuntime.Check(
+            CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(download)");
         // Make Download independently correct when the caller omits an explicit
         // barrier, while waiting only for the stream that produces this buffer.
         _runtime.Synchronize();
