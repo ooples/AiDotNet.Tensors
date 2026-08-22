@@ -762,6 +762,75 @@ internal static class DirectPtxProfileTarget
         GpuBenchmarkEnvironment.RequireNoForeignCompute("ncu-rng-stochastic-end");
     }
 
+    internal static void RunResidualLayerNormGelu()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int rows = 8192;
+        using var kernel = new PtxFusedResidualBiasLayerNormGeluD64Kernel(runtime, rows);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var residual = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var bias = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        using var gamma = runtime.AllocateBytes(kernel.Blueprint.Tensors[3].RequiredBytes);
+        using var beta = runtime.AllocateBytes(kernel.Blueprint.Tensors[4].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[5].RequiredBytes);
+        input.Upload<float>(new float[rows * 64]);
+        residual.Upload<float>(new float[rows * 64]);
+        bias.Upload<float>(new float[64]);
+        gamma.Upload<float>(Enumerable.Repeat(1f, 64).ToArray());
+        beta.Upload<float>(new float[64]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(residual, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(bias, kernel.Blueprint.Tensors[2]),
+            DirectPtxTensorView.CreateOwned(gamma, kernel.Blueprint.Tensors[3]),
+            DirectPtxTensorView.CreateOwned(beta, kernel.Blueprint.Tensors[4]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[5]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+    internal static void RunGeGlu()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int outerSize = 256, halfDimension = 11008;
+        using var kernel = new PtxFusedGeGluF32Kernel(runtime, outerSize, halfDimension);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var output = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        input.Upload<float>(new float[outerSize * halfDimension * 2]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(output, kernel.Blueprint.Tensors[1]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+    internal static void RunGeGluBackward()
+    {
+        using var runtime = new DirectPtxRuntime();
+        const int outerSize = 256, halfDimension = 11008;
+        using var kernel = new PtxFusedGeGluBackwardF32Kernel(
+            runtime, outerSize, halfDimension);
+        using var gradOutput = runtime.AllocateBytes(kernel.Blueprint.Tensors[0].RequiredBytes);
+        using var input = runtime.AllocateBytes(kernel.Blueprint.Tensors[1].RequiredBytes);
+        using var gradInput = runtime.AllocateBytes(kernel.Blueprint.Tensors[2].RequiredBytes);
+        gradOutput.Upload<float>(new float[outerSize * halfDimension]);
+        input.Upload<float>(new float[outerSize * halfDimension * 2]);
+        Action launch = () => kernel.Launch(
+            DirectPtxTensorView.CreateOwned(gradOutput, kernel.Blueprint.Tensors[0]),
+            DirectPtxTensorView.CreateOwned(input, kernel.Blueprint.Tensors[1]),
+            DirectPtxTensorView.CreateOwned(gradInput, kernel.Blueprint.Tensors[2]));
+        for (int i = 0; i < 10; i++) launch();
+        runtime.Synchronize();
+        Console.WriteLine(kernel.Audit.ToJson());
+    }
+
+
+
+
+
+
     internal static void RunGlobalAvgPool()
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("ncu-global-avgpool-start");
