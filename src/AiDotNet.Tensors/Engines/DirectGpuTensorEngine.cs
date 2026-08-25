@@ -2511,7 +2511,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Thin wrapper: the version gate itself lives in the shared persistent-cache lookup below, so EVERY
         // persistent-weight read path that passes the host Tensor.Version gets the same in-place-load
         // protection — not just this one (CodeRabbit #821). We hold the Version at read time.
-        => GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role, weights.Version);
+        // READ-ONLY accessor: GetDataArray is write-intent and calls EnsureOwnedForWrite, so using
+        // it to key this cache PRIVATISED every copy-on-write clone as a side effect of looking up
+        // its buffer. A cloned model therefore got fresh arrays, missed the cache, and uploaded a
+        // second identical copy of every weight. Reading through GetReadOnlyDataArray keeps the
+        // clone sharing its source's storage, so the key matches and the existing GPU buffer is
+        // reused -- until a genuine write privatises the storage, which is exactly when a
+        // re-upload is correct. This is the read/write split GetDataArray's own remarks call
+        // "Stage 2"; weights are an input operand the GPU only reads.
+        => GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.Version);
 
     /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
