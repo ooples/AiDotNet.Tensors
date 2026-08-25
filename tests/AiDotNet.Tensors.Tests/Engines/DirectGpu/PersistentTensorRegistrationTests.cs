@@ -21,11 +21,20 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// </remarks>
 public class PersistentTensorRegistrationTests
 {
-#if NET6_0_OR_GREATER   // GC.GetTotalAllocatedBytes is .NET Core 3.0+; this project also targets net471.
+#if NET6_0_OR_GREATER   // GetAllocatedBytesForCurrentThread is .NET Core 3.0+; this project also targets net471.
     [Fact]
     public void RegisterPersistentTensor_DoesNotMaterialiseTheTensor()
     {
-        var engine = AiDotNetEngine.Current;
+        // The engine under test must be the GPU one. AiDotNetEngine.Current starts as CpuEngine and
+        // stays there when GPU detection is off or unavailable, and CpuEngine.RegisterPersistentTensor
+        // is ALREADY a no-op -- so this would have passed without ever running the changed override.
+        using var engine = new DirectGpuTensorEngine();
+        if (!engine.IsGpuAvailable)
+        {
+            // No backend means TryGetBackend early-outs and there is nothing to assert about uploads.
+            return;
+        }
+
         var tensor = new Tensor<double>(new[] { 512, 512 });   // 2 MB of doubles
         for (int i = 0; i < tensor.Length; i += 512) tensor[i] = i * 0.5;
 
@@ -35,9 +44,11 @@ public class PersistentTensorRegistrationTests
         engine.RegisterPersistentTensor(tensor, PersistentTensorRole.Weights);
         engine.UnregisterPersistentTensor(tensor);
 
-        long before = System.GC.GetTotalAllocatedBytes(precise: true);
+        // THREAD-LOCAL, not process-wide: GetTotalAllocatedBytes counts every thread, so an
+        // unrelated test running concurrently could push this over the threshold and fail it.
+        long before = System.GC.GetAllocatedBytesForCurrentThread();
         engine.RegisterPersistentTensor(tensor, PersistentTensorRole.Weights);
-        long allocated = System.GC.GetTotalAllocatedBytes(precise: true) - before;
+        long allocated = System.GC.GetAllocatedBytesForCurrentThread() - before;
 
         engine.UnregisterPersistentTensor(tensor);
 
