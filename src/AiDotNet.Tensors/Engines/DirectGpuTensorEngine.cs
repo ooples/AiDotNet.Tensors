@@ -2511,7 +2511,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Thin wrapper: the version gate itself lives in the shared persistent-cache lookup below, so EVERY
         // persistent-weight read path that passes the host Tensor.Version gets the same in-place-load
         // protection — not just this one (CodeRabbit #821). We hold the Version at read time.
-        => GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role, weights.Version);
+        // READ-ONLY accessor: GetDataArray is write-intent and calls EnsureOwnedForWrite, so using
+        // it to key this cache PRIVATISED every copy-on-write clone as a side effect of looking up
+        // its buffer. A cloned model therefore got fresh arrays, missed the cache, and uploaded a
+        // second identical copy of every weight. Reading through GetReadOnlyDataArray keeps the
+        // clone sharing its source's storage, so the key matches and the existing GPU buffer is
+        // reused -- until a genuine write privatises the storage, which is exactly when a
+        // re-upload is correct. This is the read/write split GetDataArray's own remarks call
+        // "Stage 2"; weights are an input operand the GPU only reads.
+        => GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.Version);
 
     /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
@@ -12038,34 +12046,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         base.RegisterPersistentTensor(tensor, role);
 
-        if (!TryGetBackend(out var backend))
-            return;
-
-        // Use the tensor's data array as the cache key
-        object key = tensor.GetDataArray();
-
-        // Check if already registered
-        if (_persistentBufferCache.ContainsKey(key))
-            return;
-
-        try
-        {
-            // Convert tensor data to float and upload to GPU
-            float[] floatData = DirectGpuEngine.ToFloatArray(tensor.GetDataArray());
-            IGpuBuffer gpuBuffer = backend.AllocateBuffer(floatData);
-            backend.Synchronize();
-
-            var entry = new GpuBufferCacheEntry(gpuBuffer, role);
-            _persistentBufferCache.TryAdd(key, entry);
-            _tensorVersions.TryAdd(key, 0);
-            // Stamp the host Version this buffer was uploaded at, so the version-aware weight reader
-            // (GetOrCacheWeightBufferVersionAware) detects a later in-place load and re-uploads.
-            _persistentWeightHostVersion[key] = tensor.Version;
-        }
-        catch
-        {
-            // Silently ignore GPU allocation failures - operations will fall back to CPU
-        }
+        // NO EAGER UPLOAD. Registration used to convert the whole tensor to float and allocate a
+        // GPU buffer immediately. That is work the READ path already does on demand:
+        // GetOrCacheWeightBuffer allocates on a cache miss and re-uploads when the host Version
+        // moves, so uploading here only duplicated it -- and did so for every parameter of every
+        // layer, whether or not that layer was ever used on the GPU.
+        //
+        // It made CLONING quadratic in memory. A cloned layer re-registers each of its parameters,
+        // so every clone re-uploaded an entire model: measured on a 31.5M-parameter VAE decoder,
+        // ~120 MB of float conversion plus a GPU allocation per clone, which exhausted memory
+        // across ten large models in one test process. Deferring makes a clone that is never run
+        // on the GPU cost nothing, and one that is run pay exactly once, on first read.
+        //
+        // The per-tensor backend.Synchronize() went with it: registering a 200-layer model stalled
+        // the GPU 200 times, where the read path already synchronizes when it must.
+        //
+        // base.RegisterPersistentTensor above still pins the tensor in the arena, which is the part
+        // registration is actually for.
     }
 
     /// <summary>
