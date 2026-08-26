@@ -860,9 +860,9 @@ public sealed class TensorArena : IDisposable
     {
         if (TensorAllocator.AllocDiag)
         {
-            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={TensorAllocator.ArenaHit}({TensorAllocator.ArenaHitBytes / BytesPerMiB:F0}MB) arenaMiss={TensorAllocator.ArenaMiss}({TensorAllocator.ArenaMissBytes / BytesPerMiB:F0}MB) arenaNull={TensorAllocator.ArenaNull}({TensorAllocator.ArenaNullBytes / BytesPerMiB:F0}MB)");
-            TensorAllocator.ArenaHit = 0; TensorAllocator.ArenaMiss = 0; TensorAllocator.ArenaNull = 0;
-            TensorAllocator.ArenaHitBytes = 0; TensorAllocator.ArenaMissBytes = 0; TensorAllocator.ArenaNullBytes = 0;
+            var diag = TensorAllocator.Counters.Snapshot();
+            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={diag.Hit}({diag.HitBytes / BytesPerMiB:F0}MB) arenaMiss={diag.Miss}({diag.MissBytes / BytesPerMiB:F0}MB) arenaNull={diag.Null}({diag.NullBytes / BytesPerMiB:F0}MB)");
+            TensorAllocator.Counters.Reset();
         }
         // Rewind all cursors to 0 — arrays and tensors stay pooled.
         // NOTE: must snapshot the keys before mutating. On .NET Framework
