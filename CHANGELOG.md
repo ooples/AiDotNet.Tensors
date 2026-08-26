@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.129.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.3...v0.129.4) (2026-08-26)
+
+
+### Bug Fixes
+
+* make the arena allocation counters impossible to misread ([#984](https://github.com/ooples/AiDotNet.Tensors/issues/984)) ([4f71f71](https://github.com/ooples/AiDotNet.Tensors/commit/4f71f71f2ba707283ceb5f200515876093717547))
+
+
+### Performance
+
+* stop CloneDeepCopy staging through a full intermediate array ([#983](https://github.com/ooples/AiDotNet.Tensors/issues/983)) ([96e88a3](https://github.com/ooples/AiDotNet.Tensors/commit/96e88a3ab8d2c8f5e65d9fbf7f47cae26f928b85))
+
 ## [0.129.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.2...v0.129.3) (2026-08-26)
 
 
