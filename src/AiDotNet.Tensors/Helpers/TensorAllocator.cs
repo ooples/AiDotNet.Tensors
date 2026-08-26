@@ -21,7 +21,53 @@ public static class TensorAllocator
     // when they are off. A mutable switch would put a real branch on every Rent.
     internal static readonly bool AllocDiag =
         System.Environment.GetEnvironmentVariable("AIDOTNET_ALLOC_DIAG") == "1";
-    internal static long ArenaHit, ArenaMiss, ArenaNull, ArenaHitBytes, ArenaMissBytes, ArenaNullBytes;
+    internal static readonly ArenaAllocationCounters Counters = new ArenaAllocationCounters();
+
+    /// <summary>
+    /// The arena hit/miss/null tallies. An instance rather than static fields so the record,
+    /// snapshot and reset semantics can be unit-tested directly, in every test run, without
+    /// depending on how AIDOTNET_ALLOC_DIAG happens to be set for the process.
+    /// </summary>
+    internal sealed class ArenaAllocationCounters
+    {
+        private long _hit, _miss, _null, _hitBytes, _missBytes, _nullBytes;
+
+        internal void RecordHit(long bytes)
+        {
+            System.Threading.Interlocked.Increment(ref _hit);
+            System.Threading.Interlocked.Add(ref _hitBytes, bytes);
+        }
+
+        internal void RecordMiss(long bytes)
+        {
+            System.Threading.Interlocked.Increment(ref _miss);
+            System.Threading.Interlocked.Add(ref _missBytes, bytes);
+        }
+
+        internal void RecordNull(long bytes)
+        {
+            System.Threading.Interlocked.Increment(ref _null);
+            System.Threading.Interlocked.Add(ref _nullBytes, bytes);
+        }
+
+        internal ArenaAllocationDiagnostics Snapshot() => new ArenaAllocationDiagnostics(
+            System.Threading.Interlocked.Read(ref _hit),
+            System.Threading.Interlocked.Read(ref _miss),
+            System.Threading.Interlocked.Read(ref _null),
+            System.Threading.Interlocked.Read(ref _hitBytes),
+            System.Threading.Interlocked.Read(ref _missBytes),
+            System.Threading.Interlocked.Read(ref _nullBytes));
+
+        internal void Reset()
+        {
+            System.Threading.Interlocked.Exchange(ref _hit, 0);
+            System.Threading.Interlocked.Exchange(ref _miss, 0);
+            System.Threading.Interlocked.Exchange(ref _null, 0);
+            System.Threading.Interlocked.Exchange(ref _hitBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _missBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _nullBytes, 0);
+        }
+    }
 
     /// <summary>
     /// Whether the arena allocation counters are recording. Off unless AIDOTNET_ALLOC_DIAG=1.
@@ -87,13 +133,7 @@ public static class TensorAllocator
             return false;
         }
 
-        diagnostics = new ArenaAllocationDiagnostics(
-            System.Threading.Interlocked.Read(ref ArenaHit),
-            System.Threading.Interlocked.Read(ref ArenaMiss),
-            System.Threading.Interlocked.Read(ref ArenaNull),
-            System.Threading.Interlocked.Read(ref ArenaHitBytes),
-            System.Threading.Interlocked.Read(ref ArenaMissBytes),
-            System.Threading.Interlocked.Read(ref ArenaNullBytes));
+        diagnostics = Counters.Snapshot();
         return true;
     }
 
@@ -104,12 +144,7 @@ public static class TensorAllocator
     public static bool TryResetArenaDiagnostics()
     {
         if (!AllocDiag) return false;
-        System.Threading.Interlocked.Exchange(ref ArenaHit, 0);
-        System.Threading.Interlocked.Exchange(ref ArenaMiss, 0);
-        System.Threading.Interlocked.Exchange(ref ArenaNull, 0);
-        System.Threading.Interlocked.Exchange(ref ArenaHitBytes, 0);
-        System.Threading.Interlocked.Exchange(ref ArenaMissBytes, 0);
-        System.Threading.Interlocked.Exchange(ref ArenaNullBytes, 0);
+        Counters.Reset();
         return true;
     }
 
@@ -475,10 +510,10 @@ public static class TensorAllocator
         if (arena != null)
         {
             var pooledTensor = arena.TryRentTensor<T>(totalSize, shape);
-            if (pooledTensor != null) { if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaHit); System.Threading.Interlocked.Add(ref ArenaHitBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); } return pooledTensor; }
-            if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaMiss); System.Threading.Interlocked.Add(ref ArenaMissBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); }
+            if (pooledTensor != null) { if (AllocDiag) Counters.RecordHit((long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); return pooledTensor; }
+            if (AllocDiag) Counters.RecordMiss((long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
         }
-        else if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaNull); System.Threading.Interlocked.Add(ref ArenaNullBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); }
+        else if (AllocDiag) Counters.RecordNull((long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
 
 #if NET5_0_OR_GREATER
         // Thread-local cache: skip Array.Clear
