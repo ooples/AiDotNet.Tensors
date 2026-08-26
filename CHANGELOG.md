@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.129.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.2...v0.129.3) (2026-08-26)
+
+
+### Performance
+
+* **gpu:** stop uploading a tensor to the GPU just because it was registered ([#981](https://github.com/ooples/AiDotNet.Tensors/issues/981)) ([34a45d5](https://github.com/ooples/AiDotNet.Tensors/commit/34a45d5c578d198250eb184cc90d4bf37c1fbab0))
+
 ## [0.129.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.1...v0.129.2) (2026-08-22)
 
 
