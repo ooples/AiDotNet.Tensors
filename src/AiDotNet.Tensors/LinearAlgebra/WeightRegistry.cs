@@ -896,12 +896,40 @@ public static class WeightRegistry
     }
 
     /// <summary>Lossless (byte-shuffle + LZ4) serialization — variable size.</summary>
+    /// <remarks>
+    /// <para>
+    /// Reads the live backing array when there is one, instead of copying the tensor first. The
+    /// encoders take a <see cref="ReadOnlySpan{T}"/>, so the copy bought nothing: it existed only
+    /// because <c>T</c> is unconstrained here (this library uses <c>INumericOperations</c> rather
+    /// than a <c>where T : unmanaged</c> constraint), and materializing a <c>T[]</c> is what lets
+    /// the runtime type pivot through <c>object</c>. <c>GetReadOnlyDataArray</c> pivots the same way
+    /// with no allocation on a plain CPU-resident tensor, and still falls back to a snapshot for
+    /// exactly the cases that need one — views, non-zero storage offsets, and GPU-resident tensors
+    /// whose CPU buffer may be stale. It also materializes deferred data first, which a hand-rolled
+    /// live-array read would skip, and unlike <c>GetDataArray</c> it does not privatize a
+    /// copy-on-write clone, so inference on a cloned model never copies its shared weights.
+    /// </para>
+    /// <para>
+    /// This matters most where it is cheapest to overlook. Training mode resolves EVERY streaming
+    /// weight to <see cref="StreamingEncoding.Lossless"/>, so switching a model to training runs
+    /// this path over the whole parameter set, and the encoder already holds the shuffle buffer and
+    /// the compression buffer at once. Adding a third full-size copy on the way in is what made
+    /// InternImage at its Huge size throw OutOfMemoryException from MemoryStream..ctor beneath this
+    /// call — on the code path whose purpose is to make a large model FIT.
+    /// </para>
+    /// </remarks>
     private static byte[] SerializeLossless<T>(Tensor<T> tensor)
     {
         if (typeof(T) == typeof(float))
-            return StreamingStoreCodec.EncodeLosslessFloat((float[])(object)tensor.AsSpan().ToArray());
+        {
+            return StreamingStoreCodec.EncodeLosslessFloat(
+                (float[])(object)tensor.GetReadOnlyDataArray());
+        }
         if (typeof(T) == typeof(double))
-            return StreamingStoreCodec.EncodeLosslessDouble((double[])(object)tensor.AsSpan().ToArray());
+        {
+            return StreamingStoreCodec.EncodeLosslessDouble(
+                (double[])(object)tensor.GetReadOnlyDataArray());
+        }
         throw new NotSupportedException(
             $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
     }
@@ -1031,13 +1059,13 @@ public static class WeightRegistry
         {
             if (typeof(T) == typeof(float))
             {
-                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                var srcF = (float[])(object)tensor.GetReadOnlyDataArray();
                 StreamingStoreCodec.EncodeFloat(srcF, dst, stochastic);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
-                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                var srcD = (double[])(object)tensor.GetReadOnlyDataArray();
                 StreamingStoreCodec.EncodeDouble(srcD, dst, stochastic);
                 return;
             }
@@ -1107,31 +1135,31 @@ public static class WeightRegistry
         }
         if (typeof(T) == typeof(float))
         {
-            var src = (float[])(object)tensor.AsSpan().ToArray();
+            var src = (float[])(object)tensor.GetReadOnlyDataArray();
             Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            var src = (double[])(object)tensor.AsSpan().ToArray();
+            var src = (double[])(object)tensor.GetReadOnlyDataArray();
             Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
             return;
         }
         if (typeof(T) == typeof(int))
         {
-            var src = (int[])(object)tensor.AsSpan().ToArray();
+            var src = (int[])(object)tensor.GetReadOnlyDataArray();
             Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
             return;
         }
         if (typeof(T) == typeof(long))
         {
-            var src = (long[])(object)tensor.AsSpan().ToArray();
+            var src = (long[])(object)tensor.GetReadOnlyDataArray();
             Buffer.BlockCopy(src, 0, dst, 0, dst.Length);
             return;
         }
         if (typeof(T) == typeof(Half))
         {
-            var arr = (Half[])(object)tensor.AsSpan().ToArray();
+            var arr = (Half[])(object)tensor.GetReadOnlyDataArray();
             for (int i = 0; i < arr.Length; i++)
             {
                 ushort raw = AiDotNet.Tensors.NumericOperations.HalfBits.GetBits(arr[i]);
@@ -1142,7 +1170,7 @@ public static class WeightRegistry
         }
         if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
         {
-            var arr = (AiDotNet.Tensors.NumericOperations.BFloat16[])(object)tensor.AsSpan().ToArray();
+            var arr = (AiDotNet.Tensors.NumericOperations.BFloat16[])(object)tensor.GetReadOnlyDataArray();
             for (int i = 0; i < arr.Length; i++)
             {
                 ushort raw = arr[i].RawValue;
