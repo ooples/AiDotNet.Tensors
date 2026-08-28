@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
@@ -9495,17 +9495,42 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
 
-        // Use im2col + GEMM for float (significantly faster)
+        // SAME KERNEL AS Conv2DInto. These two entry points used to dispatch differently for
+        // float -- this one to Conv2DWithIm2ColFloat (the SIMD-direct / Winograd cascade), and
+        // Conv2DInto to Conv2DIm2colGemm -- on the stated grounds that the results are
+        // "numerically equivalent (im2col-GEMM vs direct differ only by FP summation order)".
+        //
+        // At float32 they are not. Measured on a 3x3 stride-1 conv, 8 output channels over a
+        // [1,3,16,16] input: 1658 of 2048 outputs differed, by up to 2.3e-4 RELATIVE, and against a
+        // float64 reference the two land at rms 5.13e-08 and 6.77e-08 -- either side of the float
+        // epsilon, so the disagreement is not confined to the last bits.
+        //
+        // Callers cannot see which entry point they reached. AiDotNet's ConvolutionalLayer picks
+        // between them by whether a GradientTape is recording, since the in-place variant bypasses
+        // the tape, so the SAME layer with the SAME weights computed a different function in
+        // training than at inference -- and its serialize-replay test failed intermittently in CI
+        // depending on whether a tape happened to be active. That is a dispatch bug here, not a
+        // layer bug there: PyTorch selects a convolution algorithm from shape and hardware, never
+        // from grad mode, and torch.no_grad() changes whether a graph is built rather than the
+        // values flowing through it.
+        //
+        // Routing both to Conv2DIm2colGemm also makes THIS path faster: the cascade is roughly 15x
+        // slower for the small 3x3 stride-1 convolutions that dominate CNN inference, which is the
+        // measurement that moved Conv2DInto onto the GEMM path in the first place.
         if (typeof(T) == typeof(float))
         {
-            Conv2DWithIm2ColFloat(
-                input as Tensor<float> ?? throw new InvalidCastException(),
-                kernel as Tensor<float> ?? throw new InvalidCastException(),
-                result as Tensor<float> ?? throw new InvalidCastException(),
+            // GetReadOnlyDataArray for the two INPUTS: GetDataArray privatizes a copy-on-write
+            // tensor, and a read must not. TensorCowInferenceReadPathTests.Conv2D_DoesNotPrivatizeCowKernel
+            // asserts exactly that the kernel stays COW-shared across a convolution. The output is a
+            // tensor this method just rented, so it is written through GetDataArray as normal.
+            Conv2DIm2colGemm(
+                (float[])(object)input.GetReadOnlyDataArray(),
+                (float[])(object)kernel.GetReadOnlyDataArray(),
+                (float[])(object)result.GetDataArray(),
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                stride, padding, dilation,
-                outputHeight, outputWidth);
+                outputHeight, outputWidth,
+                stride, stride, padding, padding, dilation, dilation);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
