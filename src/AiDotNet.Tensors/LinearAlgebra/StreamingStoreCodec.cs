@@ -944,16 +944,45 @@ internal static class StreamingStoreCodec
     }
 #endif
 
-    // DEFLATE (zlib's raw deflate) is the entropy coder: unlike LZ4 (match-only, no entropy
-    // stage → ~1.08x on shuffled fp weights), Deflate's Huffman stage compresses the highly
-    // repetitive sign/exponent byte-plane that the shuffle exposes → ~1.18x, bit-exact, at
-    // ~1.1 GiB/s decode. It's in the BCL on both net471 and net5+ (no extra dependency).
-    private static byte[] DeflateCompress(byte[] src)
+    // Emits the byte-plane shuffle of `src` to `dst` without materializing it, one plane tile at a
+    // time through a pooled buffer. Byte-for-byte what BytePlaneShuffle would have written; see
+    // EncodeLosslessBytes for why the intermediate is worth avoiding. The vectorized shuffle stays
+    // in use on the decode side and on the didn't-shrink fallback, where a real buffer exists.
+    private static void WriteShuffledPlanes(ReadOnlySpan<byte> src, int elem, Stream dst)
     {
-        using var ms = new MemoryStream(src.Length);
-        using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
-            ds.Write(src, 0, src.Length);
-        return ms.ToArray();
+        int count = src.Length / elem;
+        // At least `elem` so the buffer can also hold the partial-element tail below.
+        int tile = Math.Max(elem, Math.Min(count, ShuffleTileElems));
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(tile);
+        try
+        {
+            for (int k = 0; k < elem; k++)
+            {
+                for (int i0 = 0; i0 < count; i0 += tile)
+                {
+                    int n = Math.Min(tile, count - i0);
+                    for (int i = 0; i < n; i++) buffer[i] = src[(i0 + i) * elem + k];
+                    dst.Write(buffer, 0, n);
+                }
+            }
+
+            // BytePlaneShuffle only writes count*elem bytes into a dst the length of src, so a
+            // partial trailing element leaves zeros behind. Both callers pass a whole number of
+            // elements (MemoryMarshal.AsBytes over float/double), so this never fires — but emitting
+            // the same zeros keeps the two paths byte-identical rather than merely equivalent on the
+            // inputs that happen to occur. DecodeLosslessBytes requires the full length and would
+            // throw on a short stream, so a divergence here would surface as a decode failure.
+            int tail = src.Length - count * elem;
+            if (tail > 0)
+            {
+                Array.Clear(buffer, 0, tail);
+                dst.Write(buffer, 0, tail);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private static int DeflateDecompress(byte[] comp, byte[] dst, int dstLen)
@@ -965,23 +994,40 @@ internal static class StreamingStoreCodec
         return read;
     }
 
+    // DEFLATE (zlib's raw deflate) is the entropy coder: unlike LZ4 (match-only, no entropy
+    // stage → ~1.08x on shuffled fp weights), Deflate's Huffman stage compresses the highly
+    // repetitive sign/exponent byte-plane that the shuffle exposes → ~1.18x, bit-exact, at
+    // ~1.1 GiB/s decode. It's in the BCL on both net471 and net5+ (no extra dependency).
     private static byte[] EncodeLosslessBytes(ReadOnlySpan<byte> raw, int elem)
     {
-        var shuffled = new byte[raw.Length];
-        BytePlaneShuffle(raw, shuffled, elem);
-        var comp = DeflateCompress(shuffled);
-        if (comp.Length < shuffled.Length)
-        {
-            var outp = new byte[1 + comp.Length];
-            outp[0] = 1; // Deflate-compressed
-            Buffer.BlockCopy(comp, 0, outp, 1, comp.Length);
-            return outp;
-        }
+        // Shuffle straight into the compressor rather than materializing the shuffled copy.
+        //
+        // The shuffle is plane-major — dst[k*count + i] = src[i*elem + k] — so each plane is
+        // contiguous in the output and the planes can be emitted in order, a tile at a time,
+        // through a small pooled buffer. The bytes Deflate sees are identical either way; only the
+        // N-sized intermediate goes away, and it was most of the peak. Deflate reaches about 1.18x
+        // on shuffled fp weights (see the note above), so the old path held, at once: shuffled (N)
+        // + a MemoryStream pre-sized to N + ToArray (0.85N) + a further array purely to prepend one
+        // tag byte. InternImage's Huge size hit the 16 GiB ceiling inside it — first at
+        // MemoryStream..ctor, then, once a redundant copy was removed upstream in WeightRegistry,
+        // one allocation later at MemoryStream.ToArray. Writing the tag into the stream ahead of the
+        // compressed bytes removes the prepend copy too, leaving the stream buffer and one ToArray.
+        using var ms = new MemoryStream((raw.Length - (raw.Length >> 3)) + 1);
+        ms.WriteByte(1); // Deflate-compressed
+        using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+            WriteShuffledPlanes(raw, elem, ds);
+
+        // ms.Length counts the tag byte, so the compressed payload is ms.Length - 1.
+        if (ms.Length - 1 < raw.Length)
+            return ms.ToArray();
+
         // Didn't shrink (rare — tiny or high-entropy) — store the raw shuffled bytes so the
-        // round-trip is still exact and never larger than shuffled + 1.
-        var rawOut = new byte[1 + shuffled.Length];
+        // round-trip is still exact and never larger than shuffled + 1. Re-shuffling costs a second
+        // pass on a path that is already the uncommon one, and it is what lets the common path
+        // avoid holding the shuffled copy at all.
+        var rawOut = new byte[1 + raw.Length];
         rawOut[0] = 0;
-        Buffer.BlockCopy(shuffled, 0, rawOut, 1, shuffled.Length);
+        BytePlaneShuffle(raw, rawOut.AsSpan(1), elem);
         return rawOut;
     }
 
