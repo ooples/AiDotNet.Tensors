@@ -26,6 +26,16 @@ internal static class StreamingStoreCodec
     /// <summary>bf16 element size in bytes (stored little-endian).</summary>
     internal const int Bf16ElementSize = 2;
 
+    // Lossless payload framing: one leading tag byte, then the body. These are WIRE FORMAT - a
+    // stored buffer written by an older build is decoded by these same values, so they may not
+    // change meaning.
+    /// <summary>Tag: body is the byte-plane-shuffled bytes, stored uncompressed.</summary>
+    private const byte RawShuffledTag = 0;
+    /// <summary>Tag: body is the Deflate-compressed byte-plane-shuffled bytes.</summary>
+    private const byte DeflateCompressedTag = 1;
+    /// <summary>Length of the leading tag byte.</summary>
+    private const int LosslessTagLength = sizeof(byte);
+
     // Fast, non-crypto per-thread PRNG for stochastic rounding. Stochastic
     // rounding is a NUMERICAL technique (PyTorch/CUDA use Philox counters) — it
     // needs a cheap high-rate source, not cryptographic randomness, so a
@@ -1012,33 +1022,34 @@ internal static class StreamingStoreCodec
         // MemoryStream..ctor, then, once a redundant copy was removed upstream in WeightRegistry,
         // one allocation later at MemoryStream.ToArray. Writing the tag into the stream ahead of the
         // compressed bytes removes the prepend copy too, leaving the stream buffer and one ToArray.
-        using var ms = new MemoryStream((raw.Length - (raw.Length >> 3)) + 1);
-        ms.WriteByte(1); // Deflate-compressed
+        using var ms = new MemoryStream((raw.Length - (raw.Length >> 3)) + LosslessTagLength);
+        ms.WriteByte(DeflateCompressedTag);
         using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
             WriteShuffledPlanes(raw, elem, ds);
 
-        // ms.Length counts the tag byte, so the compressed payload is ms.Length - 1.
-        if (ms.Length - 1 < raw.Length)
+        // ms.Length counts the tag byte, so the compressed payload is ms.Length - LosslessTagLength.
+        if (ms.Length - LosslessTagLength < raw.Length)
             return ms.ToArray();
 
         // Didn't shrink (rare — tiny or high-entropy) — store the raw shuffled bytes so the
         // round-trip is still exact and never larger than shuffled + 1. Re-shuffling costs a second
         // pass on a path that is already the uncommon one, and it is what lets the common path
         // avoid holding the shuffled copy at all.
-        var rawOut = new byte[1 + raw.Length];
-        rawOut[0] = 0;
-        BytePlaneShuffle(raw, rawOut.AsSpan(1), elem);
+        var rawOut = new byte[LosslessTagLength + raw.Length];
+        rawOut[0] = RawShuffledTag;
+        BytePlaneShuffle(raw, rawOut.AsSpan(LosslessTagLength), elem);
         return rawOut;
     }
 
     private static void DecodeLosslessBytes(ReadOnlySpan<byte> src, Span<byte> dstRaw, int elem)
     {
-        if (src.Length < 1) throw new ArgumentException("Lossless payload too short.", nameof(src));
+        if (src.Length < LosslessTagLength)
+            throw new ArgumentException("Lossless payload too short.", nameof(src));
         int shuffledLen = dstRaw.Length;
         byte flag = src[0];
-        var payload = src.Slice(1);
+        var payload = src.Slice(LosslessTagLength);
         byte[] shuffled;
-        if (flag == 1)
+        if (flag == DeflateCompressedTag)
         {
             shuffled = new byte[shuffledLen];
             int dec = DeflateDecompress(payload.ToArray(), shuffled, shuffledLen);
