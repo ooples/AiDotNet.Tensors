@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.129.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.4...v0.129.5) (2026-08-28)
+
+
+### Bug Fixes
+
+* cut lossless streaming-encode peak from ~3.7n to ~1.7n ([#986](https://github.com/ooples/AiDotNet.Tensors/issues/986)) ([5101076](https://github.com/ooples/AiDotNet.Tensors/commit/510107653c027c4dec00b3f33d6b121b5855596f))
+* make conv2d and conv2dinto compute the same function for float ([#988](https://github.com/ooples/AiDotNet.Tensors/issues/988)) ([459539d](https://github.com/ooples/AiDotNet.Tensors/commit/459539da0adb60118fb0b49fb000db305b2cc014))
+
 ## [0.129.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.3...v0.129.4) (2026-08-26)
 
 
