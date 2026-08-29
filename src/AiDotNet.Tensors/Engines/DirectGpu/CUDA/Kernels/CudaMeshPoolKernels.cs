@@ -207,8 +207,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_find_max(
     __syncthreads();
 
     // Parallel reduction within block
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
         __syncthreads();
@@ -238,8 +238,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_final_max(
     __syncthreads();
 
     // Parallel reduction
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
         __syncthreads();
@@ -279,8 +279,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_exp_sum(
     __syncthreads();
 
     // Parallel sum reduction within block
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
@@ -306,8 +306,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_final_sum(
     scratch[tid] = val;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
@@ -352,8 +352,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_scores(
     __syncthreads();
 
     // Step 1: Find max using parallel reduction
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
         __syncthreads();
@@ -371,8 +371,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_scores(
     __syncthreads();
 
     // Sum reduction
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();

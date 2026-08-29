@@ -42,8 +42,8 @@ __kernel void reduce_sum(
     // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
         // power of two (the host clamps it to the element count), and the classic
         // stride = localSize / 2 tree silently drops the LAST element when it is odd.
-        for (int stride = (localSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (localIdx < stride && localIdx + stride < localSize) {
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (localIdx < stride && localIdx + stride < stride_active) {
             scratch[localIdx] += scratch[localIdx + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -75,8 +75,8 @@ __kernel void reduce_max(
     // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
         // power of two (the host clamps it to the element count), and the classic
         // stride = localSize / 2 tree silently drops the LAST element when it is odd.
-        for (int stride = (localSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (localIdx < stride && localIdx + stride < localSize) {
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (localIdx < stride && localIdx + stride < stride_active) {
             scratch[localIdx] = fmax(scratch[localIdx], scratch[localIdx + stride]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -108,8 +108,8 @@ __kernel void reduce_min(
     // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
         // power of two (the host clamps it to the element count), and the classic
         // stride = localSize / 2 tree silently drops the LAST element when it is odd.
-        for (int stride = (localSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (localIdx < stride && localIdx + stride < localSize) {
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (localIdx < stride && localIdx + stride < stride_active) {
             scratch[localIdx] = fmin(scratch[localIdx], scratch[localIdx + stride]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);

@@ -175,8 +175,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_find_max(
     scratch[tid] = val;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
         __syncthreads();
@@ -202,8 +202,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_final_max(
     scratch[tid] = val;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
         __syncthreads();
@@ -240,8 +240,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_exp_sum(
     scratch[tid] = expVal;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
@@ -267,8 +267,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_final_sum(
     scratch[tid] = val;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
@@ -310,8 +310,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_scores(
     scratch[tid] = val;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
         __syncthreads();
@@ -327,8 +327,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_scores(
     scratch[tid] = expVal;
     __syncthreads();
 
-    for (int stride = (blockSize + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
-        if (tid < stride && tid + stride < blockSize) {
+    for (int stride_active = blockSize, stride = (blockSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (tid < stride && tid + stride < stride_active) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
