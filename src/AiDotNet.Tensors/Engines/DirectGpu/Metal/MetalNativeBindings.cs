@@ -483,6 +483,17 @@ public static class MetalNativeBindings
         // General selectors
         public static readonly IntPtr Alloc = RegisterSelector("alloc");
         public static readonly IntPtr Init = RegisterSelector("init");
+
+        // Objective-C introspection, so a selector that a given macOS version does not implement is
+        // detected instead of raising an unrecognised-selector exception at runtime.
+        public static readonly IntPtr RespondsToSelector = RegisterSelector("respondsToSelector:");
+
+        // MTLCompileOptions.fastMathEnabled. Metal compiles with fast math ON by default, which
+        // permits reassociating float expressions — that silently invalidates compensated
+        // (two_sum / fma) arithmetic. Deprecated in newer Metal in favour of mathMode, so callers
+        // must check respondsToSelector: before using either.
+        public static readonly IntPtr SetFastMathEnabled = RegisterSelector("setFastMathEnabled:");
+        public static readonly IntPtr SetMathMode = RegisterSelector("setMathMode:");
         public static readonly IntPtr Release = RegisterSelector("release");
         public static readonly IntPtr Retain = RegisterSelector("retain");
         public static readonly IntPtr Autorelease = RegisterSelector("autorelease");

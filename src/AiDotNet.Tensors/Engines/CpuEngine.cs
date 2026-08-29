@@ -23100,7 +23100,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = 0; i < normalizedAxis; i++) outerSize = checked(outerSize * probabilities.Shape[i]);
         for (int i = normalizedAxis + 1; i < rank; i++) innerSize = checked(innerSize * probabilities.Shape[i]);
-        Random random = seed.HasValue ? new Random(seed.Value) : RandomHelper.ThreadSafeRandom;
+        // SEEDED DRAWS COME FROM THE SHARED STATELESS RNG, not System.Random. Every other seeded
+        // random op here keys StatelessRandom on (seed, element index) -- a counter-based PCG hash
+        // that the CUDA, Metal and OpenCL kernels reproduce constant-for-constant, which is what
+        // lets those ops run on the device AND still match the CPU bit for bit.
+        //
+        // System.Random cannot be reproduced in a kernel, so this op alone had no device-side
+        // implementation available to it: every GPU backend without a bespoke categorical kernel
+        // fell back to the CPU, silently, after the caller had selected the GPU engine. Keying the
+        // draw on the ROW index rather than on draw order is the part that matters -- a parallel
+        // kernel computes any row's uniform without replaying the ones before it.
+        //
+        // The seeded sequence changes as a result. The contract is reproducibility, which is kept:
+        // the same seed still yields the same sample, and the existing tests assert that plus
+        // one-hot-ness rather than any particular draw.
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -23119,7 +23132,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (!(sum > 0d) || double.IsNaN(sum) || double.IsInfinity(sum))
                     throw new ArgumentException(
                         "Every categorical slice must have a finite positive sum.", nameof(probabilities));
-                double target = random.NextDouble() * sum;
+                int row = outer * innerSize + inner;
+                double uniform = seed.HasValue
+                    ? StatelessRandom.Uniform01(unchecked((uint)seed.Value), unchecked((uint)row))
+                    : RandomHelper.ThreadSafeRandom.NextDouble();
+                double target = uniform * sum;
                 double cumulative = 0d;
                 int selected = classes - 1;
                 for (int category = 0; category < classes; category++)

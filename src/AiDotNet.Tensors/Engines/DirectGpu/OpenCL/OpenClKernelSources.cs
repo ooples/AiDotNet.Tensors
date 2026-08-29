@@ -341,8 +341,11 @@ internal static class OpenClKernelSources
             maxReduce[localId] = localMax;
             barrier(CLK_LOCAL_MEM_FENCE);
 
-            for (int stride = localSize / 2; stride > 0; stride /= 2) {
-                if (localId < stride) {
+            // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+                // power of two (the host clamps it to the element count), and the classic
+                // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+                for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+                if (localId < stride && localId + stride < stride_active) {
                     maxReduce[localId] = fmax(maxReduce[localId], maxReduce[localId + stride]);
                 }
                 barrier(CLK_LOCAL_MEM_FENCE);
@@ -364,8 +367,11 @@ internal static class OpenClKernelSources
             sumReduce[localId] = localSum;
             barrier(CLK_LOCAL_MEM_FENCE);
 
-            for (int stride = localSize / 2; stride > 0; stride /= 2) {
-                if (localId < stride) {
+            // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+                // power of two (the host clamps it to the element count), and the classic
+                // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+                for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+                if (localId < stride && localId + stride < stride_active) {
                     sumReduce[localId] += sumReduce[localId + stride];
                 }
                 barrier(CLK_LOCAL_MEM_FENCE);
