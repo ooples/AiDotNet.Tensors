@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 internal static class CategoricalKernels
 {
     /// <summary>Kernel names to register when the program compiles.</summary>
-    public static string[] GetKernelNames() => new[] { "CategoricalSample" };
+    public static string[] GetKernelNames() => new[] { "categorical_sample" };
 
     public static string GetSource() => @"
 // double accumulation is required for exact CPU parity (see the C# remarks); a device without
@@ -53,7 +53,7 @@ inline float stateless_uniform01(uint seed32, uint index)
     return (float)(sample >> 8) * (1.0f / 16777216.0f);
 }
 
-__kernel void CategoricalSample(
+__kernel void categorical_sample(
     __global const float* probabilities,
     __global float* oneHot,
     const int rows,

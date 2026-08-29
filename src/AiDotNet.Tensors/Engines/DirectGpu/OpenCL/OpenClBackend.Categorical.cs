@@ -51,7 +51,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!CanCategoricalSample(rows, classes)) return false;
             if (probabilities is not DirectOpenClGpuBuffer source) return false;
             if (oneHot is not DirectOpenClGpuBuffer destination) return false;
-            if (!_kernelCache.TryGetValue("CategoricalSample", out var kernel)) return false;
+            if (!_kernelCache.TryGetValue("categorical_sample", out var kernel)) return false;
 
             kernel.SetArg(0, source.Buffer.Handle);
             kernel.SetArg(1, destination.Buffer.Handle);
