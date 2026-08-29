@@ -2275,7 +2275,10 @@ internal static partial class SimdGemm
     /// carry pack / macro-loop overhead at thin-M, ~60 GF/s). Each output row is
     /// written by exactly one thread in fixed K order, so it is deterministic across
     /// thread counts. Contiguous row-major (lda=k, ldb=n, ldc=n); requires Fma +
-    /// n % 8 == 0 (caller gates). Every C element is overwritten (full 4-row × 8-col
+    /// Any n: the 8-wide column loop peels its tail into a masked block. It previously declared
+    /// "n % 8 == 0 (caller gates)" and stored full width regardless, which wrote past the end of C
+    /// for any caller that did not gate -- and this entry does not validate operands at all.
+    /// Every C element is overwritten (full 4-row × 8-col
     /// tiles cover the M-full / N region; the M%4 tail rows are computed scalar), so
     /// no pre-clear is needed.
     /// </summary>
@@ -2327,11 +2330,27 @@ internal static partial class SimdGemm
     }
 
     /// <summary>4-row × 8-col register-blocked FP64 microkernel over M-blocks
-    /// [blockStart, blockEnd). n % 8 == 0 (caller-guaranteed); overwrites C.</summary>
+    /// [blockStart, blockEnd). Any n (the column tail is masked); overwrites C.</summary>
     private static unsafe void DgemmDirectBlockRange(
         double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
     {
         const int MRd = 4;
+
+        // See SgemmTransABlock for the full account. In short: this loop is 8 columns wide and n
+        // need not be, and a full-width store on the final step writes 8 - n % 8 doubles past the
+        // end of each C row it touches. Those spills corrupted the NEXT row's already-written
+        // values (wrong results for every row but the last of each block), and on the last block ran
+        // past the end of C itself (GC heap corruption, surfacing as an ExecutionEngineException at
+        // some later collection). The header used to declare "n % 8 == 0", but this entry point
+        // does not enforce it -- DgemmDirectParallelMInto does not validate operands at all.
+        int nFull = (n / 8) * 8;
+        int nTail = n - nFull;
+        int tailLane0 = nTail >= 4 ? 4 : nTail;
+        int tailLane1 = nTail > 4 ? nTail - 4 : 0;
+        var tailMask0 = _partialD4Masks[tailLane0].AsDouble();
+        var tailMask1 = _partialD4Masks[tailLane1].AsDouble();
+        bool tailHasHighLane = tailLane1 > 0;
+
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRd;
@@ -2339,7 +2358,7 @@ internal static partial class SimdGemm
             double* a1 = A + (long)(i0 + 1) * k;
             double* a2 = A + (long)(i0 + 2) * k;
             double* a3 = A + (long)(i0 + 3) * k;
-            for (int j = 0; j < n; j += 8)
+            for (int j = 0; j < nFull; j += 8)
             {
                 var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
                 var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
@@ -2361,6 +2380,29 @@ internal static partial class SimdGemm
                 double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
                 double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
             }
+
+            if (nTail > 0)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + nFull;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.MaskLoad(bp, tailMask0);
+                    var b1 = tailHasHighLane ? Avx.MaskLoad(bp + 4, tailMask1) : Vector256<double>.Zero;
+                    var av = Vector256.Create(a0[p]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(a1[p]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(a2[p]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(a3[p]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* t0 = C + (long)(i0 + 0) * n + nFull; Avx.MaskStore(t0, tailMask0, c00); if (tailHasHighLane) Avx.MaskStore(t0 + 4, tailMask1, c01);
+                double* t1 = C + (long)(i0 + 1) * n + nFull; Avx.MaskStore(t1, tailMask0, c10); if (tailHasHighLane) Avx.MaskStore(t1 + 4, tailMask1, c11);
+                double* t2 = C + (long)(i0 + 2) * n + nFull; Avx.MaskStore(t2, tailMask0, c20); if (tailHasHighLane) Avx.MaskStore(t2 + 4, tailMask1, c21);
+                double* t3 = C + (long)(i0 + 3) * n + nFull; Avx.MaskStore(t3, tailMask0, c30); if (tailHasHighLane) Avx.MaskStore(t3 + 4, tailMask1, c31);
+            }
         }
     }
 
@@ -2369,8 +2411,8 @@ internal static partial class SimdGemm
     /// (lda=m) and B is [k,n]. Same broadcast-A 4×8 kernel as
     /// <see cref="DgemmDirectParallelMInto"/> but A is read strided (a[i,p] = A[p·m+i],
     /// the 4 row values at a depth are contiguous), so NO transpose is materialised —
-    /// the transpose-into-scratch alternative regresses at thin-M. n % 8 == 0; n-major
-    /// contiguous B and C; parallel over disjoint M-row-blocks (deterministic).
+    /// the transpose-into-scratch alternative regresses at thin-M. Any n (the column tail is
+    /// masked); n-major contiguous B and C; parallel over disjoint M-row-blocks (deterministic).
     /// </summary>
     [MethodImpl(Hot)]
     public static unsafe void DgemmDirectParallelMIntoTransA(
@@ -2412,10 +2454,22 @@ internal static partial class SimdGemm
     private static unsafe void DgemmTransABlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n, int m)
     {
         const int MRd = 4;
+
+        // Same 8-wide column loop, same unguarded tail, same consequence as DgemmDirectBlockRange:
+        // a full-width store on the final step runs past the end of each C row, and past the end of
+        // C on the last block. See SgemmTransABlock for the full account.
+        int nFull = (n / 8) * 8;
+        int nTail = n - nFull;
+        int tailLane0 = nTail >= 4 ? 4 : nTail;
+        int tailLane1 = nTail > 4 ? nTail - 4 : 0;
+        var tailMask0 = _partialD4Masks[tailLane0].AsDouble();
+        var tailMask1 = _partialD4Masks[tailLane1].AsDouble();
+        bool tailHasHighLane = tailLane1 > 0;
+
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRd;
-            for (int j = 0; j < n; j += 8)
+            for (int j = 0; j < nFull; j += 8)
             {
                 var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
                 var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
@@ -2437,6 +2491,30 @@ internal static partial class SimdGemm
                 double* o1 = C + (long)(i0 + 1) * n + j; Avx.Store(o1, c10); Avx.Store(o1 + 4, c11);
                 double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
                 double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
+            }
+
+            if (nTail > 0)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + nFull;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.MaskLoad(bp, tailMask0);
+                    var b1 = tailHasHighLane ? Avx.MaskLoad(bp + 4, tailMask1) : Vector256<double>.Zero;
+                    double* ap = A + (long)p * m + i0;
+                    var av = Vector256.Create(ap[0]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(ap[1]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(ap[2]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(ap[3]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* t0 = C + (long)(i0 + 0) * n + nFull; Avx.MaskStore(t0, tailMask0, c00); if (tailHasHighLane) Avx.MaskStore(t0 + 4, tailMask1, c01);
+                double* t1 = C + (long)(i0 + 1) * n + nFull; Avx.MaskStore(t1, tailMask0, c10); if (tailHasHighLane) Avx.MaskStore(t1 + 4, tailMask1, c11);
+                double* t2 = C + (long)(i0 + 2) * n + nFull; Avx.MaskStore(t2, tailMask0, c20); if (tailHasHighLane) Avx.MaskStore(t2 + 4, tailMask1, c21);
+                double* t3 = C + (long)(i0 + 3) * n + nFull; Avx.MaskStore(t3, tailMask0, c30); if (tailHasHighLane) Avx.MaskStore(t3 + 4, tailMask1, c31);
             }
         }
     }
@@ -2534,8 +2612,9 @@ internal static partial class SimdGemm
     }
 
     /// <summary>FP32 thin-M GEMM with A transposed (#368): C = Aᵀ·B, A stored [k,m]
-    /// (lda=m), strided-A 4×8 broadcast kernel (no transpose). n % 8 == 0; parallel-M
-    /// (deterministic). Float analog of <see cref="DgemmDirectParallelMIntoTransA"/>.</summary>
+    /// (lda=m), strided-A 4×8 broadcast kernel (no transpose). Any n (the column tail is masked);
+    /// parallel-M (deterministic). Float analog of
+    /// <see cref="DgemmDirectParallelMIntoTransA"/>.</summary>
     [MethodImpl(Hot)]
     public static unsafe void SgemmDirectParallelMIntoTransA(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
@@ -2588,10 +2667,43 @@ internal static partial class SimdGemm
     private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
     {
         const int MRf = 4;
+
+        // THE COLUMN LOOP IS 8 WIDE AND n NEED NOT BE. It used to run `j < n; j += 8` and finish
+        // every step with a full-width Avx.Store, so when n was not a multiple of 8 the final step
+        // wrote 8 - n % 8 floats past the end of each of the four C rows it touched. That is two
+        // separate defects, and the quieter one is the worse.
+        //
+        // WRONG RESULTS. The j loop is OUTSIDE the four row stores, so the spill from row i at the
+        // last j overwrites the start of row i+1 -- which an EARLIER j step had already written
+        // correctly, and which no later step rewrites. Every row but the last of each block came
+        // back wrong. Measured on the pre-fix code at m=4 k=3 n=13: C[1,0] is 0.33678542 where the
+        // product is 0.694251873.
+        //
+        // HEAP CORRUPTION. The spill from the last row of the last block has no next row to land
+        // in; it goes past the end of C. Writing past a managed array corrupts the GC heap and
+        // nothing fails at the call: the process dies at some later, unrelated allocation as
+        // "Internal CLR error (0x80131506)" / ExecutionEngineException, reported against whatever
+        // code happened to trigger that collection. This is how it was found -- as a test-host death
+        // two classes away from any GEMM, via
+        // SgemmDirectParallelMIntoTransA_SizesAgainstTheTransposedA, whose M=4 K=3 N=5 case stores
+        // 8 floats at offset 15 of a 20-element C.
+        //
+        // The load has the same shape of bug: it reads a full 8 floats from B, whose rows are also
+        // only n wide.
+        //
+        // The header used to declare "n % 8 == 0". The internal dispatch does gate on that, but this
+        // kernel's public entry point does not: it validates operand LENGTHS and lets any n through.
+        //
+        // The full-width blocks below are untouched -- the tail is peeled into its own masked block
+        // so the hot path keeps its unmasked load and store.
+        int nFull = (n / 8) * 8;
+        int nTail = n - nFull;
+        var tailMask = _partialNrMasks[nTail].AsSingle();
+
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRf;
-            for (int j = 0; j < n; j += 8)
+            for (int j = 0; j < nFull; j += 8)
             {
                 var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
                 var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
@@ -2609,6 +2721,26 @@ internal static partial class SimdGemm
                 Avx.Store(C + (long)(i0 + 1) * n + j, c1);
                 Avx.Store(C + (long)(i0 + 2) * n + j, c2);
                 Avx.Store(C + (long)(i0 + 3) * n + j, c3);
+            }
+
+            if (nTail > 0)
+            {
+                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
+                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
+                float* bj = B + nFull;
+                for (int p = 0; p < k; p++)
+                {
+                    var b0 = Avx.MaskLoad(bj + (long)p * n, tailMask);
+                    float* ap = A + (long)p * m + i0;
+                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
+                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
+                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
+                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
+                }
+                Avx.MaskStore(C + (long)(i0 + 0) * n + nFull, tailMask, c0);
+                Avx.MaskStore(C + (long)(i0 + 1) * n + nFull, tailMask, c1);
+                Avx.MaskStore(C + (long)(i0 + 2) * n + nFull, tailMask, c2);
+                Avx.MaskStore(C + (long)(i0 + 3) * n + nFull, tailMask, c3);
             }
         }
     }
@@ -4373,6 +4505,23 @@ internal static partial class SimdGemm
         Vector256.Create(-1, -1, -1, -1, -1, -1,  0,  0),
         Vector256.Create(-1, -1, -1, -1, -1, -1, -1,  0),
         Vector256.Create(-1, -1, -1, -1, -1, -1, -1, -1),
+    };
+
+    /// <summary>
+    /// The FP64 counterpart of <see cref="_partialNrMasks"/>, indexed by active lanes (0..4).
+    /// </summary>
+    /// <remarks>
+    /// A <c>Vector256&lt;double&gt;</c> holds four lanes, so the FP64 block kernels -- which walk
+    /// columns eight at a time as two of these -- need a four-entry table rather than the eight-entry
+    /// one above. MSB=1 in a lane means that lane is active for MaskLoad/MaskStore.
+    /// </remarks>
+    private static readonly Vector256<long>[] _partialD4Masks = new[]
+    {
+        Vector256.Create(0L, 0L, 0L, 0L),
+        Vector256.Create(-1L, 0L, 0L, 0L),
+        Vector256.Create(-1L, -1L, 0L, 0L),
+        Vector256.Create(-1L, -1L, -1L, 0L),
+        Vector256.Create(-1L, -1L, -1L, -1L),
     };
 
     /// <summary>
