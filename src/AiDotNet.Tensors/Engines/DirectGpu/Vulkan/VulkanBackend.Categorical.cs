@@ -2,6 +2,7 @@
 // Vulkan launcher for categorical sampling. Dispatches the GLSL twin of the OpenCL
 // categorical_sample kernel through the same GlslUnaryOp path the other softmax-family ops use.
 using System;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -38,12 +39,46 @@ public sealed partial class VulkanBackend : ICategoricalSamplingBackend
 
     /// <inheritdoc/>
     public bool CanCategoricalSample(int rows, int classes)
-        => _categoricalState != 2
-           && rows > 0
+        => rows > 0
            && classes > 0
            // One invocation per row; a row wider than this is still correct but the serial walk over
            // classes stops being the right shape for a GPU and the CPU reference is faster.
-           && (long)rows * classes <= int.MaxValue;
+           && (long)rows * classes <= int.MaxValue
+           && CategoricalPipelineIsAvailable();
+
+    /// <summary>
+    /// Answers the capability question BEFORE the engine commits to this route. Probed once, latched.
+    /// </summary>
+    /// <remarks>
+    /// A `Can* then Try*` split only degrades gracefully if Can* is honest. The engine calls Can*,
+    /// and on a true answer schedules the op inside DispatchDeferredGpuOp, where a Try* returning
+    /// false is turned into a NotSupportedException -- it does NOT fall through to the on-device
+    /// Gumbel-max route. So claiming support and discovering the truth inside Try* makes the FIRST
+    /// sample on a device without shaderFloat64 throw, and only later ones degrade. Creating the
+    /// pipeline here settles it before any claim is made; GetOrCreateGlslPipeline caches the result,
+    /// so the real launch does not pay for it twice.
+    /// </remarks>
+    private bool CategoricalPipelineIsAvailable()
+    {
+        int state = Volatile.Read(ref _categoricalState);
+        if (state != 0) return state == 1;
+
+        try
+        {
+            EnsureInitialized();
+            var pipeline = GetOrCreateGlslPipeline(
+                VulkanGlslKernels.CategoricalSampleGlsl, 2, 4 * sizeof(uint));
+            Volatile.Write(ref _categoricalState, pipeline is null ? 2 : 1);
+        }
+        catch (InvalidOperationException)
+        {
+            // The pipeline could not be built on this device -- the shaderFloat64 answer. Latched so
+            // a compile that cannot succeed is not retried on every call. Other exceptions propagate.
+            Volatile.Write(ref _categoricalState, 2);
+        }
+
+        return Volatile.Read(ref _categoricalState) == 1;
+    }
 
     /// <inheritdoc/>
     public bool TryCategoricalSample(

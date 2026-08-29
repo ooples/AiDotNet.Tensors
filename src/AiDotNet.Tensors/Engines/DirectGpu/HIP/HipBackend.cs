@@ -124,7 +124,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private const string GemmVendorThresholdEnvVar = "AIDOTNET_GPU_GEMM_VENDOR_THRESHOLD";
     private const long DefaultVendorGemmThreshold = 128L * 128L * 128L;
 
-    public bool IsAvailable { get; }
+    private bool _isAvailable;
+
+    /// <summary>
+    /// Whether this backend can serve work. FALSE ONCE DISPOSED, which is load-bearing:
+    /// DirectGpuBackendFactory caches one backend per process and hands the cached instance back
+    /// while it reports available. Dispose() clears the kernel cache, so a disposed-but-still-cached
+    /// backend answers every later kernel lookup with KeyNotFoundException ("add_vectors") on a
+    /// completely unrelated caller. Reporting unavailable makes the factory build a fresh backend
+    /// instead. VulkanBackend and MetalBackend already did this; these three did not.
+    /// </summary>
+    public bool IsAvailable
+    {
+        get => _isAvailable && !_disposed;
+        private set => _isAvailable = value;
+    }
     public string BackendName => $"HIP ({GetKernelTypeName()})";
     public TensorDevice DeviceType => TensorDevice.HIP;
     public string DeviceName { get; }
@@ -836,6 +850,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             hipResult = HipNativeBindings.hipModuleGetFunction(ref func, module, kernelName);
             if (hipResult == HipError.Success)
                 _kernelCache[kernelName] = func;
+                // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
+                GpuKernelDiagnostics.RegisterKernelName(func, kernelName);
         }
     }
 

@@ -513,7 +513,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
 
-                EndLaunch(_context.ProfilingCommandQueue);
+                // The enqueue created the event, so from here on WE own it. If the synchronise
+                // throws -- which is exactly what sync-launch mode exists to make happen at the
+                // faulting launch -- we never return, so the caller never receives the handle and
+                // can never release it. Release it before the exception leaves.
+                try
+                {
+                    EndLaunch(_context.ProfilingCommandQueue);
+                }
+                catch
+                {
+                    IntPtr orphaned = Marshal.ReadIntPtr(eventHandle);
+                    if (orphaned != IntPtr.Zero) OpenClNativeBindings.ReleaseEvent(orphaned);
+                    throw;
+                }
 
                 // Read the event pointer from the allocated memory
                 IntPtr eventPtr = Marshal.ReadIntPtr(eventHandle);
@@ -566,7 +579,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
 
-                EndLaunch(_context.ProfilingCommandQueue);
+                // The enqueue created the event, so from here on WE own it. If the synchronise
+                // throws -- which is exactly what sync-launch mode exists to make happen at the
+                // faulting launch -- we never return, so the caller never receives the handle and
+                // can never release it. Release it before the exception leaves.
+                try
+                {
+                    EndLaunch(_context.ProfilingCommandQueue);
+                }
+                catch
+                {
+                    IntPtr orphaned = Marshal.ReadIntPtr(eventHandle);
+                    if (orphaned != IntPtr.Zero) OpenClNativeBindings.ReleaseEvent(orphaned);
+                    throw;
+                }
 
                 return Marshal.ReadIntPtr(eventHandle);
             }

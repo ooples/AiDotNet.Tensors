@@ -18,6 +18,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
     /// harness that silently stops reporting is worse than none, because every later investigation
     /// trusts it.
     /// </remarks>
+    /// <remarks>
+    /// SERIALIZED DELIBERATELY. The residency counters are process-static and every DirectOpenClBuffer
+    /// construction anywhere in the assembly moves them, so a concurrent GPU test could change them
+    /// between this class's snapshot and its assertion. "DirectGpuSerial" is declared with
+    /// DisableParallelization = true, which means it does not run alongside other collections — so
+    /// joining it removes the interference rather than merely narrowing the window, and the delta
+    /// assertions can stay exact instead of being relaxed into something that no longer catches a
+    /// real imbalance.
+    /// </remarks>
+    [Collection("DirectGpuSerial")]
     public class GpuKernelDiagnosticsTests
     {
         [Fact]
@@ -247,15 +257,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
                 var backend = engine.GetBackend();
                 Skip.If(backend is null, "No direct GPU backend is available on this host.");
 
-                // JOURNALLING IS OPENCL-ONLY TODAY. RecordLaunch is called from DirectOpenClKernel;
-                // the CUDA and HIP reductions dispatch through their own paths and add no entry, so
-                // on a host that selects either of those this assertion would fail for a reason that
-                // has nothing to do with the diagnostic being broken. Skipping is honest here —
-                // the alternative is a test that reports a false defect on two of three backends.
+                // OpenCL, CUDA and HIP all journal now (CUDA/HIP via their native-launch choke
+                // point). This still targets OpenCL because it is the backend this host actually
+                // has, so the assertion below is exercised rather than skipped; Metal, Vulkan and
+                // WebGpu remain unjournalled (Issue #996) and would fail here for a reason that has
+                // nothing to do with the diagnostic being broken.
                 Skip.If(
                     backend is not AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend,
-                    "Launch journalling is implemented for the OpenCL backend only; "
-                        + $"this host selected {backend!.GetType().Name}.");
+                    "This test targets the OpenCL journalling path (CUDA and HIP journal via their native-launch "
+                        + "choke point; Metal, Vulkan and WebGpu are not yet journalled - Issue #996). "
+                        + $"This host selected {backend!.GetType().Name}.");
 
                 // The journal is STATIC, so a non-empty journal proves nothing — another test in
                 // this class fills it. What must be true is that this launch ADVANCES it.

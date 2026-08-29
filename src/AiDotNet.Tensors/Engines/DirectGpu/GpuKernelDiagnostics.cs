@@ -45,6 +45,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
     /// The validation entry points are public so a caller extending the library with their own
     /// kernels gets the same checks, rather than the library validating only what it happens to ship.
     /// </para>
+    /// <para>
+    /// BACKEND COVERAGE. OpenCL journals from <c>DirectOpenClKernel</c>. CUDA and HIP journal from
+    /// their single native-launch P/Invoke, resolving the kernel name through
+    /// <see cref="RegisterKernelName"/> — wrapping the one choke point covers all ~20 call sites per
+    /// backend, including any added later, which threading a name through those signatures would not.
+    /// </para>
+    /// <para>
+    /// REMAINING GAP: Metal, Vulkan and WebGpu. Their dispatch entry points receive a command buffer
+    /// or encoder rather than the pipeline, so there is no kernel identity to record without
+    /// pipeline-level plumbing; journalling them by encoder handle would add entries that name
+    /// nothing. Tracked as Issue #996.
+    /// </para>
     /// </remarks>
     public static class GpuKernelDiagnostics
     {
@@ -157,6 +169,38 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
 
             // Published last: until this store, a reader must not treat the slot as holding `slot`.
             Volatile.Write(ref _published[index], slot);
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, string> _kernelNames
+            = new System.Collections.Concurrent.ConcurrentDictionary<IntPtr, string>();
+
+        /// <summary>
+        /// Associates a device kernel handle with its name so a launch can be journalled by name.
+        /// </summary>
+        /// <remarks>
+        /// THIS IS WHAT MAKES JOURNALLING WORK ON THE HANDLE-ONLY BACKENDS. CUDA and HIP resolve a
+        /// kernel from a name-keyed cache, but every launch helper below that point receives only an
+        /// <see cref="IntPtr"/> — and there are roughly twenty such call sites per backend. Recording
+        /// the name once at registration lets the single native-launch choke point resolve it, so all
+        /// of them are covered without threading a name through twenty signatures.
+        /// </remarks>
+        public static void RegisterKernelName(IntPtr handle, string name)
+        {
+            if (handle == IntPtr.Zero || string.IsNullOrEmpty(name)) return;
+            _kernelNames[handle] = name;
+        }
+
+        /// <summary>
+        /// Records a launch identified by handle, resolving the name registered for it. Falls back to
+        /// the raw handle so an unregistered kernel is still attributable rather than dropped.
+        /// </summary>
+        public static void RecordLaunchByHandle(IntPtr handle, long globalSize, long localSize, int argCount)
+        {
+            RecordLaunch(
+                _kernelNames.TryGetValue(handle, out var name) ? name : "kernel@0x" + handle.ToString("x"),
+                globalSize,
+                localSize,
+                argCount);
         }
 
         /// <summary>The most recent launches, oldest first. Empty when nothing has launched.</summary>

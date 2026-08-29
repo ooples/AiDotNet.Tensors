@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // OpenCL backend using pure P/Invoke - no managed GPU runtime dependency.
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 
@@ -109,7 +109,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private ClBlastXgemmDirectParameters _clblastDirectParams;
         private int _clblastMinIndirectSize;
 
-        public bool IsAvailable { get; }
+        private bool _isAvailable;
+
+        /// <summary>
+        /// Whether this backend can serve work. FALSE ONCE DISPOSED, which is load-bearing:
+        /// DirectGpuBackendFactory caches one backend per process and hands the cached instance back
+        /// while it reports available. Dispose() clears the kernel cache, so a disposed-but-still-cached
+        /// backend answers every later kernel lookup with KeyNotFoundException ("add_vectors") on a
+        /// completely unrelated caller. Reporting unavailable makes the factory build a fresh backend
+        /// instead. VulkanBackend and MetalBackend already did this; these three did not.
+        /// </summary>
+        public bool IsAvailable
+        {
+            get => _isAvailable && !_disposed;
+            private set => _isAvailable = value;
+        }
         public string? InitializationError { get; private set; }
         public string BackendName => "OpenCL";
         public TensorDevice DeviceType => TensorDevice.OpenCL;
