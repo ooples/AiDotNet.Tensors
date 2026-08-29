@@ -71,6 +71,19 @@ public sealed class MetalShaderLibrary : IDisposable
     /// <param name="source">Metal Shading Language source code.</param>
     /// <returns>The compiled library handle.</returns>
     public IntPtr CompileLibrary(string libraryName, string source)
+        => CompileLibrary(libraryName, source, requireStrictFloatingPoint: false);
+
+    /// <summary>
+    /// Compiles a library, optionally requiring that fast math be disabled.
+    /// </summary>
+    /// <param name="requireStrictFloatingPoint">
+    /// When true, the library is compiled with fast math off, and compilation FAILS CLOSED if this
+    /// runtime exposes no way to disable it. Kernels whose correctness depends on compensated
+    /// arithmetic must set this: under fast math the compiler may reassociate their compensation
+    /// terms to zero, which is silent and leaves the kernel quietly less accurate than its
+    /// CPU reference rather than visibly broken.
+    /// </param>
+    public IntPtr CompileLibrary(string libraryName, string source, bool requireStrictFloatingPoint)
     {
         ThrowIfDisposed();
 
@@ -98,7 +111,30 @@ public sealed class MetalShaderLibrary : IDisposable
                 return cached;
             }
 
-            var library = _device.CreateLibrary(source, out var error);
+            IntPtr compileOptions = IntPtr.Zero;
+            if (requireStrictFloatingPoint)
+            {
+                compileOptions = MetalDevice.TryCreateStrictFloatingPointOptions();
+                if (compileOptions == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to compile Metal library '{libraryName}': this runtime exposes no way "
+                        + "to disable fast math (neither setMathMode: nor setFastMathEnabled:), and this "
+                        + "library's numerics are only correct without it. Refusing to compile rather "
+                        + "than shipping silently reassociated arithmetic.");
+                }
+            }
+
+            IntPtr library;
+            string? error;
+            try
+            {
+                library = _device.CreateLibrary(source, compileOptions, out error);
+            }
+            finally
+            {
+                if (compileOptions != IntPtr.Zero) MetalNativeBindings.Release(compileOptions);
+            }
 
             if (library == IntPtr.Zero)
             {

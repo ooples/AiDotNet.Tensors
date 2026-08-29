@@ -15,15 +15,18 @@
 // than ~48 bits — which covers any realistic class count, since each addend carries only 24. That
 // makes this kernel agree with the double reference rather than merely approximate it.
 //
-// REQUIRES IEEE SEMANTICS, AND ASKS FOR THEM IN THE SOURCE. two_sum and the fma-based product are
+// REQUIRES IEEE SEMANTICS, AND FAILS CLOSED WITHOUT THEM. two_sum and the fma-based product are
 // exact only if the compiler does not reassociate them, and Metal compiles with fast math ENABLED
-// by default (MetalDevice.CreateLibrary passes nil MTLCompileOptions, so the default applies).
-// The kernel therefore requests safe FP math with a pragma rather than relying on compile options
-// that this backend does not currently plumb through. On a Metal compiler too old to recognise the
-// pragma it is a warning, not an error, and the compensation terms may fold away — in which case
-// this degrades to plain float accumulation, which is what an uncompensated port would have done
-// anyway. It stays a valid one-hot either way; only a target landing within float rounding error of
-// a bucket edge could pick the neighbouring category.
+// by default. This library is therefore compiled with MTLCompileOptions requesting strict floating
+// point (setMathMode: / setFastMathEnabled:, whichever this runtime implements — see
+// MetalDevice.TryCreateStrictFloatingPointOptions), and if NEITHER can be established the library
+// is not compiled at all and the route is not advertised. The pragma below is belt-and-braces, not
+// the mechanism: an older compiler treats an unknown pragma as a warning and keeps fast math, so
+// the pragma alone is not evidence of anything.
+//
+// Failing closed is deliberate. The alternative — advertising the route and hoping — degrades to
+// plain float accumulation with no diagnostic, which still produces a valid one-hot and so passes
+// every smoke test while disagreeing with the CPU reference at bucket edges.
 //
 // NOT EXECUTED IN VERIFICATION: Metal runs only on macOS and this was written on Windows, so this
 // kernel is unverified against the CPU oracle. The algorithm mirrors the OpenCL kernel, which IS

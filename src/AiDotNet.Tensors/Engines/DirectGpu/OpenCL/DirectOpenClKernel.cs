@@ -354,6 +354,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
+
+            // Finish THIS queue, not the default one. Under AIDOTNET_GPU_SYNC_LAUNCHES the whole
+            // point is that a device fault is attributed to the launch that caused it; a path that
+            // enqueues and returns without finishing leaves its faults asynchronous and blames
+            // whatever synchronises next, which is the behaviour the flag exists to remove.
+            EndLaunch(commandQueue);
         }
 
         /// <summary>
@@ -396,6 +402,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
+
+            // Finish THIS queue, not the default one. Under AIDOTNET_GPU_SYNC_LAUNCHES the whole
+            // point is that a device fault is attributed to the launch that caused it; a path that
+            // enqueues and returns without finishing leaves its faults asynchronous and blames
+            // whatever synchronises next, which is the behaviour the flag exists to remove.
+            EndLaunch(commandQueue);
         }
 
         /// <summary>
@@ -442,6 +454,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
+
+            // Finish THIS queue, not the default one. Under AIDOTNET_GPU_SYNC_LAUNCHES the whole
+            // point is that a device fault is attributed to the launch that caused it; a path that
+            // enqueues and returns without finishing leaves its faults asynchronous and blames
+            // whatever synchronises next, which is the behaviour the flag exists to remove.
+            EndLaunch(commandQueue);
         }
 
         #endregion
@@ -495,6 +513,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
 
+                EndLaunch(_context.ProfilingCommandQueue);
+
                 // Read the event pointer from the allocated memory
                 IntPtr eventPtr = Marshal.ReadIntPtr(eventHandle);
                 return eventPtr;
@@ -545,6 +565,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+
+                EndLaunch(_context.ProfilingCommandQueue);
 
                 return Marshal.ReadIntPtr(eventHandle);
             }

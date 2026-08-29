@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // HIP backend for AMD GPU with real MFMA (Matrix Fused Multiply-Add) support.
 // Target: 25,000+ GFLOPS on MI200, 15,000+ GFLOPS on RX 7900.
 
@@ -488,8 +488,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 CompileKernelModule(HipCategoricalKernels.GetSource(), "categorical",
                     ref _categoricalModule, HipCategoricalKernels.GetKernelNames(), useFastMath: false);
             }
-            catch (Exception)
+            catch (OutOfMemoryException)
             {
+                // Process-level resource problem; do NOT silently downgrade. Matches the
+                // fused-advanced compilation path: a failed allocation is not a statement about
+                // this device's capability, and turning it into a quiet CPU fallback hides a
+                // condition the caller has to know about.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[HipBackend] Categorical kernel compile failed: {ex.GetType().Name}: {ex.Message}. "
+                    + "Falling back to the managed categorical sampler.");
                 _categoricalModule = IntPtr.Zero;
             }
 

@@ -356,7 +356,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // engine keeps using CpuEngine.TensorCategoricalSample.
         try
         {
-            _categoricalLibrary = _shaderLibrary.CompileLibrary("Categorical", MetalCategoricalKernels.Source);
+            // requireStrictFloatingPoint: this kernel carries its sum in a compensated two-float
+            // expansion because MSL has no double, and fast math would reassociate the compensation
+            // terms to zero. If this runtime cannot be told to disable fast math, compilation fails
+            // and the route is NOT advertised — the engine keeps the managed sampler rather than
+            // sampling at silently reduced precision.
+            _categoricalLibrary = _shaderLibrary.CompileLibrary(
+                "Categorical", MetalCategoricalKernels.Source, requireStrictFloatingPoint: true);
+        }
+        catch (OutOfMemoryException)
+        {
+            // Process-level resource problem; do NOT silently downgrade.
+            throw;
         }
         catch (Exception ex)
         {

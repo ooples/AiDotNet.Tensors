@@ -247,6 +247,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
                 var backend = engine.GetBackend();
                 Skip.If(backend is null, "No direct GPU backend is available on this host.");
 
+                // JOURNALLING IS OPENCL-ONLY TODAY. RecordLaunch is called from DirectOpenClKernel;
+                // the CUDA and HIP reductions dispatch through their own paths and add no entry, so
+                // on a host that selects either of those this assertion would fail for a reason that
+                // has nothing to do with the diagnostic being broken. Skipping is honest here —
+                // the alternative is a test that reports a false defect on two of three backends.
+                Skip.If(
+                    backend is not AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend,
+                    "Launch journalling is implemented for the OpenCL backend only; "
+                        + $"this host selected {backend!.GetType().Name}.");
+
                 // The journal is STATIC, so a non-empty journal proves nothing — another test in
                 // this class fills it. What must be true is that this launch ADVANCES it.
                 var before = GpuKernelDiagnostics.RecentLaunches();

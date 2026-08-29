@@ -138,6 +138,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             long slot = Interlocked.Increment(ref _sequence);
             int index = (int)(((slot % JournalCapacity) + JournalCapacity) % JournalCapacity);
 
+            // Two-phase publish, INVALIDATE FIRST. Publishing only after the write is not enough on
+            // its own: a reader that already accepted this slot for an older sequence would still be
+            // copying the record while this launch replaces it, and would report the new (or a
+            // half-written) record under the old launch number. Clearing the marker first means such
+            // a reader fails its verifying re-read and discards the entry instead.
+            Volatile.Write(ref _published[index], -1);
+
             _journal[index] = new LaunchRecord
             {
                 Kernel = kernelName,
@@ -167,6 +174,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 if (Volatile.Read(ref _published[index]) != slot) continue;   // not yet written, or recycled
 
                 var record = _journal[index];
+
+                // VERIFY AFTER COPYING. The check above only proves the slot held `slot` when we
+                // looked; the ring wraps every 64 launches, so the writer can replace this slot
+                // mid-copy. Re-reading the marker closes that window: if it moved, the bytes we just
+                // copied belong to a different launch and are dropped. LaunchRecord is a struct, so
+                // the copy itself can tear — which is exactly what this discards.
+                if (Volatile.Read(ref _published[index]) != slot) continue;
+
                 if (record.Kernel is null) continue;
 
                 lines.Add(string.Format(

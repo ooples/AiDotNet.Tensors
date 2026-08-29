@@ -82,14 +82,24 @@ public sealed partial class VulkanBackend : ICategoricalSamplingBackend
                 new uint[] { (uint)rows, (uint)classes, (uint)(seed & 0xFFFFFFFF), (uint)(seed >> 32) },
                 4 * sizeof(uint));
         }
-        catch (Exception)
+        catch (InvalidOperationException ex)
         {
-            // Broad by intent, and latched. The realistic failure here is a device without
-            // shaderFloat64 rejecting the pipeline, which is a capability answer rather than an
-            // error to propagate: the engine's contract for Try* is "false means use the CPU
-            // reference". Latching also stops a per-call compile attempt that can never succeed
-            // from being paid on every sample.
+            // NARROW BY INTENT. GlslUnaryOp reports an unavailable pipeline as exactly this, which is
+            // what a device without shaderFloat64 — or a host without libshaderc — produces for this
+            // kernel. That is a capability answer, so it is latched: retrying a compile that cannot
+            // succeed on every sample is pure cost. EVERY OTHER EXCEPTION PROPAGATES. A transient
+            // dispatch failure is not evidence about the device, and permanently marking the backend
+            // unsupported because of one is how a recoverable error becomes a silent downgrade.
+            //
+            // Returning false rather than throwing is deliberate and is NOT a host fallback:
+            // VulkanBackend implements IGpuBatchExecution, so TensorCategoricalSample routes to the
+            // Gumbel-max identity ON THE DEVICE. Throwing would remove a working device route
+            // instead of protecting one. (The engine does throw NotSupportedException if Try* returns
+            // false after Can* has already claimed support, so a false claim is never silent.)
             _categoricalState = 2;
+            System.Diagnostics.Debug.WriteLine(
+                $"[VulkanBackend] Categorical sampling unavailable on this device ({ex.Message}). "
+                + "Routing TensorCategoricalSample to the on-device Gumbel-max path.");
             return false;
         }
 
