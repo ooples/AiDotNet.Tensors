@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     {
         private IntPtr _kernel;
         private readonly DirectOpenClContext _context;
+        private readonly string _kernelName;
         private bool _disposed;
 
         public IntPtr Handle => _kernel;
@@ -21,6 +22,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public DirectOpenClKernel(DirectOpenClContext context, DirectOpenClProgram program, string kernelName)
         {
             _context = context;
+            _kernelName = kernelName;
 
             _kernel = OpenClNativeBindings.CreateKernel(program.Handle, kernelName, out int err);
             if (err != OpenClNativeBindings.CL_SUCCESS || _kernel == IntPtr.Zero)
@@ -120,6 +122,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // while holding _submitLock and immediately before the matching enqueue.
         private void ApplyPendingArgsLocked()
         {
+            ThrowIfUnusable();
+
             var pending = _pendingArgs;
             if (pending == null) return;
 
@@ -185,6 +189,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute1D(int globalSize, int localSize)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
@@ -218,6 +223,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute2D(int globalSizeX, int globalSizeY, int localSizeX, int localSizeY)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -252,6 +258,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute3D(int globalSizeX, int globalSizeY, int globalSizeZ, int localSizeX, int localSizeY, int localSizeZ)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -294,6 +301,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <param name="localSize">The local work size.</param>
         public void Execute1DOnQueue(IntPtr commandQueue, int globalSize, int localSize)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
@@ -332,6 +340,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <param name="localSizeY">The local work size in Y dimension.</param>
         public void Execute2DOnQueue(IntPtr commandQueue, int globalSizeX, int globalSizeY, int localSizeX, int localSizeY)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -374,6 +383,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Execute3DOnQueue(IntPtr commandQueue, int globalSizeX, int globalSizeY, int globalSizeZ,
             int localSizeX, int localSizeY, int localSizeZ)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -511,6 +521,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         #endregion
+
+        /// <summary>Refuses to launch a kernel whose handle has been released.</summary>
+        /// <remarks>
+        /// Dispose sets _kernel to IntPtr.Zero, and nothing on the launch path checked it, so a
+        /// kernel used after its backend was disposed handed NULL to clSetKernelArg. The OpenCL spec
+        /// says that returns CL_INVALID_KERNEL; drivers are not obliged to be careful about it, and
+        /// a dereference inside the runtime surfaces as an 0xC0000005 that kills the process with no
+        /// managed frame to blame. This turns that into a named, catchable failure that says which
+        /// kernel and can be attributed to a test.
+        /// </remarks>
+        private void ThrowIfUnusable()
+        {
+            if (_disposed || _kernel == IntPtr.Zero)
+            {
+                throw new ObjectDisposedException(
+                    nameof(DirectOpenClKernel),
+                    $"OpenCL kernel '{_kernelName}' was used after its handle was released. The "
+                        + "backend that owns it has been disposed while something still held a "
+                        + "reference to this kernel.");
+            }
+        }
 
         public void Dispose()
         {
