@@ -51,6 +51,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // args at Execute time; Execute clears it.
         [ThreadStatic] private static System.Collections.Generic.List<PendingArg>? _pendingArgs;
 
+        /// <summary>Which kernel the thread's staged args belong to.</summary>
+        /// <remarks>
+        /// The pending list is per-thread but shared across every kernel, and it was cleared only on
+        /// the success path of Execute. So any throw between SetArg and Execute -- a guard rejecting
+        /// an argument, an enqueue failure, an abandoned call -- left those args staged, and the NEXT
+        /// kernel this thread executed applied them: another kernel's signature, at another kernel's
+        /// arg indices, carrying buffer handles that may since have been disposed. Passing a released
+        /// cl_mem to clSetKernelArg faults inside the driver, which is what an 0xC0000005 in
+        /// SetKernelArg looks like from managed code.
+        /// </remarks>
+        [ThreadStatic] private static DirectOpenClKernel? _pendingOwner;
+
         // Serializes the apply-args + enqueue critical section across ALL kernels
         // (the shared cl_kernel arg state and the shared command queue both require it).
         private static readonly object _submitLock = new object();
@@ -58,25 +70,51 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private static System.Collections.Generic.List<PendingArg> Pending
             => _pendingArgs ??= new System.Collections.Generic.List<PendingArg>(8);
 
+        /// <summary>Begins (or continues) staging for <paramref name="owner"/>, dropping any args
+        /// abandoned by a previous kernel on this thread.</summary>
+        private static System.Collections.Generic.List<PendingArg> Stage(DirectOpenClKernel owner, uint index)
+        {
+            var pending = Pending;
+
+            // Index 0 starts a launch sequence -- every launcher sets its arguments from 0 upwards
+            // -- so this is where a previous sequence's leftovers are dropped. That makes each
+            // launch self-cleaning even when the last one threw between SetArg and Execute, without
+            // depending on the clear at the end of Execute having been reached.
+            if (index == 0 || !ReferenceEquals(_pendingOwner, owner))
+            {
+                pending.Clear();
+                _pendingOwner = owner;
+            }
+
+            return pending;
+        }
+
+        /// <summary>Drops the thread's staged args; safe to call from a finally.</summary>
+        private static void DiscardPendingArgs()
+        {
+            _pendingArgs?.Clear();
+            _pendingOwner = null;
+        }
+
         #region SetArg Overloads
 
         public void SetArg(uint index, IntPtr bufferHandle)
-            => Pending.Add(new PendingArg(index, ArgKind.Buffer, (long)bufferHandle));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Buffer, (long)bufferHandle));
 
         public void SetArg(uint index, int value)
-            => Pending.Add(new PendingArg(index, ArgKind.Int32, value));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Int32, value));
 
         public void SetArg(uint index, float value)
-            => Pending.Add(new PendingArg(index, ArgKind.Float, BitConverter.ToInt32(BitConverter.GetBytes(value), 0)));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Float, BitConverter.ToInt32(BitConverter.GetBytes(value), 0)));
 
         public void SetArg(uint index, ulong value)
-            => Pending.Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
 
         /// <summary>
         /// Sets a local memory argument (for shared memory allocation).
         /// </summary>
         public void SetLocalArg(uint index, int sizeInBytes)
-            => Pending.Add(new PendingArg(index, ArgKind.Local, sizeInBytes));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Local, sizeInBytes));
 
         // Applies the per-thread pending args to the shared kernel. MUST be called
         // while holding _submitLock and immediately before the matching enqueue.
@@ -84,6 +122,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             var pending = _pendingArgs;
             if (pending == null) return;
+
+            // Never apply args staged for a different kernel. Indices and sizes belong to that
+            // kernel's signature, not this one.
+            if (!ReferenceEquals(_pendingOwner, this))
+            {
+                pending.Clear();
+                return;
+            }
             for (int i = 0; i < pending.Count; i++)
             {
                 var a = pending[i];
@@ -160,7 +206,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -194,7 +240,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -229,7 +275,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -269,7 +315,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -308,7 +354,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -351,7 +397,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -401,7 +447,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         0,
                         IntPtr.Zero,
                         eventHandle);
-                    _pendingArgs?.Clear();
+                    DiscardPendingArgs();
                 }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
@@ -450,7 +496,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         0,
                         IntPtr.Zero,
                         eventHandle);
-                    _pendingArgs?.Clear();
+                    DiscardPendingArgs();
                 }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
