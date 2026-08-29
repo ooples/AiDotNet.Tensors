@@ -149,6 +149,81 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
             Assert.Contains("99", thrown.Message, StringComparison.Ordinal);
         }
 
+        /// <summary>
+        /// Buffer accounting has to balance, because its whole purpose is to make an IMBALANCE
+        /// visible.
+        /// </summary>
+        /// <remarks>
+        /// Deltas, not absolutes: the counters are process-static and every other GPU test in this
+        /// assembly moves them, so asserting an absolute count would be asserting test execution
+        /// order. What must hold is that an allocate/release pair leaves the live figures exactly
+        /// where it found them.
+        /// </remarks>
+        [Fact]
+        public void BufferAccounting_BalancesAcrossAllocateAndRelease()
+        {
+            long countBefore = GpuKernelDiagnostics.LiveBufferCount;
+            long bytesBefore = GpuKernelDiagnostics.LiveBufferBytes;
+            long totalBefore = GpuKernelDiagnostics.TotalBuffersAllocated;
+
+            GpuKernelDiagnostics.RecordBufferAllocated(4096);
+            GpuKernelDiagnostics.RecordBufferAllocated(1024);
+
+            Assert.Equal(countBefore + 2, GpuKernelDiagnostics.LiveBufferCount);
+            Assert.Equal(bytesBefore + 5120, GpuKernelDiagnostics.LiveBufferBytes);
+            Assert.Equal(totalBefore + 2, GpuKernelDiagnostics.TotalBuffersAllocated);
+
+            GpuKernelDiagnostics.RecordBufferReleased(4096);
+            GpuKernelDiagnostics.RecordBufferReleased(1024);
+
+            Assert.Equal(countBefore, GpuKernelDiagnostics.LiveBufferCount);
+            Assert.Equal(bytesBefore, GpuKernelDiagnostics.LiveBufferBytes);
+
+            // Released buffers must NOT decrement the cumulative total — the gap between "allocated
+            // in total" and "live" is exactly the signal a leak hunt is looking for.
+            Assert.Equal(totalBefore + 2, GpuKernelDiagnostics.TotalBuffersAllocated);
+        }
+
+        [Fact]
+        public void PeakResidency_IsAHighWaterMark_AndDoesNotFallBack()
+        {
+            GpuKernelDiagnostics.RecordBufferAllocated(64 * 1024);
+            long peakAtHeight = GpuKernelDiagnostics.PeakLiveBufferBytes;
+            Assert.True(
+                peakAtHeight >= GpuKernelDiagnostics.LiveBufferBytes,
+                "peak must be at least the current live figure");
+
+            GpuKernelDiagnostics.RecordBufferReleased(64 * 1024);
+
+            Assert.Equal(peakAtHeight, GpuKernelDiagnostics.PeakLiveBufferBytes);
+        }
+
+        [Fact]
+        public void ResidencyDescription_ReportsTheNumbers_AndReachesTheDump()
+        {
+            GpuKernelDiagnostics.RecordBufferAllocated(2048);
+            try
+            {
+                Assert.Contains("live=", GpuKernelDiagnostics.DescribeBufferResidency(), StringComparison.Ordinal);
+
+                // The residency has to travel with the journal, or a post-mortem never sees it.
+                string path = Path.Combine(Path.GetTempPath(), "aidotnet-residency-" + Guid.NewGuid().ToString("N") + ".txt");
+                try
+                {
+                    GpuKernelDiagnostics.DumpTo(path);
+                    Assert.Contains("buffers:", File.ReadAllText(path), StringComparison.Ordinal);
+                }
+                finally
+                {
+                    try { File.Delete(path); } catch (IOException) { }
+                }
+            }
+            finally
+            {
+                GpuKernelDiagnostics.RecordBufferReleased(2048);
+            }
+        }
+
         /// <summary>A real launch must appear in the journal, which is what makes it useful after a crash.</summary>
         [SkippableFact]
         public void ARealGpuLaunchIsJournalled()
