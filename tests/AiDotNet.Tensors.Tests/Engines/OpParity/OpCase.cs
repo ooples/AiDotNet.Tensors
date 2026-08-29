@@ -36,12 +36,81 @@ public sealed class OpInput
     /// <summary>Uniform samples in [lo, hi] from a fixed seed. Deterministic across runs/engines.</summary>
     public static OpInput Rand(int seed, int[] shape, double lo = -1.0, double hi = 1.0)
     {
+        shape = ApplyShapePolicy(shape);
         int n = 1;
         foreach (int d in shape) n *= d;
         var rng = new Random(seed);
         var data = new double[n];
         for (int i = 0; i < n; i++) data[i] = lo + rng.NextDouble() * (hi - lo);
         return new OpInput(data, (int[])shape.Clone());
+    }
+
+    [ThreadStatic]
+    private static Func<int[], int[]>? s_shapePolicy;
+
+    /// <summary>
+    /// Rewrites the shape of every <see cref="Rand"/> / <see cref="RandPositive"/> input built while
+    /// the returned scope is open.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE REGISTRY IS SHAPE-BLIND TO ITS OWN BLIND SPOT. Counting every shape literal across the
+    /// spec registry, the dimensions used are 1, 2, 3, 4, 6, 8, 16, 32 and 64 — each of them either
+    /// BELOW a SIMD vector (8 floats / 4 doubles) or an exact MULTIPLE of one. 536 of the 544
+    /// tensor-returning IEngine ops have a spec, and not one of them is exercised at the single
+    /// condition the vectorized tails need: a dimension larger than the vector width and not a
+    /// multiple of it.
+    /// </para>
+    /// <para>
+    /// That is not hypothetical. Two kernels shipped with unguarded column tails —
+    /// <c>SgemmDirectParallelMIntoTransA</c> and friends returned wrong values for every row but the
+    /// last of each block, and wrote past the end of C into the GC heap — and 536 covered ops said
+    /// nothing, because none of them ever asked for 13 columns.
+    /// </para>
+    /// <para>
+    /// Rewriting shapes centrally is what makes the extra coverage a DERIVATION rather than 536
+    /// hand-written duplicates: the specs stay the single source of truth for how each op is called,
+    /// and the shape axis is applied over them. Ops whose shapes must agree with an inline literal
+    /// the policy cannot see will throw; the sweep records those as not-applicable rather than
+    /// failing, and reports the count, so the gap stays visible instead of silently passing.
+    /// </para>
+    /// <para>
+    /// Only <see cref="Rand"/> and <see cref="RandPositive"/> are rewritten. <see cref="From"/>
+    /// carries structured values — indices, masks, permutations — whose length and meaning are tied
+    /// to the exact shape the spec chose, so resizing it would produce nonsense rather than coverage.
+    /// </para>
+    /// </remarks>
+    internal static IDisposable UseShapePolicy(Func<int[], int[]> policy)
+    {
+        if (policy is null) throw new ArgumentNullException(nameof(policy));
+        var previous = s_shapePolicy;
+        s_shapePolicy = policy;
+        return new ShapePolicyScope(previous);
+    }
+
+    private static int[] ApplyShapePolicy(int[] shape)
+    {
+        var policy = s_shapePolicy;
+        if (policy is null) return shape;
+
+        var rewritten = policy(shape);
+        return rewritten ?? shape;
+    }
+
+    private sealed class ShapePolicyScope : IDisposable
+    {
+        private Func<int[], int[]>? _previous;
+        private bool _disposed;
+
+        public ShapePolicyScope(Func<int[], int[]>? previous) => _previous = previous;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            s_shapePolicy = _previous;
+            _previous = null;
+        }
     }
 
     /// <summary>Strictly-positive samples in [lo, hi] — for log / sqrt / rsqrt / pow domains.</summary>
