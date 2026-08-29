@@ -1,4 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
+#if NET5_0_OR_GREATER
+// The N-tail direct kernels are AVX2/FMA intrinsics, which SimdGemm declares inside
+// #if NET5_0_OR_GREATER; SgemmDirectParallelMInto does not exist on net471 at all.
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Simd;
@@ -181,3 +184,4 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
     }
 }
+#endif
