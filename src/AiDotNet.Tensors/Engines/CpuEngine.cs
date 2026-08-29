@@ -17833,9 +17833,30 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (stride[axis] <= 0) break;
 
-                int expected =
-                    (gradOutput._shape[2 + axis] + 2 * padding[axis] - kernel._shape[2 + axis])
-                        / stride[axis] + 1;
+                // THE DIVISION MUST BE EXACT HERE, unlike the forward direction. A forward
+                // convolution genuinely floors — several input extents map to the same output — but
+                // this runs the relation BACKWARDS to recover the transposed input, and floor
+                // division silently accepts a gradOutput that no forward pass could have produced.
+                // Concretely: gradOutput 6, kernel 3, stride 2, padding 0 truncates to 2 and matches
+                // an inputShape of 2, yet the transposed forward for input 2 produces 5, not 6. The
+                // convolution downstream then drops the trailing gradient position and returns a
+                // wrong input gradient — which is exactly the silent-garbage outcome this check
+                // exists to prevent.
+                int numerator =
+                    gradOutput._shape[2 + axis] + 2 * padding[axis] - kernel._shape[2 + axis];
+
+                if (numerator < 0 || numerator % stride[axis] != 0)
+                {
+                    throw new ArgumentException(
+                        $"ConvTranspose2DBackwardInput: gradOutput spatial axis {axis} is "
+                            + $"{gradOutput._shape[2 + axis]}, which does not invert to a whole input "
+                            + $"extent for kernel {kernel._shape[2 + axis]}, stride {stride[axis]} and "
+                            + $"padding {padding[axis]} (leftover {numerator} over stride "
+                            + $"{stride[axis]}). No transposed forward pass produces that size.",
+                        nameof(gradOutput));
+                }
+
+                int expected = numerator / stride[axis] + 1;
 
                 if (expected != inputShape[2 + axis])
                 {
@@ -18383,6 +18404,11 @@ public partial class CpuEngine : ITensorLevelEngine
             return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
         // gradOutput's spatial size is determined by the forward geometry; reading it off
         // gradOutput and trusting it let the sampling loop index past the input.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "DeformableConv2DGroupedBackwardInput", gradOutput._shape, inputShape, kernel._shape,
             stride, padding, dilation, spatialRank: 2);
@@ -18538,6 +18564,12 @@ public partial class CpuEngine : ITensorLevelEngine
             return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
         // gradOutput's spatial size is determined by the forward geometry; reading it off
         // gradOutput and trusting it let the sampling loop index past the input.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "DeformableConv2DGroupedBackwardOffset", gradOutput._shape, input._shape, kernel._shape,
             stride, padding, dilation, spatialRank: 2);
@@ -18623,6 +18655,12 @@ public partial class CpuEngine : ITensorLevelEngine
             return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
         // gradOutput's spatial size is determined by the forward geometry; reading it off
         // gradOutput and trusting it let the sampling loop index past the input.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "DeformableConv2DGroupedBackwardMask", gradOutput._shape, input._shape, kernel._shape,
             stride, padding, dilation, spatialRank: 2);
@@ -18825,6 +18863,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // Without this the sampling loop indexed the input at a position the geometry never
         // produces and threw IndexOutOfRangeException -- an unvalidated precondition surfacing
         // as an internal error rather than a bad argument.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "DeformableConv2DBackwardInput", gradOutput._shape, input._shape, kernel._shape,
             stride, padding, dilation, spatialRank: 2);
@@ -19218,6 +19261,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // Without this the sampling loop indexed the input at a position the geometry never
         // produces and threw IndexOutOfRangeException -- an unvalidated precondition surfacing
         // as an internal error rather than a bad argument.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "DeformableConv2DBackwardOffset", gradOutput._shape, input._shape, kernel._shape,
             stride, padding, dilation, spatialRank: 2);
@@ -19651,6 +19699,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // Without this the sampling loop indexed the input at a position the geometry never
         // produces and threw IndexOutOfRangeException -- an unvalidated precondition surfacing
         // as an internal error rather than a bad argument.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "DeformableConv2DBackwardMask", gradOutput._shape, input._shape, kernel._shape,
             stride, padding, dilation, spatialRank: 2);
