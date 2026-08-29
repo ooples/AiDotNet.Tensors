@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.129.6](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.5...v0.129.6) (2026-08-29)
+
+
+### Bug Fixes
+
+* reject gemm operands too small for their own strides ([#989](https://github.com/ooples/AiDotNet.Tensors/issues/989)) ([70bf7e2](https://github.com/ooples/AiDotNet.Tensors/commit/70bf7e2a3fac8717e617813a9b051dd0b54c1016))
+
 ## [0.129.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.4...v0.129.5) (2026-08-28)
 
 
