@@ -1365,6 +1365,16 @@ internal static partial class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+        // Before the JIT / oneDNN fast paths below, which take fixed pointers of their own and
+        // would therefore bypass the check in SgemmAddInternal.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, lda, transA,
+                b.Length, ldb, transB,
+                c.Length, m, k, n);
+        }
+
 #if !NET471
         // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
         // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
@@ -1537,6 +1547,84 @@ internal static partial class SimdGemm
     /// across multiple Kc-tiles into the same C location.
     /// </summary>
     [MethodImpl(Hot)]
+
+    /// <summary>
+    /// Rejects operand spans that are too small for the requested shape and strides.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE KERNELS WALK RAW POINTERS. <see cref="SgemmDirect"/> and the packed paths take
+    /// <c>fixed</c> pointers into <paramref name="a"/>, <paramref name="b"/> and
+    /// <paramref name="c"/> and index them with lda / ldb / n. Nothing checked those spans were
+    /// large enough, so a caller that got a stride wrong did not get an exception - it read and
+    /// wrote past the end of the buffer. Observed as
+    /// <c>System.AccessViolationException: Attempted to read or write protected memory</c> raised
+    /// inside <c>SgemmDirect</c> on a backward pass, which kills the process outright: no catch
+    /// block runs, no shapes are reported, and a test host dies with "Test host process crashed".
+    /// </para>
+    /// <para>
+    /// The check is integer arithmetic on values already in registers, once per GEMM, against
+    /// kernels that then do m*n*k FMAs - it is not measurable. What it buys is that an undersized
+    /// operand becomes an <see cref="ArgumentException"/> naming the operand, its shape, its
+    /// stride and the length it needed, at the boundary where the caller is still on the stack.
+    /// </para>
+    /// <para>
+    /// Row-major minimums, transpose-aware. A is [m,k] read with row stride lda, or [k,m] when
+    /// <paramref name="transA"/>; B is [k,n] with row stride ldb, or [n,k] when
+    /// <paramref name="transB"/>; C is [m,n] with row stride n. The last row needs only its own
+    /// columns, hence (rows-1)*stride + cols rather than rows*stride - a caller passing an exactly
+    /// sized final row is legal and must not be rejected.
+    /// </para>
+    /// </remarks>
+    private static void ValidateGemmOperands(
+        int aLength, int lda, bool transA,
+        int bLength, int ldb, bool transB,
+        int cLength,
+        int m, int k, int n)
+    {
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        int bRows = transB ? n : k;
+        int bCols = transB ? k : n;
+
+        if (lda < aCols)
+        {
+            throw new ArgumentException(
+                $"GEMM operand A has row stride lda={lda} but {aCols} columns; the stride must be "
+                    + "at least the column count.", nameof(lda));
+        }
+
+        if (ldb < bCols)
+        {
+            throw new ArgumentException(
+                $"GEMM operand B has row stride ldb={ldb} but {bCols} columns; the stride must be "
+                    + "at least the column count.", nameof(ldb));
+        }
+
+        long needA = (long)(aRows - 1) * lda + aCols;
+        if (aLength < needA)
+        {
+            throw new ArgumentException(
+                $"GEMM operand A is {aLength} elements but [{aRows}x{aCols}] at lda={lda} needs "
+                    + $"{needA} (m={m}, k={k}, n={n}, transA={transA}).", "a");
+        }
+
+        long needB = (long)(bRows - 1) * ldb + bCols;
+        if (bLength < needB)
+        {
+            throw new ArgumentException(
+                $"GEMM operand B is {bLength} elements but [{bRows}x{bCols}] at ldb={ldb} needs "
+                    + $"{needB} (m={m}, k={k}, n={n}, transB={transB}).", "b");
+        }
+
+        long needC = (long)m * n;
+        if (cLength < needC)
+        {
+            throw new ArgumentException(
+                $"GEMM output C is {cLength} elements but [{m}x{n}] needs {needC}.", "c");
+        }
+    }
+
     internal static void SgemmAddInternal(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -1545,6 +1633,11 @@ internal static partial class SimdGemm
         bool allowParallel,
         bool clearedOutput = false)
     {
+        ValidateGemmOperands(
+            a.Length, lda, transA,
+            b.Length, ldb, transB,
+            c.Length, m, k, n);
+
         // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The
         // small-matmul fast path below requires m >= Mr and SgemmDirectParallelM requires m >= 64,
         // so a tiny-M GEMM (foundation-model batch=1 / decode forward, fused QKV/FFN projections)
