@@ -3085,10 +3085,41 @@ internal static partial class SimdGemm
         float* pA4 = pA + lda * 4;
         float* pA5 = pA + lda * 5;
 
+        // COLUMN LANE MASKS, HOISTED ABOVE THE K-LOOP because the B LOADS need them too.
+        //
+        // These kernels are entered for the N tail, where ncActual is 1..Nr-1, and they used to
+        // load a full 16-wide B row on every k step regardless:
+        //
+        //     var b0 = Avx.LoadVector256(pB);
+        //     var b1 = Avx.LoadVector256(pB + 8);
+        //
+        // The masks existed but were built AFTER the loop and used only to mask the STORE, so the
+        // reads ran past the end of B. On the final k row the last address touched is
+        // (k-1)*ldb + j + 15 while the operand check guarantees only (k-1)*ldb + n, and j + ncActual
+        // equals n -- so a tail of ncActual columns over-reads by 16 - ncActual floats with no
+        // slack to absorb it. It is harmless until that overhang crosses onto an unmapped page, and
+        // then it is an AccessViolationException that kills the process rather than failing a test:
+        // observed on a Linux CI runner as "Test Run Aborted / the host process exited
+        // unexpectedly" inside a backward-pass GEMM, on a shard that reported 250 tests executed
+        // and 0 failed.
+        //
+        // DirectKernelMxNarrow in this same file already loads B this way; these two kernels simply
+        // did not. The full-width lane keeps its unmasked load so the ncActual == Nr callers (the M
+        // tail, which passes ncActual: Nr) are not slowed down.
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+        bool bLane0Full = lane0N == 8;
+        bool bLane1Full = lane1N == 8;
+        bool bLane1Any = lane1N > 0;
+
         for (int p = 0; p < k; p++)
         {
-            var b0 = Avx.LoadVector256(pB);
-            var b1 = Avx.LoadVector256(pB + 8);
+            var b0 = bLane0Full ? Avx.LoadVector256(pB) : Avx.MaskLoad(pB, mask0);
+            var b1 = bLane1Full
+                ? Avx.LoadVector256(pB + 8)
+                : (bLane1Any ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero);
 
             // Row 0 always active (mcActual >= 1 guaranteed by caller).
             var a0 = Vector256.Create(pA0[p]);
@@ -3123,11 +3154,6 @@ internal static partial class SimdGemm
             pB += ldb;
         }
 
-        // Build column lane masks from ncActual (same logic as MicroKernelMxNMasked).
-        int lane0N = ncActual >= 8 ? 8 : ncActual;
-        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
-        var mask0 = _partialNrMasks[lane0N].AsSingle();
-        var mask1 = _partialNrMasks[lane1N].AsSingle();
 
         // Masked accumulate-and-store, row by row, skipping rows past mcActual.
         if (mcActual > 0) StoreMaskedAccumRowDirect(pC,            mask0, mask1, c00, c01);
@@ -3244,10 +3270,41 @@ internal static partial class SimdGemm
         float* pA4 = pA + lda * 4;
         float* pA5 = pA + lda * 5;
 
+        // COLUMN LANE MASKS, HOISTED ABOVE THE K-LOOP because the B LOADS need them too.
+        //
+        // These kernels are entered for the N tail, where ncActual is 1..Nr-1, and they used to
+        // load a full 16-wide B row on every k step regardless:
+        //
+        //     var b0 = Avx.LoadVector256(pB);
+        //     var b1 = Avx.LoadVector256(pB + 8);
+        //
+        // The masks existed but were built AFTER the loop and used only to mask the STORE, so the
+        // reads ran past the end of B. On the final k row the last address touched is
+        // (k-1)*ldb + j + 15 while the operand check guarantees only (k-1)*ldb + n, and j + ncActual
+        // equals n -- so a tail of ncActual columns over-reads by 16 - ncActual floats with no
+        // slack to absorb it. It is harmless until that overhang crosses onto an unmapped page, and
+        // then it is an AccessViolationException that kills the process rather than failing a test:
+        // observed on a Linux CI runner as "Test Run Aborted / the host process exited
+        // unexpectedly" inside a backward-pass GEMM, on a shard that reported 250 tests executed
+        // and 0 failed.
+        //
+        // DirectKernelMxNarrow in this same file already loads B this way; these two kernels simply
+        // did not. The full-width lane keeps its unmasked load so the ncActual == Nr callers (the M
+        // tail, which passes ncActual: Nr) are not slowed down.
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+        bool bLane0Full = lane0N == 8;
+        bool bLane1Full = lane1N == 8;
+        bool bLane1Any = lane1N > 0;
+
         for (int p = 0; p < k; p++)
         {
-            var b0 = Avx.LoadVector256(pB);
-            var b1 = Avx.LoadVector256(pB + 8);
+            var b0 = bLane0Full ? Avx.LoadVector256(pB) : Avx.MaskLoad(pB, mask0);
+            var b1 = bLane1Full
+                ? Avx.LoadVector256(pB + 8)
+                : (bLane1Any ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero);
 
             var a0 = Vector256.Create(pA0[p]);
             c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
@@ -3281,10 +3338,6 @@ internal static partial class SimdGemm
             pB += ldb;
         }
 
-        int lane0N = ncActual >= 8 ? 8 : ncActual;
-        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
-        var mask0 = _partialNrMasks[lane0N].AsSingle();
-        var mask1 = _partialNrMasks[lane1N].AsSingle();
 
         // Store-only: plain MaskStore (no MaskLoad-add).
         if (mcActual > 0) StoreMaskedRowDirect(pC,            mask0, mask1, c00, c01);
