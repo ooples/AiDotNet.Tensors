@@ -1186,6 +1186,20 @@ internal static partial class SimdGemm
         System.ReadOnlySpan<float> a, float[] b, System.Span<float> c,
         int m, int k, int n)
     {
+        // The SAME precondition as the net5+ definition above. This overload has a twin, and
+        // guarding only the one visible on the framework you happen to build locally leaves the
+        // other route unprotected: it delegates to the obsolete no-trans shim, which forwards to
+        // BlasManaged rather than through any of the guarded paths, so an undersized b arrived at
+        // the kernel as an IndexOutOfRangeException instead of a named ArgumentException. Caught by
+        // SgemmWithCachedB_ValidatesItsOperands running on the net471 leg.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
 #pragma warning disable CS0618 // Self-call to the [Obsolete] no-trans shim — SgemmWithCachedB is a net471 wrapper that legitimately delegates here.
         Sgemm(a, b.AsSpan(), c, m, k, n);
 #pragma warning restore CS0618

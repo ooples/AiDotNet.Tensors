@@ -132,7 +132,13 @@ public class SimdGemmBoundsPreconditionTests
     // ---- Public entry points that reach the pointer kernels WITHOUT passing through
     //      SgemmAddInternal. Each carries its own precondition; without these cases a future
     //      refactor could drop one and nothing would notice until a host died in CI.
+    //
+    //      All but SgemmWithCachedB live inside #if NET5_0_OR_GREATER in SimdGemm, because the
+    //      parallel-M and int8 paths need the intrinsics that target lacks. The tests have to carry
+    //      the same condition or the net471 leg of the build fails on CS0117 - which is exactly what
+    //      happened, and it is invisible when only net10.0 is built locally.
 
+#if NET5_0_OR_GREATER
     [Fact]
     public void SgemmDirectParallelMInto_ValidatesItsOperands()
     {
@@ -187,6 +193,8 @@ public class SimdGemmBoundsPreconditionTests
                 a, Filled((N - 1) * K + K - 1), new float[M * N], M, K, N));
     }
 
+#endif
+
     [Fact]
     public void SgemmWithCachedB_ValidatesItsOperands()
     {
@@ -198,6 +206,7 @@ public class SimdGemmBoundsPreconditionTests
         SimdGemm.SgemmWithCachedB(a, Filled(K * N), new float[M * N], M, K, N);
     }
 
+#if NET5_0_OR_GREATER
     [Fact]
     public void SgemmWithInt8CachedB_ValidatesItsOperands()
     {
@@ -208,4 +217,5 @@ public class SimdGemmBoundsPreconditionTests
 
         SimdGemm.SgemmWithInt8CachedB(a, Filled(K * N), new float[M * N], M, K, N);
     }
+#endif
 }
