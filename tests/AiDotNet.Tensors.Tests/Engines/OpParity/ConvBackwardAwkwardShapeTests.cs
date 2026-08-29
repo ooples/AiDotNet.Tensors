@@ -1,5 +1,4 @@
 // Copyright (c) AiDotNet. All rights reserved.
-#if !NETFRAMEWORK
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -26,11 +25,13 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 /// covered here instead, rather than simply dropped.
 /// </para>
 /// <para>
-/// What the sweep did find is real and separate: these ops validate batch and channel agreement but
+/// What the sweep did find is real and separate: these ops validated batch and channel agreement but
 /// NOT the spatial geometry, so the impossible shapes were accepted and garbage was returned instead
-/// of an <c>ArgumentException</c>. Fourteen conv backward ops share that gap and none has a shared
-/// output-dimension helper to fix it in one place. Tracked separately; if it is fixed, the sweep
-/// will begin recording these ops as not-applicable on its own and these tests stay as the coverage.
+/// of an <c>ArgumentException</c>. <c>ConvBackwardShapeGuard</c> now supplies that check, and because
+/// <c>Conv1DBackwardKernel</c> reshapes to 4-D and delegates while
+/// <c>ConvTranspose2DBackwardKernel</c> delegates with its operands swapped, one guard covers all
+/// three entry points. They are consequently recorded as not-applicable by the sweep on its own, and
+/// these tests remain the coverage that the kernels themselves handle an awkward width correctly.
 /// </para>
 /// </remarks>
 public class ConvBackwardAwkwardShapeTests
@@ -82,6 +83,23 @@ public class ConvBackwardAwkwardShapeTests
     {
         Assert.True(f.Length == d.Length, $"{op}: float/double lengths differ ({f.Length} vs {d.Length})");
 
+        // NON-FINITE VALUES ARE REJECTED FIRST, and not as a nicety. Math.Abs(f - d) is NaN when
+        // either side is NaN or when both are infinite, and `diff > worst` is FALSE for NaN — so an
+        // output that was entirely NaN would leave worst at 0 and pass this as a clean match. The
+        // corruption this file exists to catch would have been the thing that hid it.
+        for (int i = 0; i < f.Length; i++)
+        {
+            Assert.True(
+                !float.IsNaN(f[i]) && !float.IsInfinity(f[i]),
+                $"{op} at an awkward inner dimension produced {f[i]} at index {i} of {f.Length}. A "
+                    + "non-finite value is a failure in its own right, and cannot be compared against "
+                    + "the oracle.");
+            Assert.True(
+                !double.IsNaN(d[i]) && !double.IsInfinity(d[i]),
+                $"{op}: the double oracle produced {d[i]} at index {i} of {d.Length}, so there is "
+                    + "nothing to compare the float run against.");
+        }
+
         double worst = 0;
         int at = -1;
         for (int i = 0; i < f.Length; i++)
@@ -117,4 +135,3 @@ public class ConvBackwardAwkwardShapeTests
         return new Tensor<double>(a, shape);
     }
 }
-#endif

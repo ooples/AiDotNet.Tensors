@@ -42,7 +42,7 @@ internal static class ConvBackwardShapeGuard
     /// <param name="inputShape">Shape of the forward input, laid out [N, C, ...spatial].</param>
     /// <param name="kernelShape">Kernel shape; its TRAILING entries are the spatial extents.</param>
     /// <param name="stride">Per-axis stride.</param>
-    /// <param name="padding">Per-axis padding.</param>
+    /// <param name="padding">Per-axis padding, or <c>null</c> for none.</param>
     /// <param name="dilation">Per-axis dilation, or <c>null</c> for 1.</param>
     /// <param name="spatialRank">Number of spatial axes (1, 2 or 3).</param>
     public static void ValidateGradOutputSpatial(
@@ -51,19 +51,20 @@ internal static class ConvBackwardShapeGuard
         int[] inputShape,
         int[] kernelShape,
         int[] stride,
-        int[] padding,
+        int[]? padding,
         int[]? dilation,
         int spatialRank)
     {
         if (gradOutputShape is null || inputShape is null || kernelShape is null) return;
-        if (stride is null || padding is null) return;
+        if (stride is null) return;
 
         // Rank disagreements are already reported, and with better messages, by the callers'
         // existing checks. Bail rather than throw a worse one.
         if (gradOutputShape.Length < spatialRank + 2) return;
         if (inputShape.Length < spatialRank + 2) return;
         if (kernelShape.Length < spatialRank) return;
-        if (stride.Length < spatialRank || padding.Length < spatialRank) return;
+        if (stride.Length < spatialRank) return;
+        if (padding is not null && padding.Length < spatialRank) return;
         if (dilation is not null && dilation.Length < spatialRank) return;
 
         int gradSpatialStart = gradOutputShape.Length - spatialRank;
@@ -75,7 +76,7 @@ internal static class ConvBackwardShapeGuard
             int inExtent = inputShape[inputSpatialStart + axis];
             int kExtent = kernelShape[kernelSpatialStart + axis];
             int s = stride[axis];
-            int p = padding[axis];
+            int p = padding is null ? 0 : padding[axis];
             int d = dilation is null ? 1 : dilation[axis];
 
             if (s <= 0 || d <= 0) return;   // already rejected upstream

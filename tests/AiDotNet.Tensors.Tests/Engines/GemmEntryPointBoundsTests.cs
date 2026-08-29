@@ -1,5 +1,4 @@
 // Copyright (c) AiDotNet. All rights reserved.
-#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -62,6 +61,16 @@ namespace AiDotNet.Tensors.Tests.Engines
 
         private delegate void BoundsDriver(int m, int k, int n);
 
+        // Span<T> is a ref struct, so on net471 it cannot be a type ARGUMENT to Action<...> —
+        // `Action<float[], float[], Span<float>>` does not compile there. Named delegates can
+        // declare ref-struct parameters on every target, so the drivers use these instead. This is
+        // what let the whole class be excluded from net471 before, taking its coverage with it.
+        private delegate void FloatGemmCall(float[] a, float[] b, Span<float> c);
+
+        private delegate void DoubleGemmCall(double[] a, double[] b, Span<double> c);
+
+        private delegate void FloatOutputCall(Span<float> c);
+
         /// <summary>One driver per public span-taking entry point; the gate below enforces the set.</summary>
         private static readonly IReadOnlyDictionary<string, BoundsDriver> Drivers =
             new Dictionary<string, BoundsDriver>(StringComparer.Ordinal)
@@ -74,6 +83,11 @@ namespace AiDotNet.Tensors.Tests.Engines
                     (a, b, c) => SimdGemm.SgemmAdd(a, b, c, m, k, n)),
                 ["SgemmWithCachedB"] = (m, k, n) => RunF(m, k, n, m * k, k * n,
                     (a, b, c) => SimdGemm.SgemmWithCachedB(a, b, c, m, k, n)),
+#if NET5_0_OR_GREATER
+                // These entry points are declared inside #if NET5_0_OR_GREATER in SimdGemm itself
+                // (they are AVX2/FMA intrinsics), so they do not exist on net471 and their drivers
+                // cannot compile there. The reflected inventory shrinks to match on that target, so
+                // the coverage gate stays exact rather than demanding drivers for absent APIs.
                 ["SgemmWithInt8CachedB"] = (m, k, n) => RunF(m, k, n, m * k, k * n,
                     (a, b, c) => SimdGemm.SgemmWithInt8CachedB(a, b, c, m, k, n)),
                 ["SgemmDirectParallelMInto"] = (m, k, n) => RunF(m, k, n, m * k, k * n,
@@ -94,10 +108,15 @@ namespace AiDotNet.Tensors.Tests.Engines
                 ["DgemmDirectParallelMIntoTransB"] = (m, k, n) => RunD(m, k, n, m * k, n * k,
                     (a, b, c) => SimdGemm.DgemmDirectParallelMIntoTransB(a, b, c, m, k, n)),
 
+#endif
                 // Quantized / half-precision B. Same output contract, different operand types --
                 // which is exactly why the inventory is reflected rather than listed: these live in
                 // partial-class files (SimdGemm.Fp16Weight.cs, .Int8Int8.cs, .Int8RowScaled.cs) and a
                 // file-scoped search of SimdGemm.cs does not see them at all.
+#if NET5_0_OR_GREATER
+                // System.Half is the ONLY net5-only API in this file, so it is the only thing
+                // guarded. Guarding the whole class instead left net471 -- a supported target --
+                // with no bounds coverage for any GEMM entry point at all.
                 ["SgemmFp16WeightB"] = (m, k, n) => WithGuardedOutputF(m, n, c =>
                 {
                     var a = RandF(m * k, 771);
@@ -106,12 +125,15 @@ namespace AiDotNet.Tensors.Tests.Engines
                     for (int i = 0; i < b.Length; i++) b[i] = (Half)(rng.NextDouble() * 2 - 1);
                     SimdGemm.SgemmFp16WeightB(a, b, c, m, k, n);
                 }),
+#endif
                 ["SgemmA8W8RowScaledCachedB"] = (m, k, n) => WithGuardedOutputF(m, n, c =>
                     SimdGemm.SgemmA8W8RowScaledCachedB(
                         RandF(m * k, 773), RandI8(n * k, 774), RandF(n, 775), c, m, k, n)),
+#if NET5_0_OR_GREATER
                 ["SgemmWithInt8RowScaledCachedB"] = (m, k, n) => WithGuardedOutputF(m, n, c =>
                     SimdGemm.SgemmWithInt8RowScaledCachedB(
                         RandF(m * k, 776), RandI8(n * k, 777), RandF(n, 778), c, m, k, n)),
+#endif
             };
 
         [Theory]
@@ -119,16 +141,27 @@ namespace AiDotNet.Tensors.Tests.Engines
         public void EveryEntryPoint_AtAnAwkwardColumnCount_StaysInsideItsOutput(int m, int k, int n)
         {
             var failures = new List<string>();
-            foreach (var (name, driver) in Drivers.OrderBy(p => p.Key, StringComparer.Ordinal))
+            var rejected = new List<string>();
+            int verified = 0;
+
+            // Indexed rather than deconstructed: KeyValuePair<,>.Deconstruct does not exist on
+            // net471, and this class must compile there.
+            foreach (var entry in Drivers.OrderBy(p => p.Key, StringComparer.Ordinal))
             {
+                string name = entry.Key;
                 try
                 {
-                    driver(m, k, n);
+                    entry.Value(m, k, n);
+                    verified++;
                 }
-                catch (ArgumentException)
+                catch (ArgumentException ex)
                 {
-                    // A documented precondition this shape does not satisfy is a legitimate answer;
-                    // silently corrupting memory is not. Rejecting is the behaviour under test.
+                    // A rejection is NOT a pass. The first version of this swallowed every
+                    // ArgumentException and asserted only on failures.Count, so if all fifteen
+                    // entry points had rejected the shape the test would have reported success
+                    // while verifying nothing at all — the exact always-passing shape this file was
+                    // written to catch in the library.
+                    rejected.Add($"{name}: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
                 }
                 catch (BoundsViolationException ex)
                 {
@@ -141,6 +174,22 @@ namespace AiDotNet.Tensors.Tests.Engines
                 $"m={m} k={k} n={n} (tail {n % 8}): {failures.Count} GEMM entry point(s) wrote past "
                     + "the end of the output they were given. A column loop that steps by a vector "
                     + "width must mask its final store.\n  " + string.Join("\n  ", failures));
+
+            // Every entry point must ACCEPT an awkward column count. None documents a
+            // multiple-of-eight precondition on its public signature, and one that rejected here
+            // would be refusing a shape its own contract admits — worth failing on rather than
+            // absorbing. If a genuine restriction appears, declare it explicitly here rather than
+            // letting the catch hide it.
+            Assert.True(
+                rejected.Count == 0,
+                $"m={m} k={k} n={n}: {rejected.Count} entry point(s) rejected an awkward column "
+                    + "count instead of computing it, so nothing checked whether they stay inside "
+                    + "their output.\n  " + string.Join("\n  ", rejected));
+
+            Assert.True(
+                verified == Drivers.Count,
+                $"Only {verified} of {Drivers.Count} entry points were actually driven at m={m} "
+                    + $"k={k} n={n}. An assertion that never ran cannot have passed.");
         }
 
         [Fact]
@@ -208,7 +257,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
 
         /// <summary>Allocates C with a sentinel margin, runs the call, then checks the margin.</summary>
-        private static void WithGuardedOutputF(int m, int n, Action<Span<float>> call)
+        private static void WithGuardedOutputF(int m, int n, FloatOutputCall call)
         {
             var c = new float[m * n + Margin];
             for (int i = 0; i < c.Length; i++) c[i] = SentinelF;
@@ -228,7 +277,7 @@ namespace AiDotNet.Tensors.Tests.Engines
 
         private static void RunF(
             int m, int k, int n, int aLen, int bLen,
-            Action<float[], float[], Span<float>> call)
+            FloatGemmCall call)
         {
             var rng = new Random(20260829);
             var a = new float[aLen];
@@ -254,7 +303,7 @@ namespace AiDotNet.Tensors.Tests.Engines
 
         private static void RunD(
             int m, int k, int n, int aLen, int bLen,
-            Action<double[], double[], Span<double>> call)
+            DoubleGemmCall call)
         {
             var rng = new Random(20260830);
             var a = new double[aLen];
@@ -279,4 +328,3 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
     }
 }
-#endif

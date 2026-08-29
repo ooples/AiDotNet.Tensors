@@ -79,6 +79,7 @@ public class OpTailShapeSweepTests
         public List<string> Mismatches { get; } = new();
         public List<string> NotApplicable { get; } = new();
         public List<string> Excluded { get; } = new();
+        public List<string> Crashed { get; } = new();
         public int Compared { get; set; }
         public int Total { get; set; }
     }
@@ -89,6 +90,13 @@ public class OpTailShapeSweepTests
     public void EveryOp_AtAnAwkwardInnerDimension_AgreesWithTheDoubleOracle()
     {
         var outcome = Sweep.Value;
+
+        Assert.True(
+            outcome.Crashed.Count == 0,
+            $"{outcome.Crashed.Count} ops FAILED at an inner dimension that is not a multiple of a "
+                + "SIMD vector, rather than rejecting it. An op that neither validates the shape nor "
+                + "handles it walks off the end of its own operands.\n  "
+                + string.Join("\n  ", outcome.Crashed.Take(40)));
 
         Assert.True(
             outcome.Mismatches.Count == 0,
@@ -176,11 +184,27 @@ public class OpTailShapeSweepTests
                     cpuF = op.RunFloat(cpu).ToArray();
                     oracleD = op.RunDouble(cpu).ToArray();
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (!IsShapeRejection(ex))
+                {
+                    // NOT a rejection: the op FAILED at this shape. Collected rather than rethrown
+                    // so one run reports every such op instead of stopping at the first, and
+                    // asserted on below so it can never be mistaken for "unsupported".
+                    outcome.Crashed.Add($"{op.Name} [{op.Category}]: {Describe(ex)}");
+                    Append(reportPath, $"CRASH	{op.Name}	{Describe(ex)}");
+                    continue;
+                }
+                catch (Exception ex) when (IsShapeRejection(ex))
                 {
                     // The op rejected the rewritten shape — almost always because a spec pairs a
                     // policy-visible OpInput with an inline literal the policy cannot reach, so the
                     // two no longer agree. Not a kernel defect; recorded so the reach stays honest.
+                    //
+                    // ONLY a rejection is caught. Catching every Exception here made the sweep able
+                    // to hide the very thing it exists to find: a tail path that walks off the end
+                    // throws IndexOutOfRangeException, which would have been filed as "not
+                    // applicable" and skipped, and with a reach of 453 against a floor of 400 up to
+                    // 53 such failures could sit there while both tests passed. Anything that is
+                    // not a documented precondition rejection now propagates and fails the run.
                     outcome.NotApplicable.Add($"{op.Name}: {Describe(ex)}");
                     Append(reportPath, $"N/A\t{op.Name}\t{Describe(ex)}");
                     continue;
@@ -222,6 +246,24 @@ public class OpTailShapeSweepTests
         WriteSummary(reportPath, outcome);
         return outcome;
     }
+
+    /// <summary>
+    /// Whether an exception is an op REJECTING the rewritten shape, as opposed to failing on it.
+    /// </summary>
+    /// <remarks>
+    /// A precondition rejection is an <see cref="ArgumentException"/> (FFT wanting a power of two,
+    /// split wanting divisibility, a mask that must match its tensor) or a
+    /// <see cref="NotSupportedException"/>. Everything else — an index walking off the end, a null
+    /// deref, an invalid state — is the op FAILING at that shape, which is the finding this sweep
+    /// exists to surface and must never be filed as "not applicable".
+    /// <para>
+    /// <see cref="IndexOutOfRangeException"/> deliberately does not qualify. It derives from
+    /// <see cref="SystemException"/> rather than <see cref="ArgumentException"/>, so narrowing to
+    /// argument exceptions lets exactly the interesting failure through.
+    /// </para>
+    /// </remarks>
+    private static bool IsShapeRejection(Exception ex)
+        => ex is ArgumentException or NotSupportedException;
 
     private static bool GcVerifyEnabled =>
         !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_OPSWEEP_GCVERIFY"));
