@@ -553,6 +553,28 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, randomProgram, name);
                 }
 
+                // Compile categorical sampling. Isolated in its own program because it needs fp64 for
+                // exact CPU parity: a device without fp64 fails HERE, leaving _categoricalKernelReady
+                // false so the engine keeps using the managed reference, rather than failing the
+                // whole random program and taking GenerateRandomUniform down with it.
+                try
+                {
+                    var categoricalProgram = CompileOrLoadCached(
+                        Kernels.CategoricalKernels.GetSource(), optimizationFlags, "Categorical sampling kernels");
+                    _programs.Add(categoricalProgram);
+                    foreach (var name in Kernels.CategoricalKernels.GetKernelNames())
+                    {
+                        _kernelCache[name] = new DirectOpenClKernel(_context, categoricalProgram, name);
+                    }
+
+                    _categoricalKernelReady = true;
+                }
+                catch (Exception)
+                {
+                    // No fp64 (or the device rejected the program): stay on the CPU reference.
+                    _categoricalKernelReady = false;
+                }
+
                 // Compile specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
                 var specializedProgram = CompileOrLoadCached(SpecializedKernels.GetSource(), optimizationFlags, "Specialized kernels");
                 _programs.Add(specializedProgram);
