@@ -15547,6 +15547,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput._shape[1] != kernelShape[0]) throw new ArgumentException($"gradOutput outChannels ({gradOutput._shape[1]}) must match kernelShape outChannels ({kernelShape[0]})");
         if (input._shape[1] != kernelShape[1]) throw new ArgumentException($"input inChannels ({input._shape[1]}) must match kernelShape inChannels ({kernelShape[1]})");
 
+        // gradOutput's spatial size is a function of the forward geometry, not a free
+        // parameter. Without this the op accepted an impossible request and returned garbage.
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "Conv2DBackwardKernel", gradOutput._shape, input._shape, kernelShape,
+            stride, padding, dilation, spatialRank: 2);
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
