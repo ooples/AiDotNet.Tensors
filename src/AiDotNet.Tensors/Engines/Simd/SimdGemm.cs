@@ -488,6 +488,17 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
 #if !NET471
         // Our JIT'd AVX2 kernel first (opt-in). This is the entry the MLP's
         // MlpForward path and FusedLinear's tier-3 fallback use — without this
@@ -805,6 +816,17 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         c.Clear();
 
         if (n > Nc || Avx512Sgemm.CanUse)
@@ -1633,10 +1655,16 @@ internal static partial class SimdGemm
         bool allowParallel,
         bool clearedOutput = false)
     {
-        ValidateGemmOperands(
-            a.Length, lda, transA,
-            b.Length, ldb, transB,
-            c.Length, m, k, n);
+        // Degenerate shapes are a documented quiet no-op, and the kernels never touch the
+        // operands, so validating them would reject callers the contract accepts - an empty c or
+        // an unused ldb is legal when there is no work to do.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, lda, transA,
+                b.Length, ldb, transB,
+                c.Length, m, k, n);
+        }
 
         // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The
         // small-matmul fast path below requires m >= Mr and SgemmDirectParallelM requires m >= 64,
@@ -2181,6 +2209,17 @@ internal static partial class SimdGemm
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         c.Clear();
         SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
     }
@@ -2200,6 +2239,17 @@ internal static partial class SimdGemm
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
     }
 
@@ -2476,6 +2526,17 @@ internal static partial class SimdGemm
     public static unsafe void SgemmDirectParallelMIntoTransA(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [k,m] at lda=m (transposed), B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, m, true,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         const int MRf = 4;
         int mFull = (m / MRf) * MRf;
         int numFullBlocks = mFull / MRf;
@@ -2546,6 +2607,17 @@ internal static partial class SimdGemm
     public static unsafe void SgemmDirectParallelMIntoTransB(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [n,k] at ldb=k (transposed).
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, k, true,
+                c.Length, m, k, n);
+        }
+
         const int MRf = 4;
         int mFull = (m / MRf) * MRf;
         int numFullBlocks = mFull / MRf;

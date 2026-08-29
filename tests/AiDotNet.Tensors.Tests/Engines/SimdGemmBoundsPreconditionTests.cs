@@ -120,8 +120,92 @@ public class SimdGemmBoundsPreconditionTests
     public void DegenerateShapes_StillReturnWithoutValidating()
     {
         // k = 0 has no work to do and callers rely on it returning quietly; the guard must not
-        // turn a documented no-op into an exception.
-        var c = new float[M * N];
-        SimdGemm.Sgemm(Array.Empty<float>(), 0, false, Array.Empty<float>(), N, false, c, M, 0, N);
+        // turn a documented no-op into an exception. An EMPTY c and a nonsense ldb are both legal
+        // here precisely because the kernels never touch either operand - which is why the guard
+        // is gated on m/n/k rather than run unconditionally.
+        SimdGemm.Sgemm(
+            Array.Empty<float>(), 0, false,
+            Array.Empty<float>(), 0, false,
+            Array.Empty<float>(), M, 0, N);
+    }
+
+    // ---- Public entry points that reach the pointer kernels WITHOUT passing through
+    //      SgemmAddInternal. Each carries its own precondition; without these cases a future
+    //      refactor could drop one and nothing would notice until a host died in CI.
+
+    [Fact]
+    public void SgemmDirectParallelMInto_ValidatesItsOperands()
+    {
+        var a = Filled(M * K);
+        var b = Filled(K * N);
+
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmDirectParallelMInto(a, b, new float[M * N - 1], M, K, N));
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmDirectParallelMInto(Filled(M * K - 1), b, new float[M * N], M, K, N));
+
+        SimdGemm.SgemmDirectParallelMInto(a, b, new float[M * N], M, K, N);
+    }
+
+    [Fact]
+    public void SgemmDirectParallelMOverwrite_ValidatesItsOperands()
+    {
+        var a = Filled(M * K);
+        var b = Filled(K * N);
+
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmDirectParallelMOverwrite(a, Filled(K * N - 1), new float[M * N], M, K, N));
+
+        SimdGemm.SgemmDirectParallelMOverwrite(a, b, new float[M * N], M, K, N);
+    }
+
+    [Fact]
+    public void SgemmDirectParallelMIntoTransA_SizesAgainstTheTransposedA()
+    {
+        // A is [k,m] at lda=m here, so the minimum is (k-1)*m + m, not the untransposed figure.
+        var aT = Filled((K - 1) * M + M);
+        var b = Filled((K - 1) * N + N);
+
+        SimdGemm.SgemmDirectParallelMIntoTransA(aT, b, new float[M * N], M, K, N);
+
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmDirectParallelMIntoTransA(
+                Filled((K - 1) * M + M - 1), b, new float[M * N], M, K, N));
+    }
+
+    [Fact]
+    public void SgemmDirectParallelMIntoTransB_SizesAgainstTheTransposedB()
+    {
+        // B is [n,k] at ldb=k here.
+        var a = Filled((M - 1) * K + K);
+        var bT = Filled((N - 1) * K + K);
+
+        SimdGemm.SgemmDirectParallelMIntoTransB(a, bT, new float[M * N], M, K, N);
+
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmDirectParallelMIntoTransB(
+                a, Filled((N - 1) * K + K - 1), new float[M * N], M, K, N));
+    }
+
+    [Fact]
+    public void SgemmWithCachedB_ValidatesItsOperands()
+    {
+        var a = Filled(M * K);
+
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmWithCachedB(a, Filled(K * N - 1), new float[M * N], M, K, N));
+
+        SimdGemm.SgemmWithCachedB(a, Filled(K * N), new float[M * N], M, K, N);
+    }
+
+    [Fact]
+    public void SgemmWithInt8CachedB_ValidatesItsOperands()
+    {
+        var a = Filled(M * K);
+
+        Assert.Throws<ArgumentException>(
+            () => SimdGemm.SgemmWithInt8CachedB(a, Filled(K * N), new float[M * N - 1], M, K, N));
+
+        SimdGemm.SgemmWithInt8CachedB(a, Filled(K * N), new float[M * N], M, K, N);
     }
 }
