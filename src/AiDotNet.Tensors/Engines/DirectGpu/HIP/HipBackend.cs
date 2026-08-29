@@ -849,9 +849,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr func = IntPtr.Zero;
             hipResult = HipNativeBindings.hipModuleGetFunction(ref func, module, kernelName);
             if (hipResult == HipError.Success)
+            {
                 _kernelCache[kernelName] = func;
                 // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
+                // INSIDE the guard: registering on a failed lookup would map IntPtr.Zero to this
+                // name and misattribute a later fault to a kernel that never resolved.
                 GpuKernelDiagnostics.RegisterKernelName(func, kernelName);
+            }
         }
     }
 
@@ -11414,6 +11418,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _stream = IntPtr.Zero;
         }
 
+        // Drop the diagnostics registrations for these handles. A driver may reuse a freed
+        // handle address, so a stale entry would name a later kernel wrongly (Issue #996).
+        foreach (var handle in _kernelCache.Values) GpuKernelDiagnostics.UnregisterKernelName(handle);
         _kernelCache.Clear();
     }
 

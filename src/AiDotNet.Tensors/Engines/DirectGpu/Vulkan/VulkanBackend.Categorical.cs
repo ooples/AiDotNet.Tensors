@@ -34,7 +34,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// </remarks>
 public sealed partial class VulkanBackend : ICategoricalSamplingBackend
 {
-    /// <summary>0 = not yet attempted, 1 = dispatched successfully, 2 = unsupported on this device.</summary>
+    // Named rather than literal: the shader's binding layout and push-constant block are a contract
+    // with VulkanGlslKernels.CategoricalSampleGlsl, and a layout change has to update ONE definition
+    // here rather than four call sites that happen to say 2 and 16.
+
+    /// <summary>Storage bindings the shader declares: probabilities in, one-hot out.</summary>
+    private const int CategoricalBufferCount = 2;
+
+    /// <summary>Push-constant block: rows, classes, seedLo, seedHi.</summary>
+    private const uint CategoricalPushConstantBytes = 4 * sizeof(uint);
+
+    /// <summary>Capability not yet probed on this device.</summary>
+    private const int CategoricalUnprobed = 0;
+
+    /// <summary>The pipeline built, so the device can run this kernel.</summary>
+    private const int CategoricalSupported = 1;
+
+    /// <summary>The pipeline could not be built (no shaderFloat64, or no libshaderc).</summary>
+    private const int CategoricalUnsupported = 2;
+
+    /// <summary>Latched capability: see the Categorical* constants above.</summary>
     private int _categoricalState;
 
     /// <inheritdoc/>
@@ -61,23 +80,27 @@ public sealed partial class VulkanBackend : ICategoricalSamplingBackend
     private bool CategoricalPipelineIsAvailable()
     {
         int state = Volatile.Read(ref _categoricalState);
-        if (state != 0) return state == 1;
+        if (state != CategoricalUnprobed) return state == CategoricalSupported;
 
         try
         {
             EnsureInitialized();
             var pipeline = GetOrCreateGlslPipeline(
-                VulkanGlslKernels.CategoricalSampleGlsl, 2, 4 * sizeof(uint));
-            Volatile.Write(ref _categoricalState, pipeline is null ? 2 : 1);
+                VulkanGlslKernels.CategoricalSampleGlsl,
+                CategoricalBufferCount,
+                CategoricalPushConstantBytes);
+            Volatile.Write(
+                ref _categoricalState,
+                pipeline is null ? CategoricalUnsupported : CategoricalSupported);
         }
         catch (InvalidOperationException)
         {
             // The pipeline could not be built on this device -- the shaderFloat64 answer. Latched so
             // a compile that cannot succeed is not retried on every call. Other exceptions propagate.
-            Volatile.Write(ref _categoricalState, 2);
+            Volatile.Write(ref _categoricalState, CategoricalUnsupported);
         }
 
-        return Volatile.Read(ref _categoricalState) == 1;
+        return Volatile.Read(ref _categoricalState) == CategoricalSupported;
     }
 
     /// <inheritdoc/>
@@ -115,7 +138,7 @@ public sealed partial class VulkanBackend : ICategoricalSamplingBackend
                 oneHot,
                 rows,
                 new uint[] { (uint)rows, (uint)classes, (uint)(seed & 0xFFFFFFFF), (uint)(seed >> 32) },
-                4 * sizeof(uint));
+                CategoricalPushConstantBytes);
         }
         catch (InvalidOperationException ex)
         {
@@ -131,14 +154,14 @@ public sealed partial class VulkanBackend : ICategoricalSamplingBackend
             // Gumbel-max identity ON THE DEVICE. Throwing would remove a working device route
             // instead of protecting one. (The engine does throw NotSupportedException if Try* returns
             // false after Can* has already claimed support, so a false claim is never silent.)
-            _categoricalState = 2;
+            _categoricalState = CategoricalUnsupported;
             System.Diagnostics.Debug.WriteLine(
                 $"[VulkanBackend] Categorical sampling unavailable on this device ({ex.Message}). "
                 + "Routing TensorCategoricalSample to the on-device Gumbel-max path.");
             return false;
         }
 
-        _categoricalState = 1;
+        _categoricalState = CategoricalSupported;
         return true;
     }
 }

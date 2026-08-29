@@ -16565,6 +16565,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return;
 
         _disposed = true;
+
+        // Drop the diagnostics registrations for these handles. The registry is process-lifetime but
+        // kernel handles are not, and a driver may reuse a freed handle address -- a stale entry
+        // would then name a later kernel wrongly, which in crash forensics is worse than no name.
+        foreach (var handle in _kernelCache.Values) GpuKernelDiagnostics.UnregisterKernelName(handle);
+
         // Finalizer path (disposing == false) or any process/domain teardown:
         //   - The managed members (GpuBufferPool's ConcurrentBag/ThreadLocal, the cuDNN
         //     helpers) may already have been finalized by the runtime — touching them

@@ -191,6 +191,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         }
 
         /// <summary>
+        /// Drops a handle's registration. Call during backend teardown.
+        /// </summary>
+        /// <remarks>
+        /// The registry is static and process-lifetime, but kernel handles are not: a process that
+        /// creates and disposes backends repeatedly (as the test suite does) would otherwise retain an
+        /// entry per unique handle forever. Worse than the leak, a driver is free to REUSE a freed
+        /// handle address, so a stale entry could name a later kernel wrongly — in crash forensics,
+        /// confidently wrong is worse than absent.
+        /// </remarks>
+        public static void UnregisterKernelName(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero) return;
+            _kernelNames.TryRemove(handle, out _);
+        }
+
+        /// <summary>
         /// Records a launch identified by handle, resolving the name registered for it. Falls back to
         /// the raw handle so an unregistered kernel is still attributable rather than dropped.
         /// </summary>

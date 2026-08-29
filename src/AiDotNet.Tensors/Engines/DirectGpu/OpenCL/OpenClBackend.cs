@@ -13606,6 +13606,14 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_disposed) return;
 
+            // FAIL CLOSED FIRST. IsAvailable reads !_disposed, and teardown below disposes the
+            // dynamic GEMM, the buffer pool, every cached kernel and program, and the context. Set
+            // last, this flag would leave a window -- one that grows with the number of compiled
+            // kernels -- where a concurrent caller holding the process-wide cached backend still
+            // sees IsAvailable == true while _kernelCache is being cleared, and hits exactly the
+            // KeyNotFoundException this guard exists to prevent.
+            _disposed = true;
+
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
 
@@ -13631,7 +13639,6 @@ KERNEL VARIANTS (A/B testing):
             _programs.Clear();
 
             _context?.Dispose();
-            _disposed = true;
         }
 
     public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("reduce_mean", i, o, sz); }
