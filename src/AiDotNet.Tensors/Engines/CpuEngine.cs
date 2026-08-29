@@ -31091,28 +31091,6 @@ public partial class CpuEngine : ITensorLevelEngine
         int srcDimSize = sourceShape[actualDim];
         int outDimSize = gradOutput._shape[actualDim];
 
-        // dstIdx below is built from sourceShape's outer/inner extents and gradOutput's scattered
-        // dimension, then used to index BOTH the index tensor and gradOutput. Neither was checked to
-        // cover it, so a gradOutput disagreeing with sourceShape walked off the end of one of them
-        // and threw IndexOutOfRangeException instead of reporting a bad argument.
-        long addressed = (long)outerSize * outDimSize * innerSize;
-        if (gradOutput.Length < addressed)
-        {
-            throw new ArgumentException(
-                $"ScatterAddBackward: gradOutput has {gradOutput.Length} elements but the scatter addresses "
-                    + $"{addressed} (outer {outerSize} x dim {outDimSize} x inner {innerSize}, from "
-                    + "sourceShape). gradOutput must agree with sourceShape on every axis except the "
-                    + "scattered one.",
-                nameof(gradOutput));
-        }
-
-        if (indices.Length < addressed)
-        {
-            throw new ArgumentException(
-                $"ScatterAddBackward: indices has {indices.Length} entries but {addressed} are addressed; it carries one "
-                    + "source index per gradOutput element.",
-                nameof(indices));
-        }
 
         // Gather gradients back
         for (int outer = 0; outer < outerSize; outer++)
@@ -31354,28 +31332,6 @@ public partial class CpuEngine : ITensorLevelEngine
         int srcDimSize = sourceShape[actualDim];
         int outDimSize = gradOutput._shape[actualDim];
 
-        // dstIdx below is built from sourceShape's outer/inner extents and gradOutput's scattered
-        // dimension, then used to index BOTH the index tensor and gradOutput. Neither was checked to
-        // cover it, so a gradOutput disagreeing with sourceShape walked off the end of one of them
-        // and threw IndexOutOfRangeException instead of reporting a bad argument.
-        long addressed = (long)outerSize * outDimSize * innerSize;
-        if (gradOutput.Length < addressed)
-        {
-            throw new ArgumentException(
-                $"ScatterMeanBackward: gradOutput has {gradOutput.Length} elements but the scatter addresses "
-                    + $"{addressed} (outer {outerSize} x dim {outDimSize} x inner {innerSize}, from "
-                    + "sourceShape). gradOutput must agree with sourceShape on every axis except the "
-                    + "scattered one.",
-                nameof(gradOutput));
-        }
-
-        if (indices.Length < addressed)
-        {
-            throw new ArgumentException(
-                $"ScatterMeanBackward: indices has {indices.Length} entries but {addressed} are addressed; it carries one "
-                    + "source index per gradOutput element.",
-                nameof(indices));
-        }
 
         for (int outer = 0; outer < outerSize; outer++)
         {
