@@ -1564,8 +1564,8 @@ kernel void sum_reduce(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Parallel reduction in shared memory
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
+    for (uint stride = (group_size + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < group_size) {
             shared[lid] += shared[lid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1596,8 +1596,8 @@ kernel void max_reduce(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
+    for (uint stride = (group_size + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < group_size) {
             shared[lid] = max(shared[lid], shared[lid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1627,8 +1627,8 @@ kernel void min_reduce(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
+    for (uint stride = (group_size + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < group_size) {
             shared[lid] = min(shared[lid], shared[lid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2228,8 +2228,8 @@ kernel void dot_product_partial(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
+    for (uint stride = (group_size + 1) / 2; stride > 0; stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < group_size) {
             shared[lid] += shared[lid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4748,8 +4748,8 @@ kernel void dot_product(device const float* a [[buffer(0)]],
     }
     shared[lid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSize / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
+    for (uint s = (tgSize + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (lid < s && lid + s < tgSize) shared[lid] += shared[lid + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lid == 0) output[tgId] = shared[0];
@@ -4766,8 +4766,8 @@ kernel void reduce_partial_sums(device const float* partials [[buffer(0)]],
     for (uint i = lid; i < count; i += tgSize) sum += partials[i];
     shared[lid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSize / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
+    for (uint s = (tgSize + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (lid < s && lid + s < tgSize) shared[lid] += shared[lid + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lid == 0) output[0] = shared[0];

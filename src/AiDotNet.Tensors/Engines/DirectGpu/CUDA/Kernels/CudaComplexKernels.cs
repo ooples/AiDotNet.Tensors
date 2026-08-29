@@ -335,8 +335,8 @@ extern ""C"" __global__ void hrr_phase_coherence_decode(
     }
     sdata[tid] = acc;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     if (tid == 0) outScores[v] = sdata[0];

@@ -298,8 +298,8 @@ extern ""C"" __global__ void cosine_similarity_batch(
     smem[tid + 2 * blockDim.x] = local_normB;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) {
             smem[tid] += smem[tid + s];
             smem[tid + blockDim.x] += smem[tid + blockDim.x + s];
             smem[tid + 2 * blockDim.x] += smem[tid + 2 * blockDim.x + s];

@@ -558,8 +558,8 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_relu(
     sdata[tid] = localSum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float mean = sdata[0] / normalizedSize;
@@ -574,8 +574,8 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_relu(
     sdata[tid] = localVar;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float invStd = rsqrtf(sdata[0] / normalizedSize + epsilon);
@@ -613,8 +613,8 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_gelu(
     sdata[tid] = localSum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float mean = sdata[0] / normalizedSize;
@@ -629,8 +629,8 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_gelu(
     sdata[tid] = localVar;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float invStd = rsqrtf(sdata[0] / normalizedSize + epsilon);
@@ -678,8 +678,8 @@ extern ""C"" __global__ __launch_bounds__(256) void residual_layernorm(
     sdata[tid] = localSum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float mean = sdata[0] / normalizedSize;
@@ -695,8 +695,8 @@ extern ""C"" __global__ __launch_bounds__(256) void residual_layernorm(
     sdata[tid] = localVar;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float invStd = rsqrtf(sdata[0] / normalizedSize + epsilon);
@@ -736,8 +736,8 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_softmax(
     smem[tid] = localMax;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) {
             if (smem[tid + s] > smem[tid]) smem[tid] = smem[tid + s];
         }
         __syncthreads();
@@ -754,8 +754,8 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_softmax(
     smem[tid] = localSum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] += smem[tid + s];
+    for (int s = (blockDim.x + 1) / 2; s > 0; s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < blockDim.x) smem[tid] += smem[tid + s];
         __syncthreads();
     }
     float sumExp = smem[0];
