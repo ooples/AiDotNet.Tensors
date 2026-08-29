@@ -78,6 +78,33 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         private static readonly bool _synchronousLaunches =
             IsSet("AIDOTNET_GPU_SYNC_LAUNCHES");
 
+        /// <summary>
+        /// When <c>AIDOTNET_GPU_DIAGNOSTICS_DUMP</c> names a path, the journal and the buffer
+        /// residency are written there as the process exits.
+        /// </summary>
+        /// <remarks>
+        /// This is the diagnostic that answers "what was the process holding when it died". A host
+        /// that dies with gigabytes of unreleased device buffers looks, in every managed tool, like a
+        /// process with a small tidy heap — the evidence only exists if something recorded it before
+        /// the exit. Registering on both ProcessExit and DomainUnload mirrors what the CUDA backend
+        /// already does for its teardown flags.
+        /// </remarks>
+        static GpuKernelDiagnostics()
+        {
+            var path = Environment.GetEnvironmentVariable("AIDOTNET_GPU_DIAGNOSTICS_DUMP");
+            if (string.IsNullOrEmpty(path)) return;
+
+            try
+            {
+                AppDomain.CurrentDomain.ProcessExit += (_, __) => DumpTo(path);
+                AppDomain.CurrentDomain.DomainUnload += (_, __) => DumpTo(path);
+            }
+            catch (AppDomainUnloadedException)
+            {
+                // Nothing to register against; the diagnostic is best-effort by design.
+            }
+        }
+
         private static bool IsSet(string name)
         {
             var value = Environment.GetEnvironmentVariable(name);
@@ -162,6 +189,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             {
                 var text = new StringBuilder();
                 text.AppendLine("# GPU launch journal (most recent last)");
+                // Residency first: when a process dies holding gigabytes of device buffers, that is
+                // usually the story, and it is invisible in a managed heap dump.
+                text.AppendLine("# buffers: " + DescribeBufferResidency());
                 foreach (var line in RecentLaunches()) text.AppendLine(line);
                 File.WriteAllText(path, text.ToString());
             }
@@ -254,6 +284,66 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
 
         /// <summary>True for 1, 2, 4, 8, ... — see the reduction note on <see cref="ValidateLaunch"/>.</summary>
         public static bool IsPowerOfTwo(long value) => value > 0 && (value & (value - 1)) == 0;
+
+        private static long _liveBufferCount;
+        private static long _liveBufferBytes;
+        private static long _peakLiveBufferBytes;
+        private static long _totalBuffersAllocated;
+
+        /// <summary>Device buffers currently allocated and not yet released.</summary>
+        public static long LiveBufferCount => Interlocked.Read(ref _liveBufferCount);
+
+        /// <summary>Bytes currently held by unreleased device buffers.</summary>
+        public static long LiveBufferBytes => Interlocked.Read(ref _liveBufferBytes);
+
+        /// <summary>The high-water mark of <see cref="LiveBufferBytes"/> for this process.</summary>
+        public static long PeakLiveBufferBytes => Interlocked.Read(ref _peakLiveBufferBytes);
+
+        /// <summary>Every buffer allocated so far, released or not.</summary>
+        public static long TotalBuffersAllocated => Interlocked.Read(ref _totalBuffersAllocated);
+
+        /// <summary>
+        /// Records a device buffer allocation. Two interlocked adds; safe to call on every allocation.
+        /// </summary>
+        /// <remarks>
+        /// WHY THIS IS ALWAYS ON. A leaked device buffer is invisible to every managed tool: the
+        /// wrapper object is small and collectible, so the GC heap stays flat while the process grows
+        /// by gigabytes of native memory. A heap dump of such a process shows nothing wrong. This
+        /// counter is the difference between "the process is somehow using 18 GB" and "37,000 buffers
+        /// were allocated and 12 were released", which is a one-line answer instead of an
+        /// investigation.
+        /// </remarks>
+        public static void RecordBufferAllocated(long bytes)
+        {
+            Interlocked.Increment(ref _totalBuffersAllocated);
+            Interlocked.Increment(ref _liveBufferCount);
+            long live = Interlocked.Add(ref _liveBufferBytes, bytes);
+
+            // Lock-free high-water mark: retry while another thread raised it past our reading.
+            long peak = Interlocked.Read(ref _peakLiveBufferBytes);
+            while (live > peak)
+            {
+                long seen = Interlocked.CompareExchange(ref _peakLiveBufferBytes, live, peak);
+                if (seen == peak) break;
+                peak = seen;
+            }
+        }
+
+        /// <summary>Records a device buffer release. Must pair with <see cref="RecordBufferAllocated"/>.</summary>
+        public static void RecordBufferReleased(long bytes)
+        {
+            Interlocked.Decrement(ref _liveBufferCount);
+            Interlocked.Add(ref _liveBufferBytes, -bytes);
+        }
+
+        /// <summary>Human-readable buffer accounting, for a dump, a test failure, or a teardown check.</summary>
+        public static string DescribeBufferResidency()
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "live={0} buffer(s), {1:N0} byte(s); peak {2:N0} byte(s); {3} allocated in total",
+                LiveBufferCount, LiveBufferBytes, PeakLiveBufferBytes, TotalBuffersAllocated);
+        }
 
         /// <summary>
         /// Checks that a buffer can hold every element a launch will address.

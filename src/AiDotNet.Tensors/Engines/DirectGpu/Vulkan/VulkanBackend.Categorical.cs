@@ -23,6 +23,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// parity test compares one-hot outputs exactly, and a target near a bucket edge would select the
 /// neighbouring category.
 /// </para>
+/// <para>
+/// NOT EXECUTED IN VERIFICATION: this host has the Vulkan loader but no usable Vulkan compute path
+/// (every Vulkan test skips with "Vulkan not available on this system"), so this route is verified
+/// to compile but its output has NOT been observed against the CPU oracle. Unlike the Metal and
+/// WebGpu ports it is at least algorithmically identical to the verified OpenCL kernel, double
+/// accumulation included, rather than a precision-adapted rewrite.
+/// </para>
 /// </remarks>
 public sealed partial class VulkanBackend : ICategoricalSamplingBackend
 {
