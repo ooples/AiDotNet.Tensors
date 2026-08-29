@@ -4041,7 +4041,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 writeA = !writeA;
             }
 
-            var result = new float[1];
+            // Sized to the BUFFER, not to the one value being read. The final buffer is whichever
+            // scratch the last pass wrote, and its capacity is the first pass's partial count -- not
+            // one. CopyToHost validates the destination against the whole buffer, so downloading
+            // into float[1] threw "Destination array too small" for any input needing more than one
+            // partial (1025 elements at a local size of 256 gives 5). That was unreachable until the
+            // reductions started returning the right answer for shorter inputs, so it sat behind the
+            // non-power-of-two tail bug rather than beside it.
+            int downloadLength = current is DirectOpenClGpuBuffer resultBuffer
+                ? Math.Max(1, resultBuffer.Buffer.Length)
+                : 1;
+            var result = new float[downloadLength];
             DownloadBuffer(current, result);
             return result[0];
         }
