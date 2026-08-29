@@ -96,23 +96,43 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
                 $"Max over {length} elements missed the maximum at index {length - 1}.");
         }
 
+        /// <summary>
+        /// Returns null ONLY when this host genuinely has no GPU backend.
+        /// </summary>
+        /// <remarks>
+        /// A blanket <c>catch (Exception)</c> here turns every initialisation failure into a skipped
+        /// test, so a real regression on a GPU-capable host reads as "no GPU available" and the
+        /// suite stays green. Only the absence of the runtime itself is treated as "no backend" —
+        /// a missing ICD or entry point, or an unsupported platform. Anything else is a failure and
+        /// is allowed to fail.
+        /// </remarks>
         private static DirectGpuTensorEngine? TryCreateGpuEngine()
         {
+            DirectGpuTensorEngine engine;
             try
             {
-                var engine = new DirectGpuTensorEngine();
-                if (!engine.IsGpuAvailable)
-                {
-                    engine.Dispose();
-                    return null;
-                }
-
-                return engine;
+                engine = new DirectGpuTensorEngine();
             }
-            catch (Exception)
+            catch (DllNotFoundException)
             {
                 return null;
             }
+            catch (EntryPointNotFoundException)
+            {
+                return null;
+            }
+            catch (PlatformNotSupportedException)
+            {
+                return null;
+            }
+
+            if (!engine.IsGpuAvailable)
+            {
+                engine.Dispose();
+                return null;
+            }
+
+            return engine;
         }
     }
 }

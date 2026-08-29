@@ -559,8 +559,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // whole random program and taking GenerateRandomUniform down with it.
                 try
                 {
+                    // SafeMathFlags, NOT optimizationFlags. The latter enables
+                    // -cl-fast-relaxed-math / -cl-unsafe-math-optimizations, which permit the
+                    // compiler to reassociate floating-point arithmetic. This kernel's whole point is
+                    // an ORDERED double accumulation that reproduces the CPU's inverse-CDF walk
+                    // exactly; reassociating `sum` or `cumulative` moves the boundary and selects a
+                    // different category, which the exact-parity test reads as a hard mismatch.
                     var categoricalProgram = CompileOrLoadCached(
-                        Kernels.CategoricalKernels.GetSource(), optimizationFlags, "Categorical sampling kernels");
+                        Kernels.CategoricalKernels.GetSource(),
+                        OpenClBuildOptions.SafeMathFlags,
+                        "Categorical sampling kernels");
                     _programs.Add(categoricalProgram);
                     foreach (var name in Kernels.CategoricalKernels.GetKernelNames())
                     {

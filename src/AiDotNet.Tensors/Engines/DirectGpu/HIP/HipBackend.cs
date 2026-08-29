@@ -60,6 +60,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     // Additional kernel modules
     private IntPtr _activationModule;
     private IntPtr _neuralNetModule;
+    private IntPtr _categoricalModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -476,6 +477,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile Neural Net kernels
             CompileKernelModule(HipNeuralNetKernels.GetSource(), "neural_net", ref _neuralNetModule,
                 HipNeuralNetKernels.GetKernelNames());
+
+            // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
+            // module would make every kernel in it hostage to this one compiling, and fast math
+            // permits reassociating the ordered double accumulation this kernel needs to reproduce
+            // the CPU sampler exactly. A failure here leaves the engine on its CPU reference instead
+            // of taking generate_random_uniform and the rest down with it.
+            try
+            {
+                CompileKernelModule(HipCategoricalKernels.GetSource(), "categorical",
+                    ref _categoricalModule, HipCategoricalKernels.GetKernelNames(), useFastMath: false);
+            }
+            catch (Exception)
+            {
+                _categoricalModule = IntPtr.Zero;
+            }
 
             // Compile Convolution kernels
             CompileKernelModule(HipConvolutionKernels.GetSource(), "convolution", ref _convolutionModule,
@@ -11161,6 +11177,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipNativeBindings.hipModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
         }
+        if (_categoricalModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_categoricalModule);
+            _categoricalModule = IntPtr.Zero;
+        }
+
         if (_neuralNetModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_neuralNetModule);

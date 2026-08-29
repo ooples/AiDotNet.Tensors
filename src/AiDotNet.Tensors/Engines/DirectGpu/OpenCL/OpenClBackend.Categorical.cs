@@ -53,6 +53,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (oneHot is not DirectOpenClGpuBuffer destination) return false;
             if (!_kernelCache.TryGetValue("categorical_sample", out var kernel)) return false;
 
+            // Both buffers are indexed as row * classes + c, so both must actually hold that many
+            // elements. CanCategoricalSample only checks the DIMENSIONS; an undersized buffer would
+            // be written past its end on the device, which corrupts whatever is next in device
+            // memory and is reported, if at all, by some unrelated later operation.
+            long addressed = (long)rows * classes;
+            GpuKernelDiagnostics.ValidateCapacity(
+                "categorical_sample", nameof(probabilities), source.Buffer.Length, addressed);
+            GpuKernelDiagnostics.ValidateCapacity(
+                "categorical_sample", nameof(oneHot), destination.Buffer.Length, addressed);
+
+            if (source.Buffer.Length < addressed || destination.Buffer.Length < addressed)
+            {
+                // Even with deep checks off, refuse rather than launch an out-of-range write.
+                return false;
+            }
+
             kernel.SetArg(0, source.Buffer.Handle);
             kernel.SetArg(1, destination.Buffer.Handle);
             kernel.SetArg(2, rows);

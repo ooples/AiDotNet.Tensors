@@ -153,21 +153,42 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
         [SkippableFact]
         public void ARealGpuLaunchIsJournalled()
         {
-            DirectGpuTensorEngine? engine = null;
-            try { engine = new DirectGpuTensorEngine(); }
-            catch (Exception) { Skip.If(true, "No direct GPU backend is available on this host."); }
+            // Only a missing runtime counts as "no GPU"; a real initialisation failure on a
+            // GPU-capable host must fail rather than skip.
+            DirectGpuTensorEngine? engine;
+            try
+            {
+                engine = new DirectGpuTensorEngine();
+            }
+            catch (DllNotFoundException) { engine = null; }
+            catch (EntryPointNotFoundException) { engine = null; }
+            catch (PlatformNotSupportedException) { engine = null; }
+
+            Skip.If(engine is null, "No direct GPU backend is available on this host.");
 
             using (engine)
             {
-                Skip.If(engine is null || !engine.IsGpuAvailable, "No direct GPU backend is available on this host.");
-                var backend = engine!.GetBackend();
+                Skip.If(!engine!.IsGpuAvailable, "No direct GPU backend is available on this host.");
+                var backend = engine.GetBackend();
                 Skip.If(backend is null, "No direct GPU backend is available on this host.");
+
+                // The journal is STATIC, so a non-empty journal proves nothing — another test in
+                // this class fills it. What must be true is that this launch ADVANCES it.
+                var before = GpuKernelDiagnostics.RecentLaunches();
+                string? newestBefore = before.Count == 0 ? null : before[before.Count - 1];
 
                 var values = Enumerable.Range(1, 64).Select(i => (float)i).ToArray();
                 using var buffer = backend!.AllocateBuffer(values);
                 backend.Sum(buffer, values.Length);
 
-                Assert.NotEmpty(GpuKernelDiagnostics.RecentLaunches());
+                var after = GpuKernelDiagnostics.RecentLaunches();
+                Assert.NotEmpty(after);
+
+                string newestAfter = after[after.Count - 1];
+                Assert.True(
+                    newestBefore is null || !string.Equals(newestAfter, newestBefore, StringComparison.Ordinal),
+                    "backend.Sum did not add a journal entry: the newest entry is unchanged at "
+                        + $"'{newestAfter}'. A launch that is not journalled is invisible after a crash.");
             }
         }
     }

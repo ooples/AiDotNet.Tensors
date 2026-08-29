@@ -51,7 +51,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         private const int JournalCapacity = 64;
 
         private static readonly LaunchRecord[] _journal = new LaunchRecord[JournalCapacity];
+
+        /// <summary>
+        /// The sequence number each slot has finished being written for, or -1 for never.
+        /// </summary>
+        /// <remarks>
+        /// Incrementing the sequence publishes a slot number before the record in it has been
+        /// written, so a concurrent reader could format a half-written or recycled slot and label it
+        /// with the new number. The writer stamps this AFTER filling the record and the reader
+        /// checks it, so a slot is only ever reported once it genuinely holds that launch.
+        /// </remarks>
+        private static readonly long[] _published = CreatePublishedMarkers();
+
         private static long _sequence = -1;
+
+        private static long[] CreatePublishedMarkers()
+        {
+            var markers = new long[JournalCapacity];
+            for (int i = 0; i < markers.Length; i++) markers[i] = -1;
+            return markers;
+        }
 
         private static readonly bool _deepChecks =
             IsSet("AIDOTNET_GPU_KERNEL_DIAGNOSTICS");
@@ -101,6 +120,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 ManagedThreadId = Environment.CurrentManagedThreadId,
                 Ticks = DateTime.UtcNow.Ticks,
             };
+
+            // Published last: until this store, a reader must not treat the slot as holding `slot`.
+            Volatile.Write(ref _published[index], slot);
         }
 
         /// <summary>The most recent launches, oldest first. Empty when nothing has launched.</summary>
@@ -115,6 +137,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             for (long slot = Math.Max(0, last - count + 1); slot <= last; slot++)
             {
                 int index = (int)(((slot % JournalCapacity) + JournalCapacity) % JournalCapacity);
+                if (Volatile.Read(ref _published[index]) != slot) continue;   // not yet written, or recycled
+
                 var record = _journal[index];
                 if (record.Kernel is null) continue;
 

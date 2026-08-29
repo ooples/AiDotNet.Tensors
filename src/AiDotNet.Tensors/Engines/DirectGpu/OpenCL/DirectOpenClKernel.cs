@@ -193,10 +193,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
-            BeginLaunch(alignedGlobal, localSize);
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -239,6 +240,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
 
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
+
             int err;
             lock (_submitLock)
             {
@@ -280,6 +283,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -328,6 +333,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
 
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
+
             int err;
             lock (_submitLock)
             {
@@ -367,6 +374,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -411,6 +420,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -457,6 +468,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             // Allocate event handle
             IntPtr eventHandle = Marshal.AllocHGlobal(IntPtr.Size);
@@ -507,6 +520,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             IntPtr eventHandle = Marshal.AllocHGlobal(IntPtr.Size);
             try
@@ -581,11 +596,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         /// <summary>Finishes the queue when synchronous diagnostics are on, so a device fault is
         /// reported against the launch that caused it.</summary>
-        private void EndLaunch()
+        /// <summary>Work-item count across however many dimensions the launch uses.</summary>
+        private static long TotalOf(UIntPtr[] sizes)
+        {
+            long total = 1;
+            foreach (var size in sizes) total *= (long)(ulong)size;
+            return total;
+        }
+
+        private void EndLaunch() => EndLaunch(_context.CommandQueue);
+
+        /// <summary>
+        /// Finishes THE QUEUE THIS LAUNCH USED. The OnQueue and profiled paths submit to a different
+        /// queue than <c>_context.CommandQueue</c>, so finishing the default one would attribute a
+        /// fault to the wrong work — or miss it entirely.
+        /// </summary>
+        private void EndLaunch(IntPtr commandQueue)
         {
             if (!GpuKernelDiagnostics.SynchronousLaunches) return;
 
-            int err = OpenClNativeBindings.Finish(_context.CommandQueue);
+            int err = OpenClNativeBindings.Finish(commandQueue);
             if (err != OpenClNativeBindings.CL_SUCCESS)
             {
                 throw new InvalidOperationException(
@@ -617,6 +647,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         public void Dispose()
+        {
+            // Released under the SUBMIT LOCK. ThrowIfUnusable is otherwise a time-of-check to
+            // time-of-use window: a launch validates the handle, Dispose calls clReleaseKernel, and
+            // the launch then hands the released handle to clSetKernelArg. Taking the same lock the
+            // apply-and-enqueue critical section holds makes release and submission mutually
+            // exclusive, so a validated handle stays valid until its enqueue completes.
+            lock (_submitLock)
+            {
+                DisposeLocked();
+            }
+        }
+
+        private void DisposeLocked()
         {
             if (_disposed) return;
 

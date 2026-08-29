@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
     {
         /// <inheritdoc/>
         public bool CanCategoricalSample(int rows, int classes)
-            => _neuralNetModule != IntPtr.Zero
+            => _categoricalModule != IntPtr.Zero
                && rows > 0
                && classes > 0
                && (long)rows * classes <= int.MaxValue

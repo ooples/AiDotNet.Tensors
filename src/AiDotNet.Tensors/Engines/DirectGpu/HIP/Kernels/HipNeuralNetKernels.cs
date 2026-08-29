@@ -2489,45 +2489,6 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
 }
 
 #undef BATCHED_TILE_SIZE
-
-// ===========================================================================
-// CATEGORICAL SAMPLING
-// ===========================================================================
-// Device twin of the OpenCL categorical_sample kernel, and of CpuEngine's
-// TensorCategoricalSample. All three draw from the same StatelessRandom PCG hash keyed on
-// (seed, row) and walk the same inverse CDF in double, so the same seed yields the same
-// one-hot on every backend. Float accumulation would pick the neighbouring category at a
-// bucket edge, which the exact-parity test treats as a hard mismatch.
-
-extern ""C"" __global__ __launch_bounds__(256) void categorical_sample(
-    const float* probabilities, float* oneHot, int rows, int classes, unsigned long long seed)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-
-    unsigned int seed32 = (unsigned int)seed ^ (unsigned int)(seed >> 32);
-    unsigned int state = (unsigned int)row * 747796405u + seed32 + 2891336453u;
-    unsigned int word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
-    unsigned int sample = (word >> 22) ^ word;
-    float uniform = (float)(sample >> 8) * (1.0f / 16777216.0f);
-
-    int offset = row * classes;
-
-    double sum = 0.0;
-    for (int c = 0; c < classes; c++) sum += (double)probabilities[offset + c];
-
-    double target = (double)uniform * sum;
-    double cumulative = 0.0;
-    int selected = classes - 1;
-    for (int c = 0; c < classes; c++)
-    {
-        cumulative += (double)probabilities[offset + c];
-        if (target < cumulative) { selected = c; break; }
-    }
-
-    for (int c = 0; c < classes; c++) oneHot[offset + c] = 0.0f;
-    oneHot[offset + selected] = 1.0f;
-}
 ";
     }
 
@@ -2535,7 +2496,6 @@ extern ""C"" __global__ __launch_bounds__(256) void categorical_sample(
     {
         return new[]
         {
-            "categorical_sample",
             "relu_backward", "sigmoid_backward", "tanh_backward", "gelu_backward",
             "softmax_backward", "leaky_relu", "leaky_relu_backward",
             "elu", "elu_backward", "silu", "swish_backward", "mish", "softplus", "hardswish",
