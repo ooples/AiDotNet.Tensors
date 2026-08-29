@@ -193,6 +193,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
+            BeginLaunch(alignedGlobal, localSize);
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
@@ -215,7 +216,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+            {
+                throw new InvalidOperationException(
+                    $"Failed to enqueue kernel '{_kernelName}': {err}. Recent launches, most recent "
+                        + "last: " + Environment.NewLine + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+
+            EndLaunch();
         }
 
         /// <summary>
@@ -250,7 +257,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+            {
+                throw new InvalidOperationException(
+                    $"Failed to enqueue kernel '{_kernelName}': {err}. Recent launches, most recent "
+                        + "last: " + Environment.NewLine + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+
+            EndLaunch();
         }
 
         /// <summary>
@@ -286,7 +299,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+            {
+                throw new InvalidOperationException(
+                    $"Failed to enqueue kernel '{_kernelName}': {err}. Recent launches, most recent "
+                        + "last: " + Environment.NewLine + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+
+            EndLaunch();
         }
 
         #endregion
@@ -521,6 +540,60 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         #endregion
+
+        /// <summary>The kernel's own argument count, queried once. -1 when unavailable.</summary>
+        private int _declaredArgCount = -2;   // -2 = not yet queried, -1 = device would not say
+
+        private int DeclaredArgCount
+        {
+            get
+            {
+                if (_declaredArgCount == -2)
+                {
+                    _declaredArgCount = OpenClNativeBindings.GetKernelNumArgs(_kernel);
+                }
+
+                return _declaredArgCount;
+            }
+        }
+
+        /// <summary>
+        /// Validates the launch, records it in the diagnostics journal, and -- under
+        /// AIDOTNET_GPU_SYNC_LAUNCHES -- finishes the queue so an asynchronous fault is attributed
+        /// to THIS launch rather than to whatever synchronises next.
+        /// </summary>
+        private void BeginLaunch(long globalSize, long localSize)
+        {
+            int staged = _pendingArgs is null || !ReferenceEquals(_pendingOwner, this)
+                ? 0
+                : _pendingArgs.Count;
+
+            GpuKernelDiagnostics.ValidateLaunch(
+                _kernelName,
+                handleIsValid: !_disposed && _kernel != IntPtr.Zero,
+                stagedArgCount: staged,
+                declaredArgCount: DeclaredArgCount,
+                globalSize: globalSize,
+                localSize: localSize);
+
+            GpuKernelDiagnostics.RecordLaunch(_kernelName, globalSize, localSize, staged);
+        }
+
+        /// <summary>Finishes the queue when synchronous diagnostics are on, so a device fault is
+        /// reported against the launch that caused it.</summary>
+        private void EndLaunch()
+        {
+            if (!GpuKernelDiagnostics.SynchronousLaunches) return;
+
+            int err = OpenClNativeBindings.Finish(_context.CommandQueue);
+            if (err != OpenClNativeBindings.CL_SUCCESS)
+            {
+                throw new InvalidOperationException(
+                    $"GPU fault after launching '{_kernelName}' (clFinish returned {err}). Recent "
+                        + "launches, most recent last: " + Environment.NewLine
+                        + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+        }
 
         /// <summary>Refuses to launch a kernel whose handle has been released.</summary>
         /// <remarks>
