@@ -51,6 +51,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             if (probabilities is null || oneHot is null) return false;
             if (!_kernelCache.TryGetValue("categorical_sample", out var kernel)) return false;
 
+            // Both buffers are indexed as row * classes + c, so both must actually hold that many
+            // elements. CanCategoricalSample only checks the DIMENSIONS; an undersized buffer would
+            // be written past its end on the device, which corrupts whatever is next in device
+            // memory and is reported, if at all, by some unrelated later operation. CUDA already
+            // rejects this via ValidateExactCategoricalBuffer and OpenCL via the same pair of
+            // comparisons below; HIP was the one route that launched unchecked.
+            long addressed = (long)rows * classes;
+            GpuKernelDiagnostics.ValidateCapacity(
+                "categorical_sample", nameof(probabilities), probabilities.Size, addressed);
+            GpuKernelDiagnostics.ValidateCapacity(
+                "categorical_sample", nameof(oneHot), oneHot.Size, addressed);
+
+            if (probabilities.Size < addressed || oneHot.Size < addressed)
+            {
+                // Even with deep checks off, refuse rather than launch an out-of-range write.
+                return false;
+            }
+
             uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
             IntPtr probabilitiesHandle = probabilities.Handle;
             IntPtr oneHotHandle = oneHot.Handle;

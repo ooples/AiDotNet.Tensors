@@ -72,6 +72,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _fftLibrary;
     private IntPtr _detectionLibrary;
     private IntPtr _annLibrary; // fused ANN kernels (IAnnBackend: IVF / PQ / IVFPQ / HNSW primitives)
+    private IntPtr _categoricalLibrary; // categorical sampling (ICategoricalSamplingBackend)
     private IntPtr _geometryLibrary;
     private IntPtr _roiLibrary;
     private IntPtr _audioLibrary;
@@ -347,6 +348,20 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             System.Diagnostics.Debug.WriteLine($"Metal ANN pre-compilation warning: {ex.Message}");
             _annLibrary = IntPtr.Zero;
+        }
+
+        // Categorical sampling. Its OWN library rather than a shared one: a compile failure here
+        // must not take unrelated kernels down with it, and this kernel is the only one whose
+        // correctness depends on compensated (non-reassociated) float arithmetic. On failure the
+        // engine keeps using CpuEngine.TensorCategoricalSample.
+        try
+        {
+            _categoricalLibrary = _shaderLibrary.CompileLibrary("Categorical", MetalCategoricalKernels.Source);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal categorical pre-compilation warning: {ex.Message}");
+            _categoricalLibrary = IntPtr.Zero;
         }
 
         // Geometry / sampling kernels (#217). IGeometryBackend dispatch.
