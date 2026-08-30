@@ -45,6 +45,22 @@ internal static class GpuAutoDetectModuleInit
     {
         try
         {
+            // BEFORE the opt-out gate, deliberately. This installs the crash-time diagnostics dump
+            // (AIDOTNET_GPU_DIAGNOSTICS_DUMP) and costs nothing when that variable is unset.
+            //
+            // It cannot live in GpuKernelDiagnostics's static constructor alone: a static
+            // constructor runs on FIRST USE of the type, so a process that never touches the class
+            // -- a CPU-only CI shard, or a run that dies before reaching any GPU code -- never
+            // installs the handler and writes no journal. That is backwards for crash forensics,
+            // where the runs you most need evidence from are exactly the ones that got nowhere.
+            // Observed: the variable was set on every shard of a full CI matrix and not one file
+            // was produced.
+            //
+            // Registered even when AIDOTNET_DISABLE_GPU is set, because the buffer-residency
+            // counters and the launch journal are diagnostics about the process, not GPU work being
+            // requested, and a host dying with GPU disabled is still worth attributing.
+            DirectGpu.GpuKernelDiagnostics.EnsureRegistered();
+
             // Opt-out gate: AIDOTNET_DISABLE_GPU set to any non-empty
             // value skips auto-detection. Mirrors BlasEnvDefault's
             // env-var pattern on the consumer side. Users who explicitly

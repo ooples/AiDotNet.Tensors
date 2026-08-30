@@ -95,11 +95,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         /// residency are written there as the process exits.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// This is the diagnostic that answers "what was the process holding when it died". A host
         /// that dies with gigabytes of unreleased device buffers looks, in every managed tool, like a
         /// process with a small tidy heap — the evidence only exists if something recorded it before
         /// the exit. Registering on both ProcessExit and DomainUnload mirrors what the CUDA backend
         /// already does for its teardown flags.
+        /// </para>
+        /// <para>
+        /// A STATIC CONSTRUCTOR IS NOT ENOUGH ON ITS OWN, which is why <see cref="EnsureRegistered"/>
+        /// exists and is called from a module initializer. A static constructor runs on FIRST USE of
+        /// the type, so on a run where nothing happens to touch this class — a CPU-only CI shard, for
+        /// instance — the handler is never installed and no journal is written. The diagnostic would
+        /// then only work for processes that were already using it, which is backwards for crash
+        /// forensics: the runs you most need evidence from are the ones that died before reaching any
+        /// GPU code. Observed exactly that way: AIDOTNET_GPU_DIAGNOSTICS_DUMP was set on every shard
+        /// and not one file was produced.
+        /// </para>
         /// </remarks>
         static GpuKernelDiagnostics()
         {
@@ -115,6 +127,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             {
                 // Nothing to register against; the diagnostic is best-effort by design.
             }
+        }
+
+        /// <summary>
+        /// Forces the exit-dump handler to be installed at assembly load, rather than whenever some
+        /// caller first happens to touch this type. Idempotent; running the static constructor is
+        /// the entire point, so the body can stay empty.
+        /// </summary>
+        public static void EnsureRegistered()
+        {
+            // Referencing any static member is enough to run the static constructor. Kept explicit
+            // (rather than relying on a field read a future edit might delete as "unused") so the
+            // reason this call exists survives.
+            System.Runtime.CompilerServices.RuntimeHelpers.RunClassConstructor(
+                typeof(GpuKernelDiagnostics).TypeHandle);
         }
 
         private static bool IsSet(string name)
