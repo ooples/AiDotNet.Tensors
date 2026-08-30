@@ -31,6 +31,7 @@
 
 using System;
 using System.Reflection;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -51,8 +52,10 @@ public class BytecapEvictionRaceTests
     /// </summary>
     [SkippableFact]
     [Trait("Category", "CudaRequired")]
-    public void EagerTraining_BelowCap_NoCudaError()
+    public async Task EagerTraining_BelowCap_NoCudaError()
     {
+        await Task.Yield();
+
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
         var eng = AiDotNetEngine.Current;
         Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the GPU backend");
@@ -109,8 +112,10 @@ public class BytecapEvictionRaceTests
     /// </summary>
     [SkippableFact]
     [Trait("Category", "CudaRequired")]
-    public void EagerTraining_CacheAccounting_StaysConsistent()
+    public async Task EagerTraining_CacheAccounting_StaysConsistent()
     {
+        await Task.Yield();
+
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
         var eng = AiDotNetEngine.Current;
         Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the GPU backend");
@@ -130,6 +135,10 @@ public class BytecapEvictionRaceTests
                 var c = eng.TensorMatMul(a, b);
                 _ = c.AsSpan()[0];
             }
+
+            // Attribute any asynchronous fault to this test instead of leaving a
+            // sticky CUDA error for the next DirectGpuSerial test to discover.
+            cudaBackend!.Synchronize();
 
             long running = ReadLong(dgte, "_currentActivationCacheBytes");
             Assert.True(running >= 0,

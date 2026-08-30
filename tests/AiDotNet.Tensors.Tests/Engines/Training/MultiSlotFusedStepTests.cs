@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Training;
 /// pattern; this test uses a simpler [input, target, aux] triple with a linear
 /// forward to isolate the multi-slot mechanism.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class MultiSlotFusedStepTests
 {
     /// <summary>

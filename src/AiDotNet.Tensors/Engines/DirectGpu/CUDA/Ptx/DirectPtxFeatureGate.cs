@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -95,8 +96,18 @@ internal static class DirectPtxFeatureGate
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
 
-    /// <summary>Test-only override. Null restores environment-based behavior.</summary>
-    internal static bool? TestOverride { get; set; }
+    private static readonly AsyncLocal<bool?> s_testOverride = new();
+
+    /// <summary>
+    /// Test-only override for the current logical call context. Null restores
+    /// environment-based behavior. Logical-context isolation prevents parallel
+    /// tests from changing one another's feature-gate decision.
+    /// </summary>
+    internal static bool? TestOverride
+    {
+        get => s_testOverride.Value;
+        set => s_testOverride.Value = value;
+    }
     /// <summary>Benchmark-only access to reduction cells that have not passed promotion.</summary>
     internal static bool ReductionExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to mean/max/min/sum-of-squares row cells that have not passed promotion.</summary>

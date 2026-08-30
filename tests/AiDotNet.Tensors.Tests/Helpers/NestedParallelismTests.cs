@@ -25,6 +25,7 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 /// serial automatically.
 /// </para>
 /// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class NestedParallelismTests
 {
     private readonly ITestOutputHelper _output;
@@ -37,8 +38,10 @@ public class NestedParallelismTests
     }
 
     [Fact]
-    public void NestedParallelLoop_RunsSerially_WhenInsideParallelRegion()
+    public async Task NestedParallelLoop_RunsSerially_WhenInsideParallelRegion()
     {
+        await Task.Yield();
+
         // Force the OUTER loop to dispatch in parallel: huge totalWork + many
         // iterations. On a multi-core box this runs the body on several workers,
         // each of which sets IsInParallelRegion. A NESTED parallel loop must then
@@ -100,8 +103,10 @@ public class NestedParallelismTests
     [InlineData(1, 8, 1024, 64)]
     [InlineData(2, 8, 512, 64)]
     [InlineData(1, 16, 256, 72)]
-    public void FloatSdpa_LargeShape_CompletesWithoutStarvation(int b, int h, int s, int d)
+    public async Task FloatSdpa_LargeShape_CompletesWithoutStarvation(int b, int h, int s, int d)
     {
+        await Task.Yield();
+
         var engine = new CpuEngine();
         var q = RandomFloat(new[] { b, h, s, d }, 1);
         var k = RandomFloat(new[] { b, h, s, d }, 2);
@@ -113,14 +118,15 @@ public class NestedParallelismTests
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var task = Task.Run(() =>
             engine.ScaledDotProductAttention(q, k, v, mask: null, scale: null, out _));
-        bool finished = task.Wait(TimeSpan.FromSeconds(60));
+        Task completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(60)));
         sw.Stop();
 
-        Assert.True(finished,
+        Assert.True(ReferenceEquals(task, completed),
             $"float SDPA [{b},{h},{s},{d}] did not finish within 60s — nested-parallelism starvation regressed.");
+        var output = await task;
         _output.WriteLine($"[{b},{h},{s},{d}] float SDPA completed in {sw.Elapsed.TotalMilliseconds:F0} ms");
 
-        var outSpan = task.Result.AsSpan();
+        var outSpan = output.AsSpan();
         for (int i = 0; i < outSpan.Length; i++)
             // float.IsFinite is unavailable on net471 — use the NaN/Inf primitives.
             Assert.True(!float.IsNaN(outSpan[i]) && !float.IsInfinity(outSpan[i]),

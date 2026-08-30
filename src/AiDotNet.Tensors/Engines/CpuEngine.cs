@@ -9500,33 +9500,19 @@ public partial class CpuEngine : ITensorLevelEngine
         // absent from the selector because neither may change the computed function.
         if (typeof(T) == typeof(float))
         {
-            // GetReadOnlyDataArray for the two INPUTS: GetDataArray privatizes a copy-on-write
-            // tensor, and a read must not. TensorCowInferenceReadPathTests.Conv2D_DoesNotPrivatizeCowKernel
-            // asserts exactly that the kernel stays COW-shared across a convolution. The output is a
-            // tensor this method just rented, so it is written through GetDataArray as normal.
-            if (ShouldUseAdaptiveFloatConv2D(
-                input.Layout, stride, stride, padding, padding, dilation, dilation))
-            {
-                Conv2DWithIm2ColFloat(
-                    (Tensor<float>)(object)input,
-                    (Tensor<float>)(object)kernel,
-                    (Tensor<float>)(object)result,
-                    batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth,
-                    stride, padding, dilation,
-                    outputHeight, outputWidth);
-            }
-            else
-            {
-                Conv2DIm2colGemm(
-                    (float[])(object)input.GetReadOnlyDataArray(),
-                    (float[])(object)kernel.GetReadOnlyDataArray(),
-                    (float[])(object)result.GetDataArray(),
-                    batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth,
-                    outputHeight, outputWidth,
-                    stride, stride, padding, padding, dilation, dilation);
-            }
+            // The dispatcher obtains backing arrays only if it selects im2col-GEMM. Keeping that
+            // lookup lazy matters for offset views on the Windows adaptive route: a read-only array
+            // request would materialize an otherwise-unneeded full copy. When arrays are needed,
+            // GetReadOnlyDataArray preserves COW sharing for both inputs.
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result,
+                null, null, null,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
@@ -9744,33 +9730,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Output tensor shape [{string.Join(", ", output._shape)}] doesn't match expected shape [{batch}, {outChannels}, {outputHeight}, {outputWidth}].");
         }
 
-        // Use the same platform/geometry selector as both allocating overloads so
+        // Use the same platform/geometry dispatcher as both allocating overloads so
         // a preallocated destination changes allocation behavior only, never arithmetic.
         if (typeof(T) == typeof(float))
         {
-            if (ShouldUseAdaptiveFloatConv2D(
-                input.Layout, stride, stride, padding, padding, dilation, dilation))
-            {
-                Conv2DWithIm2ColFloat(
-                    (Tensor<float>)(object)input,
-                    (Tensor<float>)(object)kernel,
-                    (Tensor<float>)(object)output,
-                    batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth,
-                    stride, padding, dilation,
-                    outputHeight, outputWidth);
-            }
-            else
-            {
-                Conv2DIm2colGemm(
-                    (float[])(object)input.GetReadOnlyDataArray(),
-                    (float[])(object)kernel.GetReadOnlyDataArray(),
-                    (float[])(object)output.GetDataArray(),
-                    batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth,
-                    outputHeight, outputWidth,
-                    stride, stride, padding, padding, dilation, dilation);
-            }
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)output,
+                null, null, null,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
             return;
         }
 
@@ -9854,6 +9826,10 @@ public partial class CpuEngine : ITensorLevelEngine
             outputHeight, outputWidth);
     }
 
+    private static readonly bool IsWindowsPlatform =
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+
     /// <summary>
     /// Selects one float convolution family for every public CPU entry point.
     /// The adaptive cascade is materially faster on Windows, while im2col-GEMM is the
@@ -9869,12 +9845,79 @@ public partial class CpuEngine : ITensorLevelEngine
         int dilationH,
         int dilationW)
     {
-        return inputLayout == LinearAlgebra.TensorLayout.Nchw
+        return ShouldUseAdaptiveFloatConv2DForPlatform(
+            IsWindowsPlatform, inputLayout, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>
+    /// Applies the platform and geometry policy separately from runtime OS detection so every
+    /// decision branch can be tested deterministically on every CI host.
+    /// </summary>
+    internal static bool ShouldUseAdaptiveFloatConv2DForPlatform(
+        bool isWindows,
+        LinearAlgebra.TensorLayout inputLayout,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW)
+    {
+        return isWindows
+            && inputLayout == LinearAlgebra.TensorLayout.Nchw
             && strideH == strideW
             && padH == padW
-            && dilationH == dilationW
-            && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
-                System.Runtime.InteropServices.OSPlatform.Windows);
+            && dilationH == dilationW;
+    }
+
+    /// <summary>
+    /// Dispatches every float Conv2D entry point through the same platform/geometry policy.
+    /// The supplied arrays may already be unpacked for a packed-layout fallback.
+    /// </summary>
+    private void DispatchFloatConv2D(
+        Tensor<float> input,
+        Tensor<float> kernel,
+        Tensor<float> output,
+        float[]? inputData,
+        float[]? kernelData,
+        float[]? outputData,
+        int batch,
+        int inChannels,
+        int height,
+        int width,
+        int outChannels,
+        int kernelHeight,
+        int kernelWidth,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW,
+        int outputHeight,
+        int outputWidth)
+    {
+        if (ShouldUseAdaptiveFloatConv2D(
+            input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
+        {
+            Conv2DWithIm2ColFloat(
+                input, kernel, output,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                strideH, padH, dilationH,
+                outputHeight, outputWidth);
+            return;
+        }
+
+        inputData ??= input.GetReadOnlyDataArray();
+        kernelData ??= kernel.GetReadOnlyDataArray();
+        outputData ??= output.GetDataArray();
+        Conv2DIm2colGemm(
+            inputData, kernelData, outputData,
+            batch, inChannels, height, width,
+            outChannels, kernelHeight, kernelWidth,
+            outputHeight, outputWidth,
+            strideH, strideW, padH, padW, dilationH, dilationW);
     }
 
     /// <summary>
@@ -13814,29 +13857,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     batch, inChannels, height, width, cBlock);
                 inputData = (T[])(object)unpackedData;
             }
-            if (ShouldUseAdaptiveFloatConv2D(
-                input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
-            {
-                Conv2DWithIm2ColFloat(
-                    (Tensor<float>)(object)input,
-                    (Tensor<float>)(object)kernel,
-                    (Tensor<float>)(object)result,
-                    batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth,
-                    strideH, padH, dilationH,
-                    outputHeight, outputWidth);
-            }
-            else
-            {
-                Conv2DIm2colGemm(
-                    (float[])(object)inputData,
-                    (float[])(object)kernelData,
-                    (float[])(object)outputData,
-                    batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth,
-                    outputHeight, outputWidth,
-                    strideH, strideW, padH, padW, dilationH, dilationW);
-            }
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result,
+                (float[])(object)inputData,
+                (float[])(object)kernelData,
+                (float[])(object)outputData,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW,
+                outputHeight, outputWidth);
         }
         else if (typeof(T) == typeof(double))
         {

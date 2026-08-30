@@ -610,14 +610,20 @@ public class DirectPtxComplexMultiplyTests
 
     [SkippableTheory]
     [InlineData(65536)]
-    public void DriverOnlySplitComplexPhase_MatchesAtan2WithinTolerance(int count)
+    public async Task DriverOnlySplitComplexPhase_MatchesAtan2WithinTolerance(int count)
     {
+        await Task.Yield();
+
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var runtime = new DirectPtxRuntime();
         Skip.IfNot(DirectPtxArchitecture.HasValidatedComplexUnary(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
             "The candidate is admitted only on SM86.");
         using var kernel = new PtxSplitComplexPhaseF32Kernel(runtime, count);
+        Assert.True(
+            kernel.Audit.Function.RegistersPerThread <= kernel.Blueprint.ResourceBudget.MaxRegistersPerThread,
+            $"Split-phase kernel uses {kernel.Audit.Function.RegistersPerThread} registers/thread; " +
+            $"budget is {kernel.Blueprint.ResourceBudget.MaxRegistersPerThread}.");
         var re = new float[count]; var im = new float[count];
         var random = RandomHelper.CreateSeededRandom(20260910 + count);
         for (int i = 0; i < count; i++) { re[i] = (float)(random.NextDouble() * 2.0 - 1.0); im[i] = (float)(random.NextDouble() * 2.0 - 1.0); }

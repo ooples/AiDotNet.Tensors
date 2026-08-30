@@ -36,6 +36,7 @@ namespace AiDotNet.Tensors.Tests.Engines
     /// two are supposed to be the same computation reaching two different destinations.
     /// </para>
     /// </remarks>
+    [Collection("BlasManaged-Stats-Serial")]
     public class Conv2DEntryPointParityTests
     {
         public static IEnumerable<object[]> Shapes()
@@ -51,6 +52,41 @@ namespace AiDotNet.Tensors.Tests.Engines
             yield return new object[] { 4, 2, 1, 16, 32, 14 };
             yield return new object[] { 5, 1, 2, 3, 8, 16 };
             yield return new object[] { 7, 1, 3, 3, 8, 16 };
+        }
+
+        public static IEnumerable<object[]> AdaptiveDispatchCases()
+        {
+            // isWindows, layout, strideH/W, padH/W, dilationH/W, expected
+            yield return new object[] { true, TensorLayout.Nchw, 1, 1, 1, 1, 1, 1, true };
+            yield return new object[] { false, TensorLayout.Nchw, 1, 1, 1, 1, 1, 1, false };
+            yield return new object[] { true, TensorLayout.Nchwc8, 1, 1, 1, 1, 1, 1, false };
+            yield return new object[] { true, TensorLayout.Nchw, 1, 2, 1, 1, 1, 1, false };
+            yield return new object[] { true, TensorLayout.Nchw, 1, 1, 1, 0, 1, 1, false };
+            yield return new object[] { true, TensorLayout.Nchw, 1, 1, 1, 1, 1, 2, false };
+        }
+
+        /// <summary>
+        /// Verifies the OS/layout/geometry dispatch policy without depending on the CI host OS.
+        /// </summary>
+        [Theory]
+        [MemberData(nameof(AdaptiveDispatchCases))]
+        public async Task AdaptiveDispatchPolicy_SelectsOnlyWindowsSymmetricNchw(
+            bool isWindows,
+            TensorLayout layout,
+            int strideH,
+            int strideW,
+            int padH,
+            int padW,
+            int dilationH,
+            int dilationW,
+            bool expected)
+        {
+            await Task.Yield();
+
+            bool actual = CpuEngine.ShouldUseAdaptiveFloatConv2DForPlatform(
+                isWindows, layout, strideH, strideW, padH, padW, dilationH, dilationW);
+
+            Assert.Equal(expected, actual);
         }
 
         /// <summary>
@@ -118,6 +154,40 @@ namespace AiDotNet.Tensors.Tests.Engines
                             : string.Empty)
                         + "Every public entry point must select the same kernel, and replaying one "
                         + "entry point must not change its own output.");
+            }
+        }
+
+        /// <summary>
+        /// Exercises the im2col side of the shared dispatcher on Windows as well as Linux by using
+        /// geometry the adaptive kernel cannot represent.
+        /// </summary>
+        [Fact]
+        public async Task AsymmetricArrayEntryPoints_ProduceStableIdenticalFloatResults()
+        {
+            await Task.Yield();
+
+            var engine = new CpuEngine();
+            var rng = new Random(23);
+            var input = new Tensor<float>(new[] { 1, 3, 9, 11 });
+            var kernel = new Tensor<float>(new[] { 5, 3, 3, 2 });
+
+            for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < kernel.Length; i++) kernel[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            int[] stride = [2, 1];
+            int[] padding = [1, 0];
+            int[] dilation = [1, 2];
+            var expected = engine.Conv2D(input, kernel, stride, padding, dilation);
+            var replay = engine.Conv2D(input, kernel, stride, padding, dilation);
+            var inPlace = new Tensor<float>(expected.Shape.ToArray());
+            engine.Conv2DInto(inPlace, input, kernel, stride, padding, dilation);
+
+            Assert.Equal(expected.Shape.ToArray(), replay.Shape.ToArray());
+            Assert.Equal(expected.Shape.ToArray(), inPlace.Shape.ToArray());
+            for (int i = 0; i < expected.Length; i++)
+            {
+                Assert.Equal(expected[i], replay[i]);
+                Assert.Equal(expected[i], inPlace[i]);
             }
         }
 
