@@ -139,7 +139,7 @@ public static class PersistenceGuard
         var previousPath = _trialFilePathOverride.Value;
         bool previousConfiguredSourcesSuppressed = _testConfiguredLicenseSourcesSuppressed.Value;
         _trialFilePathOverride.Value = path;
-        _testConfiguredLicenseSourcesSuppressed.Value = true;
+        _testConfiguredLicenseSourcesSuppressed.Value = path is not null;
         return new TrialPathScope(previousPath, previousConfiguredSourcesSuppressed);
     }
 

@@ -17,6 +17,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// </summary>
 internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
 {
+    private const int MaxRegistersPerThreadLimit = 24;
+
     internal const int DefaultBlockThreads = 256;
     internal const string EntryPoint = "aidotnet_split_complex_phase_f32";
 
@@ -105,7 +107,7 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
         ptx.AppendLine("    .param .u64 out_ptr");
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
-        ptx.AppendLine(".maxnreg 24");
+        ptx.AppendLine($".maxnreg {MaxRegistersPerThreadLimit}");
         ptx.AppendLine("{");
         ptx.AppendLine("    .reg .pred %p<3>;");
         ptx.AppendLine("    .reg .b32 %r<2>;");
@@ -183,7 +185,7 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
+                MaxRegistersPerThread: MaxRegistersPerThreadLimit,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
