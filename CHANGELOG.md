@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.129.8](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.7...v0.129.8) (2026-08-30)
+
+
+### Bug Fixes
+
+* **cpu:** preserve Conv2D parity without Windows regression ([#998](https://github.com/ooples/AiDotNet.Tensors/issues/998)) ([37260c3](https://github.com/ooples/AiDotNet.Tensors/commit/37260c33a1c5bcaa35d823dbc42396c3c3afecc8))
+* register the crash diagnostics dump at assembly load, not first use ([#999](https://github.com/ooples/AiDotNet.Tensors/issues/999)) ([b21aab5](https://github.com/ooples/AiDotNet.Tensors/commit/b21aab57a341d9f877383844102ee6f14b6558b1))
+
 ## [0.129.7](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.6...v0.129.7) (2026-08-30)
 
 
