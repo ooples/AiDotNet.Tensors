@@ -329,6 +329,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         {
             try
             {
+                // CREATE THE DIRECTORY FIRST. The caller's path is frequently RELATIVE (a CI step
+                // building it from a results folder), and a test host does not run with the
+                // workspace as its working directory -- so the target folder often does not exist
+                // from where this process is standing. File.WriteAllText then throws
+                // DirectoryNotFoundException, which is an IOException, which the catch below
+                // swallows. The result was a diagnostic that failed in total silence: the env var
+                // set on every shard of a full CI matrix, and not one file produced anywhere.
+                var directory = Path.GetDirectoryName(Path.GetFullPath(path));
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                    Directory.CreateDirectory(directory);
+
                 var text = new StringBuilder();
                 text.AppendLine("# GPU launch journal (most recent last)");
                 // Residency first: when a process dies holding gigabytes of device buffers, that is
