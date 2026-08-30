@@ -90,7 +90,10 @@ jobs:
 
     # If --blame-hang-timeout (a test made no progress for 300s) or --blame-crash (test host
     # native-crashed, e.g. a CUDA-finalizer 0xC0000005) fired, the hang/crash dump + the
-    # Sequence.xml naming the culprit test land under ./coverage. Upload them so the
+    # Sequence file naming the culprit test land under ./coverage. NOTE the glob is Sequence*.xml:
+    # vstest writes Sequence.xml for a HANG but Sequence_<guid>.xml for a CRASH, verified by
+    # forcing a FailFast under --blame-crash. Matching only one of the two silently drops the
+    # case you care about. Upload them so the
     # intermittent deadlock can be diagnosed instead of the run silently stalling for hours.
     - name: Upload hang/crash dumps
       uses: actions/upload-artifact@v4
@@ -99,7 +102,7 @@ jobs:
         name: blame-dumps
         path: |
           ./coverage/**/*.dmp
-          ./coverage/**/Sequence.xml
+          ./coverage/**/Sequence*.xml
           ./coverage/gpu-diagnostics.txt
         if-no-files-found: ignore
 

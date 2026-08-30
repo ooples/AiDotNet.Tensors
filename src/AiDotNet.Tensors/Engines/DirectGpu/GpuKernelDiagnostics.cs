@@ -62,6 +62,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
     {
         private const int JournalCapacity = 64;
 
+        /// <summary>How often the journal is flushed to disk while the process is alive.</summary>
+        /// <remarks>
+        /// Two seconds bounds what a hard crash can lose. Shorter buys little (the residency totals
+        /// move slowly and the journal is a fixed 64-entry ring); longer starts losing the launches
+        /// immediately before the fault, which are the ones worth having.
+        /// </remarks>
+        private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(2);
+
+        /// <summary>Held so the timer is not collected; never disposed, it lives as long as the process.</summary>
+        private static Timer? _periodicFlush;
+
         private static readonly LaunchRecord[] _journal = new LaunchRecord[JournalCapacity];
 
         /// <summary>
@@ -120,8 +131,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
 
             try
             {
+                // EXIT HOOKS ARE NOT ENOUGH, AND THIS IS THE WHOLE POINT OF THE DIAGNOSTIC.
+                // ProcessExit and DomainUnload run only on an ORDERLY shutdown. They do not run for
+                // the deaths this exists to explain: an access violation, a stack overflow, an
+                // OOM-kill, Environment.FailFast. Verified directly -- a FailFast under
+                // --blame-crash produced the crash dump and the Sequence file and NO journal at all,
+                // because nothing got the chance to write one.
+                //
+                // So the journal is also flushed PERIODICALLY, which means a hard kill loses at most
+                // one interval instead of everything. The cost is one small text write every two
+                // seconds, and only when the caller has explicitly named a dump path.
+                _periodicFlush = new Timer(_ => DumpTo(path), null, FlushInterval, FlushInterval);
+
                 AppDomain.CurrentDomain.ProcessExit += (_, __) => DumpTo(path);
                 AppDomain.CurrentDomain.DomainUnload += (_, __) => DumpTo(path);
+
+                // One immediate write, so the file exists even if the process dies inside the first
+                // interval -- which is exactly when a startup crash happens.
+                DumpTo(path);
             }
             catch (AppDomainUnloadedException)
             {
@@ -130,10 +157,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         }
 
         /// <summary>
-        /// Forces the exit-dump handler to be installed at assembly load, rather than whenever some
-        /// caller first happens to touch this type. Idempotent; running the static constructor is
-        /// the entire point, so the body can stay empty.
+        /// Forces the diagnostics handler to be installed at assembly load, rather than whenever some
+        /// caller first happens to touch this type. Idempotent.
         /// </summary>
+        /// <remarks>
+        /// <para>
+        /// TARGET-FRAMEWORK QUALIFIED. The module initializer that calls this is
+        /// <c>NET6_0_OR_GREATER</c> only, so on <b>net471</b> registration still happens on first
+        /// use of this type. A net471 consumer that wants the journal written for a process which
+        /// might never touch GPU code must call <see cref="EnsureRegistered"/> itself during startup.
+        /// </para>
+        /// <para>
+        /// ENVIRONMENT VARIABLES ARE READ ONCE, HERE. <c>AIDOTNET_GPU_DIAGNOSTICS_DUMP</c>,
+        /// <c>AIDOTNET_GPU_KERNEL_DIAGNOSTICS</c> and <c>AIDOTNET_GPU_SYNC_LAUNCHES</c> are read by
+        /// the type initializer this triggers, and there is no runtime reconfiguration API. Setting
+        /// any of them AFTER assembly load has no effect — they must be set before the process
+        /// starts (or, on net471, before the first use of this type).
+        /// </para>
+        /// </remarks>
         public static void EnsureRegistered()
         {
             // Referencing any static member is enough to run the static constructor. Kept explicit
