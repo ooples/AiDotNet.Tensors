@@ -234,6 +234,49 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
             }
         }
 
+        /// <summary>
+        /// The diagnostics env vars are read ONCE, at type initialization. Setting them later must
+        /// not appear to work.
+        /// </summary>
+        /// <remarks>
+        /// This pins a contract rather than an implementation detail. Registration now happens at
+        /// assembly load (module initializer), so by the time any caller could call
+        /// SetEnvironmentVariable the values have already been latched. Without this test, a future
+        /// reader could reasonably assume a mid-process toggle takes effect and spend a debugging
+        /// session wondering why their flag did nothing.
+        /// </remarks>
+        [Fact]
+        public void DiagnosticsEnvironmentVariables_AreLatchedAtInitialization_NotReadPerCall()
+        {
+            bool before = GpuKernelDiagnostics.DeepChecksEnabled;
+
+            string? original = Environment.GetEnvironmentVariable("AIDOTNET_GPU_KERNEL_DIAGNOSTICS");
+            try
+            {
+                // Flip it to whatever it currently is not.
+                Environment.SetEnvironmentVariable(
+                    "AIDOTNET_GPU_KERNEL_DIAGNOSTICS", before ? "0" : "1");
+
+                Assert.Equal(before, GpuKernelDiagnostics.DeepChecksEnabled);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("AIDOTNET_GPU_KERNEL_DIAGNOSTICS", original);
+            }
+        }
+
+        /// <summary>EnsureRegistered is called from a module initializer, so it must be safe to repeat.</summary>
+        [Fact]
+        public void EnsureRegistered_IsIdempotentAndDoesNotThrow()
+        {
+            // A throw here would propagate out of the module initializer and take down the AppDomain,
+            // which is the hazard GpuAutoDetectModuleInit's own comments warn about.
+            GpuKernelDiagnostics.EnsureRegistered();
+            GpuKernelDiagnostics.EnsureRegistered();
+
+            Assert.Contains("live=", GpuKernelDiagnostics.DescribeBufferResidency(), StringComparison.Ordinal);
+        }
+
         /// <summary>A real launch must appear in the journal, which is what makes it useful after a crash.</summary>
         [SkippableFact]
         public void ARealGpuLaunchIsJournalled()
