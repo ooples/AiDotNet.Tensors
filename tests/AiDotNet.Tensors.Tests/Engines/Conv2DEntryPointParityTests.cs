@@ -53,6 +53,10 @@ namespace AiDotNet.Tensors.Tests.Engines
             yield return new object[] { 7, 1, 3, 3, 8, 16 };
         }
 
+        /// <summary>
+        /// Verifies that replaying float convolution and selecting any public parameter or
+        /// allocation form preserves both the output shape and every output bit.
+        /// </summary>
         [Theory]
         [MemberData(nameof(Shapes))]
         public async Task AllConv2DEntryPoints_ProduceStableIdenticalFloatResults(
@@ -93,6 +97,8 @@ namespace AiDotNet.Tensors.Tests.Engines
 
             foreach (var candidate in candidates)
             {
+                Assert.Equal(expected.Shape.ToArray(), candidate.Output.Shape.ToArray());
+
                 int differing = 0;
                 int firstIndex = -1;
                 for (int i = 0; i < expected.Length; i++)
