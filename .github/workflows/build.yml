@@ -63,6 +63,15 @@ jobs:
         dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net471
 
     - name: Test with Coverage
+      env:
+        # Writes the GPU launch journal and buffer residency totals as the test host exits. This is
+        # the half of the crash evidence a dump cannot give you cheaply: a host that dies holding
+        # gigabytes of device buffers looks, in every managed tool AND in a heap dump, like a
+        # process with a small tidy heap, because the managed wrappers are tiny and collectible
+        # while the native allocations are invisible to them. The residency counters separate
+        # "leaked device memory" from "the GC had not collected yet", and the journal names the last
+        # kernels to reach the device. A few kilobytes of text on a healthy run.
+        AIDOTNET_GPU_DIAGNOSTICS_DUMP: ./coverage/gpu-diagnostics.txt
       run: |
         # Coverage Exclude: GPU backends (can't run in CI) PLUS the hand-vectorized numerical
         # kernels (Engines.Simd.* / Engines.BlasManaged.*). Coverlet line-instruments every
@@ -81,7 +90,7 @@ jobs:
 
     # If --blame-hang-timeout (a test made no progress for 300s) or --blame-crash (test host
     # native-crashed, e.g. a CUDA-finalizer 0xC0000005) fired, the hang/crash dump + the
-    # Sequence_*.xml naming the culprit test land under ./coverage. Upload them so the
+    # Sequence.xml naming the culprit test land under ./coverage. Upload them so the
     # intermittent deadlock can be diagnosed instead of the run silently stalling for hours.
     - name: Upload hang/crash dumps
       uses: actions/upload-artifact@v4
@@ -90,7 +99,8 @@ jobs:
         name: blame-dumps
         path: |
           ./coverage/**/*.dmp
-          ./coverage/**/Sequence_*.xml
+          ./coverage/**/Sequence.xml
+          ./coverage/gpu-diagnostics.txt
         if-no-files-found: ignore
 
     - name: Test enterprise license validator
