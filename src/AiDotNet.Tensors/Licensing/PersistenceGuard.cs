@@ -59,6 +59,7 @@ public static class PersistenceGuard
     // ─── Active license key ────────────────────────────────────────
 
     private static readonly AsyncLocal<AiDotNetTensorsLicenseKey?> _activeKey = new();
+    private static readonly AsyncLocal<bool> _testConfiguredLicenseSourcesSuppressed = new();
 
     /// <summary>
     /// Sets the active license key for the current logical call
@@ -120,8 +121,11 @@ public static class PersistenceGuard
     /// <summary>
     /// Test hook — overrides the trial-state file path for the
     /// current logical call context so test runs don't mutate the
-    /// developer's <c>~/.aidotnet/tensors-trial.json</c>. Pass
-    /// <c>null</c> to clear an existing override.
+    /// developer's <c>~/.aidotnet/tensors-trial.json</c>. Configured
+    /// environment/file license sources are suppressed for the same scope so
+    /// the requested trial path is actually exercised; an explicit key from
+    /// <see cref="SetActiveLicenseKey"/> still takes precedence. Pass
+    /// <c>null</c> to clear an existing path override.
     /// </summary>
     /// <remarks>
     /// <c>internal</c> on purpose — exposed only via the test project's
@@ -132,16 +136,32 @@ public static class PersistenceGuard
     /// </remarks>
     internal static IDisposable SetTestTrialFilePathOverride(string? path)
     {
-        var prev = _trialFilePathOverride.Value;
+        var previousPath = _trialFilePathOverride.Value;
+        bool previousConfiguredSourcesSuppressed = _testConfiguredLicenseSourcesSuppressed.Value;
         _trialFilePathOverride.Value = path;
-        return new TrialPathScope(prev);
+        _testConfiguredLicenseSourcesSuppressed.Value = path is not null;
+        return new TrialPathScope(previousPath, previousConfiguredSourcesSuppressed);
     }
 
     private sealed class TrialPathScope : IDisposable
     {
-        private readonly string? _previous;
-        public TrialPathScope(string? prev) { _previous = prev; }
-        public void Dispose() => _trialFilePathOverride.Value = _previous;
+        private readonly string? _previousPath;
+        private readonly bool _previousConfiguredSourcesSuppressed;
+        private bool _disposed;
+
+        public TrialPathScope(string? previousPath, bool previousConfiguredSourcesSuppressed)
+        {
+            _previousPath = previousPath;
+            _previousConfiguredSourcesSuppressed = previousConfiguredSourcesSuppressed;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _trialFilePathOverride.Value = _previousPath;
+            _testConfiguredLicenseSourcesSuppressed.Value = _previousConfiguredSourcesSuppressed;
+        }
     }
 
     // ─── Shared validator cache ────────────────────────────────────
@@ -215,6 +235,7 @@ public static class PersistenceGuard
 
         // No explicit key selected → resolve from the configured env/disk sources (re-read + re-verified
         // each call so expiry/revocation and freshly-minted tokens take effect immediately).
+        if (_testConfiguredLicenseSourcesSuppressed.Value) return null;
         return AsymmetricEntitlementVerifier.TryVerifyConfigured();
     }
 
@@ -319,7 +340,7 @@ public static class PersistenceGuard
         // hard failure: we must NOT silently fall through to the trial path,
         // or a tampered/forged token would just degrade to free trial ops.
         // Absent (the default) → null → fall through unchanged.
-        var entitlement = GetCachedEntitlement();
+        var entitlement = _testConfiguredLicenseSourcesSuppressed.Value ? null : GetCachedEntitlement();
         if (entitlement is not null)
         {
             if (entitlement.IsValid && entitlement.HasCapability(requiredCapability))
@@ -438,6 +459,7 @@ public static class PersistenceGuard
     private static AiDotNetTensorsLicenseKey? ResolveActiveKey()
     {
         if (_activeKey.Value is { } explicitKey) return explicitKey;
+        if (_testConfiguredLicenseSourcesSuppressed.Value) return null;
 
         // Env var: AIDOTNET_LICENSE_KEY (same name upstream uses, so
         // setting it once configures both packages).

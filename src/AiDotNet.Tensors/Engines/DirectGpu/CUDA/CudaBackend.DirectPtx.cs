@@ -5185,7 +5185,6 @@ public sealed partial class CudaBackend
             _directPtxGumbelBackwardKernels.Dispose();
             _directPtxFusedRreluKernels.Dispose();
             _directPtxRreluKernels.Dispose();
-            _directPtxRuntime?.Dispose();
             lock (GpuDispatchLock)
             {
                 Array.Clear(
@@ -5198,6 +5197,7 @@ public sealed partial class CudaBackend
                 _directPtxCholesky4x4Plans.Clear();
             }
             DisposeDirectPtxSolver4x4Kernels();
+            _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;
         }
     }

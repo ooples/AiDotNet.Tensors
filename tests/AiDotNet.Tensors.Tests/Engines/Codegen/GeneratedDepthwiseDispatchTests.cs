@@ -12,6 +12,7 @@
 // differ in the last fp32 place.
 
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -19,33 +20,34 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Codegen;
 
+[Collection("DirectGpuSerial")]
 public class GeneratedDepthwiseDispatchTests
 {
-    private static bool TryOpenBackend(out CudaBackend? backend)
+    private static CudaBackend OpenBackendOrSkip()
     {
-        backend = null;
-        try
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+
+        var backend = new CudaBackend();
+        if (!backend.IsAvailable)
         {
-            var candidate = new CudaBackend();
-            if (!candidate.IsAvailable) { candidate.Dispose(); return false; }
-            backend = candidate;
-            return true;
+            backend.Dispose();
+            throw new InvalidOperationException(
+                "CUDA driver was detected, but the CUDA backend failed to initialize.");
         }
-        catch (Exception)
-        {
-            return false;
-        }
+
+        return backend;
     }
 
     /// <summary>
     /// With the family promoted and the flag on, a depthwise 3x3 call must take the
     /// generated kernel AND agree with the established one.
     /// </summary>
-    [Fact]
-    public void GeneratedDepthwise_DispatchesAndAgreesWithTheEstablishedKernel()
+    [SkippableFact]
+    public async Task GeneratedDepthwise_DispatchesAndAgreesWithTheEstablishedKernel()
     {
-        if (!TryOpenBackend(out var backend)) return;          // no device: nothing to assert
-        using var _ = backend!;
+        await Task.Yield();
+
+        using var backend = OpenBackendOrSkip();
 
         const int N = 2, C = 16, H = 28, W = 28;
         long elements = (long)N * C * H * W;
@@ -118,15 +120,16 @@ public class GeneratedDepthwiseDispatchTests
     /// Geometry outside the measured set must DECLINE. A 5x5 or a strided depthwise has no
     /// evidence behind it, so it has to keep taking the established path.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(5, 5, 1, 1, 2, 2)]   // 5x5 taps
     [InlineData(3, 3, 2, 2, 1, 1)]   // stride 2
     [InlineData(3, 3, 1, 1, 0, 0)]   // no padding: output extent changes
-    public void GeometryOutsideTheMeasuredSet_Declines(
+    public async Task GeometryOutsideTheMeasuredSet_Declines(
         int kh, int kw, int sh, int sw, int ph, int pw)
     {
-        if (!TryOpenBackend(out var backend)) return;
-        using var _ = backend!;
+        await Task.Yield();
+
+        using var backend = OpenBackendOrSkip();
 
         const int N = 1, C = 8, H = 16, W = 16;
         long elements = (long)N * C * H * W;
@@ -149,11 +152,12 @@ public class GeneratedDepthwiseDispatchTests
     }
 
     /// <summary>With the feature flag off, nothing dispatches — opt-in stays opt-in.</summary>
-    [Fact]
-    public void FeatureFlagOff_Declines()
+    [SkippableFact]
+    public async Task FeatureFlagOff_Declines()
     {
-        if (!TryOpenBackend(out var backend)) return;
-        using var _ = backend!;
+        await Task.Yield();
+
+        using var backend = OpenBackendOrSkip();
 
         const int N = 1, C = 8, H = 16, W = 16;
         long elements = (long)N * C * H * W;
@@ -175,17 +179,52 @@ public class GeneratedDepthwiseDispatchTests
         }
     }
 
+    [Fact]
+    public async Task TestOverride_IsIsolatedBetweenLogicalCallContexts()
+    {
+        await Task.Yield();
+
+        bool? prior = DirectPtxFeatureGate.TestOverride;
+        var falseFlowReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFalseFlow = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            DirectPtxFeatureGate.TestOverride = null;
+            Task<bool?> falseFlow = Task.Run(async () =>
+            {
+                DirectPtxFeatureGate.TestOverride = false;
+                falseFlowReady.SetResult(true);
+                await releaseFalseFlow.Task;
+                await Task.Yield();
+                return DirectPtxFeatureGate.TestOverride;
+            });
+
+            await falseFlowReady.Task;
+            DirectPtxFeatureGate.TestOverride = true;
+            releaseFalseFlow.SetResult(true);
+
+            Assert.Equal(false, await falseFlow);
+            Assert.Equal(true, DirectPtxFeatureGate.TestOverride);
+        }
+        finally
+        {
+            releaseFalseFlow.TrySetResult(true);
+            DirectPtxFeatureGate.TestOverride = prior;
+        }
+    }
+
     /// <summary>
     /// The generated max pool must agree with the established kernel on BOTH outputs. The
     /// indices matter more than the values: the backward pass routes every gradient by
     /// them, so a wrong convention corrupts training while the pooled values still look
     /// right.
     /// </summary>
-    [Fact]
-    public void GeneratedMaxPool_AgreesOnValuesAndIndices()
+    [SkippableFact]
+    public async Task GeneratedMaxPool_AgreesOnValuesAndIndices()
     {
-        if (!TryOpenBackend(out var backend)) return;
-        using var _ = backend!;
+        await Task.Yield();
+
+        using var backend = OpenBackendOrSkip();
 
         const int N = 2, C = 8, H = 16, W = 16;
         const int OutH = H / 2, OutW = W / 2;

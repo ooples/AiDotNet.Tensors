@@ -9,6 +9,7 @@
 // (arena, steady state) — a ~98% reduction.
 
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -78,8 +79,10 @@ public class InferenceArenaForwardTests
 
 #if NET5_0_OR_GREATER
     [Fact]
-    public void RepeatedForward_InArena_AllocatesFarLessThanNonArena()
+    public async Task RepeatedForward_InArena_AllocatesFarLessThanNonArena()
     {
+        await Task.Yield();
+
         const int S = 128, D = 256, N = 40;
         var x = Rand(new[] { S, D }, 11);
         var w = Rand(new[] { D, D }, 12);
@@ -90,20 +93,20 @@ public class InferenceArenaForwardTests
         float sink = 0;
         sink += Forward(x, w, gamma, beta)[0];
 
-        long a0 = GC.GetTotalAllocatedBytes(precise: true);
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < N; i++) sink += Forward(x, w, gamma, beta)[0];
-        long noArenaBytes = GC.GetTotalAllocatedBytes(precise: true) - a0;
+        long noArenaBytes = GC.GetAllocatedBytesForCurrentThread() - a0;
 
         using (var arena = TensorArena.Create())
         {
             sink += Forward(x, w, gamma, beta)[0]; // warm the arena (first forward fills it)
-            long a1 = GC.GetTotalAllocatedBytes(precise: true);
+            long a1 = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < N; i++)
             {
                 arena.Reset();
                 sink += Forward(x, w, gamma, beta)[0];
             }
-            long arenaBytes = GC.GetTotalAllocatedBytes(precise: true) - a1;
+            long arenaBytes = GC.GetAllocatedBytesForCurrentThread() - a1;
 
             // Conservative gate (real ratio is ~0.05): the arena must cut forward allocation by
             // at least half. This guards the Rent->TensorArena.Current routing for the forward

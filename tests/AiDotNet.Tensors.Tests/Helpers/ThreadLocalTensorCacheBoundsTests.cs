@@ -9,15 +9,15 @@
 // this cache on the same thread. With retention bounded it completes inside the budget.
 
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
-// Serialized with the arena tests: these poke [ThreadStatic] caches, and the allocation assertion
-// below reads GC.GetTotalAllocatedBytes, which is PROCESS-wide — a sibling collection allocating on
-// another thread lands in the same counter and makes the measurement meaningless. Same reason
-// TensorArenaPersistentPoolTests joins this collection.
+// Serialized with the arena tests because these tests poke [ThreadStatic] caches. The allocation
+// assertion below deliberately uses the current-thread counter so unrelated xUnit collections
+// cannot contaminate the measurement.
 [Collection(nameof(TensorArenaPinnedTests))]
 public class ThreadLocalTensorCacheBoundsTests
 {
@@ -109,8 +109,10 @@ public class ThreadLocalTensorCacheBoundsTests
     /// last buffer is rented — reintroduces a Bucket + Stack allocation on every cycle.
     /// </summary>
     [Fact]
-    public void HotSize_ReturnRentCycle_DoesNotAllocate()
+    public async Task HotSize_ReturnRentCycle_DoesNotAllocate()
     {
+        await Task.Yield();
+
         ThreadLocalTensorCache<float>.Clear();
         const int size = 4096;
 
@@ -123,23 +125,21 @@ public class ThreadLocalTensorCacheBoundsTests
         }
 
         const int cycles = 50_000;
-        long before = GC.GetTotalAllocatedBytes(precise: true);
+        long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < cycles; i++)
         {
             ThreadLocalTensorCache<float>.TryReturn(buffer);
             buffer = ThreadLocalTensorCache<float>.TryRent(size)!;
         }
-        long allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
 
         Assert.NotNull(buffer);
 
         // The cache's own steady-state path allocates nothing here — a dictionary lookup and a
-        // Stack push/pop — so what this measures is ambient allocation on the test thread, which
-        // came in around 0.2 MB. Dropping the dictionary entry when its last buffer is rented
-        // instead costs a Bucket + Stack per cycle, measured at 1,212,984 bytes over 10,000 cycles
-        // (~121 B/cycle), i.e. ~6 MB at this iteration count. A 1 MB ceiling separates the two by
-        // several times over in both directions rather than sitting on top of the noise.
-        Assert.True(allocated < 1024 * 1024,
+        // Stack push/pop. Allow only instrumentation-scale slack. Dropping the dictionary entry
+        // when its last buffer is rented instead costs a Bucket + Stack per cycle, measured at
+        // 1,212,984 bytes over 10,000 cycles (~121 B/cycle), or roughly 6 MB here.
+        Assert.True(allocated < 128,
             $"steady-state return/rent cycle allocated {allocated} bytes over {cycles} iterations");
 
         ThreadLocalTensorCache<float>.Clear();

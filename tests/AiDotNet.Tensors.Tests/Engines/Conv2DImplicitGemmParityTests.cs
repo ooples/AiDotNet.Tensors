@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -15,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// im2col path. This guards that across stride / padding / dilation / batch / spatial-size
 /// variations — including deep-bottleneck shapes where the row-block clamps to a single row.
 /// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class Conv2DImplicitGemmParityTests
 {
     private static Tensor<float> Rand(int[] shape, int seed)
@@ -37,9 +39,11 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(1, 256, 256, 3, 16, 1, 2, 2)]   // dilation 2
     [InlineData(1, 512, 256, 1, 16, 1, 0, 1)]   // 1×1 high-channel (routes to full path)
     [InlineData(1, 256, 300, 5, 12, 1, 2, 1)]   // 5×5, non-power-of-two outC
-    public void FusedConv_IsBitIdentical_ToFullIm2Col(
+    public async Task FusedConv_IsBitIdentical_ToFullIm2Col(
         int batch, int inC, int outC, int k, int hw, int stride, int pad, int dilation)
     {
+        await Task.Yield();
+
         var e = new CpuEngine();
         var x = Rand(new[] { batch, inC, hw, hw }, 101);
         var kernel = Rand(new[] { outC, inC, k, k }, 202);

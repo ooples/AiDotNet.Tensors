@@ -9495,42 +9495,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
 
-        // SAME KERNEL AS Conv2DInto. These two entry points used to dispatch differently for
-        // float -- this one to Conv2DWithIm2ColFloat (the SIMD-direct / Winograd cascade), and
-        // Conv2DInto to Conv2DIm2colGemm -- on the stated grounds that the results are
-        // "numerically equivalent (im2col-GEMM vs direct differ only by FP summation order)".
-        //
-        // At float32 they are not. Measured on a 3x3 stride-1 conv, 8 output channels over a
-        // [1,3,16,16] input: 1658 of 2048 outputs differed, by up to 2.3e-4 RELATIVE, and against a
-        // float64 reference the two land at rms 5.13e-08 and 6.77e-08 -- either side of the float
-        // epsilon, so the disagreement is not confined to the last bits.
-        //
-        // Callers cannot see which entry point they reached. AiDotNet's ConvolutionalLayer picks
-        // between them by whether a GradientTape is recording, since the in-place variant bypasses
-        // the tape, so the SAME layer with the SAME weights computed a different function in
-        // training than at inference -- and its serialize-replay test failed intermittently in CI
-        // depending on whether a tape happened to be active. That is a dispatch bug here, not a
-        // layer bug there: PyTorch selects a convolution algorithm from shape and hardware, never
-        // from grad mode, and torch.no_grad() changes whether a graph is built rather than the
-        // values flowing through it.
-        //
-        // Routing both to Conv2DIm2colGemm also makes THIS path faster: the cascade is roughly 15x
-        // slower for the small 3x3 stride-1 convolutions that dominate CNN inference, which is the
-        // measurement that moved Conv2DInto onto the GEMM path in the first place.
+        // Every float/NCHW entry point must select the same numeric kernel for a given
+        // platform and geometry. Overload choice and gradient recording are deliberately
+        // absent from the selector because neither may change the computed function.
         if (typeof(T) == typeof(float))
         {
-            // GetReadOnlyDataArray for the two INPUTS: GetDataArray privatizes a copy-on-write
-            // tensor, and a read must not. TensorCowInferenceReadPathTests.Conv2D_DoesNotPrivatizeCowKernel
-            // asserts exactly that the kernel stays COW-shared across a convolution. The output is a
-            // tensor this method just rented, so it is written through GetDataArray as normal.
-            Conv2DIm2colGemm(
-                (float[])(object)input.GetReadOnlyDataArray(),
-                (float[])(object)kernel.GetReadOnlyDataArray(),
-                (float[])(object)result.GetDataArray(),
+            // The dispatcher obtains backing arrays only if it selects im2col-GEMM. Keeping that
+            // lookup lazy matters for offset views on the Windows adaptive route: a read-only array
+            // request would materialize an otherwise-unneeded full copy. When arrays are needed,
+            // GetReadOnlyDataArray preserves COW sharing for both inputs.
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result,
+                null, null, null,
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                outputHeight, outputWidth,
-                stride, stride, padding, padding, dilation, dilation);
+                stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
@@ -9748,25 +9730,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Output tensor shape [{string.Join(", ", output._shape)}] doesn't match expected shape [{batch}, {outChannels}, {outputHeight}, {outputWidth}].");
         }
 
-        // Use im2col + GEMM for float. Route through Conv2DIm2colGemm — the same
-        // maintained fast path the int[] Conv2DInto / allocating Conv2D(int[])
-        // overloads use — rather than Conv2DWithIm2ColFloat (the SIMD-direct /
-        // Winograd cascade). For the small 3×3 stride-1 convs that dominate CNN
-        // inference the direct cascade is ~15× slower than im2col-GEMM (measured:
-        // a 16→32 @14×14 conv at 1967 µs via this overload vs 117 µs via the int[]
-        // overload), so the int and int[] overloads were silently making opposite
-        // kernel choices. Output is numerically equivalent (im2col-GEMM vs direct
-        // differ only by FP summation order).
+        // Use the same platform/geometry dispatcher as both allocating overloads so
+        // a preallocated destination changes allocation behavior only, never arithmetic.
         if (typeof(T) == typeof(float))
         {
-            Conv2DIm2colGemm(
-                (float[])(object)input.GetDataArray(),
-                (float[])(object)kernel.GetDataArray(),
-                (float[])(object)output.GetDataArray(),
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)output,
+                null, null, null,
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                outputHeight, outputWidth,
-                stride, stride, padding, padding, dilation, dilation);
+                stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
             return;
         }
 
@@ -9848,6 +9824,100 @@ public partial class CpuEngine : ITensorLevelEngine
             outChannels, kernelHeight, kernelWidth,
             stride, padding, dilation,
             outputHeight, outputWidth);
+    }
+
+    private static readonly bool IsWindowsPlatform =
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+
+    /// <summary>
+    /// Selects one float convolution family for every public CPU entry point.
+    /// The adaptive cascade is materially faster on Windows, while im2col-GEMM is the
+    /// measured winner on Linux. Geometry and layout, never overload or gradient mode,
+    /// determine the family so equivalent calls remain bit-identical.
+    /// </summary>
+    private static bool ShouldUseAdaptiveFloatConv2D(
+        LinearAlgebra.TensorLayout inputLayout,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW)
+    {
+        return ShouldUseAdaptiveFloatConv2DForPlatform(
+            IsWindowsPlatform, inputLayout, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>
+    /// Applies the platform and geometry policy separately from runtime OS detection so every
+    /// decision branch can be tested deterministically on every CI host.
+    /// </summary>
+    internal static bool ShouldUseAdaptiveFloatConv2DForPlatform(
+        bool isWindows,
+        LinearAlgebra.TensorLayout inputLayout,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW)
+    {
+        return isWindows
+            && inputLayout == LinearAlgebra.TensorLayout.Nchw
+            && strideH == strideW
+            && padH == padW
+            && dilationH == dilationW;
+    }
+
+    /// <summary>
+    /// Dispatches every float Conv2D entry point through the same platform/geometry policy.
+    /// The supplied arrays may already be unpacked for a packed-layout fallback.
+    /// </summary>
+    private void DispatchFloatConv2D(
+        Tensor<float> input,
+        Tensor<float> kernel,
+        Tensor<float> output,
+        float[]? inputData,
+        float[]? kernelData,
+        float[]? outputData,
+        int batch,
+        int inChannels,
+        int height,
+        int width,
+        int outChannels,
+        int kernelHeight,
+        int kernelWidth,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW,
+        int outputHeight,
+        int outputWidth)
+    {
+        if (ShouldUseAdaptiveFloatConv2D(
+            input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
+        {
+            Conv2DWithIm2ColFloat(
+                input, kernel, output,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                strideH, padH, dilationH,
+                outputHeight, outputWidth);
+            return;
+        }
+
+        inputData ??= input.GetReadOnlyDataArray();
+        kernelData ??= kernel.GetReadOnlyDataArray();
+        outputData ??= output.GetDataArray();
+        Conv2DIm2colGemm(
+            inputData, kernelData, outputData,
+            batch, inChannels, height, width,
+            outChannels, kernelHeight, kernelWidth,
+            outputHeight, outputWidth,
+            strideH, strideW, padH, padW, dilationH, dilationW);
     }
 
     /// <summary>
@@ -13787,14 +13857,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     batch, inChannels, height, width, cBlock);
                 inputData = (T[])(object)unpackedData;
             }
-            Conv2DIm2colGemm(
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result,
                 (float[])(object)inputData,
                 (float[])(object)kernelData,
                 (float[])(object)outputData,
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                outputHeight, outputWidth,
-                strideH, strideW, padH, padW, dilationH, dilationW);
+                strideH, strideW, padH, padW, dilationH, dilationW,
+                outputHeight, outputWidth);
         }
         else if (typeof(T) == typeof(double))
         {

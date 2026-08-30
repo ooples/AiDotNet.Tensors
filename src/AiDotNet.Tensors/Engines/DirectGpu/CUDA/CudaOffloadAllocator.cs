@@ -53,47 +53,79 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
         _ownsContext = sharedContext == IntPtr.Zero; // zero -> behave like the default ctor (create our own)
     }
 
-    public bool IsAvailable => CudaNativeBindings.IsAvailable;
+    internal static bool IsCudaUsable(bool driverAvailable, bool circuitBroken)
+        => driverAvailable && !circuitBroken;
+
+    internal static bool ShouldPopContext(bool pushed, bool circuitBroken)
+        => pushed && !circuitBroken;
+
+    public bool IsAvailable
+    {
+        get
+        {
+            if (!IsCudaUsable(CudaNativeBindings.IsAvailable, AiDotNetEngine.GpuCircuitBroken))
+                return false;
+
+            lock (_lifecycleLock)
+            {
+                if (_disposed) return false;
+                lock (CudaBackend.ContextLifecycleLock)
+                    return IsContextUsableUnderLifecycleLock();
+            }
+        }
+    }
+
+    // Caller must hold CudaBackend.ContextLifecycleLock. For a shared backend context, membership
+    // is the authoritative lifetime signal: CudaBackend removes it under the same lock immediately
+    // before cuCtxDestroy. Owned primary contexts are protected by this allocator's lifecycle lock.
+    private bool IsContextUsableUnderLifecycleLock()
+        => _ownsContext || (_context != IntPtr.Zero && CudaBackend.LiveContexts.ContainsKey(_context));
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
-        // Hold _lifecycleLock across the entire allocate+register so a
-        // concurrent Dispose cannot snapshot _live, clear it, and let this
-        // allocation slip in afterwards (which would leak the device handle
-        // since Dispose has already returned).
+        // Hold _lifecycleLock across the entire allocate+register so a concurrent Dispose cannot
+        // let this allocation escape its snapshot. ContextLifecycleLock is nested inside it and held
+        // across {live check + push + native call + pop}, making backend context destruction mutually
+        // exclusive with shared-context use.
         lock (_lifecycleLock)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(CudaOffloadAllocator));
-            if (!IsAvailable)
-                throw new NotSupportedException("CUDA driver is not loadable on this host.");
+            if (!IsCudaUsable(CudaNativeBindings.IsAvailable, AiDotNetEngine.GpuCircuitBroken))
+                throw new NotSupportedException("CUDA offload is unavailable on this host.");
             if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
-            EnsureContext();
-            using (PushContextScope())
+            lock (CudaBackend.ContextLifecycleLock)
             {
-                IntPtr ptr;
-                OffloadScheme effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
-                switch (effective)
+                if (!IsContextUsableUnderLifecycleLock())
+                    throw new NotSupportedException("The CUDA context backing this offload allocator is no longer live.");
+
+                EnsureContext();
+                using (PushContextScope())
                 {
-                    case OffloadScheme.Pinned:
-                        {
-                            var rc = CuBlasNative.cuMemAllocHost(out ptr, (ulong)bytes);
-                            CuBlasNative.CheckCudaResult(rc, "cuMemAllocHost(offload)");
-                            break;
-                        }
-                    case OffloadScheme.Managed:
-                        {
-                            var rc = CudaNativeBindings.cuMemAllocManaged(out ptr, (ulong)bytes, CudaNativeBindings.CU_MEM_ATTACH_GLOBAL);
-                            if (rc != CudaResult.Success)
-                                throw new InvalidOperationException($"cuMemAllocManaged returned {rc}");
-                            break;
-                        }
-                    default:
-                        throw new ArgumentOutOfRangeException(nameof(scheme), scheme, "Unknown offload scheme.");
+                    IntPtr ptr;
+                    OffloadScheme effective = scheme == OffloadScheme.Auto ? OffloadScheme.Pinned : scheme;
+                    switch (effective)
+                    {
+                        case OffloadScheme.Pinned:
+                            {
+                                var rc = CuBlasNative.cuMemAllocHost(out ptr, (ulong)bytes);
+                                CuBlasNative.CheckCudaResult(rc, "cuMemAllocHost(offload)");
+                                break;
+                            }
+                        case OffloadScheme.Managed:
+                            {
+                                var rc = CudaNativeBindings.cuMemAllocManaged(
+                                    out ptr, (ulong)bytes, CudaNativeBindings.CU_MEM_ATTACH_GLOBAL);
+                                CuBlasNative.CheckCudaResult(rc, "cuMemAllocManaged(offload)");
+                                break;
+                            }
+                        default:
+                            throw new ArgumentOutOfRangeException(nameof(scheme), scheme, "Unknown offload scheme.");
+                    }
+                    var handle = new GpuOffloadHandle(ptr, ptr, bytes, effective);
+                    _live[ptr] = handle;
+                    return handle;
                 }
-                var h = new GpuOffloadHandle(ptr, ptr, bytes, effective);
-                _live[ptr] = h;
-                return h;
             }
         }
     }
@@ -101,19 +133,21 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     public void Free(GpuOffloadHandle handle)
     {
         if (handle.HostPointer == IntPtr.Zero) return;
-        // Only call native free for handles WE own — a foreign handle or
-        // double-free would corrupt the heap on the second native release.
-        // Lock TryRemove against Dispose's snapshot+clear so a concurrent
-        // Dispose can't free the same pointer twice.
+        // Only call native free for handles WE own. Serialize the live-context check and CUDA
+        // cleanup against CudaBackend's {deregister + destroy} critical section.
         lock (_lifecycleLock)
         {
             if (!_live.TryRemove(handle.HostPointer, out _)) return;
-            // Native free needs our context current; push before, pop
-            // after so the thread's context stack is restored to its
-            // prior state.
-            using (PushContextScope())
+            if (!IsCudaUsable(CudaNativeBindings.IsAvailable, AiDotNetEngine.GpuCircuitBroken))
+                return;
+
+            lock (CudaBackend.ContextLifecycleLock)
             {
-                FreeNative(handle);
+                if (!IsContextUsableUnderLifecycleLock()) return;
+                using (PushContextScope())
+                {
+                    FreeNative(handle);
+                }
             }
         }
     }
@@ -165,7 +199,7 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
 
         public void Dispose()
         {
-            if (_pushed)
+            if (ShouldPopContext(_pushed, AiDotNetEngine.GpuCircuitBroken))
             {
                 // Best-effort pop on failure: a throwing pop here would
                 // mask the original native error and leave the stack
@@ -227,10 +261,14 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
         switch (handle.Scheme)
         {
             case OffloadScheme.Pinned:
-                CuBlasNative.cuMemFreeHost(handle.HostPointer);
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemFreeHost(handle.HostPointer),
+                    "cuMemFreeHost(offload)");
                 break;
             case OffloadScheme.Managed:
-                CudaNativeBindings.cuMemFree(handle.DevicePointer);
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemFree(handle.DevicePointer),
+                    "cuMemFree(offload)");
                 break;
         }
     }
@@ -252,6 +290,14 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
             ctxToDestroy = _context;
             _context = IntPtr.Zero;
 
+            if (AiDotNetEngine.GpuCircuitBroken)
+            {
+                // CUDA 700/709/719 can invalidate the context and even make a nominal cleanup call
+                // fault natively. The circuit breaker is process-lifetime, so abandon native teardown;
+                // the OS reclaims these resources when the process exits.
+                return;
+            }
+
             if (ctxToDestroy != IntPtr.Zero && _ownsContext)
             {
                 // WE retained the device primary context, so it is guaranteed valid here. Push it to free
@@ -270,20 +316,20 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
             }
             else if (ctxToDestroy != IntPtr.Zero)
             {
-                // SHARED (non-owning) context: its lifetime is the CudaBackend's,
-                // NOT ours. The backend may ALREADY have destroyed it before this
-                // allocator is disposed — e.g. AiDotNetEngine.ResetToCpu tears the
-                // backend (and its context) down first, then WeightRegistry.Reset
-                // disposes this allocator. Issuing cuCtxPushCurrent / cuMemFree /
-                // cuCtxPopCurrent against a destroyed context is a use-after-free
-                // that faults the process with an UNCATCHABLE native access
-                // violation (observed as "Test host process crashed" in
-                // WeightRegistry.Reset -> CudaOffloadAllocator.Dispose ->
-                // cuCtxPopCurrent). So do NOT touch the shared context here:
-                // cuCtxDestroy by its owner reclaims EVERY allocation made in the
-                // context (device + pinned host), so dropping the per-handle frees
-                // forgoes only a redundant free, never leaks past the context's own
-                // lifetime. (The owned-context branch above still frees+destroys.)
+                // SHARED (non-owning) context: free our outstanding allocations while its owner
+                // still has it live, but serialize the live check + push/free/pop against the
+                // backend's deregister + cuCtxDestroy critical section. If the backend already
+                // destroyed the context (for example ResetToCpu demoted it first), touching the raw
+                // handle is a use-after-free that can fault the process natively; skip cleanup in
+                // that case because cuCtxDestroy has already reclaimed the context's resources.
+                lock (CudaBackend.ContextLifecycleLock)
+                {
+                    if (CudaBackend.LiveContexts.ContainsKey(ctxToDestroy))
+                    {
+                        using var scope = new CudaContextPushScope(ctxToDestroy);
+                        foreach (var h in snapshot) FreeNative(h);
+                    }
+                }
             }
             else
             {
