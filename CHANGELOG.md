@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.129.7](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.6...v0.129.7) (2026-08-30)
+
+
+### Bug Fixes
+
+* gpu tape gaps, categorical residency, and non-power-of-two reductions ([#995](https://github.com/ooples/AiDotNet.Tensors/issues/995)) ([28a42f5](https://github.com/ooples/AiDotNet.Tensors/commit/28a42f5e901084dd5a48db0c17bf202c20e4dcf8))
+* mask the b loads in the n-tail direct gemm kernels ([#991](https://github.com/ooples/AiDotNet.Tensors/issues/991)) ([44c1ac1](https://github.com/ooples/AiDotNet.Tensors/commit/44c1ac147f2865c7242d4ac66503f1d75273ae7e))
+* mask the column tail in the 4-row block gemm kernels ([#993](https://github.com/ooples/AiDotNet.Tensors/issues/993)) ([4faaa5d](https://github.com/ooples/AiDotNet.Tensors/commit/4faaa5d9a0204647f552b46904d91bdaa358d9a4))
+* upload the sequence file crash evidence actually writes ([#997](https://github.com/ooples/AiDotNet.Tensors/issues/997)) ([a378851](https://github.com/ooples/AiDotNet.Tensors/commit/a3788514152fcfd742860392f7793b1fb3eb9fe5))
+
 ## [0.129.6](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.5...v0.129.6) (2026-08-29)
 
 
