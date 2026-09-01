@@ -159,9 +159,13 @@ public sealed partial class CudaBackend
                     gradLeftKey, capturing, DirectPtx16BitInputType.Float16, outputType);
                 PtxFp16GemmKernel gradRightKernel = GetOrCreateDirectPtxFp16GemmKernel(
                     gradRightKey, capturing, DirectPtx16BitInputType.Float16, outputType);
+                // Capture pins must be the REF-COUNTED kind that DestroyCapturedGraph releases with the
+                // graph exec (PinDirectPtxKernelForCapture), exactly as the forward path above does. A
+                // raw cache Pin is permanent: every captured backward step would leave two unevictable
+                // entries in the bounded FP16 GEMM cache until new specializations fail closed.
                 if (capturing &&
-                    (!_directPtxFp16GemmKernels.Pin(gradLeftKey) ||
-                     !_directPtxFp16GemmKernels.Pin(gradRightKey)))
+                    (!PinDirectPtxKernelForCapture(_directPtxFp16GemmKernels, gradLeftKey) ||
+                     !PinDirectPtxKernelForCapture(_directPtxFp16GemmKernels, gradRightKey)))
                     throw new InvalidOperationException(
                         "Could not pin both direct-PTX 16-bit backward modules for CUDA graph capture.");
                 lock (GpuDispatchLock)

@@ -1176,7 +1176,9 @@ public sealed partial class CudaBackend
     }
     internal int DirectPtxMixedLinearM16PinnedKernelCount
     {
-        get { lock (_directPtxLock) return _directPtxMixedLinearM16Kernels.PinnedCount; }
+        // The M=16 mixed-linear route dispatches from the FP16 Tensor-Core linear cache since the
+        // #836 reconciliation; the legacy _directPtxMixedLinearM16Kernels cache is never populated.
+        get { lock (_directPtxLock) return _directPtxFp16TensorCoreLinearKernels.PinnedCount; }
     }
     internal int DirectPtxQuantizedLinearPinnedKernelCount
     {
@@ -5048,6 +5050,7 @@ public sealed partial class CudaBackend
             _directPtxStridedDotKernels.Dispose();
             _directPtxCrossEntropyKernels.Dispose();
             _directPtxFp16GemmKernels.Dispose();
+            _directPtxGemmKernels.Dispose();
             _directPtxLoRAKernels.Dispose();
             _directPtxLinearBackwardKernels.Dispose();
             _directPtxMixedLinearKernels.Dispose();

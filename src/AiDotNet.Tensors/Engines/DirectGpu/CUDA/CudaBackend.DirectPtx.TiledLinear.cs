@@ -209,7 +209,10 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "gemm-tiled-shape-not-implemented";
             return false;
         }
-        if (!DirectPtxFeatureGate.FusedLinearExperimentOverride)
+        // Mirror the dispatch admission rule (promoted shape OR experiment override): a promoted cell
+        // must stay prewarmable for CUDA-graph capture without the experiment override.
+        if (!PtxFusedLinearTiledKernel.IsPromotedShape(m, k, n) &&
+            !DirectPtxFeatureGate.FusedLinearExperimentOverride)
         {
             DirectPtxLastError = "gemm-tiled-performance-gate-not-met";
             return false;

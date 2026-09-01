@@ -12,6 +12,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// accumulators stay FP32. Tile BM=BN=64, BK=8, TM=TN=4 → 256 threads, 4 KiB shared.
 /// This is the correct FP16 path; a Tensor-Core (mma.sync) tile is the perf follow-up.
 /// </summary>
+/// <remarks>
+/// INTEGRATION STATUS (2026-09-01): no <c>CudaBackend</c> entry point constructs this kernel; GemmFp16 and GemmFp16In32fOut currently dispatch <see cref="PtxFp16GemmKernel"/>.
+/// Until a route dispatches it, its emitted PTX is exercised by tests only and it carries no parity or
+/// performance claim.
+/// </remarks>
 internal sealed class PtxGemmFp16Kernel : IDisposable
 {
     internal const int BlockM = 64;

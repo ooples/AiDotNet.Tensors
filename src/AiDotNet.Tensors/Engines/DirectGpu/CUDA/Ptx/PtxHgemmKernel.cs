@@ -11,6 +11,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// epilogue narrows each accumulator back to FP16 (<c>cvt.rn.f16.f32</c>) before the
 /// coalesced FP16 store. Tile BM=BN=64, BK=8, TM=TN=4 → 256 threads, 4 KiB shared.
 /// </summary>
+/// <remarks>
+/// INTEGRATION STATUS (2026-09-01): no <c>CudaBackend</c> entry point constructs this kernel; Hgemm and GemmFp16HalfOut currently dispatch <see cref="PtxFp16GemmKernel"/> (the scalar-convert baseline).
+/// Until a route dispatches it, its emitted PTX is exercised by tests only and it carries no parity or
+/// performance claim.
+/// </remarks>
 internal sealed class PtxHgemmKernel : IDisposable
 {
     internal const int BlockM = 64;

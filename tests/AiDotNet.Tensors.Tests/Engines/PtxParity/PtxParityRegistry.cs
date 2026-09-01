@@ -591,13 +591,17 @@ public static class PtxParityRegistry
             "driver and backend oracle coverage exists; strongest-cuBLASLt/PyTorch three-way evidence is pending."),
         new PtxParitySpec("PtxMatMulTransposedKernel", PtxParityStatus.Deferred,
             "MatMulTransposed (#836)",
-            "transpose-B layout is covered by a driver oracle; production evidence remains pending."),
+            "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +
+            "MatMulTransposed route dispatches the tiled output-major kernel instead. A driver oracle and route " +
+            "integration are still required before any parity claim."),
         new PtxParitySpec("PtxFusedGemmBiasKernel", PtxParityStatus.Deferred,
             "GemmBias and fused activation epilogues (#836)",
             "fused driver oracle coverage exists; current CUDA and PyTorch championship arms remain pending."),
         new PtxParitySpec("PtxBatchedGemmKernel", PtxParityStatus.Deferred,
             "strided batched GEMM (#836)",
-            "driver oracle coverage exists; the resident three-way performance matrix remains pending."),
+            "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +
+            "BatchedGemm route dispatches the batched tiled kernel instead. A driver oracle and route integration " +
+            "are still required before any parity claim."),
         new PtxParitySpec("PtxBatchedGemmFanoutKernel", PtxParityStatus.Deferred,
             "FP32 pointer-array fanout GEMM (#836)",
             "pointer-array driver oracle coverage exists; established-backend parity evidence remains pending."),
@@ -606,10 +610,14 @@ public static class PtxParityRegistry
             "mixed-precision driver oracle coverage exists; Tensor-Core and established-backend evidence remains pending."),
         new PtxParitySpec("PtxGemmFp16Kernel", PtxParityStatus.Deferred,
             "FP16-input FP32-output GEMM (#836)",
-            "conversion and driver oracle coverage exists; Tensor-Core championship evidence remains pending."),
+            "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +
+            "GemmFp16 routes dispatch PtxFp16GemmKernel instead. A driver oracle and route integration are still " +
+            "required before any parity claim."),
         new PtxParitySpec("PtxHgemmKernel", PtxParityStatus.Deferred,
             "FP16-input FP16-output Hgemm (#836)",
-            "driver oracle coverage exists; Tensor-Core championship evidence remains pending."),
+            "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +
+            "Hgemm route dispatches PtxFp16GemmKernel instead. A driver oracle and route integration are still " +
+            "required before any parity claim."),
         new PtxParitySpec("PtxGemmFp16TransposedKernel", PtxParityStatus.Deferred,
             "FP16 transpose-B GEMM (#836)",
             "driver backward-oracle coverage exists; established-backend parity evidence remains pending."),
@@ -627,10 +635,14 @@ public static class PtxParityRegistry
             "preactivation and saved-output driver oracles exist; public three-way parity remains pending."),
         new PtxParitySpec("PtxDotProductKernel", PtxParityStatus.Deferred,
             "dot product (#836)",
-            "ISA-correct CTA reduction has a driver oracle; strongest-library evidence remains pending."),
+            "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +
+            "dot routes dispatch PtxDenseVectorKernel instead. A driver oracle and route integration are still " +
+            "required before any parity claim."),
         new PtxParitySpec("PtxOuterProductKernel", PtxParityStatus.Deferred,
             "outer product (#836)",
-            "pointer-only driver oracle coverage exists; strongest-library evidence remains pending."),
+            "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +
+            "outer routes dispatch PtxDenseVectorKernel instead. A driver oracle and route integration are still " +
+            "required before any parity claim."),
         new PtxParitySpec("PtxFusedLoRAForwardKernel", PtxParityStatus.Deferred,
             "output-major fused LoRA forward (#836)",
             "single-launch shared-Z driver oracle coverage exists; layout-equivalent competitor evidence remains pending."),

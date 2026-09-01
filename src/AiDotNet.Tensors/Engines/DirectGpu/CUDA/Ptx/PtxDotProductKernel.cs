@@ -11,6 +11,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// warp reduction leave the scalar in lane 0, which writes it. Register-resident
 /// apart from 32 bytes of shared partials. K must be a multiple of 256.
 /// </summary>
+/// <remarks>
+/// INTEGRATION STATUS (2026-09-01): no <c>CudaBackend</c> entry point constructs this kernel; the dot entry points currently dispatch <see cref="PtxDenseVectorKernel"/>.
+/// Until a route dispatches it, its emitted PTX is exercised by tests only and it carries no parity or
+/// performance claim.
+/// </remarks>
 internal sealed class PtxDotProductKernel : IDisposable
 {
     internal const int BlockThreads = 256;

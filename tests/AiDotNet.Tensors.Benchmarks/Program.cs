@@ -36,21 +36,18 @@ class Program
         // The tool contract accepts only operands, so strip the dispatch flag exactly once.
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-attention-offline-cubins")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args);
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Generate(args.Skip(1).ToArray());
             return;
         }
 
         if (args.Length > 0 && args[0] == "--verify-direct-ptx-attention-offline-cubins")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args);
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.Verify(args.Skip(1).ToArray());
             return;
         }
 
         if (args.Length > 0 && args[0] == "--audit-direct-ptx-attention-offline-sass")
         {
-            Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args);
             Environment.ExitCode = DirectPtxAttentionOfflineCubinTool.AuditSass(args.Skip(1).ToArray());
             return;
         }

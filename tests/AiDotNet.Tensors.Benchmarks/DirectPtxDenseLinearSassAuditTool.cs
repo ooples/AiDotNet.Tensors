@@ -58,8 +58,8 @@ internal static class DirectPtxDenseLinearSassAuditTool
                     throw new InvalidDataException(
                         $"Warp-collective shared-load contract regressed for " +
                         $"{cell.BlueprintId}/{metrics.EntryPoint}: LDSM=0");
-                if ((cell.BlueprintId.StartsWith("gemm-tiled-v3-", StringComparison.Ordinal) ||
-                     cell.BlueprintId.StartsWith("fused-linear-tiled-v3-", StringComparison.Ordinal)) &&
+                if ((cell.BlueprintId.StartsWith("gemm-tiled-v", StringComparison.Ordinal) ||
+                     cell.BlueprintId.StartsWith("fused-linear-tiled-v", StringComparison.Ordinal)) &&
                     metrics.AsyncCopies == 0)
                     throw new InvalidDataException(
                         $"Async tiled-GEMM SASS contract regressed for {cell.BlueprintId}/{metrics.EntryPoint}.");

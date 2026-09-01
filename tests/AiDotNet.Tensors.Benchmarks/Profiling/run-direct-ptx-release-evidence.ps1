@@ -8,6 +8,7 @@ param(
     [switch]$Issue834Only,
     [switch]$Issue835Only,
     [switch]$Issue836Only,
+    [switch]$Issue853Only,
     [string]$DenseLinearNcuCsv,
     [ValidateRange(0, 10)]
     [int]$ContaminationRetries = 4,
@@ -17,7 +18,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $hostCpuCeilingPercent = 20.0
 $benchmarkOwnedCpuAllowance = 1.5
-if (@(@($Issue834Only, $Issue835Only, $Issue853Only) | Where-Object { $_ }).Count -gt 1) {
+if (@(@($Issue834Only, $Issue835Only, $Issue836Only, $Issue853Only) | Where-Object { $_ }).Count -gt 1) {
     throw 'Only one issue-specific evidence switch may be selected.'
 }
 
@@ -625,6 +626,290 @@ function Assert-DenseLinearEvidence(
     Write-DenseLinearMarkdown $Root @($allRows) @($environments) @($verdicts) $RunCount $IncludeExternal $NcuProof
 }
 
+function Read-SolverDotnetRows([string]$Path) {
+    $prefix = 'solver_evidence_json='
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::Ordinal)
+    } | ForEach-Object {
+        $row = $_.Substring($prefix.Length) | ConvertFrom-Json
+        [pscustomobject]@{
+            status = 'ok'
+            operation = [string]$row.Operation
+            batch = [int]$row.Batch
+            method = [string]$row.Method
+            device_median_us = [double]$row.Device.Median
+            device_p95_us = [double]$row.Device.P95
+            device_launches_per_sample = [int]$row.DeviceLaunchesPerSample
+            e2e_median_us = [double]$row.EndToEnd.Median
+            max_error = [double]$row.MaximumError
+            managed_bytes = [long]$row.ManagedBytes
+            temporary_device_bytes = [long]$row.TemporaryDeviceBytes
+            static_shared_bytes = [int]$row.SharedBytes
+            local_bytes_per_thread = [int]$row.LocalBytes
+            active_blocks_per_sm = [int]$row.ActiveBlocksPerSm
+            device_fingerprint = [string]$row.DeviceFingerprint
+        }
+    })
+}
+
+function Read-SolverPythonRows([string]$Path) {
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_.TrimStart().StartsWith('{', [StringComparison]::Ordinal)
+    } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+function Assert-SolverDotnetAcceptedAttempt([string]$Path, [int]$Run) {
+    $operations = @(
+        'cholesky', 'lu-factor', 'qr', 'eigh', 'eigh-lower', 'svd', 'lu-solve',
+        'ldl-factor', 'ldl-solve', 'solve', 'tri-lower', 'tri-upper',
+        'chol-backward', 'solve-backward')
+    $batches = @(1024, 4096, 16384, 65536)
+    $currentOperations = @('cholesky', 'lu-factor', 'qr', 'eigh')
+    $rows = @(Read-SolverDotnetRows $Path)
+    if ($rows.Count -ne 128) {
+        throw "Solver attempt expected 128 .NET rows in '$Path'; found $($rows.Count)."
+    }
+    $fingerprints = @($rows.device_fingerprint | Sort-Object -Unique)
+    if ($fingerprints.Count -ne 1 -or [string]::IsNullOrWhiteSpace($fingerprints[0])) {
+        throw "Solver attempt found inconsistent .NET device fingerprints in '$Path'."
+    }
+    if (@($rows | Where-Object { [int]$_.device_launches_per_sample -lt 1000 }).Count -ne 0) {
+        throw "Solver attempt found a device distribution with fewer than 1,000 launches per sample in '$Path'."
+    }
+
+    $findings = [System.Collections.Generic.List[string]]::new()
+    foreach ($operation in $operations) {
+        foreach ($batch in $batches) {
+            $cell = @($rows | Where-Object {
+                $_.operation -eq $operation -and $_.batch -eq $batch
+            })
+            $resident = @($cell | Where-Object { $_.method -eq 'Direct PTX resident' })
+            $graph = @($cell | Where-Object { $_.method -eq 'Direct PTX CUDA graph' })
+            if ($resident.Count -ne 1 -or $graph.Count -ne 1) {
+                throw "Solver attempt has an incomplete direct method set for run $Run '$operation'/B=$batch."
+            }
+            foreach ($candidate in @($resident[0], $graph[0])) {
+                $candidateMetrics = @(
+                    [double]$candidate.device_median_us,
+                    [double]$candidate.device_p95_us,
+                    [double]$candidate.e2e_median_us)
+                if (@($candidateMetrics | Where-Object {
+                        [double]::IsNaN($_) -or [double]::IsInfinity($_) -or $_ -le 0.0
+                    }).Count -ne 0 -or
+                    [double]$candidate.max_error -gt 2e-5 -or
+                    [long]$candidate.managed_bytes -ne 0 -or
+                    [long]$candidate.temporary_device_bytes -ne 0 -or
+                    [int]$candidate.static_shared_bytes -ne 0 -or
+                    [int]$candidate.local_bytes_per_thread -ne 0 -or
+                    [int]$candidate.active_blocks_per_sm -lt 2) {
+                    throw "Solver attempt correctness/resource gate failed for run $Run '$operation'/B=$batch '$($candidate.method)'."
+                }
+            }
+
+            $current = @($cell | Where-Object { $_.method -eq 'AiDotNet CUDA established' })
+            if ($currentOperations -notcontains $operation) {
+                if ($current.Count -ne 0) {
+                    throw "Solver attempt found an unexpected established baseline for run $Run '$operation'/B=$batch."
+                }
+                continue
+            }
+            if ($current.Count -ne 1) {
+                throw "Solver attempt is missing the established AiDotNet baseline for run $Run '$operation'/B=$batch."
+            }
+            $peerMetrics = @(
+                [double]$current[0].device_median_us,
+                [double]$current[0].device_p95_us,
+                [double]$current[0].e2e_median_us)
+            if (@($peerMetrics | Where-Object {
+                    [double]::IsNaN($_) -or [double]::IsInfinity($_) -or $_ -le 0.0
+                }).Count -ne 0 -or [double]$current[0].max_error -gt 2e-5) {
+                throw "Solver attempt peer has an invalid timing metric or exceeded correctness tolerance for run $Run '$operation'/B=$batch."
+            }
+
+            $deviceSpeedup = [double]$current[0].device_median_us / [double]$resident[0].device_median_us
+            $endToEndSpeedup = [double]$current[0].e2e_median_us / [double]$resident[0].e2e_median_us
+            $p95Ratio = [double]$resident[0].device_p95_us / [double]$current[0].device_p95_us
+            if ($deviceSpeedup -lt 1.10 -or $endToEndSpeedup -lt 1.10 -or $p95Ratio -gt 1.10) {
+                $findings.Add(
+                    "'$operation'/B=$batch device=$($deviceSpeedup.ToString('F3')), " +
+                    "E2E=$($endToEndSpeedup.ToString('F3')), P95 ratio=$($p95Ratio.ToString('F3'))")
+            }
+        }
+    }
+    if ($findings.Count -ne 0) {
+        throw "Solver attempt failed $($findings.Count) internal championship comparison(s): $($findings -join '; ')."
+    }
+}
+
+function Assert-SolverReleaseGate([string]$Root, [int]$RunCount, [bool]$IncludeExternal) {
+    $operations = @(
+        'cholesky', 'lu-factor', 'qr', 'eigh', 'eigh-lower', 'svd', 'lu-solve',
+        'ldl-factor', 'ldl-solve', 'solve', 'tri-lower', 'tri-upper',
+        'chol-backward', 'solve-backward')
+    $batches = @(1024, 4096, 16384, 65536)
+    $currentOperations = @('cholesky', 'lu-factor', 'qr', 'eigh')
+    $verdicts = [System.Collections.Generic.List[object]]::new()
+    $findings = [System.Collections.Generic.List[object]]::new()
+    for ($run = 1; $run -le $RunCount; $run++) {
+        $prefix = 'run-{0:D2}' -f $run
+        $dotnetPath = Join-Path $Root ($prefix + '-solvers-4x4.log')
+        $dotnetRows = @(Read-SolverDotnetRows $dotnetPath)
+        if ($dotnetRows.Count -ne 128) {
+            throw "Solver release gate expected 128 .NET rows in '$dotnetPath'; found $($dotnetRows.Count)."
+        }
+        $pythonRows = @()
+        if ($IncludeExternal) {
+            $pythonPath = Join-Path $Root ($prefix + '-solvers-4x4-pytorch.log')
+            $pythonRows = @(Read-SolverPythonRows $pythonPath)
+            if ($pythonRows.Count -ne 112) {
+                throw "Solver release gate expected 112 PyTorch rows in '$pythonPath'; found $($pythonRows.Count)."
+            }
+            foreach ($pythonRow in @($pythonRows | Where-Object { $_.status -eq 'ok' })) {
+                $calibrationUs = [double]$pythonRow.calibration_us
+                $samples = [int]$pythonRow.samples
+                $launches = [int]$pythonRow.device_launches_per_sample
+                if ([double]::IsNaN($calibrationUs) -or
+                    [double]::IsInfinity($calibrationUs) -or $calibrationUs -le 0.0) {
+                    throw "Solver release gate found invalid PyTorch calibration metadata for run $run '$($pythonRow.operation)'/B=$($pythonRow.batch) '$($pythonRow.method)'."
+                }
+                $minimumSamples = if ($calibrationUs -ge 1000.0) { 21 } else { 101 }
+                if ($samples -lt $minimumSamples -or $launches -lt 1 -or $launches -gt 10) {
+                    throw "Solver release gate found insufficient PyTorch sampling metadata for run $run '$($pythonRow.operation)'/B=$($pythonRow.batch) '$($pythonRow.method)' (calibration=${calibrationUs}us, samples=$samples, launches=$launches)."
+                }
+            }
+        }
+
+        $fingerprints = @($dotnetRows.device_fingerprint | Sort-Object -Unique)
+        if ($fingerprints.Count -ne 1 -or [string]::IsNullOrWhiteSpace($fingerprints[0])) {
+            throw "Solver release gate found inconsistent .NET device fingerprints in '$dotnetPath'."
+        }
+        if (@($dotnetRows | Where-Object { [int]$_.device_launches_per_sample -lt 1000 }).Count -ne 0) {
+            throw "Solver release gate found a device distribution with fewer than 1,000 launches per sample in '$dotnetPath'."
+        }
+
+        foreach ($operation in $operations) {
+            foreach ($batch in $batches) {
+                $cell = @($dotnetRows | Where-Object {
+                    $_.operation -eq $operation -and $_.batch -eq $batch
+                })
+                $resident = @($cell | Where-Object { $_.method -eq 'Direct PTX resident' })
+                $graph = @($cell | Where-Object { $_.method -eq 'Direct PTX CUDA graph' })
+                if ($resident.Count -ne 1 -or $graph.Count -ne 1) {
+                    throw "Solver release gate has an incomplete direct method set for run $run '$operation'/B=$batch."
+                }
+                foreach ($candidate in @($resident[0], $graph[0])) {
+                    if ([double]$candidate.max_error -gt 2e-5 -or
+                        [long]$candidate.managed_bytes -ne 0 -or
+                        [long]$candidate.temporary_device_bytes -ne 0 -or
+                        [int]$candidate.static_shared_bytes -ne 0 -or
+                        [int]$candidate.local_bytes_per_thread -ne 0 -or
+                        [int]$candidate.active_blocks_per_sm -lt 2) {
+                        throw "Solver correctness/resource gate failed for run $run '$operation'/B=$batch '$($candidate.method)'."
+                    }
+                }
+
+                $comparisons = [System.Collections.Generic.List[object]]::new()
+                if ($currentOperations -contains $operation) {
+                    $current = @($cell | Where-Object { $_.method -eq 'AiDotNet CUDA established' })
+                    if ($current.Count -ne 1) {
+                        throw "Solver release gate is missing the established AiDotNet baseline for run $run '$operation'/B=$batch."
+                    }
+                    $comparisons.Add([pscustomobject]@{ Candidate = $resident[0]; Peer = $current[0] })
+                }
+                elseif (@($cell | Where-Object { $_.method -eq 'AiDotNet CUDA established' }).Count -ne 0) {
+                    throw "Solver release gate found an unexpected established baseline for run $run '$operation'/B=$batch."
+                }
+
+                if ($IncludeExternal) {
+                    $externalCell = @($pythonRows | Where-Object {
+                        $_.operation -eq $operation -and [int]$_.batch -eq $batch
+                    })
+                    if ($externalCell.Count -ne 2) {
+                        throw "Solver release gate has an incomplete PyTorch method set for run $run '$operation'/B=$batch."
+                    }
+                    $eager = @($externalCell | Where-Object {
+                        $_.method -eq 'PyTorch CUDA eager/cuSOLVER'
+                    })
+                    $externalGraph = @($externalCell | Where-Object {
+                        $_.method -eq 'PyTorch CUDA graph/cuSOLVER'
+                    })
+                    if ($eager.Count -ne 1 -or $externalGraph.Count -ne 1) {
+                        throw "Solver release gate found duplicate or unknown PyTorch methods for run $run '$operation'/B=$batch."
+                    }
+                    if ($eager[0].status -ne 'ok') {
+                        throw "Required PyTorch eager competitor is unavailable for run $run '$operation'/B=${batch}: $($eager[0].reason)"
+                    }
+                    $comparisons.Add([pscustomobject]@{ Candidate = $resident[0]; Peer = $eager[0] })
+                    if ($externalGraph[0].status -eq 'ok') {
+                        $comparisons.Add([pscustomobject]@{ Candidate = $graph[0]; Peer = $externalGraph[0] })
+                    }
+                }
+
+                foreach ($comparison in $comparisons) {
+                    $candidate = $comparison.Candidate
+                    $peer = $comparison.Peer
+                    if ([double]$peer.max_error -gt 2e-5) {
+                        throw "Solver peer '$($peer.method)' exceeded correctness tolerance for run $run '$operation'/B=$batch."
+                    }
+                    $deviceSpeedup = [double]$peer.device_median_us / [double]$candidate.device_median_us
+                    $endToEndSpeedup = [double]$peer.e2e_median_us / [double]$candidate.e2e_median_us
+                    $p95Ratio = [double]$candidate.device_p95_us / [double]$peer.device_p95_us
+                    $passed = $deviceSpeedup -ge 1.10 -and $endToEndSpeedup -ge 1.10 -and $p95Ratio -le 1.10
+                    $verdicts.Add([ordered]@{
+                        run = $run
+                        operation = $operation
+                        batch = $batch
+                        candidate = $candidate.method
+                        competitor = $peer.method
+                        device_median_speedup = $deviceSpeedup
+                        e2e_median_speedup = $endToEndSpeedup
+                        device_p95_ratio = $p95Ratio
+                        status = if ($passed) { 'pass' } else { 'fail' }
+                    })
+                    if (-not $passed) {
+                        $findings.Add([ordered]@{
+                            run = $run
+                            operation = $operation
+                            batch = $batch
+                            candidate = $candidate.method
+                            competitor = $peer.method
+                            device_median_speedup = $deviceSpeedup
+                            required_device_median_speedup = 1.10
+                            device_median_deficit = [Math]::Max(0.0, 1.10 - $deviceSpeedup)
+                            e2e_median_speedup = $endToEndSpeedup
+                            required_e2e_median_speedup = 1.10
+                            e2e_median_deficit = [Math]::Max(0.0, 1.10 - $endToEndSpeedup)
+                            device_p95_ratio = $p95Ratio
+                            maximum_device_p95_ratio = 1.10
+                            device_p95_excess = [Math]::Max(0.0, $p95Ratio - 1.10)
+                        })
+                    }
+                }
+            }
+        }
+    }
+    $gatePath = Join-Path $Root 'solver-release-gate.json'
+    [ordered]@{
+        status = if ($findings.Count -ne 0) { 'fail' } elseif ($IncludeExternal) { 'pass' } else { 'partial-pass' }
+        required_device_and_e2e_median_speedup = 1.10
+        maximum_device_p95_ratio = 1.10
+        maximum_error = 2e-5
+        required_managed_temporary_shared_local_bytes = 0
+        minimum_active_blocks_per_sm = 2
+        maximum_adjusted_foreign_host_cpu_percent = $hostCpuCeilingPercent
+        benchmark_owned_cpu_allowance = $benchmarkOwnedCpuAllowance
+        external_sampling = '101 samples below 1 ms; at least 21 samples at or above 1 ms; 1-10 calibrated launches/sample'
+        external_process_isolation = 'uninterrupted resident eager phase, then one disposable CUDA-graph process per run/operation/batch cell'
+        runs = $RunCount
+        external_competitors_included = $IncludeExternal
+        verdicts = @($verdicts)
+        findings = @($findings)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $gatePath -Encoding utf8
+    if ($findings.Count -ne 0) {
+        throw "Solver championship gate failed $($findings.Count) comparison(s); inspect '$gatePath' for the complete finding set."
+    }
+}
+
 function Get-GpuSnapshot {
     $output = & nvidia-smi `
         '--query-gpu=name,uuid,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used' `
@@ -737,10 +1022,10 @@ function Assert-GpuReady([string]$Label, [switch]$AfterSuite) {
 
 Push-Location $repoRoot
 try {
-    $issueOnlyCount = @(@($Issue834Only, $Issue835Only, $Issue836Only) |
+    $issueOnlyCount = @(@($Issue834Only, $Issue835Only, $Issue836Only, $Issue853Only) |
         Where-Object { $_ }).Count
     if ($issueOnlyCount -gt 1) {
-        throw '-Issue834Only, -Issue835Only, and -Issue836Only are mutually exclusive.'
+        throw '-Issue834Only, -Issue835Only, -Issue836Only, and -Issue853Only are mutually exclusive.'
     }
     if (-not [string]::IsNullOrWhiteSpace($DenseLinearNcuCsv) -and -not $Issue836Only) {
         throw '-DenseLinearNcuCsv is valid only with -Issue836Only.'
@@ -767,6 +1052,10 @@ try {
     }
 
     $suites = [System.Collections.Generic.List[object]]::new()
+    if ($Issue853Only) {
+        $suites.Add((New-EvidenceSuite 'solvers-4x4' 'dotnet' @(
+            $targetDll, '--direct-ptx-solvers-4x4', '1', '--component-only')))
+    }
     if ($Issue836Only) {
         $suites.Add((New-EvidenceSuite 'dense-linear' 'dotnet' @(
             $targetDll, '--direct-ptx-dense-linear-full', '1', '--no-python')))
@@ -777,7 +1066,7 @@ try {
                 '--runs', '1', '--json-lines')))
         }
     }
-    elseif (-not $Issue834Only -and -not $Issue835Only) {
+    elseif (-not $Issue834Only -and -not $Issue835Only -and -not $Issue853Only) {
         $suites.Add((New-EvidenceSuite 'online-attention' 'dotnet' @($targetDll, '--direct-ptx-online-attention')))
         $suites.Add((New-EvidenceSuite 'gpu-matrix' 'dotnet' @($targetDll, '--direct-ptx-gpu-matrix')))
         $suites.Add((New-EvidenceSuite 'residual-rmsnorm' 'dotnet' @($targetDll, '--direct-ptx-residual-rmsnorm')))
@@ -786,14 +1075,14 @@ try {
         }
     }
 
-    if (-not $Issue836Only -and -not $Issue835Only) {
+    if (-not $Issue836Only -and -not $Issue835Only -and -not $Issue853Only) {
         $suites.Add((New-EvidenceSuite 'attention-family' 'dotnet' @($targetDll, '--direct-ptx-attention-family', '1')))
         $suites.Add((New-EvidenceSuite 'decode' 'dotnet' @($targetDll, '--direct-ptx-decode', '1')))
         $suites.Add((New-EvidenceSuite 'paged-prefill' 'dotnet' @($targetDll, '--direct-ptx-paged-prefill', '1')))
         $suites.Add((New-EvidenceSuite 'attention-backward' 'dotnet' @($targetDll, '--direct-ptx-attention-backward', '1')))
         $suites.Add((New-EvidenceSuite 'flash-attention-backward' 'dotnet' @($targetDll, '--direct-ptx-flash-attention-backward', '1')))
     }
-    if (-not $Issue836Only -and -not $Issue834Only) {
+    if (-not $Issue836Only -and -not $Issue834Only -and -not $Issue853Only) {
         $suites.Add((New-EvidenceSuite 'qkv-rope-cache' 'dotnet' @(
             $targetDll, '--direct-ptx-qkv-rope-cache', '1', '--no-external')))
     }
@@ -821,7 +1110,8 @@ try {
     $previousAutotune = $env:AIDOTNET_DIRECT_PTX_AUTOTUNE
     $previousPath = $env:PATH
     $env:AIDOTNET_DIRECT_PTX = '1'
-    $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = '0'
+    $autotuneValue = if ($Issue853Only) { '1' } else { '0' }
+    $env:AIDOTNET_DIRECT_PTX_AUTOTUNE = $autotuneValue
     $nativeRuntime = Join-Path (Split-Path $targetDll -Parent) 'runtimes\win-x64\native'
     if (Test-Path -LiteralPath $nativeRuntime -PathType Container) {
         $env:PATH = $nativeRuntime + [IO.Path]::PathSeparator + $env:PATH
@@ -944,7 +1234,10 @@ try {
     if ($Issue836Only) {
         $denseLinearNcuProof = Read-DenseLinearNcuProof $DenseLinearNcuCsv
     }
-    if (-not $Issue834Only -and -not $Issue836Only) {
+    if ($Issue853Only) {
+        Assert-SolverReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
+    }
+    elseif (-not $Issue834Only -and -not $Issue836Only) {
         Assert-QkvReleaseGate $evidenceRoot $Runs (-not [bool]$SkipExternal)
     }
     if ($Issue836Only) {

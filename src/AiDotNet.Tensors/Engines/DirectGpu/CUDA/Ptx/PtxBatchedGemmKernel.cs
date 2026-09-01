@@ -11,6 +11,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// z grid dimension. No bias, no activation. Tile BM=BN=64, BK=8, TM=TN=4 → 256
 /// threads, 16 accumulators, 4 KiB shared. Grid = (N/BN, M/BM, Batch).
 /// </summary>
+/// <remarks>
+/// INTEGRATION STATUS (2026-09-01): no <c>CudaBackend</c> entry point constructs this kernel; BatchedGemm currently dispatches the batched <see cref="PtxFusedLinearTiledKernel"/> route.
+/// Until a route dispatches it, its emitted PTX is exercised by tests only and it carries no parity or
+/// performance claim.
+/// </remarks>
 internal sealed class PtxBatchedGemmKernel : IDisposable
 {
     internal const int BlockM = 64;

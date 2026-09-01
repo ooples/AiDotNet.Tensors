@@ -16,6 +16,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// Tile BM=BN=64, BK=8, TM=TN=4 → 256 threads, 16 FP32 accumulators/thread,
 /// 4 KiB shared. Grid = (N/BN, M/BM).
 /// </summary>
+/// <remarks>
+/// INTEGRATION STATUS (2026-09-01): no <c>CudaBackend</c> entry point constructs this kernel; MatMulTransposed currently dispatches the output-major <see cref="PtxFusedLinearTiledKernel"/> route.
+/// Until a route dispatches it, its emitted PTX is exercised by tests only and it carries no parity or
+/// performance claim.
+/// </remarks>
 internal sealed class PtxMatMulTransposedKernel : IDisposable
 {
     internal const int BlockM = 64;

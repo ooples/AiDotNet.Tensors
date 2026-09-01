@@ -11,6 +11,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// coalesced. No shared memory, no reduction, register-resident.
 /// Grid = (N/256, M).
 /// </summary>
+/// <remarks>
+/// INTEGRATION STATUS (2026-09-01): no <c>CudaBackend</c> entry point constructs this kernel; the outer entry points currently dispatch <see cref="PtxDenseVectorKernel"/>.
+/// Until a route dispatches it, its emitted PTX is exercised by tests only and it carries no parity or
+/// performance claim.
+/// </remarks>
 internal sealed class PtxOuterProductKernel : IDisposable
 {
     internal const int BlockThreads = 256;

@@ -175,7 +175,8 @@ internal static class DirectPtxCubinArtifactCache
                     out int barriers) && barriers >= 0 && barriers <= 16
                 ? match.Value
                 : "used unavailable barriers",
-            RegexOptions.CultureInvariant);
+            RegexOptions.CultureInvariant,
+            TimeSpan.FromSeconds(1));
 
     internal static DirectPtxCubinArtifact? TryResolveEmbedded(
         string ptx,

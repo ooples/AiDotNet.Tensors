@@ -41,6 +41,18 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "gemm-performance-gate-not-met";
             return false;
         }
+        // Fail closed, never throw: a null or released buffer must produce an exact rejection reason
+        // like every other admission failure, not a NullReferenceException out of the fast path.
+        if (DirectPtxBufferIsInvalid(a) || DirectPtxBufferIsInvalid(b) || DirectPtxBufferIsInvalid(c))
+        {
+            DirectPtxLastError = "gemm-null-or-invalid-buffer";
+            return false;
+        }
+        if (c.Handle == a.Handle || c.Handle == b.Handle)
+        {
+            DirectPtxLastError = "gemm-output-aliases-input";
+            return false;
+        }
         long aBytes = checked((long)m * k * sizeof(float));
         long bBytes = checked((long)k * n * sizeof(float));
         long cBytes = checked((long)m * n * sizeof(float));
@@ -100,6 +112,14 @@ public sealed partial class CudaBackend
         if (!PtxGemmKernel.IsSupportedShape(m, k, n))
         {
             DirectPtxLastError = "gemm-shape-not-implemented";
+            return false;
+        }
+        // Same admission rule as TryDirectPtxGemm: prewarming an unpromoted, non-experimental shape
+        // would link and cache a module that dispatch can never select.
+        if (!PtxGemmKernel.IsPromotedShape(m, k, n) &&
+            !DirectPtxFeatureGate.FusedLinearExperimentOverride)
+        {
+            DirectPtxLastError = "gemm-performance-gate-not-met";
             return false;
         }
         try
