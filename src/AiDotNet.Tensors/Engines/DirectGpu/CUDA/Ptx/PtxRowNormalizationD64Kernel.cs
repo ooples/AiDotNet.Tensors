@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// Exact D=64 row-normalization specializations. One warp owns one row and
 /// keeps both lane-owned values in registers across every reduction. The
-/// operation and row count are baked into the module identity; only tensor
-/// pointers reach the hot launch ABI.
+/// operation and row count are baked into the module identity; the hot launch ABI is
+/// epsilon (a scalar .param, launch argument 0) followed by the tensor pointers.
 /// </summary>
 internal enum DirectPtxRowNormalizationOperation
 {
@@ -118,16 +118,27 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             operation, rows, epsilon);
-        _module = runtime.LoadModule(
-            Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.NormalizationExperimentOverride);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+        // FAILURE-ATOMIC LOAD: every step after LoadModule can throw (missing entry point, budget
+        // violation, audit failure), and a thrown constructor has no Dispose to run -- the loaded
+        // CUmodule would leak, once per re-attempted dispatch. The helper disposes it on any throw.
         int blockThreads = GetBlockThreads(operation);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(
-            EntryPoint, info, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            blockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(
+                Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.NormalizationExperimentOverride),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(
+                    EntryPoint, info, blockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    blockThreads, activeBlocks, module);
+                return (function, audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.function;
+        Audit = loaded.Value.audit;
     }
 
     internal unsafe void Launch(ReadOnlySpan<DirectPtxTensorView> tensors)

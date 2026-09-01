@@ -28,8 +28,9 @@ internal enum DirectPtxChannelNormalizationOperation
 
 /// <summary>
 /// Exact 64-value normalization-unit family for canonical NCHW tensors. The
-/// batch, channel, spatial, group, activation, training, epsilon, and momentum
-/// semantics are all baked into separate PTX module identities.
+/// batch, channel, spatial, group, activation, and training semantics are baked into
+/// separate PTX module identities; epsilon and momentum are scalar .param launch
+/// arguments, not part of the module identity.
 /// </summary>
 internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
 {
@@ -86,17 +87,27 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, operation);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             operation, epsilon, momentum);
-        _module = runtime.LoadModule(
-            Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.NormalizationExperimentOverride);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+        // FAILURE-ATOMIC LOAD: see PtxRowNormalizationD64Kernel -- a throw after LoadModule must
+        // not leak the CUmodule.
         int blockThreads = IsParameterGradient(operation)
             ? ParameterBlockThreads
             : RowBlockThreads;
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, blockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, blockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            blockThreads, activeBlocks, _module);
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(
+                Ptx, allowExperimentalJitFallback: DirectPtxFeatureGate.NormalizationExperimentOverride),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, blockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, blockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    blockThreads, activeBlocks, module);
+                return (function, audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.function;
+        Audit = loaded.Value.audit;
     }
 
     internal unsafe void Launch(ReadOnlySpan<DirectPtxTensorView> tensors)

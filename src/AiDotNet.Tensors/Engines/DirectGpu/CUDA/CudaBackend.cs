@@ -7959,7 +7959,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (TryDirectPtxGroupNormUnit64(
                 input, output, gamma, beta, saveMean, saveInvVar,
                 batch, numGroups, channels, spatialSize, epsilon))
+        {
+            // CONTRACT ADAPTER. The direct cell publishes TRUE variance in its statistics slot: its
+            // own backward consumes variance, which is also the IEngine contract. THIS method's
+            // contract is different and fixed by the groupnorm_forward NVRTC kernel below, which
+            // stores invVar = 1/sqrt(var + eps) -- and DirectGpuTensorEngine.GroupNorm relies on it,
+            // converting the slot back to variance as 1/x^2 - eps. Left as variance, that conversion
+            // would hand GroupNormBackward 1/var^2 - eps and the gradient would be wrong whenever the
+            // experimental cell is admitted. Convert in place so the two routes are indistinguishable
+            // to every consumer; the statistics are batch*groups values, so this is negligible.
+            int statCount = batch * numGroups;
+            AddScalar(saveInvVar, saveInvVar, epsilon, statCount);
+            Sqrt(saveInvVar, saveInvVar, statCount);
+            Reciprocal(saveInvVar, saveInvVar, statCount);
             return;
+        }
 
         if (!_kernelCache.TryGetValue("groupnorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: groupnorm_forward");

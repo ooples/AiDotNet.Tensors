@@ -13,8 +13,7 @@ on:
     branches: [master, main]
     paths:
       - '.github/workflows/direct-ptx-normalization-offline-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxRowNormalizationD64Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
       - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxNormalizationOfflineCubinTool.cs'
       - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
   push:

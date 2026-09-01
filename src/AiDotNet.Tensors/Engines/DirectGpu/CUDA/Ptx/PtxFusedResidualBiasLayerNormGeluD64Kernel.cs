@@ -44,13 +44,23 @@ internal sealed class PtxFusedResidualBiasLayerNormGeluD64Kernel : IDisposable
         Epsilon = epsilon;
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, rows);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, rows, epsilon);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info,
-            BlockThreads, activeBlocks, _module);
+        // FAILURE-ATOMIC LOAD: a throw from GetFunction, the occupancy query, the budget check or
+        // the audit must not leak the CUmodule; the helper disposes it before rethrowing.
+        var loaded = DirectPtxResourceInitialization.Complete(
+            runtime.LoadModule(Ptx),
+            module =>
+            {
+                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
+                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
+                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
+                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
+                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
+                    BlockThreads, activeBlocks, module);
+                return (function, audit);
+            });
+        _module = loaded.Resource;
+        _function = loaded.Value.function;
+        Audit = loaded.Value.audit;
     }
 
     internal unsafe void Launch(
