@@ -12115,8 +12115,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return;
 
-        // Invalidation reads host data and cache identity; it must not request writable storage.
-        // A real host mutation has already passed through a write gate and detached its COW family.
+        // Cache identity is a read-only concern: key by the backing array WITHOUT requesting writable
+        // storage, which would detach a copy-on-write alias and copy the whole tensor as a side effect
+        // of cache maintenance. A real host mutation has already passed through a write gate.
         var key = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (key is null)
             return;
@@ -12124,13 +12125,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!_persistentBufferCache.TryGetValue(key, out var entry))
             return;
 
+        // The UPLOAD SOURCE is a different question from the cache key. The identity accessor never
+        // fires a pending deferred GPU->CPU download (DeferredArrayMaterializer), so a tensor whose
+        // latest value still lives on the device would re-upload its STALE host bytes. The read-only
+        // data accessor materialises that download without privatising a COW clone, and for the simple
+        // CPU layout the cache can hit on it hands back the very array used as the key. Resolve it
+        // BEFORE disposing the old buffer, so a failed materialisation leaves the cache entry intact.
+        T[] hostData = tensor.GetReadOnlyDataArray();
+
         try
         {
             // Dispose old buffer
             entry.Buffer.Dispose();
 
             // Upload new data
-            float[] floatData = DirectGpuEngine.ToFloatArray(key);
+            float[] floatData = DirectGpuEngine.ToFloatArray(hostData);
             IGpuBuffer newBuffer = backend.AllocateBuffer(floatData);
             backend.Synchronize();
 
